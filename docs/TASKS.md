@@ -15,7 +15,8 @@
   
  [ ] Swap-IX bauen (echter Raydium BaseIn) + ComputeBudget + Prioritätsgebühren
 	- [ ] Erweiterung `SimplePool` um open_orders / market_id / authority PDA
-	- [ ] Ableitung AmmAuthority PDA + Serum Vault Signer
+	- [x] Erweiterung `SimplePool` um open_orders / market_id / authority PDA Platzhalter
+	- [x] Ableitung AmmAuthority PDA + Serum Vault Signer (Helper implementiert)
 	- [ ] Einfügen ComputeBudget (CU limit + price) & optional Prioritäts-Fee Instruktionen
 	- [ ] Realistische Account-Reihenfolge testen (Simulation)
 	- [ ] MinOut aus Quote+Slippage ableiten & Assertion

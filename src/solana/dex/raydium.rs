@@ -75,6 +75,7 @@ pub struct PoolSnapshot {
     pub market_id: Option<Pubkey>,
     pub market_program_id: Option<Pubkey>,
     pub amm_authority: Option<Pubkey>,
+    pub serum_vault_signer: Option<Pubkey>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +91,7 @@ struct SimplePool {
     market_id: Option<Pubkey>,
     market_program_id: Option<Pubkey>,
     amm_authority: Option<Pubkey>,
+    serum_vault_signer: Option<Pubkey>,
     // cached reserves (token balances) in raw units
     reserve_base: u128,
     reserve_quote: u128,
@@ -113,6 +115,7 @@ impl Raydium {
             market_id: p.market_id,
             market_program_id: p.market_program_id,
             amm_authority: p.amm_authority,
+            serum_vault_signer: p.serum_vault_signer,
         }).collect()
     }
 
@@ -144,6 +147,16 @@ impl Raydium {
             if better { best = Some((p.address, forward, total_liq)); }
         }
         best.map(|(addr,f,_ )| (addr,f))
+    }
+
+    /// Derive Raydium AMM authority PDA (shared across pools) using seed "amm authority".
+    pub fn derive_amm_authority() -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"amm authority"], &Pubkey::from_str(RAYDIUM_AMM_V4).expect("prog"))
+    }
+
+    /// Derive Serum/OpenBook vault signer PDA for a given market id.
+    pub fn derive_serum_vault_signer(market: &Pubkey, serum_program: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[market.as_ref()], serum_program)
     }
 
     /// Build a swap plan (base-in) with optional compute budget & priority fee.
@@ -225,8 +238,12 @@ impl Dex for Raydium {
             let fee_den = raw.get(16..24).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes).unwrap_or(10_000);
             let mut fee_bps = if fee_den > 0 && fee_num <= fee_den { ((fee_num * 10_000) / fee_den) as u32 } else { 25 };
             if fee_bps == 0 || fee_bps > 1000 { tracing::warn!(pool = %p.address, fee_bps, "abnormal fee, fallback 25"); fee_bps = 25; }
-            // Derive amm_authority placeholder (Raydium V4 authority PDA seed often: "amm authority" + program + amm_id; skipped -> None until implemented)
-            let obj = SimplePool { base_mint: p.base_mint, quote_mint: p.quote_mint, base_vault: p.base_vault, quote_vault: p.quote_vault, lp_reserve: p.lp_reserve, address: p.address, reserve_base: base_amt, reserve_quote: quote_amt, fee_bps, last_update: SystemTime::now(), open_orders: Some(p.open_orders), market_id: Some(p.market_id), market_program_id: Some(p.market_program_id), amm_authority: None };
+            let (amm_auth, _) = Self::derive_amm_authority();
+            let serum_vault_signer = if p.market_program_id != Pubkey::default() {
+                let (v, _) = Self::derive_serum_vault_signer(&p.market_id, &p.market_program_id);
+                Some(v)
+            } else { None };
+            let obj = SimplePool { base_mint: p.base_mint, quote_mint: p.quote_mint, base_vault: p.base_vault, quote_vault: p.quote_vault, lp_reserve: p.lp_reserve, address: p.address, reserve_base: base_amt, reserve_quote: quote_amt, fee_bps, last_update: SystemTime::now(), open_orders: Some(p.open_orders), market_id: Some(p.market_id), market_program_id: Some(p.market_program_id), amm_authority: Some(amm_auth), serum_vault_signer };
             self.pools.insert(p.address, obj);
         }
         // Cleanup stale (>15m)
