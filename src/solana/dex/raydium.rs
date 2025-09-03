@@ -155,6 +155,8 @@ impl Raydium {
     fn validate_pool_state(p: &reader::PoolV4) -> Result<()> {
         ensure!(p.base_mint != p.quote_mint, "pool base_mint == quote_mint");
         ensure!(p.base_vault != p.quote_vault, "pool base_vault == quote_vault");
+    ensure!(p.base_vault.to_bytes() != [0u8;32], "pool base_vault default pubkey");
+    ensure!(p.quote_vault.to_bytes() != [0u8;32], "pool quote_vault default pubkey");
         ensure!(p.open_orders.to_bytes() != [0u8;32], "open_orders default pubkey");
         // Market linkage: only enforce market_id if market_program_id set
         if p.market_program_id.to_bytes() != [0u8;32] {
@@ -286,10 +288,16 @@ impl Dex for Raydium {
         for (p, raw) in decoded {
             let base_amt = vault_amounts.get(&p.base_vault).copied().unwrap_or(0);
             let quote_amt = vault_amounts.get(&p.quote_vault).copied().unwrap_or(0);
-            let fee_num = raw.get(8..16).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes).unwrap_or(25);
-            let fee_den = raw.get(16..24).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes).unwrap_or(10_000);
-            let mut fee_bps = if fee_den > 0 && fee_num <= fee_den { ((fee_num * 10_000) / fee_den) as u32 } else { 25 };
-            if fee_bps == 0 || fee_bps > 1000 { tracing::warn!(pool = %p.address, fee_bps, "abnormal fee, fallback 25"); fee_bps = 25; }
+            if base_amt == 0 || quote_amt == 0 {
+                tracing::warn!(pool = %p.address, base_amt, quote_amt, "skip pool missing vault balances (no silent fallback)");
+                continue;
+            }
+            let fee_num = raw.get(8..16).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes).unwrap_or_default();
+            let fee_den = raw.get(16..24).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes).unwrap_or_default();
+            if fee_num == 0 || fee_den == 0 || fee_num > fee_den { tracing::warn!(pool = %p.address, fee_num, fee_den, "invalid fee ratio -> skip"); continue; }
+            let fee_bps_calc = ((fee_num * 10_000) / fee_den) as u32;
+            if !(1..=1000).contains(&fee_bps_calc) { tracing::warn!(pool = %p.address, fee_bps_calc, "fee_bps out of supported range -> skip"); continue; }
+            let fee_bps = fee_bps_calc;
             let (amm_auth, _) = Self::derive_amm_authority();
             let serum_vault_signer = if p.market_program_id != Pubkey::default() {
                 let (v, _) = Self::derive_serum_vault_signer(&p.market_id, &p.market_program_id);

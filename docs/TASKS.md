@@ -20,7 +20,7 @@
 - [x] Gemeinsames Quote-Struct erweitert (input_mint/output_mint) für Routen-Rekonstruktion
 - [x] Orca: Replace Heuristics mit Echtem Whirlpool Layout (feste Offsets / strukturiertes Parsing)
 - [x] Orca: Echte User Accounts & Token Owner Accounts in Swap IX (statt Platzhalter Pubkeys) (Setters + validation in build_swap_ix)
-- [ ] Raydium: Offene Verbesserung – Vault Fallbacks entfernen (immer echte Vaults nutzen)
+- [x] Raydium: Offene Verbesserung – Vault Fallbacks entfernen (immer echte Vaults nutzen + skip invalid fee / zero reserves)
 - [ ] Safety: Further structural validation (Orca tick spacing bounds, vault/mint cross-check)
 - [ ] Benchmarks für Quote & Refresh (Performance Profiling)
 
