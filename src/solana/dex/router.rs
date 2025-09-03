@@ -8,6 +8,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::future::join_all;
 use super::{Dex, Quote};
+use crate::metrics::{QUOTE_REQUESTS, QUOTE_SUCCESSES, ROUTER_SINGLE_HOP, ROUTER_HOPS2, ROUTER_HOPS3, LatencyTimer};
 
 pub struct RouteQuote {
     pub dex_index: usize,
@@ -40,6 +41,8 @@ impl Router {
     /// Fetch best single-hop quote across all registered DEXs.
     pub async fn best_quote_exact_in(&self, input_mint: &str, output_mint: &str, amount_in: u64) -> Result<Option<RouteQuote>> {
         if self.dexs.is_empty() { return Ok(None); }
+    QUOTE_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _lt = LatencyTimer::start();
         let futs = self.dexs.iter().map(|d| d.quote_exact_in(input_mint, output_mint, amount_in));
         let results = join_all(futs).await;
         let mut best: Option<(usize, Quote)> = None;
@@ -49,7 +52,8 @@ impl Router {
                 if replace { best = Some((i, q)); }
             }
         }
-        Ok(best.map(|(i,q)| RouteQuote { dex_index: i, quote: q }))
+    if best.is_some() { QUOTE_SUCCESSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); ROUTER_SINGLE_HOP.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+    Ok(best.map(|(i,q)| RouteQuote { dex_index: i, quote: q }))
     }
 
     /// Naive depth-2 multi-hop: input -> mid -> output. Considers pairs from all DEXs.

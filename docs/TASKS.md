@@ -46,6 +46,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Net Profit Filter (min_profit_bps + est_tx_cost_lamports)
 6. Compute Budget: Dynamische CU-Schätzung (historische Simulation / heuristics) statt fixer Werte
 7. Metrics: Pool Count, Quote Latency, Routing Auswahlgrund (DEX, hops)
+	- [x] Basic counters (quotes, successes, hop types, triangle attempts/profitable, avg latency)
 8. CI Pipeline (fmt, clippy, test, optional wasm build)
 9. Config Hot-Reload (Signal / File Watch) für Routing/Slippage Parameter
 10. Risk Layer: Max Notional pro Trade + Daily Loss Limit Skeleton

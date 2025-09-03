@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tracing::info;
 use crate::{types::{TradeIntent, Token, Amount, Side}};
 use super::{rpc::SolanaRpc, dex::{Dex, Quote}};
+use crate::metrics::{ARB_TRIANGLE_ATTEMPTS, ARB_TRIANGLE_PROFITABLE};
 use crate::solana::dex::router::Router;
 use rust_decimal::Decimal;
 
@@ -56,14 +57,15 @@ impl ArbitrageEngine {
     let hop2 = self.router.best_quote_exact_in(b, c, h1.quote.amount_out).await?; let h2 = match hop2 { Some(h)=>h, None=>return Ok(None) };
     let hop3 = self.router.best_quote_exact_in(c, a, h2.quote.amount_out).await?; let h3 = match hop3 { Some(h)=>h, None=>return Ok(None) };
         let final_out = h3.quote.amount_out;
-        if final_out > amount_in { return Ok(Some((format!("{}-{}-{}", a,b,c), final_out - amount_in))); }
+    if final_out > amount_in { return Ok(Some((format!("{}-{}-{}", a,b,c), final_out - amount_in))); }
         Ok(None)
     }
 
     /// Triangle with profit filter (net after est tx cost and min_profit_bps threshold). Returns net profit.
     pub async fn triangle_cycle_profit_checked(&self, a: &str, b: &str, c: &str, ui_amount_a: f64, decimals: u32) -> Result<Option<(String, u64)>> {
         let amount_in = (ui_amount_a * 10f64.powi(decimals as i32)) as u64;
-        let path = self.triangle_cycle(a,b,c, ui_amount_a).await?; let (id, gross_profit) = match path { Some(p)=>p, None=>return Ok(None) };
+    ARB_TRIANGLE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = self.triangle_cycle(a,b,c, ui_amount_a).await?; let (id, gross_profit) = match path { Some(p)=>p, None=>return Ok(None) };
         if let Some(net) = compute_net_profit(amount_in, amount_in + gross_profit, self.min_profit_bps, self.est_tx_cost_lamports) { return Ok(Some((id, net))); }
         Ok(None)
     }
