@@ -1,5 +1,8 @@
-//! Simple multi-DEX router (single hop best-out selection)
-//! Future: multi-hop graph search (depth 2), path scoring, slippage-aware sorting.
+//! Simple multi-DEX router (single + multi-hop best-out selection)
+//! Supports:
+//!  - Single hop best quote
+//!  - Depth-2 (A->B->C) greedy with mid selection
+//!  - Depth-3 (A->B->C->D) greedy sequential (basic pruning)
 
 use std::sync::Arc;
 use anyhow::Result;
@@ -98,6 +101,71 @@ impl Router {
         let final_out = quotes.last().unwrap().amount_out as u128;
         let keep = 10_000u128.saturating_sub(slippage_bps as u128);
         (final_out * keep / 10_000u128) as u64
+    }
+
+    /// Greedy depth-3 path: input -> mid1 -> mid2 -> output. Mid candidates discovered from listed pairs.
+    pub async fn best_quote_exact_in_hops3(&self, input_mint: &str, output_mint: &str, amount_in: u64) -> Result<Option<(Vec<(usize, Quote)>, u64)>> {
+        use std::collections::HashSet;
+        if self.dexs.is_empty() { return Ok(None); }
+        // collect all tokens reachable from input (first hop) and tokens that can reach output (reverse adjacency) then intersect for mid2 layer
+        let mut neighbors_from_input: HashSet<String> = HashSet::new();
+        let mut neighbors_to_output: HashSet<String> = HashSet::new();
+        for d in &self.dexs {
+            for (a,b) in d.list_pairs() {
+                if a == input_mint { neighbors_from_input.insert(b.clone()); }
+                if b == input_mint { neighbors_from_input.insert(a.clone()); }
+                if a == output_mint { neighbors_to_output.insert(b.clone()); }
+                if b == output_mint { neighbors_to_output.insert(a.clone()); }
+            }
+        }
+        // candidate mid2 tokens appear in neighbors_to_output; mid1 in neighbors_from_input
+        let mut best: Option<(Vec<(usize, Quote)>, u64)> = None;
+        // iterate mid1 first
+        for mid1 in neighbors_from_input.iter() {
+            // hop1
+            let mut hop1_best: Option<(usize, Quote)> = None;
+            for (i,d) in self.dexs.iter().enumerate() {
+                if let Ok(Some(q)) = d.quote_exact_in(input_mint, mid1, amount_in).await {
+                    if hop1_best.as_ref().map(|(_,b)| b.amount_out < q.amount_out).unwrap_or(true) { hop1_best = Some((i,q)); }
+                }
+            }
+            let (i1,q1) = match hop1_best { Some(v)=>v, None=>continue };
+            if q1.price_impact_bps > 3000 { continue; }
+            // build candidate mid2 tokens reachable from mid1 and that can also reach output
+            let mut mid2_candidates: HashSet<String> = HashSet::new();
+            for d in &self.dexs {
+                for (a,b) in d.list_pairs() {
+                    if a == *mid1 { mid2_candidates.insert(b.clone()); }
+                    if b == *mid1 { mid2_candidates.insert(a.clone()); }
+                }
+            }
+            for mid2 in mid2_candidates.iter() {
+                if mid2 == mid1 || mid2 == input_mint || mid2 == output_mint { continue; }
+                if !neighbors_to_output.contains(mid2) { continue; }
+                // hop2
+                let mut hop2_best: Option<(usize, Quote)> = None;
+                for (i,d) in self.dexs.iter().enumerate() {
+                    if let Ok(Some(q)) = d.quote_exact_in(&q1.output_mint, mid2, q1.amount_out).await {
+                        if hop2_best.as_ref().map(|(_,b)| b.amount_out < q.amount_out).unwrap_or(true) { hop2_best = Some((i,q)); }
+                    }
+                }
+                let (i2,q2) = match hop2_best { Some(v)=>v, None=>continue };
+                if q2.price_impact_bps > 3000 { continue; }
+                // hop3
+                let mut hop3_best: Option<(usize, Quote)> = None;
+                for (i,d) in self.dexs.iter().enumerate() {
+                    if let Ok(Some(q)) = d.quote_exact_in(&q2.output_mint, output_mint, q2.amount_out).await {
+                        if hop3_best.as_ref().map(|(_,b)| b.amount_out < q.amount_out).unwrap_or(true) { hop3_best = Some((i,q)); }
+                    }
+                }
+                let (i3,q3) = match hop3_best { Some(v)=>v, None=>continue };
+                if q3.price_impact_bps > 3000 { continue; }
+                let total_out = q3.amount_out;
+                let replace = best.as_ref().map(|(_,bo)| total_out > *bo).unwrap_or(true);
+                if replace { best = Some((vec![(i1,q1.clone()), (i2,q2.clone()), (i3,q3)], total_out)); }
+            }
+        }
+        Ok(best)
     }
 
     /// Build a multi-hop (depth=2) swap plan with min_out (slippage applied on final output only).

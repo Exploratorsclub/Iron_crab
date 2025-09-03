@@ -6,15 +6,17 @@ use std::sync::Arc;
 use tracing::info;
 use crate::{types::{TradeIntent, Token, Amount, Side}};
 use super::{rpc::SolanaRpc, dex::{Dex, Quote}};
+use crate::solana::dex::router::Router;
 use rust_decimal::Decimal;
 
 pub struct ArbitrageEngine {
     pub rpc: Arc<SolanaRpc>,
     pub connectors: Vec<Arc<dyn Dex>>, // Raydium, Orca, ...
+    pub router: Router,
 }
 
 impl ArbitrageEngine {
-    pub fn new(rpc: Arc<SolanaRpc>, connectors: Vec<Arc<dyn Dex>>) -> Self { Self { rpc, connectors } }
+    pub fn new(rpc: Arc<SolanaRpc>, connectors: Vec<Arc<dyn Dex>>) -> Self { let router = Router::new(connectors.clone()); Self { rpc, connectors, router } }
 
     pub async fn best_edge(&self, input_mint: &str, output_mint: &str, ui_amount: f64) -> Result<Option<TradeIntent>> {
         // refresh pools (could be throttled externally)
@@ -41,5 +43,16 @@ impl ArbitrageEngine {
         } else {
             Ok(None)
         }
+    }
+
+    /// Simple triangle A->B->C->A profit attempt (greedy best per edge using router).
+    pub async fn triangle_cycle(&self, a: &str, b: &str, c: &str, ui_amount_a: f64) -> Result<Option<(String, u64)>> {
+        let amount_in = (ui_amount_a * 10f64.powi(6)) as u64; // assume 6 decimals
+    let hop1 = self.router.best_quote_exact_in(a, b, amount_in).await?; let h1 = match hop1 { Some(h)=>h, None=>return Ok(None) };
+    let hop2 = self.router.best_quote_exact_in(b, c, h1.quote.amount_out).await?; let h2 = match hop2 { Some(h)=>h, None=>return Ok(None) };
+    let hop3 = self.router.best_quote_exact_in(c, a, h2.quote.amount_out).await?; let h3 = match hop3 { Some(h)=>h, None=>return Ok(None) };
+        let final_out = h3.quote.amount_out;
+        if final_out > amount_in { return Ok(Some((format!("{}-{}-{}", a,b,c), final_out - amount_in))); }
+        Ok(None)
     }
 }
