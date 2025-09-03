@@ -11,7 +11,7 @@
 - [x] Raydium Pools scannen (`refresh_pools`) – läuft (Heuristik Fee-Extraction, Vault Balances)
 - [x] Quote-Berechnung `quote_exact_in` (Fee + Price Impact, Slippage-MinOut Helper)
 	- [x] Slippage-Enforcement im Engine (mit Execution Records / Reject Logging)
-	- [ ] Quote-Validierung gegen invarianten Test (größere Inputs -> höhere Impact Bps) – erweitern
+	- [x] Quote-Validierung gegen invarianten Test (größere Inputs -> höhere Impact Bps) – Basis Test vorhanden (`raydium_quote_validation.rs`)
   
  [ ] Swap-IX bauen (echter Raydium BaseIn) + ComputeBudget + Prioritätsgebühren
 	- [ ] Erweiterung `SimplePool` um open_orders / market_id / authority PDA
