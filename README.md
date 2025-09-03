@@ -1,13 +1,17 @@
 
 # IronCrab – Solana‑First Tradingbot (Rust)
 
-Version: **0.2.1** (Solana 2.x / Agave crates 3.x)
+Version: **0.3.0-dev** (Agave / Solana 3.x line)  
+Legacy (Solana 1.18 baseline): tag (to be created) `v0.2.1-solana1_18`.
+
+> Migration in progress. See `MIGRATION.md` for details on the upgrade from the legacy 1.18 toolchain to Agave / 3.x crates. The active development branch is `solana3x_clean` (may be renamed / merged soon).
 
 ## Features
-- Treasury mit ATA‑Erstellung, SPL‑Transfers, WSOL wrap/unwrap
-- Engine mit Allocator + Strategie‑Interface (Rust/Python via Feature)
-- DEX‑Skeletons (Raydium/Orca) + Raydium Pool‑Reader (on‑chain)
-- Beispiel‑CLI `raydium_pools` zum Testen der Pool‑Reader
+- Treasury: ATA Erstellung, SPL Transfers, WSOL wrap/unwrap
+- Engine: Allocator + Strategie‑Interface (Rust / optional Python via Feature)
+- DEX: Raydium / Orca Skeletons, Raydium Pool Reader + Quoting
+- Backtest: Slippage Enforcement & Tests
+- CLI Tools: `raydium_pools`, `backtest_driver`
 
 ## Build & Run (PowerShell)
 ```powershell
@@ -28,5 +32,7 @@ cargo run --bin raydium_pools -- --mint So11111111111111111111111111111111111111
 ```
 
 ## Hinweise
-- Dieses Repo ist als **lib + bin** strukturiert. Andere Binaries können die Bibliothek `ironcrab` direkt nutzen.
-- Solana‑Crates sind auf **3.x** gesetzt (Agave). SPL auf **7/8/9** (ATA/Token/Token‑2022).
+- Struktur: Library + mehrere Binaries (erweiterbar)
+- Solana Client / Agave Crates: **3.x**
+- (Legacy) Vor-Upgrade Code: siehe Tag `v0.2.1-solana1_18`
+- Siehe `MIGRATION.md` für offene Schritte (Swap Builder, PDA Ableitungen, Arbitrage Planner, Orca Parität)
