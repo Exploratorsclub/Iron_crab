@@ -6,7 +6,8 @@ use solana_sdk::pubkey::Pubkey;
 // Basic best-quote selection test using mocked Orca pool and empty Raydium
 #[tokio::test]
 async fn router_picks_higher_out_amount() {
-    let rpc = Arc::new(SolanaRpc::new("https://api.mainnet-beta.solana.com")); // URL irrelevant for mock
+    // Use an invalid/dummy RPC URL to guarantee no real network dependency for this unit test.
+    let rpc = Arc::new(SolanaRpc::new("http://localhost:0"));
     let raydium = Arc::new(Raydium::new(rpc.clone()));
     let orca = Arc::new(Orca::new(rpc.clone()));
     // Insert mock pool into Orca with deterministic reserves
@@ -14,9 +15,7 @@ async fn router_picks_higher_out_amount() {
     let quote = Pubkey::new_from_array([4u8;32]);
     orca.insert_mock_pool(base, quote, 1_000_000_000u128, 2_000_000_000u128, 30);
 
-    // Refresh connectors (Raydium stays empty)
-    raydium.refresh_pools().await.unwrap();
-    orca.refresh_pools().await.unwrap(); // leaves our manual insert intact
+    // Skip refresh_pools to avoid network; we rely solely on the manually inserted mock pool.
 
     let router = Router::new(vec![raydium.clone() as Arc<dyn Dex>, orca.clone() as Arc<dyn Dex>]);
     let amount_in = 10_000u64;

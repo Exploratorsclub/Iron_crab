@@ -74,21 +74,16 @@ impl Dex for Orca {
     let mut added = 0u32;
     let mut fee_tier_keys: Vec<Pubkey> = Vec::new();
         for (addr, acc) in accounts.into_iter().take(5000) { // safety limit
-            // Heuristic: minimal length check
-            if acc.data.len() < WHIRLPOOL_ACCOUNT_MIN_SIZE || acc.data.len() > WHIRLPOOL_ACCOUNT_MAX_SIZE { continue; }
-            if let Some(pool) = Self::decode_whirlpool_stub(addr, &acc.data) {
-                // fetch vault balances
+            if let Some(parsed) = layout::parse_whirlpool(&acc.data) {
+                // Fetch vault balances (SPL token accounts) to approximate reserves
                 let mut reserves = (0u128, 0u128);
-                if let Ok(vaults) = self.rpc.rpc.get_multiple_accounts(&[pool.1, pool.2]).await {
+                if let Ok(vaults) = self.rpc.rpc.get_multiple_accounts(&[parsed.token_vault_a, parsed.token_vault_b]).await {
                     if let Some(Some(v1)) = vaults.get(0).map(|o| o.as_ref()) { if v1.data.len() >= 72 { reserves.0 = Self::parse_token_amount(&v1.data) as u128; } }
                     if let Some(Some(v2)) = vaults.get(1).map(|o| o.as_ref()) { if v2.data.len() >= 72 { reserves.1 = Self::parse_token_amount(&v2.data) as u128; } }
                 }
-                let meta = pool.3;
-                if let Some(ft) = meta.fee_tier_key { fee_tier_keys.push(ft); }
-                let fee_bps = meta.fee_bps;
-                let base_mint = pool.0.0; let quote_mint = pool.0.1;
-                let id = addr; // use whirlpool account key as pool id
-                self.pools.insert(id, OrcaPool { base_mint, quote_mint, reserve_base: reserves.0, reserve_quote: reserves.1, fee_bps, fee_tier: meta.fee_tier_key, tick_spacing: meta.tick_spacing, vault_a: pool.1, vault_b: pool.2, tick_current_index: meta.tick_current_index });
+                fee_tier_keys.push(parsed.fee_tier);
+                let id = addr;
+                self.pools.insert(id, OrcaPool { base_mint: parsed.token_mint_a, quote_mint: parsed.token_mint_b, reserve_base: reserves.0, reserve_quote: reserves.1, fee_bps: parsed.fee_rate as u32, fee_tier: Some(parsed.fee_tier), tick_spacing: Some(parsed.tick_spacing), vault_a: parsed.token_vault_a, vault_b: parsed.token_vault_b, tick_current_index: Some(parsed.tick_current_index) });
                 added += 1;
             }
         }
@@ -169,51 +164,6 @@ impl Dex for Orca {
 }
 
 impl Orca {
-    // Very rough stub decode: attempts to extract token mints & vaults at plausible offsets.
-    // THIS IS NOT A COMPLETE WHIRLPOOL DECODE. Replace with full layout as needed.
-    fn decode_whirlpool_stub(_addr: Pubkey, data: &[u8]) -> Option<((Pubkey, Pubkey), Pubkey, Pubkey, WhirlpoolMeta)> {
-        // Use centralized candidate offsets from layout module.
-        const CANDIDATES: &[(usize, usize, usize, usize)] = layout::CANDIDATE_OFFSETS;
-    let mut fee_bps_detected = 30u32;
-    let mut tick_spacing_detected: Option<u16> = None;
-    let mut fee_tier_key: Option<Pubkey> = None;
-    let mut tick_current_index: Option<i32> = None;
-        // Try pull a dedicated fee field candidate: search last 96 bytes for plausible u16 fee if not found earlier.
-    for (ma, va, mb, vb) in CANDIDATES {
-            let need = *vb + 32;
-            if data.len() < need { continue; }
-            let pk = |o: usize| -> Pubkey { Pubkey::new_from_array(data[o..o+32].try_into().unwrap()) };
-            let mint_a = pk(*ma);
-            let vault_a = pk(*va);
-            let mint_b = pk(*mb);
-            let vault_b = pk(*vb);
-            // Basic sanity: mints not identical, vaults distinct, not default.
-            if layout::sanity_mints_vaults(&mint_a, &vault_a, &mint_b, &vault_b) {
-                // Fee: head scan then tail scan
-                if let Some(f) = layout::scan_fee_bps(&data[layout::FEE_SCAN_HEAD.0..layout::FEE_SCAN_HEAD.1.min(data.len())]) { fee_bps_detected = f; }
-                if fee_bps_detected == 30 { // fallback tail
-                    let start_tail = data.len().saturating_sub(layout::FEE_SCAN_TAIL_LEN);
-                    if let Some(f) = layout::scan_fee_bps(&data[start_tail..]) { fee_bps_detected = f; }
-                }
-        // Attempt fee tier meta decode: assume fee tier key follows vault_b (32 bytes) then u16 tick spacing
-        let ft_off = *vb + 32;
-        if data.len() >= ft_off + 32 + 2 {
-            let k = Pubkey::new_from_array(data[ft_off..ft_off+32].try_into().unwrap());
-            if k.to_bytes() != [0u8;32] { fee_tier_key = Some(k); }
-            tick_spacing_detected = Some(u16::from_le_bytes([data[ft_off+32], data[ft_off+33]]));
-        }
-        // Heuristic tick index scan near end
-        for off in (vb+32..data.len().saturating_sub(4)).step_by(4).take(32) {
-            if off + 4 <= data.len() {
-                let val = i32::from_le_bytes(data[off..off+4].try_into().unwrap());
-                if val.abs() < 5_000_000 { tick_current_index = Some(val); break; }
-            }
-        }
-        return Some(((mint_a, mint_b), vault_a, vault_b, WhirlpoolMeta { fee_bps: fee_bps_detected, tick_spacing: tick_spacing_detected, fee_tier_key, tick_current_index }));
-            }
-        }
-        None
-    }
 
     fn parse_token_amount(data: &[u8]) -> u64 {
         if data.len() < 72 { return 0; }
@@ -223,13 +173,7 @@ impl Orca {
     }
 }
 
-#[derive(Debug, Clone)]
-struct WhirlpoolMeta {
-    fee_bps: u32,
-    tick_spacing: Option<u16>,
-    fee_tier_key: Option<Pubkey>,
-    tick_current_index: Option<i32>,
-}
+// (Removed) WhirlpoolMeta replaced by canonical parser struct in layout module.
 
 fn derive_tick_array_pda(pool: &Pubkey, start_tick: i32) -> Pubkey {
     let seeds: &[&[u8]] = &[b"tick_array", pool.as_ref(), &start_tick.to_le_bytes()];
