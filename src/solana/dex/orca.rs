@@ -37,10 +37,18 @@ pub struct Orca {
     rpc: Arc<SolanaRpc>,
     pools: Arc<DashMap<Pubkey, OrcaPool>>, // keyed by a pseudo pool id (mint xor) for now
     fee_tiers: Arc<DashMap<Pubkey, (u32, u16)>>,
+    user_authority: Arc<std::sync::RwLock<Option<Pubkey>>>,
+    user_token_accounts: Arc<DashMap<Pubkey, Pubkey>>, // mint -> user token account (ATA)
 }
 
 impl Orca {
-    pub fn new(rpc: Arc<SolanaRpc>) -> Self { Self { rpc, pools: Arc::new(DashMap::new()), fee_tiers: Arc::new(DashMap::new()) } }
+    pub fn new(rpc: Arc<SolanaRpc>) -> Self { Self { rpc, pools: Arc::new(DashMap::new()), fee_tiers: Arc::new(DashMap::new()), user_authority: Arc::new(std::sync::RwLock::new(None)), user_token_accounts: Arc::new(DashMap::new()) } }
+
+    /// Set the global user authority (signer) used for swaps.
+    pub fn set_user_authority(&self, auth: Pubkey) { *self.user_authority.write().unwrap() = Some(auth); }
+
+    /// Register (or override) a user token account (ATA) for a given mint.
+    pub fn set_user_token_account(&self, mint: Pubkey, ata: Pubkey) { self.user_token_accounts.insert(mint, ata); }
 
     fn find_pool(&self, input: &Pubkey, output: &Pubkey) -> Option<(Pubkey, bool, OrcaPool)> {
         for p in self.pools.iter() {
@@ -73,7 +81,7 @@ impl Dex for Orca {
         let accounts = self.rpc.rpc.get_program_accounts_with_config(&program_id, cfg).await?;
     let mut added = 0u32;
     let mut fee_tier_keys: Vec<Pubkey> = Vec::new();
-        for (addr, acc) in accounts.into_iter().take(5000) { // safety limit
+    for (addr, acc) in accounts.into_iter().take(5000) { // safety limit
             if let Some(parsed) = layout::parse_whirlpool(&acc.data) {
                 // Fetch vault balances (SPL token accounts) to approximate reserves
                 let mut reserves = (0u128, 0u128);
@@ -81,6 +89,8 @@ impl Dex for Orca {
                     if let Some(Some(v1)) = vaults.get(0).map(|o| o.as_ref()) { if v1.data.len() >= 72 { reserves.0 = Self::parse_token_amount(&v1.data) as u128; } }
                     if let Some(Some(v2)) = vaults.get(1).map(|o| o.as_ref()) { if v2.data.len() >= 72 { reserves.1 = Self::parse_token_amount(&v2.data) as u128; } }
                 }
+        if parsed.fee_rate == 0 || parsed.fee_rate > 1000 { continue; } // sanity: we only support standard fee tiers presently
+        if reserves.0 == 0 || reserves.1 == 0 { continue; }
                 fee_tier_keys.push(parsed.fee_tier);
                 let id = addr;
                 self.pools.insert(id, OrcaPool { base_mint: parsed.token_mint_a, quote_mint: parsed.token_mint_b, reserve_base: reserves.0, reserve_quote: reserves.1, fee_bps: parsed.fee_rate as u32, fee_tier: Some(parsed.fee_tier), tick_spacing: Some(parsed.tick_spacing), vault_a: parsed.token_vault_a, vault_b: parsed.token_vault_b, tick_current_index: Some(parsed.tick_current_index) });
@@ -150,11 +160,15 @@ impl Dex for Orca {
         ];
         if let Some(ft) = pool.fee_tier { accounts.push(AM { pubkey: ft, is_signer: false, is_writable: false }); }
         for t in &tick_arrays { accounts.push(AM { pubkey: *t, is_signer: false, is_writable: true }); }
-        accounts.push(AM { pubkey: oracle, is_signer: false, is_writable: false });
-        // Placeholder user authority & token accounts (to be supplied by caller later)
-        accounts.push(AM { pubkey: Pubkey::default(), is_signer: true, is_writable: false });
-        accounts.push(AM { pubkey: Pubkey::default(), is_signer: false, is_writable: true });
-        accounts.push(AM { pubkey: Pubkey::default(), is_signer: false, is_writable: true });
+    accounts.push(AM { pubkey: oracle, is_signer: false, is_writable: false });
+    // Real user authority & token accounts
+    let authority = self.user_authority.read().unwrap().ok_or_else(|| anyhow!("orca user authority not set"))?;
+    let (input_mint, output_mint) = if forward { (in_pk, out_pk) } else { (out_pk, in_pk) };
+    let user_source = self.user_token_accounts.get(&input_mint).ok_or_else(|| anyhow!("missing user source token account for input mint"))?.clone();
+    let user_destination = self.user_token_accounts.get(&output_mint).ok_or_else(|| anyhow!("missing user destination token account for output mint"))?.clone();
+    accounts.push(AM { pubkey: authority, is_signer: true, is_writable: false });
+    accounts.push(AM { pubkey: user_source, is_signer: false, is_writable: true });
+    accounts.push(AM { pubkey: user_destination, is_signer: false, is_writable: true });
         Ok(vec![Instruction { program_id, accounts, data }])
     }
 

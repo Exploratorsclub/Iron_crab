@@ -18,8 +18,8 @@
 - [x] Routing: Single-Hop Best Quote + Depth‑2 Multi-Hop (Quote + Ausführungs-IX Kette)
 - [x] Multi-Hop min_out Aggregation (nur finaler Hop slippage)
 - [x] Gemeinsames Quote-Struct erweitert (input_mint/output_mint) für Routen-Rekonstruktion
-- [ ] Orca: Replace Heuristics mit Echtem Whirlpool Layout (feste Offsets / strukturiertes Parsing)
-- [ ] Orca: Echte User Accounts & Token Owner Accounts in Swap IX (statt Platzhalter Pubkeys)
+- [x] Orca: Replace Heuristics mit Echtem Whirlpool Layout (feste Offsets / strukturiertes Parsing)
+- [x] Orca: Echte User Accounts & Token Owner Accounts in Swap IX (statt Platzhalter Pubkeys) (Setters + validation in build_swap_ix)
 - [ ] Raydium: Offene Verbesserung – Vault Fallbacks entfernen (immer echte Vaults nutzen)
 - [ ] Safety: Further structural validation (Orca tick spacing bounds, vault/mint cross-check)
 - [ ] Benchmarks für Quote & Refresh (Performance Profiling)
