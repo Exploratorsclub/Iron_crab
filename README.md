@@ -9,7 +9,10 @@ Legacy (Solana 1.18 baseline): tag (to be created) `v0.2.1-solana1_18`.
 ## Features
 - Treasury: ATA Erstellung, SPL Transfers, WSOL wrap/unwrap
 - Engine: Allocator + Strategie‑Interface (Rust / optional Python via Feature)
-- DEX: Raydium / Orca Skeletons, Raydium Pool Reader + Quoting
+- DEX Connectoren:
+	- Raydium: Pool Scan, PDA Ableitungen (amm authority, serum vault signer), Quotes, Swap Plan (Compute Budget + min_out), Full Swap IX Builder
+	- Orca Whirlpool: Heuristische Decodierung (Mints, Vaults, Fee Tier, Tick Spacing/Index), Fee Tier Accounts, Placeholder Swap IX (Tick Arrays + Oracle PDAs, Vaults)
+	- Routing: Single-Hop Best Quote & Depth‑2 Multi-Hop (mit globalem finalen min_out)
 - Backtest: Slippage Enforcement & Tests
 - CLI Tools: `raydium_pools`, `backtest_driver`
 
@@ -35,4 +38,5 @@ cargo run --bin raydium_pools -- --mint So11111111111111111111111111111111111111
 - Struktur: Library + mehrere Binaries (erweiterbar)
 - Solana Client / Agave Crates: **3.x**
 - (Legacy) Vor-Upgrade Code: siehe Tag `v0.2.1-solana1_18`
-- Siehe `MIGRATION.md` für offene Schritte (Swap Builder, PDA Ableitungen, Arbitrage Planner, Orca Parität)
+- Offene DEX Punkte: Echtes Whirlpool Layout (fixe Offsets), User Accounts im Orca Swap, zusätzliche Validierungen & Performance Benchmarks
+- Siehe `docs/TASKS.md` für den aktuellen Fortschritt

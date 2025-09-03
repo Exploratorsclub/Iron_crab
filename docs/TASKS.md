@@ -8,20 +8,23 @@
 - [x] WSOL wrap/unwrap (sync_native / close)
 
 ## 2) DEX-Connectoren
-- [x] Raydium Pools scannen (`refresh_pools`) – läuft (Heuristik Fee-Extraction, Vault Balances)
-- [x] Quote-Berechnung `quote_exact_in` (Fee + Price Impact, Slippage-MinOut Helper)
-	- [x] Slippage-Enforcement im Engine (mit Execution Records / Reject Logging)
-	- [x] Quote-Validierung gegen invarianten Test (größere Inputs -> höhere Impact Bps) – Basis Test vorhanden (`raydium_quote_validation.rs`)
-  
- [ ] Swap-IX bauen (echter Raydium BaseIn) + ComputeBudget + Prioritätsgebühren
-	- [ ] Erweiterung `SimplePool` um open_orders / market_id / authority PDA
-	- [x] Erweiterung `SimplePool` um open_orders / market_id / authority PDA Platzhalter
-	- [x] Ableitung AmmAuthority PDA + Serum Vault Signer (Helper implementiert)
-	- [ ] Einfügen ComputeBudget (CU limit + price) & optional Prioritäts-Fee Instruktionen
-	- [ ] Realistische Account-Reihenfolge testen (Simulation)
-	- [ ] MinOut aus Quote+Slippage ableiten & Assertion
-- [ ] Orca Whirlpool/Classic analog
-- [ ] Routen-Suche (1–2 Hops)
+- [x] Raydium: Pool Scan (`refresh_pools`), PDA Ableitungen (amm authority, serum vault signer), Fee Extraction, Vault Balances
+- [x] Raydium Quote (`quote_exact_in`) + Slippage Helper + Invarianten Tests
+- [x] Raydium Swap Plan (`build_swap_plan`): Compute Budget (limit + price) + min_out Assertions
+- [x] Raydium Full Swap Instruction (`build_swap_instruction`) – nutzt Snapshot Felder (open_orders, market, authority, target_orders)
+- [x] Orca Whirlpool: Heuristische Pool Decodierung (Mints, Vaults, FeeTier Key, Tick Spacing, Tick Index), Vault Balances
+- [x] Orca Fee Tier Accounts: Fetch + Override heuristischen Fee Scan
+- [x] Orca Swap (Placeholder Whirlpool Swap IX) mit Tick Array & Oracle PDAs (heuristisch) + Vaults + FeeTier
+- [x] Routing: Single-Hop Best Quote + Depth‑2 Multi-Hop (Quote + Ausführungs-IX Kette)
+- [x] Multi-Hop min_out Aggregation (nur finaler Hop slippage)
+- [x] Gemeinsames Quote-Struct erweitert (input_mint/output_mint) für Routen-Rekonstruktion
+- [ ] Orca: Replace Heuristics mit Echtem Whirlpool Layout (feste Offsets / strukturiertes Parsing)
+- [ ] Orca: Echte User Accounts & Token Owner Accounts in Swap IX (statt Platzhalter Pubkeys)
+- [ ] Raydium: Offene Verbesserung – Vault Fallbacks entfernen (immer echte Vaults nutzen)
+- [ ] Safety: Further structural validation (Orca tick spacing bounds, vault/mint cross-check)
+- [ ] Benchmarks für Quote & Refresh (Performance Profiling)
+
+Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop Routing) sind implementiert; verbleiben sind Genauigkeit (Whirlpool Layout), echte Kontoersetzung und Hardening.
 
 ## 3) Arbitrage
 - [ ] DEX Quotes aggregieren, beste Edge wählen
@@ -34,17 +37,17 @@
 - [ ] Heuristiken (Blacklist, FreezeAuth, Owner, LP-Lock)
 - [ ] Erstkauf + enge SL/TP
   
-### Nächste Micro-Tasks (Prior Vorschlag)
-1. (DONE) Slippage-Enforcement in Backtest Engine (Abbruch + Execution Record)
-2. Raydium `SimplePool` um OpenOrders / Market / Authority erweitern
-3. Hilfsfunktion: Ableitung `amm_authority` PDA & Serum Vault Signer
-4. Echten Raydium Swap Instruction Builder + Simulationstest (`simulateTransaction` Dry-Run)
-5. Multi-Hop Routing Entwurf (Graph: Mints als Knoten, Pools als Kanten, BFS bis Tiefe 2, Score = erwarteter Output)
-6. Arbitrage Aggregator: Sammeln aller DEX Quotes (derzeit nur Raydium) -> Struktur vorbereiten für Orca
-7. Orca Reader Grundgerüst (nur fetch + quote) für Routing-Basis
-8. Sniper: WS Subscription Skeleton (nur Connect + Log Filter) vorbereiten
-9. CI Skeleton (GitHub Actions YAML: fmt + clippy + tests)
-10. Metrics Placeholder (Prometheus Encoder + single gauge für Pool Count)
+### Nächste Micro-Tasks (aktualisiert)
+1. Orca: Vollständige Whirlpool Layout Implementierung (strukturierter Parser, feste Offsets, verifizierte Tick Index & Liquidity Fields)
+2. Orca Swap: Ersetzen der Platzhalter User Accounts (Authority, Source/Dest Token Accounts) + Option für sqrt_price_limit
+3. Raydium: Entfernung von Vault-Fallbacks (immer echte Vault Pubkeys) & zusätzliche Hard Validation (target_orders optional, aber loggen)
+4. Router: Depth‑2 Pfad Benchmark + optional Depth‑3 (pruning heuristics)
+5. Arbitrage Aggregator: Kombinierte Multi-DEX Quote Sammlung + Profit Filter
+6. Compute Budget: Dynamische CU-Schätzung (historische Simulation / heuristics) statt fixer Werte
+7. Metrics: Pool Count, Quote Latency, Routing Auswahlgrund (DEX, hops)
+8. CI Pipeline (fmt, clippy, test, optional wasm build)
+9. Config Hot-Reload (Signal / File Watch) für Routing/Slippage Parameter
+10. Risk Layer: Max Notional pro Trade + Daily Loss Limit Skeleton
 
 ## 5) Risk & Limits
 - [ ] Positions-/Notional-Limits je Markt
