@@ -44,6 +44,6 @@ impl MarketAdapter for CfmAdapter {
         let fee_adj = (amount_in as u128) * (10_000 - p.fee_bps as u128)/10_000;
         let out = (fee_adj * rout)/(rin + fee_adj);
         let impact = (fee_adj * 10_000)/(rin + fee_adj);
-        Some(Quote { amount_out: out as u64, price_impact_bps: impact as u32, route: vec![p.pool.clone()], fee_bps: p.fee_bps, in_reserve: rin, out_reserve: rout })
+    Some(Quote { amount_out: out as u64, price_impact_bps: impact as u32, route: vec![p.pool.clone()], fee_bps: p.fee_bps, in_reserve: rin, out_reserve: rout, input_mint: (if forward { p.base_mint.clone() } else { p.quote_mint.clone() }), output_mint: (if forward { p.quote_mint.clone() } else { p.base_mint.clone() }) })
     }
 }

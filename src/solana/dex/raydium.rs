@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use std::str::FromStr;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 
 use crate::solana::rpc::SolanaRpc;
@@ -43,6 +43,17 @@ pub struct RaydiumSwapAccounts {
     pub rent_sysvar: Pubkey,
 }
 
+/// External Serum (OpenBook) market accounts required for composing a Raydium swap.
+/// These are fetched / derived outside (we do not yet cache full Serum market state in the Raydium adapter).
+#[derive(Clone, Debug)]
+pub struct SerumMarketAccounts {
+    pub bids: Pubkey,
+    pub asks: Pubkey,
+    pub event_queue: Pubkey,
+    pub base_vault: Pubkey,
+    pub quote_vault: Pubkey,
+}
+
 pub struct Raydium {
     rpc: Arc<SolanaRpc>,
     pools: Arc<DashMap<Pubkey, SimplePool>>, // in-memory pool snapshot
@@ -76,6 +87,9 @@ pub struct PoolSnapshot {
     pub market_program_id: Option<Pubkey>,
     pub amm_authority: Option<Pubkey>,
     pub serum_vault_signer: Option<Pubkey>,
+    pub target_orders: Option<Pubkey>,
+    pub base_vault: Option<Pubkey>,
+    pub quote_vault: Option<Pubkey>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +106,7 @@ struct SimplePool {
     market_program_id: Option<Pubkey>,
     amm_authority: Option<Pubkey>,
     serum_vault_signer: Option<Pubkey>,
+    target_orders: Option<Pubkey>,
     // cached reserves (token balances) in raw units
     reserve_base: u128,
     reserve_quote: u128,
@@ -116,6 +131,9 @@ impl Raydium {
             market_program_id: p.market_program_id,
             amm_authority: p.amm_authority,
             serum_vault_signer: p.serum_vault_signer,
+            target_orders: p.target_orders,
+            base_vault: Some(p.base_vault),
+            quote_vault: Some(p.quote_vault),
         }).collect()
     }
 
@@ -131,6 +149,22 @@ impl Raydium {
         let status = 6u64.to_le_bytes().to_vec();
         filters.push(RpcFilterType::Memcmp(Memcmp::new(reader::offs::STATUS, MemcmpEncodedBytes::Bytes(status))));
         filters
+    }
+
+    /// Hard validation (errors) + soft warnings for pool structural invariants.
+    fn validate_pool_state(p: &reader::PoolV4) -> Result<()> {
+        ensure!(p.base_mint != p.quote_mint, "pool base_mint == quote_mint");
+        ensure!(p.base_vault != p.quote_vault, "pool base_vault == quote_vault");
+        ensure!(p.open_orders.to_bytes() != [0u8;32], "open_orders default pubkey");
+        // Market linkage: only enforce market_id if market_program_id set
+        if p.market_program_id.to_bytes() != [0u8;32] {
+            ensure!(p.market_id.to_bytes() != [0u8;32], "market_program set but market_id default");
+        }
+        // Soft warnings
+        if p.target_orders.is_none() {
+            tracing::debug!(pool = %p.address, "raydium pool missing target_orders (soft)");
+        }
+        Ok(())
     }
 
     fn program_id() -> Pubkey { Pubkey::from_str(RAYDIUM_AMM_V4).expect("raydium program id") }
@@ -162,16 +196,28 @@ impl Raydium {
     /// Build a swap plan (base-in) with optional compute budget & priority fee.
     /// This uses the best single pool found in current snapshots.
     pub fn build_swap_plan(&self, input_mint: &str, output_mint: &str, amount_in: u64, slippage_bps: u32, compute_unit_limit: Option<u32>, compute_unit_price_micro_lamports: Option<u64>) -> Result<Option<RaydiumSwapPlan>> {
-    // NOTE: compute budget program path differs across SDK versions; if unavailable, skip injecting.
+    // Inject ComputeBudget + Priority Fee instructions (Solana 3.x SDK) when requested.
         // 1) Get quote (sync helper using current snapshot; mirrors async path logic)
         let quote_opt = self.local_quote(input_mint, output_mint, amount_in);
         let quote = match quote_opt { Some(q) => q, None => return Ok(None) };
-        // 2) Compute min_out
-        let min_out = Self::apply_slippage_min_out(quote.amount_out, slippage_bps);
+    // 2) Compute min_out
+    let min_out = Self::apply_slippage_min_out(quote.amount_out, slippage_bps);
+    // Runtime validation (hard) + debug assertions
+    let recomputed = Self::compute_min_out_from_quote(&quote, slippage_bps);
+    debug_assert_eq!(min_out, recomputed, "min_out derivation mismatch (debug)");
+    debug_assert!(min_out <= quote.amount_out, "min_out cannot exceed quoted amount (debug)");
+    debug_assert!(min_out > 0, "min_out must be > 0 (debug)");
+    ensure!(min_out == recomputed, "Raydium swap plan min_out mismatch ({} != {})", min_out, recomputed);
+    ensure!(min_out <= quote.amount_out, "Raydium swap plan min_out exceeds quote (min_out {} > quote {})", min_out, quote.amount_out);
+    ensure!(min_out > 0, "Raydium swap plan min_out is zero");
         // 3) Build swap ix (placeholder simplified variant)
         let swap_ixs = self.build_swap_ix(input_mint, output_mint, amount_in, min_out)?;
         let mut ixs = Vec::new();
-    // (Temporarily disabled compute budget instructions due to missing module in current SDK compile context)
+        if compute_unit_limit.is_some() || compute_unit_price_micro_lamports.is_some() {
+            use crate::solana::compute_budget_helper as cbh;
+            if let Some(limit) = compute_unit_limit { ixs.push(cbh::set_compute_unit_limit(limit)); }
+            if let Some(price) = compute_unit_price_micro_lamports { ixs.push(cbh::set_compute_unit_price(price)); }
+        }
         ixs.extend(swap_ixs);
         // Try parse pool pubkey from route[0]
         let pool = quote.route.get(0).and_then(|s| Pubkey::from_str(s).ok());
@@ -196,7 +242,7 @@ impl Raydium {
             let out_amt = (numerator / denominator) as u64;
             if out_amt == 0 { continue; }
             let impact_bps = ((amount_in_less_fee * 10_000) / (rin + amount_in_less_fee)) as u32;
-            let q = Quote { amount_out: out_amt, price_impact_bps: impact_bps, route: vec![p.address.to_string()], fee_bps: p.fee_bps, in_reserve: rin, out_reserve: rout };
+            let q = Quote { amount_out: out_amt, price_impact_bps: impact_bps, route: vec![p.address.to_string()], fee_bps: p.fee_bps, in_reserve: rin, out_reserve: rout, input_mint: (if is_forward { in_pk } else { out_pk }).to_string(), output_mint: (if is_forward { out_pk } else { in_pk }).to_string() };
             if best.as_ref().map(|b| b.amount_out < out_amt).unwrap_or(true) { best = Some(q); }
         }
         best
@@ -216,7 +262,13 @@ impl Dex for Raydium {
         let mut decoded: Vec<(reader::PoolV4, Vec<u8>)> = Vec::with_capacity(accounts.len());
         for (addr, acc) in &accounts {
             if acc.data.len() == reader::LIQ_STATE_V4_SIZE {
-                if let Ok(p) = reader::PoolV4::decode(*addr, &acc.data) { decoded.push((p, acc.data.clone())); }
+                if let Ok(p) = reader::PoolV4::decode(*addr, &acc.data) {
+                    if let Err(e) = Self::validate_pool_state(&p) {
+                        tracing::warn!(pool = %p.address, error = %e, "skip invalid raydium pool");
+                    } else {
+                        decoded.push((p, acc.data.clone()));
+                    }
+                }
             }
         }
         // Batch vault fetch
@@ -243,7 +295,7 @@ impl Dex for Raydium {
                 let (v, _) = Self::derive_serum_vault_signer(&p.market_id, &p.market_program_id);
                 Some(v)
             } else { None };
-            let obj = SimplePool { base_mint: p.base_mint, quote_mint: p.quote_mint, base_vault: p.base_vault, quote_vault: p.quote_vault, lp_reserve: p.lp_reserve, address: p.address, reserve_base: base_amt, reserve_quote: quote_amt, fee_bps, last_update: SystemTime::now(), open_orders: Some(p.open_orders), market_id: Some(p.market_id), market_program_id: Some(p.market_program_id), amm_authority: Some(amm_auth), serum_vault_signer };
+            let obj = SimplePool { base_mint: p.base_mint, quote_mint: p.quote_mint, base_vault: p.base_vault, quote_vault: p.quote_vault, lp_reserve: p.lp_reserve, address: p.address, reserve_base: base_amt, reserve_quote: quote_amt, fee_bps, last_update: SystemTime::now(), open_orders: Some(p.open_orders), market_id: Some(p.market_id), market_program_id: Some(p.market_program_id), amm_authority: Some(amm_auth), serum_vault_signer, target_orders: p.target_orders };
             self.pools.insert(p.address, obj);
         }
         // Cleanup stale (>15m)
@@ -277,14 +329,7 @@ impl Dex for Raydium {
             if out_amt == 0 { continue; }
             // price impact approx: (amount_in / (rin + amount_in)) * 10_000
             let impact_bps = ((amount_in_less_fee * 10_000) / (rin + amount_in_less_fee)) as u32;
-            let q = Quote {
-                amount_out: out_amt,
-                price_impact_bps: impact_bps,
-                route: vec![p.address.to_string()],
-                fee_bps: p.fee_bps,
-                in_reserve: rin,
-                out_reserve: rout,
-            };
+            let q = Quote { amount_out: out_amt, price_impact_bps: impact_bps, route: vec![p.address.to_string()], fee_bps: p.fee_bps, in_reserve: rin, out_reserve: rout, input_mint: (if is_forward { in_pk } else { out_pk }).to_string(), output_mint: (if is_forward { out_pk } else { in_pk }).to_string() };
             if best.as_ref().map(|b| b.amount_out < out_amt).unwrap_or(true) { best = Some(q); }
         }
         Ok(best)
@@ -314,6 +359,12 @@ impl Dex for Raydium {
             data,
         };
         Ok(vec![pseudo_ix])
+    }
+
+    // (build_swap_instruction moved to inherent impl below)
+
+    fn list_pairs(&self) -> Vec<(String, String)> {
+        self.pools.iter().map(|p| (p.base_mint.to_string(), p.quote_mint.to_string())).collect()
     }
 }
 
@@ -368,6 +419,70 @@ impl Raydium {
     }
 }
 
+impl Raydium {
+    /// Build a full Raydium swap instruction (BaseIn) using pool snapshot + explicit Serum + user accounts.
+    pub fn build_swap_instruction(&self,
+        pool: Pubkey,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        amount_in: u64,
+        min_out: u64,
+        user_authority: Pubkey,
+        user_source: Pubkey,
+        user_destination: Pubkey,
+        serum_program: Pubkey,
+        token_program: Pubkey,
+        rent_sysvar: Pubkey,
+        serum: SerumMarketAccounts,
+        amm_target_orders: Option<Pubkey>,
+    ) -> Result<Instruction> {
+        use solana_sdk::instruction::AccountMeta as AM;
+        let snap = self.pools.get(&pool).ok_or_else(|| anyhow!("pool snapshot missing"))?;
+        let forward = snap.base_mint == input_mint && snap.quote_mint == output_mint;
+        let reverse = snap.base_mint == output_mint && snap.quote_mint == input_mint;
+        if !forward && !reverse { return Err(anyhow!("pool does not match provided mints")); }
+        let direction_forward = forward;
+        let amm_authority = snap.amm_authority.ok_or_else(|| anyhow!("amm_authority missing in snapshot"))?;
+        let open_orders = snap.open_orders.ok_or_else(|| anyhow!("open_orders missing in snapshot"))?;
+        let market_id = snap.market_id.ok_or_else(|| anyhow!("market_id missing in snapshot"))?;
+        let _market_program = snap.market_program_id.ok_or_else(|| anyhow!("market_program_id missing in snapshot"))?; // not directly used in this minimal variant
+        let serum_vault_signer = snap.serum_vault_signer.ok_or_else(|| anyhow!("serum_vault_signer missing in snapshot"))?;
+        let target_orders = amm_target_orders.or(snap.target_orders).unwrap_or(Pubkey::default());
+        let base_vault = snap.base_vault; // already present
+        let quote_vault = snap.quote_vault;
+        let mut data = Vec::with_capacity(1 + 8 + 8 + 1);
+        data.push(9u8);
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_out.to_le_bytes());
+        data.push(if direction_forward { 0 } else { 1 });
+        Ok(Instruction {
+            program_id: Self::program_id(),
+            accounts: vec![
+                AM { pubkey: pool, is_signer: false, is_writable: true },
+                AM { pubkey: amm_authority, is_signer: false, is_writable: false },
+                AM { pubkey: open_orders, is_signer: false, is_writable: true },
+                AM { pubkey: target_orders, is_signer: false, is_writable: true },
+                AM { pubkey: base_vault, is_signer: false, is_writable: true },
+                AM { pubkey: quote_vault, is_signer: false, is_writable: true },
+                AM { pubkey: market_id, is_signer: false, is_writable: true },
+                AM { pubkey: serum.bids, is_signer: false, is_writable: true },
+                AM { pubkey: serum.asks, is_signer: false, is_writable: true },
+                AM { pubkey: serum.event_queue, is_signer: false, is_writable: true },
+                AM { pubkey: serum.base_vault, is_signer: false, is_writable: true },
+                AM { pubkey: serum.quote_vault, is_signer: false, is_writable: true },
+                AM { pubkey: serum_vault_signer, is_signer: false, is_writable: false },
+                AM { pubkey: user_source, is_signer: false, is_writable: true },
+                AM { pubkey: user_destination, is_signer: false, is_writable: true },
+                AM { pubkey: user_authority, is_signer: true, is_writable: false },
+                AM { pubkey: token_program, is_signer: false, is_writable: false },
+                AM { pubkey: rent_sysvar, is_signer: false, is_writable: false },
+                AM { pubkey: serum_program, is_signer: false, is_writable: false },
+            ],
+            data,
+        })
+    }
+}
+
 /// --- On-chain pool reader subset (blocking client for CLI) ---
 pub mod reader {
     use anyhow::{anyhow, Result};
@@ -384,8 +499,10 @@ pub mod reader {
         pub const QUOTE_MINT: usize = 432;
         pub const LP_MINT: usize = 464;
         pub const OPEN_ORDERS: usize = 496;
-        pub const MARKET_ID: usize = 528;
-        pub const MARKET_PROGRAM_ID: usize = 560;
+    // Corrected ordering: after OPEN_ORDERS comes TARGET_ORDERS, then MARKET_ID, then MARKET_PROGRAM_ID (each 32 bytes)
+    pub const TARGET_ORDERS: usize = 528;
+    pub const MARKET_ID: usize = 560;
+    pub const MARKET_PROGRAM_ID: usize = 592;
         pub const LP_RESERVE: usize = 720; // u64 LE
         pub const STATUS: usize = 0;       // u64 LE
     }
@@ -399,6 +516,7 @@ pub mod reader {
         pub base_vault: Pubkey,
         pub quote_vault: Pubkey,
         pub open_orders: Pubkey,
+    pub target_orders: Option<Pubkey>,
         pub market_id: Pubkey,
         pub market_program_id: Pubkey,
         pub lp_reserve: u64,
@@ -426,6 +544,10 @@ pub mod reader {
                 base_vault: read_pk(offs::BASE_VAULT)?,
                 quote_vault: read_pk(offs::QUOTE_VAULT)?,
                 open_orders: read_pk(offs::OPEN_ORDERS)?,
+                target_orders: {
+                    let pk = read_pk(offs::TARGET_ORDERS)?;
+                    if pk.to_bytes() == [0u8;32] { None } else { Some(pk) }
+                },
                 market_id: read_pk(offs::MARKET_ID)?,
                 market_program_id: read_pk(offs::MARKET_PROGRAM_ID)?,
                 lp_reserve: read_u64(offs::LP_RESERVE)?,
