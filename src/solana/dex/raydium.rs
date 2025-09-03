@@ -249,6 +249,23 @@ impl Raydium {
         }
         best
     }
+
+    /// Build a swap plan with heuristic compute budget estimation when caller does not want to specify limits manually.
+    pub fn build_swap_plan_auto(&self, input_mint: &str, output_mint: &str, amount_in: u64, slippage_bps: u32) -> Result<Option<RaydiumSwapPlan>> {
+        let base = self.build_swap_plan(input_mint, output_mint, amount_in, slippage_bps, None, None)?;
+        let Some(plan) = base else { return Ok(None); };
+        let est = crate::solana::compute_budget_estimator::estimate_single_swap(amount_in);
+        // Only rebuild if estimate differs from defaults (currently defaults: none)
+        let rebuilt = self.build_swap_plan(
+            input_mint,
+            output_mint,
+            amount_in,
+            slippage_bps,
+            Some(est.compute_unit_limit),
+            Some(est.compute_unit_price_micro_lamports)
+        )?;
+        Ok(rebuilt)
+    }
 }
 
 #[async_trait]

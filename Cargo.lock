@@ -1973,6 +1973,7 @@ dependencies = [
  "dashmap",
  "dirs 5.0.1",
  "futures",
+ "once_cell",
  "parking_lot",
  "pyo3",
  "rust_decimal",
