@@ -71,6 +71,10 @@ pub struct PoolSnapshot {
     pub reserve_base: u128,
     pub reserve_quote: u128,
     pub fee_bps: u32,
+    pub open_orders: Option<Pubkey>,
+    pub market_id: Option<Pubkey>,
+    pub market_program_id: Option<Pubkey>,
+    pub amm_authority: Option<Pubkey>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +86,10 @@ struct SimplePool {
     #[allow(dead_code)] quote_vault: Pubkey,
     #[allow(dead_code)] lp_reserve: u64,
     address: Pubkey,
+    open_orders: Option<Pubkey>,
+    market_id: Option<Pubkey>,
+    market_program_id: Option<Pubkey>,
+    amm_authority: Option<Pubkey>,
     // cached reserves (token balances) in raw units
     reserve_base: u128,
     reserve_quote: u128,
@@ -101,6 +109,10 @@ impl Raydium {
             reserve_base: p.reserve_base,
             reserve_quote: p.reserve_quote,
             fee_bps: p.fee_bps,
+            open_orders: p.open_orders,
+            market_id: p.market_id,
+            market_program_id: p.market_program_id,
+            amm_authority: p.amm_authority,
         }).collect()
     }
 
@@ -213,7 +225,8 @@ impl Dex for Raydium {
             let fee_den = raw.get(16..24).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes).unwrap_or(10_000);
             let mut fee_bps = if fee_den > 0 && fee_num <= fee_den { ((fee_num * 10_000) / fee_den) as u32 } else { 25 };
             if fee_bps == 0 || fee_bps > 1000 { tracing::warn!(pool = %p.address, fee_bps, "abnormal fee, fallback 25"); fee_bps = 25; }
-            let obj = SimplePool { base_mint: p.base_mint, quote_mint: p.quote_mint, base_vault: p.base_vault, quote_vault: p.quote_vault, lp_reserve: p.lp_reserve, address: p.address, reserve_base: base_amt, reserve_quote: quote_amt, fee_bps, last_update: SystemTime::now() };
+            // Derive amm_authority placeholder (Raydium V4 authority PDA seed often: "amm authority" + program + amm_id; skipped -> None until implemented)
+            let obj = SimplePool { base_mint: p.base_mint, quote_mint: p.quote_mint, base_vault: p.base_vault, quote_vault: p.quote_vault, lp_reserve: p.lp_reserve, address: p.address, reserve_base: base_amt, reserve_quote: quote_amt, fee_bps, last_update: SystemTime::now(), open_orders: Some(p.open_orders), market_id: Some(p.market_id), market_program_id: Some(p.market_program_id), amm_authority: None };
             self.pools.insert(p.address, obj);
         }
         // Cleanup stale (>15m)
