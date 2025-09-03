@@ -13,10 +13,14 @@ pub struct ArbitrageEngine {
     pub rpc: Arc<SolanaRpc>,
     pub connectors: Vec<Arc<dyn Dex>>, // Raydium, Orca, ...
     pub router: Router,
+    pub min_profit_bps: u32,
+    pub est_tx_cost_lamports: u64,
 }
 
 impl ArbitrageEngine {
-    pub fn new(rpc: Arc<SolanaRpc>, connectors: Vec<Arc<dyn Dex>>) -> Self { let router = Router::new(connectors.clone()); Self { rpc, connectors, router } }
+    pub fn new(rpc: Arc<SolanaRpc>, connectors: Vec<Arc<dyn Dex>>) -> Self { let router = Router::new(connectors.clone()); Self { rpc, connectors, router, min_profit_bps: 0, est_tx_cost_lamports: 0 } }
+
+    pub fn with_profit_params(mut self, min_profit_bps: u32, est_tx_cost_lamports: u64) -> Self { self.min_profit_bps = min_profit_bps; self.est_tx_cost_lamports = est_tx_cost_lamports; self }
 
     pub async fn best_edge(&self, input_mint: &str, output_mint: &str, ui_amount: f64) -> Result<Option<TradeIntent>> {
         // refresh pools (could be throttled externally)
@@ -55,4 +59,26 @@ impl ArbitrageEngine {
         if final_out > amount_in { return Ok(Some((format!("{}-{}-{}", a,b,c), final_out - amount_in))); }
         Ok(None)
     }
+
+    /// Triangle with profit filter (net after est tx cost and min_profit_bps threshold). Returns net profit.
+    pub async fn triangle_cycle_profit_checked(&self, a: &str, b: &str, c: &str, ui_amount_a: f64, decimals: u32) -> Result<Option<(String, u64)>> {
+        let amount_in = (ui_amount_a * 10f64.powi(decimals as i32)) as u64;
+        let path = self.triangle_cycle(a,b,c, ui_amount_a).await?; let (id, gross_profit) = match path { Some(p)=>p, None=>return Ok(None) };
+        if let Some(net) = compute_net_profit(amount_in, amount_in + gross_profit, self.min_profit_bps, self.est_tx_cost_lamports) { return Ok(Some((id, net))); }
+        Ok(None)
+    }
+}
+
+/// Compute net profit (lamports of input token) after thresholds.
+/// Returns Some(net_profit) if profit passes min_profit_bps AND exceeds est_tx_cost_lamports.
+pub fn compute_net_profit(amount_in: u64, final_out: u64, min_profit_bps: u32, est_tx_cost_lamports: u64) -> Option<u64> {
+    if final_out <= amount_in { return None; }
+    let gross = final_out - amount_in;
+    // bps = (gross / amount_in) * 10_000
+    let bps = (gross as u128 * 10_000u128 / amount_in as u128) as u32;
+    if bps < min_profit_bps { return None; }
+    if gross <= est_tx_cost_lamports { return None; }
+    let net = gross - est_tx_cost_lamports;
+    if net == 0 { return None; }
+    Some(net)
 }

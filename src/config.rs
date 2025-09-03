@@ -62,7 +62,12 @@ pub struct Config {
 pub struct ArbPairCfg { pub in_mint: String, pub out_mint: String, pub ui_amount: f64 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ArbCfg { pub pairs: Vec<ArbPairCfg>, #[serde(default)] pub interval_ms: Option<u64> }
+pub struct ArbCfg {
+    pub pairs: Vec<ArbPairCfg>,
+    #[serde(default)] pub interval_ms: Option<u64>,
+    #[serde(default)] pub min_profit_bps: Option<u32>,
+    #[serde(default)] pub est_tx_cost_lamports: Option<u64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SniperSettings { pub max_buy_sol: f64, pub max_slippage_bps: u32 }

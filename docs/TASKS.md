@@ -43,6 +43,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 3. Raydium: Entfernung von Vault-Fallbacks (immer echte Vault Pubkeys) & zusätzliche Hard Validation (target_orders optional, aber loggen)
 4. Router: Depth‑2 Pfad Benchmark + Depth‑3 (erste Greedy Implementierung + Pruning) [Depth‑3 implemented]
 5. Arbitrage Aggregator: Triangular Path (A-B-C-A) Profit Check (greedy implemented) + Erweiterung für generische Zyklen
+	- [x] Net Profit Filter (min_profit_bps + est_tx_cost_lamports)
 6. Compute Budget: Dynamische CU-Schätzung (historische Simulation / heuristics) statt fixer Werte
 7. Metrics: Pool Count, Quote Latency, Routing Auswahlgrund (DEX, hops)
 8. CI Pipeline (fmt, clippy, test, optional wasm build)
