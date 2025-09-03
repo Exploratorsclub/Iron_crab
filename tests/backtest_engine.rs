@@ -38,4 +38,9 @@ fn slippage_enforcement() {
     let rejected = !engine.slippage_rejections.is_empty();
     let executed = engine.portfolio.tokens.get("B").map(|p| p.amount > 0.into()).unwrap_or(false);
     assert!(rejected || executed, "neither executed nor rejected recorded");
+    if rejected {
+        // ensure at least one execution record with rejected=true and reason slippage
+        let any = engine.executions.iter().any(|r| r.rejected && r.reason.as_deref()==Some("slippage"));
+        assert!(any, "missing rejected execution record");
+    }
 }

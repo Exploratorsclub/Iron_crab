@@ -10,7 +10,7 @@
 ## 2) DEX-Connectoren
 - [x] Raydium Pools scannen (`refresh_pools`) – läuft (Heuristik Fee-Extraction, Vault Balances)
 - [x] Quote-Berechnung `quote_exact_in` (Fee + Price Impact, Slippage-MinOut Helper)
-	- [ ] Slippage-Enforcement im Engine (aktuell nur Helper, wird noch nicht angewendet)
+	- [x] Slippage-Enforcement im Engine (mit Execution Records / Reject Logging)
 	- [ ] Quote-Validierung gegen invarianten Test (größere Inputs -> höhere Impact Bps) – erweitern
   
  [ ] Swap-IX bauen (echter Raydium BaseIn) + ComputeBudget + Prioritätsgebühren
@@ -34,7 +34,7 @@
 - [ ] Erstkauf + enge SL/TP
   
 ### Nächste Micro-Tasks (Prior Vorschlag)
-1. Slippage-Enforcement in Backtest Engine implementieren (Abbruch oder Anpassung wenn erwartete vs. tatsächliche Ausführung > max_slippage_bps)
+1. (DONE) Slippage-Enforcement in Backtest Engine (Abbruch + Execution Record)
 2. Raydium `SimplePool` um OpenOrders / Market / Authority erweitern
 3. Hilfsfunktion: Ableitung `amm_authority` PDA & Serum Vault Signer
 4. Echten Raydium Swap Instruction Builder + Simulationstest (`simulateTransaction` Dry-Run)
