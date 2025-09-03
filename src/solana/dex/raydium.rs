@@ -48,6 +48,20 @@ pub struct Raydium {
     pools: Arc<DashMap<Pubkey, SimplePool>>, // in-memory pool snapshot
 }
 
+/// Planned swap including the constructed instruction list plus metadata for future TX assembly.
+#[derive(Debug, Clone)]
+pub struct RaydiumSwapPlan {
+    pub ixs: Vec<solana_sdk::instruction::Instruction>,
+    pub amount_in: u64,
+    pub min_out: u64,
+    pub expected_out: u64,
+    pub price_impact_bps: u32,
+    pub fee_bps: u32,
+    pub pool: Option<Pubkey>,
+    pub compute_unit_limit: Option<u32>,
+    pub compute_unit_price_micro_lamports: Option<u64>,
+}
+
 /// Lightweight public snapshot for backtesting / adapters without exposing internal struct.
 #[derive(Debug, Clone)]
 pub struct PoolSnapshot {
@@ -118,6 +132,49 @@ impl Raydium {
             if better { best = Some((p.address, forward, total_liq)); }
         }
         best.map(|(addr,f,_ )| (addr,f))
+    }
+
+    /// Build a swap plan (base-in) with optional compute budget & priority fee.
+    /// This uses the best single pool found in current snapshots.
+    pub fn build_swap_plan(&self, input_mint: &str, output_mint: &str, amount_in: u64, slippage_bps: u32, compute_unit_limit: Option<u32>, compute_unit_price_micro_lamports: Option<u64>) -> Result<Option<RaydiumSwapPlan>> {
+    // NOTE: compute budget program path differs across SDK versions; if unavailable, skip injecting.
+        // 1) Get quote (sync helper using current snapshot; mirrors async path logic)
+        let quote_opt = self.local_quote(input_mint, output_mint, amount_in);
+        let quote = match quote_opt { Some(q) => q, None => return Ok(None) };
+        // 2) Compute min_out
+        let min_out = Self::apply_slippage_min_out(quote.amount_out, slippage_bps);
+        // 3) Build swap ix (placeholder simplified variant)
+        let swap_ixs = self.build_swap_ix(input_mint, output_mint, amount_in, min_out)?;
+        let mut ixs = Vec::new();
+    // (Temporarily disabled compute budget instructions due to missing module in current SDK compile context)
+        ixs.extend(swap_ixs);
+        // Try parse pool pubkey from route[0]
+        let pool = quote.route.get(0).and_then(|s| Pubkey::from_str(s).ok());
+        Ok(Some(RaydiumSwapPlan { ixs, amount_in, min_out, expected_out: quote.amount_out, price_impact_bps: quote.price_impact_bps, fee_bps: quote.fee_bps, pool, compute_unit_limit: compute_unit_limit, compute_unit_price_micro_lamports: compute_unit_price_micro_lamports }))
+    }
+
+    fn local_quote(&self, input_mint: &str, output_mint: &str, amount_in: u64) -> Option<Quote> {
+        let in_pk = Pubkey::from_str(input_mint).ok()?;
+        let out_pk = Pubkey::from_str(output_mint).ok()?;
+        let mut best: Option<Quote> = None;
+        for p in self.pools.iter() {
+            let is_forward = p.base_mint == in_pk && p.quote_mint == out_pk;
+            let is_reverse = p.base_mint == out_pk && p.quote_mint == in_pk;
+            if !is_forward && !is_reverse { continue; }
+            let (rin, rout) = if is_forward { (p.reserve_base, p.reserve_quote) } else { (p.reserve_quote, p.reserve_base) };
+            if rin == 0 || rout == 0 { continue; }
+            let fee_bps: u128 = p.fee_bps as u128;
+            let amount_in_u = amount_in as u128;
+            let amount_in_less_fee = amount_in_u * (10_000 - fee_bps) / 10_000;
+            let numerator = amount_in_less_fee * rout;
+            let denominator = rin + amount_in_less_fee;
+            let out_amt = (numerator / denominator) as u64;
+            if out_amt == 0 { continue; }
+            let impact_bps = ((amount_in_less_fee * 10_000) / (rin + amount_in_less_fee)) as u32;
+            let q = Quote { amount_out: out_amt, price_impact_bps: impact_bps, route: vec![p.address.to_string()], fee_bps: p.fee_bps, in_reserve: rin, out_reserve: rout };
+            if best.as_ref().map(|b| b.amount_out < out_amt).unwrap_or(true) { best = Some(q); }
+        }
+        best
     }
 }
 
