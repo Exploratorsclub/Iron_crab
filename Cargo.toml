@@ -1,0 +1,58 @@
+
+[package]
+name = "ironcrab"
+version = "0.1.8"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+
+# Async & Concurrency
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+parking_lot = "0.12"
+dashmap = "5"
+
+# Config & Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+shellexpand = "3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# Math & time
+rust_decimal = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+
+# ---- Solana 2.x (Agave) – EXACT pins ----
+solana-sdk = "=3.0.0"
+solana-client = "=3.0.0"
+solana-rpc-client = "=3.0.0"
+solana-transaction-status = "=3.0.0"
+solana-account-decoder = "=3.0.0"
+solana-program = "=3.0.0"
+solana-system-program = "=3.0.0"
+
+# SPL crates (off-chain instruction builders)
+spl-associated-token-account = { version = "7", features = ["no-entrypoint"] }
+spl-associated-token-account-client = "2"
+spl-token = { version = "8", features = ["no-entrypoint"] }
+spl-token-2022 = { version = "9", features = ["no-entrypoint"] }
+
+[features]
+default = []
+python = ["pyo3"]
+jito = []
+
+[dependencies.pyo3]
+version = "0.21"
+features = ["extension-module"]
+optional = true

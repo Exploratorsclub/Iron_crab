@@ -1,0 +1,38 @@
+###############################################
+# Rust / Cargo
+###############################################
+/target/
+**/*.rs.bk
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / Temp
+*.log
+*.tmp
+*.cache
+
+# Python (strategies folder may use virtual envs)
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+venv/
+
+# Other build / dist outputs
+dist/
+build/
+
+# Node (if any tooling scripts get added)
+node_modules/
+
+# Misc
+*.old
+*.bak

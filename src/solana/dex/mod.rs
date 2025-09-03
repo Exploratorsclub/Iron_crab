@@ -1,0 +1,24 @@
+
+use async_trait::async_trait;
+use anyhow::Result;
+use solana_sdk::instruction::Instruction;
+
+pub mod raydium;
+pub mod orca;
+
+#[derive(Debug, Clone)]
+pub struct Quote {
+    pub amount_out: u64,
+    pub price_impact_bps: u32,
+    pub route: Vec<String>, // z.B. Pool IDs
+    pub fee_bps: u32,
+    pub in_reserve: u128,
+    pub out_reserve: u128,
+}
+
+#[async_trait]
+pub trait Dex: Send + Sync {
+    async fn refresh_pools(&self) -> Result<()>;
+    async fn quote_exact_in(&self, input_mint: &str, output_mint: &str, amount_in: u64) -> Result<Option<Quote>>;
+    fn build_swap_ix(&self, input_mint: &str, output_mint: &str, amount_in: u64, min_out: u64) -> Result<Vec<Instruction>>;
+}

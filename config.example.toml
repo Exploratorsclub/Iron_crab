@@ -1,0 +1,45 @@
+
+# Allgemein
+[app]
+name = "ironcrab"
+log_level = "info"         # trace, debug, info, warn, error
+autosave_state_secs = 30
+
+# Node / RPC
+[solana]
+rpc_url = "http://127.0.0.1:8899"
+ws_url  = "ws://127.0.0.1:8900"
+keypair_path = "~/.config/solana/id.json"  # Haupt-Wallet (Treasury)
+
+# Interne Wallets / Märkte (logische Buckets für Allokation)
+[[markets]]
+name = "solana-arb"
+allocation_pct = 60
+strategy = "arb-default"    # frei definierbarer Name
+
+[[markets]]
+name = "solana-sniper"
+allocation_pct = 40
+strategy = "snipe-default"
+
+# Zuweisungsstrategie Treasury → interne Wallets
+[allocator]
+mode = "static_pct"         # später: risk_budget, vol_target, usw.
+rebalance_secs = 60
+min_transfer_sol = 0.05
+
+# Strategien (Rust)
+[strategies.arb-default]
+kind = "rust"
+params = { max_routes = 3, min_edge_bps = 15 }
+
+[strategies.snipe-default]
+kind = "rust"
+params = { max_slippage_bps = 150, max_buy_sol = 0.2 }
+
+# Strategien (Python) – aktiviert nur wenn Feature "python"
+[strategies.py-experiment]
+kind = "python"
+module = "strategies.sample"
+class  = "SampleStrategy"
+params = { threshold_bps = 20 }
