@@ -8,6 +8,17 @@ fn apply_slippage_min_out(quote_out: u64, slippage_bps: u32) -> u64 {
     (quote_out as u128 * keep as u128 / 10_000u128) as u64
 }
 
+#[derive(Debug, Clone)]
+pub struct SwapExecutionRecord {
+    pub input_mint: String,
+    pub output_mint: String,
+    pub amount_in: u64,
+    pub min_out: Option<u64>,
+    pub amount_out: Option<u64>, // None if rejected
+    pub rejected: bool,
+    pub reason: Option<String>,
+}
+
 pub struct BacktestEngine<S: BacktestStrategy, M: MarketAdapter> {
     pub strategy: S,
     pub market: M,
@@ -15,15 +26,17 @@ pub struct BacktestEngine<S: BacktestStrategy, M: MarketAdapter> {
     pub events: Vec<SimEvent>,
     pub decisions: Vec<StrategyDecision>,
     pub slippage_rejections: Vec<String>,
+    pub executions: Vec<SwapExecutionRecord>,
 }
 impl<S: BacktestStrategy, M: MarketAdapter> BacktestEngine<S,M> {
-    pub fn new(strategy:S, market:M, portfolio:Portfolio, events:Vec<SimEvent>) -> Self { Self { strategy, market, portfolio, events, decisions: vec![], slippage_rejections: vec![] } }
+    pub fn new(strategy:S, market:M, portfolio:Portfolio, events:Vec<SimEvent>) -> Self { Self { strategy, market, portfolio, events, decisions: vec![], slippage_rejections: vec![], executions: vec![] } }
     pub fn run(&mut self) -> Result<()> {
         for ev in &self.events {
             let ctx = SimContext { portfolio: &self.portfolio, time_ms: ev.ts_ms };
             let decision = self.strategy.on_event(&ctx, ev);
             for act in &decision.actions {
-                if let StrategyAction::Swap(a) = act {
+                match act {
+                StrategyAction::Swap(a) => {
                     // Pre-quote for slippage enforcement
                     let mut min_out: Option<u64> = None;
                     if a.max_slippage_bps > 0 {
@@ -37,10 +50,13 @@ impl<S: BacktestStrategy, M: MarketAdapter> BacktestEngine<S,M> {
                         if out < m {
                             // Reject – record & skip portfolio mutation
                             self.slippage_rejections.push(format!("swap {}->{} amount_in={} out={} min_out={}", a.input_mint, a.output_mint, a.amount_in, out, m));
+                            self.executions.push(SwapExecutionRecord { input_mint: a.input_mint.clone(), output_mint: a.output_mint.clone(), amount_in: a.amount_in, min_out: Some(m), amount_out: None, rejected: true, reason: Some("slippage".into()) });
                             continue;
                         }
                     }
                     self.portfolio.apply_swap(&a.input_mint,&a.output_mint,iin,out);
+                    self.executions.push(SwapExecutionRecord { input_mint: a.input_mint.clone(), output_mint: a.output_mint.clone(), amount_in: a.amount_in, min_out, amount_out: Some(out), rejected: false, reason: None });
+                }
                 }
             }
             self.decisions.push(decision);
