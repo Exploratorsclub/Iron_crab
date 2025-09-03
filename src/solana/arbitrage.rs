@@ -9,6 +9,18 @@ use super::{rpc::SolanaRpc, dex::{Dex, Quote}};
 use crate::metrics::{ARB_TRIANGLE_ATTEMPTS, ARB_TRIANGLE_PROFITABLE};
 use crate::solana::dex::router::Router;
 use rust_decimal::Decimal;
+use solana_sdk::{transaction::Transaction, instruction::Instruction, message::Message, signature::Keypair};
+use crate::solana::compute_budget_estimator as cbe;
+
+/// Planned transaction containing ordered instructions plus bookkeeping.
+#[derive(Debug, Clone)]
+pub struct TransactionPlan {
+    pub ixs: Vec<Instruction>,
+    pub compute_unit_limit: u32,
+    pub compute_unit_price_micro_lamports: u64,
+    pub expected_profit: u64, // in input token raw units (post-estimate, pre-fees beyond priority)
+    pub path_id: String,
+}
 
 pub struct ArbitrageEngine {
     pub rpc: Arc<SolanaRpc>,
@@ -68,6 +80,43 @@ impl ArbitrageEngine {
     let path = self.triangle_cycle(a,b,c, ui_amount_a).await?; let (id, gross_profit) = match path { Some(p)=>p, None=>return Ok(None) };
         if let Some(net) = compute_net_profit(amount_in, amount_in + gross_profit, self.min_profit_bps, self.est_tx_cost_lamports) { return Ok(Some((id, net))); }
         Ok(None)
+    }
+
+    /// Assemble a transaction plan for a profitable triangle (A->B->C->A) using best hop quotes.
+    /// Returns None if not profitable after filters or if any hop instructions can't be built.
+    pub async fn assemble_triangle_plan(&self, a: &str, b: &str, c: &str, ui_amount_a: f64, decimals: u32, slippage_bps: u32, fee_payer: &Keypair) -> Result<Option<TransactionPlan>> {
+        let amount_in = (ui_amount_a * 10f64.powi(decimals as i32)) as u64;
+        ARB_TRIANGLE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Hop1
+        let hop1 = self.router.best_quote_exact_in(a, b, amount_in).await?; let h1 = match hop1 { Some(h)=>h, None=>return Ok(None) };
+        // Hop2
+        let hop2 = self.router.best_quote_exact_in(&h1.quote.output_mint, c, h1.quote.amount_out).await?; let h2 = match hop2 { Some(h)=>h, None=>return Ok(None) };
+        // Hop3
+        let hop3 = self.router.best_quote_exact_in(&h2.quote.output_mint, a, h2.quote.amount_out).await?; let h3 = match hop3 { Some(h)=>h, None=>return Ok(None) };
+        let final_out = h3.quote.amount_out;
+        if final_out <= amount_in { return Ok(None); }
+        let gross_profit = final_out - amount_in;
+        let maybe_net = compute_net_profit(amount_in, final_out, self.min_profit_bps, self.est_tx_cost_lamports);
+        let net_profit = match maybe_net { Some(n)=>n, None=>return Ok(None) };
+        ARB_TRIANGLE_PROFITABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Build instructions for each hop using DEX trait (min_out only on final hop applying slippage)
+    let quotes_vec = vec![h1.quote.clone(), h2.quote.clone(), h3.quote.clone()];
+    let min_out_final = Router::cumulative_min_out(&quotes_vec, slippage_bps);
+    let dexs = self.router.dexs();
+    let mut ixs: Vec<Instruction> = Vec::new();
+    // Hop1: min_out = 0 (feed into hop2)
+    let hop1_ixs = dexs[h1.dex_index].build_swap_ix(&h1.quote.input_mint, &h1.quote.output_mint, amount_in, 0)?;
+    ixs.extend(hop1_ixs);
+    // Hop2: min_out = 0 (feed into hop3)
+    let hop2_ixs = dexs[h2.dex_index].build_swap_ix(&h2.quote.input_mint, &h2.quote.output_mint, h1.quote.amount_out, 0)?;
+    ixs.extend(hop2_ixs);
+    // Hop3: apply min_out
+    let hop3_ixs = dexs[h3.dex_index].build_swap_ix(&h3.quote.input_mint, &h3.quote.output_mint, h2.quote.amount_out, min_out_final)?;
+    ixs.extend(hop3_ixs);
+        // Compute budget estimation (single tx, 3 swaps => hops=3, ixs ~ 3 + 2 compute budget)
+        let est = cbe::estimate_from_instructions(&ixs, 3, amount_in, cbe::EstimatorConfig::default());
+        let plan = TransactionPlan { ixs, compute_unit_limit: est.compute_unit_limit, compute_unit_price_micro_lamports: est.compute_unit_price_micro_lamports, expected_profit: net_profit, path_id: format!("{}-{}-{}", a,b,c) };
+        Ok(Some(plan))
     }
 }
 

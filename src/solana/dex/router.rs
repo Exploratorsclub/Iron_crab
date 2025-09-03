@@ -32,6 +32,8 @@ pub struct MultiHopSwapPlan {
 impl Router {
     pub fn new(dexs: Vec<Arc<dyn Dex>>) -> Self { Self { dexs } }
 
+    pub fn dexs(&self) -> &Vec<Arc<dyn Dex>> { &self.dexs }
+
     /// Refresh all dexs sequentially (can parallelize later if RPC budget allows).
     pub async fn refresh_all(&self) -> Result<()> {
         for d in &self.dexs { d.refresh_pools().await?; }
