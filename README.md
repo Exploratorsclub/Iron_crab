@@ -81,6 +81,14 @@ scrape_configs:
 			- targets: ['127.0.0.1:9898']
 ```
 
+### Geplante zusätzliche Metrics
+- `ironcrab_sharpe_ratio` (Gauge) – rolling window Sharpe
+- `ironcrab_drawdown_pct` (Gauge) – aktueller relativer Peak-to-Trough Drawdown
+- `ironcrab_trade_return_bucket` (+Inf Bucket) – Verteilung einzelner Realized Returns
+- `ironcrab_fee_breakdown_total{type="protocol|network|referral"}` – Aggregierte Fees
+
+Sobald implementiert: Dashboard JSON Beispiel wird in `docs/` ergänzt.
+
 ## Trade Log Beispiel (gekürzt)
 ```
 timestamp_utc,side,mint,dex,signature,lamports_in,lamports_out,tokens_in,tokens_out,expected_tokens_out,expected_sol_out,shortfall_tokens,shortfall_sol,network_fee_lamports,realized_pnl_sol,notes
