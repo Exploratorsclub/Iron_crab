@@ -95,6 +95,7 @@ struct PendingTrade {
     expected_out_tokens: u64,
     network_fee_lamports: u64,
     ts: i64,
+    fee_bps: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -411,18 +412,14 @@ impl SniperEngine {
                     if pm.expected_out > 0 {
                         let sol_in = lamports_in as f64 / 1e9;
                         self.record_fill_placeholder(*mint, sol_in);
-                        let engine_clone = self.clone_for_spawn();
-                        let mint_copy = *mint;
-                        tokio::spawn(async move { engine_clone.finalize_fill(mint_copy).await; });
+                        self.finalize_fill(*mint).await;
                     }
                 } else {
                     info!(mint=%mint, sig=%sig, lamports_in, liq_sol, "sniper: initial buy submitted (orca)");
                     // Orca: we only know lamports_in and min_out (very conservative); use min_out for price upper bound
                     let sol_in = lamports_in as f64 / 1e9;
                     self.record_fill_placeholder(*mint, sol_in);
-                    let engine_clone = self.clone_for_spawn();
-                    let mint_copy = *mint;
-                    tokio::spawn(async move { engine_clone.finalize_fill(mint_copy).await; });
+                    self.finalize_fill(*mint).await;
                 }
                 self.purchased.write().insert(*mint);
                 // Trade CSV log
@@ -431,7 +428,7 @@ impl SniperEngine {
                         // Record pending expected tokens for later shortfall calculation
                         {
                             let mut rs = self.risk.write();
-                            rs.pending.insert(*mint, PendingTrade { expected_out_tokens: pm.expected_out, dex: "RAYDIUM".into(), sig: sig.to_string(), lamports_in, network_fee_lamports: fee_estimate, ts: ChronoUtc::now().timestamp() });
+                            rs.pending.insert(*mint, PendingTrade { expected_out_tokens: pm.expected_out, dex: "RAYDIUM".into(), sig: sig.to_string(), lamports_in, network_fee_lamports: fee_estimate, ts: ChronoUtc::now().timestamp(), fee_bps: pm.fee_bps });
                         }
                         record_network_fee(fee_estimate);
                         let line = format!(
@@ -598,62 +595,62 @@ impl SniperEngine {
     async fn finalize_fill(&self, mint: Pubkey) {
         let owner = self.treasury.pubkey();
         let mint_sdk = solana_sdk::pubkey::Pubkey::new_from_array(mint.to_bytes());
-        if let Ok((ata,_)) = self.treasury.ata_address(&self.rpc, &owner, &mint_sdk).await {
-            let mut decimals = 0u8;
-            if let Ok(mint_acc) = self.rpc.rpc.get_account(&mint).await { if mint_acc.data.len()>44 { decimals = mint_acc.data[44]; } }
-            if let Ok(acc) = self.rpc.rpc.get_account(&ata).await { if acc.data.len()>=72 {
-                let raw = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
-                let amt = if decimals==0 { raw as f64 } else { raw as f64 / 10f64.powi(decimals as i32) };
+        let ata = match self.treasury.ata_address(&self.rpc, &owner, &mint_sdk).await { Ok(v)=>v.0, Err(_)=> return };
+        let decimals = if let Ok(mint_acc) = self.rpc.rpc.get_account(&mint).await { if mint_acc.data.len()>44 { mint_acc.data[44] } else {0} } else {0};
+        let acc_opt = self.rpc.rpc.get_account(&ata).await.ok();
+        if let Some(acc) = acc_opt { if acc.data.len()>=72 {
+            let raw = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+            let amt = if decimals==0 { raw as f64 } else { raw as f64 / 10f64.powi(decimals as i32) };
+            if amt <= 0.0 { return; }
+            // Take snapshot of pending & position without holding lock across RPC
+            let (pend_opt, entry_price_existing) = {
                 let mut rs = self.risk.write();
-                if amt > 0.0 {
-                    // Extract pending first
-                    let pending_opt = rs.pending.remove(&mint);
-                    if let Some(pos) = rs.open.get_mut(&mint) { if pos.entry_price_sol==0.0 { 
-                        pos.amount_tokens = amt; pos.token_decimals = decimals; pos.entry_price_sol = pos.invested_sol / amt.max(1e-9);
-                    }}
-                    if let Some(pend) = pending_opt {
-                        if let Some(pos) = rs.open.get(&mint) {
-                        // Compute shortfall
-                        let scale = 10f64.powi(decimals as i32);
-                        let actual_raw = (amt * scale).round() as u64;
-                        let expected_raw = pend.expected_out_tokens;
-                        let shortfall = expected_raw.saturating_sub(actual_raw);
-                        let shortfall_ui = shortfall as f64 / scale;
-                        let shortfall_sol = shortfall_ui * pos.entry_price_sol;
-                        // Protocol fee approximation: Raydium fee already applied in expected_out; we approximate effective fee in output tokens as (expected_out_tokens * fee_bps / (10_000 - fee_bps)).
-                        // Since we don't store fee_bps per pending, derive from difference between theoretical no-fee out.
-                        // Heuristic: if shortfall relatively small (<5%) treat none of it as fee; fee tokens ~ expected_out - actual_raw when positive with cap.
-                        let fee_tokens = if expected_raw > actual_raw { (expected_raw - actual_raw).min(expected_raw / 20) } else { 0 }; // cap at 5%
-                        if fee_tokens > 0 {
-                            PROTOCOL_FEE_TOKENS_TOTAL.fetch_add(fee_tokens as u64, std::sync::atomic::Ordering::Relaxed);
-                            let fee_ui = fee_tokens as f64 / scale;
-                            let fee_sol = fee_ui * pos.entry_price_sol;
-                            PROTOCOL_FEE_SOL_MICRO_TOTAL.fetch_add((fee_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        record_shortfall(shortfall, shortfall_sol);
-                        let line = format!(
-                            "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9};protocol_fee_tokens={fee_tokens}",
-                            ts=ChronoUtc::now().to_rfc3339(),
-                            mint=mint,
-                            dex=pend.dex,
-                            sig=pend.sig,
-                            lamports_in=pend.lamports_in,
-                            actual_tokens=actual_raw,
-                            expected_tokens=expected_raw,
-                            shortfall_tokens=shortfall,
-                            fee=pend.network_fee_lamports,
-                            shortfall_ui=shortfall_ui,
-                            shortfall_sol=shortfall_sol,
-                            fee_tokens=fee_tokens
-                        );
-                        drop(rs); // release lock
-                        self.append_trade_record(&line, true);
-                        return;
-                        }
-                    }
+                let pend = rs.pending.remove(&mint);
+                if let Some(pos) = rs.open.get_mut(&mint) { if pos.entry_price_sol==0.0 { pos.amount_tokens = amt; pos.token_decimals = decimals; pos.entry_price_sol = pos.invested_sol / amt.max(1e-9); } }
+                (pend, rs.open.get(&mint).map(|p| p.entry_price_sol).unwrap_or(0.0))
+            };
+            if let Some(pend) = pend_opt {
+                // Fetch meta outside lock
+                let mut exact_network_fee = pend.network_fee_lamports;
+                if let Ok(sig_obj) = solana_sdk::signature::Signature::from_str(&pend.sig) {
+                    use solana_transaction_status::UiTransactionEncoding;
+                    use solana_client::rpc_config::RpcTransactionConfig;
+                    let cfg = RpcTransactionConfig { encoding: Some(UiTransactionEncoding::JsonParsed), commitment: None, max_supported_transaction_version: None };
+                    if let Ok(tx_opt) = self.rpc.rpc.get_transaction_with_config(&sig_obj, cfg).await { if let Some(meta) = tx_opt.transaction.meta { exact_network_fee = meta.fee; } }
                 }
-            }}
-        }
+                let scale = 10f64.powi(decimals as i32);
+                let actual_raw = (amt * scale).round() as u64;
+                let expected_raw = pend.expected_out_tokens;
+                let shortfall = expected_raw.saturating_sub(actual_raw);
+                let shortfall_ui = shortfall as f64 / scale;
+                let shortfall_sol = shortfall_ui * entry_price_existing;
+                let fee_tokens = if expected_raw > actual_raw { (expected_raw - actual_raw).min(expected_raw / 20) } else { 0 };
+                if fee_tokens > 0 {
+                    PROTOCOL_FEE_TOKENS_TOTAL.fetch_add(fee_tokens as u64, std::sync::atomic::Ordering::Relaxed);
+                    let fee_ui = fee_tokens as f64 / scale;
+                    let fee_sol = fee_ui * entry_price_existing;
+                    PROTOCOL_FEE_SOL_MICRO_TOTAL.fetch_add((fee_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                record_shortfall(shortfall, shortfall_sol);
+                let line = format!(
+                    "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9};protocol_fee_tokens={fee_tokens};network_fee_exact={network_fee_exact}",
+                    ts=ChronoUtc::now().to_rfc3339(),
+                    mint=mint,
+                    dex=pend.dex,
+                    sig=pend.sig,
+                    lamports_in=pend.lamports_in,
+                    actual_tokens=actual_raw,
+                    expected_tokens=expected_raw,
+                    shortfall_tokens=shortfall,
+                    fee=exact_network_fee,
+                    shortfall_ui=shortfall_ui,
+                    shortfall_sol=shortfall_sol,
+                    fee_tokens=fee_tokens,
+                    network_fee_exact=exact_network_fee
+                );
+                self.append_trade_record(&line, true);
+            }
+        }}
     }
 
     async fn evaluate_positions(&self) -> Result<()> {
@@ -854,9 +851,7 @@ impl SniperEngine {
                         if status.err.is_none() {
                             // Try finalize now (will remove pending & log fill)
                             PENDING_RECONCILIATIONS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let engine_clone = self.clone_for_spawn();
-                            let mint_copy = *mint;
-                            tokio::spawn(async move { engine_clone.finalize_fill(mint_copy).await; });
+                            self.finalize_fill(*mint).await;
                         }
                     } else {
                         // No progress yet; if older than half TTL consider dropping
