@@ -40,7 +40,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Grund-SniperEngine Skeleton + Config Struct
 - [x] WS-Logs Subscribe (Pool-Create) via raw WebSocket (manual logsSubscribe JSON-RPC)
 - [~] Heuristiken: Config Felder (Blacklist Mints/Owners, Min Liquidity, FreezeAuth None, Decimals Range) implementiert; Runtime Checks integriert – fehlend: echte Pool Account / Mint Fetch & LP-Lock Analyse
-- [ ] Pool Account & Mint Fetch (Owner, FreezeAuth, Decimals, Supply, Liquidity Berechnung)
+- [~] Pool Account & Mint Fetch (Owner, FreezeAuth, Decimals, Supply, Liquidity) – WebSocket detection in place; detailed account fetch & liquidity calc pending
 - [ ] LP-Lock / Token Distribution Heuristik
 - [ ] Erstkauf + enge SL/TP
   

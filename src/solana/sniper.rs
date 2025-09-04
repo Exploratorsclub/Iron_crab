@@ -20,6 +20,7 @@ use serde_json::json;
 // Simple global blacklist (extendable via config later)
 static MINT_BLACKLIST: Lazy<HashSet<String>> = Lazy::new(|| HashSet::new());
 
+#[derive(Clone)]
 pub struct SniperCfg {
     pub max_buy_sol: f64,
     pub max_slippage_bps: u32,
@@ -67,7 +68,7 @@ impl SniperEngine {
                                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
                                             if let Some(arr) = v.pointer("/params/result/value/logs").and_then(|x| x.as_array()) {
                                                 let lines: Vec<String> = arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect();
-                                                Self::handle_logs("program", lines);
+                                                Self::handle_logs_static(lines).await;
                                             }
                                         }
                                     }
@@ -88,14 +89,9 @@ impl SniperEngine {
     }
 
     #[allow(dead_code)]
-    fn handle_logs(program: &str, logs: Vec<String>) {
-        // Very naive pool-detect heuristic: look for 'initialize' or 'Init' keywords.
-        for l in logs {
-            let lower = l.to_ascii_lowercase();
-            if (lower.contains("initialize") || lower.contains("init")) && (lower.contains("pool") || lower.contains("whirlpool")) {
-                debug!(program, line = %l, "candidate pool init log");
-            }
-        }
+    async fn handle_logs_static(logs: Vec<String>) {
+        // Placeholder (will be replaced with cfg/rpc richer version in next iteration)
+        for l in logs { let lower = l.to_ascii_lowercase(); if (lower.contains("initialize") || lower.contains("init")) && (lower.contains("pool") || lower.contains("whirlpool")) { debug!(line = %l, "candidate pool init log"); } }
     }
 
     pub async fn run(&self) -> Result<()> {
