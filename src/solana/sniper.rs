@@ -161,6 +161,8 @@ pub struct LpLockAssessment {
     pub top5_pct: f64,
     pub concentration_ok: bool,
     pub largest_account: Option<String>,
+    pub burned_pct: f64,
+    pub program_vault_pct: f64,
 }
 
 impl SniperEngine {
@@ -183,29 +185,65 @@ impl SniperEngine {
     if supply == 0.0 { return Ok(None); }
         // Largest accounts
         let list = match self.rpc.rpc.get_token_largest_accounts(mint).await { Ok(v)=>v, Err(e)=> { warn!(?e, "largest accounts fetch failed"); return Ok(None); } };
-        let mut largest_key: Option<String> = None;
-        let mut raw_amounts: Vec<f64> = Vec::new();
-        for (i,acc) in list.iter().enumerate() {
-            // acc.amount.amount raw units string nested path
-            let raw_units_str = &acc.amount.amount;
-            if let Ok(raw_u128) = raw_units_str.parse::<u128>() {
-                let val_tokens = if decimals == 0 { raw_u128 as f64 } else { raw_u128 as f64 / 10f64.powi(decimals as i32) };
-                raw_amounts.push(val_tokens);
-                if i == 0 { largest_key = Some(acc.address.clone()); }
+        if list.is_empty() { return Ok(None); }
+        // Collect top5 addresses & amounts raw
+        let mut holder_accts: Vec<(String, u128)> = Vec::new();
+        for (i, acc) in list.iter().enumerate() { if i >= 5 { break; } if let Ok(raw_u128) = acc.amount.amount.parse::<u128>() { holder_accts.push((acc.address.clone(), raw_u128)); } }
+        if holder_accts.is_empty() { return Ok(None); }
+        let largest_key = Some(holder_accts[0].0.clone());
+        // Fetch token account data for classification (burn / program-vault)
+        let addrs: Vec<Pubkey> = holder_accts.iter().filter_map(|(a,_)| Pubkey::from_str(a).ok()).collect();
+        let acct_infos = match self.rpc.rpc.get_multiple_accounts(&addrs).await { Ok(v)=>v, Err(e)=> { warn!(?e, "largest token accounts fetch failed"); Vec::new() } };
+        // Known constants
+        let incinerator = Pubkey::from_str("1nc1nerator11111111111111111111111111111111").unwrap();
+        let known_programs: Vec<Pubkey> = vec![
+            Pubkey::from_str(RAYDIUM_AMM_V4).unwrap_or(Pubkey::default()),
+            Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap_or(Pubkey::default()),
+        ];
+        #[derive(PartialEq)] enum Class { Burn, ProgramVault, Regular }
+        struct HolderRec { amt_tokens: f64, class: Class }
+        let mut records: Vec<HolderRec> = Vec::new();
+        let mut burned_total = 0f64;
+        let mut program_locked_total = 0f64;
+        for (idx, (addr_str, raw_amount)) in holder_accts.iter().enumerate() {
+            let mut class = Class::Regular;
+            let amt_tokens = if decimals == 0 { *raw_amount as f64 } else { *raw_amount as f64 / 10f64.powi(decimals as i32) };
+            if let Ok(acc_pk) = Pubkey::from_str(addr_str) {
+                if acc_pk == incinerator { class = Class::Burn; }
             }
-            if i >= 4 { break; } // we only need top5 for now
+            if class == Class::Regular {
+                if let Some(Some(acc_info)) = acct_infos.get(idx).map(|o| o.as_ref()) {
+                    // Token account length heuristic: >= 80 for owner field
+                    if acc_info.data.len() >= 64 {
+                        let owner_slice = &acc_info.data[32..64];
+                        let owner_auth = Pubkey::new_from_array(owner_slice.try_into().unwrap());
+                        if owner_auth == incinerator { class = Class::Burn; }
+                        else if known_programs.iter().any(|p| *p == owner_auth) { class = Class::ProgramVault; }
+                        else {
+                            // Fallback: fetch owner auth executable bit via separate account info if present in batch (future optimization)
+                        }
+                    }
+                }
+            }
+            match class { Class::Burn => burned_total += amt_tokens, Class::ProgramVault => program_locked_total += amt_tokens, Class::Regular => {} }
+            records.push(HolderRec { amt_tokens, class });
         }
-        if raw_amounts.is_empty() { return Ok(None); }
-        // Sort descending just in case
-        raw_amounts.sort_by(|a,b| b.partial_cmp(a).unwrap());
-        let top1 = raw_amounts.get(0).copied().unwrap_or(0.0);
-        let top3_sum: f64 = raw_amounts.iter().take(3).sum();
-        let top5_sum: f64 = raw_amounts.iter().take(5).sum();
-        let top1_pct = if supply>0.0 { top1 / supply } else { 0.0 };
-        let top3_pct = if supply>0.0 { top3_sum / supply } else { 0.0 };
-        let top5_pct = if supply>0.0 { top5_sum / supply } else { 0.0 };
+        let effective_supply = (supply - burned_total - program_locked_total).max(0.0);
+        if effective_supply <= 0.0 { return Ok(None); }
+        // Compute concentration using only regular holders relative to effective supply
+        let mut regular_amounts: Vec<f64> = records.iter().filter(|r| r.class == Class::Regular).map(|r| r.amt_tokens).collect();
+        if regular_amounts.is_empty() { return Ok(None); }
+        regular_amounts.sort_by(|a,b| b.partial_cmp(a).unwrap());
+        let top1 = regular_amounts.get(0).copied().unwrap_or(0.0);
+        let top3_sum: f64 = regular_amounts.iter().take(3).sum();
+        let top5_sum: f64 = regular_amounts.iter().take(5).sum();
+        let top1_pct = if effective_supply>0.0 { top1 / effective_supply } else { 0.0 };
+        let top3_pct = if effective_supply>0.0 { top3_sum / effective_supply } else { 0.0 };
+        let top5_pct = if effective_supply>0.0 { top5_sum / effective_supply } else { 0.0 };
         let concentration_ok = top1_pct <= thr1 && top3_pct <= thr3 && top5_pct <= thr5;
-        Ok(Some(LpLockAssessment { top1_pct, top3_pct, top5_pct, concentration_ok, largest_account: largest_key }))
+        let burned_pct = if supply>0.0 { burned_total / supply } else { 0.0 };
+        let program_vault_pct = if supply>0.0 { program_locked_total / supply } else { 0.0 };
+        Ok(Some(LpLockAssessment { top1_pct, top3_pct, top5_pct, concentration_ok, largest_account: largest_key, burned_pct, program_vault_pct }))
     }
 }
 

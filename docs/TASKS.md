@@ -42,7 +42,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [~] Heuristiken: Config Felder (Blacklist Mints/Owners, Min Liquidity, FreezeAuth None, Decimals Range) implementiert; Runtime Checks integriert – fehlend: echte Pool Account / Mint Fetch & LP-Lock Analyse
 - [~] Pool Account & Mint Fetch (Owner, FreezeAuth, Decimals, Supply, Liquidity) – WebSocket detection in place; detailed account fetch & liquidity calc pending
 - [x] LP-Lock / Konzentrations-Heuristik (Top1/Top3/Top5 via largestAccounts + Log-Integration)
-- [ ] LP-Lock / Token Distribution Heuristik
+- [~] LP-Lock / Token Distribution Heuristik (Burn + Program-Owned Vault Erkennung integriert in Konzentrationsberechnung; weitere Verfeinerung offen)
 - [ ] Erstkauf + enge SL/TP
   
 ### Nächste Micro-Tasks (aktualisiert)
