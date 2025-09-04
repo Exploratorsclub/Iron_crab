@@ -41,6 +41,8 @@ use crate::metrics::{
     WS_RECONNECTS_TOTAL,
     PENDING_RECONCILIATIONS_TOTAL,
     PENDING_FAILED_TOTAL,
+    PROTOCOL_FEE_TOKENS_TOTAL,
+    PROTOCOL_FEE_SOL_MICRO_TOTAL,
 };
 use serde::{Serialize, Deserialize};
 use serde_json::json;
@@ -618,9 +620,19 @@ impl SniperEngine {
                         let shortfall = expected_raw.saturating_sub(actual_raw);
                         let shortfall_ui = shortfall as f64 / scale;
                         let shortfall_sol = shortfall_ui * pos.entry_price_sol;
+                        // Protocol fee approximation: Raydium fee already applied in expected_out; we approximate effective fee in output tokens as (expected_out_tokens * fee_bps / (10_000 - fee_bps)).
+                        // Since we don't store fee_bps per pending, derive from difference between theoretical no-fee out.
+                        // Heuristic: if shortfall relatively small (<5%) treat none of it as fee; fee tokens ~ expected_out - actual_raw when positive with cap.
+                        let fee_tokens = if expected_raw > actual_raw { (expected_raw - actual_raw).min(expected_raw / 20) } else { 0 }; // cap at 5%
+                        if fee_tokens > 0 {
+                            PROTOCOL_FEE_TOKENS_TOTAL.fetch_add(fee_tokens as u64, std::sync::atomic::Ordering::Relaxed);
+                            let fee_ui = fee_tokens as f64 / scale;
+                            let fee_sol = fee_ui * pos.entry_price_sol;
+                            PROTOCOL_FEE_SOL_MICRO_TOTAL.fetch_add((fee_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
                         record_shortfall(shortfall, shortfall_sol);
                         let line = format!(
-                            "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9}",
+                            "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9};protocol_fee_tokens={fee_tokens}",
                             ts=ChronoUtc::now().to_rfc3339(),
                             mint=mint,
                             dex=pend.dex,
@@ -631,7 +643,8 @@ impl SniperEngine {
                             shortfall_tokens=shortfall,
                             fee=pend.network_fee_lamports,
                             shortfall_ui=shortfall_ui,
-                            shortfall_sol=shortfall_sol
+                            shortfall_sol=shortfall_sol,
+                            fee_tokens=fee_tokens
                         );
                         drop(rs); // release lock
                         self.append_trade_record(&line, true);

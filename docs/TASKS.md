@@ -54,6 +54,8 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Shortfall Berechnung (Tokens & SOL Äquivalent) bei FILL
 - [x] Netzwerk Fee Schätzung via `get_fee_for_message`
 - [ ] Erweiterte Fee Aufschlüsselung (Protocol Fee, Referrer, Compute Budget Overhead via Meta)
+	- [x] Grundlegende Protokoll Fee Approx (Output Token Fee Heuristik + Metrics `protocol_fee_tokens_total`, `protocol_fee_sol_total`)
+	- [ ] Exakte Fee Extraktion via Transaction Meta (inner instructions & postTokenBalances)
 - [ ] Partielle Exit-Unterstützung (mehrere SELLs pro Position)
 - [ ] Persistenter Positionssnapshot (Reload nach Neustart)
   
