@@ -57,6 +57,7 @@ pub struct SerumMarketAccounts {
 pub struct Raydium {
     rpc: Arc<SolanaRpc>,
     pools: Arc<DashMap<Pubkey, SimplePool>>, // in-memory pool snapshot
+    mint_index: Arc<DashMap<Pubkey, Vec<Pubkey>>>, // mint -> pools containing it
 }
 
 /// Planned swap including the constructed instruction list plus metadata for future TX assembly.
@@ -115,7 +116,7 @@ struct SimplePool {
 }
 
 impl Raydium {
-    pub fn new(rpc: Arc<SolanaRpc>) -> Self { Self { rpc, pools: Arc::new(DashMap::new()) } }
+    pub fn new(rpc: Arc<SolanaRpc>) -> Self { Self { rpc, pools: Arc::new(DashMap::new()), mint_index: Arc::new(DashMap::new()) } }
 
     /// Export immutable pool snapshots (cheap clone of small fields) for backtest ingestion.
     pub fn snapshots(&self) -> Vec<PoolSnapshot> {
@@ -136,6 +137,9 @@ impl Raydium {
             quote_vault: Some(p.quote_vault),
         }).collect()
     }
+
+    /// Pools that reference this mint.
+    pub fn pools_for_mint(&self, mint: &Pubkey) -> Vec<Pubkey> { self.mint_index.get(mint).map(|v| v.clone()).unwrap_or_default() }
 
     fn parse_token_account_amount(data: &[u8]) -> Result<u64> {
         if data.len() < 72 { return Err(anyhow!("token account data too short")); }
@@ -327,6 +331,12 @@ impl Dex for Raydium {
         let cutoff = SystemTime::now() - Duration::from_secs(15 * 60);
         let mut removed = 0u32;
         self.pools.retain(|_, v| { let keep = v.last_update >= cutoff; if !keep { removed += 1; } keep });
+        // Rebuild mint index
+        self.mint_index.clear();
+        for p in self.pools.iter() { 
+            self.mint_index.entry(p.base_mint).or_insert_with(|| Vec::with_capacity(2)).push(p.address);
+            self.mint_index.entry(p.quote_mint).or_insert_with(|| Vec::with_capacity(2)).push(p.address);
+        }
         tracing::info!(pools = self.pools.len(), removed, "raydium.refresh_pools done");
         Ok(())
     }

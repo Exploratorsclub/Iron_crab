@@ -19,6 +19,7 @@
 - [x] Multi-Hop min_out Aggregation (nur finaler Hop slippage)
 - [x] Gemeinsames Quote-Struct erweitert (input_mint/output_mint) für Routen-Rekonstruktion
 - [x] Orca: Replace Heuristics mit Echtem Whirlpool Layout (feste Offsets / strukturiertes Parsing)
+- [x] Mint->Pool Mapping Index (Raydium & Orca) für schnelle Liquidity Lookups (Sniper)
 - [x] Orca: Echte User Accounts & Token Owner Accounts in Swap IX (statt Platzhalter Pubkeys) (Setters + validation in build_swap_ix)
 - [x] Raydium: Offene Verbesserung – Vault Fallbacks entfernen (immer echte Vaults nutzen + skip invalid fee / zero reserves)
 - [x] Safety: Further structural validation (Orca tick spacing bounds, vault/mint cross-check, tick index sanity)
