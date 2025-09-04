@@ -2,6 +2,7 @@
 // Memecoin‑Sniper Skeleton: beobachtet neue Pools/LP‑Creations, filtert Risiken,
 // setzt kleine Erstkäufe mit harten Limits (Slippage/Blacklist/Owner/Freeze Auth usw.)
 use std::{sync::Arc, collections::HashSet};
+use std::str::FromStr;
 use anyhow::Result;
 use tracing::{info, debug, warn};
 use crate::solana::rpc::SolanaRpc;
@@ -9,6 +10,7 @@ use crate::config::SniperSettings;
 use solana_sdk::pubkey::Pubkey;
 // (log subscription stub – real PubSub integration to be reintroduced with correct crate paths)
 use once_cell::sync::Lazy;
+use regex::Regex;
 
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
 use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
@@ -43,6 +45,8 @@ pub struct SniperEngine {
 impl SniperEngine {
     pub fn new(rpc: Arc<SolanaRpc>, cfg: SniperCfg) -> Self { Self { rpc, cfg } }
 
+    fn clone_for_spawn(&self) -> Self { SniperEngine { rpc: self.rpc.clone(), cfg: self.cfg.clone() } }
+
     fn http_to_ws(url: &str) -> String {
         if url.starts_with("https://") { url.replacen("https://", "wss://", 1) }
         else if url.starts_with("http://") { url.replacen("http://", "ws://", 1) } else { url.to_string() }
@@ -53,6 +57,7 @@ impl SniperEngine {
         let programs = vec![RAYDIUM_AMM_V4.to_string(), ORCA_WHIRLPOOL_PROGRAM.to_string()];
         for pid in programs {
             let url = ws_url.clone();
+            let engine_clone = self.clone_for_spawn();
             tokio::spawn(async move {
                 let sub_req = json!({
                     "jsonrpc": "2.0",
@@ -72,7 +77,7 @@ impl SniperEngine {
                                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
                                             if let Some(arr) = v.pointer("/params/result/value/logs").and_then(|x| x.as_array()) {
                                                 let lines: Vec<String> = arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect();
-                                                Self::handle_logs_static(lines).await;
+                                                engine_clone.extract_and_evaluate(lines).await;
                                             }
                                         }
                                     }
@@ -93,9 +98,37 @@ impl SniperEngine {
     }
 
     #[allow(dead_code)]
-    async fn handle_logs_static(logs: Vec<String>) {
-        // Placeholder (will be replaced with cfg/rpc richer version in next iteration)
-        for l in logs { let lower = l.to_ascii_lowercase(); if (lower.contains("initialize") || lower.contains("init")) && (lower.contains("pool") || lower.contains("whirlpool")) { debug!(line = %l, "candidate pool init log"); } }
+    async fn handle_logs_static(_logs: Vec<String>) {
+        // deprecated placeholder
+    }
+
+    async fn extract_and_evaluate(&self, logs: Vec<String>) {
+        static BASE58_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[1-9A-HJ-NP-Za-km-z]{32,44}").unwrap());
+        for line in logs {
+            let lower = line.to_ascii_lowercase();
+            if !(lower.contains("init") || lower.contains("initialize")) { continue; }
+            if !(lower.contains("pool") || lower.contains("whirlpool")) { continue; }
+            debug!(line = %line, "sniper: init-like log");
+            let mut seen = std::collections::HashSet::new();
+            for m in BASE58_RE.find_iter(&line) {
+                let s = m.as_str();
+                if !seen.insert(s) { continue; }
+                if let Ok(pk) = Pubkey::from_str(s) {
+                    // Run LP concentration check (if thresholds configured)
+                    match self.lp_lock_check(&pk).await {
+                        Ok(Some(assess)) => {
+                            if assess.concentration_ok {
+                                info!(mint = %pk, top1 = assess.top1_pct, top3 = assess.top3_pct, top5 = assess.top5_pct, "sniper: candidate mint passes concentration");
+                            } else {
+                                debug!(mint = %pk, top1 = assess.top1_pct, top3 = assess.top3_pct, top5 = assess.top5_pct, "sniper: rejected by concentration");
+                            }
+                        }
+                        Ok(None) => { debug!(mint = %pk, "sniper: no lp thresholds configured or insufficient data"); }
+                        Err(e) => { debug!(mint = %pk, error = ?e, "sniper: lp check error"); }
+                    }
+                }
+            }
+        }
     }
 
     pub async fn run(&self) -> Result<()> {
