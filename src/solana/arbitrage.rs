@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tracing::info;
 use crate::{types::{TradeIntent, Token, Amount, Side}};
 use super::{rpc::SolanaRpc, dex::{Dex, Quote}};
-use crate::metrics::{ARB_TRIANGLE_ATTEMPTS, ARB_TRIANGLE_PROFITABLE};
+use crate::metrics::{ARB_TRIANGLE_ATTEMPTS, ARB_TRIANGLE_PROFITABLE, CYCLE_PARTIAL_EXAMINED, CYCLE_PRUNED_DOMINANCE, CYCLE_PRUNED_BOUND, CYCLE_COMPLETED};
 use crate::solana::dex::router::Router;
 use rust_decimal::Decimal;
 use solana_sdk::{transaction::Transaction, instruction::Instruction, signature::Keypair, hash::Hash, signature::Signer};
@@ -118,7 +118,7 @@ impl ArbitrageEngine {
 
     /// Assemble a transaction plan for a profitable triangle (A->B->C->A) using best hop quotes.
     /// Returns None if not profitable after filters or if any hop instructions can't be built.
-    pub async fn assemble_triangle_plan(&self, a: &str, b: &str, c: &str, ui_amount_a: f64, decimals: u32, slippage_bps: u32, fee_payer: &Keypair) -> Result<Option<TransactionPlan>> {
+    pub async fn assemble_triangle_plan(&self, a: &str, b: &str, c: &str, ui_amount_a: f64, decimals: u32, slippage_bps: u32, _fee_payer: &Keypair) -> Result<Option<TransactionPlan>> {
         let amount_in = (ui_amount_a * 10f64.powi(decimals as i32)) as u64;
         ARB_TRIANGLE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Hop1
@@ -129,7 +129,7 @@ impl ArbitrageEngine {
         let hop3 = self.router.best_quote_exact_in(&h2.quote.output_mint, a, h2.quote.amount_out).await?; let h3 = match hop3 { Some(h)=>h, None=>return Ok(None) };
         let final_out = h3.quote.amount_out;
         if final_out <= amount_in { return Ok(None); }
-        let gross_profit = final_out - amount_in;
+    let _gross_profit = final_out - amount_in; // gross currently not returned directly; kept for potential logging
         let maybe_net = compute_net_profit(amount_in, final_out, self.min_profit_bps, self.est_tx_cost_lamports);
         let net_profit = match maybe_net { Some(n)=>n, None=>return Ok(None) };
         ARB_TRIANGLE_PROFITABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -303,6 +303,7 @@ impl ArbitrageEngine {
                         };
                         let replace = seen_paths.insert(key);
                         if replace { results.push(GenericCycleOpportunity { path: full, amount_in, gross_out: in_amount_close, gross_profit, net_profit: net }); }
+                        CYCLE_COMPLETED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     }
                     // Avoid revisiting base mid-path or repeating tokens (simple cycle, no repeats except closing base)
@@ -317,7 +318,7 @@ impl ArbitrageEngine {
                     // Dominance check
                     let depth_next = path.len(); // depth after adding nxt (0-based path len -1 edges so far)
                     let dom_key = (nxt.clone(), depth_next);
-                    if let Some(best_amt) = dominance.get(&dom_key) { if *best_amt >= new_amount { continue; } }
+                    if let Some(best_amt) = dominance.get(&dom_key) { if *best_amt >= new_amount { CYCLE_PRUNED_DOMINANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed); continue; } }
                     dominance.insert(dom_key, new_amount);
                     // Upper-bound pruning: remaining edges (including closing back to base)
                     let remaining_edges = if max_hops > path.len()+1 { max_hops - (path.len()+1) } else { 0 }; // edges we could still traverse before hitting max_hops (excluding required closing which we allow within bound)
@@ -327,9 +328,10 @@ impl ArbitrageEngine {
                         let mut ub: u128 = new_amount as u128;
                         for _ in 0..exp { ub = ub * (max_ratio_bps as u128) / 10_000u128; if ub > u128::MAX / 2 { break; } }
                         let ub_u64 = if ub > u128::from(u64::MAX) { u64::MAX } else { ub as u64 };
-                        if ub_u64 <= amount_in + best_gross_profit { continue; }
+                        if ub_u64 <= amount_in + best_gross_profit { CYCLE_PRUNED_BOUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed); continue; }
                     }
                     let mut new_path = path.clone(); new_path.push(nxt.clone());
+                    CYCLE_PARTIAL_EXAMINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     stack.push((new_path, new_amount));
                 }
             }

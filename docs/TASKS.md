@@ -32,6 +32,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Profit Ranking (rank_triangular_cycles) für Triangular Cycles
 - [x] N>3 Hop Cycle Enumeration (enumerate_cycles_generic + ranking)
 	- [x] Dominance + Upper-Bound Pruning (verlustfrei) für generic cycle search
+	- [x] Cycle Search Metrics (partial examined, dominance pruned, bound pruned, completed)
 - [ ] Jito/MEV-Integration (später)
 - [x] Pre-TX Simulation (RPC `simulateTransaction`)
 
@@ -53,6 +54,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Erste heuristische Implementierung (Estimator Modul + Raydium build_swap_plan_auto)
 7. Metrics: Pool Count, Quote Latency, Routing Auswahlgrund (DEX, hops)
 	- [x] Basic counters (quotes, successes, hop types, triangle attempts/profitable, avg latency)
+	- [x] Generic cycle & pruning counters (partial examined, dominance, bound, completed)
 8. CI Pipeline (fmt, clippy, test, optional wasm build)
 9. Config Hot-Reload (Signal / File Watch) für Routing/Slippage Parameter
 10. Risk Layer: Max Notional pro Trade + Daily Loss Limit Skeleton
