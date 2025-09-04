@@ -71,10 +71,11 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 7. Metrics & Observability
 	- [x] Prometheus HTTP Exporter (Port 9898)
 	- [x] Swap Latency Histogram
+	- [x] Quote Latenz Histogramm
 	- [x] Trade / RPC Error / Open Positions / Realized PnL / Liquidity Gauges & Counter
-	- [ ] Quote Latenz Histogramm
-	- [ ] Slippage / Shortfall Metrics (Aggregierte Verteilung)
-	- [ ] Fee Breakdown Metrics
+	- [x] Slippage / Shortfall Metrics (Aggregierte Shortfall Tokens & SOL)
+	- [x] Fee Breakdown (Aggregierte Netzwerk Fees)
+	- [ ] PnL Distribution Histogram / Buckets (optional)
 8. CI Pipeline (fmt, clippy, test, optional wasm build)
 9. Config Hot-Reload (Signal / File Watch) für Routing/Slippage Parameter
 10. Risk Layer

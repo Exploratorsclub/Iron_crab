@@ -35,6 +35,8 @@ use crate::metrics::{
     LIQUIDITY_ESTIMATE_SOL_MICRO,
     RPC_ERRORS_TOTAL,
     record_swap_latency,
+    record_shortfall,
+    record_network_fee,
 };
 
 // Simple global blacklist (extendable via config later)
@@ -397,6 +399,7 @@ impl SniperEngine {
                             let mut rs = self.risk.write();
                             rs.pending.insert(*mint, PendingTrade { expected_out_tokens: pm.expected_out, dex: "RAYDIUM".into(), sig: sig.to_string(), lamports_in, network_fee_lamports: fee_estimate, ts: ChronoUtc::now().timestamp() });
                         }
+                        record_network_fee(fee_estimate);
                         let line = format!(
                             "{ts},BUY,{mint},RAYDIUM,{sig},{lamports_in},0,0,0,{exp_tokens},,{short_tokens},,{fee},,expected_min_out={min_out}",
                             ts=ChronoUtc::now().to_rfc3339(),
@@ -411,6 +414,7 @@ impl SniperEngine {
                         self.append_trade_record(&line, true);
                     }
                 } else {
+                    record_network_fee(fee_estimate);
                     let line = format!(
                         "{ts},BUY,{mint},ORCA,{sig},{lamports_in},0,0,0,0,,0,,{fee},,notes=orca_buy",
                         ts=ChronoUtc::now().to_rfc3339(),
@@ -564,6 +568,7 @@ impl SniperEngine {
                         let shortfall = expected_raw.saturating_sub(actual_raw);
                         let shortfall_ui = shortfall as f64 / scale;
                         let shortfall_sol = shortfall_ui * pos.entry_price_sol;
+                        record_shortfall(shortfall, shortfall_sol);
                         let line = format!(
                             "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9}",
                             ts=ChronoUtc::now().to_rfc3339(),
@@ -715,6 +720,7 @@ impl SniperEngine {
                 let _ = self.treasury.unwrap_wsol(&self.rpc, None).await;
                 // Trade CSV log (SELL)
                 let lamports_out = (delta_wsol * 1e9) as u64;
+                record_network_fee(fee_estimate);
                 let line = format!(
                     "{ts},SELL,{mint},*,{sig},0,{lamports_out},{tok_in},{tok_out},,,0,,{fee},{realized},exit_full",
                     ts=ChronoUtc::now().to_rfc3339(),

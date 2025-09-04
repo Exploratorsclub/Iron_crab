@@ -30,8 +30,11 @@ Sniper & Risk
 - Config Hot Reload (ENV: `IRONCRAB_SNIPER_RELOAD_PATH`)
 
 Metrics & Observability
-- Prometheus Exporter (Port 9898) – Trades, RPC Errors, Open Positions, Realized PnL (µSOL), Liquidity, Swap Latency Histogram
-- Geplante Erweiterungen: Quote Latency Histogram, Slippage/Shortfall Aggregation, Fee Breakdown
+ - Prometheus Exporter (Port 9898) – Trades, RPC Errors, Open Positions, Realized PnL (µSOL), Liquidity
+ - Histograms: Swap Latency & Quote Latency
+ - Aggregates: Shortfall Tokens & SOL, Network Fees (Lamports)
+ - Rolling PnL / Sharpe (intern) – (exponieren via zukünftige Gauge geplant)
+ - Geplante Erweiterungen: PnL Distribution Histogram, Fee Type Breakdown (LP vs Network)
 
 Trade Logging
 - CSV Rotation: `trade_logs/trades-YYYYMMDD.csv` (override Pfad via `IRONCRAB_TRADE_LOG_DIR`)
