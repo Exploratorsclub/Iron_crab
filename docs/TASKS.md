@@ -46,7 +46,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [ ] Erstkauf + enge SL/TP
   
 ### Nächste Micro-Tasks (aktualisiert)
-1. Orca: Vollständige Whirlpool Layout Implementierung (strukturierter Parser, feste Offsets, verifizierte Tick Index & Liquidity Fields)
+1. Orca: Vollständige Whirlpool Layout Implementierung (strukturierter Parser, feste Offsets, verifizierte Tick Index & Liquidity Fields) – DONE (strict parser + semantic validation)
 2. Orca Swap: Ersetzen der Platzhalter User Accounts (Authority, Source/Dest Token Accounts) + Option für sqrt_price_limit
 3. Raydium: Entfernung von Vault-Fallbacks (immer echte Vault Pubkeys) & zusätzliche Hard Validation (target_orders optional, aber loggen)
 4. Router: Depth‑2 Pfad Benchmark + Depth‑3 (erste Greedy Implementierung + Pruning) [Depth‑3 implemented]

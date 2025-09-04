@@ -82,23 +82,14 @@ impl Dex for Orca {
     let mut added = 0u32;
     let mut fee_tier_keys: Vec<Pubkey> = Vec::new();
         for (addr, acc) in accounts.into_iter().take(5000) { // safety limit
-            if let Some(parsed) = layout::parse_whirlpool(&acc.data) {
-                // Additional structural validation (Safety task):
-                // 1. Tick spacing bounds (typical small set: 1, 8, 16, 32, 64, 128, 256, 512)
-                const ALLOWED_SPACINGS: [u16;8] = [1,8,16,32,64,128,256,512];
-                if !ALLOWED_SPACINGS.contains(&parsed.tick_spacing) { continue; }
-                // 2. Vault / Mint cross-check: ensure vaults are distinct from mints (should be token accounts, not mint accounts)
-                if parsed.token_vault_a == parsed.token_mint_a || parsed.token_vault_b == parsed.token_mint_b { continue; }
-                // 3. Current tick plausibility: for sqrt_price > 0; skip if absurd magnitude (|tick| > 5e6)
-                if parsed.tick_current_index.abs() > 5_000_000 { continue; }
+            if let Some(parsed) = layout::parse_whirlpool_strict(&acc.data) {
                 // Fetch vault balances (SPL token accounts) to approximate reserves
                 let mut reserves = (0u128, 0u128);
                 if let Ok(vaults) = self.rpc.rpc.get_multiple_accounts(&[parsed.token_vault_a, parsed.token_vault_b]).await {
                     if let Some(Some(v1)) = vaults.get(0).map(|o| o.as_ref()) { if v1.data.len() >= 72 { reserves.0 = Self::parse_token_amount(&v1.data) as u128; } }
                     if let Some(Some(v2)) = vaults.get(1).map(|o| o.as_ref()) { if v2.data.len() >= 72 { reserves.1 = Self::parse_token_amount(&v2.data) as u128; } }
                 }
-    if parsed.fee_rate == 0 || parsed.fee_rate > 1000 { continue; } // sanity: we only support standard fee tiers presently
-        if reserves.0 == 0 || reserves.1 == 0 { continue; }
+                if reserves.0 == 0 || reserves.1 == 0 { continue; }
                 fee_tier_keys.push(parsed.fee_tier);
                 let id = addr;
                 self.pools.insert(id, OrcaPool { base_mint: parsed.token_mint_a, quote_mint: parsed.token_mint_b, reserve_base: reserves.0, reserve_quote: reserves.1, fee_bps: parsed.fee_rate as u32, fee_tier: Some(parsed.fee_tier), tick_spacing: Some(parsed.tick_spacing), vault_a: parsed.token_vault_a, vault_b: parsed.token_vault_b, tick_current_index: Some(parsed.tick_current_index) });
