@@ -29,6 +29,24 @@ pub struct SimulationOutcome {
     pub err: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EdgeQuoteAgg {
+    pub input_mint: String,
+    pub output_mint: String,
+    pub amount_in: u64,
+    pub best_dex_index: usize,
+    pub quote: Quote,
+}
+
+#[derive(Debug, Clone)]
+pub struct CycleOpportunity {
+    pub path: (String,String,String),
+    pub amount_in: u64,
+    pub gross_out: u64,
+    pub gross_profit: u64,
+    pub net_profit: Option<u64>,
+}
+
 pub struct ArbitrageEngine {
     pub rpc: Arc<SolanaRpc>,
     pub connectors: Vec<Arc<dyn Dex>>, // Raydium, Orca, ...
@@ -142,6 +160,71 @@ impl ArbitrageEngine {
         let units_consumed = value.units_consumed;
         let err = value.err.map(|e| format!("{:?}", e));
         Ok(SimulationOutcome { units_consumed, logs, err })
+    }
+
+    /// Aggregate best quotes for a list of (input, output) pairs using all connectors (does NOT refresh).
+    pub async fn aggregate_best_edges(&self, pairs: &[(String,String)], amount_in: u64) -> Result<Vec<EdgeQuoteAgg>> {
+        use futures::future::join_all;
+        let mut results: Vec<EdgeQuoteAgg> = Vec::new();
+        for (input, output) in pairs.iter() {
+            // query all dexs concurrently
+            let futs = self.connectors.iter().map(|d| d.quote_exact_in(input, output, amount_in));
+            let outs = join_all(futs).await;
+            let mut best: Option<(usize, Quote)> = None;
+            for (i,r) in outs.into_iter().enumerate() {
+                if let Ok(Some(q)) = r {
+                    let rep = best.as_ref().map(|(_,b)| b.amount_out < q.amount_out).unwrap_or(true);
+                    if rep { best = Some((i,q)); }
+                }
+            }
+            if let Some((di,q)) = best { results.push(EdgeQuoteAgg { input_mint: input.clone(), output_mint: output.clone(), amount_in, best_dex_index: di, quote: q }); }
+        }
+        Ok(results)
+    }
+
+    /// Enumerate triangular cycles (A->B->C->A) over discovered token graph and return profitable opportunities (gross > in).
+    /// Decimals assumed homogeneous (6) for now; future: per-mint decimals map.
+    pub async fn enumerate_triangular_cycles(&self, base_tokens: &[String], amount_in: u64) -> Result<Vec<CycleOpportunity>> {
+        use std::collections::{HashSet, HashMap};
+        let mut pairs: HashSet<(String,String)> = HashSet::new();
+        for d in &self.connectors { for (a,b) in d.list_pairs() { pairs.insert((a.clone(), b.clone())); } }
+        // Build adjacency
+        let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
+        for (a,b) in pairs.iter() { adj.entry(a.clone()).or_default().insert(b.clone()); adj.entry(b.clone()).or_default().insert(a.clone()); }
+        let mut cycles = Vec::new();
+        for base in base_tokens {
+            if !adj.contains_key(base) { continue; }
+            let neigh1 = adj.get(base).unwrap();
+            for mid1 in neigh1.iter() {
+                if mid1 == base { continue; }
+                let neigh2 = match adj.get(mid1) { Some(n)=>n, None=>continue };
+                for mid2 in neigh2.iter() {
+                    if mid2 == mid1 || mid2 == base { continue; }
+                    // require edge mid2 -> base exists to close cycle
+                    if !adj.get(mid2).map(|s| s.contains(base)).unwrap_or(false) { continue; }
+                    // Evaluate greedy cycle using router quotes
+                    let h1 = self.router.best_quote_exact_in(base, mid1, amount_in).await?; let h1 = match h1 { Some(v)=>v, None=>continue };
+                    let h2 = self.router.best_quote_exact_in(&h1.quote.output_mint, mid2, h1.quote.amount_out).await?; let h2 = match h2 { Some(v)=>v, None=>continue };
+                    let h3 = self.router.best_quote_exact_in(&h2.quote.output_mint, base, h2.quote.amount_out).await?; let h3 = match h3 { Some(v)=>v, None=>continue };
+                    let final_out = h3.quote.amount_out;
+                    if final_out <= amount_in { continue; }
+                    let gross_profit = final_out - amount_in;
+                    let net = compute_net_profit(amount_in, final_out, self.min_profit_bps, self.est_tx_cost_lamports);
+                    cycles.push(CycleOpportunity { path: (base.clone(), mid1.clone(), mid2.clone()), amount_in, gross_out: final_out, gross_profit, net_profit: net });
+                }
+            }
+        }
+        // Deduplicate cycles (A,B,C) vs (A,C,B): enforce order mid1 < mid2 lexicographically
+        let mut uniq: HashMap<(String,String,String), CycleOpportunity> = HashMap::new();
+        for c in cycles.into_iter() {
+            let (a,b,c2) = &c.path;
+            let key = if b < c2 { (a.clone(), b.clone(), c2.clone()) } else { (a.clone(), c2.clone(), b.clone()) };
+            let replace = uniq.get(&key).map(|e| e.gross_profit < c.gross_profit).unwrap_or(true);
+            if replace { uniq.insert(key, c); }
+        }
+        let mut v: Vec<_> = uniq.into_values().collect();
+        v.sort_by(|x,y| y.gross_profit.cmp(&x.gross_profit));
+        Ok(v)
     }
 }
 

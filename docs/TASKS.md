@@ -27,10 +27,10 @@
 Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop Routing) sind implementiert; verbleiben sind Genauigkeit (Whirlpool Layout), echte Kontoersetzung und Hardening.
 
 ## 3) Arbitrage
-- [ ] DEX Quotes aggregieren, beste Edge wählen
-	- (Partial vorhanden: Grundgerüst `arbitrage.rs`, aber keine finale Auswahl-/TX-Pipeline)
+- [x] DEX Quotes aggregieren, beste Edge wählen (aggregate_best_edges + best_edge)
+	- Erweiterungen: enumerate_triangular_cycles, TransactionPlan + Simulation
 - [ ] Jito/MEV-Integration (später)
-- [ ] Pre-TX Simulation (RPC `simulateTransaction`)
+- [x] Pre-TX Simulation (RPC `simulateTransaction`)
 
 ## 4) Sniper
 - [ ] WS-Logs Subscribe (Pool-Create)
