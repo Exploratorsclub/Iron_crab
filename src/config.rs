@@ -78,6 +78,7 @@ pub struct SniperSettings {
     #[serde(default)] pub min_pool_liquidity_sol: Option<f64>,
     #[serde(default)] pub require_freeze_auth_none: Option<bool>,
     #[serde(default)] pub require_mint_decimals_range: Option<(u8,u8)>,
+    #[serde(default)] pub lp_top1_max_pct: Option<f64>,
 }
 
 impl Config {

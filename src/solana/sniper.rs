@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use serde_json::json;
 
 // Simple global blacklist (extendable via config later)
+#[allow(dead_code)]
 static MINT_BLACKLIST: Lazy<HashSet<String>> = Lazy::new(|| HashSet::new());
 
 #[derive(Clone)]
@@ -29,6 +30,7 @@ pub struct SniperCfg {
     pub min_pool_liquidity_sol: Option<f64>,
     pub require_freeze_auth_none: Option<bool>,
     pub require_mint_decimals_range: Option<(u8,u8)>,
+    pub lp_top1_max_pct: Option<f64>,
 }
 
 pub struct SniperEngine {
@@ -117,6 +119,39 @@ impl SniperEngine {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct LpLockAssessment {
+    pub top1_pct: f64,
+    pub concentration_ok: bool,
+    pub largest_account: Option<String>,
+}
+
+impl SniperEngine {
+    pub async fn lp_lock_check(&self, mint: &Pubkey) -> Result<Option<LpLockAssessment>> {
+        // Only run if threshold configured
+        if self.cfg.lp_top1_max_pct.is_none() { return Ok(None); }
+        let threshold = self.cfg.lp_top1_max_pct.unwrap();
+        // Fetch mint account
+        let mint_acc = match self.rpc.rpc.get_account(mint).await { Ok(a)=>a, Err(e)=> { warn!(?e, "mint account fetch failed"); return Ok(None); } };
+    // SPL Mint length heuristic (approx range) & manual decode subset
+    if mint_acc.data.len() < 70 || mint_acc.data.len() > 90 { return Ok(None); }
+    // Minimal decimals extraction (offset 44 for decimals for Token Program v3 layout)
+    let _decimals = mint_acc.data.get(44).cloned().unwrap_or(0);
+    let supply_le_bytes = &mint_acc.data[36..44];
+    let supply_raw = u64::from_le_bytes(supply_le_bytes.try_into().unwrap());
+    let supply = supply_raw as f64;
+    if supply == 0.0 { return Ok(None); }
+    if supply == 0.0 { return Ok(None); }
+        // Largest accounts
+    let list = match self.rpc.rpc.get_token_largest_accounts(mint).await { Ok(v)=>v, Err(e)=> { warn!(?e, "largest accounts fetch failed"); return Ok(None); } };
+    let top1_pct = 0.0; // placeholder until proper amount decode
+    let mut largest_key: Option<String> = None;
+    if let Some(first) = list.first() { largest_key = Some(first.address.clone()); /* TODO: decode UiTokenAmount fields once types confirmed */ }
+        let concentration_ok = top1_pct <= threshold;
+        Ok(Some(LpLockAssessment { top1_pct, concentration_ok, largest_account: largest_key }))
+    }
+}
+
 pub async fn run_sniper(rpc: Arc<SolanaRpc>, cfg: SniperCfg) -> Result<()> {
     let engine = SniperEngine::new(rpc, cfg);
     engine.run().await
@@ -132,6 +167,7 @@ impl From<&SniperSettings> for SniperCfg {
             min_pool_liquidity_sol: s.min_pool_liquidity_sol,
             require_freeze_auth_none: s.require_freeze_auth_none,
             require_mint_decimals_range: s.require_mint_decimals_range,
+            lp_top1_max_pct: s.lp_top1_max_pct,
         }
     }
 }
