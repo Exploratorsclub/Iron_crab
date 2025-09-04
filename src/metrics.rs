@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use once_cell::sync::Lazy;
 use std::time::{Instant};
 use std::net::SocketAddr;
@@ -47,6 +47,15 @@ pub static SHORTFALL_SOL_MICRO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::
 pub static FILLS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Network fees aggregation
 pub static NETWORK_FEES_LAMPORTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Realized trade return histogram (ratio realized_pnl / invested) buckets (cumulative style capture)
+// Buckets chosen to capture deep losses to outsized wins.
+const TRADE_RETURN_BUCKETS: &[f64] = &[
+    -0.9, -0.5, -0.25, -0.1, -0.05, -0.02, -0.01, 0.0,
+     0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0
+];
+pub static TRADE_RETURN_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| TRADE_RETURN_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
+pub static TRADE_RETURN_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TRADE_RETURN_SUM_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0)); // signed sum(ret * 1e6) for average
 
 pub struct LatencyTimer { start: Instant }
 impl LatencyTimer { pub fn start() -> Self { Self { start: Instant::now() } } }
@@ -65,6 +74,22 @@ pub fn record_shortfall(tokens: u64, sol_ui: f64) {
 }
 
 pub fn record_network_fee(lamports: u64) { NETWORK_FEES_LAMPORTS_TOTAL.fetch_add(lamports, Ordering::Relaxed); }
+
+pub fn record_trade_return(ret: f64) {
+    // Clamp extreme outliers to last bucket range for stability
+    let mut placed = false;
+    for (i,b) in TRADE_RETURN_BUCKETS.iter().enumerate() {
+        if ret <= *b { TRADE_RETURN_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed); placed = true; break; }
+    }
+    if !placed {
+        // Overflow (> last bucket) counts only in an implicit +Inf bucket via count (Prometheus expectation). We don't keep explicit here.
+    }
+    TRADE_RETURN_COUNT.fetch_add(1, Ordering::Relaxed);
+    let micro = (ret * 1_000_000.0).round();
+    // Bound to i64 range
+    let micro_i64 = if micro > i64::MAX as f64 { i64::MAX } else if micro < i64::MIN as f64 { i64::MIN } else { micro as i64 };
+    TRADE_RETURN_SUM_MICRO.fetch_add(micro_i64, Ordering::Relaxed);
+}
 
 pub fn snapshot() -> MetricsSnapshot {
     MetricsSnapshot {
@@ -152,6 +177,12 @@ async fn metrics_response() -> Response<Body> {
     line!("shortfall_sol_total", SHORTFALL_SOL_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0);
     line!("fills_total", FILLS_TOTAL.load(Ordering::Relaxed));
     line!("network_fees_lamports_total", NETWORK_FEES_LAMPORTS_TOTAL.load(Ordering::Relaxed));
+    // Trade return histogram (realized PnL / invested)
+    let tr_count = TRADE_RETURN_COUNT.load(Ordering::Relaxed);
+    let tr_sum_micro = TRADE_RETURN_SUM_MICRO.load(Ordering::Relaxed);
+    for (i,b) in TRADE_RETURN_BUCKETS.iter().enumerate() { let c = TRADE_RETURN_BUCKET_COUNTS[i].load(Ordering::Relaxed); out.push_str(&format!("trade_return_bucket{{le=\"{}\"}} {}\n", b, c)); }
+    out.push_str(&format!("trade_return_sum {}\n", tr_sum_micro as f64 / 1_000_000.0));
+    out.push_str(&format!("trade_return_count {}\n", tr_count));
     // Histogram exposition (Prometheus classic format)
     let swap_count = SWAP_LATENCY_COUNT.load(Ordering::Relaxed);
     let swap_sum = SWAP_LATENCY_SUM_NS.load(Ordering::Relaxed);

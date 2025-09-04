@@ -37,6 +37,7 @@ use crate::metrics::{
     record_swap_latency,
     record_shortfall,
     record_network_fee,
+    record_trade_return,
 };
 
 // Simple global blacklist (extendable via config later)
@@ -695,6 +696,8 @@ impl SniperEngine {
     let fee_est_native = fee_estimate as f64 / 1e9;
     let fee_est = if native_delta < 0.0 { -native_delta.max(fee_est_native) } else { fee_est_native }; // prefer RPC reported fee_estimate
     let realized = delta_wsol - invested_sol - fee_est;
+    let trade_ret = if invested_sol > 0.0 { realized / invested_sol } else { 0.0 };
+    record_trade_return(trade_ret);
                 self.risk_reset_if_needed();
                 {
                     let mut rs = self.risk.write();
