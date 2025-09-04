@@ -47,6 +47,15 @@ pub struct CycleOpportunity {
     pub net_profit: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct GenericCycleOpportunity {
+    pub path: Vec<String>, // first == last
+    pub amount_in: u64,
+    pub gross_out: u64,
+    pub gross_profit: u64,
+    pub net_profit: Option<u64>,
+}
+
 pub struct ArbitrageEngine {
     pub rpc: Arc<SolanaRpc>,
     pub connectors: Vec<Arc<dyn Dex>>, // Raydium, Orca, ...
@@ -234,6 +243,76 @@ impl ArbitrageEngine {
             let an = a.net_profit.unwrap_or(a.gross_profit);
             let bn = b.net_profit.unwrap_or(b.gross_profit);
             bn.cmp(&an) // descending
+        });
+        if cycles.len() > limit { cycles.truncate(limit); }
+        Ok(cycles)
+    }
+
+    /// Enumerate generic cycles up to `max_hops` (token count including start/end) starting from each base token.
+    /// Example: max_hops=5 allows A->B->C->D->A (4 distinct edges, 5 tokens with return).
+    pub async fn enumerate_cycles_generic(&self, base_tokens: &[String], amount_in: u64, max_hops: usize, max_cycles: usize) -> Result<Vec<GenericCycleOpportunity>> {
+        use std::collections::{HashSet, HashMap};
+        if max_hops < 4 { return Ok(Vec::new()); }
+        // Build adjacency from all connectors
+        let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
+        for d in &self.connectors { for (a,b) in d.list_pairs() { adj.entry(a.clone()).or_default().insert(b.clone()); adj.entry(b.clone()).or_default().insert(a.clone()); } }
+        let mut results: Vec<GenericCycleOpportunity> = Vec::new();
+        for base in base_tokens {
+            if !adj.contains_key(base) { continue; }
+            // DFS stack: (path_tokens, current_amount_out)
+            let mut stack: Vec<(Vec<String>, u64)> = vec![(vec![base.clone()], amount_in)];
+            let mut seen_paths = HashSet::new();
+            while let Some((path, amt)) = stack.pop() {
+                if results.len() >= max_cycles { break; }
+                if path.len() > max_hops { continue; }
+                let current = path.last().unwrap();
+                let neighbors = match adj.get(current) { Some(n)=>n, None=>continue };
+                for nxt in neighbors {
+                    if results.len() >= max_cycles { break; }
+                    // Closing condition
+                    let closing = nxt == base && path.len() >= 3; // >=3 distinct tokens visited (path len >=3 before adding base)
+                    if closing {
+                        // Form cycle path including base again
+                        let mut full = path.clone(); full.push(base.clone());
+                        // Quote along edges to compute profit (re-run sequential quotes for accuracy)
+                        let mut in_amount = amount_in;
+                        let mut ok = true;
+                        for w in 0..full.len()-1 { // last is closing base
+                            let from = &full[w]; let to = &full[w+1];
+                            match self.router.best_quote_exact_in(from, to, in_amount).await? { Some(rq)=> { in_amount = rq.quote.amount_out; } None => { ok = false; break; } }
+                        }
+                        if !ok { continue; }
+                        if in_amount <= amount_in { continue; }
+                        let gross_profit = in_amount - amount_in;
+                        let net = compute_net_profit(amount_in, in_amount, self.min_profit_bps, self.est_tx_cost_lamports);
+                        // Dedup by sorted internal tokens (excluding duplicate base at end) + length
+                        let key = {
+                            let mut inner = full.clone(); inner.pop(); // remove trailing base
+                            format!("{}:{}", inner.join("->"), inner.len())
+                        };
+                        let replace = seen_paths.insert(key);
+                        if replace { results.push(GenericCycleOpportunity { path: full, amount_in, gross_out: in_amount, gross_profit, net_profit: net }); }
+                        continue;
+                    }
+                    // Avoid revisiting base mid-path or repeating tokens (simple cycle, no repeats except closing base)
+                    if nxt == base || path.contains(nxt) { continue; }
+                    if path.len()+1 <= max_hops {
+                        let mut new_path = path.clone(); new_path.push(nxt.clone());
+                        stack.push((new_path, amt));
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Rank generic cycles (variable length) by net or gross profit.
+    pub async fn rank_cycles_generic(&self, base_tokens: &[String], amount_in: u64, max_hops: usize, max_cycles: usize, limit: usize) -> Result<Vec<GenericCycleOpportunity>> {
+        let mut cycles = self.enumerate_cycles_generic(base_tokens, amount_in, max_hops, max_cycles).await?;
+        cycles.sort_by(|a,b| {
+            let an = a.net_profit.unwrap_or(a.gross_profit);
+            let bn = b.net_profit.unwrap_or(b.gross_profit);
+            bn.cmp(&an)
         });
         if cycles.len() > limit { cycles.truncate(limit); }
         Ok(cycles)
