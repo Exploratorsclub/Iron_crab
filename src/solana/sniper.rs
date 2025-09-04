@@ -37,6 +37,8 @@ use crate::metrics::{
     record_shortfall,
     record_network_fee,
     record_trade_return,
+    RPC_RETRY_ATTEMPTS_TOTAL,
+    WS_RECONNECTS_TOTAL,
 };
 use serde::{Serialize, Deserialize};
 use serde_json::json;
@@ -124,6 +126,21 @@ pub struct SniperEngine {
 }
 
 impl SniperEngine {
+    async fn rpc_retry_tx(&self, tx: &Transaction, max_attempts: u32) -> Result<solana_sdk::signature::Signature> {
+        let mut attempt = 0;
+        loop {
+            match self.rpc.rpc.send_and_confirm_transaction(tx).await {
+                Ok(sig) => return Ok(sig),
+                Err(e) => {
+                    attempt += 1;
+                    RPC_RETRY_ATTEMPTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if attempt >= max_attempts { return Err(e.into()); }
+                    let delay_ms = (2u64.pow(attempt.min(5)) * 200).min(5_000);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
     fn effective_max_buy_sol(&self) -> f64 {
         let cfg = self.cfg.read().clone();
         let rs = self.risk.read();
@@ -186,32 +203,39 @@ impl SniperEngine {
                     "method": "logsSubscribe",
                     "params": [ { "mentions": [pid] }, { "commitment": "processed" } ]
                 });
-                match connect_async(&url).await {
-                    Ok((mut ws, _resp)) => {
-                        if ws.send(Message::text(sub_req.to_string())).await.is_err() { return; }
-                        info!(program_id = %RAYDIUM_AMM_V4, "sniper websocket connected (generic)");
-                        while let Some(msg) = ws.next().await {
-                            match msg {
-                                Ok(Message::Text(txt)) => {
-                                    if txt.contains("logsNotification") {
-                                        // Extract logs array heuristically
-                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                                            if let Some(arr) = v.pointer("/params/result/value/logs").and_then(|x| x.as_array()) {
-                                                let lines: Vec<String> = arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect();
-                                                engine_clone.extract_and_evaluate(lines).await;
+                let mut attempt: u32 = 0;
+                loop {
+                    match connect_async(&url).await {
+                        Ok((mut ws, _resp)) => {
+                            attempt = 0;
+                            if ws.send(Message::text(sub_req.to_string())).await.is_err() { return; }
+                            info!(program_id = %RAYDIUM_AMM_V4, "sniper websocket connected (generic)");
+                            while let Some(msg) = ws.next().await {
+                                match msg {
+                                    Ok(Message::Text(txt)) => {
+                                        if txt.contains("logsNotification") {
+                                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                                if let Some(arr) = v.pointer("/params/result/value/logs").and_then(|x| x.as_array()) {
+                                                    let lines: Vec<String> = arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect();
+                                                    engine_clone.extract_and_evaluate(lines).await;
+                                                }
                                             }
                                         }
                                     }
+                                    Ok(Message::Binary(_)) => {}
+                                    Ok(Message::Ping(p)) => { let _ = ws.send(Message::Pong(p)).await; }
+                                    Ok(Message::Close(_)) => { warn!("ws closed"); break; }
+                                    Err(e) => { warn!(?e, "ws error"); break; }
+                                    _ => {}
                                 }
-                                Ok(Message::Binary(_)) => {}
-                                Ok(Message::Ping(p)) => { let _ = ws.send(Message::Pong(p)).await; }
-                                Ok(Message::Close(_)) => { warn!("ws closed"); break; }
-                                Err(e) => { warn!(?e, "ws error"); break; }
-                                _ => {}
                             }
                         }
+                        Err(e) => { warn!(?e, "failed websocket connect"); }
                     }
-                    Err(e) => warn!(?e, "failed websocket connect"),
+                    WS_RECONNECTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    attempt += 1;
+                    let backoff_ms = (2u64.pow(attempt.min(6)) * 250).min(10_000);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 }
             });
         }
@@ -371,7 +395,7 @@ impl SniperEngine {
     let fee_estimate = self.rpc.rpc.get_fee_for_message(&message).await.unwrap_or(0);
     let tx = Transaction::new_signed_with_payer(&tx_ixs, Some(&self.treasury.pubkey()), &[self.treasury.keypair.as_ref()], bh);
     let sent_at = Instant::now();
-    match self.rpc.rpc.send_and_confirm_transaction(&tx).await {
+    match self.rpc_retry_tx(&tx, 3).await {
             Ok(sig) => {
         let dur = sent_at.elapsed();
         record_swap_latency(dur.as_nanos() as u64);
@@ -698,7 +722,7 @@ impl SniperEngine {
     let (wsol_ata, _prog_wsol) = match self.treasury.ata_address(&self.rpc, &owner_sdk, &wsol_mint_sdk).await { Ok(v)=>v, Err(_)=> (self.treasury.pubkey(), self.treasury.pubkey()) };
     let pre_wsol_amount: u64 = if let Ok(acc) = self.rpc.rpc.get_account(&wsol_ata).await { if acc.data.len()>=72 { u64::from_le_bytes(acc.data[64..72].try_into().unwrap()) } else {0} } else {0};
     let sent_at = Instant::now();
-    match self.rpc.rpc.send_and_confirm_transaction(&tx).await {
+    match self.rpc_retry_tx(&tx, 3).await {
             Ok(sig) => {
                 let dur = sent_at.elapsed();
                 record_swap_latency(dur.as_nanos() as u64);

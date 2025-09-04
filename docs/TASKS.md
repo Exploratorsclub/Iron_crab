@@ -117,10 +117,12 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 
 ### Execution & Routing
 - [ ] Stabiler WebSocket PubSub (Reconnect, Backoff, Heartbeat)
+	- [x] Reconnect + Exponential Backoff + Metric (`ws_reconnects_total`)
 - [ ] Volle Raydium Serum Market Accounts erzwungen (kein Fallback)
 - [ ] Multi-DEX Best-Route Auswahl (Raydium vs Orca dynamisch)
 - [ ] Partielle Exits (gestaffelte SELL Orders / Positionsplits)
 - [ ] Retry & Backoff Strategie bei transienten RPC Fehlern
+	- [x] Grund-RPC Retry (Exponentiell, 3 Versuche, Metric `rpc_retry_attempts_total`)
 - [ ] PendingTrade TTL + Reconciliation (Zombie Pending entfernen)
 	- [x] TTL Cleanup (Config `pending_trade_ttl_secs`) – implemented
 	- [ ] Reconciliation (Retry / status check vs RPC for missing fills)
