@@ -116,6 +116,24 @@ pub struct SniperEngine {
 }
 
 impl SniperEngine {
+    fn effective_max_buy_sol(&self) -> f64 {
+        let cfg = self.cfg.read().clone();
+        let rs = self.risk.read();
+        if let (Some(limit), Some(start), Some(max_red)) = (cfg.daily_loss_limit_sol, cfg.drawdown_scale_start, cfg.drawdown_max_reduction) {
+            if limit > 0.0 && start < 1.0 && max_red > 0.0 {
+                let ratio = (rs.realized_loss_today_sol / limit).clamp(0.0, 1.0);
+                if ratio <= start { return cfg.max_buy_sol; }
+                let frac = ((ratio - start) / (1.0 - start)).clamp(0.0, 1.0);
+                let reduction = max_red.clamp(0.0,1.0) * frac;
+                return cfg.max_buy_sol * (1.0 - reduction);
+            }
+        }
+        cfg.max_buy_sol
+    }
+
+    fn mark_cooldown(&self, mint: Pubkey) {
+        if let Some(secs) = self.cfg.read().stop_loss_cooldown_secs { if secs>0 { let until = chrono::Utc::now().timestamp() + secs as i64; let mut rs = self.risk.write(); rs.cooldown_until.insert(mint, until); } }
+    }
     async fn total_sol_balance(&self) -> Result<f64> {
         // Native SOL lamports
     let owner = self.treasury.pubkey();
@@ -226,8 +244,8 @@ impl SniperEngine {
                                 let liq_ok = self.cfg.read().min_pool_liquidity_sol.map(|thr| liq_sol.unwrap_or(0.0) >= thr).unwrap_or(true);
                                 if liq_ok {
                                     // Risk: Notional cap & daily loss limit pre-check
-                                    let base_buy = self.cfg.read().max_buy_sol;
-                                    if !self.can_open_position(base_buy) {
+                                    let base_buy = self.effective_max_buy_sol();
+                                    if !self.can_open_position_for(&pk, base_buy) {
                                         debug!(mint=%pk, "sniper: risk gate blocked new position (notional/daily loss)");
                                         continue;
                                     }
@@ -261,7 +279,7 @@ impl SniperEngine {
         // Determine input (SOL) and output (mint) ordering for swap (we buy the mint with SOL)
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
         // Convert max_buy_sol (f64) to lamports safely
-    let lamports_in = ((self.cfg.read().max_buy_sol * 1e9) as u64).max(10_000); // min lamports safeguard (scaling TBD at entry call site)
+    let lamports_in = ((self.effective_max_buy_sol() * 1e9) as u64).max(10_000); // dynamic drawdown-adjusted size
         // Ensure destination ATA for target mint (may fail if mint malformed)
         use solana_sdk::pubkey::Pubkey as SdkPubkey;
         let mint_sdk = SdkPubkey::new_from_array(mint.to_bytes());
@@ -424,6 +442,34 @@ impl SniperEngine {
         info!("sniper engine running (skeleton)");
         // Placeholder periodic task: future spot for initial buys & SL/TP mgmt
         let mut iv = tokio::time::interval(Duration::from_secs(15));
+        // Hot reload task (env IRONCRAB_SNIPER_RELOAD_PATH)
+        if let Some(path) = std::env::var_os("IRONCRAB_SNIPER_RELOAD_PATH") {
+            let path_buf = std::path::PathBuf::from(path);
+            let engine_clone = self.clone_for_spawn();
+            tokio::spawn(async move {
+                let mut ivr = tokio::time::interval(Duration::from_secs(30));
+                let mut last_mod = std::time::SystemTime::UNIX_EPOCH;
+                loop {
+                    ivr.tick().await;
+                    if let Ok(meta) = std::fs::metadata(&path_buf) {
+                        if let Ok(modified) = meta.modified() {
+                            if modified > last_mod {
+                                last_mod = modified;
+                                if let Ok(txt) = std::fs::read_to_string(&path_buf) {
+                                    if let Ok(root) = toml::from_str::<crate::config::Config>(&txt) {
+                                        if let Some(sn) = root.sniper.clone() {
+                                            let new_cfg: SniperCfg = (&sn).into();
+                                            *engine_clone.cfg.write() = new_cfg;
+                                            tracing::info!("sniper hot reload applied");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
         loop {
             iv.tick().await;
             let mb = self.cfg.read().max_buy_sol;
@@ -458,17 +504,14 @@ impl SniperEngine {
         }
     }
 
-    fn can_open_position(&self, planned_sol: f64) -> bool {
+    fn can_open_position_for(&self, mint: &Pubkey, planned_sol: f64) -> bool {
         self.risk_reset_if_needed();
         let rs = self.risk.read();
     let cfg_r = self.cfg.read();
     if let Some(cap) = cfg_r.max_position_sol { if planned_sol > cap { return false; } }
     if let Some(daily) = cfg_r.daily_loss_limit_sol { if rs.realized_loss_today_sol >= daily { return false; } }
     if let Some(mop) = cfg_r.max_open_positions { if rs.open.len() >= mop { return false; } }
-    // Cooldown check (current unix ts)
-    // purchased holds mints already bought; cooldown avoids re-entry after SL
-    if rs.cooldown_until.get(&Pubkey::default()).is_some() { /* placeholder to silence warning */ }
-    // Future per-mint cooldown check would require mint param here (not available); assume external call adds mint-specific gating.
+    if let Some(until) = rs.cooldown_until.get(mint) { if *until > chrono::Utc::now().timestamp() { return false; } }
         true
     }
 
@@ -575,9 +618,11 @@ impl SniperEngine {
             }
             let stop_trigger = pnl_bps <= -(stop_bps as i64);
             let tp_trigger = pnl_bps >= tp_bps as i64;
-            if stop_trigger || tp_trigger { 
+            if stop_trigger || tp_trigger {
                 debug!(mint=%mint, pnl_bps, stop_trigger, tp_trigger, "exit trigger");
+                let is_stop = stop_trigger;
                 if let Err(e) = self.attempt_exit(&mint, pos.amount_tokens as u64).await { warn!(?e, mint=%mint, "exit tx failed"); }
+                else if is_stop { self.mark_cooldown(mint); }
             }
         }
         Ok(())
@@ -648,9 +693,21 @@ impl SniperEngine {
                 self.risk_reset_if_needed();
                 {
                     let mut rs = self.risk.write();
-                    let _ = rs.open.remove(mint);
+                    let pos = rs.open.remove(mint);
                     rs.realized_pnl_sol += realized;
                     if realized < 0.0 { rs.realized_loss_today_sol += -realized; }
+                    // Rolling return (pct of invested)
+                    if let Some(p) = pos { if p.invested_sol > 0.0 { let ret = realized / p.invested_sol; rs.recent_realized.push(ret); }
+                    }
+                    let window = self.cfg.read().rolling_pnl_window.unwrap_or(50);
+                    if rs.recent_realized.len() > window { let excess = rs.recent_realized.len() - window; rs.recent_realized.drain(0..excess); }
+                    if rs.recent_realized.len() >= 5 { // compute simple Sharpe (mean / std * sqrt(n))
+                        let n = rs.recent_realized.len() as f64;
+                        let mean = rs.recent_realized.iter().copied().sum::<f64>() / n;
+                        let var = rs.recent_realized.iter().map(|r| (r-mean)*(r-mean)).sum::<f64>() / n.max(1.0);
+                        let std = var.sqrt();
+                        if std > 0.0 { rs.last_sharpe = mean / std * n.sqrt(); }
+                    }
                     DAILY_REALIZED_PNL_SOL_MICRO.store((rs.realized_pnl_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
                     OPEN_POSITIONS_GAUGE.store(rs.open.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
