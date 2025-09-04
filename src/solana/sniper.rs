@@ -31,6 +31,8 @@ pub struct SniperCfg {
     pub require_freeze_auth_none: Option<bool>,
     pub require_mint_decimals_range: Option<(u8,u8)>,
     pub lp_top1_max_pct: Option<f64>,
+    pub lp_top3_max_pct: Option<f64>,
+    pub lp_top5_max_pct: Option<f64>,
 }
 
 pub struct SniperEngine {
@@ -122,41 +124,55 @@ impl SniperEngine {
 #[derive(Debug, Clone)]
 pub struct LpLockAssessment {
     pub top1_pct: f64,
+    pub top3_pct: f64,
+    pub top5_pct: f64,
     pub concentration_ok: bool,
     pub largest_account: Option<String>,
 }
 
 impl SniperEngine {
     pub async fn lp_lock_check(&self, mint: &Pubkey) -> Result<Option<LpLockAssessment>> {
-        // Only run if threshold configured
-        if self.cfg.lp_top1_max_pct.is_none() { return Ok(None); }
-        let threshold = self.cfg.lp_top1_max_pct.unwrap();
+        // Only run if any threshold configured
+        if self.cfg.lp_top1_max_pct.is_none() && self.cfg.lp_top3_max_pct.is_none() && self.cfg.lp_top5_max_pct.is_none() { return Ok(None); }
+        let thr1 = self.cfg.lp_top1_max_pct.unwrap_or(f64::MAX);
+        let thr3 = self.cfg.lp_top3_max_pct.unwrap_or(f64::MAX);
+        let thr5 = self.cfg.lp_top5_max_pct.unwrap_or(f64::MAX);
         // Fetch mint account
         let mint_acc = match self.rpc.rpc.get_account(mint).await { Ok(a)=>a, Err(e)=> { warn!(?e, "mint account fetch failed"); return Ok(None); } };
-    // SPL Mint length heuristic (approx range) & manual decode subset
+    // SPL Mint length heuristic (approx range) & manual decode subset (legacy Token program)
     if mint_acc.data.len() < 70 || mint_acc.data.len() > 90 { return Ok(None); }
-    // Minimal decimals extraction (offset 44 for decimals for Token Program v3 layout)
-    let _decimals = mint_acc.data.get(44).cloned().unwrap_or(0);
+    let decimals = mint_acc.data.get(44).cloned().unwrap_or(0);
     let supply_le_bytes = &mint_acc.data[36..44];
     let supply_raw = u64::from_le_bytes(supply_le_bytes.try_into().unwrap());
-    let supply = supply_raw as f64;
+    let supply_tokens = if decimals == 0 { supply_raw as f64 } else { (supply_raw as f64) / 10f64.powi(decimals as i32) };
+    let supply = supply_tokens;
     if supply == 0.0 { return Ok(None); }
     if supply == 0.0 { return Ok(None); }
         // Largest accounts
         let list = match self.rpc.rpc.get_token_largest_accounts(mint).await { Ok(v)=>v, Err(e)=> { warn!(?e, "largest accounts fetch failed"); return Ok(None); } };
-        let mut top1_pct = 0.0;
         let mut largest_key: Option<String> = None;
-        if let Some(first) = list.first() {
-            // first.amount is UiTokenAmount { amount (raw string), decimals, ui_amount, ui_amount_string }
-            #[allow(dead_code)]
-            struct Dummy; // placeholder to silence potential warnings if fields differ
-            // Raw integer amount string
-            let raw_str = &first.amount.amount; // raw base-10 without decimals
-            if let Ok(raw_u128) = raw_str.parse::<u128>() { if supply > 0.0 { top1_pct = raw_u128 as f64 / supply; } }
-            largest_key = Some(first.address.clone());
+        let mut raw_amounts: Vec<f64> = Vec::new();
+        for (i,acc) in list.iter().enumerate() {
+            // acc.amount.amount raw units string nested path
+            let raw_units_str = &acc.amount.amount;
+            if let Ok(raw_u128) = raw_units_str.parse::<u128>() {
+                let val_tokens = if decimals == 0 { raw_u128 as f64 } else { raw_u128 as f64 / 10f64.powi(decimals as i32) };
+                raw_amounts.push(val_tokens);
+                if i == 0 { largest_key = Some(acc.address.clone()); }
+            }
+            if i >= 4 { break; } // we only need top5 for now
         }
-        let concentration_ok = top1_pct <= threshold;
-        Ok(Some(LpLockAssessment { top1_pct, concentration_ok, largest_account: largest_key }))
+        if raw_amounts.is_empty() { return Ok(None); }
+        // Sort descending just in case
+        raw_amounts.sort_by(|a,b| b.partial_cmp(a).unwrap());
+        let top1 = raw_amounts.get(0).copied().unwrap_or(0.0);
+        let top3_sum: f64 = raw_amounts.iter().take(3).sum();
+        let top5_sum: f64 = raw_amounts.iter().take(5).sum();
+        let top1_pct = if supply>0.0 { top1 / supply } else { 0.0 };
+        let top3_pct = if supply>0.0 { top3_sum / supply } else { 0.0 };
+        let top5_pct = if supply>0.0 { top5_sum / supply } else { 0.0 };
+        let concentration_ok = top1_pct <= thr1 && top3_pct <= thr3 && top5_pct <= thr5;
+        Ok(Some(LpLockAssessment { top1_pct, top3_pct, top5_pct, concentration_ok, largest_account: largest_key }))
     }
 }
 
@@ -176,6 +192,8 @@ impl From<&SniperSettings> for SniperCfg {
             require_freeze_auth_none: s.require_freeze_auth_none,
             require_mint_decimals_range: s.require_mint_decimals_range,
             lp_top1_max_pct: s.lp_top1_max_pct,
+            lp_top3_max_pct: s.lp_top3_max_pct,
+            lp_top5_max_pct: s.lp_top5_max_pct,
         }
     }
 }

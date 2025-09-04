@@ -79,6 +79,8 @@ pub struct SniperSettings {
     #[serde(default)] pub require_freeze_auth_none: Option<bool>,
     #[serde(default)] pub require_mint_decimals_range: Option<(u8,u8)>,
     #[serde(default)] pub lp_top1_max_pct: Option<f64>,
+    #[serde(default)] pub lp_top3_max_pct: Option<f64>,
+    #[serde(default)] pub lp_top5_max_pct: Option<f64>,
 }
 
 impl Config {
