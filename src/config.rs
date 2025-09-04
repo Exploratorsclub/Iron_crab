@@ -70,7 +70,15 @@ pub struct ArbCfg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SniperSettings { pub max_buy_sol: f64, pub max_slippage_bps: u32 }
+pub struct SniperSettings {
+    pub max_buy_sol: f64,
+    pub max_slippage_bps: u32,
+    #[serde(default)] pub blacklist_mints: Vec<String>,
+    #[serde(default)] pub blacklist_owners: Vec<String>,
+    #[serde(default)] pub min_pool_liquidity_sol: Option<f64>,
+    #[serde(default)] pub require_freeze_auth_none: Option<bool>,
+    #[serde(default)] pub require_mint_decimals_range: Option<(u8,u8)>,
+}
 
 impl Config {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {

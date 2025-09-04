@@ -129,12 +129,15 @@ impl Engine {
         }
 
         // Sniper-Loop (Stub) – nutzt SniperCfg/run_sniper
-        tokio::spawn(async move {
-            let cfg = SniperCfg { max_buy_sol: 0.1, max_slippage_bps: 150 };
-            if let Err(e) = run_sniper(cfg).await {
-                tracing::warn!(?e, "sniper exited");
-            }
-        });
+        if let Some(sn_cfg) = self.ctx.cfg.sniper.clone() {
+            let rpc_clone = self.ctx.rpc.clone();
+            tokio::spawn(async move {
+                let cfg: SniperCfg = (&sn_cfg).into();
+                if let Err(e) = run_sniper(rpc_clone, cfg).await {
+                    tracing::warn!(?e, "sniper exited");
+                }
+            });
+        }
 
         // Strategy Tick Loop
         let mut iv = interval(Duration::from_millis(600));
