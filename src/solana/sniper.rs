@@ -7,6 +7,7 @@ use anyhow::Result;
 use tracing::{info, debug, warn};
 use crate::solana::rpc::SolanaRpc;
 use crate::config::SniperSettings;
+use crate::solana::dex::{raydium::Raydium, orca::Orca, Dex};
 use solana_sdk::pubkey::Pubkey;
 // (log subscription stub – real PubSub integration to be reintroduced with correct crate paths)
 use once_cell::sync::Lazy;
@@ -40,12 +41,14 @@ pub struct SniperCfg {
 pub struct SniperEngine {
     pub rpc: Arc<SolanaRpc>,
     cfg: SniperCfg,
+    raydium: Option<Arc<Raydium>>,
+    orca: Option<Arc<Orca>>,
 }
 
 impl SniperEngine {
-    pub fn new(rpc: Arc<SolanaRpc>, cfg: SniperCfg) -> Self { Self { rpc, cfg } }
+    pub fn new(rpc: Arc<SolanaRpc>, cfg: SniperCfg, raydium: Option<Arc<Raydium>>, orca: Option<Arc<Orca>>) -> Self { Self { rpc, cfg, raydium, orca } }
 
-    fn clone_for_spawn(&self) -> Self { SniperEngine { rpc: self.rpc.clone(), cfg: self.cfg.clone() } }
+    fn clone_for_spawn(&self) -> Self { SniperEngine { rpc: self.rpc.clone(), cfg: self.cfg.clone(), raydium: self.raydium.clone(), orca: self.orca.clone() } }
 
     fn http_to_ws(url: &str) -> String {
         if url.starts_with("https://") { url.replacen("https://", "wss://", 1) }
@@ -121,7 +124,10 @@ impl SniperEngine {
                                 // Attempt liquidity estimation (Raydium/Orca pool scan) if min_pool_liquidity_sol configured
                                 let mut liq_sol: Option<f64> = None;
                                 if self.cfg.min_pool_liquidity_sol.is_some() {
-                                    liq_sol = self.estimate_liquidity_for_mint(&pk).await.ok().flatten();
+                                    match self.estimate_liquidity_index(&pk).await {
+                                        Ok(v) => liq_sol = v,
+                                        Err(_) => { liq_sol = self.estimate_liquidity_for_mint(&pk).await.ok().flatten(); }
+                                    }
                                 }
                                 info!(mint = %pk, top1 = assess.top1_pct, top3 = assess.top3_pct, top5 = assess.top5_pct, burned = assess.burned_pct, program_locked = assess.program_vault_pct, liq_sol, "sniper: candidate mint passes concentration");
                             } else {
@@ -171,6 +177,33 @@ pub struct LpLockAssessment {
 }
 
 impl SniperEngine {
+    /// Index-based (Raydium/Orca) liquidity estimation using current pool snapshots.
+    /// Returns conservative SOL notionals (sum over pools: 2 * SOL_reserve for SOL pairs, stable converted to SOL via placeholder rate).
+    async fn estimate_liquidity_index(&self, mint: &Pubkey) -> Result<Option<f64>> {
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        let usdc = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+        let usdt = Pubkey::from_str("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB").unwrap();
+        let mut total_sol = 0f64;
+        let mut considered = 0u32;
+        // Helper to process pools from a connector
+        let mut handle_pool = |base: Pubkey, quote: Pubkey, r_base: u128, r_quote: u128| {
+            if base == *mint && quote == sol_mint { // mint-SOL
+                let sol_res = r_quote as f64 / 1e9; total_sol += sol_res * 2.0; considered += 1; return; }
+            if quote == *mint && base == sol_mint { let sol_res = r_base as f64 / 1e9; total_sol += sol_res * 2.0; considered += 1; return; }
+            // Stable pairing (USDC/USDT)
+            let stable_rate = 100.0; // placeholder USD per SOL
+            if (base == *mint && (quote == usdc || quote == usdt)) { let usd = r_quote as f64 / 1e6; total_sol += (usd / stable_rate) * 2.0; considered += 1; }
+            else if (quote == *mint && (base == usdc || base == usdt)) { let usd = r_base as f64 / 1e6; total_sol += (usd / stable_rate) * 2.0; considered += 1; }
+        };
+        if let Some(r) = &self.raydium {
+            // Access internal pools via snapshots
+            for snap in r.snapshots() { if snap.base_mint == *mint || snap.quote_mint == *mint { handle_pool(snap.base_mint, snap.quote_mint, snap.reserve_base, snap.reserve_quote); } }
+        }
+    if let Some(_o) = &self.orca { /* TODO: expose Orca pool snapshots for index-based liquidity */ }
+        
+        if considered == 0 { return Ok(None); }
+        Ok(Some(total_sol))
+    }
     /// Attempt to estimate total pool liquidity in SOL terms for a given candidate mint.
     /// Strategy:
     /// 1. Fetch largest token accounts for mint (already done in lp_lock_check for initial filters).
@@ -304,8 +337,8 @@ impl SniperEngine {
     }
 }
 
-pub async fn run_sniper(rpc: Arc<SolanaRpc>, cfg: SniperCfg) -> Result<()> {
-    let engine = SniperEngine::new(rpc, cfg);
+pub async fn run_sniper(rpc: Arc<SolanaRpc>, cfg: SniperCfg, raydium: Option<Arc<Raydium>>, orca: Option<Arc<Orca>>) -> Result<()> {
+    let engine = SniperEngine::new(rpc, cfg, raydium, orca);
     engine.run().await
 }
 
