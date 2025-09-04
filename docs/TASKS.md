@@ -37,7 +37,8 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Pre-TX Simulation (RPC `simulateTransaction`)
 
 ## 4) Sniper
-- [ ] WS-Logs Subscribe (Pool-Create)
+- [x] Grund-SniperEngine Skeleton + Config Struct
+- [~] WS-Logs Subscribe (Pool-Create) (Stub – echte PubSub Filter pending korrekte crate Pfade)
 - [ ] Heuristiken (Blacklist, FreezeAuth, Owner, LP-Lock)
 - [ ] Erstkauf + enge SL/TP
   
