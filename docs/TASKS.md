@@ -21,8 +21,8 @@
 - [x] Orca: Replace Heuristics mit Echtem Whirlpool Layout (feste Offsets / strukturiertes Parsing)
 - [x] Orca: Echte User Accounts & Token Owner Accounts in Swap IX (statt Platzhalter Pubkeys) (Setters + validation in build_swap_ix)
 - [x] Raydium: Offene Verbesserung – Vault Fallbacks entfernen (immer echte Vaults nutzen + skip invalid fee / zero reserves)
-- [ ] Safety: Further structural validation (Orca tick spacing bounds, vault/mint cross-check)
-- [ ] Benchmarks für Quote & Refresh (Performance Profiling)
+- [x] Safety: Further structural validation (Orca tick spacing bounds, vault/mint cross-check, tick index sanity)
+- [x] Benchmarks für Quote & Refresh (Lightweight timing harness test `bench_quote_refresh.rs`)
 
 Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop Routing) sind implementiert; verbleiben sind Genauigkeit (Whirlpool Layout), echte Kontoersetzung und Hardening.
 
