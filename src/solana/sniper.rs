@@ -618,13 +618,21 @@ impl SniperEngine {
                     let cfg = RpcTransactionConfig { encoding: Some(UiTransactionEncoding::JsonParsed), commitment: None, max_supported_transaction_version: None };
                     if let Ok(tx_opt) = self.rpc.rpc.get_transaction_with_config(&sig_obj, cfg).await { if let Some(meta) = tx_opt.transaction.meta { exact_network_fee = meta.fee; } }
                 }
+                // Meta-based token delta extraction for accuracy
                 let scale = 10f64.powi(decimals as i32);
-                let actual_raw = (amt * scale).round() as u64;
+                let actual_raw = (amt * scale).round() as u64; // fallback
+                let meta_shortfall_tokens: Option<u64> = None; // placeholder (meta parsing TODO)
+                // NOTE: OptionSerializer wrapper complicates direct access; keep fallback for now.
                 let expected_raw = pend.expected_out_tokens;
-                let shortfall = expected_raw.saturating_sub(actual_raw);
+                let shortfall = meta_shortfall_tokens.unwrap_or_else(|| expected_raw.saturating_sub(actual_raw));
                 let shortfall_ui = shortfall as f64 / scale;
                 let shortfall_sol = shortfall_ui * entry_price_existing;
-                let fee_tokens = if expected_raw > actual_raw { (expected_raw - actual_raw).min(expected_raw / 20) } else { 0 };
+                // Compute protocol fee tokens exactly from fee_bps if available: expected_out already fee-deducted
+                let fee_tokens = if pend.fee_bps > 0 && pend.fee_bps < 5000 {
+                    // expected_out = no_fee_out * (1 - fee_bps/10_000) approximately; invert
+                    let no_fee_out = ((expected_raw as u128) * 10_000u128 / (10_000u128 - pend.fee_bps as u128)) as u64;
+                    no_fee_out.saturating_sub(expected_raw)
+                } else { 0 };
                 if fee_tokens > 0 {
                     PROTOCOL_FEE_TOKENS_TOTAL.fetch_add(fee_tokens as u64, std::sync::atomic::Ordering::Relaxed);
                     let fee_ui = fee_tokens as f64 / scale;

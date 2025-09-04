@@ -55,7 +55,8 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Netzwerk Fee Schätzung via `get_fee_for_message`
 - [ ] Erweiterte Fee Aufschlüsselung (Protocol Fee, Referrer, Compute Budget Overhead via Meta)
 	- [x] Grundlegende Protokoll Fee Approx (Output Token Fee Heuristik + Metrics `protocol_fee_tokens_total`, `protocol_fee_sol_total`)
-	- [x] Exakte Fee Extraktion (network fee via Transaction Meta; groundwork for postTokenBalances parsing)
+	- [x] Exakte Network Fee (Transaction Meta)
+	- [~] Token Fee via postTokenBalances (wrapper type TODO; fallback heuristic retained)
 - [ ] Partielle Exit-Unterstützung (mehrere SELLs pro Position)
 - [ ] Persistenter Positionssnapshot (Reload nach Neustart)
   
