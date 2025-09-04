@@ -39,6 +39,8 @@ use crate::metrics::{
     record_trade_return,
     RPC_RETRY_ATTEMPTS_TOTAL,
     WS_RECONNECTS_TOTAL,
+    PENDING_RECONCILIATIONS_TOTAL,
+    PENDING_FAILED_TOTAL,
 };
 use serde::{Serialize, Deserialize};
 use serde_json::json;
@@ -522,6 +524,12 @@ impl SniperEngine {
             if let Err(e) = self.evaluate_positions().await { debug!(?e, "risk evaluation error"); }
             // Pending trade TTL cleanup
             if let Some(ttl) = self.cfg.read().pending_trade_ttl_secs { if ttl > 0 { self.cleanup_stale_pending(ttl); } }
+            // Reconciliation pass (half of TTL age threshold)
+            if let Some(ttl) = self.cfg.read().pending_trade_ttl_secs { if ttl >= 20 { // minimal threshold
+                let cutoff = (ttl as i64) / 2; // drop if older than half TTL w/o status
+                let engine_clone = self.clone_for_spawn();
+                tokio::spawn(async move { engine_clone.reconcile_pending(cutoff).await; });
+            } }
         }
     }
 
@@ -796,6 +804,69 @@ impl SniperEngine {
             });
         }
         if !removed.is_empty() { debug!(count=removed.len(), "pending cleanup removed stale trades"); }
+    }
+
+    // Reconcile pending trades that are still within TTL but haven't produced a fill yet.
+    // Strategy: fetch signature statuses; if confirmed and token balance now reflects fill, finalize.
+    // If status is Err or NotFound after N seconds (half TTL), mark failed and remove.
+    async fn reconcile_pending(&self, half_ttl_cutoff: i64) {
+        // Collect copy of pending (mint -> trade) to avoid holding write lock across awaits
+        let pend: Vec<(Pubkey, PendingTrade)> = {
+            let rs = self.risk.read();
+            rs.pending.iter().map(|(k,v)| (*k, v.clone())).collect()
+        };
+        if pend.is_empty() { return; }
+        // Build list of signatures (dedup)
+        let mut sigs: Vec<solana_sdk::signature::Signature> = Vec::new();
+        for (_mint, p) in &pend { if let Ok(sig) = solana_sdk::signature::Signature::from_str(&p.sig) { sigs.push(sig); } }
+        if sigs.is_empty() { return; }
+        // Use low-level RPC client directly (status API) – fall back if not available
+        // (Requires feature set in solana_rpc_client)
+        let statuses_res = self.rpc.rpc.get_signature_statuses(&sigs).await.ok();
+        let now_ts = chrono::Utc::now().timestamp();
+        if let Some(statuses) = statuses_res {
+            for ((mint, p), status_opt) in pend.iter().zip(statuses.value.into_iter()) {
+                if let Some(status) = status_opt { // Some information available
+                    if status.confirmations.is_some() || status.err.is_some() || status.slot > 0 { // progressed
+                        if status.err.is_some() {
+                            // Failed transaction -> drop pending
+                            let mut rs = self.risk.write();
+                            if rs.pending.remove(mint).is_some() {
+                                PENDING_FAILED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                debug!(mint=%mint, sig=%p.sig, "pending trade failed (status error)");
+                            }
+                            continue;
+                        }
+                        // If confirmed (confirmations None typically means rooted) attempt finalize_fill
+                        if status.err.is_none() {
+                            // Try finalize now (will remove pending & log fill)
+                            PENDING_RECONCILIATIONS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let engine_clone = self.clone_for_spawn();
+                            let mint_copy = *mint;
+                            tokio::spawn(async move { engine_clone.finalize_fill(mint_copy).await; });
+                        }
+                    } else {
+                        // No progress yet; if older than half TTL consider dropping
+                        if now_ts - p.ts > half_ttl_cutoff {
+                            let mut rs = self.risk.write();
+                            if rs.pending.remove(mint).is_some() {
+                                PENDING_FAILED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                debug!(mint=%mint, sig=%p.sig, "pending trade dropped (stale no-progress)");
+                            }
+                        }
+                    }
+                } else {
+                    // Missing status entirely; same half-ttl rule
+                    if now_ts - p.ts > half_ttl_cutoff {
+                        let mut rs = self.risk.write();
+                        if rs.pending.remove(mint).is_some() {
+                            PENDING_FAILED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            debug!(mint=%mint, sig=%p.sig, "pending trade dropped (no status)");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn risk_state_file_path() -> std::path::PathBuf {

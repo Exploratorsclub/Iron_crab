@@ -49,6 +49,8 @@ pub static FILLS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static NETWORK_FEES_LAMPORTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static WS_RECONNECTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RPC_RETRY_ATTEMPTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static PENDING_RECONCILIATIONS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static PENDING_FAILED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Realized trade return histogram (ratio realized_pnl / invested) buckets (cumulative style capture)
 // Buckets chosen to capture deep losses to outsized wins.
 const TRADE_RETURN_BUCKETS: &[f64] = &[
@@ -181,6 +183,8 @@ async fn metrics_response() -> Response<Body> {
     line!("network_fees_lamports_total", NETWORK_FEES_LAMPORTS_TOTAL.load(Ordering::Relaxed));
     line!("ws_reconnects_total", WS_RECONNECTS_TOTAL.load(Ordering::Relaxed));
     line!("rpc_retry_attempts_total", RPC_RETRY_ATTEMPTS_TOTAL.load(Ordering::Relaxed));
+    line!("pending_reconciliations_total", PENDING_RECONCILIATIONS_TOTAL.load(Ordering::Relaxed));
+    line!("pending_failed_total", PENDING_FAILED_TOTAL.load(Ordering::Relaxed));
     // Trade return histogram (realized PnL / invested)
     let tr_count = TRADE_RETURN_COUNT.load(Ordering::Relaxed);
     let tr_sum_micro = TRADE_RETURN_SUM_MICRO.load(Ordering::Relaxed);

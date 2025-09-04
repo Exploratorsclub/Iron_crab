@@ -125,7 +125,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Grund-RPC Retry (Exponentiell, 3 Versuche, Metric `rpc_retry_attempts_total`)
 - [ ] PendingTrade TTL + Reconciliation (Zombie Pending entfernen)
 	- [x] TTL Cleanup (Config `pending_trade_ttl_secs`) – implemented
-	- [ ] Reconciliation (Retry / status check vs RPC for missing fills)
+	- [x] Reconciliation (Signature status check + finalize/dismiss logic, metrics `pending_reconciliations_total`, `pending_failed_total`)
 - [ ] Re-Quote unmittelbar vor Signatur (Front‑run Schutz / aktualisiertes min_out)
 
 ### State & Persistence
