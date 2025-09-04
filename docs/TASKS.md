@@ -31,6 +31,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- Erweiterungen: enumerate_triangular_cycles, TransactionPlan + Simulation
 - [x] Profit Ranking (rank_triangular_cycles) für Triangular Cycles
 - [x] N>3 Hop Cycle Enumeration (enumerate_cycles_generic + ranking)
+	- [x] Dominance + Upper-Bound Pruning (verlustfrei) für generic cycle search
 - [ ] Jito/MEV-Integration (später)
 - [x] Pre-TX Simulation (RPC `simulateTransaction`)
 

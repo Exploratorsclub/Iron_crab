@@ -257,6 +257,12 @@ impl ArbitrageEngine {
         let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
         for d in &self.connectors { for (a,b) in d.list_pairs() { adj.entry(a.clone()).or_default().insert(b.clone()); adj.entry(b.clone()).or_default().insert(a.clone()); } }
         let mut results: Vec<GenericCycleOpportunity> = Vec::new();
+        // Dominance map: (last_token, depth) -> best_amount_out observed so far.
+        let mut dominance: HashMap<(String, usize), u64> = HashMap::new();
+        // Track best gross profit (for bound pruning)
+        let mut best_gross_profit: u64 = 0;
+        // Optimistic max per-hop multiplier in bps (start very high so pruning is safe / null until refined)
+        let mut max_ratio_bps: u64 = 30_000; // 3.0x start optimistic (will reduce as we measure real quotes)
         for base in base_tokens {
             if !adj.contains_key(base) { continue; }
             // DFS stack: (path_tokens, current_amount_out)
@@ -275,31 +281,56 @@ impl ArbitrageEngine {
                         // Form cycle path including base again
                         let mut full = path.clone(); full.push(base.clone());
                         // Quote along edges to compute profit (re-run sequential quotes for accuracy)
-                        let mut in_amount = amount_in;
-                        let mut ok = true;
+                        let mut in_amount_close = amount_in;
+                        let mut ok_close = true;
                         for w in 0..full.len()-1 { // last is closing base
                             let from = &full[w]; let to = &full[w+1];
-                            match self.router.best_quote_exact_in(from, to, in_amount).await? { Some(rq)=> { in_amount = rq.quote.amount_out; } None => { ok = false; break; } }
+                            match self.router.best_quote_exact_in(from, to, in_amount_close).await? { Some(rq)=> {
+                                // refine max_ratio_bps if this hop ratio is higher
+                                let ratio_bps = if in_amount_close == 0 { 0 } else { (rq.quote.amount_out as u128 * 10_000u128 / in_amount_close as u128) as u64 };
+                                if ratio_bps > max_ratio_bps { max_ratio_bps = ratio_bps; }
+                                in_amount_close = rq.quote.amount_out; } None => { ok_close = false; break; } }
                         }
-                        if !ok { continue; }
-                        if in_amount <= amount_in { continue; }
-                        let gross_profit = in_amount - amount_in;
-                        let net = compute_net_profit(amount_in, in_amount, self.min_profit_bps, self.est_tx_cost_lamports);
+                        if !ok_close { continue; }
+                        if in_amount_close <= amount_in { continue; }
+                        let gross_profit = in_amount_close - amount_in;
+                        if gross_profit > best_gross_profit { best_gross_profit = gross_profit; }
+                        let net = compute_net_profit(amount_in, in_amount_close, self.min_profit_bps, self.est_tx_cost_lamports);
                         // Dedup by sorted internal tokens (excluding duplicate base at end) + length
                         let key = {
                             let mut inner = full.clone(); inner.pop(); // remove trailing base
                             format!("{}:{}", inner.join("->"), inner.len())
                         };
                         let replace = seen_paths.insert(key);
-                        if replace { results.push(GenericCycleOpportunity { path: full, amount_in, gross_out: in_amount, gross_profit, net_profit: net }); }
+                        if replace { results.push(GenericCycleOpportunity { path: full, amount_in, gross_out: in_amount_close, gross_profit, net_profit: net }); }
                         continue;
                     }
                     // Avoid revisiting base mid-path or repeating tokens (simple cycle, no repeats except closing base)
                     if nxt == base || path.contains(nxt) { continue; }
-                    if path.len()+1 <= max_hops {
-                        let mut new_path = path.clone(); new_path.push(nxt.clone());
-                        stack.push((new_path, amt));
+                    if path.len()+1 > max_hops { continue; }
+                    // Fetch quote for expansion edge (current -> nxt) to know new amount
+                    let maybe_quote = self.router.best_quote_exact_in(current, nxt, amt).await?;
+                    let rq = match maybe_quote { Some(v) => v, None => continue };
+                    let new_amount = rq.quote.amount_out;
+                    // Update optimistic max_ratio_bps if this hop higher
+                    if amt > 0 { let ratio_bps = (new_amount as u128 * 10_000u128 / amt as u128) as u64; if ratio_bps > max_ratio_bps { max_ratio_bps = ratio_bps; } }
+                    // Dominance check
+                    let depth_next = path.len(); // depth after adding nxt (0-based path len -1 edges so far)
+                    let dom_key = (nxt.clone(), depth_next);
+                    if let Some(best_amt) = dominance.get(&dom_key) { if *best_amt >= new_amount { continue; } }
+                    dominance.insert(dom_key, new_amount);
+                    // Upper-bound pruning: remaining edges (including closing back to base)
+                    let remaining_edges = if max_hops > path.len()+1 { max_hops - (path.len()+1) } else { 0 }; // edges we could still traverse before hitting max_hops (excluding required closing which we allow within bound)
+                    if remaining_edges > 0 {
+                        // optimistic upper bound with exponent (remaining_edges + 1) to include closing hop
+                        let exp = remaining_edges + 1;
+                        let mut ub: u128 = new_amount as u128;
+                        for _ in 0..exp { ub = ub * (max_ratio_bps as u128) / 10_000u128; if ub > u128::MAX / 2 { break; } }
+                        let ub_u64 = if ub > u128::from(u64::MAX) { u64::MAX } else { ub as u64 };
+                        if ub_u64 <= amount_in + best_gross_profit { continue; }
                     }
+                    let mut new_path = path.clone(); new_path.push(nxt.clone());
+                    stack.push((new_path, new_amount));
                 }
             }
         }
