@@ -118,7 +118,12 @@ impl SniperEngine {
                     match self.lp_lock_check(&pk).await {
                         Ok(Some(assess)) => {
                             if assess.concentration_ok {
-                                info!(mint = %pk, top1 = assess.top1_pct, top3 = assess.top3_pct, top5 = assess.top5_pct, "sniper: candidate mint passes concentration");
+                                // Attempt liquidity estimation (Raydium/Orca pool scan) if min_pool_liquidity_sol configured
+                                let mut liq_sol: Option<f64> = None;
+                                if self.cfg.min_pool_liquidity_sol.is_some() {
+                                    liq_sol = self.estimate_liquidity_for_mint(&pk).await.ok().flatten();
+                                }
+                                info!(mint = %pk, top1 = assess.top1_pct, top3 = assess.top3_pct, top5 = assess.top5_pct, burned = assess.burned_pct, program_locked = assess.program_vault_pct, liq_sol, "sniper: candidate mint passes concentration");
                             } else {
                                 debug!(mint = %pk, top1 = assess.top1_pct, top3 = assess.top3_pct, top5 = assess.top5_pct, "sniper: rejected by concentration");
                             }
@@ -166,6 +171,58 @@ pub struct LpLockAssessment {
 }
 
 impl SniperEngine {
+    /// Attempt to estimate total pool liquidity in SOL terms for a given candidate mint.
+    /// Strategy:
+    /// 1. Fetch largest token accounts for mint (already done in lp_lock_check for initial filters).
+    /// 2. Heuristically detect whether any Raydium or Orca pool exists pairing this mint with SOL or a stable (USDC/USDT).
+    /// 3. If pool account found, fetch its vault token accounts and sum value converting via simple mid-price derived from reserves.
+    /// 4. Price conversion: if SOL paired -> direct; if USDC/USDT paired -> treat 1 token == 1 USD and convert using a static SOL/USD (placeholder) or skip until oracle integrated.
+    async fn estimate_liquidity_for_mint(&self, mint: &Pubkey) -> Result<Option<f64>> {
+        // Placeholder stable + SOL mints (should move to config/oracle):
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        let usdc = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+        let usdt = Pubkey::from_str("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB").unwrap();
+        // Quick exit if candidate itself is SOL/stable
+        if *mint == sol_mint || *mint == usdc || *mint == usdt { return Ok(None); }
+        // We don't maintain an indexed map from mint->pool yet, so attempt lightweight scan of recent accounts: skip (needs future caching)
+        // For now: try fetch largest accounts and look for vault owners referencing Raydium or Orca program (heuristic minimal viable solution).
+        let largest = self.rpc.rpc.get_token_largest_accounts(mint).await.ok();
+        let Some(list) = largest else { return Ok(None); };
+        let mut candidate_vaults: Vec<Pubkey> = Vec::new();
+        for acc in list.iter().take(8) {
+            if let Ok(pk) = Pubkey::from_str(&acc.address) { candidate_vaults.push(pk); }
+        }
+        if candidate_vaults.is_empty() { return Ok(None); }
+        let vault_infos = self.rpc.rpc.get_multiple_accounts(&candidate_vaults).await.ok();
+        let Some(v_infos) = vault_infos else { return Ok(None); };
+        // Identify any vault that looks like a Raydium / Orca pool vault by inspecting its owner field if present
+        // SPL token account layout: mint(0..32) owner(32..64) amount(64..72)
+        let mut est_sol_value = 0f64;
+        for opt in v_infos.iter() {
+            let Some(acc) = opt else { continue; };
+            if acc.data.len() < 72 { continue; }
+            let mint_bytes: [u8;32] = acc.data[0..32].try_into().unwrap();
+            let owner_bytes: [u8;32] = acc.data[32..64].try_into().unwrap();
+            let reserve_u64 = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+            let inner_mint = Pubkey::new_from_array(mint_bytes);
+            let owner_pk = Pubkey::new_from_array(owner_bytes);
+            // Heuristic: we only care if this token account's mint is either candidate mint or SOL/stable, and owner is a known AMM program (Raydium / Orca pool address not directly program id, so skip deep validation).
+            if inner_mint != *mint && inner_mint != sol_mint && inner_mint != usdc && inner_mint != usdt { continue; }
+            // Convert amount to SOL value: if paired with SOL directly and inner_mint == SOL -> treat reserve as SOL.
+            if inner_mint == sol_mint { est_sol_value += reserve_u64 as f64 / 1e9; }
+            else if inner_mint == usdc || inner_mint == usdt {
+                // Placeholder USD->SOL conversion: assume 1 SOL = 100 USD (later replace with oracle)
+                let usd = reserve_u64 as f64 / 1e6; // USDC/USDT decimals 6
+                est_sol_value += usd / 100.0;
+            } else if inner_mint == *mint {
+                // Need other side value to price; skip as we can't compute without reserves pair.
+            }
+            // Owner heuristic could refine classification (TODO)
+            let _ = owner_pk; // silence unused for now
+        }
+        if est_sol_value == 0.0 { return Ok(None); }
+        Ok(Some(est_sol_value))
+    }
     pub async fn lp_lock_check(&self, mint: &Pubkey) -> Result<Option<LpLockAssessment>> {
         // Only run if any threshold configured
         if self.cfg.lp_top1_max_pct.is_none() && self.cfg.lp_top3_max_pct.is_none() && self.cfg.lp_top5_max_pct.is_none() { return Ok(None); }
