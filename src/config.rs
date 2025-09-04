@@ -94,6 +94,7 @@ pub struct SniperSettings {
     #[serde(default)] pub drawdown_max_reduction: Option<f64>,     // Max Reduktion Kaufgröße (0.7 => bis 70% Reduktion)
     #[serde(default)] pub rolling_pnl_window: Option<usize>,       // Fenster für Sharpe Approx
     #[serde(default)] pub hot_reload_secs: Option<u64>,            // Interval für Config Reload
+    #[serde(default)] pub pending_trade_ttl_secs: Option<u64>,     // TTL für PendingTrade Einträge (Cleanup wenn kein Fill)
 }
 
 impl Config {

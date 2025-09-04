@@ -67,6 +67,7 @@ pub struct SniperCfg {
     pub drawdown_max_reduction: Option<f64>,
     pub rolling_pnl_window: Option<usize>,
     pub hot_reload_secs: Option<u64>,
+    pub pending_trade_ttl_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -481,6 +482,8 @@ impl SniperEngine {
             debug!(max_buy_sol = mb, "sniper heartbeat");
             // Evaluate open positions for SL/TP exits
             if let Err(e) = self.evaluate_positions().await { debug!(?e, "risk evaluation error"); }
+            // Pending trade TTL cleanup
+            if let Some(ttl) = self.cfg.read().pending_trade_ttl_secs { if ttl > 0 { self.cleanup_stale_pending(ttl); } }
         }
     }
 
@@ -741,6 +744,20 @@ impl SniperEngine {
         }
         Ok(())
     }
+
+    fn cleanup_stale_pending(&self, ttl_secs: u64) {
+        let now = chrono::Utc::now().timestamp();
+        let mut removed: Vec<Pubkey> = Vec::new();
+        {
+            let mut rs = self.risk.write();
+            rs.pending.retain(|mint, p| {
+                let alive = (now - p.ts) <= ttl_secs as i64;
+                if !alive { removed.push(*mint); }
+                alive
+            });
+        }
+        if !removed.is_empty() { debug!(count=removed.len(), "pending cleanup removed stale trades"); }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -944,6 +961,7 @@ impl From<&SniperSettings> for SniperCfg {
             drawdown_max_reduction: s.drawdown_max_reduction,
             rolling_pnl_window: s.rolling_pnl_window,
             hot_reload_secs: s.hot_reload_secs,
+            pending_trade_ttl_secs: s.pending_trade_ttl_secs,
         }
     }
 }

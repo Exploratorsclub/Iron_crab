@@ -121,6 +121,8 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [ ] Partielle Exits (gestaffelte SELL Orders / Positionsplits)
 - [ ] Retry & Backoff Strategie bei transienten RPC Fehlern
 - [ ] PendingTrade TTL + Reconciliation (Zombie Pending entfernen)
+	- [x] TTL Cleanup (Config `pending_trade_ttl_secs`) – implemented
+	- [ ] Reconciliation (Retry / status check vs RPC for missing fills)
 - [ ] Re-Quote unmittelbar vor Signatur (Front‑run Schutz / aktualisiertes min_out)
 
 ### State & Persistence
