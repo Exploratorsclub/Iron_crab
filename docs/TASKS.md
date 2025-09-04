@@ -81,8 +81,8 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Max Notional pro Trade (Config `max_position_sol`)
 	- [x] Daily Loss Limit (`daily_loss_limit_sol` + Tagesreset)
 	- [x] Positions Open Gauge
-	- [ ] Cooldown pro Mint nach SL Exit
-	- [ ] Dynamischer Size-Scaler (Reduce Size nach Drawdown)
+	- [x] Cooldown pro Mint nach SL Exit (Konfig `stop_loss_cooldown_secs`)
+	- [x] Dynamischer Size-Scaler (Drawdown Adjust: `drawdown_scale_start`, `drawdown_max_reduction`)
 11. Sniper: Orca Pools in Index-Liquidität aufnehmen – DONE (Snapshot integriert)
 12. Sniper: Verbesserte min_out Berechnung für Raydium & Orca (quantile impact) – PARTIAL (Orca basic slippage, quantile TODO)
 
@@ -97,10 +97,11 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Positions-/Notional-Limit (max_position_sol pro Trade)
 - [x] Daily Loss Limit Tracking + Reset Tageswechsel
 - [x] Realized & Unrealized PnL intern (Realized via WSOL Delta, Unrealized via Quotes)
-- [ ] Per-Mint Positions-Limit (Anzahl paralleler Positionen)
-- [ ] Cooldowns nach Stop-Loss
-- [ ] Erweiterte PnL Reports (rolling window, Sharpe Approx)
-- [ ] Config Hot-Reload zur Laufzeit
+- [ ] Per-Mint Positions-Limit (Mehrfachpositionen – derzeit 1 enforced)
+- [x] Cooldowns nach Stop-Loss (HashMap cooldown_until)
+- [x] Erweiterte PnL Reports (rolling window + Sharpe Approx `rolling_pnl_window`)
+- [x] Config Hot-Reload (ENV `IRONCRAB_SNIPER_RELOAD_PATH`, 30s Interval)
+- [ ] Persistente RiskState Speicherung (Positions & Sharpe) (TODO)
 
 ## 6) Infra & Observability
 - [x] Structured Metrics (Prometheus Exporter Port 9898)

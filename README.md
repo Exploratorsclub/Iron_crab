@@ -24,6 +24,10 @@ Sniper & Risk
 - Realized PnL: Exakter Exit via WSOL Delta
 - Unrealized PnL: Periodische Quote Aktualisierung
 - Daily Loss Limit & Max Position Size
+- Dynamische Positionsgröße bei Drawdown (Scaling)
+- Stop-Loss Cooldown je Mint
+- Rolling Realized Return Window + Sharpe Approx
+- Config Hot Reload (ENV: `IRONCRAB_SNIPER_RELOAD_PATH`)
 
 Metrics & Observability
 - Prometheus Exporter (Port 9898) – Trades, RPC Errors, Open Positions, Realized PnL (µSOL), Liquidity, Swap Latency Histogram
