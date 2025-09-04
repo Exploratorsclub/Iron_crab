@@ -20,7 +20,6 @@ use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use futures::{StreamExt, SinkExt};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use serde_json::json;
 use std::time::{Duration, Instant};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -39,6 +38,8 @@ use crate::metrics::{
     record_network_fee,
     record_trade_return,
 };
+use serde::{Serialize, Deserialize};
+use serde_json::json;
 
 // Simple global blacklist (extendable via config later)
 #[allow(dead_code)]
@@ -70,7 +71,7 @@ pub struct SniperCfg {
     pub pending_trade_ttl_secs: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Position {
     entry_price_sol: f64,
     amount_tokens: f64,
@@ -79,7 +80,7 @@ struct Position {
     last_unrealized_pnl_sol: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 struct PendingTrade {
     dex: String,
@@ -90,14 +91,17 @@ struct PendingTrade {
     ts: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 struct RiskState {
+    #[serde(skip)]
     open: std::collections::HashMap<Pubkey, Position>,
     realized_pnl_sol: f64,
     realized_loss_today_sol: f64,
     current_day: u32,
+    #[serde(skip)]
     pending: std::collections::HashMap<Pubkey, PendingTrade>,
+    #[serde(skip)]
     cooldown_until: std::collections::HashMap<Pubkey, i64>,
     recent_realized: Vec<f64>,
     last_sharpe: f64,
@@ -444,10 +448,20 @@ impl SniperEngine {
     }
 
     pub async fn run(&self) -> Result<()> {
+        self.try_load_risk_state();
         self.subscribe_logs().await?;
         info!("sniper engine running (skeleton)");
         // Placeholder periodic task: future spot for initial buys & SL/TP mgmt
         let mut iv = tokio::time::interval(Duration::from_secs(15));
+        // Autosave task
+        let autosave_secs: u64 = std::env::var("IRONCRAB_RISK_AUTOSAVE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        if autosave_secs > 0 {
+            let engine_clone = self.clone_for_spawn();
+            tokio::spawn(async move {
+                let mut saver = tokio::time::interval(Duration::from_secs(autosave_secs));
+                loop { saver.tick().await; engine_clone.persist_risk_state(); }
+            });
+        }
         // Hot reload task (env IRONCRAB_SNIPER_RELOAD_PATH)
         if let Some(path) = std::env::var_os("IRONCRAB_SNIPER_RELOAD_PATH") {
             let path_buf = std::path::PathBuf::from(path);
@@ -739,6 +753,7 @@ impl SniperEngine {
                     realized=realized
                 );
                 self.append_trade_record(&line, true);
+                self.persist_risk_state();
             }
             Err(e) => warn!(?e, mint=%mint, "exit tx failed"),
         }
@@ -757,6 +772,83 @@ impl SniperEngine {
             });
         }
         if !removed.is_empty() { debug!(count=removed.len(), "pending cleanup removed stale trades"); }
+    }
+
+    fn risk_state_file_path() -> std::path::PathBuf {
+        let path = std::env::var("IRONCRAB_RISK_STATE_PATH").unwrap_or_else(|_| "state/risk_state.json".to_string());
+        std::path::PathBuf::from(path)
+    }
+
+    fn persist_risk_state(&self) {
+        let path = Self::risk_state_file_path();
+        if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+        let snapshot = self.build_risk_snapshot_json();
+        if let Ok(txt) = serde_json::to_string_pretty(&snapshot) { let _ = std::fs::write(&path, txt); }
+    }
+
+    fn build_risk_snapshot_json(&self) -> serde_json::Value {
+        let rs = self.risk.read();
+        let open: Vec<serde_json::Value> = rs.open.iter().map(|(k,v)| json!({
+            "mint": k.to_string(),
+            "entry_price_sol": v.entry_price_sol,
+            "amount_tokens": v.amount_tokens,
+            "invested_sol": v.invested_sol,
+            "token_decimals": v.token_decimals,
+            "last_unrealized_pnl_sol": v.last_unrealized_pnl_sol
+        })).collect();
+        let cooldown: Vec<serde_json::Value> = rs.cooldown_until.iter().map(|(k,v)| json!({"mint": k.to_string(), "until": v})).collect();
+        json!({
+            "version": 1,
+            "realized_pnl_sol": rs.realized_pnl_sol,
+            "realized_loss_today_sol": rs.realized_loss_today_sol,
+            "current_day": rs.current_day,
+            "recent_realized": rs.recent_realized,
+            "last_sharpe": rs.last_sharpe,
+            "open_positions": open,
+            "cooldowns": cooldown
+        })
+    }
+
+    fn try_load_risk_state(&self) {
+        let path = Self::risk_state_file_path();
+        if !path.exists() { return; }
+        if let Ok(txt) = std::fs::read_to_string(&path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    let mut rs = self.risk.write();
+                    rs.realized_pnl_sol = val.get("realized_pnl_sol").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    rs.realized_loss_today_sol = val.get("realized_loss_today_sol").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    rs.current_day = val.get("current_day").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    rs.recent_realized = val.get("recent_realized").and_then(|v| v.as_array()).map(|arr| arr.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
+                    rs.last_sharpe = val.get("last_sharpe").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    rs.open.clear();
+                    if let Some(op) = val.get("open_positions").and_then(|v| v.as_array()) {
+                        for ent in op {
+                            let mint_opt = ent.get("mint").and_then(|m| m.as_str());
+                            let entry_opt = ent.get("entry_price_sol").and_then(|f| f.as_f64());
+                            let amt_opt = ent.get("amount_tokens").and_then(|f| f.as_f64());
+                            if let (Some(mint_str), Some(entry_price), Some(amount_tokens)) = (mint_opt, entry_opt, amt_opt) {
+                                if let Ok(pk) = Pubkey::from_str(mint_str) {
+                                    let invested = ent.get("invested_sol").and_then(|f| f.as_f64()).unwrap_or(0.0);
+                                    let decs = ent.get("token_decimals").and_then(|f| f.as_u64()).unwrap_or(0) as u8;
+                                    let last_unr = ent.get("last_unrealized_pnl_sol").and_then(|f| f.as_f64()).unwrap_or(0.0);
+                                    rs.open.insert(pk, Position { entry_price_sol: entry_price, amount_tokens, invested_sol: invested, token_decimals: decs, last_unrealized_pnl_sol: last_unr });
+                                }
+                            }
+                        }
+                    }
+                    rs.cooldown_until.clear();
+                    if let Some(cd) = val.get("cooldowns").and_then(|v| v.as_array()) {
+                        for c in cd { if let (Some(mint_str), Some(until)) = (c.get("mint").and_then(|m| m.as_str()), c.get("until").and_then(|u| u.as_i64())) { if let Ok(pk) = Pubkey::from_str(mint_str) { rs.cooldown_until.insert(pk, until); } } }
+                    }
+                    OPEN_POSITIONS_GAUGE.store(rs.open.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    DAILY_REALIZED_PNL_SOL_MICRO.store((rs.realized_pnl_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+                    info!(positions = rs.open.len(), "risk state restored");
+            } else {
+                warn!("risk state json parse failed");
+            }
+        } else {
+            debug!("risk state read failed");
+        }
     }
 }
 
@@ -965,3 +1057,4 @@ impl From<&SniperSettings> for SniperCfg {
         }
     }
 }
+// EOF extra brace fix

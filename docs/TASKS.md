@@ -103,6 +103,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Erweiterte PnL Reports (rolling window + Sharpe Approx `rolling_pnl_window`)
 - [x] Config Hot-Reload (ENV `IRONCRAB_SNIPER_RELOAD_PATH`, 30s Interval)
 - [ ] Persistente RiskState Speicherung (Positions & Sharpe) (TODO)
+	- [x] Basis Persistenz (JSON Snapshot: ENV `IRONCRAB_RISK_STATE_PATH`, Autosave `IRONCRAB_RISK_AUTOSAVE_SECS`)
 
 ## 6) Infra & Observability
 - [x] Structured Metrics (Prometheus Exporter Port 9898)
