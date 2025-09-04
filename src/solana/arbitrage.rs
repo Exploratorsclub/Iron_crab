@@ -9,7 +9,7 @@ use super::{rpc::SolanaRpc, dex::{Dex, Quote}};
 use crate::metrics::{ARB_TRIANGLE_ATTEMPTS, ARB_TRIANGLE_PROFITABLE};
 use crate::solana::dex::router::Router;
 use rust_decimal::Decimal;
-use solana_sdk::{transaction::Transaction, instruction::Instruction, message::Message, signature::Keypair};
+use solana_sdk::{transaction::Transaction, instruction::Instruction, signature::Keypair, hash::Hash, signature::Signer};
 use crate::solana::compute_budget_estimator as cbe;
 
 /// Planned transaction containing ordered instructions plus bookkeeping.
@@ -20,6 +20,13 @@ pub struct TransactionPlan {
     pub compute_unit_price_micro_lamports: u64,
     pub expected_profit: u64, // in input token raw units (post-estimate, pre-fees beyond priority)
     pub path_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimulationOutcome {
+    pub units_consumed: Option<u64>,
+    pub logs: Vec<String>,
+    pub err: Option<String>,
 }
 
 pub struct ArbitrageEngine {
@@ -117,6 +124,24 @@ impl ArbitrageEngine {
         let est = cbe::estimate_from_instructions(&ixs, 3, amount_in, cbe::EstimatorConfig::default());
         let plan = TransactionPlan { ixs, compute_unit_limit: est.compute_unit_limit, compute_unit_price_micro_lamports: est.compute_unit_price_micro_lamports, expected_profit: net_profit, path_id: format!("{}-{}-{}", a,b,c) };
         Ok(Some(plan))
+    }
+
+    /// Simulate a transaction plan (adds compute budget ixs at front).
+    pub async fn simulate_transaction_plan(&self, plan: &TransactionPlan, fee_payer: &Keypair) -> Result<SimulationOutcome> {
+        use crate::solana::compute_budget_helper as cbh;
+        // Fetch recent blockhash
+        let bh: Hash = self.rpc.rpc.get_latest_blockhash().await?;
+        let mut ixs: Vec<Instruction> = Vec::new();
+        if plan.compute_unit_limit > 0 { ixs.push(cbh::set_compute_unit_limit(plan.compute_unit_limit)); }
+        if plan.compute_unit_price_micro_lamports > 0 { ixs.push(cbh::set_compute_unit_price(plan.compute_unit_price_micro_lamports)); }
+        ixs.extend(plan.ixs.clone());
+        let tx = Transaction::new_signed_with_payer(&ixs, Some(&fee_payer.pubkey()), &[fee_payer], bh);
+        let sim = self.rpc.rpc.simulate_transaction(&tx).await?; // RpcSimulateTransactionResult
+        let value = sim.value;
+        let logs = value.logs.unwrap_or_default();
+        let units_consumed = value.units_consumed;
+        let err = value.err.map(|e| format!("{:?}", e));
+        Ok(SimulationOutcome { units_consumed, logs, err })
     }
 }
 

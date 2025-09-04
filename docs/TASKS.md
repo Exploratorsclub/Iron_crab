@@ -44,6 +44,8 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 4. Router: Depth‑2 Pfad Benchmark + Depth‑3 (erste Greedy Implementierung + Pruning) [Depth‑3 implemented]
 5. Arbitrage Aggregator: Triangular Path (A-B-C-A) Profit Check (greedy implemented) + Erweiterung für generische Zyklen
 	- [x] Net Profit Filter (min_profit_bps + est_tx_cost_lamports)
+	- [x] TransactionPlan Scaffold (triangle assembly)
+	- [x] Pre-TX Simulation (RPC simulateTransaction)
 6. Compute Budget: Dynamische CU-Schätzung (historische Simulation / heuristics) statt fixer Werte
 	- [x] Erste heuristische Implementierung (Estimator Modul + Raydium build_swap_plan_auto)
 7. Metrics: Pool Count, Quote Latency, Routing Auswahlgrund (DEX, hops)
