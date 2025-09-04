@@ -81,6 +81,19 @@ pub struct SniperSettings {
     #[serde(default)] pub lp_top1_max_pct: Option<f64>,
     #[serde(default)] pub lp_top3_max_pct: Option<f64>,
     #[serde(default)] pub lp_top5_max_pct: Option<f64>,
+    // --- Risk Layer (neu) ---
+    #[serde(default)] pub max_position_sol: Option<f64>,          // Max Depot-Notional für eine einzelne neue Position
+    #[serde(default)] pub stop_loss_bps: Option<u32>,              // z.B. 3000 = -30% unter Entry
+    #[serde(default)] pub take_profit_bps: Option<u32>,            // z.B. 10000 = +100% Gewinn
+    #[serde(default)] pub daily_loss_limit_sol: Option<f64>,       // harter Tagesverlust-Limiter
+    // --- Erweiterte Risk & Limits ---
+    #[serde(default)] pub max_open_positions: Option<usize>,       // Gesamtanzahl paralleler Positionen
+    #[serde(default)] pub per_mint_position_limit: Option<u32>,    // Mehrfachkäufe je Mint (derzeit 1 unterstützt; Platzhalter)
+    #[serde(default)] pub stop_loss_cooldown_secs: Option<u64>,    // Cooldown nach SL Exit
+    #[serde(default)] pub drawdown_scale_start: Option<f64>,       // Anteil daily_loss_limit ab dem Kaufgrößen reduziert werden (0.3 = 30%)
+    #[serde(default)] pub drawdown_max_reduction: Option<f64>,     // Max Reduktion Kaufgröße (0.7 => bis 70% Reduktion)
+    #[serde(default)] pub rolling_pnl_window: Option<usize>,       // Fenster für Sharpe Approx
+    #[serde(default)] pub hot_reload_secs: Option<u64>,            // Interval für Config Reload
 }
 
 impl Config {

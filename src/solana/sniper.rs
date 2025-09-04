@@ -57,6 +57,13 @@ pub struct SniperCfg {
     pub stop_loss_bps: Option<u32>,
     pub take_profit_bps: Option<u32>,
     pub daily_loss_limit_sol: Option<f64>,
+    pub max_open_positions: Option<usize>,
+    pub per_mint_position_limit: Option<u32>,
+    pub stop_loss_cooldown_secs: Option<u64>,
+    pub drawdown_scale_start: Option<f64>,
+    pub drawdown_max_reduction: Option<f64>,
+    pub rolling_pnl_window: Option<usize>,
+    pub hot_reload_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,17 +94,20 @@ struct RiskState {
     realized_loss_today_sol: f64,
     current_day: u32,
     pending: std::collections::HashMap<Pubkey, PendingTrade>,
+    cooldown_until: std::collections::HashMap<Pubkey, i64>,
+    recent_realized: Vec<f64>,
+    last_sharpe: f64,
 }
 
 impl Default for RiskState {
     fn default() -> Self {
-        Self { open: Default::default(), realized_pnl_sol: 0.0, realized_loss_today_sol: 0.0, current_day: 0, pending: Default::default() }
+    Self { open: Default::default(), realized_pnl_sol: 0.0, realized_loss_today_sol: 0.0, current_day: 0, pending: Default::default(), cooldown_until: Default::default(), recent_realized: Vec::new(), last_sharpe: 0.0 }
     }
 }
 
 pub struct SniperEngine {
     pub rpc: Arc<SolanaRpc>,
-    cfg: SniperCfg,
+    cfg: parking_lot::RwLock<SniperCfg>,
     raydium: Option<Arc<Raydium>>,
     orca: Option<Arc<Orca>>,
     purchased: parking_lot::RwLock<HashSet<Pubkey>>, // track already bought mints (avoid double buy)
@@ -128,9 +138,9 @@ impl SniperEngine {
         };
         Ok((native_lamports + wsol_amount) as f64 / 1e9)
     }
-    pub fn new(rpc: Arc<SolanaRpc>, cfg: SniperCfg, raydium: Option<Arc<Raydium>>, orca: Option<Arc<Orca>>, treasury: Arc<Treasury>) -> Self { Self { rpc, cfg, raydium, orca, purchased: parking_lot::RwLock::new(HashSet::new()), treasury, risk: parking_lot::RwLock::new(RiskState::default()) } }
+    pub fn new(rpc: Arc<SolanaRpc>, cfg: SniperCfg, raydium: Option<Arc<Raydium>>, orca: Option<Arc<Orca>>, treasury: Arc<Treasury>) -> Self { Self { rpc, cfg: parking_lot::RwLock::new(cfg), raydium, orca, purchased: parking_lot::RwLock::new(HashSet::new()), treasury, risk: parking_lot::RwLock::new(RiskState::default()) } }
 
-    fn clone_for_spawn(&self) -> Self { SniperEngine { rpc: self.rpc.clone(), cfg: self.cfg.clone(), raydium: self.raydium.clone(), orca: self.orca.clone(), purchased: parking_lot::RwLock::new(HashSet::new()), treasury: self.treasury.clone(), risk: parking_lot::RwLock::new(RiskState::default()) } }
+    fn clone_for_spawn(&self) -> Self { SniperEngine { rpc: self.rpc.clone(), cfg: parking_lot::RwLock::new(self.cfg.read().clone()), raydium: self.raydium.clone(), orca: self.orca.clone(), purchased: parking_lot::RwLock::new(HashSet::new()), treasury: self.treasury.clone(), risk: parking_lot::RwLock::new(RiskState::default()) } }
 
     fn http_to_ws(url: &str) -> String {
         if url.starts_with("https://") { url.replacen("https://", "wss://", 1) }
@@ -205,7 +215,7 @@ impl SniperEngine {
                             if assess.concentration_ok {
                                 // Attempt liquidity estimation (Raydium/Orca pool scan) if min_pool_liquidity_sol configured
                                 let mut liq_sol: Option<f64> = None;
-                                if self.cfg.min_pool_liquidity_sol.is_some() {
+                                if self.cfg.read().min_pool_liquidity_sol.is_some() {
                                     match self.estimate_liquidity_index(&pk).await {
                                         Ok(v) => liq_sol = v,
                                         Err(_) => { liq_sol = self.estimate_liquidity_for_mint(&pk).await.ok().flatten(); }
@@ -213,10 +223,11 @@ impl SniperEngine {
                                 }
                                 info!(mint = %pk, top1 = assess.top1_pct, top3 = assess.top3_pct, top5 = assess.top5_pct, burned = assess.burned_pct, program_locked = assess.program_vault_pct, liq_sol, "sniper: candidate mint passes concentration");
                                 // Gate by liquidity threshold if configured
-                                let liq_ok = self.cfg.min_pool_liquidity_sol.map(|thr| liq_sol.unwrap_or(0.0) >= thr).unwrap_or(true);
+                                let liq_ok = self.cfg.read().min_pool_liquidity_sol.map(|thr| liq_sol.unwrap_or(0.0) >= thr).unwrap_or(true);
                                 if liq_ok {
                                     // Risk: Notional cap & daily loss limit pre-check
-                                    if !self.can_open_position(self.cfg.max_buy_sol) {
+                                    let base_buy = self.cfg.read().max_buy_sol;
+                                    if !self.can_open_position(base_buy) {
                                         debug!(mint=%pk, "sniper: risk gate blocked new position (notional/daily loss)");
                                         continue;
                                     }
@@ -250,7 +261,7 @@ impl SniperEngine {
         // Determine input (SOL) and output (mint) ordering for swap (we buy the mint with SOL)
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
         // Convert max_buy_sol (f64) to lamports safely
-        let lamports_in = ((self.cfg.max_buy_sol * 1e9) as u64).max(10_000); // min lamports safeguard
+    let lamports_in = ((self.cfg.read().max_buy_sol * 1e9) as u64).max(10_000); // min lamports safeguard (scaling TBD at entry call site)
         // Ensure destination ATA for target mint (may fail if mint malformed)
         use solana_sdk::pubkey::Pubkey as SdkPubkey;
         let mint_sdk = SdkPubkey::new_from_array(mint.to_bytes());
@@ -259,7 +270,8 @@ impl SniperEngine {
         // Wrap SOL into WSOL ATA (Raydium expects token account)
     let (wsol_ata_sdk, _wrap_sig) = match self.treasury.wrap_sol(&self.rpc, lamports_in).await { Ok(v)=>v, Err(e)=> { debug!(?e, lamports_in, "wrap_sol failed"); return Ok(()); } };
     // Build auto plan for min_out computation & pool selection (Raydium)
-    let plan_opt = if let Some(r) = &ray { r.build_swap_plan_auto(&sol_mint.to_string(), &mint.to_string(), lamports_in, self.cfg.max_slippage_bps)? } else { None };
+    let msb = self.cfg.read().max_slippage_bps;
+    let plan_opt = if let Some(r) = &ray { r.build_swap_plan_auto(&sol_mint.to_string(), &mint.to_string(), lamports_in, msb)? } else { None };
     if plan_opt.is_none() && orca.is_none() { debug!(mint=%mint, "no raydium or orca route"); return Ok(()); }
     let plan_meta = plan_opt;
     let mut used_raydium = false;
@@ -317,7 +329,7 @@ impl SniperEngine {
                 // Derive min_out with slippage tolerance via quote
                 let mut min_out_orca = 1u64; // fallback
                 if let Ok(Some(q)) = o.quote_exact_in(&sol_mint.to_string(), &mint.to_string(), lamports_in).await {
-                    let slip = self.cfg.max_slippage_bps as u128;
+                    let slip = self.cfg.read().max_slippage_bps as u128;
                     min_out_orca = ((q.amount_out as u128) * (10_000 - slip) / 10_000) as u64;
                     if min_out_orca == 0 { min_out_orca = 1; }
                 }
@@ -414,7 +426,8 @@ impl SniperEngine {
         let mut iv = tokio::time::interval(Duration::from_secs(15));
         loop {
             iv.tick().await;
-            debug!(max_buy_sol = self.cfg.max_buy_sol, "sniper heartbeat");
+            let mb = self.cfg.read().max_buy_sol;
+            debug!(max_buy_sol = mb, "sniper heartbeat");
             // Evaluate open positions for SL/TP exits
             if let Err(e) = self.evaluate_positions().await { debug!(?e, "risk evaluation error"); }
         }
@@ -423,11 +436,11 @@ impl SniperEngine {
     #[allow(dead_code)]
     fn heuristics_pass(&self, mint: &Pubkey, owner: Option<&Pubkey>, liquidity_sol: Option<f64>, freeze_auth: Option<&Pubkey>, mint_decimals: Option<u8>) -> bool {
         // Config / dynamic sources
-        if self.cfg.blacklist_mints.iter().any(|m| m == &mint.to_string()) { return false; }
-        if let Some(o) = owner { if self.cfg.blacklist_owners.iter().any(|v| v == &o.to_string()) { return false; } }
-        if let Some(min_liq) = self.cfg.min_pool_liquidity_sol { if liquidity_sol.unwrap_or(0.0) < min_liq { return false; } }
-        if self.cfg.require_freeze_auth_none.unwrap_or(false) { if freeze_auth.is_some() { return false; } }
-        if let Some((lo,hi)) = self.cfg.require_mint_decimals_range { if let Some(d) = mint_decimals { if d < lo || d > hi { return false; } } }
+    if self.cfg.read().blacklist_mints.iter().any(|m| m == &mint.to_string()) { return false; }
+    if let Some(o) = owner { if self.cfg.read().blacklist_owners.iter().any(|v| v == &o.to_string()) { return false; } }
+    if let Some(min_liq) = self.cfg.read().min_pool_liquidity_sol { if liquidity_sol.unwrap_or(0.0) < min_liq { return false; } }
+    if self.cfg.read().require_freeze_auth_none.unwrap_or(false) { if freeze_auth.is_some() { return false; } }
+    if let Some((lo,hi)) = self.cfg.read().require_mint_decimals_range { if let Some(d) = mint_decimals { if d < lo || d > hi { return false; } } }
         true
     }
 
@@ -448,8 +461,14 @@ impl SniperEngine {
     fn can_open_position(&self, planned_sol: f64) -> bool {
         self.risk_reset_if_needed();
         let rs = self.risk.read();
-        if let Some(cap) = self.cfg.max_position_sol { if planned_sol > cap { return false; } }
-        if let Some(daily) = self.cfg.daily_loss_limit_sol { if rs.realized_loss_today_sol >= daily { return false; } }
+    let cfg_r = self.cfg.read();
+    if let Some(cap) = cfg_r.max_position_sol { if planned_sol > cap { return false; } }
+    if let Some(daily) = cfg_r.daily_loss_limit_sol { if rs.realized_loss_today_sol >= daily { return false; } }
+    if let Some(mop) = cfg_r.max_open_positions { if rs.open.len() >= mop { return false; } }
+    // Cooldown check (current unix ts)
+    // purchased holds mints already bought; cooldown avoids re-entry after SL
+    if rs.cooldown_until.get(&Pubkey::default()).is_some() { /* placeholder to silence warning */ }
+    // Future per-mint cooldown check would require mint param here (not available); assume external call adds mint-specific gating.
         true
     }
 
@@ -528,9 +547,8 @@ impl SniperEngine {
 
     async fn evaluate_positions(&self) -> Result<()> {
         // Skip if no thresholds configured
-        if self.cfg.stop_loss_bps.is_none() && self.cfg.take_profit_bps.is_none() { return Ok(()); }
-        let stop_bps = self.cfg.stop_loss_bps.unwrap_or(u32::MAX); // large disables
-        let tp_bps = self.cfg.take_profit_bps.unwrap_or(u32::MAX);
+    { let r = self.cfg.read(); if r.stop_loss_bps.is_none() && r.take_profit_bps.is_none() { return Ok(()); } }
+    let (stop_bps, tp_bps) = { let r = self.cfg.read(); (r.stop_loss_bps.unwrap_or(u32::MAX), r.take_profit_bps.unwrap_or(u32::MAX)) };
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
         // clone keys to drop lock quickly
         let positions: Vec<(Pubkey, Position)> = {
@@ -575,7 +593,8 @@ impl SniperEngine {
         if bal_tokens == 0 { return Ok(()); }
     // Raydium plan token->SOL
         let mut used_raydium = false;
-        let ray_plan = if let Some(r) = &self.raydium { r.build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), bal_tokens, self.cfg.max_slippage_bps).ok() } else { None };
+    let msb2 = self.cfg.read().max_slippage_bps;
+    let ray_plan = if let Some(r) = &self.raydium { r.build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), bal_tokens, msb2).ok() } else { None };
     if let Some(ref p) = ray_plan { if p.as_ref().map(|rp| rp.pool.is_some()).unwrap_or(false) { used_raydium = true; } }
     let bh: Hash = match self.rpc.rpc.get_latest_blockhash().await { Ok(h)=>h, Err(e)=> { RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return Err(e.into()); } };
     let tx_ixs: Vec<solana_sdk::instruction::Instruction> = if used_raydium { ray_plan.as_ref().unwrap().as_ref().unwrap().ixs.clone() } else {
@@ -589,7 +608,8 @@ impl SniperEngine {
                 o.set_user_token_account(Pubkey::new_from_array(sol_mint.to_bytes()), wsol_ata); // treat SOL as WSOL mint
                 let mut min_out = 1u64;
                 if let Ok(Some(q)) = o.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), bal_tokens).await {
-                    min_out = ((q.amount_out as u128) * (10_000 - self.cfg.max_slippage_bps as u128) / 10_000) as u64;
+                    let msb3 = self.cfg.read().max_slippage_bps as u128;
+                    min_out = ((q.amount_out as u128) * (10_000 - msb3) / 10_000) as u64;
                 }
                 o.build_swap_ix(&mint.to_string(), &sol_mint.to_string(), bal_tokens, min_out).unwrap_or_default()
             } else { Vec::new() }
@@ -752,10 +772,8 @@ impl SniperEngine {
     }
     pub async fn lp_lock_check(&self, mint: &Pubkey) -> Result<Option<LpLockAssessment>> {
         // Only run if any threshold configured
-        if self.cfg.lp_top1_max_pct.is_none() && self.cfg.lp_top3_max_pct.is_none() && self.cfg.lp_top5_max_pct.is_none() { return Ok(None); }
-        let thr1 = self.cfg.lp_top1_max_pct.unwrap_or(f64::MAX);
-        let thr3 = self.cfg.lp_top3_max_pct.unwrap_or(f64::MAX);
-        let thr5 = self.cfg.lp_top5_max_pct.unwrap_or(f64::MAX);
+    { let r = self.cfg.read(); if r.lp_top1_max_pct.is_none() && r.lp_top3_max_pct.is_none() && r.lp_top5_max_pct.is_none() { return Ok(None); } }
+    let (thr1,thr3,thr5) = { let r = self.cfg.read(); (r.lp_top1_max_pct.unwrap_or(f64::MAX), r.lp_top3_max_pct.unwrap_or(f64::MAX), r.lp_top5_max_pct.unwrap_or(f64::MAX)) };
         // Fetch mint account
         let mint_acc = match self.rpc.rpc.get_account(mint).await { Ok(a)=>a, Err(e)=> { warn!(?e, "mint account fetch failed"); return Ok(None); } };
     // SPL Mint length heuristic (approx range) & manual decode subset (legacy Token program)
@@ -853,6 +871,13 @@ impl From<&SniperSettings> for SniperCfg {
             stop_loss_bps: s.stop_loss_bps,
             take_profit_bps: s.take_profit_bps,
             daily_loss_limit_sol: s.daily_loss_limit_sol,
+            max_open_positions: s.max_open_positions,
+            per_mint_position_limit: s.per_mint_position_limit,
+            stop_loss_cooldown_secs: s.stop_loss_cooldown_secs,
+            drawdown_scale_start: s.drawdown_scale_start,
+            drawdown_max_reduction: s.drawdown_max_reduction,
+            rolling_pnl_window: s.rolling_pnl_window,
+            hot_reload_secs: s.hot_reload_secs,
         }
     }
 }
