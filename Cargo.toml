@@ -51,12 +51,14 @@ spl-associated-token-account = { version = "7", features = ["no-entrypoint"] }
 spl-associated-token-account-client = "2"
 spl-token = { version = "8", features = ["no-entrypoint"] }
 spl-token-2022 = { version = "9", features = ["no-entrypoint"] }
+notify = { version = "6", optional = true }
 
 [features]
 default = []
 test_helpers = []
 python = ["pyo3"]
 jito = []
+notify_watch = ["notify"]
 
 [dependencies.pyo3]
 version = "0.21"

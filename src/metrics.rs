@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use once_cell::sync::Lazy;
-use std::time::{Instant};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::net::SocketAddr;
 use hyper::{Body, Request, Response, Server};
 use hyper::service::{make_service_fn, service_fn};
@@ -63,6 +63,10 @@ const TRADE_RETURN_BUCKETS: &[f64] = &[
 pub static TRADE_RETURN_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| TRADE_RETURN_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
 pub static TRADE_RETURN_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TRADE_RETURN_SUM_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0)); // signed sum(ret * 1e6) for average
+pub static SHARPE_RATIO_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+pub static DRAWDOWN_PCT_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+pub static LAST_ACTIVITY_TS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct LatencyTimer { start: Instant }
 impl LatencyTimer { pub fn start() -> Self { Self { start: Instant::now() } } }
@@ -193,9 +197,13 @@ async fn metrics_response() -> Response<Body> {
     // Trade return histogram (realized PnL / invested)
     let tr_count = TRADE_RETURN_COUNT.load(Ordering::Relaxed);
     let tr_sum_micro = TRADE_RETURN_SUM_MICRO.load(Ordering::Relaxed);
-    for (i,b) in TRADE_RETURN_BUCKETS.iter().enumerate() { let c = TRADE_RETURN_BUCKET_COUNTS[i].load(Ordering::Relaxed); out.push_str(&format!("trade_return_bucket{{le=\"{}\"}} {}\n", b, c)); }
-    out.push_str(&format!("trade_return_sum {}\n", tr_sum_micro as f64 / 1_000_000.0));
-    out.push_str(&format!("trade_return_count {}\n", tr_count));
+        for (i,b) in TRADE_RETURN_BUCKETS.iter().enumerate() { let c = TRADE_RETURN_BUCKET_COUNTS[i].load(Ordering::Relaxed); out.push_str(&format!("trade_return_bucket{{le=\"{}\"}} {}\n", b, c)); }
+        out.push_str(&format!("trade_return_bucket{{le=\"+Inf\"}} {}\n", tr_count));
+        out.push_str(&format!("trade_return_sum {}\n", tr_sum_micro as f64 / 1_000_000.0));
+        out.push_str(&format!("trade_return_count {}\n", tr_count));
+        line!("ironcrab_sharpe_ratio", SHARPE_RATIO_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
+        line!("ironcrab_drawdown_pct", DRAWDOWN_PCT_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
+        out.push_str(&format!("ironcrab_build_info{{version=\"{}\"}} 1\n", BUILD_VERSION));
     // Histogram exposition (Prometheus classic format)
     let swap_count = SWAP_LATENCY_COUNT.load(Ordering::Relaxed);
     let swap_sum = SWAP_LATENCY_SUM_NS.load(Ordering::Relaxed);
@@ -210,8 +218,34 @@ async fn metrics_response() -> Response<Body> {
 
 pub async fn serve_metrics(addr: SocketAddr) -> anyhow::Result<()> {
     let make_svc = make_service_fn(|_conn| async {
-        Ok::<_, hyper::Error>(service_fn(|_req: Request<Body>| async move { Ok::<_, hyper::Error>(metrics_response().await) }))
+        Ok::<_, hyper::Error>(service_fn(|req: Request<Body>| async move {
+            let path = req.uri().path();
+            if path == "/metrics" { return Ok::<_, hyper::Error>(metrics_response().await); }
+            if path == "/live" { return Ok::<_, hyper::Error>(Response::new(Body::from("ok"))); }
+            if path == "/ready" {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let last = LAST_ACTIVITY_TS.load(Ordering::Relaxed);
+                if last > 0 && now.saturating_sub(last) <= 120 { return Ok::<_, hyper::Error>(Response::new(Body::from("ready"))); }
+                else { return Ok::<_, hyper::Error>(Response::builder().status(503).body(Body::from("stale")).unwrap()); }
+            }
+            Ok::<_, hyper::Error>(metrics_response().await)
+        }))
     });
     Server::bind(&addr).serve(make_svc).await?;
     Ok(())
+}
+
+pub fn update_sharpe(sharpe: f64) {
+    let micro = (sharpe * 1_000_000.0).clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+    SHARPE_RATIO_MICRO.store(micro, Ordering::Relaxed);
+}
+
+pub fn update_drawdown(drawdown_pct: f64) {
+    let micro = (drawdown_pct * 1_000_000.0).clamp(0.0, i64::MAX as f64) as i64;
+    DRAWDOWN_PCT_MICRO.store(micro, Ordering::Relaxed);
+}
+
+pub fn record_activity() {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    LAST_ACTIVITY_TS.store(now, Ordering::Relaxed);
 }

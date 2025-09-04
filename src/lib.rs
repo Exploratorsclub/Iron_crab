@@ -6,3 +6,4 @@ pub mod engine;
 pub mod solana;
 pub mod backtest;
 pub mod metrics;
+pub mod config_reload;

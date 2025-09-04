@@ -147,6 +147,7 @@ impl Engine {
         let mut iv = interval(Duration::from_millis(600));
         loop {
             iv.tick().await;
+            crate::metrics::record_activity();
             for s in &self.strategies {
                 match run_strategy_tick(s.as_ref(), self.ctx.clone()).await {
                     Ok(intents) => {

@@ -1,0 +1,15 @@
+{
+  "title": "IronCrab Overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "panels": [
+    { "type": "graph", "title": "Sharpe Ratio", "targets": [{ "expr": "ironcrab_sharpe_ratio" }], "gridPos": {"h":8,"w":12,"x":0,"y":0} },
+    { "type": "graph", "title": "Drawdown %", "targets": [{ "expr": "ironcrab_drawdown_pct" }], "gridPos": {"h":8,"w":12,"x":12,"y":0} },
+    { "type": "graph", "title": "Open Positions", "targets": [{ "expr": "open_positions" }], "gridPos": {"h":6,"w":8,"x":0,"y":8} },
+    { "type": "graph", "title": "Daily Realized PnL (SOL)", "targets": [{ "expr": "daily_realized_pnl_sol" }], "gridPos": {"h":6,"w":8,"x":8,"y":8} },
+    { "type": "graph", "title": "RPC Errors", "targets": [{ "expr": "rpc_errors_total" }], "gridPos": {"h":6,"w":8,"x":16,"y":8} },
+    { "type": "graph", "title": "Trade Return Distribution", "targets": [{ "expr": "trade_return_bucket" }], "gridPos": {"h":8,"w":12,"x":0,"y":14} },
+    { "type": "graph", "title": "Swap Latency (count)", "targets": [{ "expr": "swap_latency_seconds_count" }], "gridPos": {"h":8,"w":12,"x":12,"y":14} }
+  ],
+  "templating": { "list": [] }
+}

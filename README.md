@@ -27,7 +27,11 @@ Sniper & Risk
 - Dynamische Positionsgröße bei Drawdown (Scaling)
 - Stop-Loss Cooldown je Mint
 - Rolling Realized Return Window + Sharpe Approx (Tests für Fee-Impact & Window-Truncation)
-- Config Hot Reload (ENV: `IRONCRAB_SNIPER_RELOAD_PATH`)
+ - Sharpe & Drawdown Gauges (Prometheus: `ironcrab_sharpe_ratio`, `ironcrab_drawdown_pct`)
+ - Liveness (`/live`) & Readiness (`/ready`) Endpoints
+ - Config Hot Reload (ENV: `IRONCRAB_SNIPER_RELOAD_PATH`) mit Diff Logging (Änderungen werden geloggt)
+	 - Watcher Feature (`--features notify_watch`) ersetzt 30s Polling
+	 - Unix: SIGHUP (`kill -HUP <pid>`) triggert sofortigen Reload
 - Multi-Lot Positions & Partielle Exits (TP Teilverkauf, SL Vollausstieg)
 - Persistente Risk-State Snapshot (JSON) + Autosave
 - Graceful Shutdown (Snapshot Flush)
@@ -36,8 +40,9 @@ Metrics & Observability
  - Prometheus Exporter (Port 9898) – Trades, RPC Errors, Open Positions, Realized PnL (µSOL), Liquidity
  - Histograms: Swap Latency & Quote Latency
  - Aggregates: Shortfall Tokens & SOL, Network Fees (Lamports)
- - Rolling PnL / Sharpe (intern) – (exponieren via zukünftige Gauge geplant)
- - Geplante Erweiterungen: PnL Distribution Histogram, Fee Type Breakdown (LP vs Network)
+ - Rolling PnL / Sharpe (intern) + Gauges (`ironcrab_sharpe_ratio`, `ironcrab_drawdown_pct`)
+ - PnL Distribution Histogram (`ironcrab_trade_return_bucket` inkl. +Inf Bucket)
+ - Geplante Erweiterungen: Fee Type Breakdown (Protocol vs Referral) & zusätzliche PnL / Shortfall Histograms
 
 Trade Logging
 - CSV Rotation: `trade_logs/trades-YYYYMMDD.csv` (override Pfad via `IRONCRAB_TRADE_LOG_DIR`)
@@ -53,6 +58,22 @@ Backtest & Tools
 cargo run --release -- --config .\config.example.toml
 ```
 
+### Echtzeit Config Reload (Watcher & SIGHUP)
+Watcher aktivieren (statt Polling):
+```powershell
+cargo run --release --no-default-features --features notify_watch -- --config .\config.example.toml
+```
+Hot-Reload Pfad setzen (Windows PowerShell):
+```powershell
+$env:IRONCRAB_SNIPER_RELOAD_PATH="C:\\full\\path\\to\\config.toml";
+cargo run --release --features notify_watch -- --config $env:IRONCRAB_SNIPER_RELOAD_PATH
+```
+Unix Beispiel mit SIGHUP Trigger:
+```bash
+IRONCRAB_SNIPER_RELOAD_PATH=./config.toml ./target/release/ironcrab --config ./config.toml &
+kill -HUP $!  # Sofortiger Reload
+```
+
 ### Python‑Strategien (optional)
 ```powershell
 cargo run --release --features python -- --config .\config.example.toml
@@ -66,7 +87,7 @@ cargo run --bin raydium_pools -- --mint So11111111111111111111111111111111111111
 
 ## Hinweise / Roadmap Auszug
 - Siehe `docs/TASKS.md` für detaillierte Meilensteine
-- Nächste Schritte: Exakte Fee Aufschlüsselung (Protocol/Referral), +Inf Bucket für Returns, CI Pipeline, Sharpe/Drawdown Gauges
+- Nächste Schritte: Exakte Fee Aufschlüsselung (Protocol/Referral), SIGHUP Trigger für Config Reload (Unix), zusätzliche Histograms (Absolute Realized PnL, Shortfall %), finalisiertes Grafana Dashboard
 - MEV/Jito Bundles & Adaptive Slippage geplant
 
 ## Test Helpers
@@ -81,13 +102,21 @@ scrape_configs:
 			- targets: ['127.0.0.1:9898']
 ```
 
-### Geplante zusätzliche Metrics
-- `ironcrab_sharpe_ratio` (Gauge) – rolling window Sharpe
-- `ironcrab_drawdown_pct` (Gauge) – aktueller relativer Peak-to-Trough Drawdown
-- `ironcrab_trade_return_bucket` (+Inf Bucket) – Verteilung einzelner Realized Returns
-- `ironcrab_fee_breakdown_total{type="protocol|network|referral"}` – Aggregierte Fees
+### Verfügbare Metrics (Auszug)
+Bereits implementiert:
+- `ironcrab_sharpe_ratio` (Gauge) – Rolling Window Sharpe
+- `ironcrab_drawdown_pct` (Gauge) – approximierter aktueller Drawdown (0..1)
+- `ironcrab_build_info{version="x.y.z"}` – Build/Version Kennzahl
+- `ironcrab_trade_return_bucket` – Realized Return Distribution (+Inf Bucket)
+- Netzwerk / Shortfall / Fee Aggregationen (`*_total`)
 
-Sobald implementiert: Dashboard JSON Beispiel wird in `docs/` ergänzt.
+Geplant / Offen:
+- `ironcrab_fee_breakdown_total{type="protocol|network|referral"}` – Feingranulare Fee Typen
+- Histogram für absoluten Realized PnL (SOL)
+- Shortfall Prozent Histogram
+- Weitere Route / Quote Performance Metriken
+
+Grafana Dashboard Skeleton: `docs/grafana_dashboard_example.json` (finale Panels & Alerts pending)
 
 ## Trade Log Beispiel (gekürzt)
 ```

@@ -7,6 +7,8 @@ use anyhow::Result;
 use tracing::{info, debug, warn};
 use crate::solana::rpc::SolanaRpc;
 use crate::config::SniperSettings;
+#[allow(unused_imports)]
+use crate::config_reload::{diff_sniper_cfg, validate_sniper_cfg};
 use crate::solana::dex::{raydium::Raydium, orca::Orca, Dex};
 use crate::wallet::Treasury;
 use solana_sdk::{transaction::Transaction, hash::Hash};
@@ -640,33 +642,67 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
                 loop { saver.tick().await; engine_clone.persist_risk_state(); }
             });
         }
-        // Hot reload task (env IRONCRAB_SNIPER_RELOAD_PATH)
+        // Config Hot Reload (ENV IRONCRAB_SNIPER_RELOAD_PATH)
         if let Some(path) = std::env::var_os("IRONCRAB_SNIPER_RELOAD_PATH") {
             let path_buf = std::path::PathBuf::from(path);
-            let engine_clone = self.clone_for_spawn();
-            tokio::spawn(async move {
-                let mut ivr = tokio::time::interval(Duration::from_secs(30));
-                let mut last_mod = std::time::SystemTime::UNIX_EPOCH;
-                loop {
-                    ivr.tick().await;
-                    if let Ok(meta) = std::fs::metadata(&path_buf) {
-                        if let Ok(modified) = meta.modified() {
-                            if modified > last_mod {
-                                last_mod = modified;
-                                if let Ok(txt) = std::fs::read_to_string(&path_buf) {
-                                    if let Ok(root) = toml::from_str::<crate::config::Config>(&txt) {
-                                        if let Some(sn) = root.sniper.clone() {
-                                            let new_cfg: SniperCfg = (&sn).into();
-                                            *engine_clone.cfg.write() = new_cfg;
-                                            tracing::info!("sniper hot reload applied");
-                                        }
+            let _engine_clone_poll = self.clone_for_spawn();
+            // Polling fallback (disabled if feature notify_watch active)
+            #[cfg(not(feature = "notify_watch"))]
+            {
+                tokio::spawn(async move {
+                    let mut ivr = tokio::time::interval(Duration::from_secs(30));
+                    let mut last_mod = std::time::SystemTime::UNIX_EPOCH;
+                    loop {
+                        ivr.tick().await;
+                        if let Ok(meta) = std::fs::metadata(&path_buf) {
+                            if let Ok(modified) = meta.modified() {
+                                if modified > last_mod {
+                                    last_mod = modified;
+                                    if let Ok(txt) = std::fs::read_to_string(&path_buf) {
+                                        if let Ok(root) = toml::from_str::<crate::config::Config>(&txt) { if let Some(sn) = root.sniper.clone() { let new_cfg: SniperCfg = (&sn).into();
+                                                let mut guard = _engine_clone_poll.cfg.write();
+                                                let diff = diff_sniper_cfg(&*guard, &new_cfg);
+                                                if let Err(reason) = validate_sniper_cfg(&new_cfg) { tracing::warn!(%reason, "rejecting config reload"); }
+                                                else { *guard = new_cfg; tracing::info!(diff=%diff, "sniper hot reload applied (poll)"); }
+                                        }}
                                     }
                                 }
                             }
                         }
                     }
-                }
-            });
+                });
+            }
+            // File watch (if feature enabled)
+            #[cfg(feature = "notify_watch")]
+            {
+                let engine_clone_watch = self.clone_for_spawn();
+                let path_fw = path_buf.clone();
+                tokio::spawn(async move {
+                    let apply = move |new_cfg: SniperCfg, diff: String| {
+                        let mut guard = engine_clone_watch.cfg.write();
+                        if let Err(reason) = validate_sniper_cfg(&new_cfg) { tracing::warn!(%reason, "rejecting config reload (watch)"); return; }
+                        *guard = new_cfg; tracing::info!(diff=%diff, "sniper hot reload applied (watch)");
+                    };
+                    if let Err(e) = crate::config_reload::watch_and_reload(path_fw, apply).await { tracing::warn!(?e, "file watch init failed, fallback to no reload"); }
+                });
+            }
+            // SIGHUP handler (Unix only)
+            #[cfg(unix)]
+            {
+                use std::sync::Arc as StdArc;
+                let engine_arc = StdArc::new(self.clone_for_spawn());
+                let path2 = path_buf.clone();
+                let apply_cb = {
+                    let engine_arc = engine_arc.clone();
+                    StdArc::new(move |new_cfg: SniperCfg, _diff: String| {
+                        let mut guard = engine_arc.cfg.write();
+                        if let Err(reason) = validate_sniper_cfg(&new_cfg) { tracing::warn!(%reason, "rejecting config reload (SIGHUP)"); return; }
+                        let diff = diff_sniper_cfg(&*guard, &new_cfg);
+                        *guard = new_cfg; tracing::info!(diff=%diff, "sniper hot reload applied (SIGHUP)");
+                    })
+                };
+                crate::config_reload::spawn_sighup_reload(path2, apply_cb);
+            }
         }
     let shutdown_rx = self.shutdown_rx.clone();
         loop {
@@ -674,6 +710,7 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
             iv.tick().await;
             let mb = self.cfg.read().max_buy_sol;
             debug!(max_buy_sol = mb, "sniper heartbeat");
+            crate::metrics::record_activity();
             // Evaluate open positions for SL/TP exits
             if let Err(e) = self.evaluate_positions().await { debug!(?e, "risk evaluation error"); }
             // Pending trade TTL cleanup
@@ -952,6 +989,10 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
                     DAILY_REALIZED_PNL_SOL_MICRO.store((rs.realized_pnl_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
                     let lots: usize = rs.open.values().map(|v| v.len()).sum();
                     OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
+                    // Update sharpe & drawdown metrics
+                    crate::metrics::update_sharpe(rs.last_sharpe);
+                    // Simple drawdown approximation: daily loss / (daily loss limit) if configured
+                    if let Some(limit) = self.cfg.read().daily_loss_limit_sol { if limit > 0.0 { let dd = (rs.realized_loss_today_sol / limit).clamp(0.0, 1.0); crate::metrics::update_drawdown(dd); } }
                 }
                 // Unwrap afterwards outside lock
                 let _ = self.treasury.unwrap_wsol(&self.rpc, None).await;

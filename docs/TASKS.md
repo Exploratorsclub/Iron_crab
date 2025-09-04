@@ -111,10 +111,11 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 ## 6) Infra & Observability
 - [x] Structured Metrics (Prometheus Exporter Port 9898)
 - [x] Trade CSV Logs (rotierend, Shortfall & Fees)
-- [ ] Config-Reload (SIGHUP / File Watch)
-- [ ] CI: `cargo fmt`, `cargo clippy`, Tests
-- [ ] Liveness / Readiness Endpoints
-- [ ] Grafana Dashboard Beispiel (JSON)
+- [~] Config-Reload (Polling + Diff Logging + optional File Watch feature `notify_watch`; SIGHUP signal trigger PENDING)
+- [x] CI: `cargo fmt`, `cargo clippy`, Tests (GitHub Actions Workflow)
+- [x] Liveness / Readiness Endpoints (/live, /ready)
+- [x] Sharpe & Drawdown Gauges + +Inf Bucket & Build Info Metric
+- [ ] Grafana Dashboard Beispiel (JSON) (Skeleton committed; finalize panels & alerts PENDING)
 
 ## 7) Production Hardening & Open Roadmap
 
@@ -153,11 +154,11 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Test-Helpers Feature (`test_helpers`) für deterministische State Mutation / Sharpe Tests
 
 ### Logging & Observability Erweiterungen
-- [ ] +Inf Bucket für trade_return Histogram (Prometheus Konvention)
+- [x] +Inf Bucket für trade_return Histogram (Prometheus Konvention)
 - [ ] Absolutes Realized PnL Histogram (SOL)
 - [ ] Shortfall Prozent Histogram
-- [ ] Sharpe & Drawdown Gauges
-- [ ] Build / Version Metric
+- [x] Sharpe & Drawdown Gauges
+- [x] Build / Version Metric
 	- [x] Interne Sharpe Validierung (Fee Impact & Rolling Window Truncation Tests)
 
 ### Backtesting & Strategy
@@ -186,7 +187,10 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 
 ### Developer Experience / Config
 - [ ] Erweiterte Dokumentation der neuen Risk Parameter
-- [ ] Diff Logging bei Hot Reload (was hat sich geändert?)
+- [x] Diff Logging bei Hot Reload (was hat sich geändert?)
+	- Implementiert: `diff_sniper_cfg` vergleicht Felder & loggt Änderungen (Hot Reload Task)
+	- Optional Echtzeit File Watch via Feature `notify_watch` (aktivieren mit `--features notify_watch`)
+	- Ausstehend: SIGHUP Signal Handler (Unix) als alternativer Trigger
 - [ ] Start Skripte (Windows/Unix) für build/run/backtest
 - [ ] Konfigurierbare Log Rotation & Retention (N Tage)
 
