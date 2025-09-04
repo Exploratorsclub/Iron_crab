@@ -75,7 +75,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Trade / RPC Error / Open Positions / Realized PnL / Liquidity Gauges & Counter
 	- [x] Slippage / Shortfall Metrics (Aggregierte Shortfall Tokens & SOL)
 	- [x] Fee Breakdown (Aggregierte Netzwerk Fees)
-	- [ ] PnL Distribution Histogram / Buckets (optional)
+	- [x] PnL Distribution Histogram (realized trade return buckets; -90%..+200% with cumulative buckets)
 8. CI Pipeline (fmt, clippy, test, optional wasm build)
 9. Config Hot-Reload (Signal / File Watch) für Routing/Slippage Parameter
 10. Risk Layer
@@ -111,3 +111,80 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [ ] CI: `cargo fmt`, `cargo clippy`, Tests
 - [ ] Liveness / Readiness Endpoints
 - [ ] Grafana Dashboard Beispiel (JSON)
+
+## 7) Production Hardening & Open Roadmap
+
+### Execution & Routing
+- [ ] Stabiler WebSocket PubSub (Reconnect, Backoff, Heartbeat)
+- [ ] Volle Raydium Serum Market Accounts erzwungen (kein Fallback)
+- [ ] Multi-DEX Best-Route Auswahl (Raydium vs Orca dynamisch)
+- [ ] Partielle Exits (gestaffelte SELL Orders / Positionsplits)
+- [ ] Retry & Backoff Strategie bei transienten RPC Fehlern
+- [ ] PendingTrade TTL + Reconciliation (Zombie Pending entfernen)
+- [ ] Re-Quote unmittelbar vor Signatur (Front‑run Schutz / aktualisiertes min_out)
+
+### State & Persistence
+- [ ] Persistenter RiskState Snapshot (offene Positionen, realized PnL, rolling returns, Sharpe)
+- [ ] Per-Mint Mehrfachpositionen (konfigurierbar per_mint_position_limit)
+- [ ] Periodische Flush / Recover Logik beim Shutdown
+
+### Fees & PnL Genauigkeit
+- [ ] Protocol / LP / Referral Fees Extraktion aus Transaction Meta
+- [ ] Brutto vs Netto PnL Metriken (separate Gauges)
+- [ ] Fee % des Notionals als Histogram
+
+### Data & Pricing
+- [ ] Echte SOL/USD & Stable Preise via Oracle (Pyth / Switchboard)
+- [ ] Präzisere Liquidity Schätzung (Reserven * Mid-Price, multi-pool Aggregation)
+- [ ] Adaptive Slippage basierend auf empirischer Fill-Abweichung
+
+### Stability & Concurrency
+- [ ] Separate Task für Exit Evaluation (konfigurierbares Intervall)
+- [ ] Graceful Shutdown (Flush, Snapshot, Metrics finalisieren)
+- [ ] Rate Limit Erkennung + adaptiver Parallelismus
+
+### Logging & Observability Erweiterungen
+- [ ] +Inf Bucket für trade_return Histogram (Prometheus Konvention)
+- [ ] Absolutes Realized PnL Histogram (SOL)
+- [ ] Shortfall Prozent Histogram
+- [ ] Sharpe & Drawdown Gauges
+- [ ] Build / Version Metric
+
+### Backtesting & Strategy
+- [ ] `py_strategy` FFI (pyo3 oder IPC) für externe Signale
+- [ ] Deterministischer Replay-Modus (Slot Iterator)
+- [ ] Impact / Slippage Modell im Backtest
+
+### Security & Key Handling
+- [ ] Gesicherte Keypair Ladepfade / optional KMS
+- [ ] Keine Private Keys in Logs (Audit Layer)
+- [ ] Config Validierung (Schema + Constraints)
+
+### Tests & CI
+- [ ] Unit: drawdown sizing, cooldown gating, trade_return bucketing
+- [ ] Integration: Mock RPC Buy->Fill->Sell Lifecycle
+- [ ] Fuzz: Log Parser & Pool Snapshot Decoder
+- [ ] Load / Stress: Quote & Swap Latency unter Last
+- [ ] GitHub Actions: clippy, fmt, test, audit
+
+### Resilience & Edge Cases
+- [ ] 0-Reserve Pool Handling (Skip & Metric)
+- [ ] Token ohne Decimals Info (Fallback & Warn)
+- [ ] Overflow / Extremwerte Guard für Returns & Fees
+
+### Developer Experience / Config
+- [ ] Erweiterte Dokumentation der neuen Risk Parameter
+- [ ] Diff Logging bei Hot Reload (was hat sich geändert?)
+- [ ] Start Skripte (Windows/Unix) für build/run/backtest
+- [ ] Konfigurierbare Log Rotation & Retention (N Tage)
+
+### Priorisierte Reihenfolge (Empfehlung)
+1. PendingTrade TTL & State Persistenz
+2. Retry/Backoff + WebSocket Stabilität
+3. Protocol Fee Parsing & Multi-Position Support
+4. Partielle Exits & Best-Route Auswahl
+5. Tests & CI Pipeline
+6. Sharpe/Drawdown Gauges & +Inf Bucket
+7. Oracle Preise & Adaptive Slippage
+8. Backtest FFI & Impact Modell
+
