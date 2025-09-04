@@ -8,6 +8,8 @@ use tracing::{info, debug, warn};
 use crate::solana::rpc::SolanaRpc;
 use crate::config::SniperSettings;
 use crate::solana::dex::{raydium::Raydium, orca::Orca, Dex};
+use crate::wallet::Treasury;
+use solana_sdk::{transaction::Transaction, hash::Hash};
 use solana_sdk::pubkey::Pubkey;
 // (log subscription stub – real PubSub integration to be reintroduced with correct crate paths)
 use once_cell::sync::Lazy;
@@ -19,6 +21,21 @@ use futures::{StreamExt, SinkExt};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use serde_json::json;
+use std::time::{Duration, Instant};
+use std::fs::OpenOptions;
+use std::io::Write;
+use chrono::Utc as ChronoUtc;
+use once_cell::sync::Lazy as OnceLazy;
+use parking_lot::Mutex;
+use crate::metrics::{
+    TRADES_EXECUTED_TOTAL,
+    TRADES_FAILED_TOTAL,
+    OPEN_POSITIONS_GAUGE,
+    DAILY_REALIZED_PNL_SOL_MICRO,
+    LIQUIDITY_ESTIMATE_SOL_MICRO,
+    RPC_ERRORS_TOTAL,
+    record_swap_latency,
+};
 
 // Simple global blacklist (extendable via config later)
 #[allow(dead_code)]
@@ -36,6 +53,46 @@ pub struct SniperCfg {
     pub lp_top1_max_pct: Option<f64>,
     pub lp_top3_max_pct: Option<f64>,
     pub lp_top5_max_pct: Option<f64>,
+    pub max_position_sol: Option<f64>,
+    pub stop_loss_bps: Option<u32>,
+    pub take_profit_bps: Option<u32>,
+    pub daily_loss_limit_sol: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct Position {
+    entry_price_sol: f64,
+    amount_tokens: f64,
+    invested_sol: f64,
+    token_decimals: u8,
+    last_unrealized_pnl_sol: f64,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct PendingTrade {
+    dex: String,
+    sig: String,
+    lamports_in: u64,
+    expected_out_tokens: u64,
+    network_fee_lamports: u64,
+    ts: i64,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct RiskState {
+    open: std::collections::HashMap<Pubkey, Position>,
+    realized_pnl_sol: f64,
+    realized_loss_today_sol: f64,
+    current_day: u32,
+    pending: std::collections::HashMap<Pubkey, PendingTrade>,
+}
+
+impl Default for RiskState {
+    fn default() -> Self {
+        Self { open: Default::default(), realized_pnl_sol: 0.0, realized_loss_today_sol: 0.0, current_day: 0, pending: Default::default() }
+    }
 }
 
 pub struct SniperEngine {
@@ -43,12 +100,37 @@ pub struct SniperEngine {
     cfg: SniperCfg,
     raydium: Option<Arc<Raydium>>,
     orca: Option<Arc<Orca>>,
+    purchased: parking_lot::RwLock<HashSet<Pubkey>>, // track already bought mints (avoid double buy)
+    treasury: Arc<Treasury>,
+    risk: parking_lot::RwLock<RiskState>,
 }
 
 impl SniperEngine {
-    pub fn new(rpc: Arc<SolanaRpc>, cfg: SniperCfg, raydium: Option<Arc<Raydium>>, orca: Option<Arc<Orca>>) -> Self { Self { rpc, cfg, raydium, orca } }
+    async fn total_sol_balance(&self) -> Result<f64> {
+        // Native SOL lamports
+    let owner = self.treasury.pubkey();
+    let native_lamports = match self.rpc.rpc.get_account(&owner).await {
+            Ok(acc) => acc.lamports,
+            Err(e) => { RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return Err(e.into()); }
+        } as u128;
+        // WSOL ATA amount (if exists)
+    let wsol_mint_prog = spl_token::native_mint::id();
+    let wsol_mint_sdk = solana_sdk::pubkey::Pubkey::new_from_array(wsol_mint_prog.to_bytes());
+    let (wsol_ata, _prog) = match self.treasury.ata_address(&self.rpc, &owner, &wsol_mint_sdk).await {
+            Ok(v) => v,
+            Err(_) => { return Ok(native_lamports as f64 / 1e9); }
+        };
+        let wsol_amount = match self.rpc.rpc.get_account(&wsol_ata).await {
+            Ok(acc) => {
+                if acc.data.len() >= 72 { u64::from_le_bytes(acc.data[64..72].try_into().unwrap()) as u128 } else { 0 }
+            }
+            Err(_) => 0,
+        };
+        Ok((native_lamports + wsol_amount) as f64 / 1e9)
+    }
+    pub fn new(rpc: Arc<SolanaRpc>, cfg: SniperCfg, raydium: Option<Arc<Raydium>>, orca: Option<Arc<Orca>>, treasury: Arc<Treasury>) -> Self { Self { rpc, cfg, raydium, orca, purchased: parking_lot::RwLock::new(HashSet::new()), treasury, risk: parking_lot::RwLock::new(RiskState::default()) } }
 
-    fn clone_for_spawn(&self) -> Self { SniperEngine { rpc: self.rpc.clone(), cfg: self.cfg.clone(), raydium: self.raydium.clone(), orca: self.orca.clone() } }
+    fn clone_for_spawn(&self) -> Self { SniperEngine { rpc: self.rpc.clone(), cfg: self.cfg.clone(), raydium: self.raydium.clone(), orca: self.orca.clone(), purchased: parking_lot::RwLock::new(HashSet::new()), treasury: self.treasury.clone(), risk: parking_lot::RwLock::new(RiskState::default()) } }
 
     fn http_to_ws(url: &str) -> String {
         if url.starts_with("https://") { url.replacen("https://", "wss://", 1) }
@@ -130,6 +212,23 @@ impl SniperEngine {
                                     }
                                 }
                                 info!(mint = %pk, top1 = assess.top1_pct, top3 = assess.top3_pct, top5 = assess.top5_pct, burned = assess.burned_pct, program_locked = assess.program_vault_pct, liq_sol, "sniper: candidate mint passes concentration");
+                                // Gate by liquidity threshold if configured
+                                let liq_ok = self.cfg.min_pool_liquidity_sol.map(|thr| liq_sol.unwrap_or(0.0) >= thr).unwrap_or(true);
+                                if liq_ok {
+                                    // Risk: Notional cap & daily loss limit pre-check
+                                    if !self.can_open_position(self.cfg.max_buy_sol) {
+                                        debug!(mint=%pk, "sniper: risk gate blocked new position (notional/daily loss)");
+                                        continue;
+                                    }
+                                    // Avoid duplicate buys
+                                    if !self.purchased.read().contains(&pk) {
+                                        if let Err(e) = self.attempt_initial_buy(&pk, liq_sol).await { warn!(mint = %pk, error = ?e, "sniper: initial buy failed"); }
+                                    } else {
+                                        debug!(mint = %pk, "sniper: already purchased, skip");
+                                    }
+                                } else {
+                                    debug!(mint = %pk, liq_sol, "sniper: below min liquidity -> no buy");
+                                }
                             } else {
                                 debug!(mint = %pk, top1 = assess.top1_pct, top3 = assess.top3_pct, top5 = assess.top5_pct, "sniper: rejected by concentration");
                             }
@@ -142,14 +241,182 @@ impl SniperEngine {
         }
     }
 
+    /// Build (but not yet send) an initial Raydium buy swap plan. For now we only log the plan.
+    /// Strategy: spend up to cfg.max_buy_sol SOL buying the candidate mint via best SOL pairing.
+    async fn attempt_initial_buy(&self, mint: &Pubkey, liq_sol: Option<f64>) -> Result<()> {
+        // Choose Raydium first (faster listing) – require connector
+    let ray = self.raydium.clone();
+    let orca = self.orca.clone();
+        // Determine input (SOL) and output (mint) ordering for swap (we buy the mint with SOL)
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        // Convert max_buy_sol (f64) to lamports safely
+        let lamports_in = ((self.cfg.max_buy_sol * 1e9) as u64).max(10_000); // min lamports safeguard
+        // Ensure destination ATA for target mint (may fail if mint malformed)
+        use solana_sdk::pubkey::Pubkey as SdkPubkey;
+        let mint_sdk = SdkPubkey::new_from_array(mint.to_bytes());
+        let owner_sdk = self.treasury.pubkey();
+        let _dest_ata = match self.treasury.ensure_ata(&self.rpc, &owner_sdk, &mint_sdk).await { Ok(a)=>a, Err(e)=> { debug!(?e, mint=%mint, "ensure dest ATA fail"); return Ok(()); } };
+        // Wrap SOL into WSOL ATA (Raydium expects token account)
+    let (wsol_ata_sdk, _wrap_sig) = match self.treasury.wrap_sol(&self.rpc, lamports_in).await { Ok(v)=>v, Err(e)=> { debug!(?e, lamports_in, "wrap_sol failed"); return Ok(()); } };
+    // Build auto plan for min_out computation & pool selection (Raydium)
+    let plan_opt = if let Some(r) = &ray { r.build_swap_plan_auto(&sol_mint.to_string(), &mint.to_string(), lamports_in, self.cfg.max_slippage_bps)? } else { None };
+    if plan_opt.is_none() && orca.is_none() { debug!(mint=%mint, "no raydium or orca route"); return Ok(()); }
+    let plan_meta = plan_opt;
+    let mut used_raydium = false;
+    if let Some(ref pm) = plan_meta { if pm.pool.is_some() { used_raydium = true; } }
+    // Source WSOL ATA (after wrap) & destination token ATA
+    let _wsol_ata = wsol_ata_sdk; // already ensured via wrap
+    let (_dest_ata, _token_prog) = self.treasury.ata_address(&self.rpc, &owner_sdk, &mint_sdk).await?;
+    // Derive Serum market related accounts from snapshot (already stored inside Raydium SimplePool)
+    // We still need serum bids/asks/event/base_vault/quote_vault; currently not exposed -> placeholder fetch skipped (in full impl these would be read separately)
+    // For now abort if we cannot assemble full accounts; fallback to pseudo plan already logged earlier.
+    // (Future: extend Raydium snapshot to include serum market detail accounts.)
+        // Try to upgrade to full swap instruction if serum accounts present in snapshot
+        let mut final_ixs: Vec<solana_sdk::instruction::Instruction> = plan_meta.as_ref().map(|p| p.ixs.clone()).unwrap_or_default();
+        if used_raydium {
+            if let Some(r) = &ray {
+                if let Some(pool_addr) = plan_meta.as_ref().and_then(|p| p.pool) {
+                    if let Some(snap) = r.snapshots().into_iter().find(|s| s.address == pool_addr) {
+                        if let (Some(_open_orders), Some(_market_id)) = (snap.open_orders, snap.market_id) {
+                            if let (Some(bids), Some(asks), Some(event_q), Some(base_vault), Some(quote_vault), Some(_serum_vs)) = (snap.serum_bids, snap.serum_asks, snap.serum_event_queue, snap.serum_base_vault, snap.serum_quote_vault, snap.serum_vault_signer) {
+                                let token_prog = spl_token::id();
+                                let rent_sysvar = solana_sdk::sysvar::rent::id();
+                                use crate::solana::dex::raydium::SerumMarketAccounts;
+                                let serum_accounts = SerumMarketAccounts { bids, asks, event_queue: event_q, base_vault, quote_vault };
+                                if let Ok(ray_prog) = Pubkey::from_str(RAYDIUM_AMM_V4) {
+                                    let auth_pk = Pubkey::new_from_array(self.treasury.pubkey().to_bytes());
+                                    let user_source = Pubkey::new_from_array(_wsol_ata.to_bytes());
+                                    let user_dest = Pubkey::new_from_array(_dest_ata.to_bytes());
+                                    let token_prog_pk = Pubkey::new_from_array(token_prog.to_bytes());
+                                    let rent_pk = Pubkey::new_from_array(rent_sysvar.to_bytes());
+                                    if let Some(ref pm) = plan_meta {
+                                        if let Ok(full_ix) = r.build_swap_instruction(pool_addr, sol_mint, *mint, lamports_in, pm.min_out, auth_pk, user_source, user_dest, ray_prog, token_prog_pk, rent_pk, serum_accounts, snap.target_orders) {
+                                            final_ixs = vec![full_ix];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    let bh: Hash = match self.rpc.rpc.get_latest_blockhash().await { Ok(h)=>h, Err(e)=> { RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return Err(e.into()); } };
+        let tx_ixs: Vec<solana_sdk::instruction::Instruction> = if used_raydium { final_ixs } else {
+            // Orca path: build swap ix directly
+            if let Some(o) = &orca {
+                let wsol_mint_prog = spl_token::native_mint::id();
+                let wsol_mint_sdk = Pubkey::new_from_array(wsol_mint_prog.to_bytes());
+                o.set_user_authority(Pubkey::new_from_array(self.treasury.pubkey().to_bytes()));
+                if let Ok((wsol_ata,_prog)) = self.treasury.ata_address(&self.rpc, &self.treasury.pubkey(), &wsol_mint_sdk).await {
+                    o.set_user_token_account(wsol_mint_sdk, wsol_ata);
+                }
+                if let Ok((dst_ata,_prog2)) = self.treasury.ata_address(&self.rpc, &self.treasury.pubkey(), &mint_sdk).await {
+                    o.set_user_token_account(mint_sdk, dst_ata);
+                }
+                // Derive min_out with slippage tolerance via quote
+                let mut min_out_orca = 1u64; // fallback
+                if let Ok(Some(q)) = o.quote_exact_in(&sol_mint.to_string(), &mint.to_string(), lamports_in).await {
+                    let slip = self.cfg.max_slippage_bps as u128;
+                    min_out_orca = ((q.amount_out as u128) * (10_000 - slip) / 10_000) as u64;
+                    if min_out_orca == 0 { min_out_orca = 1; }
+                }
+                match o.build_swap_ix(&sol_mint.to_string(), &mint.to_string(), lamports_in, min_out_orca) {
+                    Ok(ixs) => ixs,
+                    Err(e) => { debug!(?e, mint=%mint, "orca build_swap_ix failed"); Vec::new() }
+                }
+            } else { Vec::new() }
+        };
+        if tx_ixs.is_empty() { debug!(mint=%mint, "no swap instructions built"); return Ok(()); }
+    // Prepare message for fee estimate before signing
+    let message = solana_sdk::message::Message::new(&tx_ixs, Some(&self.treasury.pubkey()));
+    let fee_estimate = self.rpc.rpc.get_fee_for_message(&message).await.unwrap_or(0);
+    let tx = Transaction::new_signed_with_payer(&tx_ixs, Some(&self.treasury.pubkey()), &[self.treasury.keypair.as_ref()], bh);
+    let sent_at = Instant::now();
+    match self.rpc.rpc.send_and_confirm_transaction(&tx).await {
+            Ok(sig) => {
+        let dur = sent_at.elapsed();
+        record_swap_latency(dur.as_nanos() as u64);
+                TRADES_EXECUTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if used_raydium {
+                    let pm = plan_meta.as_ref().unwrap();
+                    info!(mint=%mint, sig=%sig, lamports_in, expected_out=pm.expected_out, min_out=pm.min_out, pool=?pm.pool, liq_sol, "sniper: initial buy submitted (raydium)");
+                    // Approx position record (use expected_out as mid estimate)
+                    if pm.expected_out > 0 {
+                        let sol_in = lamports_in as f64 / 1e9;
+                        self.record_fill_placeholder(*mint, sol_in);
+                        let engine_clone = self.clone_for_spawn();
+                        let mint_copy = *mint;
+                        tokio::spawn(async move { engine_clone.finalize_fill(mint_copy).await; });
+                    }
+                } else {
+                    info!(mint=%mint, sig=%sig, lamports_in, liq_sol, "sniper: initial buy submitted (orca)");
+                    // Orca: we only know lamports_in and min_out (very conservative); use min_out for price upper bound
+                    let sol_in = lamports_in as f64 / 1e9;
+                    self.record_fill_placeholder(*mint, sol_in);
+                    let engine_clone = self.clone_for_spawn();
+                    let mint_copy = *mint;
+                    tokio::spawn(async move { engine_clone.finalize_fill(mint_copy).await; });
+                }
+                self.purchased.write().insert(*mint);
+                // Trade CSV log
+                if used_raydium {
+                    if let Some(pm) = plan_meta.as_ref() {
+                        // Record pending expected tokens for later shortfall calculation
+                        {
+                            let mut rs = self.risk.write();
+                            rs.pending.insert(*mint, PendingTrade { expected_out_tokens: pm.expected_out, dex: "RAYDIUM".into(), sig: sig.to_string(), lamports_in, network_fee_lamports: fee_estimate, ts: ChronoUtc::now().timestamp() });
+                        }
+                        let line = format!(
+                            "{ts},BUY,{mint},RAYDIUM,{sig},{lamports_in},0,0,0,{exp_tokens},,{short_tokens},,{fee},,expected_min_out={min_out}",
+                            ts=ChronoUtc::now().to_rfc3339(),
+                            mint=mint,
+                            sig=sig,
+                            lamports_in=lamports_in,
+                            exp_tokens=pm.expected_out,
+                            short_tokens=0,
+                            fee=fee_estimate,
+                            min_out=pm.min_out
+                        );
+                        self.append_trade_record(&line, true);
+                    }
+                } else {
+                    let line = format!(
+                        "{ts},BUY,{mint},ORCA,{sig},{lamports_in},0,0,0,0,,0,,{fee},,notes=orca_buy",
+                        ts=ChronoUtc::now().to_rfc3339(),
+                        mint=mint,
+                        sig=sig,
+                        lamports_in=lamports_in,
+                        fee=fee_estimate
+                    );
+                    self.append_trade_record(&line, true);
+                }
+                // Attempt WSOL unwrap to reclaim leftover lamports
+                match self.treasury.unwrap_wsol(&self.rpc, None).await {
+                    Ok(unwrap_sig) => info!(mint=%mint, unwrap_sig=%unwrap_sig, "sniper: wsol unwrapped post-trade"),
+                    Err(e) => debug!(?e, mint=%mint, "sniper: wsol unwrap failed"),
+                }
+            }
+            Err(e) => {
+                warn!(?e, mint=%mint, "sniper: buy tx failed (will not retry immediately)");
+                TRADES_FAILED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // TODO: unwrap remaining WSOL (not done yet)
+        Ok(())
+    }
+
     pub async fn run(&self) -> Result<()> {
         self.subscribe_logs().await?;
         info!("sniper engine running (skeleton)");
         // Placeholder periodic task: future spot for initial buys & SL/TP mgmt
-        let mut iv = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut iv = tokio::time::interval(Duration::from_secs(15));
         loop {
             iv.tick().await;
             debug!(max_buy_sol = self.cfg.max_buy_sol, "sniper heartbeat");
+            // Evaluate open positions for SL/TP exits
+            if let Err(e) = self.evaluate_positions().await { debug!(?e, "risk evaluation error"); }
         }
     }
 
@@ -162,6 +429,231 @@ impl SniperEngine {
         if self.cfg.require_freeze_auth_none.unwrap_or(false) { if freeze_auth.is_some() { return false; } }
         if let Some((lo,hi)) = self.cfg.require_mint_decimals_range { if let Some(d) = mint_decimals { if d < lo || d > hi { return false; } } }
         true
+    }
+
+    fn today_key() -> u32 {
+        // Simple day number (UTC days since epoch) for daily loss tracking
+        (chrono::Utc::now().timestamp() / 86_400) as u32
+    }
+
+    fn risk_reset_if_needed(&self) {
+        let mut rs = self.risk.write();
+        let today = Self::today_key();
+        if rs.current_day != today {
+            rs.current_day = today;
+            rs.realized_loss_today_sol = 0.0;
+        }
+    }
+
+    fn can_open_position(&self, planned_sol: f64) -> bool {
+        self.risk_reset_if_needed();
+        let rs = self.risk.read();
+        if let Some(cap) = self.cfg.max_position_sol { if planned_sol > cap { return false; } }
+        if let Some(daily) = self.cfg.daily_loss_limit_sol { if rs.realized_loss_today_sol >= daily { return false; } }
+        true
+    }
+
+    fn record_fill_placeholder(&self, mint: Pubkey, invested_sol: f64) {
+        self.risk_reset_if_needed();
+        let mut rs = self.risk.write();
+        rs.open.entry(mint).or_insert(Position { entry_price_sol: 0.0, amount_tokens: 0.0, invested_sol, token_decimals: 0, last_unrealized_pnl_sol: 0.0 });
+    OPEN_POSITIONS_GAUGE.store(rs.open.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn append_trade_record(&self, line: &str, include_header: bool) {
+        static TRADE_LOG_LOCK: OnceLazy<Mutex<()>> = OnceLazy::new(|| Mutex::new(()));
+        let _g = TRADE_LOG_LOCK.lock();
+        let dir_name = std::env::var("IRONCRAB_TRADE_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string());
+        let dir = std::path::Path::new(&dir_name);
+        if !dir.exists() { let _ = std::fs::create_dir_all(dir); }
+        let date = ChronoUtc::now().format("%Y%m%d");
+        let file_path = dir.join(format!("trades-{}.csv", date));
+        let new_file = !file_path.exists();
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&file_path) {
+            if new_file && include_header {
+                let _ = writeln!(f, "timestamp_utc,side,mint,dex,signature,lamports_in,lamports_out,tokens_in,tokens_out,expected_tokens_out,expected_sol_out,shortfall_tokens,shortfall_sol,network_fee_lamports,realized_pnl_sol,notes");
+            }
+            let _ = writeln!(f, "{}", line);
+        }
+    }
+
+    async fn finalize_fill(&self, mint: Pubkey) {
+        let owner = self.treasury.pubkey();
+        let mint_sdk = solana_sdk::pubkey::Pubkey::new_from_array(mint.to_bytes());
+        if let Ok((ata,_)) = self.treasury.ata_address(&self.rpc, &owner, &mint_sdk).await {
+            let mut decimals = 0u8;
+            if let Ok(mint_acc) = self.rpc.rpc.get_account(&mint).await { if mint_acc.data.len()>44 { decimals = mint_acc.data[44]; } }
+            if let Ok(acc) = self.rpc.rpc.get_account(&ata).await { if acc.data.len()>=72 {
+                let raw = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+                let amt = if decimals==0 { raw as f64 } else { raw as f64 / 10f64.powi(decimals as i32) };
+                let mut rs = self.risk.write();
+                if amt > 0.0 {
+                    // Extract pending first
+                    let pending_opt = rs.pending.remove(&mint);
+                    if let Some(pos) = rs.open.get_mut(&mint) { if pos.entry_price_sol==0.0 { 
+                        pos.amount_tokens = amt; pos.token_decimals = decimals; pos.entry_price_sol = pos.invested_sol / amt.max(1e-9);
+                    }}
+                    if let Some(pend) = pending_opt {
+                        if let Some(pos) = rs.open.get(&mint) {
+                        // Compute shortfall
+                        let scale = 10f64.powi(decimals as i32);
+                        let actual_raw = (amt * scale).round() as u64;
+                        let expected_raw = pend.expected_out_tokens;
+                        let shortfall = expected_raw.saturating_sub(actual_raw);
+                        let shortfall_ui = shortfall as f64 / scale;
+                        let shortfall_sol = shortfall_ui * pos.entry_price_sol;
+                        let line = format!(
+                            "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9}",
+                            ts=ChronoUtc::now().to_rfc3339(),
+                            mint=mint,
+                            dex=pend.dex,
+                            sig=pend.sig,
+                            lamports_in=pend.lamports_in,
+                            actual_tokens=actual_raw,
+                            expected_tokens=expected_raw,
+                            shortfall_tokens=shortfall,
+                            fee=pend.network_fee_lamports,
+                            shortfall_ui=shortfall_ui,
+                            shortfall_sol=shortfall_sol
+                        );
+                        drop(rs); // release lock
+                        self.append_trade_record(&line, true);
+                        return;
+                        }
+                    }
+                }
+            }}
+        }
+    }
+
+    async fn evaluate_positions(&self) -> Result<()> {
+        // Skip if no thresholds configured
+        if self.cfg.stop_loss_bps.is_none() && self.cfg.take_profit_bps.is_none() { return Ok(()); }
+        let stop_bps = self.cfg.stop_loss_bps.unwrap_or(u32::MAX); // large disables
+        let tp_bps = self.cfg.take_profit_bps.unwrap_or(u32::MAX);
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        // clone keys to drop lock quickly
+        let positions: Vec<(Pubkey, Position)> = {
+            let rs = self.risk.read();
+            rs.open.iter().map(|(k,v)| (*k, v.clone())).collect()
+        };
+        if positions.is_empty() { return Ok(()); }
+        for (mint, pos) in positions {
+            // Quote exit value (prefer Raydium then Orca)
+            let mut quote_out: Option<u64> = None;
+            if let Some(r) = &self.raydium {
+                if let Ok(Some(q)) = r.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), pos.amount_tokens as u64).await { quote_out = Some(q.amount_out); } else { RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+            }
+            if quote_out.is_none() {
+                if let Some(o) = &self.orca { if let Ok(Some(q)) = o.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), pos.amount_tokens as u64).await { quote_out = Some(q.amount_out); } else { RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } }
+            }
+            let Some(out_lamports) = quote_out else { continue; };
+            let price_now = if pos.amount_tokens>0.0 { (out_lamports as f64 / 1e9) / pos.amount_tokens } else { 0.0 };
+            let pnl_pct = if pos.entry_price_sol > 0.0 { (price_now - pos.entry_price_sol) / pos.entry_price_sol } else { 0.0 };
+            let pnl_bps = (pnl_pct * 10_000.0) as i64;
+            {
+                let mut rs = self.risk.write();
+                if let Some(p) = rs.open.get_mut(&mint) { p.last_unrealized_pnl_sol = (out_lamports as f64 / 1e9) - p.invested_sol; }
+            }
+            let stop_trigger = pnl_bps <= -(stop_bps as i64);
+            let tp_trigger = pnl_bps >= tp_bps as i64;
+            if stop_trigger || tp_trigger { 
+                debug!(mint=%mint, pnl_bps, stop_trigger, tp_trigger, "exit trigger");
+                if let Err(e) = self.attempt_exit(&mint, pos.amount_tokens as u64).await { warn!(?e, mint=%mint, "exit tx failed"); }
+            }
+        }
+        Ok(())
+    }
+
+    async fn attempt_exit(&self, mint: &Pubkey, amount_tokens: u64) -> Result<()> {
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        // Determine actual token balance (ATA) to avoid over-selling
+        let owner_sdk = self.treasury.pubkey();
+        let mint_sdk = solana_sdk::pubkey::Pubkey::new_from_array(mint.to_bytes());
+        let (ata,_prog) = match self.treasury.ata_address(&self.rpc, &owner_sdk, &mint_sdk).await { Ok(v)=>v, Err(_)=> return Ok(()) };
+        let bal_tokens = if let Ok(acc) = self.rpc.rpc.get_account(&ata).await { if acc.data.len()>=72 { u64::from_le_bytes(acc.data[64..72].try_into().unwrap()) } else { amount_tokens } } else { amount_tokens };
+        if bal_tokens == 0 { return Ok(()); }
+    // Raydium plan token->SOL
+        let mut used_raydium = false;
+        let ray_plan = if let Some(r) = &self.raydium { r.build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), bal_tokens, self.cfg.max_slippage_bps).ok() } else { None };
+    if let Some(ref p) = ray_plan { if p.as_ref().map(|rp| rp.pool.is_some()).unwrap_or(false) { used_raydium = true; } }
+    let bh: Hash = match self.rpc.rpc.get_latest_blockhash().await { Ok(h)=>h, Err(e)=> { RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return Err(e.into()); } };
+    let tx_ixs: Vec<solana_sdk::instruction::Instruction> = if used_raydium { ray_plan.as_ref().unwrap().as_ref().unwrap().ixs.clone() } else {
+            if let Some(o) = &self.orca {
+                // Register accounts (source token -> WSOL dest path requires wrap? Actually we receive WSOL then unwrap handled below.)
+                o.set_user_authority(Pubkey::new_from_array(self.treasury.pubkey().to_bytes()));
+                // Ensure WSOL ATA for destination
+                let wsol_ata = match self.treasury.wrap_sol(&self.rpc, 0).await { Ok((ata,_sig)) => ata, Err(_) => self.treasury.pubkey() };
+                // Source token ATA already found
+                o.set_user_token_account(Pubkey::new_from_array(mint.to_bytes()), ata);
+                o.set_user_token_account(Pubkey::new_from_array(sol_mint.to_bytes()), wsol_ata); // treat SOL as WSOL mint
+                let mut min_out = 1u64;
+                if let Ok(Some(q)) = o.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), bal_tokens).await {
+                    min_out = ((q.amount_out as u128) * (10_000 - self.cfg.max_slippage_bps as u128) / 10_000) as u64;
+                }
+                o.build_swap_ix(&mint.to_string(), &sol_mint.to_string(), bal_tokens, min_out).unwrap_or_default()
+            } else { Vec::new() }
+        };
+        if tx_ixs.is_empty() { return Ok(()); }
+    let message = solana_sdk::message::Message::new(&tx_ixs, Some(&self.treasury.pubkey()));
+    let fee_estimate = self.rpc.rpc.get_fee_for_message(&message).await.unwrap_or(0);
+    let tx = Transaction::new_signed_with_payer(&tx_ixs, Some(&self.treasury.pubkey()), &[self.treasury.keypair.as_ref()], bh);
+        // Snapshot invested_sol for position (if exists) before trade
+        let invested_sol = {
+            let rs = self.risk.read();
+            rs.open.get(mint).map(|p| p.invested_sol).unwrap_or(0.0)
+        };
+        let pre_balance = self.total_sol_balance().await.unwrap_or(0.0);
+    // Pre WSOL ATA amount (destination of swap proceeds)
+    let wsol_mint_prog = spl_token::native_mint::id();
+    let wsol_mint_sdk = solana_sdk::pubkey::Pubkey::new_from_array(wsol_mint_prog.to_bytes());
+    let (wsol_ata, _prog_wsol) = match self.treasury.ata_address(&self.rpc, &owner_sdk, &wsol_mint_sdk).await { Ok(v)=>v, Err(_)=> (self.treasury.pubkey(), self.treasury.pubkey()) };
+    let pre_wsol_amount: u64 = if let Ok(acc) = self.rpc.rpc.get_account(&wsol_ata).await { if acc.data.len()>=72 { u64::from_le_bytes(acc.data[64..72].try_into().unwrap()) } else {0} } else {0};
+    let sent_at = Instant::now();
+    match self.rpc.rpc.send_and_confirm_transaction(&tx).await {
+            Ok(sig) => {
+                let dur = sent_at.elapsed();
+                record_swap_latency(dur.as_nanos() as u64);
+                info!(mint=%mint, sig=%sig, amount_tokens=bal_tokens, "exit trade submitted");
+        // Read WSOL ATA after swap before unwrap
+        let post_wsol_amount: u64 = if let Ok(acc) = self.rpc.rpc.get_account(&wsol_ata).await { if acc.data.len()>=72 { u64::from_le_bytes(acc.data[64..72].try_into().unwrap()) } else {0} } else {0};
+        let delta_wsol = post_wsol_amount.saturating_sub(pre_wsol_amount) as f64 / 1e9;
+        // Fetch recent block fee estimation via meta fallback (if any) else approximate by difference in native balance delta
+        let post_native = self.rpc.rpc.get_balance(&owner_sdk).await.unwrap_or(0) as f64 / 1e9;
+        let native_delta = (post_native - (pre_balance - (pre_wsol_amount as f64 / 1e9))).max(0.0); // approximate, excludes wsol tokens
+        // Assume fee ~ native_delta decrease unrelated to proceeds (if negative) ignore
+    let fee_est_native = fee_estimate as f64 / 1e9;
+    let fee_est = if native_delta < 0.0 { -native_delta.max(fee_est_native) } else { fee_est_native }; // prefer RPC reported fee_estimate
+    let realized = delta_wsol - invested_sol - fee_est;
+                self.risk_reset_if_needed();
+                {
+                    let mut rs = self.risk.write();
+                    let _ = rs.open.remove(mint);
+                    rs.realized_pnl_sol += realized;
+                    if realized < 0.0 { rs.realized_loss_today_sol += -realized; }
+                    DAILY_REALIZED_PNL_SOL_MICRO.store((rs.realized_pnl_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+                    OPEN_POSITIONS_GAUGE.store(rs.open.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Unwrap afterwards outside lock
+                let _ = self.treasury.unwrap_wsol(&self.rpc, None).await;
+                // Trade CSV log (SELL)
+                let lamports_out = (delta_wsol * 1e9) as u64;
+                let line = format!(
+                    "{ts},SELL,{mint},*,{sig},0,{lamports_out},{tok_in},{tok_out},,,0,,{fee},{realized},exit_full",
+                    ts=ChronoUtc::now().to_rfc3339(),
+                    mint=mint,
+                    sig=sig,
+                    lamports_out=lamports_out,
+                    tok_in=bal_tokens,
+                    tok_out=bal_tokens,
+                    fee=fee_estimate,
+                    realized=realized
+                );
+                self.append_trade_record(&line, true);
+            }
+            Err(e) => warn!(?e, mint=%mint, "exit tx failed"),
+        }
+        Ok(())
     }
 }
 
@@ -192,17 +684,19 @@ impl SniperEngine {
             if quote == *mint && base == sol_mint { let sol_res = r_base as f64 / 1e9; total_sol += sol_res * 2.0; considered += 1; return; }
             // Stable pairing (USDC/USDT)
             let stable_rate = 100.0; // placeholder USD per SOL
-            if (base == *mint && (quote == usdc || quote == usdt)) { let usd = r_quote as f64 / 1e6; total_sol += (usd / stable_rate) * 2.0; considered += 1; }
-            else if (quote == *mint && (base == usdc || base == usdt)) { let usd = r_base as f64 / 1e6; total_sol += (usd / stable_rate) * 2.0; considered += 1; }
+            if base == *mint && (quote == usdc || quote == usdt) { let usd = r_quote as f64 / 1e6; total_sol += (usd / stable_rate) * 2.0; considered += 1; }
+            else if quote == *mint && (base == usdc || base == usdt) { let usd = r_base as f64 / 1e6; total_sol += (usd / stable_rate) * 2.0; considered += 1; }
         };
         if let Some(r) = &self.raydium {
-            // Access internal pools via snapshots
             for snap in r.snapshots() { if snap.base_mint == *mint || snap.quote_mint == *mint { handle_pool(snap.base_mint, snap.quote_mint, snap.reserve_base, snap.reserve_quote); } }
         }
-    if let Some(_o) = &self.orca { /* TODO: expose Orca pool snapshots for index-based liquidity */ }
+        if let Some(o) = &self.orca {
+            for ps in o.pools_snapshot() { if ps.base_mint == *mint || ps.quote_mint == *mint { handle_pool(ps.base_mint, ps.quote_mint, ps.reserve_base, ps.reserve_quote); } }
+        }
         
-        if considered == 0 { return Ok(None); }
-        Ok(Some(total_sol))
+    if considered == 0 { return Ok(None); }
+    LIQUIDITY_ESTIMATE_SOL_MICRO.store((total_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+    Ok(Some(total_sol))
     }
     /// Attempt to estimate total pool liquidity in SOL terms for a given candidate mint.
     /// Strategy:
@@ -337,8 +831,8 @@ impl SniperEngine {
     }
 }
 
-pub async fn run_sniper(rpc: Arc<SolanaRpc>, cfg: SniperCfg, raydium: Option<Arc<Raydium>>, orca: Option<Arc<Orca>>) -> Result<()> {
-    let engine = SniperEngine::new(rpc, cfg, raydium, orca);
+pub async fn run_sniper(rpc: Arc<SolanaRpc>, cfg: SniperCfg, raydium: Option<Arc<Raydium>>, orca: Option<Arc<Orca>>, treasury: Arc<Treasury>) -> Result<()> {
+    let engine = SniperEngine::new(rpc, cfg, raydium, orca, treasury);
     engine.run().await
 }
 
@@ -355,6 +849,10 @@ impl From<&SniperSettings> for SniperCfg {
             lp_top1_max_pct: s.lp_top1_max_pct,
             lp_top3_max_pct: s.lp_top3_max_pct,
             lp_top5_max_pct: s.lp_top5_max_pct,
+            max_position_sol: s.max_position_sol,
+            stop_loss_bps: s.stop_loss_bps,
+            take_profit_bps: s.take_profit_bps,
+            daily_loss_limit_sol: s.daily_loss_limit_sol,
         }
     }
 }

@@ -45,11 +45,21 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 		- [x] Liquidity Heuristik: Index-basierte SOL/Stable Schätzung (Raydium Pools + Fallback largest accounts; Orca TODO Snaps) (Oracle TODO)
 - [x] LP-Lock / Konzentrations-Heuristik (Top1/Top3/Top5 via largestAccounts + Log-Integration)
 - [~] LP-Lock / Token Distribution Heuristik (Burn + Program-Owned Vault Erkennung integriert in Konzentrationsberechnung; weitere Verfeinerung offen)
-- [ ] Erstkauf + enge SL/TP
+- [x] Erstkauf TX Skeleton (Raydium Auto Swap Plan -> TX bauen & senden, WSOL wrap, ATA ensure, Purchase Tracking, Post-Trade WSOL Unwrap)
+- [x] SL/TP Grundlogik (Stop-Loss & Take-Profit Trigger, periodische Evaluation)
+- [x] Realized PnL über WSOL-Delta beim Exit (transaktions-lokal)
+- [x] Unrealized PnL Update pro Evaluationszyklus
+- [x] Trade CSV Logging (rotierend pro Tag, Env `IRONCRAB_TRADE_LOG_DIR`)
+- [x] PendingTrade Map für FILL Shortfall (expected vs actual Tokens) – integriert
+- [x] Shortfall Berechnung (Tokens & SOL Äquivalent) bei FILL
+- [x] Netzwerk Fee Schätzung via `get_fee_for_message`
+- [ ] Erweiterte Fee Aufschlüsselung (Protocol Fee, Referrer, Compute Budget Overhead via Meta)
+- [ ] Partielle Exit-Unterstützung (mehrere SELLs pro Position)
+- [ ] Persistenter Positionssnapshot (Reload nach Neustart)
   
 ### Nächste Micro-Tasks (aktualisiert)
 1. Orca: Vollständige Whirlpool Layout Implementierung (strukturierter Parser, feste Offsets, verifizierte Tick Index & Liquidity Fields) – DONE (strict parser + semantic validation)
-2. Orca Swap: Ersetzen der Platzhalter User Accounts (Authority, Source/Dest Token Accounts) + Option für sqrt_price_limit
+2. Orca Swap: Ersetzen der Platzhalter User Accounts (Authority, Source/Dest Token Accounts) + Option für sqrt_price_limit – DONE (Sniper nutzt echte Authority & ATAs, min_out via Quote + Slippage)
 3. Raydium: Entfernung von Vault-Fallbacks (immer echte Vault Pubkeys) & zusätzliche Hard Validation (target_orders optional, aber loggen)
 4. Router: Depth‑2 Pfad Benchmark + Depth‑3 (erste Greedy Implementierung + Pruning) [Depth‑3 implemented]
 5. Arbitrage Aggregator: Triangular Path (A-B-C-A) Profit Check (greedy implemented) + Erweiterung für generische Zyklen
@@ -58,19 +68,44 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Pre-TX Simulation (RPC simulateTransaction)
 6. Compute Budget: Dynamische CU-Schätzung (historische Simulation / heuristics) statt fixer Werte
 	- [x] Erste heuristische Implementierung (Estimator Modul + Raydium build_swap_plan_auto)
-7. Metrics: Pool Count, Quote Latency, Routing Auswahlgrund (DEX, hops)
-	- [x] Basic counters (quotes, successes, hop types, triangle attempts/profitable, avg latency)
-	- [x] Generic cycle & pruning counters (partial examined, dominance, bound, completed)
+7. Metrics & Observability
+	- [x] Prometheus HTTP Exporter (Port 9898)
+	- [x] Swap Latency Histogram
+	- [x] Trade / RPC Error / Open Positions / Realized PnL / Liquidity Gauges & Counter
+	- [ ] Quote Latenz Histogramm
+	- [ ] Slippage / Shortfall Metrics (Aggregierte Verteilung)
+	- [ ] Fee Breakdown Metrics
 8. CI Pipeline (fmt, clippy, test, optional wasm build)
 9. Config Hot-Reload (Signal / File Watch) für Routing/Slippage Parameter
-10. Risk Layer: Max Notional pro Trade + Daily Loss Limit Skeleton
+10. Risk Layer
+	- [x] Max Notional pro Trade (Config `max_position_sol`)
+	- [x] Daily Loss Limit (`daily_loss_limit_sol` + Tagesreset)
+	- [x] Positions Open Gauge
+	- [ ] Cooldown pro Mint nach SL Exit
+	- [ ] Dynamischer Size-Scaler (Reduce Size nach Drawdown)
+11. Sniper: Orca Pools in Index-Liquidität aufnehmen – DONE (Snapshot integriert)
+12. Sniper: Verbesserte min_out Berechnung für Raydium & Orca (quantile impact) – PARTIAL (Orca basic slippage, quantile TODO)
+
+### Neue Folge-Themen
+- Persistenz: Speichern offener Positionen & Tages-PnL in lokaler DB (sled oder sqlite)
+- Konfigurierbare Rotation / Aufräumen alter Trade Logs (> N Tage)
+- MEV / Jito Bundle Versand für Front-Run Schutz
+- Adaptive Slippage: dynamische Anpassung basierend auf beobachteter Ausführungsabweichung
+- Simulation basierter Pre-Trade Impact Score
 
 ## 5) Risk & Limits
-- [ ] Positions-/Notional-Limits je Markt
-- [ ] Cooldowns / Daily Loss Limit
-- [ ] P&L Tracking + Reporting
+- [x] Positions-/Notional-Limit (max_position_sol pro Trade)
+- [x] Daily Loss Limit Tracking + Reset Tageswechsel
+- [x] Realized & Unrealized PnL intern (Realized via WSOL Delta, Unrealized via Quotes)
+- [ ] Per-Mint Positions-Limit (Anzahl paralleler Positionen)
+- [ ] Cooldowns nach Stop-Loss
+- [ ] Erweiterte PnL Reports (rolling window, Sharpe Approx)
+- [ ] Config Hot-Reload zur Laufzeit
 
-## 6) Infra
-- [ ] Config-Reload (SIGHUP)
-- [ ] Structured Metrics (Prometheus)
+## 6) Infra & Observability
+- [x] Structured Metrics (Prometheus Exporter Port 9898)
+- [x] Trade CSV Logs (rotierend, Shortfall & Fees)
+- [ ] Config-Reload (SIGHUP / File Watch)
 - [ ] CI: `cargo fmt`, `cargo clippy`, Tests
+- [ ] Liveness / Readiness Endpoints
+- [ ] Grafana Dashboard Beispiel (JSON)
