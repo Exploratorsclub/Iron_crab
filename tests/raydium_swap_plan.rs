@@ -1,10 +1,10 @@
-use ironcrab::solana::dex::raydium::{Raydium, PoolSnapshot};
+use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::rpc::SolanaRpc;
 use std::sync::Arc;
 use solana_sdk::pubkey::Pubkey;
 
 // Helper to fabricate a Raydium instance with an injected pool snapshot.
-fn mk_raydium_with_pool(base_res: u128, quote_res: u128, fee_bps: u32) -> Raydium {
+fn mk_raydium_with_pool(_base_res: u128, _quote_res: u128, _fee_bps: u32) -> Raydium {
     let rpc = Arc::new(SolanaRpc::new("http://localhost:8899"));
     let r = Raydium::new(rpc);
     // Direct insert via internal map not exposed; use snapshots() ingestion pattern mimic by calling refresh not feasible here.

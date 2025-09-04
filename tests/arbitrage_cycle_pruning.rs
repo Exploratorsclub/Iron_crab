@@ -11,8 +11,8 @@ use ironcrab::solana::dex::{Dex, Quote};
 impl Dex for EdgeDex {
     async fn refresh_pools(&self)->Result<()> { Ok(()) }
     async fn quote_exact_in(&self, i:&str, o:&str, amt:u64)->Result<Option<Quote>> {
-        if (i==self.a && o==self.b) { let out= amt.saturating_mul(self.mul_bps)/10_000; return Ok(Some(Quote{amount_out:out, price_impact_bps:10, route:vec!["e".into()], fee_bps:30, in_reserve:1_000_000_000, out_reserve:1_000_000_000, input_mint:i.into(), output_mint:o.into()})); }
-        if (i==self.b && o==self.a) { let out= amt.saturating_mul(10_000)/self.mul_bps.max(1); return Ok(Some(Quote{amount_out:out, price_impact_bps:10, route:vec!["e".into()], fee_bps:30, in_reserve:1_000_000_000, out_reserve:1_000_000_000, input_mint:i.into(), output_mint:o.into()})); }
+    if i==self.a && o==self.b { let out= amt.saturating_mul(self.mul_bps)/10_000; return Ok(Some(Quote{amount_out:out, price_impact_bps:10, route:vec!["e".into()], fee_bps:30, in_reserve:1_000_000_000, out_reserve:1_000_000_000, input_mint:i.into(), output_mint:o.into()})); }
+    if i==self.b && o==self.a { let out= amt.saturating_mul(10_000)/self.mul_bps.max(1); return Ok(Some(Quote{amount_out:out, price_impact_bps:10, route:vec!["e".into()], fee_bps:30, in_reserve:1_000_000_000, out_reserve:1_000_000_000, input_mint:i.into(), output_mint:o.into()})); }
         Ok(None)
     }
     fn build_swap_ix(&self,_:&str,_:&str,_:u64,_:u64)->Result<Vec<Instruction>> { Ok(vec![]) }

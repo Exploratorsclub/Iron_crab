@@ -26,8 +26,11 @@ Sniper & Risk
 - Daily Loss Limit & Max Position Size
 - Dynamische Positionsgröße bei Drawdown (Scaling)
 - Stop-Loss Cooldown je Mint
-- Rolling Realized Return Window + Sharpe Approx
+- Rolling Realized Return Window + Sharpe Approx (Tests für Fee-Impact & Window-Truncation)
 - Config Hot Reload (ENV: `IRONCRAB_SNIPER_RELOAD_PATH`)
+- Multi-Lot Positions & Partielle Exits (TP Teilverkauf, SL Vollausstieg)
+- Persistente Risk-State Snapshot (JSON) + Autosave
+- Graceful Shutdown (Snapshot Flush)
 
 Metrics & Observability
  - Prometheus Exporter (Port 9898) – Trades, RPC Errors, Open Positions, Realized PnL (µSOL), Liquidity
@@ -63,8 +66,11 @@ cargo run --bin raydium_pools -- --mint So11111111111111111111111111111111111111
 
 ## Hinweise / Roadmap Auszug
 - Siehe `docs/TASKS.md` für detaillierte Meilensteine
-- Nächste Schritte: Quote Latenz Histogramm, Slippage/Shortfall Metrics, Partielle Exits, Persistenz offener Positionen
+- Nächste Schritte: Exakte Fee Aufschlüsselung (Protocol/Referral), +Inf Bucket für Returns, CI Pipeline, Sharpe/Drawdown Gauges
 - MEV/Jito Bundles & Adaptive Slippage geplant
+
+## Test Helpers
+Feature `test_helpers` stellt gezielte Methoden bereit (`test_insert_lot`, `test_simulate_partial_exit_with_fee`, Sharpe Abfragen) für deterministische Unit-/Integrationstests ohne Netzwerk‑Side‑Effects. Standardmäßig nicht im Release aktiv.
 
 ## Metrics Scrape Beispiel
 Prometheus config snippet:

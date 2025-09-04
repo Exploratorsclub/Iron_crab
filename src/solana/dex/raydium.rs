@@ -91,6 +91,11 @@ pub struct PoolSnapshot {
     pub target_orders: Option<Pubkey>,
     pub base_vault: Option<Pubkey>,
     pub quote_vault: Option<Pubkey>,
+    pub serum_bids: Option<Pubkey>,
+    pub serum_asks: Option<Pubkey>,
+    pub serum_event_queue: Option<Pubkey>,
+    pub serum_base_vault: Option<Pubkey>,
+    pub serum_quote_vault: Option<Pubkey>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +118,11 @@ struct SimplePool {
     reserve_quote: u128,
     fee_bps: u32,
     last_update: std::time::SystemTime,
+    serum_bids: Option<Pubkey>,
+    serum_asks: Option<Pubkey>,
+    serum_event_queue: Option<Pubkey>,
+    serum_base_vault: Option<Pubkey>,
+    serum_quote_vault: Option<Pubkey>,
 }
 
 impl Raydium {
@@ -135,6 +145,11 @@ impl Raydium {
             target_orders: p.target_orders,
             base_vault: Some(p.base_vault),
             quote_vault: Some(p.quote_vault),
+            serum_bids: p.serum_bids,
+            serum_asks: p.serum_asks,
+            serum_event_queue: p.serum_event_queue,
+            serum_base_vault: p.serum_base_vault,
+            serum_quote_vault: p.serum_quote_vault,
         }).collect()
     }
 
@@ -257,7 +272,7 @@ impl Raydium {
     /// Build a swap plan with heuristic compute budget estimation when caller does not want to specify limits manually.
     pub fn build_swap_plan_auto(&self, input_mint: &str, output_mint: &str, amount_in: u64, slippage_bps: u32) -> Result<Option<RaydiumSwapPlan>> {
         let base = self.build_swap_plan(input_mint, output_mint, amount_in, slippage_bps, None, None)?;
-        let Some(plan) = base else { return Ok(None); };
+    let Some(_plan) = base else { return Ok(None); };
         let est = crate::solana::compute_budget_estimator::estimate_single_swap(amount_in);
         // Only rebuild if estimate differs from defaults (currently defaults: none)
         let rebuilt = self.build_swap_plan(
@@ -276,6 +291,7 @@ impl Raydium {
 impl Dex for Raydium {
     async fn refresh_pools(&self) -> Result<()> {
         use std::time::{SystemTime, Duration};
+    use crate::metrics::{RAYDIUM_POOLS_LOADED, RAYDIUM_POOLS_SKIPPED_INVALID, RAYDIUM_POOLS_SKIPPED_SERUM};
         tracing::trace!("raydium.refresh_pools() start");
         let acc_cfg = RpcAccountInfoConfig { encoding: None, data_slice: None, commitment: None, min_context_slot: None };
         let cfg = RpcProgramAccountsConfig { filters: Some(Self::pool_filters()), account_config: acc_cfg, with_context: None, sort_results: None };
@@ -288,6 +304,7 @@ impl Dex for Raydium {
                 if let Ok(p) = reader::PoolV4::decode(*addr, &acc.data) {
                     if let Err(e) = Self::validate_pool_state(&p) {
                         tracing::warn!(pool = %p.address, error = %e, "skip invalid raydium pool");
+                        RAYDIUM_POOLS_SKIPPED_INVALID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     } else {
                         decoded.push((p, acc.data.clone()));
                     }
@@ -305,13 +322,14 @@ impl Dex for Raydium {
                 }
             }
         }
-        // Insert/update
-        for (p, raw) in decoded {
+    // Insert/update (with optional serum market fetch per pool)
+    for (p, raw) in decoded {
             let base_amt = vault_amounts.get(&p.base_vault).copied().unwrap_or(0);
             let quote_amt = vault_amounts.get(&p.quote_vault).copied().unwrap_or(0);
-            if base_amt == 0 || quote_amt == 0 {
-                tracing::warn!(pool = %p.address, base_amt, quote_amt, "skip pool missing vault balances (no silent fallback)");
-                continue;
+            if base_amt == 0 || quote_amt == 0 { 
+                tracing::warn!(pool = %p.address, base_amt, quote_amt, "skip pool missing vault balances (no silent fallback)"); 
+                RAYDIUM_POOLS_SKIPPED_INVALID.fetch_add(1, std::sync::atomic::Ordering::Relaxed); 
+                continue; 
             }
             let fee_num = raw.get(8..16).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes).unwrap_or_default();
             let fee_den = raw.get(16..24).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes).unwrap_or_default();
@@ -324,8 +342,48 @@ impl Dex for Raydium {
                 let (v, _) = Self::derive_serum_vault_signer(&p.market_id, &p.market_program_id);
                 Some(v)
             } else { None };
-            let obj = SimplePool { base_mint: p.base_mint, quote_mint: p.quote_mint, base_vault: p.base_vault, quote_vault: p.quote_vault, lp_reserve: p.lp_reserve, address: p.address, reserve_base: base_amt, reserve_quote: quote_amt, fee_bps, last_update: SystemTime::now(), open_orders: Some(p.open_orders), market_id: Some(p.market_id), market_program_id: Some(p.market_program_id), amm_authority: Some(amm_auth), serum_vault_signer, target_orders: p.target_orders };
+            // Attempt Serum market account fetch (single account RPC) for orderbook + vault pointers
+            let (serum_bids, serum_asks, serum_event_queue, serum_base_vault, serum_quote_vault, serum_ok) = if p.market_id != Pubkey::default() && p.market_program_id != Pubkey::default() {
+                match self.rpc.rpc.get_account(&p.market_id).await {
+                    Ok(acct) => {
+                        match Self::parse_serum_market_accounts(&acct.data) {
+                            Some((b,a,e,bv,qv)) => (b,a,e,bv,qv, true),
+                            None => (None,None,None,None,None, false)
+                        }
+                    }
+                    Err(_) => (None,None,None,None,None, false)
+                }
+            } else { (None,None,None,None,None, true) }; // pools without market linkage are allowed
+            if !serum_ok { 
+                tracing::warn!(pool=%p.address, market=%p.market_id, "skip pool: incomplete serum market accounts"); 
+                RAYDIUM_POOLS_SKIPPED_SERUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed); 
+                continue; 
+            }
+            let obj = SimplePool {
+                base_mint: p.base_mint,
+                quote_mint: p.quote_mint,
+                base_vault: p.base_vault,
+                quote_vault: p.quote_vault,
+                lp_reserve: p.lp_reserve,
+                address: p.address,
+                reserve_base: base_amt,
+                reserve_quote: quote_amt,
+                fee_bps,
+                last_update: SystemTime::now(),
+                open_orders: Some(p.open_orders),
+                market_id: Some(p.market_id),
+                market_program_id: Some(p.market_program_id),
+                amm_authority: Some(amm_auth),
+                serum_vault_signer,
+                target_orders: p.target_orders,
+                serum_bids,
+                serum_asks,
+                serum_event_queue,
+                serum_base_vault,
+                serum_quote_vault,
+            };
             self.pools.insert(p.address, obj);
+            RAYDIUM_POOLS_LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // Cleanup stale (>15m)
         let cutoff = SystemTime::now() - Duration::from_secs(15 * 60);
@@ -400,6 +458,38 @@ impl Dex for Raydium {
 
     fn list_pairs(&self) -> Vec<(String, String)> {
         self.pools.iter().map(|p| (p.base_mint.to_string(), p.quote_mint.to_string())).collect()
+    }
+}
+
+impl Raydium {
+    /// Attempt to parse essential Serum/OpenBook v3 market account pointers with sanity checks.
+    /// We purposely avoid full layout replication; instead we maintain a small set of known offset templates
+    /// (there have been minor layout variants historically). Each template lists offsets for:
+    /// bids, asks, event_queue, base_vault, quote_vault. We validate:
+    ///  - account length large enough for highest offset + 32
+    ///  - extracted pubkeys non-default
+    ///  - bids != asks, vaults distinct
+    /// If multiple templates match we return the first.
+    fn parse_serum_market_accounts(data: &[u8]) -> Option<(Option<Pubkey>, Option<Pubkey>, Option<Pubkey>, Option<Pubkey>, Option<Pubkey>)> {
+        #[derive(Clone, Copy)]
+        struct Offs { bids: usize, asks: usize, event_q: usize, base_vault: usize, quote_vault: usize }
+        // Primary (legacy serum v3) heuristic offsets (approx.)
+        const T1: Offs = Offs { bids: 384, asks: 392, event_q: 400, base_vault: 448, quote_vault: 456 };
+        // Fallback template (some builds show shifted vault region by +8)
+        const T2: Offs = Offs { bids: 384, asks: 392, event_q: 400, base_vault: 456, quote_vault: 464 };
+        let templates = [T1, T2];
+        for t in templates.iter() {
+            let req = [t.bids, t.asks, t.event_q, t.base_vault, t.quote_vault].iter().max().cloned().unwrap_or(0) + 32;
+            if data.len() < req { continue; }
+            let rd = |off: usize| -> Option<Pubkey> { let slice = data.get(off..off+32)?; let arr: [u8;32] = slice.try_into().ok()?; let pk = Pubkey::new_from_array(arr); if pk.to_bytes() == [0u8;32] { None } else { Some(pk) } };
+            let bids = rd(t.bids); let asks = rd(t.asks); let event_q = rd(t.event_q); let base_vault = rd(t.base_vault); let quote_vault = rd(t.quote_vault);
+            // Basic sanity
+            if bids.is_none() || asks.is_none() || event_q.is_none() || base_vault.is_none() || quote_vault.is_none() { continue; }
+            if bids == asks { continue; }
+            if base_vault == quote_vault { continue; }
+            return Some((bids, asks, event_q, base_vault, quote_vault));
+        }
+        None
     }
 }
 

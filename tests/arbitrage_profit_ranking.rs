@@ -47,7 +47,7 @@ async fn profit_ranking_orders_cycles() {
     assert!(!ranked.is_empty());
     // Ensure top path contains X or Y (higher profit cycle)
     let top = &ranked[0];
-    let (a, m1, m2) = &top.path;
+    let (_a, m1, m2) = &top.path;
     assert!(m1 == "X" || m2 == "Y" || m1 == "Y" || m2 == "X", "expected higher profit cycle with X/Y in top rank");
     // Net or gross profit should be > 0
     assert!(top.gross_profit > 0);

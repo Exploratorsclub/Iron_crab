@@ -134,9 +134,10 @@ impl Engine {
             // Instantiate shared DEX connectors for sniper (lightweight additional instances)
             let raydium_ref = Arc::new(Raydium::new(rpc_clone.clone()));
             let orca_ref = Arc::new(Orca::new(rpc_clone.clone()));
+            let treasury_arc = Arc::new(self.ctx.treasury.clone());
             tokio::spawn(async move {
                 let cfg: SniperCfg = (&sn_cfg).into();
-                if let Err(e) = run_sniper(rpc_clone, cfg, Some(raydium_ref), Some(orca_ref)).await {
+                if let Err(e) = run_sniper(rpc_clone, cfg, Some(raydium_ref), Some(orca_ref), treasury_arc).await {
                     tracing::warn!(?e, "sniper exited");
                 }
             });

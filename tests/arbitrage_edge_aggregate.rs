@@ -1,7 +1,6 @@
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::arbitrage::ArbitrageEngine; // re-export via crate root
 use ironcrab::solana::rpc::SolanaRpc;
-use ironcrab::solana::dex::raydium::Raydium; // placeholders (we'll mock Dex below)
 use async_trait::async_trait;
 use anyhow::Result;
 use std::sync::Arc;

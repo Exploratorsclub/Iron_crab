@@ -29,6 +29,7 @@ shellexpand = "3"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 
 # Math & time
 rust_decimal = { version = "1", features = ["serde"] }
@@ -53,6 +54,7 @@ spl-token-2022 = { version = "9", features = ["no-entrypoint"] }
 
 [features]
 default = []
+test_helpers = []
 python = ["pyo3"]
 jito = []
 

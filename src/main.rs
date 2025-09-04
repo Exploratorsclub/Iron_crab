@@ -7,6 +7,8 @@ use ironcrab::config::Config;
 use ironcrab::wallet::Treasury;
 use ironcrab::engine::Engine;
 use ironcrab::solana::rpc::SolanaRpc;
+use ironcrab::metrics::serve_metrics;
+use std::net::SocketAddr;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -26,6 +28,14 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).compact().init();
 
     tracing::info!(app = %cfg.app.name, "starting ironcrab");
+
+    // Start metrics exporter (Prometheus text format) on 0.0.0.0:9898
+    tokio::spawn(async move {
+        let addr: SocketAddr = "0.0.0.0:9898".parse().unwrap();
+        if let Err(e) = serve_metrics(addr).await {
+            tracing::warn!(?e, "metrics server exited");
+        }
+    });
 
     // Solana RPC & Treasury
     let rpc = Arc::new(SolanaRpc::new(&cfg.solana.rpc_url));

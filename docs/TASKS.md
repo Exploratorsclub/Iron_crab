@@ -57,8 +57,8 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Grundlegende Protokoll Fee Approx (Output Token Fee Heuristik + Metrics `protocol_fee_tokens_total`, `protocol_fee_sol_total`)
 	- [x] Exakte Network Fee (Transaction Meta)
 	- [~] Token Fee via postTokenBalances (wrapper type TODO; fallback heuristic retained)
-- [ ] Partielle Exit-Unterstützung (mehrere SELLs pro Position)
-- [ ] Persistenter Positionssnapshot (Reload nach Neustart)
+- [x] Partielle Exit-Unterstützung (erste Version: teilweiser TP (50%), vollständiger SL Exit); weitere gestaffelte SELL Reihenfolge optional
+- [x] Persistenter Positionssnapshot (Reload nach Neustart, multi-lot Unterstützung)
   
 ### Nächste Micro-Tasks (aktualisiert)
 1. Orca: Vollständige Whirlpool Layout Implementierung (strukturierter Parser, feste Offsets, verifizierte Tick Index & Liquidity Fields) – DONE (strict parser + semantic validation)
@@ -101,11 +101,11 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Positions-/Notional-Limit (max_position_sol pro Trade)
 - [x] Daily Loss Limit Tracking + Reset Tageswechsel
 - [x] Realized & Unrealized PnL intern (Realized via WSOL Delta, Unrealized via Quotes)
-- [ ] Per-Mint Positions-Limit (Mehrfachpositionen – derzeit 1 enforced)
+- [x] Per-Mint Positions-Limit (konfigurierbar, multi-lot enforced)
 - [x] Cooldowns nach Stop-Loss (HashMap cooldown_until)
 - [x] Erweiterte PnL Reports (rolling window + Sharpe Approx `rolling_pnl_window`)
 - [x] Config Hot-Reload (ENV `IRONCRAB_SNIPER_RELOAD_PATH`, 30s Interval)
-- [ ] Persistente RiskState Speicherung (Positions & Sharpe) (TODO)
+- [~] Persistente RiskState Speicherung (Positions & Sharpe) (Grundpersistenz + Multi-Lot fertig; Sharpe + erweiterte Metriken offen)
 	- [x] Basis Persistenz (JSON Snapshot: ENV `IRONCRAB_RISK_STATE_PATH`, Autosave `IRONCRAB_RISK_AUTOSAVE_SECS`)
 
 ## 6) Infra & Observability
@@ -148,8 +148,9 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 
 ### Stability & Concurrency
 - [ ] Separate Task für Exit Evaluation (konfigurierbares Intervall)
-- [ ] Graceful Shutdown (Flush, Snapshot, Metrics finalisieren)
+- [x] Graceful Shutdown (Flush, Snapshot, Metrics finalisieren via watch channel)
 - [ ] Rate Limit Erkennung + adaptiver Parallelismus
+	- [x] Test-Helpers Feature (`test_helpers`) für deterministische State Mutation / Sharpe Tests
 
 ### Logging & Observability Erweiterungen
 - [ ] +Inf Bucket für trade_return Histogram (Prometheus Konvention)
@@ -157,6 +158,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [ ] Shortfall Prozent Histogram
 - [ ] Sharpe & Drawdown Gauges
 - [ ] Build / Version Metric
+	- [x] Interne Sharpe Validierung (Fee Impact & Rolling Window Truncation Tests)
 
 ### Backtesting & Strategy
 - [ ] `py_strategy` FFI (pyo3 oder IPC) für externe Signale
@@ -174,6 +176,8 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [ ] Fuzz: Log Parser & Pool Snapshot Decoder
 - [ ] Load / Stress: Quote & Swap Latency unter Last
 - [ ] GitHub Actions: clippy, fmt, test, audit
+	- [x] Multi-Lot Partial Exit Mathe Test
+	- [x] Partial Exit State Mutation & Fee / Sharpe Window Tests (gated via feature)
 
 ### Resilience & Edge Cases
 - [ ] 0-Reserve Pool Handling (Skip & Metric)

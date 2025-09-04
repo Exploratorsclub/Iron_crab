@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::future::join_all;
 use super::{Dex, Quote};
-use crate::metrics::{QUOTE_REQUESTS, QUOTE_SUCCESSES, ROUTER_SINGLE_HOP, ROUTER_HOPS2, ROUTER_HOPS3, LatencyTimer};
+use crate::metrics::{QUOTE_REQUESTS, QUOTE_SUCCESSES, ROUTER_SINGLE_HOP, LatencyTimer};
 
 pub struct RouteQuote {
     pub dex_index: usize,

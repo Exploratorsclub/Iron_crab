@@ -21,11 +21,8 @@ use futures::{StreamExt, SinkExt};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use std::time::{Duration, Instant};
-use std::fs::OpenOptions;
-use std::io::Write;
 use chrono::Utc as ChronoUtc;
-use once_cell::sync::Lazy as OnceLazy;
-use parking_lot::Mutex;
+// removed unused imports (OpenOptions, Write, OnceLazy alias, Mutex)
 use crate::metrics::{
     TRADES_EXECUTED_TOTAL,
     TRADES_FAILED_TOTAL,
@@ -77,13 +74,43 @@ pub struct SniperCfg {
     pub pending_trade_ttl_secs: Option<u64>,
 }
 
+impl Default for SniperCfg {
+    fn default() -> Self {
+        Self {
+            max_buy_sol: 1.0,
+            max_slippage_bps: 100,
+            blacklist_mints: Vec::new(),
+            blacklist_owners: Vec::new(),
+            min_pool_liquidity_sol: None,
+            require_freeze_auth_none: None,
+            require_mint_decimals_range: None,
+            lp_top1_max_pct: None,
+            lp_top3_max_pct: None,
+            lp_top5_max_pct: None,
+            max_position_sol: None,
+            stop_loss_bps: Some(500),
+            take_profit_bps: Some(1000),
+            daily_loss_limit_sol: None,
+            max_open_positions: Some(5),
+            per_mint_position_limit: Some(3),
+            stop_loss_cooldown_secs: Some(300),
+            drawdown_scale_start: None,
+            drawdown_max_reduction: None,
+            rolling_pnl_window: Some(50),
+            hot_reload_secs: Some(30),
+            pending_trade_ttl_secs: Some(120),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct Position {
+struct PositionLot {
     entry_price_sol: f64,
-    amount_tokens: f64,
-    invested_sol: f64,
+    amount_tokens: f64,         // UI tokens
+    invested_sol: f64,          // SOL notionals allocated to this lot
     token_decimals: u8,
     last_unrealized_pnl_sol: f64,
+    opened_ts: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -102,7 +129,7 @@ struct PendingTrade {
 #[allow(dead_code)]
 struct RiskState {
     #[serde(skip)]
-    open: std::collections::HashMap<Pubkey, Position>,
+    open: std::collections::HashMap<Pubkey, Vec<PositionLot>>, // multi-lot per mint
     realized_pnl_sol: f64,
     realized_loss_today_sol: f64,
     current_day: u32,
@@ -116,7 +143,7 @@ struct RiskState {
 
 impl Default for RiskState {
     fn default() -> Self {
-    Self { open: Default::default(), realized_pnl_sol: 0.0, realized_loss_today_sol: 0.0, current_day: 0, pending: Default::default(), cooldown_until: Default::default(), recent_realized: Vec::new(), last_sharpe: 0.0 }
+        Self { open: Default::default(), realized_pnl_sol: 0.0, realized_loss_today_sol: 0.0, current_day: 0, pending: Default::default(), cooldown_until: Default::default(), recent_realized: Vec::new(), last_sharpe: 0.0 }
     }
 }
 
@@ -128,6 +155,104 @@ pub struct SniperEngine {
     purchased: parking_lot::RwLock<HashSet<Pubkey>>, // track already bought mints (avoid double buy)
     treasury: Arc<Treasury>,
     risk: parking_lot::RwLock<RiskState>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+// --- Test Helpers (feature-gated) -----------------------------------------------------------
+#[cfg(any(test, feature = "test_helpers"))]
+impl SniperEngine {
+    /// Insert a synthetic position lot for a mint (used by unit tests).
+    pub fn test_insert_lot(&self, mint: Pubkey, invested_sol: f64, amount_tokens: f64, entry_price_sol: f64, token_decimals: u8) {
+        let lot = PositionLot {
+            entry_price_sol,
+            amount_tokens,
+            invested_sol,
+            token_decimals,
+            last_unrealized_pnl_sol: 0.0,
+            opened_ts: chrono::Utc::now().timestamp(),
+        };
+        let mut rs = self.risk.write();
+        rs.open.entry(mint).or_default().push(lot);
+    }
+
+    /// Apply the internal proportional reduction logic as attempt_exit would after a partial fill.
+    /// Returns (remaining_invested_sol, remaining_amount_tokens, realized_added, lots_remaining)
+    pub fn test_apply_partial_reduction(&self, mint: &Pubkey, lot_idx: usize, fraction: f64, realized_delta: f64) -> Option<(f64,f64,f64,usize)> {
+        let mut remove_entire = false;
+        let mut remaining_vals: Option<(f64,f64,usize)> = None;
+        // First mutate lot only
+        {
+            let mut rs = self.risk.write();
+            let Some(v) = rs.open.get_mut(mint) else { return None; };
+            if lot_idx >= v.len() { return None; }
+            let l = &mut v[lot_idx];
+            let invest_slice = l.invested_sol * fraction;
+            l.invested_sol -= invest_slice;
+            l.amount_tokens = (l.amount_tokens - (l.amount_tokens * fraction)).max(0.0);
+            if l.amount_tokens <= 1e-9 { remove_entire = true; }
+            if !remove_entire { remaining_vals = Some((l.invested_sol, l.amount_tokens, v.len())); }
+        }
+        // Second, update realized metrics & remove if empty
+        {
+            let mut rs = self.risk.write();
+            rs.realized_pnl_sol += realized_delta;
+            if realized_delta < 0.0 { rs.realized_loss_today_sol += -realized_delta; }
+            if remove_entire {
+                if let Some(v) = rs.open.get_mut(mint) { if lot_idx < v.len() { v.remove(lot_idx); } }
+                if let Some(v2) = rs.open.get(mint) { if v2.is_empty() { rs.open.remove(mint); } }
+            }
+        }
+        if remove_entire {
+            let rs = self.risk.read();
+            return Some((0.0,0.0, realized_delta, rs.open.get(mint).map(|v| v.len()).unwrap_or(0)));
+        }
+        if let Some((i,a,len)) = remaining_vals { Some((i,a, realized_delta, len)) } else { None }
+    }
+
+    /// Simulate a partial exit including proceeds & fee, updating realized returns & Sharpe.
+    /// r = (proceeds - fee - invested_slice)/invested_slice.
+    /// Returns (return_r, last_sharpe, recent_count).
+    pub fn test_simulate_partial_exit_with_fee(&self, mint: &Pubkey, lot_idx: usize, fraction: f64, proceeds_sol: f64, fee_sol: f64) -> Option<(f64, f64, usize)> {
+        // Capture invest_slice first
+        let invest_slice = {
+            let rs = self.risk.read();
+            let v = rs.open.get(mint)?;
+            if lot_idx >= v.len() { return None; }
+            v[lot_idx].invested_sol * fraction
+        };
+        if invest_slice <= 0.0 { return None; }
+        let realized_delta = proceeds_sol - fee_sol - invest_slice;
+        // Apply proportional reduction & realized update
+        self.test_apply_partial_reduction(mint, lot_idx, fraction, realized_delta)?;
+        // Push normalized return & recompute Sharpe replicating production logic
+        {
+            let mut rs = self.risk.write();
+            let ret = if invest_slice > 0.0 { realized_delta / invest_slice } else { 0.0 };
+            rs.recent_realized.push(ret);
+            let window = self.cfg.read().rolling_pnl_window.unwrap_or(50);
+            if rs.recent_realized.len() > window { let excess = rs.recent_realized.len() - window; rs.recent_realized.drain(0..excess); }
+            if rs.recent_realized.len() >= 5 {
+                let n = rs.recent_realized.len() as f64;
+                let mean = rs.recent_realized.iter().copied().sum::<f64>() / n;
+                let var = rs.recent_realized.iter().map(|r| { let d = r-mean; d*d }).sum::<f64>() / n.max(1.0);
+                let std = var.sqrt();
+                if std > 0.0 { rs.last_sharpe = mean / std * n.sqrt(); }
+            }
+            return Some((ret, rs.last_sharpe, rs.recent_realized.len()));
+        }
+    }
+
+    /// Access current Sharpe and realized returns count.
+    pub fn test_get_sharpe(&self) -> (f64, usize) {
+        let rs = self.risk.read();
+        (rs.last_sharpe, rs.recent_realized.len())
+    }
+
+    pub fn test_current_invested_for_lot(&self, mint: &Pubkey, lot_idx: usize) -> Option<f64> {
+        let rs = self.risk.read();
+        rs.open.get(mint).and_then(|v| v.get(lot_idx).map(|l| l.invested_sol))
+    }
 }
 
 impl SniperEngine {
@@ -186,9 +311,17 @@ impl SniperEngine {
         };
         Ok((native_lamports + wsol_amount) as f64 / 1e9)
     }
-    pub fn new(rpc: Arc<SolanaRpc>, cfg: SniperCfg, raydium: Option<Arc<Raydium>>, orca: Option<Arc<Orca>>, treasury: Arc<Treasury>) -> Self { Self { rpc, cfg: parking_lot::RwLock::new(cfg), raydium, orca, purchased: parking_lot::RwLock::new(HashSet::new()), treasury, risk: parking_lot::RwLock::new(RiskState::default()) } }
+    pub fn new(rpc: Arc<SolanaRpc>, cfg: SniperCfg, raydium: Option<Arc<Raydium>>, orca: Option<Arc<Orca>>, treasury: Arc<Treasury>) -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        Self { rpc, cfg: parking_lot::RwLock::new(cfg), raydium, orca, purchased: parking_lot::RwLock::new(HashSet::new()), treasury, risk: parking_lot::RwLock::new(RiskState::default()), shutdown_tx: tx, shutdown_rx: rx }
+    }
 
-    fn clone_for_spawn(&self) -> Self { SniperEngine { rpc: self.rpc.clone(), cfg: parking_lot::RwLock::new(self.cfg.read().clone()), raydium: self.raydium.clone(), orca: self.orca.clone(), purchased: parking_lot::RwLock::new(HashSet::new()), treasury: self.treasury.clone(), risk: parking_lot::RwLock::new(RiskState::default()) } }
+    fn clone_for_spawn(&self) -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(false); // spawned clones don't receive shutdown (fire-and-forget tasks)
+        SniperEngine { rpc: self.rpc.clone(), cfg: parking_lot::RwLock::new(self.cfg.read().clone()), raydium: self.raydium.clone(), orca: self.orca.clone(), purchased: parking_lot::RwLock::new(HashSet::new()), treasury: self.treasury.clone(), risk: parking_lot::RwLock::new(RiskState::default()), shutdown_tx: tx, shutdown_rx: rx }
+    }
+
+    pub fn request_shutdown(&self) { let _ = self.shutdown_tx.send(true); }
 
     fn http_to_ws(url: &str) -> String {
         if url.starts_with("https://") { url.replacen("https://", "wss://", 1) }
@@ -307,6 +440,26 @@ impl SniperEngine {
         }
     }
 
+} // close primary impl SniperEngine block before auxiliary helpers
+
+impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
+    fn append_trade_record(&self, line: &str, include_header: bool) {
+        use std::io::Write as _;
+        static TRADE_LOG_LOCK: once_cell::sync::Lazy<std::sync::Mutex<()>> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
+        let _g = TRADE_LOG_LOCK.lock().unwrap();
+        let dir_name = std::env::var("IRONCRAB_TRADE_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string());
+        let dir = std::path::Path::new(&dir_name);
+        if !dir.exists() { let _ = std::fs::create_dir_all(dir); }
+        let date = ChronoUtc::now().format("%Y%m%d");
+        let file_path = dir.join(format!("trades-{}.csv", date));
+        let new_file = !file_path.exists();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&file_path) {
+            if new_file && include_header {
+                let _ = writeln!(f, "timestamp_utc,side,mint,dex,signature,lamports_in,lamports_out,tokens_in,tokens_out,expected_tokens_out,expected_sol_out,shortfall_tokens,shortfall_sol,network_fee_lamports,realized_pnl_sol,notes");
+            }
+            let _ = writeln!(f, "{}", line);
+        }
+    }
     /// Build (but not yet send) an initial Raydium buy swap plan. For now we only log the plan.
     /// Strategy: spend up to cfg.max_buy_sol SOL buying the candidate mint via best SOL pairing.
     async fn attempt_initial_buy(&self, mint: &Pubkey, liq_sol: Option<f64>) -> Result<()> {
@@ -515,7 +668,9 @@ impl SniperEngine {
                 }
             });
         }
+    let shutdown_rx = self.shutdown_rx.clone();
         loop {
+            if *shutdown_rx.borrow() { break; }
             iv.tick().await;
             let mb = self.cfg.read().max_buy_sol;
             debug!(max_buy_sol = mb, "sniper heartbeat");
@@ -530,6 +685,9 @@ impl SniperEngine {
                 tokio::spawn(async move { engine_clone.reconcile_pending(cutoff).await; });
             } }
         }
+        info!("sniper engine shutdown");
+        self.persist_risk_state();
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -571,25 +729,14 @@ impl SniperEngine {
     fn record_fill_placeholder(&self, mint: Pubkey, invested_sol: f64) {
         self.risk_reset_if_needed();
         let mut rs = self.risk.write();
-        rs.open.entry(mint).or_insert(Position { entry_price_sol: 0.0, amount_tokens: 0.0, invested_sol, token_decimals: 0, last_unrealized_pnl_sol: 0.0 });
-    OPEN_POSITIONS_GAUGE.store(rs.open.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn append_trade_record(&self, line: &str, include_header: bool) {
-        static TRADE_LOG_LOCK: OnceLazy<Mutex<()>> = OnceLazy::new(|| Mutex::new(()));
-        let _g = TRADE_LOG_LOCK.lock();
-        let dir_name = std::env::var("IRONCRAB_TRADE_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string());
-        let dir = std::path::Path::new(&dir_name);
-        if !dir.exists() { let _ = std::fs::create_dir_all(dir); }
-        let date = ChronoUtc::now().format("%Y%m%d");
-        let file_path = dir.join(format!("trades-{}.csv", date));
-        let new_file = !file_path.exists();
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&file_path) {
-            if new_file && include_header {
-                let _ = writeln!(f, "timestamp_utc,side,mint,dex,signature,lamports_in,lamports_out,tokens_in,tokens_out,expected_tokens_out,expected_sol_out,shortfall_tokens,shortfall_sol,network_fee_lamports,realized_pnl_sol,notes");
-            }
-            let _ = writeln!(f, "{}", line);
+        // Respect per-mint lot limit if configured
+        if let Some(limit) = self.cfg.read().per_mint_position_limit {
+            if let Some(v) = rs.open.get(&mint) { if v.len() as u32 >= limit { return; } }
         }
+        let lot = PositionLot { entry_price_sol: 0.0, amount_tokens: 0.0, invested_sol, token_decimals: 0, last_unrealized_pnl_sol: 0.0, opened_ts: chrono::Utc::now().timestamp() };
+    rs.open.entry(mint).or_insert_with(Vec::new).push(lot);
+    let lots: usize = rs.open.values().map(|v| v.len()).sum();
+    OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn finalize_fill(&self, mint: Pubkey) {
@@ -606,8 +753,9 @@ impl SniperEngine {
             let (pend_opt, entry_price_existing) = {
                 let mut rs = self.risk.write();
                 let pend = rs.pending.remove(&mint);
-                if let Some(pos) = rs.open.get_mut(&mint) { if pos.entry_price_sol==0.0 { pos.amount_tokens = amt; pos.token_decimals = decimals; pos.entry_price_sol = pos.invested_sol / amt.max(1e-9); } }
-                (pend, rs.open.get(&mint).map(|p| p.entry_price_sol).unwrap_or(0.0))
+                if let Some(v) = rs.open.get_mut(&mint) { if let Some(last) = v.last_mut() { if last.entry_price_sol==0.0 { last.amount_tokens = amt; last.token_decimals = decimals; last.entry_price_sol = last.invested_sol / amt.max(1e-9); } } }
+                let entry_price_last = rs.open.get(&mint).and_then(|v| v.last()).map(|l| l.entry_price_sol).unwrap_or(0.0);
+                (pend, entry_price_last)
             };
             if let Some(pend) = pend_opt {
                 // Fetch meta outside lock
@@ -666,12 +814,17 @@ impl SniperEngine {
     { let r = self.cfg.read(); if r.stop_loss_bps.is_none() && r.take_profit_bps.is_none() { return Ok(()); } }
     let (stop_bps, tp_bps) = { let r = self.cfg.read(); (r.stop_loss_bps.unwrap_or(u32::MAX), r.take_profit_bps.unwrap_or(u32::MAX)) };
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-        let positions: Vec<(Pubkey, Position)> = {
+    // Flatten lots for evaluation
+    let positions: Vec<(Pubkey, PositionLot, usize)> = {
             let rs = self.risk.read();
-            rs.open.iter().map(|(k,v)| (*k, v.clone())).collect()
+            let mut out = Vec::new();
+            for (mint, lots) in rs.open.iter() {
+                for (idx, lot) in lots.iter().cloned().enumerate() { out.push((*mint, lot, idx)); }
+            }
+            out
         };
         if positions.is_empty() { return Ok(()); }
-        for (mint, pos) in positions {
+    for (mint, pos, lot_idx) in positions {
             // Quote exit value (prefer Raydium then Orca)
             let mut quote_out: Option<u64> = None;
             if let Some(r) = &self.raydium {
@@ -686,32 +839,39 @@ impl SniperEngine {
             let pnl_bps = (pnl_pct * 10_000.0) as i64;
             {
                 let mut rs = self.risk.write();
-                if let Some(p) = rs.open.get_mut(&mint) { p.last_unrealized_pnl_sol = (out_lamports as f64 / 1e9) - p.invested_sol; }
+                if let Some(v) = rs.open.get_mut(&mint) { if let Some(l) = v.get_mut(lot_idx) { l.last_unrealized_pnl_sol = (out_lamports as f64 / 1e9) - l.invested_sol; } }
             }
             let stop_trigger = pnl_bps <= -(stop_bps as i64);
             let tp_trigger = pnl_bps >= tp_bps as i64;
             if stop_trigger || tp_trigger {
                 debug!(mint=%mint, pnl_bps, stop_trigger, tp_trigger, "exit trigger");
-                let is_stop = stop_trigger;
-                if let Err(e) = self.attempt_exit(&mint, pos.amount_tokens as u64).await { warn!(?e, mint=%mint, "exit tx failed"); }
-                else if is_stop { self.mark_cooldown(mint); }
+                // stop trigger stored in stop_trigger; variable removed to avoid unused warning
+                let fraction = if stop_trigger { 1.0 } else { 0.5 }; // TP: sell half, SL: full
+                let sell_tokens = (pos.amount_tokens * fraction).floor() as u64;
+                if sell_tokens > 0 {
+                    if let Err(e) = self.attempt_exit(&mint, lot_idx, sell_tokens, fraction).await { warn!(?e, mint=%mint, "exit tx failed"); }
+                    else if stop_trigger { self.mark_cooldown(mint); }
+                }
             }
         }
         Ok(())
     }
 
-    async fn attempt_exit(&self, mint: &Pubkey, amount_tokens: u64) -> Result<()> {
+    async fn attempt_exit(&self, mint: &Pubkey, lot_idx: usize, amount_tokens: u64, fraction: f64) -> Result<()> {
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
         // Determine actual token balance (ATA) to avoid over-selling
         let owner_sdk = self.treasury.pubkey();
         let mint_sdk = solana_sdk::pubkey::Pubkey::new_from_array(mint.to_bytes());
         let (ata,_prog) = match self.treasury.ata_address(&self.rpc, &owner_sdk, &mint_sdk).await { Ok(v)=>v, Err(_)=> return Ok(()) };
-        let bal_tokens = if let Ok(acc) = self.rpc.rpc.get_account(&ata).await { if acc.data.len()>=72 { u64::from_le_bytes(acc.data[64..72].try_into().unwrap()) } else { amount_tokens } } else { amount_tokens };
-        if bal_tokens == 0 { return Ok(()); }
+        let ata_tokens = if let Ok(acc) = self.rpc.rpc.get_account(&ata).await { if acc.data.len()>=72 { u64::from_le_bytes(acc.data[64..72].try_into().unwrap()) } else { amount_tokens } } else { amount_tokens };
+        if ata_tokens == 0 { return Ok(()); }
+        // Cap sale to both requested amount_tokens and on-chain balance (safety)
+        let sell_tokens = amount_tokens.min(ata_tokens);
+        if sell_tokens == 0 { return Ok(()); }
     // Raydium plan token->SOL
         let mut used_raydium = false;
     let msb2 = self.cfg.read().max_slippage_bps;
-    let ray_plan = if let Some(r) = &self.raydium { r.build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), bal_tokens, msb2).ok() } else { None };
+    let ray_plan = if let Some(r) = &self.raydium { r.build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), sell_tokens, msb2).ok() } else { None };
     if let Some(ref p) = ray_plan { if p.as_ref().map(|rp| rp.pool.is_some()).unwrap_or(false) { used_raydium = true; } }
     let bh: Hash = match self.rpc.rpc.get_latest_blockhash().await { Ok(h)=>h, Err(e)=> { RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return Err(e.into()); } };
     let tx_ixs: Vec<solana_sdk::instruction::Instruction> = if used_raydium { ray_plan.as_ref().unwrap().as_ref().unwrap().ixs.clone() } else {
@@ -724,22 +884,22 @@ impl SniperEngine {
                 o.set_user_token_account(Pubkey::new_from_array(mint.to_bytes()), ata);
                 o.set_user_token_account(Pubkey::new_from_array(sol_mint.to_bytes()), wsol_ata); // treat SOL as WSOL mint
                 let mut min_out = 1u64;
-                if let Ok(Some(q)) = o.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), bal_tokens).await {
+                if let Ok(Some(q)) = o.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), sell_tokens).await {
                     let msb3 = self.cfg.read().max_slippage_bps as u128;
                     min_out = ((q.amount_out as u128) * (10_000 - msb3) / 10_000) as u64;
                 }
-                o.build_swap_ix(&mint.to_string(), &sol_mint.to_string(), bal_tokens, min_out).unwrap_or_default()
+                o.build_swap_ix(&mint.to_string(), &sol_mint.to_string(), sell_tokens, min_out).unwrap_or_default()
             } else { Vec::new() }
         };
         if tx_ixs.is_empty() { return Ok(()); }
     let message = solana_sdk::message::Message::new(&tx_ixs, Some(&self.treasury.pubkey()));
     let fee_estimate = self.rpc.rpc.get_fee_for_message(&message).await.unwrap_or(0);
     let tx = Transaction::new_signed_with_payer(&tx_ixs, Some(&self.treasury.pubkey()), &[self.treasury.keypair.as_ref()], bh);
-        // Snapshot invested_sol for position (if exists) before trade
-        let invested_sol = {
-            let rs = self.risk.read();
-            rs.open.get(mint).map(|p| p.invested_sol).unwrap_or(0.0)
-        };
+    // Snapshot invested_sol for position (if exists) before trade (read-only borrow)
+    let invested_sol_lot = {
+        let rs = self.risk.read();
+        if let Some(v) = rs.open.get(mint) { if let Some(l) = v.get(lot_idx) { l.invested_sol } else { 0.0 } } else { 0.0 }
+    };
         let pre_balance = self.total_sol_balance().await.unwrap_or(0.0);
     // Pre WSOL ATA amount (destination of swap proceeds)
     let wsol_mint_prog = spl_token::native_mint::id();
@@ -751,7 +911,7 @@ impl SniperEngine {
             Ok(sig) => {
                 let dur = sent_at.elapsed();
                 record_swap_latency(dur.as_nanos() as u64);
-                info!(mint=%mint, sig=%sig, amount_tokens=bal_tokens, "exit trade submitted");
+                info!(mint=%mint, sig=%sig, amount_tokens=sell_tokens, "exit trade submitted");
         // Read WSOL ATA after swap before unwrap
         let post_wsol_amount: u64 = if let Ok(acc) = self.rpc.rpc.get_account(&wsol_ata).await { if acc.data.len()>=72 { u64::from_le_bytes(acc.data[64..72].try_into().unwrap()) } else {0} } else {0};
         let delta_wsol = post_wsol_amount.saturating_sub(pre_wsol_amount) as f64 / 1e9;
@@ -761,21 +921,28 @@ impl SniperEngine {
         // Assume fee ~ native_delta decrease unrelated to proceeds (if negative) ignore
     let fee_est_native = fee_estimate as f64 / 1e9;
     let fee_est = if native_delta < 0.0 { -native_delta.max(fee_est_native) } else { fee_est_native }; // prefer RPC reported fee_estimate
-    let realized = delta_wsol - invested_sol - fee_est;
-    let trade_ret = if invested_sol > 0.0 { realized / invested_sol } else { 0.0 };
+    let realized = delta_wsol - invested_sol_lot * fraction - fee_est; // proportional share of invested capital sold
+    let trade_ret = if invested_sol_lot > 0.0 { realized / (invested_sol_lot * fraction.max(1e-9)) } else { 0.0 };
     record_trade_return(trade_ret);
                 self.risk_reset_if_needed();
                 {
                     let mut rs = self.risk.write();
-                    let pos = rs.open.remove(mint);
+                    let mut invest_slice = 0.0;
+                    let mut remove_current = false;
+                    if let Some(v) = rs.open.get_mut(mint) { if lot_idx < v.len() {
+                        let l = &mut v[lot_idx];
+                        invest_slice = l.invested_sol * fraction;
+                        l.invested_sol -= invest_slice;
+                        l.amount_tokens = (l.amount_tokens - (l.amount_tokens * fraction)).max(0.0);
+                        if l.amount_tokens <= 1e-9 { remove_current = true; }
+                    } }
+                    if let Some(v) = rs.open.get_mut(mint) { if remove_current && lot_idx < v.len() { v.remove(lot_idx); } if v.is_empty() { rs.open.remove(mint); } }
                     rs.realized_pnl_sol += realized;
                     if realized < 0.0 { rs.realized_loss_today_sol += -realized; }
-                    // Rolling return (pct of invested)
-                    if let Some(p) = pos { if p.invested_sol > 0.0 { let ret = realized / p.invested_sol; rs.recent_realized.push(ret); }
-                    }
+                    if invest_slice > 0.0 { rs.recent_realized.push(realized / invest_slice); }
                     let window = self.cfg.read().rolling_pnl_window.unwrap_or(50);
                     if rs.recent_realized.len() > window { let excess = rs.recent_realized.len() - window; rs.recent_realized.drain(0..excess); }
-                    if rs.recent_realized.len() >= 5 { // compute simple Sharpe (mean / std * sqrt(n))
+                    if rs.recent_realized.len() >= 5 {
                         let n = rs.recent_realized.len() as f64;
                         let mean = rs.recent_realized.iter().copied().sum::<f64>() / n;
                         let var = rs.recent_realized.iter().map(|r| (r-mean)*(r-mean)).sum::<f64>() / n.max(1.0);
@@ -783,23 +950,25 @@ impl SniperEngine {
                         if std > 0.0 { rs.last_sharpe = mean / std * n.sqrt(); }
                     }
                     DAILY_REALIZED_PNL_SOL_MICRO.store((rs.realized_pnl_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
-                    OPEN_POSITIONS_GAUGE.store(rs.open.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let lots: usize = rs.open.values().map(|v| v.len()).sum();
+                    OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 // Unwrap afterwards outside lock
                 let _ = self.treasury.unwrap_wsol(&self.rpc, None).await;
                 // Trade CSV log (SELL)
-                let lamports_out = (delta_wsol * 1e9) as u64;
+                let lamports_out = (delta_wsol * 1e9) as u64; // proceeds
                 record_network_fee(fee_estimate);
                 let line = format!(
-                    "{ts},SELL,{mint},*,{sig},0,{lamports_out},{tok_in},{tok_out},,,0,,{fee},{realized},exit_full",
+                    "{ts},SELL,{mint},*,{sig},0,{lamports_out},{tok_in},{tok_out},,,0,,{fee},{realized},exit_fraction={fraction}",
                     ts=ChronoUtc::now().to_rfc3339(),
                     mint=mint,
                     sig=sig,
                     lamports_out=lamports_out,
-                    tok_in=bal_tokens,
-                    tok_out=bal_tokens,
+                    tok_in=sell_tokens,
+                    tok_out=sell_tokens,
                     fee=fee_estimate,
-                    realized=realized
+                    realized=realized,
+                    fraction=fraction
                 );
                 self.append_trade_record(&line, true);
                 self.persist_risk_state();
@@ -898,16 +1067,17 @@ impl SniperEngine {
 
     fn build_risk_snapshot_json(&self) -> serde_json::Value {
         let rs = self.risk.read();
-        let open: Vec<serde_json::Value> = rs.open.iter().map(|(k,v)| json!({
+    let open: Vec<serde_json::Value> = rs.open.iter().flat_map(|(k,vs)| vs.iter().map(move |lot| json!({
             "mint": k.to_string(),
-            "entry_price_sol": v.entry_price_sol,
-            "amount_tokens": v.amount_tokens,
-            "invested_sol": v.invested_sol,
-            "token_decimals": v.token_decimals,
-            "last_unrealized_pnl_sol": v.last_unrealized_pnl_sol
-        })).collect();
+            "entry_price_sol": lot.entry_price_sol,
+            "amount_tokens": lot.amount_tokens,
+            "invested_sol": lot.invested_sol,
+            "token_decimals": lot.token_decimals,
+            "last_unrealized_pnl_sol": lot.last_unrealized_pnl_sol,
+            "opened_ts": lot.opened_ts
+        }))).collect();
         let cooldown: Vec<serde_json::Value> = rs.cooldown_until.iter().map(|(k,v)| json!({"mint": k.to_string(), "until": v})).collect();
-        json!({
+    json!({
             "version": 1,
             "realized_pnl_sol": rs.realized_pnl_sol,
             "realized_loss_today_sol": rs.realized_loss_today_sol,
@@ -916,7 +1086,7 @@ impl SniperEngine {
             "last_sharpe": rs.last_sharpe,
             "open_positions": open,
             "cooldowns": cooldown
-        })
+    })
     }
 
     fn try_load_risk_state(&self) {
@@ -941,7 +1111,8 @@ impl SniperEngine {
                                     let invested = ent.get("invested_sol").and_then(|f| f.as_f64()).unwrap_or(0.0);
                                     let decs = ent.get("token_decimals").and_then(|f| f.as_u64()).unwrap_or(0) as u8;
                                     let last_unr = ent.get("last_unrealized_pnl_sol").and_then(|f| f.as_f64()).unwrap_or(0.0);
-                                    rs.open.insert(pk, Position { entry_price_sol: entry_price, amount_tokens, invested_sol: invested, token_decimals: decs, last_unrealized_pnl_sol: last_unr });
+                                    let opened_ts = ent.get("opened_ts").and_then(|f| f.as_i64()).unwrap_or(0);
+                                    rs.open.entry(pk).or_insert_with(Vec::new).push(PositionLot { entry_price_sol: entry_price, amount_tokens, invested_sol: invested, token_decimals: decs, last_unrealized_pnl_sol: last_unr, opened_ts });
                                 }
                             }
                         }
@@ -950,7 +1121,8 @@ impl SniperEngine {
                     if let Some(cd) = val.get("cooldowns").and_then(|v| v.as_array()) {
                         for c in cd { if let (Some(mint_str), Some(until)) = (c.get("mint").and_then(|m| m.as_str()), c.get("until").and_then(|u| u.as_i64())) { if let Ok(pk) = Pubkey::from_str(mint_str) { rs.cooldown_until.insert(pk, until); } } }
                     }
-                    OPEN_POSITIONS_GAUGE.store(rs.open.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let lots: usize = rs.open.values().map(|v| v.len()).sum();
+                    OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
                     DAILY_REALIZED_PNL_SOL_MICRO.store((rs.realized_pnl_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
                     info!(positions = rs.open.len(), "risk state restored");
             } else {
@@ -960,8 +1132,10 @@ impl SniperEngine {
             debug!("risk state read failed");
         }
     }
-}
+    }
+    // end try_load_risk_state; keep impl open for helper structs/functions below
 
+// Liquidity concentration assessment result
 #[derive(Debug, Clone)]
 pub struct LpLockAssessment {
     pub top1_pct: f64,
@@ -1133,6 +1307,8 @@ impl SniperEngine {
         Ok(Some(LpLockAssessment { top1_pct, top3_pct, top5_pct, concentration_ok, largest_account: largest_key, burned_pct, program_vault_pct }))
     }
 }
+// end secondary impl SniperEngine helpers
+// (auxiliary impl closed above)
 
 pub async fn run_sniper(rpc: Arc<SolanaRpc>, cfg: SniperCfg, raydium: Option<Arc<Raydium>>, orca: Option<Arc<Orca>>, treasury: Arc<Treasury>) -> Result<()> {
     let engine = SniperEngine::new(rpc, cfg, raydium, orca, treasury);
@@ -1167,4 +1343,5 @@ impl From<&SniperSettings> for SniperCfg {
         }
     }
 }
-// EOF extra brace fix
+// final file closing brace for module (no additional opens)
+// EOF

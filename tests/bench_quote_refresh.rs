@@ -1,7 +1,6 @@
 //! Lightweight timing test (not a criterion benchmark) to profile refresh & quote.
 use std::sync::Arc;
 use ironcrab::solana::{rpc::SolanaRpc, dex::{raydium::Raydium, orca::Orca, Dex}};
-use solana_sdk::pubkey::Pubkey;
 
 #[tokio::test]
 async fn timing_refresh_and_quote() {

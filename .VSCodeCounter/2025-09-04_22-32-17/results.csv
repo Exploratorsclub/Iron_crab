@@ -1,0 +1,29 @@
+"filename", "language", "Rust", "comment", "blank", "total"
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\engine.rs", "Rust", 64, 2, 6, 72
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\market.rs", "Rust", 45, 0, 5, 50
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\mod.rs", "Rust", 3, 1, 1, 5
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\types.rs", "Rust", 42, 0, 11, 53
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\bin\backtest_driver.rs", "Rust", 21, 2, 2, 25
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\bin\raydium_pools.rs", "Rust", 69, 0, 10, 79
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\config.rs", "Rust", 91, 3, 13, 107
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\engine\allocator.rs", "Rust", 21, 1, 5, 27
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\engine\mod.rs", "Rust", 150, 9, 17, 176
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\engine\py_strategy.rs", "Rust", 42, 2, 8, 52
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\engine\strategy.rs", "Rust", 20, 3, 7, 30
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\lib.rs", "Rust", 7, 0, 2, 9
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\main.rs", "Rust", 35, 5, 10, 50
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\metrics.rs", "Rust", 185, 20, 12, 217
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\arbitrage.rs", "Rust", 298, 48, 22, 368
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\compute_budget_estimator.rs", "Rust", 45, 6, 6, 57
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\compute_budget_helper.rs", "Rust", 1, 0, 1, 2
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\dex\mod.rs", "Rust", 25, 1, 5, 31
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\dex\orca.rs", "Rust", 184, 12, 26, 222
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\dex\orca_whirlpool_layout.rs", "Rust", 82, 46, 11, 139
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\dex\raydium.rs", "Rust", 639, 56, 42, 737
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\dex\router.rs", "Rust", 161, 25, 13, 199
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\mod.rs", "Rust", 6, 0, 2, 8
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\rpc.rs", "Rust", 12, 0, 4, 16
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\sniper.rs", "Rust", 1066, 118, 39, 1223
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\types.rs", "Rust", 23, 0, 6, 29
+"c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\wallet.rs", "Rust", 223, 33, 35, 291
+"Total", "-", 3560, 393, 321, 4274

@@ -33,6 +33,15 @@ struct OrcaPool {
     tick_current_index: Option<i32>,
 }
 
+#[derive(Clone, Debug)]
+pub struct OrcaPoolSnapshot {
+    pub address: Pubkey,
+    pub base_mint: Pubkey,
+    pub quote_mint: Pubkey,
+    pub reserve_base: u128,
+    pub reserve_quote: u128,
+}
+
 pub struct Orca {
     rpc: Arc<SolanaRpc>,
     pools: Arc<DashMap<Pubkey, OrcaPool>>, // keyed by a pseudo pool id (mint xor) for now
@@ -66,6 +75,11 @@ impl Orca {
 
     /// Pools that reference this mint.
     pub fn pools_for_mint(&self, mint: &Pubkey) -> Vec<Pubkey> { self.mint_index.get(mint).map(|v| v.clone()).unwrap_or_default() }
+
+    /// Return a lightweight snapshot of current pools (for read-only aggregation like liquidity indexing).
+    pub fn pools_snapshot(&self) -> Vec<OrcaPoolSnapshot> {
+        self.pools.iter().map(|p| OrcaPoolSnapshot { address: *p.key(), base_mint: p.base_mint, quote_mint: p.quote_mint, reserve_base: p.reserve_base, reserve_quote: p.reserve_quote }).collect()
+    }
 }
 
 #[async_trait]
