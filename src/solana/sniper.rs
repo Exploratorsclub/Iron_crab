@@ -143,10 +143,18 @@ impl SniperEngine {
     if supply == 0.0 { return Ok(None); }
     if supply == 0.0 { return Ok(None); }
         // Largest accounts
-    let list = match self.rpc.rpc.get_token_largest_accounts(mint).await { Ok(v)=>v, Err(e)=> { warn!(?e, "largest accounts fetch failed"); return Ok(None); } };
-    let top1_pct = 0.0; // placeholder until proper amount decode
-    let mut largest_key: Option<String> = None;
-    if let Some(first) = list.first() { largest_key = Some(first.address.clone()); /* TODO: decode UiTokenAmount fields once types confirmed */ }
+        let list = match self.rpc.rpc.get_token_largest_accounts(mint).await { Ok(v)=>v, Err(e)=> { warn!(?e, "largest accounts fetch failed"); return Ok(None); } };
+        let mut top1_pct = 0.0;
+        let mut largest_key: Option<String> = None;
+        if let Some(first) = list.first() {
+            // first.amount is UiTokenAmount { amount (raw string), decimals, ui_amount, ui_amount_string }
+            #[allow(dead_code)]
+            struct Dummy; // placeholder to silence potential warnings if fields differ
+            // Raw integer amount string
+            let raw_str = &first.amount.amount; // raw base-10 without decimals
+            if let Ok(raw_u128) = raw_str.parse::<u128>() { if supply > 0.0 { top1_pct = raw_u128 as f64 / supply; } }
+            largest_key = Some(first.address.clone());
+        }
         let concentration_ok = top1_pct <= threshold;
         Ok(Some(LpLockAssessment { top1_pct, concentration_ok, largest_account: largest_key }))
     }
