@@ -666,7 +666,6 @@ impl SniperEngine {
     { let r = self.cfg.read(); if r.stop_loss_bps.is_none() && r.take_profit_bps.is_none() { return Ok(()); } }
     let (stop_bps, tp_bps) = { let r = self.cfg.read(); (r.stop_loss_bps.unwrap_or(u32::MAX), r.take_profit_bps.unwrap_or(u32::MAX)) };
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-        // clone keys to drop lock quickly
         let positions: Vec<(Pubkey, Position)> = {
             let rs = self.risk.read();
             rs.open.iter().map(|(k,v)| (*k, v.clone())).collect()
