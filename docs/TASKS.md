@@ -29,6 +29,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 ## 3) Arbitrage
 - [x] DEX Quotes aggregieren, beste Edge wählen (aggregate_best_edges + best_edge)
 	- Erweiterungen: enumerate_triangular_cycles, TransactionPlan + Simulation
+- [x] Profit Ranking (rank_triangular_cycles) für Triangular Cycles
 - [ ] Jito/MEV-Integration (später)
 - [x] Pre-TX Simulation (RPC `simulateTransaction`)
 

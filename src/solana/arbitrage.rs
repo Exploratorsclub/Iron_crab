@@ -226,6 +226,18 @@ impl ArbitrageEngine {
         v.sort_by(|x,y| y.gross_profit.cmp(&x.gross_profit));
         Ok(v)
     }
+
+    /// Rank triangular cycles by net_profit (if available) otherwise by gross_profit. Returns top `limit`.
+    pub async fn rank_triangular_cycles(&self, base_tokens: &[String], amount_in: u64, limit: usize) -> Result<Vec<CycleOpportunity>> {
+        let mut cycles = self.enumerate_triangular_cycles(base_tokens, amount_in).await?;
+        cycles.sort_by(|a,b| {
+            let an = a.net_profit.unwrap_or(a.gross_profit);
+            let bn = b.net_profit.unwrap_or(b.gross_profit);
+            bn.cmp(&an) // descending
+        });
+        if cycles.len() > limit { cycles.truncate(limit); }
+        Ok(cycles)
+    }
 }
 
 /// Compute net profit (lamports of input token) after thresholds.
