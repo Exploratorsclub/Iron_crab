@@ -111,7 +111,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 ## 6) Infra & Observability
 - [x] Structured Metrics (Prometheus Exporter Port 9898)
 - [x] Trade CSV Logs (rotierend, Shortfall & Fees)
-- [~] Config-Reload (Polling + Diff Logging + optional File Watch feature `notify_watch`; SIGHUP signal trigger PENDING)
+- [x] Config-Reload (Polling + Diff Logging + optional File Watch feature `notify_watch`; SIGHUP signal trigger on Unix)
 - [x] CI: `cargo fmt`, `cargo clippy`, Tests (GitHub Actions Workflow)
 - [x] Liveness / Readiness Endpoints (/live, /ready)
 - [x] Sharpe & Drawdown Gauges + +Inf Bucket & Build Info Metric
@@ -126,25 +126,25 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Message Counting & Active Connections (`ws_messages_total`, `ws_active_connections`)
 	- [ ] Adaptive Backoff w/ server error codes (future)
 	- [ ] Multi-endpoint failover / rotating RPC WS URLs
-- [ ] Volle Raydium Serum Market Accounts erzwungen (kein Fallback)
-- [ ] Multi-DEX Best-Route Auswahl (Raydium vs Orca dynamisch)
-- [ ] Partielle Exits (gestaffelte SELL Orders / Positionsplits)
-- [ ] Retry & Backoff Strategie bei transienten RPC Fehlern
+- [x] Volle Raydium Serum Market Accounts erzwungen (kein Fallback)
+- [x]  (Raydium vs Orca dynamisch)
+- [x] Partielle Exits (gestaffelte SELL Orders / Positionsplits)
+- [x] Retry & Backoff Strategie bei transienten RPC Fehlern
 	- [x] Grund-RPC Retry (Exponentiell, 3 Versuche, Metric `rpc_retry_attempts_total`)
-- [ ] PendingTrade TTL + Reconciliation (Zombie Pending entfernen)
+- [x] PendingTrade TTL + Reconciliation (Zombie Pending entfernen)
 	- [x] TTL Cleanup (Config `pending_trade_ttl_secs`) – implemented
 	- [x] Reconciliation (Signature status check + finalize/dismiss logic, metrics `pending_reconciliations_total`, `pending_failed_total`)
-- [ ] Re-Quote unmittelbar vor Signatur (Front‑run Schutz / aktualisiertes min_out)
+- [x] Re-Quote unmittelbar vor Signatur (Front‑run Schutz / aktualisiertes min_out)
 
 ### State & Persistence
-- [ ] Persistenter RiskState Snapshot (offene Positionen, realized PnL, rolling returns, Sharpe)
-- [ ] Per-Mint Mehrfachpositionen (konfigurierbar per_mint_position_limit)
-- [ ] Periodische Flush / Recover Logik beim Shutdown
+- [x] Persistenter RiskState Snapshot (offene Positionen, realized PnL, rolling returns, Sharpe)
+- [x] Per-Mint Mehrfachpositionen (konfigurierbar per_mint_position_limit)
+- [x] Periodische Flush / Recover Logik beim Shutdown
 
 ### Fees & PnL Genauigkeit
-- [ ] Protocol / LP / Referral Fees Extraktion aus Transaction Meta
-- [ ] Brutto vs Netto PnL Metriken (separate Gauges)
-- [ ] Fee % des Notionals als Histogram
+- [~] Protocol / LP / Referral Fees Extraktion aus Transaction Meta (postTokenBalances Delta & Meta-basierte Aggregation implementiert; DEX-spezifische Fee-Vault Attribution pending)
+- [x] Brutto vs Netto PnL Metriken (separate Gauges)
+- [x] Fee % des Notionals als Histogram
 
 ### Data & Pricing
 - [ ] Echte SOL/USD & Stable Preise via Oracle (Pyth / Switchboard)
@@ -194,7 +194,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Diff Logging bei Hot Reload (was hat sich geändert?)
 	- Implementiert: `diff_sniper_cfg` vergleicht Felder & loggt Änderungen (Hot Reload Task)
 	- Optional Echtzeit File Watch via Feature `notify_watch` (aktivieren mit `--features notify_watch`)
-	- Ausstehend: SIGHUP Signal Handler (Unix) als alternativer Trigger
+	- SIGHUP Signal Handler (Unix) als alternativer Trigger – implemented
 - [ ] Start Skripte (Windows/Unix) für build/run/backtest
 - [ ] Konfigurierbare Log Rotation & Retention (N Tage)
 

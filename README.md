@@ -41,6 +41,8 @@ Metrics & Observability
  - Histograms: Swap Latency & Quote Latency
  - Aggregates: Shortfall Tokens & SOL, Network Fees (Lamports)
  - Rolling PnL / Sharpe (intern) + Gauges (`ironcrab_sharpe_ratio`, `ironcrab_drawdown_pct`)
+ - Brutto vs Netto Realized PnL Gauges (`gross_realized_pnl_sol`, `net_realized_pnl_sol`)
+ - Fee-% Histogram (`fee_percent_bucket{le="..."}`) basierend auf Fee / Notional
  - PnL Distribution Histogram (`ironcrab_trade_return_bucket` inkl. +Inf Bucket)
  - Geplante Erweiterungen: Fee Type Breakdown (Protocol vs Referral) & zusätzliche PnL / Shortfall Histograms
 
@@ -74,6 +76,33 @@ IRONCRAB_SNIPER_RELOAD_PATH=./config.toml ./target/release/ironcrab --config ./c
 kill -HUP $!  # Sofortiger Reload
 ```
 
+## Konfig – neue Felder (Sniper)
+Die Sniper‑Konfiguration wurde um optionale Felder für gestaffelte Teilverkäufe, Trailing‑Stop, minimale Exit‑Notional und Pending‑TTL erweitert.
+
+- take_profit_tiers: Array von Ebenen mit Bps‑Schwelle und Fraction (nicht kumulativ). Aufsteigend sortiert empfohlen.
+- trailing_stop_bps: Optionaler Trailing‑Stop Abstand in bps ab dem bisherigen Höchst‑PnL des Lots.
+- min_exit_notional_sol: Mindest‑Notional in SOL für einen Exit; kleine Restbeträge werden übersprungen.
+- pending_trade_ttl_secs: TTL in Sekunden; Pending Trades werden nach Ablauf bereinigt und per Reconciliation verifiziert.
+
+Beispiel (TOML):
+```toml
+[sniper]
+# Rebuy/Exit/Risk Parameter (Auszug)
+take_profit_tiers = [
+	{ bps = 500,  fraction = 0.30 },
+	{ bps = 1000, fraction = 0.30 },
+	{ bps = 1500, fraction = 0.40 },
+]
+trailing_stop_bps = 300
+min_exit_notional_sol = 0.02
+pending_trade_ttl_secs = 120
+```
+
+Hinweise:
+- Fractionen sind pro Ebene (z. B. 0.30 = 30% des zum Zeitpunkt offenen Lot‑Volumens)
+- Tiers sollten aufsteigend nach bps definiert werden; Werte außerhalb realistischer Spannen werden ignoriert.
+- Greift, falls keine Tiers gesetzt sind: Legacy‑Fallback (einfacher TP/SL).
+
 ### Python‑Strategien (optional)
 ```powershell
 cargo run --release --features python -- --config .\config.example.toml
@@ -87,7 +116,7 @@ cargo run --bin raydium_pools -- --mint So11111111111111111111111111111111111111
 
 ## Hinweise / Roadmap Auszug
 - Siehe `docs/TASKS.md` für detaillierte Meilensteine
-- Nächste Schritte: Exakte Fee Aufschlüsselung (Protocol/Referral), SIGHUP Trigger für Config Reload (Unix), zusätzliche Histograms (Absolute Realized PnL, Shortfall %), finalisiertes Grafana Dashboard
+- Nächste Schritte: Exakte Fee Aufschlüsselung (Protocol/Referral), zusätzliche Histograms (Absolute Realized PnL, Shortfall %), finalisiertes Grafana Dashboard
 - MEV/Jito Bundles & Adaptive Slippage geplant
 
 ## Test Helpers
@@ -108,7 +137,17 @@ Bereits implementiert:
 - `ironcrab_drawdown_pct` (Gauge) – approximierter aktueller Drawdown (0..1)
 - `ironcrab_build_info{version="x.y.z"}` – Build/Version Kennzahl
 - `ironcrab_trade_return_bucket` – Realized Return Distribution (+Inf Bucket)
+ - `gross_realized_pnl_sol`, `net_realized_pnl_sol` – Session‑aggregierte Brutto/Netto PnL (SOL)
+ - `fee_percent_bucket{le=...}` – Gebührenanteil gemessen am Notional pro Trade (inkl. +Inf Bucket via Count)
 - Netzwerk / Shortfall / Fee Aggregationen (`*_total`)
+	- `network_fees_lamports_total` – Summierte Netzwerkgebühren (Lamports)
+	- `shortfall_tokens_total`, `shortfall_sol_total` – Aggregierte Shortfalls
+	- `fills_total` – Anzahl bestätigter Fills
+	- `pending_reconciliations_total`, `pending_failed_total` – PendingTrade Reconciliation
+	- `partial_exit_events_total`, `partial_exit_fraction_sum` – Partielle Exit‑Ausführungen und kumulierte Fraktionen
+	- `requote_events_total`, `requote_improved_total`, `requote_worsened_total`, `requote_min_out_delta_ratio_sum` – Re‑Quote Effekte vor Signatur
+	- `dex_selection_entry_raydium_total`, `dex_selection_entry_orca_total` – DEX‑Auswahl bei Entry
+	- `dex_selection_exit_raydium_total`, `dex_selection_exit_orca_total` – DEX‑Auswahl bei Exit
 
 Geplant / Offen:
 - `ironcrab_fee_breakdown_total{type="protocol|network|referral"}` – Feingranulare Fee Typen
@@ -117,6 +156,9 @@ Geplant / Offen:
 - Weitere Route / Quote Performance Metriken
 
 Grafana Dashboard Skeleton: `docs/grafana_dashboard_example.json` (finale Panels & Alerts pending)
+
+## Fee / Meta‑Parsing
+BUY‑FILLs nutzen `postTokenBalances - preTokenBalances` (Transaction Meta, JsonParsed) für die tatsächlich erhaltene Tokenmenge (Treasury‑Owner). Shortfall & Protokoll‑Fees werden daraus bzw. heuristisch über `fee_bps` abgeleitet und in `protocol_fee_tokens_total`/`protocol_fee_sol_total` aggregiert. Exakte Referral/Protocol‑Splits sind DEX‑spezifisch und folgen.
 
 ## Trade Log Beispiel (gekürzt)
 ```

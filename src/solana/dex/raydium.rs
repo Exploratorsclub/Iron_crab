@@ -342,18 +342,22 @@ impl Dex for Raydium {
                 let (v, _) = Self::derive_serum_vault_signer(&p.market_id, &p.market_program_id);
                 Some(v)
             } else { None };
+            // Enforce: pools must have valid Serum market linkage and all required Serum accounts
+            if p.market_id == Pubkey::default() || p.market_program_id == Pubkey::default() {
+                tracing::warn!(pool=%p.address, "skip pool: missing serum market linkage");
+                RAYDIUM_POOLS_SKIPPED_SERUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
             // Attempt Serum market account fetch (single account RPC) for orderbook + vault pointers
-            let (serum_bids, serum_asks, serum_event_queue, serum_base_vault, serum_quote_vault, serum_ok) = if p.market_id != Pubkey::default() && p.market_program_id != Pubkey::default() {
-                match self.rpc.rpc.get_account(&p.market_id).await {
-                    Ok(acct) => {
-                        match Self::parse_serum_market_accounts(&acct.data) {
-                            Some((b,a,e,bv,qv)) => (b,a,e,bv,qv, true),
-                            None => (None,None,None,None,None, false)
-                        }
+            let (serum_bids, serum_asks, serum_event_queue, serum_base_vault, serum_quote_vault, serum_ok) = match self.rpc.rpc.get_account(&p.market_id).await {
+                Ok(acct) => {
+                    match Self::parse_serum_market_accounts(&acct.data) {
+                        Some((b,a,e,bv,qv)) => (b,a,e,bv,qv, true),
+                        None => (None,None,None,None,None, false)
                     }
-                    Err(_) => (None,None,None,None,None, false)
                 }
-            } else { (None,None,None,None,None, true) }; // pools without market linkage are allowed
+                Err(_) => (None,None,None,None,None, false)
+            };
             if !serum_ok { 
                 tracing::warn!(pool=%p.address, market=%p.market_id, "skip pool: incomplete serum market accounts"); 
                 RAYDIUM_POOLS_SKIPPED_SERUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed); 

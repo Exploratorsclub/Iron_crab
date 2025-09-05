@@ -61,6 +61,24 @@ pub static PENDING_FAILED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0
 // Partial exit metrics
 pub static PARTIAL_EXIT_EVENTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static PARTIAL_EXIT_FRACTION_MICRO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Re-quote metrics
+pub static REQUOTE_EVENTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REQUOTE_IMPROVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REQUOTE_WORSENED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Sum of (new_min_out - old_min_out)/old_min_out in micro (signed)
+pub static REQUOTE_MIN_OUT_DELTA_RATIO_MICRO_SUM: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+// DEX selection (entry/exit) counters
+pub static DEX_SELECTION_ENTRY_RAYDIUM_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static DEX_SELECTION_ENTRY_ORCA_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static DEX_SELECTION_EXIT_RAYDIUM_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static DEX_SELECTION_EXIT_ORCA_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Gross vs Net realized PnL (session aggregates, SOL micro)
+pub static GROSS_REALIZED_PNL_SOL_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+pub static NET_REALIZED_PNL_SOL_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+// Fee percent histogram (fee / notional), common percent buckets
+const FEE_PCT_BUCKETS: &[f64] = &[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1];
+pub static FEE_PCT_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| FEE_PCT_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
+pub static FEE_PCT_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Realized trade return histogram (ratio realized_pnl / invested) buckets (cumulative style capture)
 // Buckets chosen to capture deep losses to outsized wins.
 const TRADE_RETURN_BUCKETS: &[f64] = &[
@@ -107,6 +125,21 @@ pub fn record_trade_return(ret: f64) {
     // Bound to i64 range
     let micro_i64 = if micro > i64::MAX as f64 { i64::MAX } else if micro < i64::MIN as f64 { i64::MIN } else { micro as i64 };
     TRADE_RETURN_SUM_MICRO.fetch_add(micro_i64, Ordering::Relaxed);
+}
+
+pub fn record_fee_pct(pct: f64) {
+    let p = if pct.is_nan() || pct.is_infinite() || pct < 0.0 { 0.0 } else { pct };
+    for (i,b) in FEE_PCT_BUCKETS.iter().enumerate() {
+        if p <= *b { FEE_PCT_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed); break; }
+    }
+    FEE_PCT_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_realized_gross_net(gross_sol: f64, net_sol: f64) {
+    let g = (gross_sol * 1_000_000.0).clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+    let n = (net_sol * 1_000_000.0).clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+    GROSS_REALIZED_PNL_SOL_MICRO.fetch_add(g, Ordering::Relaxed);
+    NET_REALIZED_PNL_SOL_MICRO.fetch_add(n, Ordering::Relaxed);
 }
 
 pub fn snapshot() -> MetricsSnapshot {
@@ -206,6 +239,24 @@ async fn metrics_response() -> Response<Body> {
     line!("pending_failed_total", PENDING_FAILED_TOTAL.load(Ordering::Relaxed));
     line!("partial_exit_events_total", PARTIAL_EXIT_EVENTS_TOTAL.load(Ordering::Relaxed));
     line!("partial_exit_fraction_sum", PARTIAL_EXIT_FRACTION_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0);
+    line!("requote_events_total", REQUOTE_EVENTS_TOTAL.load(Ordering::Relaxed));
+    line!("requote_improved_total", REQUOTE_IMPROVED_TOTAL.load(Ordering::Relaxed));
+    line!("requote_worsened_total", REQUOTE_WORSENED_TOTAL.load(Ordering::Relaxed));
+    line!("requote_min_out_delta_ratio_sum", REQUOTE_MIN_OUT_DELTA_RATIO_MICRO_SUM.load(Ordering::Relaxed) as f64 / 1_000_000.0);
+    // DEX selection counters
+    line!("dex_selection_entry_raydium_total", DEX_SELECTION_ENTRY_RAYDIUM_TOTAL.load(Ordering::Relaxed));
+    line!("dex_selection_entry_orca_total", DEX_SELECTION_ENTRY_ORCA_TOTAL.load(Ordering::Relaxed));
+    line!("dex_selection_exit_raydium_total", DEX_SELECTION_EXIT_RAYDIUM_TOTAL.load(Ordering::Relaxed));
+    line!("dex_selection_exit_orca_total", DEX_SELECTION_EXIT_ORCA_TOTAL.load(Ordering::Relaxed));
+    // Gross/Net realized PnL (session aggregates)
+    line!("gross_realized_pnl_sol", GROSS_REALIZED_PNL_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
+    line!("net_realized_pnl_sol", NET_REALIZED_PNL_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
+    // Fee percent histogram
+    for (i,b) in FEE_PCT_BUCKETS.iter().enumerate() {
+        let c = FEE_PCT_BUCKET_COUNTS[i].load(Ordering::Relaxed);
+        out.push_str(&format!("fee_percent_bucket{{le=\"{}\"}} {}\n", b, c));
+    }
+    out.push_str(&format!("fee_percent_bucket{{le=\"+Inf\"}} {}\n", FEE_PCT_COUNT.load(Ordering::Relaxed)));
     // Trade return histogram (realized PnL / invested)
     let tr_count = TRADE_RETURN_COUNT.load(Ordering::Relaxed);
     let tr_sum_micro = TRADE_RETURN_SUM_MICRO.load(Ordering::Relaxed);
