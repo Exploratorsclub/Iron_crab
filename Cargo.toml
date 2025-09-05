@@ -17,6 +17,7 @@ dashmap = "5"
 once_cell = "1"
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
 regex = "1"
+rand = { version = "0.8", features = ["std", "small_rng"] }
 
 # Config & Serde
 serde = { version = "1", features = ["derive"] }

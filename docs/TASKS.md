@@ -120,8 +120,12 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 ## 7) Production Hardening & Open Roadmap
 
 ### Execution & Routing
-- [ ] Stabiler WebSocket PubSub (Reconnect, Backoff, Heartbeat)
-	- [x] Reconnect + Exponential Backoff + Metric (`ws_reconnects_total`)
+- [~] Stabiler WebSocket PubSub (Reconnect, Backoff, Heartbeat)
+	- [x] Reconnect + Exponential Backoff + Metric (`ws_reconnects_total` + jitter)
+	- [x] Heartbeat Timer + Stale Detection (90s silence -> reconnect, metric `ws_heartbeat_misses_total`)
+	- [x] Message Counting & Active Connections (`ws_messages_total`, `ws_active_connections`)
+	- [ ] Adaptive Backoff w/ server error codes (future)
+	- [ ] Multi-endpoint failover / rotating RPC WS URLs
 - [ ] Volle Raydium Serum Market Accounts erzwungen (kein Fallback)
 - [ ] Multi-DEX Best-Route Auswahl (Raydium vs Orca dynamisch)
 - [ ] Partielle Exits (gestaffelte SELL Orders / Positionsplits)

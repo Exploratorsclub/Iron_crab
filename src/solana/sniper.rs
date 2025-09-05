@@ -42,6 +42,9 @@ use crate::metrics::{
     PENDING_FAILED_TOTAL,
     PROTOCOL_FEE_TOKENS_TOTAL,
     PROTOCOL_FEE_SOL_MICRO_TOTAL,
+    WS_MESSAGES_TOTAL,
+    WS_HEARTBEAT_MISSES_TOTAL,
+    WS_ACTIVE_CONNECTIONS,
 };
 use serde::{Serialize, Deserialize};
 use serde_json::json;
@@ -331,6 +334,7 @@ impl SniperEngine {
     }
 
     pub async fn subscribe_logs(&self) -> Result<()> {
+        use rand::{Rng, SeedableRng};
         let ws_url = Self::http_to_ws(&self.rpc.rpc.url());
         let programs = vec![RAYDIUM_AMM_V4.to_string(), ORCA_WHIRLPOOL_PROGRAM.to_string()];
         for pid in programs {
@@ -344,38 +348,64 @@ impl SniperEngine {
                     "params": [ { "mentions": [pid] }, { "commitment": "processed" } ]
                 });
                 let mut attempt: u32 = 0;
+                let mut rng = rand::rngs::StdRng::from_entropy();
                 loop {
+                    let start_connect = Instant::now();
                     match connect_async(&url).await {
                         Ok((mut ws, _resp)) => {
                             attempt = 0;
-                            if ws.send(Message::text(sub_req.to_string())).await.is_err() { return; }
-                            info!(program_id = %RAYDIUM_AMM_V4, "sniper websocket connected (generic)");
-                            while let Some(msg) = ws.next().await {
-                                match msg {
-                                    Ok(Message::Text(txt)) => {
-                                        if txt.contains("logsNotification") {
-                                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                                                if let Some(arr) = v.pointer("/params/result/value/logs").and_then(|x| x.as_array()) {
-                                                    let lines: Vec<String> = arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect();
-                                                    engine_clone.extract_and_evaluate(lines).await;
-                                                }
-                                            }
+                            WS_ACTIVE_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if ws.send(Message::text(sub_req.to_string())).await.is_err() { WS_ACTIVE_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); return; }
+                            info!(program_id = %pid, elapsed_ms = start_connect.elapsed().as_millis(), "sniper websocket connected");
+                            let mut last_msg = Instant::now();
+                            let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+                            loop {
+                                tokio::select! {
+                                    _ = heartbeat.tick() => {
+                                        // heartbeats: if no message for > 90s, consider stale and break to reconnect
+                                        if last_msg.elapsed() > Duration::from_secs(90) {
+                                            WS_HEARTBEAT_MISSES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            warn!(program_id=%pid, "ws heartbeat stale – reconnecting");
+                                            break;
+                                        } else {
+                                            // send ping proactively
+                                            if ws.send(Message::Ping(Vec::new())).await.is_err() { break; }
                                         }
                                     }
-                                    Ok(Message::Binary(_)) => {}
-                                    Ok(Message::Ping(p)) => { let _ = ws.send(Message::Pong(p)).await; }
-                                    Ok(Message::Close(_)) => { warn!("ws closed"); break; }
-                                    Err(e) => { warn!(?e, "ws error"); break; }
-                                    _ => {}
+                                    maybe_msg = ws.next() => {
+                                        match maybe_msg {
+                                            Some(Ok(Message::Text(txt))) => {
+                                                WS_MESSAGES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                last_msg = Instant::now();
+                                                if txt.contains("logsNotification") {
+                                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                                        if let Some(arr) = v.pointer("/params/result/value/logs").and_then(|x| x.as_array()) {
+                                                            let lines: Vec<String> = arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect();
+                                                            engine_clone.extract_and_evaluate(lines).await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Some(Ok(Message::Binary(_))) => { WS_MESSAGES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed); last_msg = Instant::now(); }
+                                            Some(Ok(Message::Pong(_))) => { last_msg = Instant::now(); }
+                                            Some(Ok(Message::Ping(p))) => { let _ = ws.send(Message::Pong(p)).await; last_msg = Instant::now(); }
+                                            Some(Ok(Message::Close(_))) => { warn!(program_id=%pid, "ws closed by peer"); break; }
+                                            Some(Ok(Message::Frame(_))) => { /* ignore internal frame */ }
+                                            Some(Err(e)) => { warn!(?e, program_id=%pid, "ws error"); break; }
+                                            None => { warn!(program_id=%pid, "ws stream ended"); break; }
+                                        }
+                                    }
                                 }
                             }
+                            WS_ACTIVE_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Err(e) => { warn!(?e, "failed websocket connect"); }
+                        Err(e) => { warn!(?e, program_id=%pid, "failed websocket connect"); }
                     }
                     WS_RECONNECTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     attempt += 1;
-                    let backoff_ms = (2u64.pow(attempt.min(6)) * 250).min(10_000);
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    let base = (2u64.pow(attempt.min(6)) * 250).min(15_000);
+                    let jitter: u64 = rng.gen_range(0..250);
+                    tokio::time::sleep(Duration::from_millis(base + jitter)).await;
                 }
             });
         }

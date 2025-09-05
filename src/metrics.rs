@@ -49,6 +49,10 @@ pub static FILLS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static NETWORK_FEES_LAMPORTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static WS_RECONNECTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RPC_RETRY_ATTEMPTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// WebSocket stability metrics
+pub static WS_MESSAGES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static WS_HEARTBEAT_MISSES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static WS_ACTIVE_CONNECTIONS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Protocol / LP fee (aggregated lamports-equivalent or raw tokens? We aggregate lamports-equivalent for SOL side, plus raw token fee counts)
 pub static PROTOCOL_FEE_TOKENS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static PROTOCOL_FEE_SOL_MICRO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -190,6 +194,9 @@ async fn metrics_response() -> Response<Body> {
     line!("network_fees_lamports_total", NETWORK_FEES_LAMPORTS_TOTAL.load(Ordering::Relaxed));
     line!("ws_reconnects_total", WS_RECONNECTS_TOTAL.load(Ordering::Relaxed));
     line!("rpc_retry_attempts_total", RPC_RETRY_ATTEMPTS_TOTAL.load(Ordering::Relaxed));
+    line!("ws_messages_total", WS_MESSAGES_TOTAL.load(Ordering::Relaxed));
+    line!("ws_heartbeat_misses_total", WS_HEARTBEAT_MISSES_TOTAL.load(Ordering::Relaxed));
+    line!("ws_active_connections", WS_ACTIVE_CONNECTIONS.load(Ordering::Relaxed));
     line!("protocol_fee_tokens_total", PROTOCOL_FEE_TOKENS_TOTAL.load(Ordering::Relaxed));
     line!("protocol_fee_sol_total", PROTOCOL_FEE_SOL_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0);
     line!("pending_reconciliations_total", PENDING_RECONCILIATIONS_TOTAL.load(Ordering::Relaxed));
