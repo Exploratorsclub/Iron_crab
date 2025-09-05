@@ -58,6 +58,9 @@ pub static PROTOCOL_FEE_TOKENS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::
 pub static PROTOCOL_FEE_SOL_MICRO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static PENDING_RECONCILIATIONS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static PENDING_FAILED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Partial exit metrics
+pub static PARTIAL_EXIT_EVENTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static PARTIAL_EXIT_FRACTION_MICRO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Realized trade return histogram (ratio realized_pnl / invested) buckets (cumulative style capture)
 // Buckets chosen to capture deep losses to outsized wins.
 const TRADE_RETURN_BUCKETS: &[f64] = &[
@@ -201,6 +204,8 @@ async fn metrics_response() -> Response<Body> {
     line!("protocol_fee_sol_total", PROTOCOL_FEE_SOL_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0);
     line!("pending_reconciliations_total", PENDING_RECONCILIATIONS_TOTAL.load(Ordering::Relaxed));
     line!("pending_failed_total", PENDING_FAILED_TOTAL.load(Ordering::Relaxed));
+    line!("partial_exit_events_total", PARTIAL_EXIT_EVENTS_TOTAL.load(Ordering::Relaxed));
+    line!("partial_exit_fraction_sum", PARTIAL_EXIT_FRACTION_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0);
     // Trade return histogram (realized PnL / invested)
     let tr_count = TRADE_RETURN_COUNT.load(Ordering::Relaxed);
     let tr_sum_micro = TRADE_RETURN_SUM_MICRO.load(Ordering::Relaxed);

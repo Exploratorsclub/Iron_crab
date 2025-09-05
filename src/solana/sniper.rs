@@ -46,6 +46,7 @@ use crate::metrics::{
     WS_HEARTBEAT_MISSES_TOTAL,
     WS_ACTIVE_CONNECTIONS,
 };
+use crate::metrics; // for qualified partial exit metrics usage
 use serde::{Serialize, Deserialize};
 use serde_json::json;
 
@@ -77,6 +78,9 @@ pub struct SniperCfg {
     pub rolling_pnl_window: Option<usize>,
     pub hot_reload_secs: Option<u64>,
     pub pending_trade_ttl_secs: Option<u64>,
+    pub take_profit_tiers: Option<Vec<crate::config::TakeProfitTier>>,
+    pub trailing_stop_bps: Option<u32>,
+    pub min_exit_notional_sol: Option<f64>,
 }
 
 impl Default for SniperCfg {
@@ -104,6 +108,41 @@ impl Default for SniperCfg {
             rolling_pnl_window: Some(50),
             hot_reload_secs: Some(30),
             pending_trade_ttl_secs: Some(120),
+            take_profit_tiers: None,
+            trailing_stop_bps: None,
+            min_exit_notional_sol: None,
+        }
+    }
+}
+
+impl From<&crate::config::SniperSettings> for SniperCfg {
+    fn from(c: &crate::config::SniperSettings) -> Self {
+        Self {
+            max_buy_sol: c.max_buy_sol,
+            max_slippage_bps: c.max_slippage_bps,
+            blacklist_mints: c.blacklist_mints.clone(),
+            blacklist_owners: c.blacklist_owners.clone(),
+            min_pool_liquidity_sol: c.min_pool_liquidity_sol,
+            require_freeze_auth_none: c.require_freeze_auth_none,
+            require_mint_decimals_range: c.require_mint_decimals_range,
+            lp_top1_max_pct: c.lp_top1_max_pct,
+            lp_top3_max_pct: c.lp_top3_max_pct,
+            lp_top5_max_pct: c.lp_top5_max_pct,
+            max_position_sol: c.max_position_sol,
+            stop_loss_bps: c.stop_loss_bps,
+            take_profit_bps: c.take_profit_bps,
+            daily_loss_limit_sol: c.daily_loss_limit_sol,
+            max_open_positions: c.max_open_positions,
+            per_mint_position_limit: c.per_mint_position_limit,
+            stop_loss_cooldown_secs: c.stop_loss_cooldown_secs,
+            drawdown_scale_start: c.drawdown_scale_start,
+            drawdown_max_reduction: c.drawdown_max_reduction,
+            rolling_pnl_window: c.rolling_pnl_window,
+            hot_reload_secs: c.hot_reload_secs,
+            pending_trade_ttl_secs: c.pending_trade_ttl_secs,
+            take_profit_tiers: c.take_profit_tiers.clone(),
+            trailing_stop_bps: c.trailing_stop_bps,
+            min_exit_notional_sol: c.min_exit_notional_sol,
         }
     }
 }
@@ -116,6 +155,8 @@ struct PositionLot {
     token_decimals: u8,
     last_unrealized_pnl_sol: f64,
     opened_ts: i64,
+    #[serde(default)] executed_tp_bps: Vec<u32>, // welche TP Stufen bereits ausgeführt wurden
+    #[serde(default)] peak_pnl_bps: i64,         // Hochwasser-Marke für Trailing Stop
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -800,7 +841,7 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
         if let Some(limit) = self.cfg.read().per_mint_position_limit {
             if let Some(v) = rs.open.get(&mint) { if v.len() as u32 >= limit { return; } }
         }
-        let lot = PositionLot { entry_price_sol: 0.0, amount_tokens: 0.0, invested_sol, token_decimals: 0, last_unrealized_pnl_sol: 0.0, opened_ts: chrono::Utc::now().timestamp() };
+    let lot = PositionLot { entry_price_sol: 0.0, amount_tokens: 0.0, invested_sol, token_decimals: 0, last_unrealized_pnl_sol: 0.0, opened_ts: chrono::Utc::now().timestamp(), executed_tp_bps: Vec::new(), peak_pnl_bps: 0 };
     rs.open.entry(mint).or_insert_with(Vec::new).push(lot);
     let lots: usize = rs.open.values().map(|v| v.len()).sum();
     OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
@@ -878,8 +919,14 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
 
     async fn evaluate_positions(&self) -> Result<()> {
         // Skip if no thresholds configured
-    { let r = self.cfg.read(); if r.stop_loss_bps.is_none() && r.take_profit_bps.is_none() { return Ok(()); } }
-    let (stop_bps, tp_bps) = { let r = self.cfg.read(); (r.stop_loss_bps.unwrap_or(u32::MAX), r.take_profit_bps.unwrap_or(u32::MAX)) };
+    { let r = self.cfg.read(); if r.stop_loss_bps.is_none() && r.take_profit_bps.is_none() && r.take_profit_tiers.is_none() { return Ok(()); } }
+    let (stop_bps, tp_bps, tiers, trailing, min_exit_notional) = { let r = self.cfg.read(); (
+        r.stop_loss_bps.unwrap_or(u32::MAX),
+        r.take_profit_bps.unwrap_or(u32::MAX),
+        r.take_profit_tiers.clone(),
+        r.trailing_stop_bps,
+        r.min_exit_notional_sol.unwrap_or(0.0),
+    ) };
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
     // Flatten lots for evaluation
     let positions: Vec<(Pubkey, PositionLot, usize)> = {
@@ -909,15 +956,43 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
                 if let Some(v) = rs.open.get_mut(&mint) { if let Some(l) = v.get_mut(lot_idx) { l.last_unrealized_pnl_sol = (out_lamports as f64 / 1e9) - l.invested_sol; } }
             }
             let stop_trigger = pnl_bps <= -(stop_bps as i64);
-            let tp_trigger = pnl_bps >= tp_bps as i64;
-            if stop_trigger || tp_trigger {
-                debug!(mint=%mint, pnl_bps, stop_trigger, tp_trigger, "exit trigger");
-                // stop trigger stored in stop_trigger; variable removed to avoid unused warning
-                let fraction = if stop_trigger { 1.0 } else { 0.5 }; // TP: sell half, SL: full
+            let mut fraction: f64 = 0.0;
+            let mut full_exit = false;
+            // Load live state for executed tiers / peak watermark
+            {
+                let mut rs = self.risk.write();
+                if let Some(v) = rs.open.get_mut(&mint) { if let Some(l) = v.get_mut(lot_idx) {
+                    // Update peak
+                    if pnl_bps > l.peak_pnl_bps { l.peak_pnl_bps = pnl_bps; }
+                    // Trailing stop check (only after any TP tier executed or basic TP reached)
+                    let trailing_hit = if let Some(trail) = trailing { if l.peak_pnl_bps > 0 { pnl_bps <= l.peak_pnl_bps - trail as i64 } else { false } } else { false };
+                    if stop_trigger || trailing_hit { fraction = 1.0; full_exit = true; }
+                    else {
+                        // Tiered logic
+                        if let Some(ref ts) = tiers {
+                            // Determine highest tier reached not yet executed
+                            let mut selected: Option<&crate::config::TakeProfitTier> = None;
+                            for tier in ts.iter().filter(|t: &&crate::config::TakeProfitTier| pnl_bps >= t.bps as i64) {
+                                if !l.executed_tp_bps.contains(&tier.bps) { selected = Some(tier); }
+                            }
+                            if let Some(sel) = selected { fraction = sel.fraction.max(0.0).min(1.0); l.executed_tp_bps.push(sel.bps); }
+                        } else if pnl_bps >= tp_bps as i64 { fraction = 0.5; }
+                    }
+                } }
+            }
+            if fraction > 0.0 {
+                // Enforce min exit notional if configured
+                let notional_now_sol = (out_lamports as f64) / 1e9;
+                if notional_now_sol < min_exit_notional { continue; }
                 let sell_tokens = (pos.amount_tokens * fraction).floor() as u64;
                 if sell_tokens > 0 {
                     if let Err(e) = self.attempt_exit(&mint, lot_idx, sell_tokens, fraction).await { warn!(?e, mint=%mint, "exit tx failed"); }
-                    else if stop_trigger { self.mark_cooldown(mint); }
+                    else {
+                        if full_exit || stop_trigger { self.mark_cooldown(mint); }
+                        // metrics
+                        metrics::PARTIAL_EXIT_EVENTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics::PARTIAL_EXIT_FRACTION_MICRO_TOTAL.fetch_add((fraction * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -1183,7 +1258,7 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
                                     let decs = ent.get("token_decimals").and_then(|f| f.as_u64()).unwrap_or(0) as u8;
                                     let last_unr = ent.get("last_unrealized_pnl_sol").and_then(|f| f.as_f64()).unwrap_or(0.0);
                                     let opened_ts = ent.get("opened_ts").and_then(|f| f.as_i64()).unwrap_or(0);
-                                    rs.open.entry(pk).or_insert_with(Vec::new).push(PositionLot { entry_price_sol: entry_price, amount_tokens, invested_sol: invested, token_decimals: decs, last_unrealized_pnl_sol: last_unr, opened_ts });
+                                    rs.open.entry(pk).or_insert_with(Vec::new).push(PositionLot { entry_price_sol: entry_price, amount_tokens, invested_sol: invested, token_decimals: decs, last_unrealized_pnl_sol: last_unr, opened_ts, executed_tp_bps: Vec::new(), peak_pnl_bps: 0 });
                                 }
                             }
                         }
@@ -1386,33 +1461,5 @@ pub async fn run_sniper(rpc: Arc<SolanaRpc>, cfg: SniperCfg, raydium: Option<Arc
     engine.run().await
 }
 
-impl From<&SniperSettings> for SniperCfg {
-    fn from(s: &SniperSettings) -> Self {
-        Self {
-            max_buy_sol: s.max_buy_sol,
-            max_slippage_bps: s.max_slippage_bps,
-            blacklist_mints: s.blacklist_mints.clone(),
-            blacklist_owners: s.blacklist_owners.clone(),
-            min_pool_liquidity_sol: s.min_pool_liquidity_sol,
-            require_freeze_auth_none: s.require_freeze_auth_none,
-            require_mint_decimals_range: s.require_mint_decimals_range,
-            lp_top1_max_pct: s.lp_top1_max_pct,
-            lp_top3_max_pct: s.lp_top3_max_pct,
-            lp_top5_max_pct: s.lp_top5_max_pct,
-            max_position_sol: s.max_position_sol,
-            stop_loss_bps: s.stop_loss_bps,
-            take_profit_bps: s.take_profit_bps,
-            daily_loss_limit_sol: s.daily_loss_limit_sol,
-            max_open_positions: s.max_open_positions,
-            per_mint_position_limit: s.per_mint_position_limit,
-            stop_loss_cooldown_secs: s.stop_loss_cooldown_secs,
-            drawdown_scale_start: s.drawdown_scale_start,
-            drawdown_max_reduction: s.drawdown_max_reduction,
-            rolling_pnl_window: s.rolling_pnl_window,
-            hot_reload_secs: s.hot_reload_secs,
-            pending_trade_ttl_secs: s.pending_trade_ttl_secs,
-        }
-    }
-}
 // final file closing brace for module (no additional opens)
 // EOF

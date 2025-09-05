@@ -95,6 +95,16 @@ pub struct SniperSettings {
     #[serde(default)] pub rolling_pnl_window: Option<usize>,       // Fenster für Sharpe Approx
     #[serde(default)] pub hot_reload_secs: Option<u64>,            // Interval für Config Reload
     #[serde(default)] pub pending_trade_ttl_secs: Option<u64>,     // TTL für PendingTrade Einträge (Cleanup wenn kein Fill)
+    // --- Partielle Exits Konfiguration ---
+    #[serde(default)] pub take_profit_tiers: Option<Vec<TakeProfitTier>>, // Gestaffelte TP Ebenen; aufsteigend nach bps
+    #[serde(default)] pub trailing_stop_bps: Option<u32>,          // Optionaler Trailing Stop (Abstand in bps vom Hoch nach Erreichen erster TP Ebene)
+    #[serde(default)] pub min_exit_notional_sol: Option<f64>,      // Mindest-Notional für einen Exit (Dust-Vermeidung)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TakeProfitTier {
+    pub bps: u32,        // Gewinnschwelle (>= bps löst diese Stufe aus)
+    pub fraction: f64,   // Anteil der ursprünglichen Lot-Größe, der an dieser Stufe verkauft wird (nicht kumulativ)
 }
 
 impl Config {
