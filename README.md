@@ -169,6 +169,7 @@ timestamp_utc,side,mint,dex,signature,lamports_in,lamports_out,tokens_in,tokens_
 
 ## Data & Pricing
 
-- SOL/USD Override: Setze `sniper.oracle_sol_usd_override`, um USDC/USDT‑Reserven in SOL zu konvertieren (Liquidity‑Schätzung), bis echte Oracles (Pyth/Switchboard) integriert sind.
+- SOL/USD Preisquellen: `oracle_preference` steuert Reihenfolge ("pyth" | "switchboard" | "override"). Setze `oracle_pyth_sol_usd` (Pyth Price Account) bzw. `oracle_switchboard_sol_usd` (Aggregator). Fallback: `oracle_sol_usd_override`.
+- SOL/USD Override: `sniper.oracle_sol_usd_override` konvertiert USDC/USDT‑Reserven in SOL für Liquidity‑Schätzungen, wenn Oracles fehlen.
 - Adaptive Slippage: Rolling Mean der beobachteten BUY‑Shortfalls (tatsächlich erhaltene Tokens vs. expected) steuert die effektive Slippage‑Bps. Ziel‑Slippage `adaptive_slippage_target_pct`, Schrittweite `adaptive_slippage_step_bps`, Grenzen `adaptive_slippage_min_bps`/`max_bps`. Zustand wird im Risk‑Snapshot persistiert.
 

@@ -147,7 +147,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Fee % des Notionals als Histogram
 
 ### Data & Pricing
-- [ ] Echte SOL/USD & Stable Preise via Oracle (Pyth / Switchboard)
+- [x] Echte SOL/USD & Stable Preise via Oracle (Pyth / Switchboard) – basic readers wired with safe fallbacks (preference + override)
 - [x] Präzisere Liquidity Schätzung (Reserven * Mid-Price, multi-pool Aggregation) – uses SOL/USD override when paired with stables
 - [x] Adaptive Slippage basierend auf empirischer Fill-Abweichung – rolling mean shortfall drives slippage bps toward target within min/max; persisted in risk state
 

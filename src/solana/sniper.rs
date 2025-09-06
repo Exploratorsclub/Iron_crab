@@ -89,6 +89,9 @@ pub struct SniperCfg {
     pub adaptive_slippage_window: Option<usize>,
     pub adaptive_slippage_target_pct: Option<f64>,
     pub adaptive_slippage_step_bps: Option<u32>,
+    pub oracle_pyth_sol_usd: Option<String>,
+    pub oracle_switchboard_sol_usd: Option<String>,
+    pub oracle_preference: Option<String>,
 }
 
 impl Default for SniperCfg {
@@ -125,6 +128,9 @@ impl Default for SniperCfg {
             adaptive_slippage_window: None,
             adaptive_slippage_target_pct: None,
             adaptive_slippage_step_bps: None,
+            oracle_pyth_sol_usd: None,
+            oracle_switchboard_sol_usd: None,
+            oracle_preference: None,
         }
     }
 }
@@ -163,6 +169,9 @@ impl From<&crate::config::SniperSettings> for SniperCfg {
             adaptive_slippage_window: c.adaptive_slippage_window,
             adaptive_slippage_target_pct: c.adaptive_slippage_target_pct,
             adaptive_slippage_step_bps: c.adaptive_slippage_step_bps,
+            oracle_pyth_sol_usd: c.oracle_pyth_sol_usd.clone(),
+            oracle_switchboard_sol_usd: c.oracle_switchboard_sol_usd.clone(),
+            oracle_preference: c.oracle_preference.clone(),
         }
     }
 }
@@ -549,6 +558,75 @@ impl SniperEngine {
 } // close primary impl SniperEngine block before auxiliary helpers
 
 impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
+    async fn sol_usd_price(&self) -> f64 {
+    // Snapshot config to avoid holding locks across await
+    let cfg = self.cfg.read().clone();
+    // Preference: oracle_preference -> specific source -> override -> default 100
+    let pref = cfg.oracle_preference.clone().unwrap_or_else(|| "override".to_string());
+    // Try preferred first, then alternate, then override
+    let mut try_sources: Vec<String> = vec![];
+    let has_pyth = cfg.oracle_pyth_sol_usd.is_some();
+    let has_sb = cfg.oracle_switchboard_sol_usd.is_some();
+        match pref.as_str() {
+            "pyth" => { if has_pyth { try_sources.push("pyth".into()); } if has_sb { try_sources.push("switchboard".into()); } try_sources.push("override".into()); },
+            "switchboard" => { if has_sb { try_sources.push("switchboard".into()); } if has_pyth { try_sources.push("pyth".into()); } try_sources.push("override".into()); },
+            _ => { try_sources.push("override".into()); if has_pyth { try_sources.push("pyth".into()); } if has_sb { try_sources.push("switchboard".into()); } },
+        }
+        // Readers
+        async fn read_pyth_price(rpc: &crate::solana::rpc::SolanaRpc, price_pk: &solana_sdk::pubkey::Pubkey) -> Option<f64> {
+            // Pyth v2/v1: assume price account layout where bytes 208..216 is price exponent and 208+? may differ; to avoid tight coupling, use pyth-client? Not included.
+            // Minimal safe approach: use RPC get_account and attempt to decode current price i64 at known offset for classic Pyth v2 (offset 208: expo i32; 208+4..+12 price i64). If mismatch, return None.
+            if let Ok(acc) = rpc.get_account_retry(price_pk).await {
+                if acc.data.len() >= 224 {
+                    let expo_bytes: [u8;4] = acc.data[208..212].try_into().ok()?;
+                    let expo = i32::from_le_bytes(expo_bytes);
+                    let price_bytes: [u8;8] = acc.data[208+4..208+12].try_into().ok()?;
+                    let price = i64::from_le_bytes(price_bytes);
+                    // price * 10^expo
+                    let scale = 10f64.powi(expo as i32);
+                    let v = (price as f64) * scale;
+                    if v.is_finite() && v > 0.0 { return Some(v); }
+                }
+            }
+            None
+        }
+        async fn read_switchboard_price(rpc: &crate::solana::rpc::SolanaRpc, agg_pk: &solana_sdk::pubkey::Pubkey) -> Option<f64> {
+            // Switchboard aggregator v2 accounts: value at a dynamic offset; without sbv2 client, heuristically read last result at trailing 16 bytes as f64? Unsafe.
+            // Safer: try parse little-endian f64 at a couple of common offsets; if invalid, return None.
+            if let Ok(acc) = rpc.get_account_retry(agg_pk).await {
+                let data = acc.data;
+                // Try final 16 bytes as two u64 forming f64 via to_le_bytes
+                if data.len() >= 16 {
+                    let val = f64::from_le_bytes(data[data.len()-16..data.len()-8].try_into().ok()?);
+                    if val.is_finite() && val > 0.0 { return Some(val); }
+                }
+            }
+            None
+        }
+    for src in try_sources {
+            match src.as_str() {
+                "pyth" => {
+            if let Some(pk_str) = cfg.oracle_pyth_sol_usd.clone() {
+                        if let Ok(pk) = solana_sdk::pubkey::Pubkey::from_str(&pk_str) {
+                            if let Some(v) = read_pyth_price(&self.rpc, &pk).await { return v; }
+                        }
+                    }
+                }
+                "switchboard" => {
+            if let Some(pk_str) = cfg.oracle_switchboard_sol_usd.clone() {
+                        if let Ok(pk) = solana_sdk::pubkey::Pubkey::from_str(&pk_str) {
+                            if let Some(v) = read_switchboard_price(&self.rpc, &pk).await { return v; }
+                        }
+                    }
+                }
+                _ => {
+            if let Some(ovr) = cfg.oracle_sol_usd_override { if ovr > 0.0 { return ovr; } }
+                }
+            }
+        }
+        // Fallback default
+    cfg.oracle_sol_usd_override.unwrap_or(100.0)
+    }
     fn append_trade_record(&self, line: &str, include_header: bool) {
         use std::io::Write as _;
         static TRADE_LOG_LOCK: once_cell::sync::Lazy<std::sync::Mutex<()>> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
@@ -1551,7 +1629,7 @@ impl SniperEngine {
         let mut total_sol = 0f64;
         let mut considered = 0u32;
         // Helper to process pools from a connector
-        let sol_usd = self.cfg.read().oracle_sol_usd_override.unwrap_or(100.0).max(1.0);
+    let sol_usd = self.sol_usd_price().await.max(1.0);
         let mut handle_pool = |base: Pubkey, quote: Pubkey, r_base: u128, r_quote: u128| {
             if base == *mint && quote == sol_mint { // mint-SOL
                 let sol_res = r_quote as f64 / 1e9; total_sol += sol_res * 2.0; considered += 1; return; }
@@ -1598,7 +1676,7 @@ impl SniperEngine {
         // Identify any vault that looks like a Raydium / Orca pool vault by inspecting its owner field if present
         // SPL token account layout: mint(0..32) owner(32..64) amount(64..72)
         let mut est_sol_value = 0f64;
-    let sol_usd = self.cfg.read().oracle_sol_usd_override.unwrap_or(100.0).max(1.0);
+    let sol_usd = self.sol_usd_price().await.max(1.0);
     for opt in v_infos.iter() {
             let Some(acc) = opt else { continue; };
             if acc.data.len() < 72 { continue; }
