@@ -99,6 +99,13 @@ pub struct SniperSettings {
     #[serde(default)] pub take_profit_tiers: Option<Vec<TakeProfitTier>>, // Gestaffelte TP Ebenen; aufsteigend nach bps
     #[serde(default)] pub trailing_stop_bps: Option<u32>,          // Optionaler Trailing Stop (Abstand in bps vom Hoch nach Erreichen erster TP Ebene)
     #[serde(default)] pub min_exit_notional_sol: Option<f64>,      // Mindest-Notional für einen Exit (Dust-Vermeidung)
+    // --- Data & Pricing / Adaptive Slippage ---
+    #[serde(default)] pub oracle_sol_usd_override: Option<f64>,     // Optionaler statischer SOL/USD Preis (Oracle Placeholder)
+    #[serde(default)] pub adaptive_slippage_min_bps: Option<u32>,   // Untere Grenze dynamischer Slippage
+    #[serde(default)] pub adaptive_slippage_max_bps: Option<u32>,   // Obere Grenze dynamischer Slippage
+    #[serde(default)] pub adaptive_slippage_window: Option<usize>,  // Fenstergröße für gemittelten Fill-Slippage Anteil
+    #[serde(default)] pub adaptive_slippage_target_pct: Option<f64>,// Ziel-Slippage in Anteil (z.B. 0.002 = 0.2%)
+    #[serde(default)] pub adaptive_slippage_step_bps: Option<u32>,  // Anpassungsschritt in bps je Fill (z.B. 5)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

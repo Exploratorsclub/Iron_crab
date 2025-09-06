@@ -167,3 +167,8 @@ timestamp_utc,side,mint,dex,signature,lamports_in,lamports_out,tokens_in,tokens_
 2025-09-04T12:03:10Z,FILL,So111...,RAYDIUM,5abc..,100000000,0,0,1229000,1234500,,5500,,5000,,shortfall_ui=0.00055;shortfall_sol=0.00001
 ```
 
+## Data & Pricing
+
+- SOL/USD Override: Setze `sniper.oracle_sol_usd_override`, um USDC/USDT‑Reserven in SOL zu konvertieren (Liquidity‑Schätzung), bis echte Oracles (Pyth/Switchboard) integriert sind.
+- Adaptive Slippage: Rolling Mean der beobachteten BUY‑Shortfalls (tatsächlich erhaltene Tokens vs. expected) steuert die effektive Slippage‑Bps. Ziel‑Slippage `adaptive_slippage_target_pct`, Schrittweite `adaptive_slippage_step_bps`, Grenzen `adaptive_slippage_min_bps`/`max_bps`. Zustand wird im Risk‑Snapshot persistiert.
+

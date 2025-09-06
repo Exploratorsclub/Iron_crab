@@ -82,6 +82,13 @@ pub struct SniperCfg {
     pub take_profit_tiers: Option<Vec<crate::config::TakeProfitTier>>,
     pub trailing_stop_bps: Option<u32>,
     pub min_exit_notional_sol: Option<f64>,
+    // Data & Pricing / Adaptive Slippage
+    pub oracle_sol_usd_override: Option<f64>,
+    pub adaptive_slippage_min_bps: Option<u32>,
+    pub adaptive_slippage_max_bps: Option<u32>,
+    pub adaptive_slippage_window: Option<usize>,
+    pub adaptive_slippage_target_pct: Option<f64>,
+    pub adaptive_slippage_step_bps: Option<u32>,
 }
 
 impl Default for SniperCfg {
@@ -112,6 +119,12 @@ impl Default for SniperCfg {
             take_profit_tiers: None,
             trailing_stop_bps: None,
             min_exit_notional_sol: None,
+            oracle_sol_usd_override: None,
+            adaptive_slippage_min_bps: None,
+            adaptive_slippage_max_bps: None,
+            adaptive_slippage_window: None,
+            adaptive_slippage_target_pct: None,
+            adaptive_slippage_step_bps: None,
         }
     }
 }
@@ -144,6 +157,12 @@ impl From<&crate::config::SniperSettings> for SniperCfg {
             take_profit_tiers: c.take_profit_tiers.clone(),
             trailing_stop_bps: c.trailing_stop_bps,
             min_exit_notional_sol: c.min_exit_notional_sol,
+            oracle_sol_usd_override: c.oracle_sol_usd_override,
+            adaptive_slippage_min_bps: c.adaptive_slippage_min_bps,
+            adaptive_slippage_max_bps: c.adaptive_slippage_max_bps,
+            adaptive_slippage_window: c.adaptive_slippage_window,
+            adaptive_slippage_target_pct: c.adaptive_slippage_target_pct,
+            adaptive_slippage_step_bps: c.adaptive_slippage_step_bps,
         }
     }
 }
@@ -186,12 +205,12 @@ struct RiskState {
     cooldown_until: std::collections::HashMap<Pubkey, i64>,
     recent_realized: Vec<f64>,
     last_sharpe: f64,
+    #[serde(default)] recent_slippage: Vec<f64>,
+    #[serde(default)] adaptive_slippage_bps: Option<u32>,
 }
 
 impl Default for RiskState {
-    fn default() -> Self {
-        Self { open: Default::default(), realized_pnl_sol: 0.0, realized_loss_today_sol: 0.0, current_day: 0, pending: Default::default(), cooldown_until: Default::default(), recent_realized: Vec::new(), last_sharpe: 0.0 }
-    }
+    fn default() -> Self { Self { open: Default::default(), realized_pnl_sol: 0.0, realized_loss_today_sol: 0.0, current_day: 0, pending: Default::default(), cooldown_until: Default::default(), recent_realized: Vec::new(), last_sharpe: 0.0, recent_slippage: Vec::new(), adaptive_slippage_bps: None } }
 }
 
 pub struct SniperEngine {
@@ -305,6 +324,17 @@ impl SniperEngine {
 }
 
 impl SniperEngine {
+    fn adaptive_slippage_bps(&self) -> u32 {
+        let r = self.cfg.read();
+        let base = r.max_slippage_bps;
+        let min_b = r.adaptive_slippage_min_bps.unwrap_or(base);
+        let max_b = r.adaptive_slippage_max_bps.unwrap_or(base);
+        let cur = {
+            let rs = self.risk.read();
+            rs.adaptive_slippage_bps.unwrap_or(base)
+        };
+        cur.clamp(min_b, max_b)
+    }
     async fn rpc_retry_tx(&self, tx: &Transaction, max_attempts: u32) -> Result<solana_sdk::signature::Signature> {
         let mut attempt = 0;
         loop {
@@ -554,7 +584,7 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
         // Wrap SOL into WSOL ATA (Raydium expects token account)
     let (wsol_ata_sdk, _wrap_sig) = match self.treasury.wrap_sol(&self.rpc, lamports_in).await { Ok(v)=>v, Err(e)=> { debug!(?e, lamports_in, "wrap_sol failed"); return Ok(()); } };
     // Build auto plan for min_out computation & pool selection (Raydium)
-    let msb = self.cfg.read().max_slippage_bps;
+    let msb = self.adaptive_slippage_bps();
     let plan_opt = if let Some(r) = &ray { r.build_swap_plan_auto(&sol_mint.to_string(), &mint.to_string(), lamports_in, msb)? } else { None };
     if plan_opt.is_none() && orca.is_none() { debug!(mint=%mint, "no raydium or orca route"); return Ok(()); }
     let plan_meta = plan_opt;
@@ -666,7 +696,7 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
         if let Some(o) = &orca {
             let mut min_out_orca = 1u64;
             if let Ok(Some(q)) = o.quote_exact_in(&sol_mint.to_string(), &mint.to_string(), lamports_in).await {
-                let slip = self.cfg.read().max_slippage_bps as u128;
+                let slip = self.adaptive_slippage_bps() as u128;
                 min_out_orca = ((q.amount_out as u128) * (10_000 - slip) / 10_000) as u64;
                 if min_out_orca == 0 { min_out_orca = 1; }
             }
@@ -1000,6 +1030,27 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
                 let shortfall = meta_shortfall_tokens.unwrap_or_else(|| expected_raw.saturating_sub(actual_raw));
                 let shortfall_ui = shortfall as f64 / scale;
                 let shortfall_sol = shortfall_ui * entry_price_existing;
+                // Adaptive slippage controller update (BUY fills only)
+                // Observed slippage fraction relative to expected_out: s = shortfall / max(expected,1)
+                let expected_safe = expected_raw.max(1) as f64;
+                let observed_slip = (shortfall as f64 / expected_safe).max(0.0);
+                {
+                    let mut rs = self.risk.write();
+                    // Maintain rolling window
+                    rs.recent_slippage.push(observed_slip);
+                    let win = self.cfg.read().adaptive_slippage_window.unwrap_or(20);
+                    if rs.recent_slippage.len() > win { let excess = rs.recent_slippage.len() - win; rs.recent_slippage.drain(0..excess); }
+                    // Compute mean and adjust toward target
+                    let mean = if rs.recent_slippage.is_empty() { 0.0 } else { rs.recent_slippage.iter().copied().sum::<f64>() / (rs.recent_slippage.len() as f64) };
+                    let target = self.cfg.read().adaptive_slippage_target_pct.unwrap_or(0.002).clamp(0.0, 0.2); // default 0.2%
+                    let step = self.cfg.read().adaptive_slippage_step_bps.unwrap_or(5).max(1) as i64;
+                    let min_b = self.cfg.read().adaptive_slippage_min_bps.unwrap_or(self.cfg.read().max_slippage_bps) as i64;
+                    let max_b = self.cfg.read().adaptive_slippage_max_bps.unwrap_or(self.cfg.read().max_slippage_bps) as i64;
+                    let mut cur = rs.adaptive_slippage_bps.unwrap_or(self.cfg.read().max_slippage_bps) as i64;
+                    if mean > target { cur = (cur + step).min(max_b); }
+                    else if mean < target { cur = (cur - step).max(min_b); }
+                    rs.adaptive_slippage_bps = Some(cur as u32);
+                }
                 // Record fee percent based on network fee vs notional invested
                 let invested_ui = pend.lamports_in as f64 / 1e9;
                 if invested_ui > 0.0 {
@@ -1142,7 +1193,7 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
         } };
 
         // Dynamic route selection for exit: compare Raydium vs Orca quotes
-        let msb2 = self.cfg.read().max_slippage_bps;
+    let msb2 = self.adaptive_slippage_bps();
         let ray_plan = if let Some(r) = &self.raydium { r.build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), sell_tokens, msb2).ok() } else { None };
         let ray_out: u64 = ray_plan.as_ref().and_then(|p| p.as_ref().map(|pm| pm.expected_out)).unwrap_or(0);
         let mut orca_out: u64 = 0;
@@ -1203,7 +1254,7 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
                 // Compute min_out with slippage
                 let mut min_out = 1u64;
                 if let Ok(Some(q)) = o.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), sell_tokens).await {
-                    let msb3 = self.cfg.read().max_slippage_bps as u128;
+                    let msb3 = self.adaptive_slippage_bps() as u128;
                     min_out = ((q.amount_out as u128) * (10_000 - msb3) / 10_000) as u64;
                     if min_out == 0 { min_out = 1; }
                 }
@@ -1422,6 +1473,8 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
             "current_day": rs.current_day,
             "recent_realized": rs.recent_realized,
             "last_sharpe": rs.last_sharpe,
+            "recent_slippage": rs.recent_slippage,
+            "adaptive_slippage_bps": rs.adaptive_slippage_bps,
             "open_positions": open,
             "cooldowns": cooldown
     })
@@ -1459,6 +1512,9 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
                     if let Some(cd) = val.get("cooldowns").and_then(|v| v.as_array()) {
                         for c in cd { if let (Some(mint_str), Some(until)) = (c.get("mint").and_then(|m| m.as_str()), c.get("until").and_then(|u| u.as_i64())) { if let Ok(pk) = Pubkey::from_str(mint_str) { rs.cooldown_until.insert(pk, until); } } }
                     }
+                    // Adaptive slippage fields
+                    rs.recent_slippage = val.get("recent_slippage").and_then(|v| v.as_array()).map(|arr| arr.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
+                    rs.adaptive_slippage_bps = val.get("adaptive_slippage_bps").and_then(|v| v.as_u64()).map(|v| v as u32);
                     let lots: usize = rs.open.values().map(|v| v.len()).sum();
                     OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
                     DAILY_REALIZED_PNL_SOL_MICRO.store((rs.realized_pnl_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1495,14 +1551,14 @@ impl SniperEngine {
         let mut total_sol = 0f64;
         let mut considered = 0u32;
         // Helper to process pools from a connector
+        let sol_usd = self.cfg.read().oracle_sol_usd_override.unwrap_or(100.0).max(1.0);
         let mut handle_pool = |base: Pubkey, quote: Pubkey, r_base: u128, r_quote: u128| {
             if base == *mint && quote == sol_mint { // mint-SOL
                 let sol_res = r_quote as f64 / 1e9; total_sol += sol_res * 2.0; considered += 1; return; }
             if quote == *mint && base == sol_mint { let sol_res = r_base as f64 / 1e9; total_sol += sol_res * 2.0; considered += 1; return; }
             // Stable pairing (USDC/USDT)
-            let stable_rate = 100.0; // placeholder USD per SOL
-            if base == *mint && (quote == usdc || quote == usdt) { let usd = r_quote as f64 / 1e6; total_sol += (usd / stable_rate) * 2.0; considered += 1; }
-            else if quote == *mint && (base == usdc || base == usdt) { let usd = r_base as f64 / 1e6; total_sol += (usd / stable_rate) * 2.0; considered += 1; }
+            if base == *mint && (quote == usdc || quote == usdt) { let usd = r_quote as f64 / 1e6; total_sol += (usd / sol_usd) * 2.0; considered += 1; }
+            else if quote == *mint && (base == usdc || base == usdt) { let usd = r_base as f64 / 1e6; total_sol += (usd / sol_usd) * 2.0; considered += 1; }
         };
         if let Some(r) = &self.raydium {
             for snap in r.snapshots() { if snap.base_mint == *mint || snap.quote_mint == *mint { handle_pool(snap.base_mint, snap.quote_mint, snap.reserve_base, snap.reserve_quote); } }
@@ -1542,7 +1598,8 @@ impl SniperEngine {
         // Identify any vault that looks like a Raydium / Orca pool vault by inspecting its owner field if present
         // SPL token account layout: mint(0..32) owner(32..64) amount(64..72)
         let mut est_sol_value = 0f64;
-        for opt in v_infos.iter() {
+    let sol_usd = self.cfg.read().oracle_sol_usd_override.unwrap_or(100.0).max(1.0);
+    for opt in v_infos.iter() {
             let Some(acc) = opt else { continue; };
             if acc.data.len() < 72 { continue; }
             let mint_bytes: [u8;32] = acc.data[0..32].try_into().unwrap();
@@ -1555,9 +1612,9 @@ impl SniperEngine {
             // Convert amount to SOL value: if paired with SOL directly and inner_mint == SOL -> treat reserve as SOL.
             if inner_mint == sol_mint { est_sol_value += reserve_u64 as f64 / 1e9; }
             else if inner_mint == usdc || inner_mint == usdt {
-                // Placeholder USD->SOL conversion: assume 1 SOL = 100 USD (later replace with oracle)
+                // Convert USD stable to SOL using override oracle if provided
                 let usd = reserve_u64 as f64 / 1e6; // USDC/USDT decimals 6
-                est_sol_value += usd / 100.0;
+                est_sol_value += usd / sol_usd;
             } else if inner_mint == *mint {
                 // Need other side value to price; skip as we can't compute without reserves pair.
             }
