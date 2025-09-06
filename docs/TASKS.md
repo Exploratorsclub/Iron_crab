@@ -125,7 +125,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Heartbeat Timer + Stale Detection (90s silence -> reconnect, metric `ws_heartbeat_misses_total`)
 	- [x] Message Counting & Active Connections (`ws_messages_total`, `ws_active_connections`)
 	- [ ] Adaptive Backoff w/ server error codes (future)
-	- [ ] Multi-endpoint failover / rotating RPC WS URLs
+	- [x] Multi-endpoint failover / rotating RPC WS URLs
 - [x] Volle Raydium Serum Market Accounts erzwungen (kein Fallback)
 - [x]  (Raydium vs Orca dynamisch)
 - [x] Partielle Exits (gestaffelte SELL Orders / Positionsplits)
@@ -154,7 +154,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 ### Stability & Concurrency
 - [x] Separate Task für Exit Evaluation (konfigurierbares Intervall) – `exit_eval_interval_secs` steuert das Intervall
 - [x] Graceful Shutdown (Flush, Snapshot, Metrics finalisieren via watch channel)
-- [ ] Rate Limit Erkennung + adaptiver Parallelismus
+- [x] Rate Limit Erkennung + adaptiver Parallelismus
 	- [x] Adaptive RPC Concurrency Limiter (spin-wait permits, dynamic allowed window, success-driven increase, rate-limit/timeout-driven decrease)
 	- [x] Error classification (429/Too Many Requests/Throttle -> rate limit, timeouts) with retries + exponential backoff
 	- [x] Metrics: rpc_rate_limit_hits_total, rpc_timeouts_total, rpc_backoff_ms_total, rpc_inflight, rpc_allowed_concurrency, rpc_concurrency_adjustments_total
@@ -163,16 +163,35 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 
 ### Logging & Observability Erweiterungen
 - [x] +Inf Bucket für trade_return Histogram (Prometheus Konvention)
-- [ ] Absolutes Realized PnL Histogram (SOL)
-- [ ] Shortfall Prozent Histogram
+- [x] Absolutes Realized PnL Histogram (SOL)
+ - [x] Shortfall Prozent Histogram
 - [x] Sharpe & Drawdown Gauges
 - [x] Build / Version Metric
 	- [x] Interne Sharpe Validierung (Fee Impact & Rolling Window Truncation Tests)
 
 ### Backtesting & Strategy
 - [ ] `py_strategy` FFI (pyo3 oder IPC) für externe Signale
+	- [ ] API‑Contract definieren: Inputs (Preis‑Snapshots, Pool‑State, Positions‑State), Outputs (Entry/Exit‑Signale, Size, min_out bps)
+	- [ ] Schnittstelle (Serde Schema): JSON/MessagePack; Versionierung + Kompatibilitätscheck
+	- [ ] pyo3 Modul‑Skeleton (+ Feature‑Flag `py_strategy`); Alternative IPC (lokaler TCP/Named Pipe) mit Request/Response – PARTIAL (Engine `python` Feature + sample bindings exist)
+	- [ ] Strategy‑Lifecycle: `init`, `on_tick`, `on_fill`, `on_exit` (+ Zeitbudget/Timeout je Call)
+	- [ ] Sandbox & Isolation: Panic/Exception Catching, Timeout‑Abbruch, Circuit Breaker bei Fehlerhäufung
+	- [ ] Beispielstrategie (`strategies/sample.py`) + README mit Interface‑Spec
+	- [ ] Tests: Stub‑Strategy (deterministische Signale) + Integrationstest (Signal → Quote → Sim)
 - [ ] Deterministischer Replay-Modus (Slot Iterator)
+	- [ ] Slot‑Iterator (Start..End) mit lokalem Cache für Blöcke/Transaktionen/Logs
+	- [ ] Mock `SolanaRpc` für Replays (get_account/get_program_accounts/logs aus Trace‑Dateien)
+	- [ ] Determinismus: seedbares RNG, feste Timestamps, eingefrorene Wall‑Clock, deterministischer Scheduler
+	- [ ] Recorder‑Tool: Live‑Stream (Blöcke/Logs/Accounts) in Dateien schreiben (kompakt, komprimiert)
+	- [~] CLI/Config: `--replay` Flags (Slot‑Range, Quelle, Speedup), Metriken mit Label `mode="replay"` – PARTIAL (basic flags in `backtest_driver`)
+	- [~] Trace Loader: JSON/JSONL zu TraceEvent → SimEvent Mapping – PARTIAL (Slot & Log unterstützt)
+	- [ ] Golden Tests: Repräsentative Pools/Routen, erwartete Trade‑Sequenzen
 - [ ] Impact / Slippage Modell im Backtest
+	- [~] DEX‑spezifische Modelle: Raydium (CPMM) vs. Orca Whirlpool (konzentrierte Liquidität, Tick‑Kreuzungen) – PARTIAL (CPMM & CLMM Platzhalter + CLI `--impact` Schalter)
+	- [ ] Gebühren & Ticks: LP/Protocol Fees, Tick‑Sprünge, Price‑Impact, Oracle‑Latenz optional
+	- [ ] Shortfall‑Noise: Parametrisierung aus Live‑Fills (Histogramme) für stochastische Ausführung
+	- [ ] Szenario‑Runner: Grid‑Sweeps über `slippage_bps`, Size, Latenz → PnL‑Sensitivität
+	- [ ] Validierung: Vergleich Backtest‑PnL vs. historische Live‑Trades (Fehlerbänder)
 
 ### Security & Key Handling
 - [ ] Gesicherte Keypair Ladepfade / optional KMS
@@ -203,12 +222,12 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [ ] Konfigurierbare Log Rotation & Retention (N Tage)
 
 ### Priorisierte Reihenfolge (Empfehlung)
-1. PendingTrade TTL & State Persistenz
-2. Retry/Backoff + WebSocket Stabilität
-3. Protocol Fee Parsing & Multi-Position Support
-4. Partielle Exits & Best-Route Auswahl
-5. Tests & CI Pipeline
-6. Sharpe/Drawdown Gauges & +Inf Bucket
-7. Oracle Preise & Adaptive Slippage
-8. Backtest FFI & Impact Modell
+1. PendingTrade TTL & State Persistenz — DONE
+2. Retry/Backoff + WebSocket Stabilität — DONE
+3. Protocol Fee Parsing & Multi-Position Support — PARTIAL (DEX-spezifische Fee-Vault Attribution PENDING)
+4. Partielle Exits & Best-Route Auswahl — DONE
+5. Tests & CI Pipeline — PARTIAL
+6. Sharpe/Drawdown Gauges & +Inf Bucket — DONE
+7. Oracle Preise & Adaptive Slippage — DONE
+8. Backtest FFI & Impact Modell — PENDING
 

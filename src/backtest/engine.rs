@@ -1,6 +1,6 @@
 use anyhow::Result;
 use super::types::{SimEvent,Portfolio,StrategyDecision,BacktestStrategy,StrategyAction,SimContext};
-use super::market::MarketAdapter;
+use super::market::{MarketAdapter, ImpactModel};
 
 fn apply_slippage_min_out(quote_out: u64, slippage_bps: u32) -> u64 {
     if slippage_bps == 0 { return quote_out; }
@@ -27,9 +27,11 @@ pub struct BacktestEngine<S: BacktestStrategy, M: MarketAdapter> {
     pub decisions: Vec<StrategyDecision>,
     pub slippage_rejections: Vec<String>,
     pub executions: Vec<SwapExecutionRecord>,
+    pub impact_model: Option<Box<dyn ImpactModel + Send + Sync>>, // optional pluggable model
 }
 impl<S: BacktestStrategy, M: MarketAdapter> BacktestEngine<S,M> {
-    pub fn new(strategy:S, market:M, portfolio:Portfolio, events:Vec<SimEvent>) -> Self { Self { strategy, market, portfolio, events, decisions: vec![], slippage_rejections: vec![], executions: vec![] } }
+    pub fn new(strategy:S, market:M, portfolio:Portfolio, events:Vec<SimEvent>) -> Self { Self { strategy, market, portfolio, events, decisions: vec![], slippage_rejections: vec![], executions: vec![], impact_model: None } }
+    pub fn set_impact_model(&mut self, model: Box<dyn ImpactModel + Send + Sync>) { self.impact_model = Some(model); }
     pub fn run(&mut self) -> Result<()> {
         for ev in &self.events {
             let ctx = SimContext { portfolio: &self.portfolio, time_ms: ev.ts_ms };
@@ -41,7 +43,11 @@ impl<S: BacktestStrategy, M: MarketAdapter> BacktestEngine<S,M> {
                     let mut min_out: Option<u64> = None;
                     if a.max_slippage_bps > 0 {
                         if let Some(q) = self.market.quote(&a.input_mint, &a.output_mint, a.amount_in) {
-                            let m = apply_slippage_min_out(q.amount_out, a.max_slippage_bps);
+                            let base_out = if let Some(ref im) = self.impact_model {
+                                // Use model on reserves for expected out
+                                im.expected_out(q.in_reserve, q.out_reserve, a.amount_in, q.fee_bps)
+                            } else { q.amount_out };
+                            let m = apply_slippage_min_out(base_out, a.max_slippage_bps);
                             min_out = Some(m);
                         }
                     }

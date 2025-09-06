@@ -55,6 +55,15 @@ Backtest & Tools
 - Backtest Engine + Tests (Slippage Enforcement)
 - CLI: `raydium_pools`, `backtest_driver`
 
+### Backtest: Replay & Impact Modelle
+- Replay Loader: JSONL/JSON Trace Dateien werden eingelesen (`backtest::replay::load_trace`). Unterstützt aktuell Slot & Log Events; Account Events folgen.
+- Impact Model: Pluggable Slippage/Impact Modell für Backtests. CLI Schalter `--impact cpmm|clmm|none` auf `backtest_driver`.
+- Beispiel (PowerShell):
+```powershell
+cargo run --bin backtest_driver -- --replay-trace .\traces\sample.jsonl --replay-start 250000000 --replay-end 250000120 --impact cpmm
+```
+Hinweis: Ohne `--replay-trace` generiert der Driver eine minimale Slot-Sequenz. `clmm` ist derzeit ein Platzhalter (CPMM-Fallback).
+
 ## Build & Run (PowerShell)
 ```powershell
 cargo run --release -- --config .\config.example.toml
@@ -152,8 +161,8 @@ Bereits implementiert:
 
 Geplant / Offen:
 - `ironcrab_fee_breakdown_total{type="protocol|network|referral"}` – Feingranulare Fee Typen
-- Histogram für absoluten Realized PnL (SOL)
-- Shortfall Prozent Histogram
+- Absolute Realized PnL Histogram (SOL): `realized_pnl_sol_bucket{le=...}`, plus `realized_pnl_sol_sum` und `realized_pnl_sol_count` – DONE
+- Shortfall Prozent Histogram: `shortfall_percent_bucket{le=...}` – DONE
 - Weitere Route / Quote Performance Metriken
 
 Grafana Dashboard Skeleton: `docs/grafana_dashboard_example.json` (finale Panels & Alerts pending)
