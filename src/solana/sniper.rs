@@ -89,6 +89,7 @@ pub struct SniperCfg {
     pub adaptive_slippage_window: Option<usize>,
     pub adaptive_slippage_target_pct: Option<f64>,
     pub adaptive_slippage_step_bps: Option<u32>,
+    pub exit_eval_interval_secs: Option<u64>,
     pub oracle_pyth_sol_usd: Option<String>,
     pub oracle_switchboard_sol_usd: Option<String>,
     pub oracle_preference: Option<String>,
@@ -128,6 +129,7 @@ impl Default for SniperCfg {
             adaptive_slippage_window: None,
             adaptive_slippage_target_pct: None,
             adaptive_slippage_step_bps: None,
+            exit_eval_interval_secs: None,
             oracle_pyth_sol_usd: None,
             oracle_switchboard_sol_usd: None,
             oracle_preference: None,
@@ -169,6 +171,7 @@ impl From<&crate::config::SniperSettings> for SniperCfg {
             adaptive_slippage_window: c.adaptive_slippage_window,
             adaptive_slippage_target_pct: c.adaptive_slippage_target_pct,
             adaptive_slippage_step_bps: c.adaptive_slippage_step_bps,
+            exit_eval_interval_secs: c.exit_eval_interval_secs,
             oracle_pyth_sol_usd: c.oracle_pyth_sol_usd.clone(),
             oracle_switchboard_sol_usd: c.oracle_switchboard_sol_usd.clone(),
             oracle_preference: c.oracle_preference.clone(),
@@ -892,8 +895,18 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
         self.try_load_risk_state();
         self.subscribe_logs().await?;
         info!("sniper engine running (skeleton)");
-        // Placeholder periodic task: future spot for initial buys & SL/TP mgmt
+        // Main loop heartbeat (lightweight)
         let mut iv = tokio::time::interval(Duration::from_secs(15));
+        // Separate Exit Evaluation Task (configurable interval)
+        let exit_secs = self.cfg.read().exit_eval_interval_secs.unwrap_or(15).max(1);
+        let engine_clone_exit = self.clone_for_spawn();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(exit_secs));
+            loop {
+                tick.tick().await;
+                if let Err(e) = engine_clone_exit.evaluate_positions().await { tracing::debug!(?e, "exit evaluation error"); }
+            }
+        });
         // Autosave task
         let autosave_secs: u64 = std::env::var("IRONCRAB_RISK_AUTOSAVE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
         if autosave_secs > 0 {
@@ -972,8 +985,7 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
             let mb = self.cfg.read().max_buy_sol;
             debug!(max_buy_sol = mb, "sniper heartbeat");
             crate::metrics::record_activity();
-            // Evaluate open positions for SL/TP exits
-            if let Err(e) = self.evaluate_positions().await { debug!(?e, "risk evaluation error"); }
+            // Exit evaluation now handled by separate task
             // Pending trade TTL cleanup
             if let Some(ttl) = self.cfg.read().pending_trade_ttl_secs { if ttl > 0 { self.cleanup_stale_pending(ttl); } }
             // Reconciliation pass (half of TTL age threshold)

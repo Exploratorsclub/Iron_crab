@@ -106,6 +106,8 @@ pub struct SniperSettings {
     #[serde(default)] pub adaptive_slippage_window: Option<usize>,  // Fenstergröße für gemittelten Fill-Slippage Anteil
     #[serde(default)] pub adaptive_slippage_target_pct: Option<f64>,// Ziel-Slippage in Anteil (z.B. 0.002 = 0.2%)
     #[serde(default)] pub adaptive_slippage_step_bps: Option<u32>,  // Anpassungsschritt in bps je Fill (z.B. 5)
+    // Exit Evaluation
+    #[serde(default)] pub exit_eval_interval_secs: Option<u64>,     // Separates Intervall für Exit-Evaluation
     // Oracles
     #[serde(default)] pub oracle_pyth_sol_usd: Option<String>,       // Pyth Price account pubkey for SOL/USD
     #[serde(default)] pub oracle_switchboard_sol_usd: Option<String>, // Switchboard aggregator pubkey for SOL/USD

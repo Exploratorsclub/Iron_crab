@@ -152,7 +152,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Adaptive Slippage basierend auf empirischer Fill-Abweichung – rolling mean shortfall drives slippage bps toward target within min/max; persisted in risk state
 
 ### Stability & Concurrency
-- [ ] Separate Task für Exit Evaluation (konfigurierbares Intervall)
+- [x] Separate Task für Exit Evaluation (konfigurierbares Intervall) – `exit_eval_interval_secs` steuert das Intervall
 - [x] Graceful Shutdown (Flush, Snapshot, Metrics finalisieren via watch channel)
 - [ ] Rate Limit Erkennung + adaptiver Parallelismus
 	- [x] Test-Helpers Feature (`test_helpers`) für deterministische State Mutation / Sharpe Tests

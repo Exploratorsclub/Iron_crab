@@ -83,6 +83,7 @@ Die Sniper‑Konfiguration wurde um optionale Felder für gestaffelte Teilverkä
 - trailing_stop_bps: Optionaler Trailing‑Stop Abstand in bps ab dem bisherigen Höchst‑PnL des Lots.
 - min_exit_notional_sol: Mindest‑Notional in SOL für einen Exit; kleine Restbeträge werden übersprungen.
 - pending_trade_ttl_secs: TTL in Sekunden; Pending Trades werden nach Ablauf bereinigt und per Reconciliation verifiziert.
+- exit_eval_interval_secs: Intervall (Sekunden) für die separate Exit‑Evaluation Task.
 
 Beispiel (TOML):
 ```toml
