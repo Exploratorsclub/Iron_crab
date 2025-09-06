@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Solana RPC & Treasury
-    let rpc = Arc::new(SolanaRpc::new(&cfg.solana.rpc_url));
+    let rpc = Arc::new(SolanaRpc::from_cfg(&cfg.solana));
     let treasury = Treasury::load(&cfg.solana.keypair_path)?;
 
     // Engine

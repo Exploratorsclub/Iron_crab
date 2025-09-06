@@ -155,6 +155,10 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Separate Task für Exit Evaluation (konfigurierbares Intervall) – `exit_eval_interval_secs` steuert das Intervall
 - [x] Graceful Shutdown (Flush, Snapshot, Metrics finalisieren via watch channel)
 - [ ] Rate Limit Erkennung + adaptiver Parallelismus
+	- [x] Adaptive RPC Concurrency Limiter (spin-wait permits, dynamic allowed window, success-driven increase, rate-limit/timeout-driven decrease)
+	- [x] Error classification (429/Too Many Requests/Throttle -> rate limit, timeouts) with retries + exponential backoff
+	- [x] Metrics: rpc_rate_limit_hits_total, rpc_timeouts_total, rpc_backoff_ms_total, rpc_inflight, rpc_allowed_concurrency, rpc_concurrency_adjustments_total
+	- [x] Configurable knobs (rpc_min/max/initial_concurrency, rpc_inc_every_successes, rpc_dec_on_rate_limit, rpc_timeout_ms)
 	- [x] Test-Helpers Feature (`test_helpers`) für deterministische State Mutation / Sharpe Tests
 
 ### Logging & Observability Erweiterungen

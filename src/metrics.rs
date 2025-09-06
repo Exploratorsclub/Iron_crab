@@ -28,6 +28,12 @@ pub static RAYDIUM_POOLS_SKIPPED_INVALID: Lazy<AtomicU64> = Lazy::new(|| AtomicU
 pub static TRADES_EXECUTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TRADES_FAILED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RPC_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static RPC_RATE_LIMIT_HITS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static RPC_TIMEOUTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static RPC_BACKOFF_MS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static RPC_CONCURRENCY_ADJUSTMENTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static RPC_INFLIGHT_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static RPC_ALLOWED_CONCURRENCY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static OPEN_POSITIONS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static DAILY_REALIZED_PNL_SOL_MICRO: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static LIQUIDITY_ESTIMATE_SOL_MICRO: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -214,6 +220,12 @@ async fn metrics_response() -> Response<Body> {
     line!("trades_executed_total", TRADES_EXECUTED_TOTAL.load(Ordering::Relaxed));
     line!("trades_failed_total", TRADES_FAILED_TOTAL.load(Ordering::Relaxed));
     line!("rpc_errors_total", RPC_ERRORS_TOTAL.load(Ordering::Relaxed));
+    line!("rpc_rate_limit_hits_total", RPC_RATE_LIMIT_HITS_TOTAL.load(Ordering::Relaxed));
+    line!("rpc_timeouts_total", RPC_TIMEOUTS_TOTAL.load(Ordering::Relaxed));
+    line!("rpc_backoff_ms_total", RPC_BACKOFF_MS_TOTAL.load(Ordering::Relaxed));
+    line!("rpc_concurrency_adjustments_total", RPC_CONCURRENCY_ADJUSTMENTS_TOTAL.load(Ordering::Relaxed));
+    line!("rpc_inflight", RPC_INFLIGHT_GAUGE.load(Ordering::Relaxed));
+    line!("rpc_allowed_concurrency", RPC_ALLOWED_CONCURRENCY.load(Ordering::Relaxed));
     line!("open_positions", OPEN_POSITIONS_GAUGE.load(Ordering::Relaxed));
     line!("daily_realized_pnl_sol", DAILY_REALIZED_PNL_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
     line!("liquidity_estimate_sol", LIQUIDITY_ESTIMATE_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);

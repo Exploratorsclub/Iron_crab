@@ -13,6 +13,12 @@ pub struct SolanaCfg {
     pub rpc_url: String,
     pub ws_url: String,
     pub keypair_path: String,
+    #[serde(default)] pub rpc_min_concurrency: Option<usize>,
+    #[serde(default)] pub rpc_max_concurrency: Option<usize>,
+    #[serde(default)] pub rpc_initial_concurrency: Option<usize>,
+    #[serde(default)] pub rpc_inc_every_successes: Option<usize>,
+    #[serde(default)] pub rpc_dec_on_rate_limit: Option<usize>,
+    #[serde(default)] pub rpc_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -10,6 +10,13 @@ autosave_state_secs = 30
 rpc_url = "http://127.0.0.1:8899"
 ws_url  = "ws://127.0.0.1:8900"
 keypair_path = "~/.config/solana/id.json"  # Haupt-Wallet (Treasury)
+## Adaptive RPC Parallelismus
+# rpc_min_concurrency = 8
+# rpc_max_concurrency = 64
+# rpc_initial_concurrency = 16
+# rpc_inc_every_successes = 64
+# rpc_dec_on_rate_limit = 4
+# rpc_timeout_ms = 10000
 
 # Interne Wallets / Märkte (logische Buckets für Allokation)
 [[markets]]

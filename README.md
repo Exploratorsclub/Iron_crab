@@ -174,3 +174,19 @@ timestamp_utc,side,mint,dex,signature,lamports_in,lamports_out,tokens_in,tokens_
 - SOL/USD Override: `sniper.oracle_sol_usd_override` konvertiert USDC/USDT‑Reserven in SOL für Liquidity‑Schätzungen, wenn Oracles fehlen.
 - Adaptive Slippage: Rolling Mean der beobachteten BUY‑Shortfalls (tatsächlich erhaltene Tokens vs. expected) steuert die effektive Slippage‑Bps. Ziel‑Slippage `adaptive_slippage_target_pct`, Schrittweite `adaptive_slippage_step_bps`, Grenzen `adaptive_slippage_min_bps`/`max_bps`. Zustand wird im Risk‑Snapshot persistiert.
 
+## RPC Concurrency & Rate Limits
+
+Der RPC‑Client passt die erlaubte Parallelität dynamisch an. Rate‑Limit Treffer (HTTP 429/"Too Many Requests"/Throttle) und Timeouts verringern das Fenster, anhaltend erfolgreiche Requests erhöhen es schrittweise.
+
+Konfiguration (TOML unter `[solana]`):
+- `rpc_min_concurrency` (usize)
+- `rpc_max_concurrency` (usize)
+- `rpc_initial_concurrency` (usize)
+- `rpc_inc_every_successes` (usize)
+- `rpc_dec_on_rate_limit` (usize)
+- `rpc_timeout_ms` (u64)
+
+Metrics:
+- `rpc_rate_limit_hits_total`, `rpc_timeouts_total`, `rpc_backoff_ms_total`
+- `rpc_inflight`, `rpc_allowed_concurrency`, `rpc_concurrency_adjustments_total`
+
