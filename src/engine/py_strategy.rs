@@ -28,7 +28,13 @@ pub mod py {
             let py_obj = Python::with_gil(|py| -> PyResult<PyObject> {
                 let m = PyModule::import(py, &module_path)?;
                 let cls = m.getattr(&class_name)?;
-                let inst = cls.call1((serde_json::to_string(&params)?,))?;
+                // Serialize params; map JSON errors into a Python ValueError
+                let params_str = serde_json::to_string(&params).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "failed to serialize params to JSON: {e}"
+                    ))
+                })?;
+                let inst = cls.call1((params_str,))?;
                 Ok(inst.into())
             })?;
 
