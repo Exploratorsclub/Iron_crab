@@ -4,6 +4,7 @@ pub mod py {
     use anyhow::Result;
     use async_trait::async_trait;
     use pyo3::prelude::*;
+    use parking_lot::Mutex;
     use std::sync::Arc;
 
     use crate::engine::{EngineContext, Strategy};
@@ -15,7 +16,7 @@ pub mod py {
     _module_path: String,
     _class_name: String,
     _params: serde_json::Value,
-        py_obj: PyObject,
+    py_obj: Mutex<PyObject>,
     }
 
     impl PyStrategy {
@@ -39,7 +40,7 @@ pub mod py {
                 Ok(inst.into())
             })?;
 
-            Ok(Self { name, _module_path: module_path, _class_name: class_name, _params: params, py_obj })
+            Ok(Self { name, _module_path: module_path, _class_name: class_name, _params: params, py_obj: Mutex::new(py_obj) })
         }
     }
 
@@ -50,7 +51,7 @@ pub mod py {
         }
 
         async fn on_tick(&self, _ctx: Arc<EngineContext>) -> Result<Vec<TradeIntent>> {
-            let obj = self.py_obj.clone();
+            let obj = self.py_obj.lock().clone();
             let intents = Python::with_gil(|py| -> PyResult<Vec<TradeIntent>> {
                 let out = obj.call_method0(py, "on_tick")?;
                 let s: String = out.extract(py)?;
