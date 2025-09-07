@@ -15,11 +15,11 @@ impl Dex for EdgeDex {
     async fn quote_exact_in(&self, input_mint: &str, output_mint: &str, amount_in: u64) -> Result<Option<Quote>> {
         if input_mint == self.a && output_mint == self.b {
             let out = amount_in.saturating_mul(self.mul_bps) / 10_000;
-            return Ok(Some(Quote { amount_out: out, price_impact_bps: 10, route: vec!["e".into()], fee_bps: 30, in_reserve: 1_000_000_000, out_reserve: 1_000_000_000, input_mint: input_mint.into(), output_mint: output_mint.into() }));
+            return Ok(Some(Quote { amount_out: out, price_impact_bps: 10, route: vec!["e".into()], fee_bps: 30, in_reserve: 1_000_000_000, out_reserve: 1_000_000_000, input_mint: input_mint.into(), output_mint: output_mint.into(), tick_spacing: None }));
         }
         if input_mint == self.b && output_mint == self.a {
             let out = amount_in.saturating_mul(10_000) / self.mul_bps.max(1);
-            return Ok(Some(Quote { amount_out: out, price_impact_bps: 10, route: vec!["e".into()], fee_bps: 30, in_reserve: 1_000_000_000, out_reserve: 1_000_000_000, input_mint: input_mint.into(), output_mint: output_mint.into() }));
+            return Ok(Some(Quote { amount_out: out, price_impact_bps: 10, route: vec!["e".into()], fee_bps: 30, in_reserve: 1_000_000_000, out_reserve: 1_000_000_000, input_mint: input_mint.into(), output_mint: output_mint.into(), tick_spacing: None }));
         }
         Ok(None)
     }

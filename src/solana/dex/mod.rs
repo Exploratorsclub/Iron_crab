@@ -18,6 +18,7 @@ pub struct Quote {
     pub out_reserve: u128,
     pub input_mint: String,
     pub output_mint: String,
+    pub tick_spacing: Option<u16>,
 }
 
 #[async_trait]

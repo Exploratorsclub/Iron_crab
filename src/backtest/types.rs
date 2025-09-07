@@ -8,6 +8,8 @@ pub enum SimEventKind {
     CfmPriceUpdate { pool: String, base_reserve: u128, quote_reserve: u128, fee_bps: u32 },
     NewPool { pool: String, base_mint: String, quote_mint: String, fee_bps: u32 },
     TradeFill { pool: String, input: u64, output: u64 },
+    /// Scenario parameters announcement at run start for strategy consumption
+    ScenarioMeta { name: String, size: u64, slippage_bps: u32, latency_ms: u64 },
     Log(String),
 }
 
@@ -43,10 +45,38 @@ pub enum StrategyAction { Swap(ActionSwap) }
 pub struct StrategyDecision { pub actions: Vec<StrategyAction> }
 
 pub trait BacktestStrategy: Send + Sync {
-    fn on_event(&self, ctx: &SimContext, event: &SimEvent) -> StrategyDecision;
+    /// Optional once-per-run initialization hook.
+    #[allow(unused)]
+    fn init(&self, _ctx: &SimContext) {}
+
+    /// Periodic tick; typically mapped from SlotAdvance events.
+    #[allow(unused)]
+    fn on_tick(&self, _ctx: &SimContext) -> StrategyDecision { StrategyDecision { actions: vec![] } }
+
+    /// Generic event handler (fallback for non-tick events in a replay stream).
+    #[allow(unused)]
+    fn on_event(&self, _ctx: &SimContext, _event: &SimEvent) -> StrategyDecision { StrategyDecision { actions: vec![] } }
+
+    /// Notification that a trade was filled in the simulation.
+    #[allow(unused)]
+    fn on_fill(&self, _ctx: &SimContext, _fill: &FillInfo) {}
+
+    /// Finalization at the end of the run.
+    #[allow(unused)]
+    fn on_exit(&self, _ctx: &SimContext) {}
 }
 
 pub struct SimContext<'a> {
     pub portfolio: &'a Portfolio,
     pub time_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FillInfo {
+    pub ts_ms: u64,
+    pub pool: String,
+    pub input_mint: String,
+    pub output_mint: String,
+    pub amount_in: u64,
+    pub amount_out: u64,
 }

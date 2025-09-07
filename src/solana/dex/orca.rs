@@ -40,6 +40,7 @@ pub struct OrcaPoolSnapshot {
     pub quote_mint: Pubkey,
     pub reserve_base: u128,
     pub reserve_quote: u128,
+    pub tick_spacing: Option<u16>,
 }
 
 pub struct Orca {
@@ -78,7 +79,67 @@ impl Orca {
 
     /// Return a lightweight snapshot of current pools (for read-only aggregation like liquidity indexing).
     pub fn pools_snapshot(&self) -> Vec<OrcaPoolSnapshot> {
-        self.pools.iter().map(|p| OrcaPoolSnapshot { address: *p.key(), base_mint: p.base_mint, quote_mint: p.quote_mint, reserve_base: p.reserve_base, reserve_quote: p.reserve_quote }).collect()
+        self.pools.iter().map(|p| OrcaPoolSnapshot { address: *p.key(), base_mint: p.base_mint, quote_mint: p.quote_mint, reserve_base: p.reserve_base, reserve_quote: p.reserve_quote, tick_spacing: p.tick_spacing }).collect()
+    }
+
+    /// Replay: refresh Orca (Whirlpool) pools from a ReplayRpc store.
+    /// Scans latest accounts, decodes Whirlpool states, optionally reads vault balances if present,
+    /// and populates in-memory snapshots similar to live refresh.
+    pub fn refresh_pools_replay(&self, replay: &crate::backtest::replay_rpc::ReplayRpc) -> anyhow::Result<()> {
+        // Clear current index but keep pools map; we'll upsert
+        self.mint_index.clear();
+        let all = replay.all_latest();
+        let mut fee_tier_keys: Vec<Pubkey> = Vec::new();
+        let mut added = 0u32;
+        for (addr_str, bytes) in all.into_iter() {
+            // Fast size gate to reduce decode attempts
+            if bytes.len() < WHIRLPOOL_ACCOUNT_MIN_SIZE || bytes.len() > WHIRLPOOL_ACCOUNT_MAX_SIZE { continue; }
+            if let Some(parsed) = layout::parse_whirlpool_strict(&bytes) {
+                let address = Pubkey::from_str(&addr_str).unwrap_or_else(|_| Pubkey::new_unique());
+                // Try to fetch vault balances from replay if vault accounts are present in trace
+                let mut reserves = (0u128, 0u128);
+                let vaults = replay.get_multiple_accounts(&[parsed.token_vault_a, parsed.token_vault_b]);
+                if let Some(Some(v1)) = vaults.get(0) { if v1.data.len() >= 72 { reserves.0 = Self::parse_token_amount(&v1.data) as u128; } }
+                if let Some(Some(v2)) = vaults.get(1) { if v2.data.len() >= 72 { reserves.1 = Self::parse_token_amount(&v2.data) as u128; } }
+                // Record fee tier to refine fee/tick spacing if available in trace
+                fee_tier_keys.push(parsed.fee_tier);
+                // Insert/overwrite pool
+                self.pools.insert(address, OrcaPool {
+                    base_mint: parsed.token_mint_a,
+                    quote_mint: parsed.token_mint_b,
+                    reserve_base: reserves.0,
+                    reserve_quote: reserves.1,
+                    fee_bps: parsed.fee_rate as u32, // may be overridden by fee tier account below
+                    fee_tier: Some(parsed.fee_tier),
+                    tick_spacing: Some(parsed.tick_spacing),
+                    vault_a: parsed.token_vault_a,
+                    vault_b: parsed.token_vault_b,
+                    tick_current_index: Some(parsed.tick_current_index),
+                });
+                for m in [parsed.token_mint_a, parsed.token_mint_b] {
+                    self.mint_index.entry(m).or_insert_with(|| Vec::with_capacity(2)).push(address);
+                }
+                added += 1;
+            }
+        }
+        // Deduplicate and fetch fee tier accounts via replay to set authoritative fee_bps & tick_spacing
+        fee_tier_keys.sort_unstable(); fee_tier_keys.dedup();
+        if !fee_tier_keys.is_empty() {
+            let accts = replay.get_multiple_accounts(&fee_tier_keys);
+            for (i, acc_opt) in accts.into_iter().enumerate() {
+                if let Some(acc) = acc_opt { if acc.data.len() >= 4 {
+                    let tick = u16::from_le_bytes([acc.data[0], acc.data[1]]);
+                    let fee = u16::from_le_bytes([acc.data[2], acc.data[3]]) as u32;
+                    if (1..=1000).contains(&fee) { self.fee_tiers.insert(fee_tier_keys[i], (fee, tick)); }
+                } }
+            }
+            // Patch pools with authoritative values
+            for mut p in self.pools.iter_mut() {
+                if let Some(key) = p.fee_tier { if let Some((fee, tick)) = self.fee_tiers.get(&key).map(|v| *v) { p.fee_bps = fee; p.tick_spacing = Some(tick); } }
+            }
+        }
+        tracing::info!(added, total = self.pools.len(), "orca.refresh_pools_replay() done");
+        Ok(())
     }
 }
 
@@ -149,7 +210,7 @@ impl Dex for Orca {
         let out = (amount_less_fee * rout) / (rin + amount_less_fee);
         if out == 0 { return Ok(None); }
         let impact_bps = ((amount_less_fee * 10_000) / (rin + amount_less_fee)) as u32;
-    Ok(Some(Quote { amount_out: out as u64, price_impact_bps: impact_bps, route: vec![pid.to_string()], fee_bps: p.fee_bps, in_reserve: rin, out_reserve: rout, input_mint: (if forward { input } else { output }).to_string(), output_mint: (if forward { output } else { input }).to_string() }))
+    Ok(Some(Quote { amount_out: out as u64, price_impact_bps: impact_bps, route: vec![pid.to_string()], fee_bps: p.fee_bps, in_reserve: rin, out_reserve: rout, input_mint: (if forward { input } else { output }).to_string(), output_mint: (if forward { output } else { input }).to_string(), tick_spacing: p.tick_spacing }))
     }
 
     fn build_swap_ix(&self, _input_mint: &str, _output_mint: &str, _amount_in: u64, _min_out: u64) -> Result<Vec<Instruction>> {

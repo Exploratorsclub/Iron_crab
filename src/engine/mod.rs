@@ -1,8 +1,8 @@
 
 use std::{sync::Arc, time::Duration};
 use anyhow::Result;
-use tokio::time::interval;
-use tracing::{info, warn};
+use tokio::time::{interval, Duration as TokioDuration};
+use tracing::{info, warn, Instrument as _};
 
 use crate::config::{Config, StrategyDef};
 use crate::wallet::Treasury;
@@ -20,7 +20,7 @@ pub mod strategy;
 pub mod py_strategy;
 
 use allocator::Allocator;
-use strategy::{Strategy, run_strategy_tick};
+use strategy::Strategy;
 
 #[derive(Clone)]
 pub struct EngineContext {
@@ -76,6 +76,11 @@ impl Engine {
     pub async fn run(&self) -> Result<()> {
         // DEX program log
         tracing::debug!(raydium = %RAYDIUM_AMM_V4, orca = %ORCA_WHIRLPOOL_PROGRAM, "DEX program IDs loaded");
+
+        // Strategy init hooks (best-effort)
+        for s in &self.strategies {
+            if let Err(e) = s.init(self.ctx.clone()) { tracing::warn!(?e, name = s.name(), "strategy init failed"); }
+        }
 
         // Rebalancing Loop (mit RPC-Referenz)
         let ctx = self.ctx.clone();
@@ -145,15 +150,52 @@ impl Engine {
 
         // Strategy Tick Loop
         let mut iv = interval(Duration::from_millis(600));
+        // Simple per-strategy circuit breakers (local state)
+        struct Circuit { failures: u32, opened_until: Option<std::time::Instant> }
+        let mut circuits: Vec<Circuit> = self.strategies.iter().map(|_| Circuit { failures: 0, opened_until: None }).collect();
+        const FAIL_THRESHOLD: u32 = 5;
+        const OPEN_MS: u64 = 5_000;
         loop {
             iv.tick().await;
             crate::metrics::record_activity();
-            for s in &self.strategies {
-                match run_strategy_tick(s.as_ref(), self.ctx.clone()).await {
-                    Ok(intents) => {
+            for (idx, s) in self.strategies.iter().enumerate() {
+                // circuit open?
+                if let Some(until) = circuits[idx].opened_until {
+                    if std::time::Instant::now() < until { continue; }
+                    circuits[idx].opened_until = None; // half-open reset
+                }
+                // per-tick timeout budget
+                let span = tracing::info_span!("strategy_tick", name = s.name());
+                let s_arc = s.clone();
+                let ctx = self.ctx.clone();
+                let handle = tokio::spawn(async move {
+                    Strategy::on_tick(&*s_arc, ctx).await
+                }.instrument(span));
+                match tokio::time::timeout(TokioDuration::from_millis(500), handle).await {
+                    Err(_) => { // timeout
+                        tracing::warn!(name = s.name(), "strategy tick timed out");
+                        crate::metrics::STRATEGY_TICK_TIMEOUTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        circuits[idx].failures += 1;
+                    }
+                    Ok(Err(join_err)) => { // panic
+                        tracing::warn!(name = s.name(), panic = %join_err, "strategy tick panicked");
+                        crate::metrics::STRATEGY_TICK_PANICS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        circuits[idx].failures += 1;
+                    }
+                    Ok(Ok(Err(e))) => { // returned error
+                        tracing::warn!(?e, name = s.name(), "strategy tick error");
+                        circuits[idx].failures += 1;
+                    }
+                    Ok(Ok(Ok(intents))) => { // success
+                        circuits[idx].failures = 0;
                         for ti in intents { self.execute(ti).await?; }
                     }
-                    Err(e) => tracing::warn!(?e, name = s.name(), "strategy tick error"),
+                }
+                if circuits[idx].failures >= FAIL_THRESHOLD {
+                    circuits[idx].failures = 0;
+                    circuits[idx].opened_until = Some(std::time::Instant::now() + TokioDuration::from_millis(OPEN_MS));
+                    crate::metrics::STRATEGY_CIRCUIT_OPENS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(name = s.name(), open_ms = OPEN_MS, "strategy circuit opened due to repeated failures");
                 }
             }
         }

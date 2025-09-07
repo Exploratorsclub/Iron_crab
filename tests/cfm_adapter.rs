@@ -2,7 +2,7 @@ mod common;
 use ironcrab::backtest::market::{CfmAdapter,CfmPool,MarketAdapter};
 use ironcrab::backtest::types::ActionSwap;
 
-fn sample_pool() -> CfmPool { CfmPool { pool: "X".into(), base_mint: "A".into(), quote_mint: "B".into(), base_reserve: 1_000_000_000, quote_reserve: 2_000_000_000, fee_bps: 30 } }
+fn sample_pool() -> CfmPool { CfmPool { pool: "X".into(), base_mint: "A".into(), quote_mint: "B".into(), base_reserve: 1_000_000_000, quote_reserve: 2_000_000_000, fee_bps: 30, tick_spacing: None } }
 
 #[test]
 fn quote_basic() { let ad = CfmAdapter { pools: vec![sample_pool()] }; let q = ad.quote("A","B", 1_000_000).unwrap(); assert!(q.amount_out>0); }

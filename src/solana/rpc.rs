@@ -112,13 +112,22 @@ impl AdaptiveLimiter {
 pub struct SolanaRpc {
     pub rpc: Arc<RpcClient>,
     limiter: Arc<AdaptiveLimiter>,
+    ws_failover_urls: Arc<Vec<String>>, // additional endpoints for PubSub
+    ws_connect_timeout_ms: u64,
+    ws_max_backoff_ms: u64,
 }
 
 impl SolanaRpc {
     pub fn new(url: &str) -> Self {
         let rpc = RpcClient::new(url.to_string());
         let limiter = AdaptiveLimiter::new(AdaptiveLimiterOptions::default());
-        Self { rpc: Arc::new(rpc), limiter: Arc::new(limiter) }
+        Self {
+            rpc: Arc::new(rpc),
+            limiter: Arc::new(limiter),
+            ws_failover_urls: Arc::new(Vec::new()),
+            ws_connect_timeout_ms: 8_000,
+            ws_max_backoff_ms: 15_000,
+        }
     }
 
     pub fn from_cfg(cfg: &crate::config::SolanaCfg) -> Self {
@@ -132,8 +141,21 @@ impl SolanaRpc {
             timeout_ms: cfg.rpc_timeout_ms.unwrap_or(10_000),
         };
         let limiter = AdaptiveLimiter::new(opts);
-        Self { rpc: Arc::new(rpc), limiter: Arc::new(limiter) }
+        let ws_failover_urls = cfg.ws_failover_urls.clone().unwrap_or_default();
+        let ws_connect_timeout_ms = cfg.ws_connect_timeout_ms.unwrap_or(8_000);
+        let ws_max_backoff_ms = cfg.ws_max_backoff_ms.unwrap_or(15_000);
+        Self {
+            rpc: Arc::new(rpc),
+            limiter: Arc::new(limiter),
+            ws_failover_urls: Arc::new(ws_failover_urls),
+            ws_connect_timeout_ms,
+            ws_max_backoff_ms,
+        }
     }
+
+    pub fn ws_failovers(&self) -> Arc<Vec<String>> { self.ws_failover_urls.clone() }
+    pub fn ws_connect_timeout_ms(&self) -> u64 { self.ws_connect_timeout_ms }
+    pub fn ws_max_backoff_ms(&self) -> u64 { self.ws_max_backoff_ms }
 
     async fn sleep_with_backoff(attempt: u32) {
         let base = (2u64.pow(attempt.min(6)) * 100).min(2_000); // 100ms, 200ms, 400ms, ... up to 2s

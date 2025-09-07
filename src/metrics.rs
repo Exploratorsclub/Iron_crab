@@ -78,13 +78,33 @@ pub static DEX_SELECTION_ENTRY_RAYDIUM_TOTAL: Lazy<AtomicU64> = Lazy::new(|| Ato
 pub static DEX_SELECTION_ENTRY_ORCA_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static DEX_SELECTION_EXIT_RAYDIUM_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static DEX_SELECTION_EXIT_ORCA_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Strategy sandboxing/IPC metrics
+pub static STRATEGY_TICK_TIMEOUTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static STRATEGY_TICK_PANICS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static STRATEGY_CIRCUIT_OPENS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static PY_STRAT_TIMEOUTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static PY_STRAT_FAILS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static PY_STRAT_CIRCUIT_OPENS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static PY_STRAT_RESTARTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Gross vs Net realized PnL (session aggregates, SOL micro)
 pub static GROSS_REALIZED_PNL_SOL_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 pub static NET_REALIZED_PNL_SOL_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+// Realized PnL (SOL) histogram (signed, absolute in SOL)
+const REALIZED_PNL_SOL_BUCKETS: &[f64] = &[
+    -1.0, -0.5, -0.25, -0.1, -0.05, -0.02, -0.01, 0.0,
+     0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0
+];
+pub static REALIZED_PNL_SOL_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| REALIZED_PNL_SOL_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
+pub static REALIZED_PNL_SOL_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REALIZED_PNL_SOL_SUM_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 // Fee percent histogram (fee / notional), common percent buckets
 const FEE_PCT_BUCKETS: &[f64] = &[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1];
 pub static FEE_PCT_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| FEE_PCT_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
 pub static FEE_PCT_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Shortfall percent histogram (shortfall / expected_out)
+const SHORTFALL_PCT_BUCKETS: &[f64] = &[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5];
+pub static SHORTFALL_PCT_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| SHORTFALL_PCT_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
+pub static SHORTFALL_PCT_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Realized trade return histogram (ratio realized_pnl / invested) buckets (cumulative style capture)
 // Buckets chosen to capture deep losses to outsized wins.
 const TRADE_RETURN_BUCKETS: &[f64] = &[
@@ -141,11 +161,32 @@ pub fn record_fee_pct(pct: f64) {
     FEE_PCT_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn record_shortfall_pct(pct: f64) {
+    let p = if pct.is_nan() || pct.is_infinite() || pct < 0.0 { 0.0 } else { pct };
+    for (i,b) in SHORTFALL_PCT_BUCKETS.iter().enumerate() {
+        if p <= *b { SHORTFALL_PCT_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed); break; }
+    }
+    SHORTFALL_PCT_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn record_realized_gross_net(gross_sol: f64, net_sol: f64) {
     let g = (gross_sol * 1_000_000.0).clamp(i64::MIN as f64, i64::MAX as f64) as i64;
     let n = (net_sol * 1_000_000.0).clamp(i64::MIN as f64, i64::MAX as f64) as i64;
     GROSS_REALIZED_PNL_SOL_MICRO.fetch_add(g, Ordering::Relaxed);
     NET_REALIZED_PNL_SOL_MICRO.fetch_add(n, Ordering::Relaxed);
+}
+
+pub fn record_realized_pnl_sol(value_sol: f64) {
+    // Place in signed buckets; overflow goes to +Inf via count only
+    let mut placed = false;
+    for (i,b) in REALIZED_PNL_SOL_BUCKETS.iter().enumerate() {
+        if value_sol <= *b { REALIZED_PNL_SOL_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed); placed = true; break; }
+    }
+    if !placed { /* +Inf implicit via count only */ }
+    REALIZED_PNL_SOL_COUNT.fetch_add(1, Ordering::Relaxed);
+    let micro = (value_sol * 1_000_000.0).round();
+    let micro_i64 = if micro > i64::MAX as f64 { i64::MAX } else if micro < i64::MIN as f64 { i64::MIN } else { micro as i64 };
+    REALIZED_PNL_SOL_SUM_MICRO.fetch_add(micro_i64, Ordering::Relaxed);
 }
 
 pub fn snapshot() -> MetricsSnapshot {
@@ -260,6 +301,14 @@ async fn metrics_response() -> Response<Body> {
     line!("dex_selection_entry_orca_total", DEX_SELECTION_ENTRY_ORCA_TOTAL.load(Ordering::Relaxed));
     line!("dex_selection_exit_raydium_total", DEX_SELECTION_EXIT_RAYDIUM_TOTAL.load(Ordering::Relaxed));
     line!("dex_selection_exit_orca_total", DEX_SELECTION_EXIT_ORCA_TOTAL.load(Ordering::Relaxed));
+    // Strategy sandboxing/IPC metrics
+    line!("strategy_tick_timeouts_total", STRATEGY_TICK_TIMEOUTS_TOTAL.load(Ordering::Relaxed));
+    line!("strategy_tick_panics_total", STRATEGY_TICK_PANICS_TOTAL.load(Ordering::Relaxed));
+    line!("strategy_circuit_opens_total", STRATEGY_CIRCUIT_OPENS_TOTAL.load(Ordering::Relaxed));
+    line!("py_strat_timeouts_total", PY_STRAT_TIMEOUTS_TOTAL.load(Ordering::Relaxed));
+    line!("py_strat_fails_total", PY_STRAT_FAILS_TOTAL.load(Ordering::Relaxed));
+    line!("py_strat_circuit_opens_total", PY_STRAT_CIRCUIT_OPENS_TOTAL.load(Ordering::Relaxed));
+    line!("py_strat_restarts_total", PY_STRAT_RESTARTS_TOTAL.load(Ordering::Relaxed));
     // Gross/Net realized PnL (session aggregates)
     line!("gross_realized_pnl_sol", GROSS_REALIZED_PNL_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
     line!("net_realized_pnl_sol", NET_REALIZED_PNL_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
@@ -269,6 +318,12 @@ async fn metrics_response() -> Response<Body> {
         out.push_str(&format!("fee_percent_bucket{{le=\"{}\"}} {}\n", b, c));
     }
     out.push_str(&format!("fee_percent_bucket{{le=\"+Inf\"}} {}\n", FEE_PCT_COUNT.load(Ordering::Relaxed)));
+    // Shortfall percent histogram
+    for (i,b) in SHORTFALL_PCT_BUCKETS.iter().enumerate() {
+        let c = SHORTFALL_PCT_BUCKET_COUNTS[i].load(Ordering::Relaxed);
+        out.push_str(&format!("shortfall_percent_bucket{{le=\"{}\"}} {}\n", b, c));
+    }
+    out.push_str(&format!("shortfall_percent_bucket{{le=\"+Inf\"}} {}\n", SHORTFALL_PCT_COUNT.load(Ordering::Relaxed)));
     // Trade return histogram (realized PnL / invested)
     let tr_count = TRADE_RETURN_COUNT.load(Ordering::Relaxed);
     let tr_sum_micro = TRADE_RETURN_SUM_MICRO.load(Ordering::Relaxed);
@@ -279,6 +334,13 @@ async fn metrics_response() -> Response<Body> {
         line!("ironcrab_sharpe_ratio", SHARPE_RATIO_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
         line!("ironcrab_drawdown_pct", DRAWDOWN_PCT_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
         out.push_str(&format!("ironcrab_build_info{{version=\"{}\"}} 1\n", BUILD_VERSION));
+    // Realized PnL (SOL) histogram
+    let r_count = REALIZED_PNL_SOL_COUNT.load(Ordering::Relaxed);
+    let r_sum_micro = REALIZED_PNL_SOL_SUM_MICRO.load(Ordering::Relaxed);
+    for (i,b) in REALIZED_PNL_SOL_BUCKETS.iter().enumerate() { let c = REALIZED_PNL_SOL_BUCKET_COUNTS[i].load(Ordering::Relaxed); out.push_str(&format!("realized_pnl_sol_bucket{{le=\"{}\"}} {}\n", b, c)); }
+    out.push_str(&format!("realized_pnl_sol_bucket{{le=\"+Inf\"}} {}\n", r_count));
+    out.push_str(&format!("realized_pnl_sol_sum {}\n", r_sum_micro as f64 / 1_000_000.0));
+    out.push_str(&format!("realized_pnl_sol_count {}\n", r_count));
     // Histogram exposition (Prometheus classic format)
     let swap_count = SWAP_LATENCY_COUNT.load(Ordering::Relaxed);
     let swap_sum = SWAP_LATENCY_SUM_NS.load(Ordering::Relaxed);

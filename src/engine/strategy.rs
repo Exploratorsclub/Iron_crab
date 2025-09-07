@@ -11,12 +11,24 @@ use super::EngineContext;
 pub trait Strategy: Send + Sync {
     fn name(&self) -> &str;
 
+    /// Optional: einmaliger Init Hook beim Engine-Start
+    #[allow(unused)]
+    fn init(&self, _ctx: Arc<EngineContext>) -> anyhow::Result<()> { Ok(()) }
+
     /// Wird ca. alle `tick_ms` vom Engine Loop aufgerufen.
     async fn on_tick(&self, ctx: Arc<EngineContext>) -> anyhow::Result<Vec<TradeIntent>>;
 
     /// Optional: Event‑Hooks (z.B. neue Pools entdeckt, Preisänderung, etc.)
     #[allow(unused)]
     fn on_event(&self, _event: &Value) {}
+
+    /// Optional: Fill‑Hook, wenn eine Order ausgeführt wurde
+    #[allow(unused)]
+    fn on_fill(&self, _ctx: Arc<EngineContext>, _fill: &Value) {}
+
+    /// Optional: Exit‑Hook beim sauberen Shutdown
+    #[allow(unused)]
+    fn on_exit(&self, _ctx: Arc<EngineContext>) {}
 }
 
 /// Hilfsfunktion für instrumentiertes Ausführen

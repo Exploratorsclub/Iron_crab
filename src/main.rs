@@ -1,7 +1,6 @@
 
 use std::{path::PathBuf, sync::Arc};
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
 
 use ironcrab::config::Config;
 use ironcrab::wallet::Treasury;
@@ -24,8 +23,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = std::sync::Arc::new(Config::load(&args.config)?);
 
     // Logging
-    let filter = EnvFilter::try_new(std::env::var("RUST_LOG").unwrap_or(cfg.app.log_level.clone()))?;
-    tracing_subscriber::fmt().with_env_filter(filter).compact().init();
+    ironcrab::audit::init_redacting_logging(&cfg.app.log_level)?;
 
     tracing::info!(app = %cfg.app.name, "starting ironcrab");
 

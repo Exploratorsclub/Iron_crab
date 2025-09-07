@@ -105,7 +105,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Cooldowns nach Stop-Loss (HashMap cooldown_until)
 - [x] Erweiterte PnL Reports (rolling window + Sharpe Approx `rolling_pnl_window`)
 - [x] Config Hot-Reload (ENV `IRONCRAB_SNIPER_RELOAD_PATH`, 30s Interval)
-- [~] Persistente RiskState Speicherung (Positions & Sharpe) (Grundpersistenz + Multi-Lot fertig; Sharpe + erweiterte Metriken offen)
+- [x] Persistente RiskState Speicherung (Positions & Sharpe) (Grundpersistenz + Multi-Lot fertig; Sharpe + erweiterte Metriken DONE)
 	- [x] Basis Persistenz (JSON Snapshot: ENV `IRONCRAB_RISK_STATE_PATH`, Autosave `IRONCRAB_RISK_AUTOSAVE_SECS`)
 
 ## 6) Infra & Observability
@@ -174,29 +174,41 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [~] API‑Contract definieren: Inputs (Preis‑Snapshots, Pool‑State, Positions‑State), Outputs (Entry/Exit‑Signale, Size, min_out bps) – PARTIAL (Backtest akzeptiert `StrategyDecision` JSON, siehe README)
 	- [~] Schnittstelle (Serde Schema): JSON/MessagePack; Versionierung + Kompatibilitätscheck – PARTIAL (JSON für Backtest IPC)
 	- [~] pyo3 Modul‑Skeleton (+ Feature‑Flag `py_strategy`); Alternative IPC (lokaler TCP/Named Pipe) mit Request/Response – PARTIAL (Engine pyo3 Adapter + Backtest IPC Prozess‑Adapter)
-	- [ ] Strategy‑Lifecycle: `init`, `on_tick`, `on_fill`, `on_exit` (+ Zeitbudget/Timeout je Call)
-	- [ ] Sandbox & Isolation: Panic/Exception Catching, Timeout‑Abbruch, Circuit Breaker bei Fehlerhäufung
-	- [ ] Beispielstrategie (`strategies/sample.py`) + README mit Interface‑Spec
+	- [x] Strategy‑Lifecycle: `init`, `on_tick`, `on_fill`, `on_exit` (+ Zeitbudget/Timeout je Call) – BACKTEST IPC implementiert (per‑Call Prozesse, Timeout konfigurierbar); Engine‑pyo3 Pfad folgt separat
+	- [~] Sandbox & Isolation: Panic/Exception Catching, Timeout‑Abbruch, Circuit Breaker bei Fehlerhäufung – PARTIAL (Runtime: tick timeout + panic catch + per‑strategy circuit breaker; Backtest IPC: per‑call timeout + breaker stub)
+	- [x] Beispielstrategie (`strategies/sample.py`, `strategies/sample_worker.py`) + README mit Interface‑Spec
 	- [ ] Tests: Stub‑Strategy (deterministische Signale) + Integrationstest (Signal → Quote → Sim)
 - [ ] Deterministischer Replay-Modus (Slot Iterator)
-	- [ ] Slot‑Iterator (Start..End) mit lokalem Cache für Blöcke/Transaktionen/Logs
-	- [ ] Mock `SolanaRpc` für Replays (get_account/get_program_accounts/logs aus Trace‑Dateien)
-	- [ ] Determinismus: seedbares RNG, feste Timestamps, eingefrorene Wall‑Clock, deterministischer Scheduler
-	- [ ] Recorder‑Tool: Live‑Stream (Blöcke/Logs/Accounts) in Dateien schreiben (kompakt, komprimiert)
-	- [~] CLI/Config: `--replay` Flags (Slot‑Range, Quelle, Speedup), Metriken mit Label `mode="replay"` – PARTIAL (basic flags in `backtest_driver`)
-	- [~] Trace Loader: JSON/JSONL zu TraceEvent → SimEvent Mapping – PARTIAL (Slot & Log unterstützt)
-	- [ ] Golden Tests: Repräsentative Pools/Routen, erwartete Trade‑Sequenzen
+	- [x] Slot‑Iterator (Start..End) mit lokalem Cache für Blöcke/Transaktionen/Logs (in‑memory `ReplayStore` für Slots/Logs/Accounts)
+	- [~] Mock `SolanaRpc` für Replays (get_account/get_program_accounts/logs aus Trace‑Dateien)
+		- Implementiert: `ReplayRpc` mit `get_account`, `get_multiple_accounts`, `logs_in_range`, `all_latest` (genutzt für Decoding)
+		- Offen: direktes `get_program_accounts` API (ersetzt durch `all_latest` + Filter)
+	- [~] Determinismus: feste Timestamps via `slot_ms`, seedbares RNG Feld reserviert (für Impact/Noise); deterministischer Ablauf im Backtest (erste Version aktiv)
+	- [x] Recorder‑Tool: Live‑Stream (Blöcke/Logs/Accounts) in Dateien schreiben (kompakt, komprimiert)
+		- Neues Binary `ironcrab-recorder`: schreibt JSONL‑Trace (gzip, .jsonl.gz) kompatibel zu `TraceEvent` (Slot/Log/Account base64)
+		- Logs via WS logsSubscribe (Raydium/Orca), Accounts via periodischem get_program_accounts Dump
+	- [~] CLI/Config: `--replay*` Flags (Slot‑Range, Quelle, slot_ms, seed) implementiert: `--replay-trace`, `--replay-start`, `--replay-end`, `--replay-slot-ms`, `--replay-seed` (Metriken TODO)
+	- [x] Trace Loader: JSON/JSONL → TraceEvent → SimEvent (Slots, Logs, Account→NewPool+CfmPriceUpdate)
+	- [x] Golden Tests: Minimaler Replay‑Test (Deterministische Slot‑TS, Account‑Mapping)
+	- [x] Raydium Replay Refresh: Pool‑Snapshots aus `ReplayRpc` lesen (`fetch_pools_replay`/`refresh_pools_replay`) und im Backtest‑Driver vorinitialisieren
+	- [x] Orca Replay Refresh: Whirlpool‑Snapshots aus `ReplayRpc` lesen (`refresh_pools_replay`) und im Backtest‑Driver vorinitialisieren
 - [ ] Impact / Slippage Modell im Backtest
-	- [~] DEX‑spezifische Modelle: Raydium (CPMM) vs. Orca Whirlpool (konzentrierte Liquidität, Tick‑Kreuzungen) – PARTIAL (CPMM & CLMM Platzhalter + CLI `--impact` Schalter)
-	- [ ] Gebühren & Ticks: LP/Protocol Fees, Tick‑Sprünge, Price‑Impact, Oracle‑Latenz optional
-	- [ ] Shortfall‑Noise: Parametrisierung aus Live‑Fills (Histogramme) für stochastische Ausführung
-	- [ ] Szenario‑Runner: Grid‑Sweeps über `slippage_bps`, Size, Latenz → PnL‑Sensitivität
+	- [x] DEX‑spezifische Modelle: Raydium (CPMM) vs. Orca Whirlpool (konzentrierte Liquidität, Tick‑Kreuzungen)
+		- Implementiert: Pluggable ImpactModel (CPMM exakt, CLMM mit konservativer Zusatz‑Penalty für große Trades)
+		- CLI: `--impact cpmm|clmm|none` wählt Modell für min_out‑Berechnung
+	- [x] Gebühren & Ticks: Zusätzliche Protocol/Referral Fee (bps) + einfache Latenz‑Penalty
+		- Neue Flags: `--impact-extra-fee-bps` (Output‑Abschlag) und Nutzung `--replay-slot-ms` für Latenzmodell (`10 bps/Slot`, Kappung)
+	- [x] Shortfall‑Noise: Stochastischer Aufschlag (Normalverteilung, 0‑trunkiert) auf `max_slippage_bps`
+		- Flags: `--impact-noise-mean-bps`, `--impact-noise-std-bps`, Seed via `--replay-seed` (deterministisch)
+	- [~] Szenario‑Runner: Grundgerüst vorhanden (`backtest::scenario`), weitere Parametrisierung TODO
 	- [ ] Validierung: Vergleich Backtest‑PnL vs. historische Live‑Trades (Fehlerbänder)
 
 ### Security & Key Handling
-- [ ] Gesicherte Keypair Ladepfade / optional KMS
-- [ ] Keine Private Keys in Logs (Audit Layer)
-- [ ] Config Validierung (Schema + Constraints)
+- [~] Gesicherte Keypair Ladepfade / optional KMS
+	- [x] Gesicherte Ladepfade (Strict Mode + erlaubte Verzeichnisse, ENV Loader JSON/B64/Base58)
+	- [ ] KMS‑Backend (Feature‑gated Remote Signer)
+- [x] Keine Private Keys in Logs (Audit Layer)
+- [x] Config Validierung (Schema + Constraints)
 
 ### Tests & CI
 - [ ] Unit: drawdown sizing, cooldown gating, trade_return bucketing

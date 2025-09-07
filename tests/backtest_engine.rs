@@ -17,7 +17,7 @@ fn mk_events() -> Vec<SimEvent> {
 #[test]
 fn engine_runs() {
     let strategy = NoopStrategy;
-    let market = CfmAdapter { pools: vec![ CfmPool { pool:"X".into(), base_mint:"A".into(), quote_mint:"B".into(), base_reserve: 1_000_000, quote_reserve: 2_000_000, fee_bps: 25 } ] };
+    let market = CfmAdapter { pools: vec![ CfmPool { pool:"X".into(), base_mint:"A".into(), quote_mint:"B".into(), base_reserve: 1_000_000, quote_reserve: 2_000_000, fee_bps: 25, tick_spacing: None } ] };
     let portfolio = Portfolio::new();
     let events = mk_events();
     let mut engine = BacktestEngine::new(strategy, market, portfolio, events);
@@ -28,7 +28,7 @@ fn engine_runs() {
 #[test]
 fn slippage_enforcement() {
     // Very small pool -> price impact likely > 0.10% so may reject
-    let market = CfmAdapter { pools: vec![ CfmPool { pool:"P1".into(), base_mint:"A".into(), quote_mint:"B".into(), base_reserve: 20_000, quote_reserve: 20_000, fee_bps: 30 } ] };
+    let market = CfmAdapter { pools: vec![ CfmPool { pool:"P1".into(), base_mint:"A".into(), quote_mint:"B".into(), base_reserve: 20_000, quote_reserve: 20_000, fee_bps: 30, tick_spacing: None } ] };
     let portfolio = Portfolio::new();
     let events = vec![SimEvent { ts_ms: 0, kind: SimEventKind::SlotAdvance { slot:0 }}];
     let strategy = OneSwap;

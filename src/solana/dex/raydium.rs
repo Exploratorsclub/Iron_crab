@@ -263,7 +263,7 @@ impl Raydium {
             let out_amt = (numerator / denominator) as u64;
             if out_amt == 0 { continue; }
             let impact_bps = ((amount_in_less_fee * 10_000) / (rin + amount_in_less_fee)) as u32;
-            let q = Quote { amount_out: out_amt, price_impact_bps: impact_bps, route: vec![p.address.to_string()], fee_bps: p.fee_bps, in_reserve: rin, out_reserve: rout, input_mint: (if is_forward { in_pk } else { out_pk }).to_string(), output_mint: (if is_forward { out_pk } else { in_pk }).to_string() };
+            let q = Quote { amount_out: out_amt, price_impact_bps: impact_bps, route: vec![p.address.to_string()], fee_bps: p.fee_bps, in_reserve: rin, out_reserve: rout, input_mint: (if is_forward { in_pk } else { out_pk }).to_string(), output_mint: (if is_forward { out_pk } else { in_pk }).to_string(), tick_spacing: None };
             if best.as_ref().map(|b| b.amount_out < out_amt).unwrap_or(true) { best = Some(q); }
         }
         best
@@ -284,6 +284,57 @@ impl Raydium {
             Some(est.compute_unit_price_micro_lamports)
         )?;
         Ok(rebuilt)
+    }
+
+    /// Replay: refresh pools using a ReplayRpc store (synchronous). Populates in-memory snapshots like live refresh.
+    pub fn refresh_pools_replay(&self, replay: &crate::backtest::replay_rpc::ReplayRpc) -> anyhow::Result<()> {
+    use reader::fetch_pools_replay;
+    let decoded = fetch_pools_replay(replay, None, None, true, true, Self::program_id())?;
+        // Build a quick map of vault balances if token account bytes are present in replay (optional). For replay MVP, keep reserves as zeros; rely on account CfmPriceUpdate events to set reserves later.
+        for p in decoded {
+            // Apply validate checks similar to live path, but softened for replay.
+            if let Err(e) = Self::validate_pool_state(&p) {
+                tracing::debug!(pool = %p.address, error = %e, "skip invalid raydium pool in replay");
+                continue;
+            }
+            // In replay, reserves may be filled by CfmPriceUpdate; initialize with zeros.
+            let (amm_auth, _) = Self::derive_amm_authority();
+            let serum_vault_signer = if p.market_program_id != solana_sdk::pubkey::Pubkey::default() {
+                let (v, _) = Self::derive_serum_vault_signer(&p.market_id, &p.market_program_id);
+                Some(v)
+            } else { None };
+            let obj = SimplePool {
+                base_mint: p.base_mint,
+                quote_mint: p.quote_mint,
+                base_vault: p.base_vault,
+                quote_vault: p.quote_vault,
+                lp_reserve: p.lp_reserve,
+                address: p.address,
+                reserve_base: 0,
+                reserve_quote: 0,
+                fee_bps: 30, // conservative default; will be overridden by Cfm updates if present
+                last_update: std::time::SystemTime::now(),
+                open_orders: Some(p.open_orders),
+                market_id: Some(p.market_id),
+                market_program_id: Some(p.market_program_id),
+                amm_authority: Some(amm_auth),
+                serum_vault_signer,
+                target_orders: p.target_orders,
+                serum_bids: None,
+                serum_asks: None,
+                serum_event_queue: None,
+                serum_base_vault: None,
+                serum_quote_vault: None,
+            };
+            self.pools.insert(p.address, obj);
+        }
+        // Rebuild mint index
+        self.mint_index.clear();
+        for p in self.pools.iter() {
+            self.mint_index.entry(p.base_mint).or_insert_with(|| Vec::with_capacity(2)).push(p.address);
+            self.mint_index.entry(p.quote_mint).or_insert_with(|| Vec::with_capacity(2)).push(p.address);
+        }
+        Ok(())
     }
 }
 
@@ -426,7 +477,7 @@ impl Dex for Raydium {
             if out_amt == 0 { continue; }
             // price impact approx: (amount_in / (rin + amount_in)) * 10_000
             let impact_bps = ((amount_in_less_fee * 10_000) / (rin + amount_in_less_fee)) as u32;
-            let q = Quote { amount_out: out_amt, price_impact_bps: impact_bps, route: vec![p.address.to_string()], fee_bps: p.fee_bps, in_reserve: rin, out_reserve: rout, input_mint: (if is_forward { in_pk } else { out_pk }).to_string(), output_mint: (if is_forward { out_pk } else { in_pk }).to_string() };
+            let q = Quote { amount_out: out_amt, price_impact_bps: impact_bps, route: vec![p.address.to_string()], fee_bps: p.fee_bps, in_reserve: rin, out_reserve: rout, input_mint: (if is_forward { in_pk } else { out_pk }).to_string(), output_mint: (if is_forward { out_pk } else { in_pk }).to_string(), tick_spacing: None };
             if best.as_ref().map(|b| b.amount_out < out_amt).unwrap_or(true) { best = Some(q); }
         }
         Ok(best)
@@ -619,6 +670,8 @@ pub mod reader {
     use solana_client::rpc_config::{RpcProgramAccountsConfig, RpcAccountInfoConfig};
     use solana_client::rpc_filter::{RpcFilterType, Memcmp, MemcmpEncodedBytes};
     use solana_sdk::{account::Account, pubkey::Pubkey};
+    use crate::backtest::replay_rpc::ReplayRpc;
+    use std::str::FromStr;
 
     pub const LIQ_STATE_V4_SIZE: usize = 752;
     pub mod offs {
@@ -733,6 +786,35 @@ pub mod reader {
             } else {
                 acc.data.clear();
             }
+            out.push(d);
+        }
+        Ok(out)
+    }
+
+    /// Replay-mode variant: scan all latest accounts from ReplayRpc, filter by size and optional base/quote, and decode pools.
+    pub fn fetch_pools_replay(
+        replay: &ReplayRpc,
+        base: Option<Pubkey>,
+        quote: Option<Pubkey>,
+        active_only: bool,
+        with_accounts: bool,
+    _program_id: Pubkey,
+    ) -> Result<Vec<PoolV4>> {
+        let mut out = Vec::new();
+        let items = replay.all_latest();
+        for (addr_str, bytes) in items {
+            if bytes.len() != LIQ_STATE_V4_SIZE { continue; }
+            // Attempt to parse pool
+            let addr = match Pubkey::from_str(&addr_str) { Ok(pk) => pk, Err(_) => continue };
+            let mut d = match PoolV4::decode(addr, &bytes) { Ok(p) => p, Err(_) => continue };
+            // Filter by base/quote if requested
+            if let Some(b) = base { if d.base_mint != b { continue; } }
+            if let Some(q) = quote { if d.quote_mint != q { continue; } }
+            if active_only {
+                // Status field at offs::STATUS equals 6 for active; quickly check raw bytes
+                if u64::from_le_bytes(bytes[offs::STATUS..offs::STATUS+8].try_into().unwrap_or([0u8;8])) != 6 { continue; }
+            }
+            if with_accounts { d.raw_account = Some(Account { lamports: 0, data: bytes.clone(), owner: Pubkey::default(), executable: false, rent_epoch: 0 }); }
             out.push(d);
         }
         Ok(out)

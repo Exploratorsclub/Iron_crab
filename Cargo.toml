@@ -35,6 +35,8 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 # Math & time
 rust_decimal = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.21"
+flate2 = "1"
 
 
 # ---- Solana 2.x (Agave) – EXACT pins ----

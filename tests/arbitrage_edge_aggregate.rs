@@ -14,7 +14,7 @@ impl Dex for MockDex {
     async fn refresh_pools(&self) -> Result<()> { Ok(()) }
     async fn quote_exact_in(&self, input_mint: &str, output_mint: &str, amount_in: u64) -> Result<Option<ironcrab::solana::dex::Quote>> {
         if (input_mint, output_mint) == (self.pair.0.as_str(), self.pair.1.as_str()) {
-            Ok(Some(ironcrab::solana::dex::Quote { amount_out: self.out_amount + amount_in/1000, price_impact_bps: 10, route: vec!["mock".into()], fee_bps: 30, in_reserve: 1_000_000_000, out_reserve: 1_000_000_000, input_mint: input_mint.into(), output_mint: output_mint.into() }))
+            Ok(Some(ironcrab::solana::dex::Quote { amount_out: self.out_amount + amount_in/1000, price_impact_bps: 10, route: vec!["mock".into()], fee_bps: 30, in_reserve: 1_000_000_000, out_reserve: 1_000_000_000, input_mint: input_mint.into(), output_mint: output_mint.into(), tick_spacing: None }))
         } else { Ok(None) }
     }
     fn build_swap_ix(&self, _i:&str, _o:&str, _a:u64, _m:u64) -> Result<Vec<Instruction>> { Ok(vec![]) }

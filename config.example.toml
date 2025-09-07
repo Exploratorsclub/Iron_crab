@@ -17,6 +17,10 @@ keypair_path = "~/.config/solana/id.json"  # Haupt-Wallet (Treasury)
 # rpc_inc_every_successes = 64
 # rpc_dec_on_rate_limit = 4
 # rpc_timeout_ms = 10000
+## WebSocket Failover & Backoff
+# ws_failover_urls = ["wss://api.mainnet-beta.solana.com:8900"]
+# ws_connect_timeout_ms = 8000
+# ws_max_backoff_ms = 20000
 
 # Interne Wallets / Märkte (logische Buckets für Allokation)
 [[markets]]

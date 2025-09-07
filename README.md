@@ -69,6 +69,41 @@ Hinweis: Ohne `--replay-trace` generiert der Driver eine minimale Slot-Sequenz. 
 cargo run --release -- --config .\config.example.toml
 ```
 
+## Security: Keypair ENV loaders & redacting logger
+
+- Keypair sources (priority):
+	1. IRONCRAB_KEYPAIR_JSON – JSON array of 32 or 64 bytes (secret key)
+	2. IRONCRAB_KEYPAIR_B64 – base64 of 32 or 64 bytes
+	3. IRONCRAB_KEYPAIR_BASE58 – base58 secret key string
+	4. IRONCRAB_KEYPAIR_PATH – path to the standard Solana keypair file
+
+- Strict path validation (for PATH):
+	- Enable with IRONCRAB_KEYPAIR_STRICT=1
+	- Allow-list directories via IRONCRAB_KEYPAIR_ALLOWED_DIRS (separate with ; or ,)
+	- Defaults if unset: %APPDATA%\Solana, %USERPROFILE%\.config\solana, .\secrets
+
+- Examples (PowerShell):
+```powershell
+# JSON (32/64 bytes)
+$env:IRONCRAB_KEYPAIR_JSON='[1,2,3, ... ,255]';
+
+# Base64
+$env:IRONCRAB_KEYPAIR_B64='BASE64_SECRET_HERE';
+
+# Base58
+$env:IRONCRAB_KEYPAIR_BASE58='BASE58_SECRET_HERE';
+
+# File path with strict allow-list
+$env:IRONCRAB_KEYPAIR_PATH='C:\\keys\\id.json';
+$env:IRONCRAB_KEYPAIR_STRICT='1';
+$env:IRONCRAB_KEYPAIR_ALLOWED_DIRS='C:\\keys;C:\\Users\\<you>\\AppData\\Roaming\\Solana';
+```
+
+- Redacting logger:
+	- Enabled by default in binaries; respects RUST_LOG (e.g., RUST_LOG=info,ironcrab=debug)
+	- Redacts fields with names containing: secret, private, seed, mnemonic, keypair, sk, kp; also large JSON-like byte arrays
+	- Best-effort protection; do not log secrets explicitly
+
 ### Echtzeit Config Reload (Watcher & SIGHUP)
 Watcher aktivieren (statt Polling):
 ```powershell
@@ -135,6 +170,17 @@ Linux Beispiel:
 ```bash
 cargo run --bin backtest_driver --features python_ipc -- --replay-trace ./traces/sample.jsonl --py-script ./strategies/sample.py
 ```
+
+#### Strategy Interface (Backtest IPC Schema)
+- Input event (one JSON line): SimEvent
+	- { ts_ms: number, kind: "SlotAdvance" | "CfmPriceUpdate" | "NewPool" | "TradeFill" | "ScenarioMeta" | "Log", ... }
+- Output decision (one JSON line): StrategyDecision
+	- { actions: [ { "Swap": { pool, input_mint, output_mint, amount_in, max_slippage_bps } } ] }
+
+Beispiele:
+- `strategies/sample.py`: Minimale Klasse mit `on_tick()` Rückgabe (Demo)
+- `strategies/sample_worker.py`: Zeilen‑Protokoll Worker, der eingehende Events liest und leere Entscheidungen zurückgibt
+
 
 ### Raydium Pool‑Reader CLI
 ```powershell

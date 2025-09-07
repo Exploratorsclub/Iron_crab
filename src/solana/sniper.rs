@@ -20,7 +20,7 @@ use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
 use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use futures::{StreamExt, SinkExt};
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, Error as WsError};
 use std::time::{Duration, Instant};
 use chrono::Utc as ChronoUtc;
 // removed unused imports (OpenOptions, Write, OnceLazy alias, Mutex)
@@ -35,7 +35,9 @@ use crate::metrics::{
     record_shortfall,
     record_network_fee,
     record_trade_return,
+    record_shortfall_pct,
     record_realized_gross_net,
+    record_realized_pnl_sol,
     record_fee_pct,
     RPC_RETRY_ATTEMPTS_TOTAL,
     WS_RECONNECTS_TOTAL,
@@ -421,10 +423,12 @@ impl SniperEngine {
 
     pub async fn subscribe_logs(&self) -> Result<()> {
         use rand::{Rng, SeedableRng};
-        let ws_url = Self::http_to_ws(&self.rpc.rpc.url());
-        let programs = vec![RAYDIUM_AMM_V4.to_string(), ORCA_WHIRLPOOL_PROGRAM.to_string()];
+    // Build endpoint list: primary + optional failovers
+    let mut endpoints: Vec<String> = vec![Self::http_to_ws(&self.rpc.rpc.url())];
+    for e in self.rpc.ws_failovers().iter() { endpoints.push(Self::http_to_ws(e)); }
+    let programs = vec![RAYDIUM_AMM_V4.to_string(), ORCA_WHIRLPOOL_PROGRAM.to_string()];
         for pid in programs {
-            let url = ws_url.clone();
+            let urls = endpoints.clone();
             let engine_clone = self.clone_for_spawn();
             tokio::spawn(async move {
                 let sub_req = json!({
@@ -434,15 +438,24 @@ impl SniperEngine {
                     "params": [ { "mentions": [pid] }, { "commitment": "processed" } ]
                 });
                 let mut attempt: u32 = 0;
+                let mut url_idx: usize = 0;
                 let mut rng = rand::rngs::StdRng::from_entropy();
                 loop {
                     let start_connect = Instant::now();
-                    match connect_async(&url).await {
+                    let url = urls.get(url_idx % urls.len()).cloned().unwrap_or_else(|| urls[0].clone());
+                    // Optional connect timeout wrapper
+                    let connect_fut = connect_async(&url);
+                    let ms = engine_clone.rpc.ws_connect_timeout_ms();
+                    let connect_res = match tokio::time::timeout(Duration::from_millis(ms), connect_fut).await {
+                        Ok(res) => res,
+                        Err(_elapsed) => Err(WsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "ws connect timeout"))),
+                    };
+                    match connect_res {
                         Ok((mut ws, _resp)) => {
                             attempt = 0;
                             WS_ACTIVE_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if ws.send(Message::text(sub_req.to_string())).await.is_err() { WS_ACTIVE_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); return; }
-                            info!(program_id = %pid, elapsed_ms = start_connect.elapsed().as_millis(), "sniper websocket connected");
+                            info!(program_id = %pid, url=%url, elapsed_ms = start_connect.elapsed().as_millis(), "sniper websocket connected");
                             let mut last_msg = Instant::now();
                             let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
                             loop {
@@ -485,11 +498,16 @@ impl SniperEngine {
                             }
                             WS_ACTIVE_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Err(e) => { warn!(?e, program_id=%pid, "failed websocket connect"); }
+                        Err(e) => {
+                            warn!(?e, program_id=%pid, url=%url, "failed websocket connect");
+                            // On failure, rotate endpoint after a couple attempts to avoid sticky failures
+                            if attempt % 3 == 2 { url_idx = url_idx.wrapping_add(1); }
+                        }
                     }
                     WS_RECONNECTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     attempt += 1;
-                    let base = (2u64.pow(attempt.min(6)) * 250).min(15_000);
+                    let max_backoff = engine_clone.rpc.ws_max_backoff_ms();
+                    let base = (2u64.pow(attempt.min(6)) * 250).min(max_backoff);
                     let jitter: u64 = rng.gen_range(0..250);
                     tokio::time::sleep(Duration::from_millis(base + jitter)).await;
                 }
@@ -817,7 +835,8 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
     // Prepare message for fee estimate before signing
     let message = solana_sdk::message::Message::new(&tx_ixs, Some(&self.treasury.pubkey()));
     let fee_estimate = self.rpc.get_fee_for_message_retry(&message).await.unwrap_or(0);
-    let tx = Transaction::new_signed_with_payer(&tx_ixs, Some(&self.treasury.pubkey()), &[self.treasury.keypair.as_ref()], bh);
+    let mut tx = Transaction::new_with_payer(&tx_ixs, Some(&self.treasury.pubkey()));
+    tx.try_sign(&[self.treasury.signer_ref()], bh)?;
     let sent_at = Instant::now();
     match self.rpc_retry_tx(&tx, 3).await {
             Ok(sig) => {
@@ -1124,6 +1143,7 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
                 // Observed slippage fraction relative to expected_out: s = shortfall / max(expected,1)
                 let expected_safe = expected_raw.max(1) as f64;
                 let observed_slip = (shortfall as f64 / expected_safe).max(0.0);
+                record_shortfall_pct(observed_slip);
                 {
                     let mut rs = self.risk.write();
                     // Maintain rolling window
@@ -1355,7 +1375,8 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
         if tx_ixs.is_empty() { return Ok(()); }
     let message = solana_sdk::message::Message::new(&tx_ixs, Some(&self.treasury.pubkey()));
     let fee_estimate = self.rpc.get_fee_for_message_retry(&message).await.unwrap_or(0);
-    let tx = Transaction::new_signed_with_payer(&tx_ixs, Some(&self.treasury.pubkey()), &[self.treasury.keypair.as_ref()], bh);
+    let mut tx = Transaction::new_with_payer(&tx_ixs, Some(&self.treasury.pubkey()));
+    tx.try_sign(&[self.treasury.signer_ref()], bh)?;
     // Snapshot invested_sol for position (if exists) before trade (read-only borrow)
     let invested_sol_lot = {
         let rs = self.risk.read();
@@ -1432,6 +1453,8 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
                 let gross = delta_wsol - notional; // proceeds minus cost basis slice
                 let net = gross - (fee_estimate as f64 / 1e9);
                 record_realized_gross_net(gross, net);
+                // Also record absolute realized PnL (SOL) histogram using net
+                record_realized_pnl_sol(net);
                 let line = format!(
                     "{ts},SELL,{mint},*,{sig},0,{lamports_out},{tok_in},{tok_out},,,0,,{fee},{realized},exit_fraction={fraction}",
                     ts=ChronoUtc::now().to_rfc3339(),
@@ -1542,6 +1565,21 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
         if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
         let snapshot = self.build_risk_snapshot_json();
         if let Ok(txt) = serde_json::to_string_pretty(&snapshot) { let _ = std::fs::write(&path, txt); }
+        // Update extended metrics from current RiskState on each persist
+        {
+            let rs = self.risk.read();
+            let lots: usize = rs.open.values().map(|v| v.len()).sum();
+            OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
+            DAILY_REALIZED_PNL_SOL_MICRO.store((rs.realized_pnl_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+            // Sharpe gauge
+            crate::metrics::update_sharpe(rs.last_sharpe);
+            // Drawdown relative to configured daily loss limit (if set)
+            if let Some(limit) = self.cfg.read().daily_loss_limit_sol { if limit > 0.0 {
+                let dd = (rs.realized_loss_today_sol / limit).clamp(0.0, 1.0);
+                crate::metrics::update_drawdown(dd);
+            }}
+        }
+        crate::metrics::record_activity();
     }
 
     fn build_risk_snapshot_json(&self) -> serde_json::Value {
@@ -1608,6 +1646,12 @@ impl SniperEngine { // auxiliary impl continuation (initial buy etc.)
                     let lots: usize = rs.open.values().map(|v| v.len()).sum();
                     OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
                     DAILY_REALIZED_PNL_SOL_MICRO.store((rs.realized_pnl_sol * 1_000_000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+                    // Also publish Sharpe and drawdown gauges after restore
+                    crate::metrics::update_sharpe(rs.last_sharpe);
+                    if let Some(limit) = self.cfg.read().daily_loss_limit_sol { if limit > 0.0 {
+                        let dd = (rs.realized_loss_today_sol / limit).clamp(0.0, 1.0);
+                        crate::metrics::update_drawdown(dd);
+                    }}
                     info!(positions = rs.open.len(), "risk state restored");
             } else {
                 warn!("risk state json parse failed");

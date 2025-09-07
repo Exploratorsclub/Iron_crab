@@ -16,12 +16,12 @@ impl Dex for EdgeDex {
         // Provide both directions; inverse multiplier for reverse
         if input_mint == self.a && output_mint == self.b {
             let out = amount_in.saturating_mul(self.multiplier) / 10_000;
-            return Ok(Some(Quote { amount_out: out, price_impact_bps: 10, route: vec!["edge".into()], fee_bps: 30, in_reserve: 1_000_000_000, out_reserve: 1_000_000_000, input_mint: input_mint.into(), output_mint: output_mint.into() }));
+            return Ok(Some(Quote { amount_out: out, price_impact_bps: 10, route: vec!["edge".into()], fee_bps: 30, in_reserve: 1_000_000_000, out_reserve: 1_000_000_000, input_mint: input_mint.into(), output_mint: output_mint.into(), tick_spacing: None }));
         }
         if input_mint == self.b && output_mint == self.a {
             // approximate inverse
             let out = amount_in.saturating_mul(10_000) / self.multiplier.max(1);
-            return Ok(Some(Quote { amount_out: out, price_impact_bps: 10, route: vec!["edge".into()], fee_bps: 30, in_reserve: 1_000_000_000, out_reserve: 1_000_000_000, input_mint: input_mint.into(), output_mint: output_mint.into() }));
+            return Ok(Some(Quote { amount_out: out, price_impact_bps: 10, route: vec!["edge".into()], fee_bps: 30, in_reserve: 1_000_000_000, out_reserve: 1_000_000_000, input_mint: input_mint.into(), output_mint: output_mint.into(), tick_spacing: None }));
         }
         Ok(None)
     }
