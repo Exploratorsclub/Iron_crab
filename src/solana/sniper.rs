@@ -1395,16 +1395,17 @@ impl SniperEngine {
             // Polling fallback (disabled if feature notify_watch active)
             #[cfg(not(feature = "notify_watch"))]
             {
+                let path_poll = path_buf.clone();
                 tokio::spawn(async move {
                     let mut ivr = tokio::time::interval(Duration::from_secs(30));
                     let mut last_mod = std::time::SystemTime::UNIX_EPOCH;
                     loop {
                         ivr.tick().await;
-                        if let Ok(meta) = std::fs::metadata(&path_buf) {
+                        if let Ok(meta) = std::fs::metadata(&path_poll) {
                             if let Ok(modified) = meta.modified() {
                                 if modified > last_mod {
                                     last_mod = modified;
-                                    if let Ok(txt) = std::fs::read_to_string(&path_buf) {
+                                    if let Ok(txt) = std::fs::read_to_string(&path_poll) {
                                         if let Ok(root) =
                                             toml::from_str::<crate::config::Config>(&txt)
                                         {
