@@ -11,9 +11,10 @@ pub mod py {
 
     pub struct PyStrategy {
         name: String,
-        module_path: String,
-        class_name: String,
-        params: serde_json::Value,
+    // Stored for potential introspection/debug; currently unused
+    _module_path: String,
+    _class_name: String,
+    _params: serde_json::Value,
         py_obj: PyObject,
     }
 
@@ -38,13 +39,7 @@ pub mod py {
                 Ok(inst.into())
             })?;
 
-            Ok(Self {
-                name,
-                module_path,
-                class_name,
-                params,
-                py_obj,
-            })
+            Ok(Self { name, _module_path: module_path, _class_name: class_name, _params: params, py_obj })
         }
     }
 
