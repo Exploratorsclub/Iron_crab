@@ -18,6 +18,9 @@ struct Opts {
     /// Impact model to use for slippage checks (cpmm|clmm|none)
     #[arg(long)]
     impact: Option<String>,
+    /// Python script path to use as IPC strategy (feature=python)
+    #[arg(long)]
+    py_script: Option<String>,
 }
 
 #[tokio::main]
@@ -57,8 +60,25 @@ async fn main() -> anyhow::Result<()> {
     } else {
         vec![SimEvent { ts_ms: 0, kind: SimEventKind::SlotAdvance { slot: 0 } }]
     };
-    let strategy = NoopStrategy;
-    let mut engine = BacktestEngine::new(strategy, adapter, portfolio, events);
+    #[allow(unused_mut)]
+    let mut engine = {
+        #[cfg(feature = "python")]
+        {
+            if let Some(script) = opts.py_script.as_ref() {
+                use ironcrab::backtest::engine::py_strategy_adapter::PyProcStrategy;
+                let strategy = PyProcStrategy::from_script(script.clone());
+                BacktestEngine::new(strategy, adapter, portfolio, events)
+            } else {
+                let strategy = NoopStrategy;
+                BacktestEngine::new(strategy, adapter, portfolio, events)
+            }
+        }
+        #[cfg(not(feature = "python"))]
+        {
+            let strategy = NoopStrategy;
+            BacktestEngine::new(strategy, adapter, portfolio, events)
+        }
+    };
     // Optional impact model selection
     if let Some(model) = opts.impact.as_deref() {
         match model.to_ascii_lowercase().as_str() {

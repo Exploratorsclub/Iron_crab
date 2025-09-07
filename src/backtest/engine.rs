@@ -86,6 +86,17 @@ pub mod py_strategy_adapter {
 
     impl PyProcStrategy {
         pub fn new(cmd: impl Into<String>, args: Vec<String>) -> Self { Self { cmd: cmd.into(), args } }
+        /// Convenience: run `python <script_path>`
+        pub fn from_script(script_path: impl Into<String>) -> Self {
+            Self { cmd: "python".into(), args: vec![script_path.into()] }
+        }
+        /// Convenience: custom python executable + script + extra args
+        pub fn with_python(python_exe: impl Into<String>, script_path: impl Into<String>, extra_args: &[impl AsRef<str>]) -> Self {
+            let mut args: Vec<String> = Vec::with_capacity(1 + extra_args.len());
+            args.push(script_path.into());
+            for a in extra_args { args.push(a.as_ref().to_string()); }
+            Self { cmd: python_exe.into(), args }
+        }
     }
 
     impl BacktestStrategy for PyProcStrategy {
