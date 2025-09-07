@@ -52,6 +52,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Setup Python
+        id: setup-py
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -74,12 +75,12 @@ jobs:
           which python3 || true
           echo "pythonLocation=$PYTHONLOCATION"
 
-      - name: Clippy (python feature)
+    - name: Clippy (python feature)
         env:
-          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
+      PYO3_PYTHON: ${{ steps.setup-py.outputs.python-path }}
         run: cargo clippy --all-targets --features python -- -D warnings
 
-      - name: Tests (python feature)
+    - name: Tests (python feature)
         env:
-          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
+      PYO3_PYTHON: ${{ steps.setup-py.outputs.python-path }}
         run: cargo test --features python --quiet
