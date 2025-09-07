@@ -60,25 +60,27 @@ async fn main() -> anyhow::Result<()> {
     } else {
         vec![SimEvent { ts_ms: 0, kind: SimEventKind::SlotAdvance { slot: 0 } }]
     };
-    #[allow(unused_mut)]
-    let mut engine = {
-        #[cfg(feature = "python")]
-        {
-            if let Some(script) = opts.py_script.as_ref() {
-                use ironcrab::backtest::engine::py_strategy_adapter::PyProcStrategy;
-                let strategy = PyProcStrategy::from_script(script.clone());
-                BacktestEngine::new(strategy, adapter, portfolio, events)
-            } else {
-                let strategy = NoopStrategy;
-                BacktestEngine::new(strategy, adapter, portfolio, events)
+    #[cfg(feature = "python_ipc")]
+    if let Some(script) = opts.py_script.as_ref() {
+        use ironcrab::backtest::engine::py_strategy_adapter::PyProcStrategy;
+        let strategy = PyProcStrategy::from_script(script.clone());
+        let mut engine = BacktestEngine::new(strategy, adapter, portfolio, events);
+        // Optional impact model selection
+        if let Some(model) = opts.impact.as_deref() {
+            match model.to_ascii_lowercase().as_str() {
+                "cpmm" => engine.set_impact_model(Box::new(CpmMModel)),
+                "clmm" => engine.set_impact_model(Box::new(ClmmModel)),
+                "none" => { /* leave unset */ }
+                other => eprintln!("Unknown impact model: {other} (use cpmm|clmm|none)"),
             }
         }
-        #[cfg(not(feature = "python"))]
-        {
-            let strategy = NoopStrategy;
-            BacktestEngine::new(strategy, adapter, portfolio, events)
-        }
-    };
+        engine.run()?;
+        println!("Decisions: {}", engine.decisions.len());
+        return Ok(());
+    }
+
+    let strategy = NoopStrategy;
+    let mut engine = BacktestEngine::new(strategy, adapter, portfolio, events);
     // Optional impact model selection
     if let Some(model) = opts.impact.as_deref() {
         match model.to_ascii_lowercase().as_str() {

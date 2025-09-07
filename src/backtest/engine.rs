@@ -71,8 +71,8 @@ impl<S: BacktestStrategy, M: MarketAdapter> BacktestEngine<S,M> {
     }
 }
 
-// Optional: Python Strategy Adapter (IPC JSON) for backtests
-#[cfg(feature = "python")]
+// Optional: Python Strategy Adapter (IPC JSON) for backtests (no pyo3 needed)
+#[cfg(feature = "python_ipc")]
 pub mod py_strategy_adapter {
     use super::*;
     use anyhow::{Result, anyhow};

@@ -127,9 +127,13 @@ print(json.dumps({"actions": []}))
 ```
 Verwendung im Backtest‑Code: `PyProcStrategy::new("python", ["strategies/sample.py"])` (unter Feature `python`).
 
-CLI Komfort (Feature `python`):
+CLI Komfort (Feature `python_ipc` – pyo3 nicht benötigt, funktioniert ohne Python Headers):
 ```powershell
-cargo run --bin backtest_driver --features python -- --replay-trace .\traces\sample.jsonl --py-script .\strategies\sample.py
+cargo run --bin backtest_driver --features python_ipc -- --replay-trace .\traces\sample.jsonl --py-script .\strategies\sample.py
+```
+Linux Beispiel:
+```bash
+cargo run --bin backtest_driver --features python_ipc -- --replay-trace ./traces/sample.jsonl --py-script ./strategies/sample.py
 ```
 
 ### Raydium Pool‑Reader CLI

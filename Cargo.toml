@@ -58,6 +58,7 @@ notify = { version = "6", optional = true }
 default = []
 test_helpers = []
 python = ["pyo3"]
+python_ipc = []
 jito = []
 notify_watch = ["notify"]
 
