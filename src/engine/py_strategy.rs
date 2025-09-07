@@ -3,8 +3,8 @@
 pub mod py {
     use anyhow::Result;
     use async_trait::async_trait;
-    use pyo3::prelude::*;
     use parking_lot::Mutex;
+    use pyo3::prelude::*;
     use std::sync::Arc;
 
     use crate::engine::{EngineContext, Strategy};
@@ -12,11 +12,11 @@ pub mod py {
 
     pub struct PyStrategy {
         name: String,
-    // Stored for potential introspection/debug; currently unused
-    _module_path: String,
-    _class_name: String,
-    _params: serde_json::Value,
-    py_obj: Mutex<PyObject>,
+        // Stored for potential introspection/debug; currently unused
+        _module_path: String,
+        _class_name: String,
+        _params: serde_json::Value,
+        py_obj: Mutex<PyObject>,
     }
 
     impl PyStrategy {
@@ -40,7 +40,13 @@ pub mod py {
                 Ok(inst.into())
             })?;
 
-            Ok(Self { name, _module_path: module_path, _class_name: class_name, _params: params, py_obj: Mutex::new(py_obj) })
+            Ok(Self {
+                name,
+                _module_path: module_path,
+                _class_name: class_name,
+                _params: params,
+                py_obj: Mutex::new(py_obj),
+            })
         }
     }
 
