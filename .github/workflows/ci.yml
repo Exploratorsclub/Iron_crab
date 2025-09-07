@@ -66,15 +66,20 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-py
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Show Python version
-        run: python --version
+      - name: Show Python version and path
+        run: |
+          python --version || true
+          python3 --version || true
+          which python || true
+          which python3 || true
+          echo "pythonLocation=$PYTHONLOCATION"
 
       - name: Clippy (python feature)
         env:
-          PYO3_PYTHON: python
+          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
         run: cargo clippy --all-targets --features python -- -D warnings
 
       - name: Tests (python feature)
         env:
-          PYO3_PYTHON: python
+          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
         run: cargo test --features python --quiet

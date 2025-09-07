@@ -66,5 +66,5 @@ notify_watch = ["notify"]
 
 [dependencies.pyo3]
 version = "0.21"
-features = ["extension-module"]
+features = ["auto-initialize"]
 optional = true
