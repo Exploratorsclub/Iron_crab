@@ -71,6 +71,45 @@ impl<S: BacktestStrategy, M: MarketAdapter> BacktestEngine<S,M> {
     }
 }
 
+// Optional: Python Strategy Adapter (IPC JSON) for backtests
+#[cfg(feature = "python")]
+pub mod py_strategy_adapter {
+    use super::*;
+    use anyhow::{Result, anyhow};
+    use std::process::{Command, Stdio};
+    use std::io::Write;
+
+    pub struct PyProcStrategy {
+        pub cmd: String,
+        pub args: Vec<String>,
+    }
+
+    impl PyProcStrategy {
+        pub fn new(cmd: impl Into<String>, args: Vec<String>) -> Self { Self { cmd: cmd.into(), args } }
+    }
+
+    impl BacktestStrategy for PyProcStrategy {
+        fn on_event(&self, _ctx: &SimContext, event: &SimEvent) -> StrategyDecision {
+            // Send event JSON on stdin; read a single JSON line of StrategyDecision from stdout
+            let mut child = match Command::new(&self.cmd)
+                .args(&self.args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn() {
+                Ok(c) => c,
+                Err(_) => return StrategyDecision { actions: vec![] },
+            };
+            let ev_json = match serde_json::to_string(event) { Ok(s) => s, Err(_) => return StrategyDecision { actions: vec![] } };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = writeln!(stdin, "{}", ev_json);
+            }
+            let out = match child.wait_with_output() { Ok(o) => o, Err(_) => return StrategyDecision { actions: vec![] } };
+            if !out.status.success() { return StrategyDecision { actions: vec![] }; }
+            match serde_json::from_slice::<StrategyDecision>(&out.stdout) { Ok(d) => d, Err(_) => StrategyDecision { actions: vec![] } }
+        }
+    }
+}
+
 pub struct NoopStrategy;
 impl BacktestStrategy for NoopStrategy { fn on_event(&self, _ctx:&SimContext, _ev:&SimEvent) -> StrategyDecision { StrategyDecision { actions: vec![] } } }
 

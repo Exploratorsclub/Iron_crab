@@ -117,6 +117,15 @@ Hinweise:
 ```powershell
 cargo run --release --features python -- --config .\config.example.toml
 ```
+Backtesting (IPC Variante): Für Backtests steht zusätzlich eine einfache IPC‑Strategie zur Verfügung, die bei jedem Event ein Python‑Skript als Prozess startet, das eine `StrategyDecision` als JSON an stdout schreibt. Erwartetes Protokoll: stdin erhält genau ein Zeile JSON des `SimEvent`, stdout liefert genau eine `StrategyDecision` JSON.
+
+Beispiel Python (vereinfachtes Echo):
+```python
+import sys, json
+ev = json.loads(sys.stdin.readline())
+print(json.dumps({"actions": []}))
+```
+Verwendung im Backtest‑Code: `PyProcStrategy::new("python", ["strategies/sample.py"])` (unter Feature `python`).
 
 ### Raydium Pool‑Reader CLI
 ```powershell

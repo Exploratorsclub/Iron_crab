@@ -33,13 +33,13 @@ impl Portfolio {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionSwap { pub pool: String, pub input_mint: String, pub output_mint: String, pub amount_in: u64, pub max_slippage_bps: u32 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StrategyAction { Swap(ActionSwap) }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyDecision { pub actions: Vec<StrategyAction> }
 
 pub trait BacktestStrategy: Send + Sync {

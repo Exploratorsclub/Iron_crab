@@ -171,9 +171,9 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 
 ### Backtesting & Strategy
 - [ ] `py_strategy` FFI (pyo3 oder IPC) für externe Signale
-	- [ ] API‑Contract definieren: Inputs (Preis‑Snapshots, Pool‑State, Positions‑State), Outputs (Entry/Exit‑Signale, Size, min_out bps)
-	- [ ] Schnittstelle (Serde Schema): JSON/MessagePack; Versionierung + Kompatibilitätscheck
-	- [ ] pyo3 Modul‑Skeleton (+ Feature‑Flag `py_strategy`); Alternative IPC (lokaler TCP/Named Pipe) mit Request/Response – PARTIAL (Engine `python` Feature + sample bindings exist)
+	- [~] API‑Contract definieren: Inputs (Preis‑Snapshots, Pool‑State, Positions‑State), Outputs (Entry/Exit‑Signale, Size, min_out bps) – PARTIAL (Backtest akzeptiert `StrategyDecision` JSON, siehe README)
+	- [~] Schnittstelle (Serde Schema): JSON/MessagePack; Versionierung + Kompatibilitätscheck – PARTIAL (JSON für Backtest IPC)
+	- [~] pyo3 Modul‑Skeleton (+ Feature‑Flag `py_strategy`); Alternative IPC (lokaler TCP/Named Pipe) mit Request/Response – PARTIAL (Engine pyo3 Adapter + Backtest IPC Prozess‑Adapter)
 	- [ ] Strategy‑Lifecycle: `init`, `on_tick`, `on_fill`, `on_exit` (+ Zeitbudget/Timeout je Call)
 	- [ ] Sandbox & Isolation: Panic/Exception Catching, Timeout‑Abbruch, Circuit Breaker bei Fehlerhäufung
 	- [ ] Beispielstrategie (`strategies/sample.py`) + README mit Interface‑Spec
