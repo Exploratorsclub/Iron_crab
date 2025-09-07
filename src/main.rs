@@ -1,12 +1,11 @@
-
-use std::{path::PathBuf, sync::Arc};
 use clap::Parser;
+use std::{path::PathBuf, sync::Arc};
 
 use ironcrab::config::Config;
-use ironcrab::wallet::Treasury;
 use ironcrab::engine::Engine;
-use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::metrics::serve_metrics;
+use ironcrab::solana::rpc::SolanaRpc;
+use ironcrab::wallet::Treasury;
 use std::net::SocketAddr;
 
 #[derive(Parser, Debug)]

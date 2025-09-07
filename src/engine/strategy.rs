@@ -1,11 +1,10 @@
-
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::Instrument;
 
-use crate::types::TradeIntent;
 use super::EngineContext;
+use crate::types::TradeIntent;
 
 #[async_trait]
 pub trait Strategy: Send + Sync {
@@ -13,7 +12,9 @@ pub trait Strategy: Send + Sync {
 
     /// Optional: einmaliger Init Hook beim Engine-Start
     #[allow(unused)]
-    fn init(&self, _ctx: Arc<EngineContext>) -> anyhow::Result<()> { Ok(()) }
+    fn init(&self, _ctx: Arc<EngineContext>) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Wird ca. alle `tick_ms` vom Engine Loop aufgerufen.
     async fn on_tick(&self, ctx: Arc<EngineContext>) -> anyhow::Result<Vec<TradeIntent>>;

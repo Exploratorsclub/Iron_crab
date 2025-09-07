@@ -1,9 +1,9 @@
-use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
-use once_cell::sync::Lazy;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use std::net::SocketAddr;
-use hyper::{Body, Request, Response, Server};
 use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Request, Response, Server};
+use once_cell::sync::Lazy;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // Global counters (simple, lock-free). For production consider Prometheus exporter.
 pub static QUOTE_REQUESTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -38,13 +38,44 @@ pub static OPEN_POSITIONS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0
 pub static DAILY_REALIZED_PNL_SOL_MICRO: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static LIQUIDITY_ESTIMATE_SOL_MICRO: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Histogram (swap latency) simplified: we keep bucket counters manually (ns)
-const SWAP_LATENCY_BUCKETS: &[u64] = &[1_000_000, 2_000_000, 5_000_000, 10_000_000, 25_000_000, 50_000_000, 100_000_000, 250_000_000, 500_000_000, 1_000_000_000];
-pub static SWAP_LATENCY_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| SWAP_LATENCY_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
+const SWAP_LATENCY_BUCKETS: &[u64] = &[
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    25_000_000,
+    50_000_000,
+    100_000_000,
+    250_000_000,
+    500_000_000,
+    1_000_000_000,
+];
+pub static SWAP_LATENCY_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    SWAP_LATENCY_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
 pub static SWAP_LATENCY_SUM_NS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static SWAP_LATENCY_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Quote latency histogram
-const QUOTE_LATENCY_BUCKETS: &[u64] = &[200_000, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000, 25_000_000, 50_000_000, 100_000_000];
-pub static QUOTE_LATENCY_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| QUOTE_LATENCY_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
+const QUOTE_LATENCY_BUCKETS: &[u64] = &[
+    200_000,
+    500_000,
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    25_000_000,
+    50_000_000,
+    100_000_000,
+];
+pub static QUOTE_LATENCY_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    QUOTE_LATENCY_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
 pub static QUOTE_LATENCY_SUM_NS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static QUOTE_LATENCY_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Shortfall / Slippage aggregation
@@ -91,27 +122,43 @@ pub static GROSS_REALIZED_PNL_SOL_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI6
 pub static NET_REALIZED_PNL_SOL_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 // Realized PnL (SOL) histogram (signed, absolute in SOL)
 const REALIZED_PNL_SOL_BUCKETS: &[f64] = &[
-    -1.0, -0.5, -0.25, -0.1, -0.05, -0.02, -0.01, 0.0,
-     0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0
+    -1.0, -0.5, -0.25, -0.1, -0.05, -0.02, -0.01, 0.0, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0,
 ];
-pub static REALIZED_PNL_SOL_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| REALIZED_PNL_SOL_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
+pub static REALIZED_PNL_SOL_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    REALIZED_PNL_SOL_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
 pub static REALIZED_PNL_SOL_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static REALIZED_PNL_SOL_SUM_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 // Fee percent histogram (fee / notional), common percent buckets
 const FEE_PCT_BUCKETS: &[f64] = &[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1];
-pub static FEE_PCT_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| FEE_PCT_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
+pub static FEE_PCT_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| FEE_PCT_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
 pub static FEE_PCT_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Shortfall percent histogram (shortfall / expected_out)
-const SHORTFALL_PCT_BUCKETS: &[f64] = &[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5];
-pub static SHORTFALL_PCT_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| SHORTFALL_PCT_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
+const SHORTFALL_PCT_BUCKETS: &[f64] = &[
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5,
+];
+pub static SHORTFALL_PCT_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    SHORTFALL_PCT_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
 pub static SHORTFALL_PCT_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Realized trade return histogram (ratio realized_pnl / invested) buckets (cumulative style capture)
 // Buckets chosen to capture deep losses to outsized wins.
 const TRADE_RETURN_BUCKETS: &[f64] = &[
-    -0.9, -0.5, -0.25, -0.1, -0.05, -0.02, -0.01, 0.0,
-     0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0
+    -0.9, -0.5, -0.25, -0.1, -0.05, -0.02, -0.01, 0.0, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0,
 ];
-pub static TRADE_RETURN_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| TRADE_RETURN_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect());
+pub static TRADE_RETURN_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    TRADE_RETURN_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
 pub static TRADE_RETURN_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TRADE_RETURN_SUM_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0)); // signed sum(ret * 1e6) for average
 pub static SHARPE_RATIO_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
@@ -119,14 +166,32 @@ pub static DRAWDOWN_PCT_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0))
 pub static LAST_ACTIVITY_TS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub struct LatencyTimer { start: Instant }
-impl LatencyTimer { pub fn start() -> Self { Self { start: Instant::now() } } }
-impl Drop for LatencyTimer { fn drop(&mut self) { let ns = self.start.elapsed().as_nanos() as u64; QUOTE_LATENCY_TOTAL_NS.fetch_add(ns, Ordering::Relaxed); } }
+pub struct LatencyTimer {
+    start: Instant,
+}
+impl LatencyTimer {
+    pub fn start() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+impl Drop for LatencyTimer {
+    fn drop(&mut self) {
+        let ns = self.start.elapsed().as_nanos() as u64;
+        QUOTE_LATENCY_TOTAL_NS.fetch_add(ns, Ordering::Relaxed);
+    }
+}
 
 pub fn record_quote_latency(ns: u64) {
     QUOTE_LATENCY_SUM_NS.fetch_add(ns, Ordering::Relaxed);
     QUOTE_LATENCY_COUNT.fetch_add(1, Ordering::Relaxed);
-    for (i,b) in QUOTE_LATENCY_BUCKETS.iter().enumerate() { if ns <= *b { QUOTE_LATENCY_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed); break; } }
+    for (i, b) in QUOTE_LATENCY_BUCKETS.iter().enumerate() {
+        if ns <= *b {
+            QUOTE_LATENCY_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+    }
 }
 
 pub fn record_shortfall(tokens: u64, sol_ui: f64) {
@@ -135,13 +200,19 @@ pub fn record_shortfall(tokens: u64, sol_ui: f64) {
     FILLS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn record_network_fee(lamports: u64) { NETWORK_FEES_LAMPORTS_TOTAL.fetch_add(lamports, Ordering::Relaxed); }
+pub fn record_network_fee(lamports: u64) {
+    NETWORK_FEES_LAMPORTS_TOTAL.fetch_add(lamports, Ordering::Relaxed);
+}
 
 pub fn record_trade_return(ret: f64) {
     // Clamp extreme outliers to last bucket range for stability
     let mut placed = false;
-    for (i,b) in TRADE_RETURN_BUCKETS.iter().enumerate() {
-        if ret <= *b { TRADE_RETURN_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed); placed = true; break; }
+    for (i, b) in TRADE_RETURN_BUCKETS.iter().enumerate() {
+        if ret <= *b {
+            TRADE_RETURN_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+            placed = true;
+            break;
+        }
     }
     if !placed {
         // Overflow (> last bucket) counts only in an implicit +Inf bucket via count (Prometheus expectation). We don't keep explicit here.
@@ -149,22 +220,42 @@ pub fn record_trade_return(ret: f64) {
     TRADE_RETURN_COUNT.fetch_add(1, Ordering::Relaxed);
     let micro = (ret * 1_000_000.0).round();
     // Bound to i64 range
-    let micro_i64 = if micro > i64::MAX as f64 { i64::MAX } else if micro < i64::MIN as f64 { i64::MIN } else { micro as i64 };
+    let micro_i64 = if micro > i64::MAX as f64 {
+        i64::MAX
+    } else if micro < i64::MIN as f64 {
+        i64::MIN
+    } else {
+        micro as i64
+    };
     TRADE_RETURN_SUM_MICRO.fetch_add(micro_i64, Ordering::Relaxed);
 }
 
 pub fn record_fee_pct(pct: f64) {
-    let p = if pct.is_nan() || pct.is_infinite() || pct < 0.0 { 0.0 } else { pct };
-    for (i,b) in FEE_PCT_BUCKETS.iter().enumerate() {
-        if p <= *b { FEE_PCT_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed); break; }
+    let p = if pct.is_nan() || pct.is_infinite() || pct < 0.0 {
+        0.0
+    } else {
+        pct
+    };
+    for (i, b) in FEE_PCT_BUCKETS.iter().enumerate() {
+        if p <= *b {
+            FEE_PCT_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+            break;
+        }
     }
     FEE_PCT_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn record_shortfall_pct(pct: f64) {
-    let p = if pct.is_nan() || pct.is_infinite() || pct < 0.0 { 0.0 } else { pct };
-    for (i,b) in SHORTFALL_PCT_BUCKETS.iter().enumerate() {
-        if p <= *b { SHORTFALL_PCT_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed); break; }
+    let p = if pct.is_nan() || pct.is_infinite() || pct < 0.0 {
+        0.0
+    } else {
+        pct
+    };
+    for (i, b) in SHORTFALL_PCT_BUCKETS.iter().enumerate() {
+        if p <= *b {
+            SHORTFALL_PCT_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+            break;
+        }
     }
     SHORTFALL_PCT_COUNT.fetch_add(1, Ordering::Relaxed);
 }
@@ -179,13 +270,23 @@ pub fn record_realized_gross_net(gross_sol: f64, net_sol: f64) {
 pub fn record_realized_pnl_sol(value_sol: f64) {
     // Place in signed buckets; overflow goes to +Inf via count only
     let mut placed = false;
-    for (i,b) in REALIZED_PNL_SOL_BUCKETS.iter().enumerate() {
-        if value_sol <= *b { REALIZED_PNL_SOL_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed); placed = true; break; }
+    for (i, b) in REALIZED_PNL_SOL_BUCKETS.iter().enumerate() {
+        if value_sol <= *b {
+            REALIZED_PNL_SOL_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+            placed = true;
+            break;
+        }
     }
     if !placed { /* +Inf implicit via count only */ }
     REALIZED_PNL_SOL_COUNT.fetch_add(1, Ordering::Relaxed);
     let micro = (value_sol * 1_000_000.0).round();
-    let micro_i64 = if micro > i64::MAX as f64 { i64::MAX } else if micro < i64::MIN as f64 { i64::MIN } else { micro as i64 };
+    let micro_i64 = if micro > i64::MAX as f64 {
+        i64::MAX
+    } else if micro < i64::MIN as f64 {
+        i64::MIN
+    } else {
+        micro as i64
+    };
     REALIZED_PNL_SOL_SUM_MICRO.fetch_add(micro_i64, Ordering::Relaxed);
 }
 
@@ -198,17 +299,17 @@ pub fn snapshot() -> MetricsSnapshot {
         router_hops3: ROUTER_HOPS3.load(Ordering::Relaxed),
         arb_triangle_attempts: ARB_TRIANGLE_ATTEMPTS.load(Ordering::Relaxed),
         arb_triangle_profitable: ARB_TRIANGLE_PROFITABLE.load(Ordering::Relaxed),
-    cycle_partial_examined: CYCLE_PARTIAL_EXAMINED.load(Ordering::Relaxed),
-    cycle_pruned_dominance: CYCLE_PRUNED_DOMINANCE.load(Ordering::Relaxed),
-    cycle_pruned_bound: CYCLE_PRUNED_BOUND.load(Ordering::Relaxed),
-    cycle_completed: CYCLE_COMPLETED.load(Ordering::Relaxed),
-    raydium_pools_loaded: RAYDIUM_POOLS_LOADED.load(Ordering::Relaxed),
-    raydium_pools_skipped_serum: RAYDIUM_POOLS_SKIPPED_SERUM.load(Ordering::Relaxed),
-    raydium_pools_skipped_invalid: RAYDIUM_POOLS_SKIPPED_INVALID.load(Ordering::Relaxed),
+        cycle_partial_examined: CYCLE_PARTIAL_EXAMINED.load(Ordering::Relaxed),
+        cycle_pruned_dominance: CYCLE_PRUNED_DOMINANCE.load(Ordering::Relaxed),
+        cycle_pruned_bound: CYCLE_PRUNED_BOUND.load(Ordering::Relaxed),
+        cycle_completed: CYCLE_COMPLETED.load(Ordering::Relaxed),
+        raydium_pools_loaded: RAYDIUM_POOLS_LOADED.load(Ordering::Relaxed),
+        raydium_pools_skipped_serum: RAYDIUM_POOLS_SKIPPED_SERUM.load(Ordering::Relaxed),
+        raydium_pools_skipped_invalid: RAYDIUM_POOLS_SKIPPED_INVALID.load(Ordering::Relaxed),
         avg_quote_latency_ms: {
             let reqs = QUOTE_REQUESTS.load(Ordering::Relaxed).max(1);
             (QUOTE_LATENCY_TOTAL_NS.load(Ordering::Relaxed) / reqs) as f64 / 1_000_000.0
-        }
+        },
     }
 }
 
@@ -236,134 +337,372 @@ pub fn record_swap_latency(ns: u64) {
     SWAP_LATENCY_SUM_NS.fetch_add(ns, Ordering::Relaxed);
     SWAP_LATENCY_COUNT.fetch_add(1, Ordering::Relaxed);
     for (i, bucket) in SWAP_LATENCY_BUCKETS.iter().enumerate() {
-        if ns <= *bucket { SWAP_LATENCY_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed); break; }
+        if ns <= *bucket {
+            SWAP_LATENCY_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+            break;
+        }
     }
 }
 
 async fn metrics_response() -> Response<Body> {
     // Build Prometheus exposition text
     let mut out = String::with_capacity(4096);
-    macro_rules! line { ($name:expr, $val:expr) => { out.push_str($name); out.push(' '); out.push_str(&$val.to_string()); out.push('\n'); }; }
-    line!("quote_requests_total", QUOTE_REQUESTS.load(Ordering::Relaxed));
-    line!("quote_successes_total", QUOTE_SUCCESSES.load(Ordering::Relaxed));
-    line!("router_single_hop_total", ROUTER_SINGLE_HOP.load(Ordering::Relaxed));
+    macro_rules! line {
+        ($name:expr, $val:expr) => {
+            out.push_str($name);
+            out.push(' ');
+            out.push_str(&$val.to_string());
+            out.push('\n');
+        };
+    }
+    line!(
+        "quote_requests_total",
+        QUOTE_REQUESTS.load(Ordering::Relaxed)
+    );
+    line!(
+        "quote_successes_total",
+        QUOTE_SUCCESSES.load(Ordering::Relaxed)
+    );
+    line!(
+        "router_single_hop_total",
+        ROUTER_SINGLE_HOP.load(Ordering::Relaxed)
+    );
     line!("router_hops2_total", ROUTER_HOPS2.load(Ordering::Relaxed));
     line!("router_hops3_total", ROUTER_HOPS3.load(Ordering::Relaxed));
-    line!("arb_triangle_attempts_total", ARB_TRIANGLE_ATTEMPTS.load(Ordering::Relaxed));
-    line!("arb_triangle_profitable_total", ARB_TRIANGLE_PROFITABLE.load(Ordering::Relaxed));
-    line!("cycle_partial_examined_total", CYCLE_PARTIAL_EXAMINED.load(Ordering::Relaxed));
-    line!("cycle_pruned_dominance_total", CYCLE_PRUNED_DOMINANCE.load(Ordering::Relaxed));
-    line!("cycle_pruned_bound_total", CYCLE_PRUNED_BOUND.load(Ordering::Relaxed));
-    line!("cycle_completed_total", CYCLE_COMPLETED.load(Ordering::Relaxed));
-    line!("raydium_pools_loaded_total", RAYDIUM_POOLS_LOADED.load(Ordering::Relaxed));
-    line!("raydium_pools_skipped_serum_total", RAYDIUM_POOLS_SKIPPED_SERUM.load(Ordering::Relaxed));
-    line!("raydium_pools_skipped_invalid_total", RAYDIUM_POOLS_SKIPPED_INVALID.load(Ordering::Relaxed));
-    line!("trades_executed_total", TRADES_EXECUTED_TOTAL.load(Ordering::Relaxed));
-    line!("trades_failed_total", TRADES_FAILED_TOTAL.load(Ordering::Relaxed));
+    line!(
+        "arb_triangle_attempts_total",
+        ARB_TRIANGLE_ATTEMPTS.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_triangle_profitable_total",
+        ARB_TRIANGLE_PROFITABLE.load(Ordering::Relaxed)
+    );
+    line!(
+        "cycle_partial_examined_total",
+        CYCLE_PARTIAL_EXAMINED.load(Ordering::Relaxed)
+    );
+    line!(
+        "cycle_pruned_dominance_total",
+        CYCLE_PRUNED_DOMINANCE.load(Ordering::Relaxed)
+    );
+    line!(
+        "cycle_pruned_bound_total",
+        CYCLE_PRUNED_BOUND.load(Ordering::Relaxed)
+    );
+    line!(
+        "cycle_completed_total",
+        CYCLE_COMPLETED.load(Ordering::Relaxed)
+    );
+    line!(
+        "raydium_pools_loaded_total",
+        RAYDIUM_POOLS_LOADED.load(Ordering::Relaxed)
+    );
+    line!(
+        "raydium_pools_skipped_serum_total",
+        RAYDIUM_POOLS_SKIPPED_SERUM.load(Ordering::Relaxed)
+    );
+    line!(
+        "raydium_pools_skipped_invalid_total",
+        RAYDIUM_POOLS_SKIPPED_INVALID.load(Ordering::Relaxed)
+    );
+    line!(
+        "trades_executed_total",
+        TRADES_EXECUTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "trades_failed_total",
+        TRADES_FAILED_TOTAL.load(Ordering::Relaxed)
+    );
     line!("rpc_errors_total", RPC_ERRORS_TOTAL.load(Ordering::Relaxed));
-    line!("rpc_rate_limit_hits_total", RPC_RATE_LIMIT_HITS_TOTAL.load(Ordering::Relaxed));
-    line!("rpc_timeouts_total", RPC_TIMEOUTS_TOTAL.load(Ordering::Relaxed));
-    line!("rpc_backoff_ms_total", RPC_BACKOFF_MS_TOTAL.load(Ordering::Relaxed));
-    line!("rpc_concurrency_adjustments_total", RPC_CONCURRENCY_ADJUSTMENTS_TOTAL.load(Ordering::Relaxed));
+    line!(
+        "rpc_rate_limit_hits_total",
+        RPC_RATE_LIMIT_HITS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "rpc_timeouts_total",
+        RPC_TIMEOUTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "rpc_backoff_ms_total",
+        RPC_BACKOFF_MS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "rpc_concurrency_adjustments_total",
+        RPC_CONCURRENCY_ADJUSTMENTS_TOTAL.load(Ordering::Relaxed)
+    );
     line!("rpc_inflight", RPC_INFLIGHT_GAUGE.load(Ordering::Relaxed));
-    line!("rpc_allowed_concurrency", RPC_ALLOWED_CONCURRENCY.load(Ordering::Relaxed));
-    line!("open_positions", OPEN_POSITIONS_GAUGE.load(Ordering::Relaxed));
-    line!("daily_realized_pnl_sol", DAILY_REALIZED_PNL_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
-    line!("liquidity_estimate_sol", LIQUIDITY_ESTIMATE_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
+    line!(
+        "rpc_allowed_concurrency",
+        RPC_ALLOWED_CONCURRENCY.load(Ordering::Relaxed)
+    );
+    line!(
+        "open_positions",
+        OPEN_POSITIONS_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "daily_realized_pnl_sol",
+        DAILY_REALIZED_PNL_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
+    line!(
+        "liquidity_estimate_sol",
+        LIQUIDITY_ESTIMATE_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
     // Quote latency histogram exposition
     let q_count = QUOTE_LATENCY_COUNT.load(Ordering::Relaxed);
     let q_sum = QUOTE_LATENCY_SUM_NS.load(Ordering::Relaxed);
-    for (i,b) in QUOTE_LATENCY_BUCKETS.iter().enumerate() { let cum = QUOTE_LATENCY_BUCKET_COUNTS[i].load(Ordering::Relaxed); out.push_str(&format!("quote_latency_seconds_bucket{{le=\"{}\"}} {}\n", (*b as f64)/1e9, cum)); }
-    out.push_str(&format!("quote_latency_seconds_sum {}\n", (q_sum as f64)/1e9));
+    for (i, b) in QUOTE_LATENCY_BUCKETS.iter().enumerate() {
+        let cum = QUOTE_LATENCY_BUCKET_COUNTS[i].load(Ordering::Relaxed);
+        out.push_str(&format!(
+            "quote_latency_seconds_bucket{{le=\"{}\"}} {}\n",
+            (*b as f64) / 1e9,
+            cum
+        ));
+    }
+    out.push_str(&format!(
+        "quote_latency_seconds_sum {}\n",
+        (q_sum as f64) / 1e9
+    ));
     out.push_str(&format!("quote_latency_seconds_count {}\n", q_count));
     // Shortfall & fees aggregates
-    line!("shortfall_tokens_total", SHORTFALL_TOKENS_TOTAL.load(Ordering::Relaxed));
-    line!("shortfall_sol_total", SHORTFALL_SOL_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0);
+    line!(
+        "shortfall_tokens_total",
+        SHORTFALL_TOKENS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "shortfall_sol_total",
+        SHORTFALL_SOL_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
     line!("fills_total", FILLS_TOTAL.load(Ordering::Relaxed));
-    line!("network_fees_lamports_total", NETWORK_FEES_LAMPORTS_TOTAL.load(Ordering::Relaxed));
-    line!("ws_reconnects_total", WS_RECONNECTS_TOTAL.load(Ordering::Relaxed));
-    line!("rpc_retry_attempts_total", RPC_RETRY_ATTEMPTS_TOTAL.load(Ordering::Relaxed));
-    line!("ws_messages_total", WS_MESSAGES_TOTAL.load(Ordering::Relaxed));
-    line!("ws_heartbeat_misses_total", WS_HEARTBEAT_MISSES_TOTAL.load(Ordering::Relaxed));
-    line!("ws_active_connections", WS_ACTIVE_CONNECTIONS.load(Ordering::Relaxed));
-    line!("protocol_fee_tokens_total", PROTOCOL_FEE_TOKENS_TOTAL.load(Ordering::Relaxed));
-    line!("protocol_fee_sol_total", PROTOCOL_FEE_SOL_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0);
-    line!("pending_reconciliations_total", PENDING_RECONCILIATIONS_TOTAL.load(Ordering::Relaxed));
-    line!("pending_failed_total", PENDING_FAILED_TOTAL.load(Ordering::Relaxed));
-    line!("partial_exit_events_total", PARTIAL_EXIT_EVENTS_TOTAL.load(Ordering::Relaxed));
-    line!("partial_exit_fraction_sum", PARTIAL_EXIT_FRACTION_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0);
-    line!("requote_events_total", REQUOTE_EVENTS_TOTAL.load(Ordering::Relaxed));
-    line!("requote_improved_total", REQUOTE_IMPROVED_TOTAL.load(Ordering::Relaxed));
-    line!("requote_worsened_total", REQUOTE_WORSENED_TOTAL.load(Ordering::Relaxed));
-    line!("requote_min_out_delta_ratio_sum", REQUOTE_MIN_OUT_DELTA_RATIO_MICRO_SUM.load(Ordering::Relaxed) as f64 / 1_000_000.0);
+    line!(
+        "network_fees_lamports_total",
+        NETWORK_FEES_LAMPORTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "ws_reconnects_total",
+        WS_RECONNECTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "rpc_retry_attempts_total",
+        RPC_RETRY_ATTEMPTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "ws_messages_total",
+        WS_MESSAGES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "ws_heartbeat_misses_total",
+        WS_HEARTBEAT_MISSES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "ws_active_connections",
+        WS_ACTIVE_CONNECTIONS.load(Ordering::Relaxed)
+    );
+    line!(
+        "protocol_fee_tokens_total",
+        PROTOCOL_FEE_TOKENS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "protocol_fee_sol_total",
+        PROTOCOL_FEE_SOL_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
+    line!(
+        "pending_reconciliations_total",
+        PENDING_RECONCILIATIONS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "pending_failed_total",
+        PENDING_FAILED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "partial_exit_events_total",
+        PARTIAL_EXIT_EVENTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "partial_exit_fraction_sum",
+        PARTIAL_EXIT_FRACTION_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
+    line!(
+        "requote_events_total",
+        REQUOTE_EVENTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "requote_improved_total",
+        REQUOTE_IMPROVED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "requote_worsened_total",
+        REQUOTE_WORSENED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "requote_min_out_delta_ratio_sum",
+        REQUOTE_MIN_OUT_DELTA_RATIO_MICRO_SUM.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
     // DEX selection counters
-    line!("dex_selection_entry_raydium_total", DEX_SELECTION_ENTRY_RAYDIUM_TOTAL.load(Ordering::Relaxed));
-    line!("dex_selection_entry_orca_total", DEX_SELECTION_ENTRY_ORCA_TOTAL.load(Ordering::Relaxed));
-    line!("dex_selection_exit_raydium_total", DEX_SELECTION_EXIT_RAYDIUM_TOTAL.load(Ordering::Relaxed));
-    line!("dex_selection_exit_orca_total", DEX_SELECTION_EXIT_ORCA_TOTAL.load(Ordering::Relaxed));
+    line!(
+        "dex_selection_entry_raydium_total",
+        DEX_SELECTION_ENTRY_RAYDIUM_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "dex_selection_entry_orca_total",
+        DEX_SELECTION_ENTRY_ORCA_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "dex_selection_exit_raydium_total",
+        DEX_SELECTION_EXIT_RAYDIUM_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "dex_selection_exit_orca_total",
+        DEX_SELECTION_EXIT_ORCA_TOTAL.load(Ordering::Relaxed)
+    );
     // Strategy sandboxing/IPC metrics
-    line!("strategy_tick_timeouts_total", STRATEGY_TICK_TIMEOUTS_TOTAL.load(Ordering::Relaxed));
-    line!("strategy_tick_panics_total", STRATEGY_TICK_PANICS_TOTAL.load(Ordering::Relaxed));
-    line!("strategy_circuit_opens_total", STRATEGY_CIRCUIT_OPENS_TOTAL.load(Ordering::Relaxed));
-    line!("py_strat_timeouts_total", PY_STRAT_TIMEOUTS_TOTAL.load(Ordering::Relaxed));
-    line!("py_strat_fails_total", PY_STRAT_FAILS_TOTAL.load(Ordering::Relaxed));
-    line!("py_strat_circuit_opens_total", PY_STRAT_CIRCUIT_OPENS_TOTAL.load(Ordering::Relaxed));
-    line!("py_strat_restarts_total", PY_STRAT_RESTARTS_TOTAL.load(Ordering::Relaxed));
+    line!(
+        "strategy_tick_timeouts_total",
+        STRATEGY_TICK_TIMEOUTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "strategy_tick_panics_total",
+        STRATEGY_TICK_PANICS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "strategy_circuit_opens_total",
+        STRATEGY_CIRCUIT_OPENS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "py_strat_timeouts_total",
+        PY_STRAT_TIMEOUTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "py_strat_fails_total",
+        PY_STRAT_FAILS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "py_strat_circuit_opens_total",
+        PY_STRAT_CIRCUIT_OPENS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "py_strat_restarts_total",
+        PY_STRAT_RESTARTS_TOTAL.load(Ordering::Relaxed)
+    );
     // Gross/Net realized PnL (session aggregates)
-    line!("gross_realized_pnl_sol", GROSS_REALIZED_PNL_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
-    line!("net_realized_pnl_sol", NET_REALIZED_PNL_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
+    line!(
+        "gross_realized_pnl_sol",
+        GROSS_REALIZED_PNL_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
+    line!(
+        "net_realized_pnl_sol",
+        NET_REALIZED_PNL_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
     // Fee percent histogram
-    for (i,b) in FEE_PCT_BUCKETS.iter().enumerate() {
+    for (i, b) in FEE_PCT_BUCKETS.iter().enumerate() {
         let c = FEE_PCT_BUCKET_COUNTS[i].load(Ordering::Relaxed);
         out.push_str(&format!("fee_percent_bucket{{le=\"{}\"}} {}\n", b, c));
     }
-    out.push_str(&format!("fee_percent_bucket{{le=\"+Inf\"}} {}\n", FEE_PCT_COUNT.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "fee_percent_bucket{{le=\"+Inf\"}} {}\n",
+        FEE_PCT_COUNT.load(Ordering::Relaxed)
+    ));
     // Shortfall percent histogram
-    for (i,b) in SHORTFALL_PCT_BUCKETS.iter().enumerate() {
+    for (i, b) in SHORTFALL_PCT_BUCKETS.iter().enumerate() {
         let c = SHORTFALL_PCT_BUCKET_COUNTS[i].load(Ordering::Relaxed);
         out.push_str(&format!("shortfall_percent_bucket{{le=\"{}\"}} {}\n", b, c));
     }
-    out.push_str(&format!("shortfall_percent_bucket{{le=\"+Inf\"}} {}\n", SHORTFALL_PCT_COUNT.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "shortfall_percent_bucket{{le=\"+Inf\"}} {}\n",
+        SHORTFALL_PCT_COUNT.load(Ordering::Relaxed)
+    ));
     // Trade return histogram (realized PnL / invested)
     let tr_count = TRADE_RETURN_COUNT.load(Ordering::Relaxed);
     let tr_sum_micro = TRADE_RETURN_SUM_MICRO.load(Ordering::Relaxed);
-        for (i,b) in TRADE_RETURN_BUCKETS.iter().enumerate() { let c = TRADE_RETURN_BUCKET_COUNTS[i].load(Ordering::Relaxed); out.push_str(&format!("trade_return_bucket{{le=\"{}\"}} {}\n", b, c)); }
-        out.push_str(&format!("trade_return_bucket{{le=\"+Inf\"}} {}\n", tr_count));
-        out.push_str(&format!("trade_return_sum {}\n", tr_sum_micro as f64 / 1_000_000.0));
-        out.push_str(&format!("trade_return_count {}\n", tr_count));
-        line!("ironcrab_sharpe_ratio", SHARPE_RATIO_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
-        line!("ironcrab_drawdown_pct", DRAWDOWN_PCT_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0);
-        out.push_str(&format!("ironcrab_build_info{{version=\"{}\"}} 1\n", BUILD_VERSION));
+    for (i, b) in TRADE_RETURN_BUCKETS.iter().enumerate() {
+        let c = TRADE_RETURN_BUCKET_COUNTS[i].load(Ordering::Relaxed);
+        out.push_str(&format!("trade_return_bucket{{le=\"{}\"}} {}\n", b, c));
+    }
+    out.push_str(&format!(
+        "trade_return_bucket{{le=\"+Inf\"}} {}\n",
+        tr_count
+    ));
+    out.push_str(&format!(
+        "trade_return_sum {}\n",
+        tr_sum_micro as f64 / 1_000_000.0
+    ));
+    out.push_str(&format!("trade_return_count {}\n", tr_count));
+    line!(
+        "ironcrab_sharpe_ratio",
+        SHARPE_RATIO_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
+    line!(
+        "ironcrab_drawdown_pct",
+        DRAWDOWN_PCT_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
+    out.push_str(&format!(
+        "ironcrab_build_info{{version=\"{}\"}} 1\n",
+        BUILD_VERSION
+    ));
     // Realized PnL (SOL) histogram
     let r_count = REALIZED_PNL_SOL_COUNT.load(Ordering::Relaxed);
     let r_sum_micro = REALIZED_PNL_SOL_SUM_MICRO.load(Ordering::Relaxed);
-    for (i,b) in REALIZED_PNL_SOL_BUCKETS.iter().enumerate() { let c = REALIZED_PNL_SOL_BUCKET_COUNTS[i].load(Ordering::Relaxed); out.push_str(&format!("realized_pnl_sol_bucket{{le=\"{}\"}} {}\n", b, c)); }
-    out.push_str(&format!("realized_pnl_sol_bucket{{le=\"+Inf\"}} {}\n", r_count));
-    out.push_str(&format!("realized_pnl_sol_sum {}\n", r_sum_micro as f64 / 1_000_000.0));
+    for (i, b) in REALIZED_PNL_SOL_BUCKETS.iter().enumerate() {
+        let c = REALIZED_PNL_SOL_BUCKET_COUNTS[i].load(Ordering::Relaxed);
+        out.push_str(&format!("realized_pnl_sol_bucket{{le=\"{}\"}} {}\n", b, c));
+    }
+    out.push_str(&format!(
+        "realized_pnl_sol_bucket{{le=\"+Inf\"}} {}\n",
+        r_count
+    ));
+    out.push_str(&format!(
+        "realized_pnl_sol_sum {}\n",
+        r_sum_micro as f64 / 1_000_000.0
+    ));
     out.push_str(&format!("realized_pnl_sol_count {}\n", r_count));
     // Histogram exposition (Prometheus classic format)
     let swap_count = SWAP_LATENCY_COUNT.load(Ordering::Relaxed);
     let swap_sum = SWAP_LATENCY_SUM_NS.load(Ordering::Relaxed);
     for (i, bucket) in SWAP_LATENCY_BUCKETS.iter().enumerate() {
         let cum = SWAP_LATENCY_BUCKET_COUNTS[i].load(Ordering::Relaxed);
-        out.push_str(&format!("swap_latency_seconds_bucket{{le=\"{}\"}} {}\n", (*bucket as f64)/1e9, cum));
+        out.push_str(&format!(
+            "swap_latency_seconds_bucket{{le=\"{}\"}} {}\n",
+            (*bucket as f64) / 1e9,
+            cum
+        ));
     }
-    out.push_str(&format!("swap_latency_seconds_sum {}\n", (swap_sum as f64)/1e9));
+    out.push_str(&format!(
+        "swap_latency_seconds_sum {}\n",
+        (swap_sum as f64) / 1e9
+    ));
     out.push_str(&format!("swap_latency_seconds_count {}\n", swap_count));
-    Response::builder().status(200).header("Content-Type","text/plain; version=0.0.4").body(Body::from(out)).unwrap()
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "text/plain; version=0.0.4")
+        .body(Body::from(out))
+        .unwrap()
 }
 
 pub async fn serve_metrics(addr: SocketAddr) -> anyhow::Result<()> {
     let make_svc = make_service_fn(|_conn| async {
         Ok::<_, hyper::Error>(service_fn(|req: Request<Body>| async move {
             let path = req.uri().path();
-            if path == "/metrics" { return Ok::<_, hyper::Error>(metrics_response().await); }
-            if path == "/live" { return Ok::<_, hyper::Error>(Response::new(Body::from("ok"))); }
+            if path == "/metrics" {
+                return Ok::<_, hyper::Error>(metrics_response().await);
+            }
+            if path == "/live" {
+                return Ok::<_, hyper::Error>(Response::new(Body::from("ok")));
+            }
             if path == "/ready" {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
                 let last = LAST_ACTIVITY_TS.load(Ordering::Relaxed);
-                if last > 0 && now.saturating_sub(last) <= 120 { return Ok::<_, hyper::Error>(Response::new(Body::from("ready"))); }
-                else { return Ok::<_, hyper::Error>(Response::builder().status(503).body(Body::from("stale")).unwrap()); }
+                if last > 0 && now.saturating_sub(last) <= 120 {
+                    return Ok::<_, hyper::Error>(Response::new(Body::from("ready")));
+                } else {
+                    return Ok::<_, hyper::Error>(
+                        Response::builder()
+                            .status(503)
+                            .body(Body::from("stale"))
+                            .unwrap(),
+                    );
+                }
             }
             Ok::<_, hyper::Error>(metrics_response().await)
         }))
@@ -383,6 +722,9 @@ pub fn update_drawdown(drawdown_pct: f64) {
 }
 
 pub fn record_activity() {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     LAST_ACTIVITY_TS.store(now, Ordering::Relaxed);
 }

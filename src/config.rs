@@ -1,5 +1,5 @@
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppCfg {
@@ -13,16 +13,25 @@ pub struct SolanaCfg {
     pub rpc_url: String,
     pub ws_url: String,
     pub keypair_path: String,
-    #[serde(default)] pub rpc_min_concurrency: Option<usize>,
-    #[serde(default)] pub rpc_max_concurrency: Option<usize>,
-    #[serde(default)] pub rpc_initial_concurrency: Option<usize>,
-    #[serde(default)] pub rpc_inc_every_successes: Option<usize>,
-    #[serde(default)] pub rpc_dec_on_rate_limit: Option<usize>,
-    #[serde(default)] pub rpc_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub rpc_min_concurrency: Option<usize>,
+    #[serde(default)]
+    pub rpc_max_concurrency: Option<usize>,
+    #[serde(default)]
+    pub rpc_initial_concurrency: Option<usize>,
+    #[serde(default)]
+    pub rpc_inc_every_successes: Option<usize>,
+    #[serde(default)]
+    pub rpc_dec_on_rate_limit: Option<usize>,
+    #[serde(default)]
+    pub rpc_timeout_ms: Option<u64>,
     // WS options
-    #[serde(default)] pub ws_failover_urls: Option<Vec<String>>, // additional endpoints to try for PubSub
-    #[serde(default)] pub ws_connect_timeout_ms: Option<u64>,     // connect timeout per attempt
-    #[serde(default)] pub ws_max_backoff_ms: Option<u64>,         // cap for exponential backoff
+    #[serde(default)]
+    pub ws_failover_urls: Option<Vec<String>>, // additional endpoints to try for PubSub
+    #[serde(default)]
+    pub ws_connect_timeout_ms: Option<u64>, // connect timeout per attempt
+    #[serde(default)]
+    pub ws_max_backoff_ms: Option<u64>, // cap for exponential backoff
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,65 +78,105 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ArbPairCfg { pub in_mint: String, pub out_mint: String, pub ui_amount: f64 }
+pub struct ArbPairCfg {
+    pub in_mint: String,
+    pub out_mint: String,
+    pub ui_amount: f64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ArbCfg {
     pub pairs: Vec<ArbPairCfg>,
-    #[serde(default)] pub interval_ms: Option<u64>,
-    #[serde(default)] pub min_profit_bps: Option<u32>,
-    #[serde(default)] pub est_tx_cost_lamports: Option<u64>,
+    #[serde(default)]
+    pub interval_ms: Option<u64>,
+    #[serde(default)]
+    pub min_profit_bps: Option<u32>,
+    #[serde(default)]
+    pub est_tx_cost_lamports: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SniperSettings {
     pub max_buy_sol: f64,
     pub max_slippage_bps: u32,
-    #[serde(default)] pub blacklist_mints: Vec<String>,
-    #[serde(default)] pub blacklist_owners: Vec<String>,
-    #[serde(default)] pub min_pool_liquidity_sol: Option<f64>,
-    #[serde(default)] pub require_freeze_auth_none: Option<bool>,
-    #[serde(default)] pub require_mint_decimals_range: Option<(u8,u8)>,
-    #[serde(default)] pub lp_top1_max_pct: Option<f64>,
-    #[serde(default)] pub lp_top3_max_pct: Option<f64>,
-    #[serde(default)] pub lp_top5_max_pct: Option<f64>,
+    #[serde(default)]
+    pub blacklist_mints: Vec<String>,
+    #[serde(default)]
+    pub blacklist_owners: Vec<String>,
+    #[serde(default)]
+    pub min_pool_liquidity_sol: Option<f64>,
+    #[serde(default)]
+    pub require_freeze_auth_none: Option<bool>,
+    #[serde(default)]
+    pub require_mint_decimals_range: Option<(u8, u8)>,
+    #[serde(default)]
+    pub lp_top1_max_pct: Option<f64>,
+    #[serde(default)]
+    pub lp_top3_max_pct: Option<f64>,
+    #[serde(default)]
+    pub lp_top5_max_pct: Option<f64>,
     // --- Risk Layer (neu) ---
-    #[serde(default)] pub max_position_sol: Option<f64>,          // Max Depot-Notional für eine einzelne neue Position
-    #[serde(default)] pub stop_loss_bps: Option<u32>,              // z.B. 3000 = -30% unter Entry
-    #[serde(default)] pub take_profit_bps: Option<u32>,            // z.B. 10000 = +100% Gewinn
-    #[serde(default)] pub daily_loss_limit_sol: Option<f64>,       // harter Tagesverlust-Limiter
+    #[serde(default)]
+    pub max_position_sol: Option<f64>, // Max Depot-Notional für eine einzelne neue Position
+    #[serde(default)]
+    pub stop_loss_bps: Option<u32>, // z.B. 3000 = -30% unter Entry
+    #[serde(default)]
+    pub take_profit_bps: Option<u32>, // z.B. 10000 = +100% Gewinn
+    #[serde(default)]
+    pub daily_loss_limit_sol: Option<f64>, // harter Tagesverlust-Limiter
     // --- Erweiterte Risk & Limits ---
-    #[serde(default)] pub max_open_positions: Option<usize>,       // Gesamtanzahl paralleler Positionen
-    #[serde(default)] pub per_mint_position_limit: Option<u32>,    // Mehrfachkäufe je Mint (derzeit 1 unterstützt; Platzhalter)
-    #[serde(default)] pub stop_loss_cooldown_secs: Option<u64>,    // Cooldown nach SL Exit
-    #[serde(default)] pub drawdown_scale_start: Option<f64>,       // Anteil daily_loss_limit ab dem Kaufgrößen reduziert werden (0.3 = 30%)
-    #[serde(default)] pub drawdown_max_reduction: Option<f64>,     // Max Reduktion Kaufgröße (0.7 => bis 70% Reduktion)
-    #[serde(default)] pub rolling_pnl_window: Option<usize>,       // Fenster für Sharpe Approx
-    #[serde(default)] pub hot_reload_secs: Option<u64>,            // Interval für Config Reload
-    #[serde(default)] pub pending_trade_ttl_secs: Option<u64>,     // TTL für PendingTrade Einträge (Cleanup wenn kein Fill)
+    #[serde(default)]
+    pub max_open_positions: Option<usize>, // Gesamtanzahl paralleler Positionen
+    #[serde(default)]
+    pub per_mint_position_limit: Option<u32>, // Mehrfachkäufe je Mint (derzeit 1 unterstützt; Platzhalter)
+    #[serde(default)]
+    pub stop_loss_cooldown_secs: Option<u64>, // Cooldown nach SL Exit
+    #[serde(default)]
+    pub drawdown_scale_start: Option<f64>, // Anteil daily_loss_limit ab dem Kaufgrößen reduziert werden (0.3 = 30%)
+    #[serde(default)]
+    pub drawdown_max_reduction: Option<f64>, // Max Reduktion Kaufgröße (0.7 => bis 70% Reduktion)
+    #[serde(default)]
+    pub rolling_pnl_window: Option<usize>, // Fenster für Sharpe Approx
+    #[serde(default)]
+    pub hot_reload_secs: Option<u64>, // Interval für Config Reload
+    #[serde(default)]
+    pub pending_trade_ttl_secs: Option<u64>, // TTL für PendingTrade Einträge (Cleanup wenn kein Fill)
     // --- Partielle Exits Konfiguration ---
-    #[serde(default)] pub take_profit_tiers: Option<Vec<TakeProfitTier>>, // Gestaffelte TP Ebenen; aufsteigend nach bps
-    #[serde(default)] pub trailing_stop_bps: Option<u32>,          // Optionaler Trailing Stop (Abstand in bps vom Hoch nach Erreichen erster TP Ebene)
-    #[serde(default)] pub min_exit_notional_sol: Option<f64>,      // Mindest-Notional für einen Exit (Dust-Vermeidung)
+    #[serde(default)]
+    pub take_profit_tiers: Option<Vec<TakeProfitTier>>, // Gestaffelte TP Ebenen; aufsteigend nach bps
+    #[serde(default)]
+    pub trailing_stop_bps: Option<u32>, // Optionaler Trailing Stop (Abstand in bps vom Hoch nach Erreichen erster TP Ebene)
+    #[serde(default)]
+    pub min_exit_notional_sol: Option<f64>, // Mindest-Notional für einen Exit (Dust-Vermeidung)
     // --- Data & Pricing / Adaptive Slippage ---
-    #[serde(default)] pub oracle_sol_usd_override: Option<f64>,     // Optionaler statischer SOL/USD Preis (Oracle Placeholder)
-    #[serde(default)] pub adaptive_slippage_min_bps: Option<u32>,   // Untere Grenze dynamischer Slippage
-    #[serde(default)] pub adaptive_slippage_max_bps: Option<u32>,   // Obere Grenze dynamischer Slippage
-    #[serde(default)] pub adaptive_slippage_window: Option<usize>,  // Fenstergröße für gemittelten Fill-Slippage Anteil
-    #[serde(default)] pub adaptive_slippage_target_pct: Option<f64>,// Ziel-Slippage in Anteil (z.B. 0.002 = 0.2%)
-    #[serde(default)] pub adaptive_slippage_step_bps: Option<u32>,  // Anpassungsschritt in bps je Fill (z.B. 5)
+    #[serde(default)]
+    pub oracle_sol_usd_override: Option<f64>, // Optionaler statischer SOL/USD Preis (Oracle Placeholder)
+    #[serde(default)]
+    pub adaptive_slippage_min_bps: Option<u32>, // Untere Grenze dynamischer Slippage
+    #[serde(default)]
+    pub adaptive_slippage_max_bps: Option<u32>, // Obere Grenze dynamischer Slippage
+    #[serde(default)]
+    pub adaptive_slippage_window: Option<usize>, // Fenstergröße für gemittelten Fill-Slippage Anteil
+    #[serde(default)]
+    pub adaptive_slippage_target_pct: Option<f64>, // Ziel-Slippage in Anteil (z.B. 0.002 = 0.2%)
+    #[serde(default)]
+    pub adaptive_slippage_step_bps: Option<u32>, // Anpassungsschritt in bps je Fill (z.B. 5)
     // Exit Evaluation
-    #[serde(default)] pub exit_eval_interval_secs: Option<u64>,     // Separates Intervall für Exit-Evaluation
+    #[serde(default)]
+    pub exit_eval_interval_secs: Option<u64>, // Separates Intervall für Exit-Evaluation
     // Oracles
-    #[serde(default)] pub oracle_pyth_sol_usd: Option<String>,       // Pyth Price account pubkey for SOL/USD
-    #[serde(default)] pub oracle_switchboard_sol_usd: Option<String>, // Switchboard aggregator pubkey for SOL/USD
-    #[serde(default)] pub oracle_preference: Option<String>,          // "pyth" | "switchboard" | "override"
+    #[serde(default)]
+    pub oracle_pyth_sol_usd: Option<String>, // Pyth Price account pubkey for SOL/USD
+    #[serde(default)]
+    pub oracle_switchboard_sol_usd: Option<String>, // Switchboard aggregator pubkey for SOL/USD
+    #[serde(default)]
+    pub oracle_preference: Option<String>, // "pyth" | "switchboard" | "override"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TakeProfitTier {
-    pub bps: u32,        // Gewinnschwelle (>= bps löst diese Stufe aus)
-    pub fraction: f64,   // Anteil der ursprünglichen Lot-Größe, der an dieser Stufe verkauft wird (nicht kumulativ)
+    pub bps: u32,      // Gewinnschwelle (>= bps löst diese Stufe aus)
+    pub fraction: f64, // Anteil der ursprünglichen Lot-Größe, der an dieser Stufe verkauft wird (nicht kumulativ)
 }
 
 impl Config {
@@ -144,126 +193,330 @@ impl Config {
         let mut errs: Vec<String> = Vec::new();
 
         // --- app ---
-        if self.app.name.trim().is_empty() { errs.push("app.name must not be empty".into()); }
-        if !matches!(self.app.log_level.to_ascii_lowercase().as_str(), "trace"|"debug"|"info"|"warn"|"error") {
-            errs.push(format!("app.log_level invalid: {} (allowed: trace|debug|info|warn|error)", self.app.log_level));
+        if self.app.name.trim().is_empty() {
+            errs.push("app.name must not be empty".into());
         }
-        if self.app.autosave_state_secs == 0 { errs.push("app.autosave_state_secs must be > 0".into()); }
+        if !matches!(
+            self.app.log_level.to_ascii_lowercase().as_str(),
+            "trace" | "debug" | "info" | "warn" | "error"
+        ) {
+            errs.push(format!(
+                "app.log_level invalid: {} (allowed: trace|debug|info|warn|error)",
+                self.app.log_level
+            ));
+        }
+        if self.app.autosave_state_secs == 0 {
+            errs.push("app.autosave_state_secs must be > 0".into());
+        }
 
         // --- solana ---
-        if !(self.solana.rpc_url.starts_with("http://") || self.solana.rpc_url.starts_with("https://")) {
-            errs.push(format!("solana.rpc_url must start with http:// or https:// (got {})", self.solana.rpc_url));
+        if !(self.solana.rpc_url.starts_with("http://")
+            || self.solana.rpc_url.starts_with("https://"))
+        {
+            errs.push(format!(
+                "solana.rpc_url must start with http:// or https:// (got {})",
+                self.solana.rpc_url
+            ));
         }
         if !(self.solana.ws_url.starts_with("ws://") || self.solana.ws_url.starts_with("wss://")) {
-            errs.push(format!("solana.ws_url must start with ws:// or wss:// (got {})", self.solana.ws_url));
+            errs.push(format!(
+                "solana.ws_url must start with ws:// or wss:// (got {})",
+                self.solana.ws_url
+            ));
         }
         if self.solana.keypair_path.trim().is_empty() {
             errs.push("solana.keypair_path must not be empty".into());
         } else {
             let p = std::path::Path::new(&self.solana.keypair_path);
-            if !p.exists() { errs.push(format!("solana.keypair_path does not exist: {}", self.solana.keypair_path)); }
+            if !p.exists() {
+                errs.push(format!(
+                    "solana.keypair_path does not exist: {}",
+                    self.solana.keypair_path
+                ));
+            }
         }
         // concurrency constraints
-        let (minc, maxc, initc) = (self.solana.rpc_min_concurrency, self.solana.rpc_max_concurrency, self.solana.rpc_initial_concurrency);
+        let (minc, maxc, initc) = (
+            self.solana.rpc_min_concurrency,
+            self.solana.rpc_max_concurrency,
+            self.solana.rpc_initial_concurrency,
+        );
         if let (Some(min), Some(max)) = (minc, maxc) {
-            if min == 0 { errs.push("solana.rpc_min_concurrency must be > 0".into()); }
-            if max == 0 { errs.push("solana.rpc_max_concurrency must be > 0".into()); }
-            if min > max { errs.push(format!("solana.rpc_min_concurrency ({min}) must be <= rpc_max_concurrency ({max})")); }
+            if min == 0 {
+                errs.push("solana.rpc_min_concurrency must be > 0".into());
+            }
+            if max == 0 {
+                errs.push("solana.rpc_max_concurrency must be > 0".into());
+            }
+            if min > max {
+                errs.push(format!(
+                    "solana.rpc_min_concurrency ({min}) must be <= rpc_max_concurrency ({max})"
+                ));
+            }
         }
         if let (Some(init), Some(min), Some(max)) = (initc, minc, maxc) {
-            if init < min || init > max { errs.push(format!("solana.rpc_initial_concurrency ({init}) must be within [{min},{max}]")); }
+            if init < min || init > max {
+                errs.push(format!(
+                    "solana.rpc_initial_concurrency ({init}) must be within [{min},{max}]"
+                ));
+            }
         }
-        if let Some(t) = self.solana.rpc_timeout_ms { if t == 0 { errs.push("solana.rpc_timeout_ms must be > 0".into()); } }
-        if let Some(b) = self.solana.ws_max_backoff_ms { if b == 0 { errs.push("solana.ws_max_backoff_ms must be > 0".into()); } }
-        if let Some(c) = self.solana.ws_connect_timeout_ms { if c == 0 { errs.push("solana.ws_connect_timeout_ms must be > 0".into()); } }
+        if let Some(t) = self.solana.rpc_timeout_ms {
+            if t == 0 {
+                errs.push("solana.rpc_timeout_ms must be > 0".into());
+            }
+        }
+        if let Some(b) = self.solana.ws_max_backoff_ms {
+            if b == 0 {
+                errs.push("solana.ws_max_backoff_ms must be > 0".into());
+            }
+        }
+        if let Some(c) = self.solana.ws_connect_timeout_ms {
+            if c == 0 {
+                errs.push("solana.ws_connect_timeout_ms must be > 0".into());
+            }
+        }
         if let Some(vec) = self.solana.ws_failover_urls.as_ref() {
             for (i, u) in vec.iter().enumerate() {
                 if !(u.starts_with("ws://") || u.starts_with("wss://")) {
-                    errs.push(format!("solana.ws_failover_urls[{i}] must start with ws:// or wss:// (got {u})"));
+                    errs.push(format!(
+                        "solana.ws_failover_urls[{i}] must start with ws:// or wss:// (got {u})"
+                    ));
                 }
             }
         }
 
         // --- markets & allocator ---
-        if self.markets.is_empty() { errs.push("markets must not be empty".into()); }
+        if self.markets.is_empty() {
+            errs.push("markets must not be empty".into());
+        }
         let mut sum_alloc: i64 = 0;
         for (i, m) in self.markets.iter().enumerate() {
-            if m.name.trim().is_empty() { errs.push(format!("markets[{i}].name must not be empty")); }
-            if !(0..=100).contains(&m.allocation_pct) { errs.push(format!("markets[{i}].allocation_pct must be 0..=100 (got {})", m.allocation_pct)); }
-            if !self.strategies.contains_key(&m.strategy) { errs.push(format!("markets[{i}].strategy '{}' not defined in [strategies]", m.strategy)); }
+            if m.name.trim().is_empty() {
+                errs.push(format!("markets[{i}].name must not be empty"));
+            }
+            if !(0..=100).contains(&m.allocation_pct) {
+                errs.push(format!(
+                    "markets[{i}].allocation_pct must be 0..=100 (got {})",
+                    m.allocation_pct
+                ));
+            }
+            if !self.strategies.contains_key(&m.strategy) {
+                errs.push(format!(
+                    "markets[{i}].strategy '{}' not defined in [strategies]",
+                    m.strategy
+                ));
+            }
             sum_alloc += m.allocation_pct as i64;
         }
-        if sum_alloc != 100 { errs.push(format!("markets allocation sum must be 100, got {sum_alloc}")); }
+        if sum_alloc != 100 {
+            errs.push(format!(
+                "markets allocation sum must be 100, got {sum_alloc}"
+            ));
+        }
 
-        if self.allocator.mode.trim().is_empty() { errs.push("allocator.mode must not be empty".into()); }
-        if self.allocator.rebalance_secs == 0 { errs.push("allocator.rebalance_secs must be > 0".into()); }
-        if self.allocator.min_transfer_sol < 0.0 { errs.push("allocator.min_transfer_sol must be >= 0".into()); }
+        if self.allocator.mode.trim().is_empty() {
+            errs.push("allocator.mode must not be empty".into());
+        }
+        if self.allocator.rebalance_secs == 0 {
+            errs.push("allocator.rebalance_secs must be > 0".into());
+        }
+        if self.allocator.min_transfer_sol < 0.0 {
+            errs.push("allocator.min_transfer_sol must be >= 0".into());
+        }
 
         // --- strategies ---
         for (name, s) in &self.strategies {
             match s.kind.to_ascii_lowercase().as_str() {
                 "rust" => { /* ok; module/class optional */ }
                 "python" => {
-                    if s.module.as_deref().unwrap_or("").is_empty() { errs.push(format!("strategies['{name}']: python kind requires 'module'")); }
-                    if s.class.as_deref().unwrap_or("").is_empty() { errs.push(format!("strategies['{name}']: python kind requires 'class'")); }
+                    if s.module.as_deref().unwrap_or("").is_empty() {
+                        errs.push(format!(
+                            "strategies['{name}']: python kind requires 'module'"
+                        ));
+                    }
+                    if s.class.as_deref().unwrap_or("").is_empty() {
+                        errs.push(format!(
+                            "strategies['{name}']: python kind requires 'class'"
+                        ));
+                    }
                 }
-                other => errs.push(format!("strategies['{name}']: unknown kind '{other}' (expected 'rust' or 'python')")),
+                other => errs.push(format!(
+                    "strategies['{name}']: unknown kind '{other}' (expected 'rust' or 'python')"
+                )),
             }
         }
 
         // --- arbitrage ---
         if let Some(a) = &self.arbitrage {
             for (i, p) in a.pairs.iter().enumerate() {
-                if p.in_mint.trim().is_empty() || p.out_mint.trim().is_empty() { errs.push(format!("arbitrage.pairs[{i}] mints must not be empty")); }
-                if p.ui_amount <= 0.0 { errs.push(format!("arbitrage.pairs[{i}].ui_amount must be > 0")); }
+                if p.in_mint.trim().is_empty() || p.out_mint.trim().is_empty() {
+                    errs.push(format!("arbitrage.pairs[{i}] mints must not be empty"));
+                }
+                if p.ui_amount <= 0.0 {
+                    errs.push(format!("arbitrage.pairs[{i}].ui_amount must be > 0"));
+                }
             }
-            if let Some(bps) = a.min_profit_bps { if bps > 50_000 { errs.push(format!("arbitrage.min_profit_bps too large: {bps}")); } }
-            if let Some(cost) = a.est_tx_cost_lamports { if cost == 0 { errs.push("arbitrage.est_tx_cost_lamports must be > 0".into()); } }
-            if let Some(intv) = a.interval_ms { if intv == 0 { errs.push("arbitrage.interval_ms must be > 0".into()); } }
+            if let Some(bps) = a.min_profit_bps {
+                if bps > 50_000 {
+                    errs.push(format!("arbitrage.min_profit_bps too large: {bps}"));
+                }
+            }
+            if let Some(cost) = a.est_tx_cost_lamports {
+                if cost == 0 {
+                    errs.push("arbitrage.est_tx_cost_lamports must be > 0".into());
+                }
+            }
+            if let Some(intv) = a.interval_ms {
+                if intv == 0 {
+                    errs.push("arbitrage.interval_ms must be > 0".into());
+                }
+            }
         }
 
         // --- sniper ---
         if let Some(s) = &self.sniper {
-            if s.max_buy_sol < 0.0 { errs.push("sniper.max_buy_sol must be >= 0".into()); }
-            if s.max_slippage_bps > 50_000 { errs.push("sniper.max_slippage_bps unrealistic (>50000)".into()); }
-            if let Some(v) = s.min_pool_liquidity_sol { if v < 0.0 { errs.push("sniper.min_pool_liquidity_sol must be >= 0".into()); } }
-            if let Some((lo, hi)) = s.require_mint_decimals_range { if lo > hi || hi > 12 { errs.push("sniper.require_mint_decimals_range invalid (lo<=hi<=12)".into()); } }
-            for (label, v) in [("lp_top1_max_pct", s.lp_top1_max_pct), ("lp_top3_max_pct", s.lp_top3_max_pct), ("lp_top5_max_pct", s.lp_top5_max_pct)] {
-                if let Some(x) = v { if !(0.0..=100.0).contains(&x) { errs.push(format!("sniper.{label} must be 0..=100")); } }
+            if s.max_buy_sol < 0.0 {
+                errs.push("sniper.max_buy_sol must be >= 0".into());
             }
-            if let Some(v) = s.max_position_sol { if v < 0.0 { errs.push("sniper.max_position_sol must be >= 0".into()); } }
-            if let Some(v) = s.daily_loss_limit_sol { if v < 0.0 { errs.push("sniper.daily_loss_limit_sol must be >= 0".into()); } }
-            if let Some(v) = s.stop_loss_cooldown_secs { if v == 0 { errs.push("sniper.stop_loss_cooldown_secs must be > 0".into()); } }
-            if let Some(v) = s.drawdown_scale_start { if !(0.0..=1.0).contains(&v) { errs.push("sniper.drawdown_scale_start must be 0..=1".into()); } }
-            if let Some(v) = s.drawdown_max_reduction { if !(0.0..=1.0).contains(&v) { errs.push("sniper.drawdown_max_reduction must be 0..=1".into()); } }
-            if let Some(v) = s.rolling_pnl_window { if v == 0 { errs.push("sniper.rolling_pnl_window must be > 0".into()); } }
-            if let Some(v) = s.hot_reload_secs { if v == 0 { errs.push("sniper.hot_reload_secs must be > 0".into()); } }
-            if let Some(v) = s.pending_trade_ttl_secs { if v == 0 { errs.push("sniper.pending_trade_ttl_secs must be > 0".into()); } }
-            if let Some(v) = s.trailing_stop_bps { if v > 100_000 { errs.push("sniper.trailing_stop_bps unrealistic (>100000)".into()); } }
-            if let Some(v) = s.min_exit_notional_sol { if v < 0.0 { errs.push("sniper.min_exit_notional_sol must be >= 0".into()); } }
+            if s.max_slippage_bps > 50_000 {
+                errs.push("sniper.max_slippage_bps unrealistic (>50000)".into());
+            }
+            if let Some(v) = s.min_pool_liquidity_sol {
+                if v < 0.0 {
+                    errs.push("sniper.min_pool_liquidity_sol must be >= 0".into());
+                }
+            }
+            if let Some((lo, hi)) = s.require_mint_decimals_range {
+                if lo > hi || hi > 12 {
+                    errs.push("sniper.require_mint_decimals_range invalid (lo<=hi<=12)".into());
+                }
+            }
+            for (label, v) in [
+                ("lp_top1_max_pct", s.lp_top1_max_pct),
+                ("lp_top3_max_pct", s.lp_top3_max_pct),
+                ("lp_top5_max_pct", s.lp_top5_max_pct),
+            ] {
+                if let Some(x) = v {
+                    if !(0.0..=100.0).contains(&x) {
+                        errs.push(format!("sniper.{label} must be 0..=100"));
+                    }
+                }
+            }
+            if let Some(v) = s.max_position_sol {
+                if v < 0.0 {
+                    errs.push("sniper.max_position_sol must be >= 0".into());
+                }
+            }
+            if let Some(v) = s.daily_loss_limit_sol {
+                if v < 0.0 {
+                    errs.push("sniper.daily_loss_limit_sol must be >= 0".into());
+                }
+            }
+            if let Some(v) = s.stop_loss_cooldown_secs {
+                if v == 0 {
+                    errs.push("sniper.stop_loss_cooldown_secs must be > 0".into());
+                }
+            }
+            if let Some(v) = s.drawdown_scale_start {
+                if !(0.0..=1.0).contains(&v) {
+                    errs.push("sniper.drawdown_scale_start must be 0..=1".into());
+                }
+            }
+            if let Some(v) = s.drawdown_max_reduction {
+                if !(0.0..=1.0).contains(&v) {
+                    errs.push("sniper.drawdown_max_reduction must be 0..=1".into());
+                }
+            }
+            if let Some(v) = s.rolling_pnl_window {
+                if v == 0 {
+                    errs.push("sniper.rolling_pnl_window must be > 0".into());
+                }
+            }
+            if let Some(v) = s.hot_reload_secs {
+                if v == 0 {
+                    errs.push("sniper.hot_reload_secs must be > 0".into());
+                }
+            }
+            if let Some(v) = s.pending_trade_ttl_secs {
+                if v == 0 {
+                    errs.push("sniper.pending_trade_ttl_secs must be > 0".into());
+                }
+            }
+            if let Some(v) = s.trailing_stop_bps {
+                if v > 100_000 {
+                    errs.push("sniper.trailing_stop_bps unrealistic (>100000)".into());
+                }
+            }
+            if let Some(v) = s.min_exit_notional_sol {
+                if v < 0.0 {
+                    errs.push("sniper.min_exit_notional_sol must be >= 0".into());
+                }
+            }
             if let Some(ts) = s.take_profit_tiers.as_ref() {
-                if ts.is_empty() { errs.push("sniper.take_profit_tiers must not be empty if provided".into()); }
+                if ts.is_empty() {
+                    errs.push("sniper.take_profit_tiers must not be empty if provided".into());
+                }
                 let mut last_bps = 0u32;
                 let mut sum_frac = 0.0f64;
                 for (i, t) in ts.iter().enumerate() {
-                    if t.bps == 0 { errs.push(format!("sniper.take_profit_tiers[{i}].bps must be > 0")); }
-                    if t.bps < last_bps { errs.push("sniper.take_profit_tiers must be sorted ascending by bps".into()); }
-                    if !(0.0..=1.0).contains(&t.fraction) { errs.push(format!("sniper.take_profit_tiers[{i}].fraction must be 0..=1")); }
+                    if t.bps == 0 {
+                        errs.push(format!("sniper.take_profit_tiers[{i}].bps must be > 0"));
+                    }
+                    if t.bps < last_bps {
+                        errs.push(
+                            "sniper.take_profit_tiers must be sorted ascending by bps".into(),
+                        );
+                    }
+                    if !(0.0..=1.0).contains(&t.fraction) {
+                        errs.push(format!(
+                            "sniper.take_profit_tiers[{i}].fraction must be 0..=1"
+                        ));
+                    }
                     sum_frac += t.fraction;
                     last_bps = t.bps;
                 }
-                if sum_frac > 1.000_000_1 { errs.push(format!("sniper.take_profit_tiers fractions sum {sum_frac:.3} exceeds 1.0")); }
+                if sum_frac > 1.000_000_1 {
+                    errs.push(format!(
+                        "sniper.take_profit_tiers fractions sum {sum_frac:.3} exceeds 1.0"
+                    ));
+                }
             }
             if let Some(pref) = s.oracle_preference.as_deref() {
                 match pref.to_ascii_lowercase().as_str() {
-                    "pyth" => { if s.oracle_pyth_sol_usd.as_deref().unwrap_or("").is_empty() { errs.push("sniper.oracle_pyth_sol_usd required when oracle_preference=pyth".into()); } }
-                    "switchboard" => { if s.oracle_switchboard_sol_usd.as_deref().unwrap_or("").is_empty() { errs.push("sniper.oracle_switchboard_sol_usd required when oracle_preference=switchboard".into()); } }
-                    "override" => { if s.oracle_sol_usd_override.is_none() { errs.push("sniper.oracle_sol_usd_override required when oracle_preference=override".into()); } }
-                    other => errs.push(format!("sniper.oracle_preference invalid: {other} (pyth|switchboard|override)")),
+                    "pyth" => {
+                        if s.oracle_pyth_sol_usd.as_deref().unwrap_or("").is_empty() {
+                            errs.push(
+                                "sniper.oracle_pyth_sol_usd required when oracle_preference=pyth"
+                                    .into(),
+                            );
+                        }
+                    }
+                    "switchboard" => {
+                        if s.oracle_switchboard_sol_usd
+                            .as_deref()
+                            .unwrap_or("")
+                            .is_empty()
+                        {
+                            errs.push("sniper.oracle_switchboard_sol_usd required when oracle_preference=switchboard".into());
+                        }
+                    }
+                    "override" => {
+                        if s.oracle_sol_usd_override.is_none() {
+                            errs.push("sniper.oracle_sol_usd_override required when oracle_preference=override".into());
+                        }
+                    }
+                    other => errs.push(format!(
+                        "sniper.oracle_preference invalid: {other} (pyth|switchboard|override)"
+                    )),
                 }
             }
         }
 
-        if errs.is_empty() { Ok(()) } else { Err(anyhow!(format!("config invalid:\n- {}", errs.join("\n- ")))) }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(format!("config invalid:\n- {}", errs.join("\n- "))))
+        }
     }
 }

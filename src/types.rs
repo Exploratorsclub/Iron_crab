@@ -1,4 +1,3 @@
-
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -25,4 +24,7 @@ pub struct TradeIntent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Side { Buy, Sell }
+pub enum Side {
+    Buy,
+    Sell,
+}

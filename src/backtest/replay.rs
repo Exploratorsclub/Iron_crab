@@ -1,8 +1,8 @@
 //! Deterministic replay scaffolding (slot iterator + trace-backed RPC mocks)
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
-use base64::{engine::general_purpose, Engine as _};
 use crate::backtest::types::{SimEvent, SimEventKind};
+use base64::{engine::general_purpose, Engine as _};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayConfig {
@@ -18,19 +18,40 @@ pub struct ReplayConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceEvent {
-    Slot { slot: u64 },
+    Slot {
+        slot: u64,
+    },
     /// Account snapshot/update. Data is base64; if it's UTF-8 JSON matching a known schema we can project it to SimEvents.
-    Account { pubkey: String, data_b64: String },
-    Log { slot: u64, msg: String },
+    Account {
+        pubkey: String,
+        data_b64: String,
+    },
+    Log {
+        slot: u64,
+        msg: String,
+    },
 }
 
-pub struct SlotIterator { cur: u64, end: u64 }
+pub struct SlotIterator {
+    cur: u64,
+    end: u64,
+}
 impl SlotIterator {
-    pub fn new(start:u64, end:u64) -> Self { Self { cur:start, end } }
-    pub fn next_slot(&mut self) -> Option<u64> { if self.cur>self.end { None } else { let s=self.cur; self.cur+=1; Some(s) } }
+    pub fn new(start: u64, end: u64) -> Self {
+        Self { cur: start, end }
+    }
+    pub fn next_slot(&mut self) -> Option<u64> {
+        if self.cur > self.end {
+            None
+        } else {
+            let s = self.cur;
+            self.cur += 1;
+            Some(s)
+        }
+    }
 }
 
-pub fn load_trace(path:&str) -> anyhow::Result<Vec<TraceEvent>> {
+pub fn load_trace(path: &str) -> anyhow::Result<Vec<TraceEvent>> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
     // Try JSONL first (one event per line)
@@ -40,10 +61,16 @@ pub fn load_trace(path:&str) -> anyhow::Result<Vec<TraceEvent>> {
     for line in reader.lines() {
         let line = line?;
         let s = line.trim();
-        if s.is_empty() { continue; }
-        if let Ok(ev) = serde_json::from_str::<TraceEvent>(s) { events.push(ev); }
+        if s.is_empty() {
+            continue;
+        }
+        if let Ok(ev) = serde_json::from_str::<TraceEvent>(s) {
+            events.push(ev);
+        }
     }
-    if !events.is_empty() { return Ok(events); }
+    if !events.is_empty() {
+        return Ok(events);
+    }
     // Fallback: full JSON array
     let text = std::fs::read_to_string(path)?;
     let vec: Vec<TraceEvent> = serde_json::from_str(&text)?;
@@ -52,10 +79,18 @@ pub fn load_trace(path:&str) -> anyhow::Result<Vec<TraceEvent>> {
 
 /// Deterministic clock: maps slots to monotonically increasing timestamps.
 #[derive(Debug, Clone, Copy)]
-pub struct DeterministicClock { pub slot_ms: u64 }
-impl Default for DeterministicClock { fn default() -> Self { Self { slot_ms: 400 } } }
+pub struct DeterministicClock {
+    pub slot_ms: u64,
+}
+impl Default for DeterministicClock {
+    fn default() -> Self {
+        Self { slot_ms: 400 }
+    }
+}
 impl DeterministicClock {
-    pub fn ts_for_slot(&self, slot: u64) -> u64 { slot.saturating_mul(self.slot_ms) }
+    pub fn ts_for_slot(&self, slot: u64) -> u64 {
+        slot.saturating_mul(self.slot_ms)
+    }
 }
 
 /// Simple schema we understand from Account events when base64-decoded bytes are UTF-8 JSON.
@@ -81,14 +116,22 @@ pub struct ReplayStore {
 
 impl ReplayStore {
     pub fn from_events(events: &[TraceEvent]) -> Self {
-        let mut store = ReplayStore { slots: Vec::new(), logs: Vec::new(), accounts: HashMap::new() };
+        let mut store = ReplayStore {
+            slots: Vec::new(),
+            logs: Vec::new(),
+            accounts: HashMap::new(),
+        };
         for ev in events {
             match ev {
                 TraceEvent::Slot { slot } => store.slots.push(*slot),
                 TraceEvent::Log { slot, msg } => store.logs.push((*slot, msg.clone())),
                 TraceEvent::Account { pubkey, data_b64 } => {
                     if let Ok(bytes) = general_purpose::STANDARD.decode(data_b64) {
-                        store.accounts.entry(pubkey.clone()).or_default().push(bytes);
+                        store
+                            .accounts
+                            .entry(pubkey.clone())
+                            .or_default()
+                            .push(bytes);
                     }
                 }
             }
@@ -100,35 +143,59 @@ impl ReplayStore {
 
     /// Build SimEvents in the chosen slot range using a deterministic clock and by projecting logs/accounts we can understand.
     pub fn to_sim_events(&self, cfg: &ReplayConfig) -> Vec<SimEvent> {
-        let clock = DeterministicClock { slot_ms: cfg.slot_ms.unwrap_or(400) };
+        let clock = DeterministicClock {
+            slot_ms: cfg.slot_ms.unwrap_or(400),
+        };
         let mut out = Vec::new();
         // emit SlotAdvance for every slot in range
         let mut it = SlotIterator::new(cfg.start_slot, cfg.end_slot);
         while let Some(slot) = it.next_slot() {
-            out.push(SimEvent { ts_ms: clock.ts_for_slot(slot), kind: SimEventKind::SlotAdvance { slot } });
+            out.push(SimEvent {
+                ts_ms: clock.ts_for_slot(slot),
+                kind: SimEventKind::SlotAdvance { slot },
+            });
         }
         // project logs within range
         for (slot, msg) in &self.logs {
             if *slot >= cfg.start_slot && *slot <= cfg.end_slot {
-                out.push(SimEvent { ts_ms: clock.ts_for_slot(*slot), kind: SimEventKind::Log(format!("replay: {msg}")) });
+                out.push(SimEvent {
+                    ts_ms: clock.ts_for_slot(*slot),
+                    kind: SimEventKind::Log(format!("replay: {msg}")),
+                });
             }
         }
         // project any account entries that decode to our CfmPoolJson
-    for (_k, updates) in &self.accounts {
+        for (_k, updates) in &self.accounts {
             for bytes in updates {
                 if let Ok(s) = std::str::from_utf8(bytes) {
                     if let Ok(pool) = serde_json::from_str::<CfmPoolJson>(s) {
-            // Emit a NewPool followed by a price/update event with current reserves
-            // Note: no slot associated in generic account events; map to start_slot as baseline
-            let ts = clock.ts_for_slot(cfg.start_slot);
-            out.push(SimEvent { ts_ms: ts, kind: SimEventKind::NewPool { pool: pool.pool.clone(), base_mint: pool.base_mint.clone(), quote_mint: pool.quote_mint.clone(), fee_bps: pool.fee_bps } });
-            out.push(SimEvent { ts_ms: ts, kind: SimEventKind::CfmPriceUpdate { pool: pool.pool.clone(), base_reserve: pool.base_reserve, quote_reserve: pool.quote_reserve, fee_bps: pool.fee_bps } });
+                        // Emit a NewPool followed by a price/update event with current reserves
+                        // Note: no slot associated in generic account events; map to start_slot as baseline
+                        let ts = clock.ts_for_slot(cfg.start_slot);
+                        out.push(SimEvent {
+                            ts_ms: ts,
+                            kind: SimEventKind::NewPool {
+                                pool: pool.pool.clone(),
+                                base_mint: pool.base_mint.clone(),
+                                quote_mint: pool.quote_mint.clone(),
+                                fee_bps: pool.fee_bps,
+                            },
+                        });
+                        out.push(SimEvent {
+                            ts_ms: ts,
+                            kind: SimEventKind::CfmPriceUpdate {
+                                pool: pool.pool.clone(),
+                                base_reserve: pool.base_reserve,
+                                quote_reserve: pool.quote_reserve,
+                                fee_bps: pool.fee_bps,
+                            },
+                        });
                     }
                 }
             }
         }
         // keep deterministic order by ts then kind string tag (cheap stable sort)
-        out.sort_by(|a,b| a.ts_ms.cmp(&b.ts_ms));
+        out.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms));
         out
     }
 }
@@ -143,4 +210,3 @@ pub fn build_events_from_trace(cfg: &ReplayConfig) -> anyhow::Result<(ReplayStor
     let sim_events = store.to_sim_events(cfg);
     Ok((store, sim_events))
 }
-

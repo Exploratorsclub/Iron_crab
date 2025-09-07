@@ -1,9 +1,9 @@
 //! Minimal RPC facade for deterministic replays backed by ReplayStore.
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::str::FromStr;
 use solana_sdk::account::Account;
 use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
 
 use super::replay::ReplayStore;
 
@@ -18,15 +18,26 @@ impl ReplayRpc {
     pub fn new(store: Arc<ReplayStore>) -> Self {
         let mut latest = HashMap::new();
         for (k, updates) in &store.accounts {
-            if let Some(last) = updates.last() { latest.insert(k.clone(), last.clone()); }
+            if let Some(last) = updates.last() {
+                latest.insert(k.clone(), last.clone());
+            }
         }
-        Self { store, latest: Arc::new(latest) }
+        Self {
+            store,
+            latest: Arc::new(latest),
+        }
     }
 
     pub fn get_account(&self, key: &Pubkey) -> Option<Account> {
         let k = key.to_string();
         let bytes = self.latest.get(&k)?.clone();
-        Some(Account { lamports: 0, data: bytes, owner: Pubkey::default(), executable: false, rent_epoch: 0 })
+        Some(Account {
+            lamports: 0,
+            data: bytes,
+            owner: Pubkey::default(),
+            executable: false,
+            rent_epoch: 0,
+        })
     }
 
     pub fn get_multiple_accounts(&self, keys: &[Pubkey]) -> Vec<Option<Account>> {
@@ -51,6 +62,9 @@ impl ReplayRpc {
 
     /// Return a cloned vector of (pubkey_string, latest_bytes) for all known accounts.
     pub fn all_latest(&self) -> Vec<(String, Vec<u8>)> {
-        self.latest.iter().map(|(k,v)| (k.clone(), v.clone())).collect()
+        self.latest
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 }

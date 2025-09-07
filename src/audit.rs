@@ -1,12 +1,16 @@
 use anyhow::Result;
 use std::fmt;
-use tracing::{Event, Subscriber};
 use tracing::field::Field;
-use tracing_subscriber::{
-    fmt::{FmtContext, format::{FormatEvent, Writer, FormatFields}},
-    EnvFilter, registry::LookupSpan,
-};
 use tracing::field::Visit;
+use tracing::{Event, Subscriber};
+use tracing_subscriber::{
+    fmt::{
+        format::{FormatEvent, FormatFields, Writer},
+        FmtContext,
+    },
+    registry::LookupSpan,
+    EnvFilter,
+};
 
 /// Initialize global logging with a redacting formatter that prevents secrets from leaking.
 pub fn init_redacting_logging(default_level: &str) -> Result<()> {
@@ -26,7 +30,12 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
     N: for<'writer> FormatFields<'writer> + 'static,
 {
-    fn format_event(&self, ctx: &FmtContext<S, N>, mut writer: Writer, event: &Event) -> fmt::Result {
+    fn format_event(
+        &self,
+        ctx: &FmtContext<S, N>,
+        mut writer: Writer,
+        event: &Event,
+    ) -> fmt::Result {
         // Timestamp and level
         let meta = event.metadata();
         write!(writer, "{} {} ", meta.level(), meta.target())?;
@@ -37,14 +46,20 @@ where
         }
 
         // Fields with redaction
-        let mut visitor = RedactionVisitor { out: String::new(), first: true };
+        let mut visitor = RedactionVisitor {
+            out: String::new(),
+            first: true,
+        };
         event.record(&mut visitor);
         writer.write_str(&visitor.out)?;
         writeln!(writer)
     }
 }
 
-struct RedactionVisitor { out: String, first: bool }
+struct RedactionVisitor {
+    out: String,
+    first: bool,
+}
 
 impl Visit for RedactionVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
@@ -59,7 +74,11 @@ impl Visit for RedactionVisitor {
 
 impl RedactionVisitor {
     fn push_kv(&mut self, key: &str, value: &str) {
-        if !self.first { self.out.push(' '); } else { self.first = false; }
+        if !self.first {
+            self.out.push(' ');
+        } else {
+            self.first = false;
+        }
         let redacted = redact_if_sensitive(key, value);
         // Avoid adding quotes around already quoted debug strings to keep compact output
         self.out.push_str(key);
@@ -72,10 +91,14 @@ fn redact_if_sensitive(key: &str, val: &str) -> String {
     let lname = key.to_ascii_lowercase();
     // Remove surrounding quotes from debug strings
     let v = val.trim_matches('"');
-    let key_hint = ["secret", "private", "priv", "seed", "mnemonic", "keypair", "sk", "kp"]
-        .iter()
-        .any(|k| lname.contains(k));
-    if key_hint { return "***REDACTED***".into(); }
+    let key_hint = [
+        "secret", "private", "priv", "seed", "mnemonic", "keypair", "sk", "kp",
+    ]
+    .iter()
+    .any(|k| lname.contains(k));
+    if key_hint {
+        return "***REDACTED***".into();
+    }
 
     // Heuristic: JSON-like large numeric arrays (e.g., keypair bytes)
     if v.starts_with('[') && v.ends_with(']') && v.len() >= 64 && v.contains(',') {

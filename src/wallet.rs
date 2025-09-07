@@ -1,8 +1,7 @@
-
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _; // for base64 decode on Engine instances
-use std::sync::Arc;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use solana_sdk::{
     hash::Hash,
@@ -17,10 +16,12 @@ use solana_sdk::{
 // Build system transfer manually (system_instruction module removed in 3.x public API); use legacy helper via solana_program re-export in spl_token if available, else construct inline
 use spl_token::solana_program::instruction::Instruction as ProgInstruction;
 // (ProgInstruction already imported above)
-use solana_sdk::instruction::{Instruction as SdkInstruction, AccountMeta as SdkAccountMeta};
+use solana_sdk::instruction::{AccountMeta as SdkAccountMeta, Instruction as SdkInstruction};
 // Access system program id from crate to avoid hardcoding
 #[inline]
-fn system_program_id() -> SdkPubkey { SdkPubkey::new_from_array(solana_system_program::id().to_bytes()) }
+fn system_program_id() -> SdkPubkey {
+    SdkPubkey::new_from_array(solana_system_program::id().to_bytes())
+}
 
 // Our RPC wrapper
 use crate::solana::rpc::SolanaRpc;
@@ -30,7 +31,10 @@ use spl_token::id as spl_token_program_id;
 use spl_token_2022::id as spl_token_2022_program_id;
 
 // Associated token account (program-facing helpers)
-use spl_associated_token_account::{get_associated_token_address_with_program_id, instruction::create_associated_token_account_idempotent};
+use spl_associated_token_account::{
+    get_associated_token_address_with_program_id,
+    instruction::create_associated_token_account_idempotent,
+};
 
 // Token instruction builders
 use spl_token::instruction as spl_ix;
@@ -39,17 +43,25 @@ use spl_token_2022::instruction as spl22_ix;
 // Use the spl_token re-export of solana_program::Pubkey so the function signatures align
 use spl_token::solana_program::pubkey::Pubkey as SplProgPubkey;
 #[inline]
-fn sdk_to_spl(pk: &SdkPubkey) -> SplProgPubkey { SplProgPubkey::new_from_array(pk.to_bytes()) }
+fn sdk_to_spl(pk: &SdkPubkey) -> SplProgPubkey {
+    SplProgPubkey::new_from_array(pk.to_bytes())
+}
 #[inline]
-fn spl_to_sdk(pk: &SplProgPubkey) -> SdkPubkey { SdkPubkey::new_from_array(pk.to_bytes()) }
+fn spl_to_sdk(pk: &SplProgPubkey) -> SdkPubkey {
+    SdkPubkey::new_from_array(pk.to_bytes())
+}
 fn prog_ix_to_sdk(ix: ProgInstruction) -> SdkInstruction {
     SdkInstruction {
         program_id: SdkPubkey::new_from_array(ix.program_id.to_bytes()),
-        accounts: ix.accounts.into_iter().map(|a| SdkAccountMeta {
-            pubkey: SdkPubkey::new_from_array(a.pubkey.to_bytes()),
-            is_signer: a.is_signer,
-            is_writable: a.is_writable,
-        }).collect(),
+        accounts: ix
+            .accounts
+            .into_iter()
+            .map(|a| SdkAccountMeta {
+                pubkey: SdkPubkey::new_from_array(a.pubkey.to_bytes()),
+                is_signer: a.is_signer,
+                is_writable: a.is_writable,
+            })
+            .collect(),
         data: ix.data,
     }
 }
@@ -61,9 +73,13 @@ pub struct Treasury {
 
 impl Treasury {
     /// Construct from any signer (e.g., remote signer or KMS-backed signer)
-    pub fn from_signer(signer: Arc<dyn Signer + Send + Sync>) -> Self { Self { signer } }
+    pub fn from_signer(signer: Arc<dyn Signer + Send + Sync>) -> Self {
+        Self { signer }
+    }
     /// Load from an on-disk keypair file (JSON array), with basic path hardening.
-    pub fn load(path: &str) -> Result<Self> { Self::load_secure(path, false) }
+    pub fn load(path: &str) -> Result<Self> {
+        Self::load_secure(path, false)
+    }
 
     /// Secure loader with optional strict mode. When strict=true, the path must reside under allowed dirs.
     /// Allowed dirs: env IRONCRAB_KEYPAIR_ALLOWED_DIRS (split by ';' or ','), otherwise defaults to
@@ -75,7 +91,9 @@ impl Treasury {
         Self::validate_keypair_path(&expanded, strict)?;
         let kp = read_keypair_file(&expanded)
             .map_err(|e| anyhow!("Failed to read keypair {expanded}: {e}"))?;
-        Ok(Self { signer: Arc::new(kp) })
+        Ok(Self {
+            signer: Arc::new(kp),
+        })
     }
 
     /// Load from environment variables in priority order:
@@ -84,34 +102,51 @@ impl Treasury {
     /// - IRONCRAB_KEYPAIR_PATH: file path (validated, strict if IRONCRAB_KEYPAIR_STRICT=1)
     pub fn load_from_env() -> Result<Self> {
         if let Ok(js) = std::env::var("IRONCRAB_KEYPAIR_JSON") {
-            let bytes: Vec<u8> = serde_json::from_str(&js).context("parse IRONCRAB_KEYPAIR_JSON")?;
+            let bytes: Vec<u8> =
+                serde_json::from_str(&js).context("parse IRONCRAB_KEYPAIR_JSON")?;
             let secret: [u8; 32] = match bytes.len() {
-                32 => <[u8;32]>::try_from(bytes.as_slice()).unwrap(),
-                64 => <[u8;32]>::try_from(&bytes[..32]).unwrap(),
-                n => return Err(anyhow!("IRONCRAB_KEYPAIR_JSON must be 32 or 64 bytes, got {n}")),
+                32 => <[u8; 32]>::try_from(bytes.as_slice()).unwrap(),
+                64 => <[u8; 32]>::try_from(&bytes[..32]).unwrap(),
+                n => {
+                    return Err(anyhow!(
+                        "IRONCRAB_KEYPAIR_JSON must be 32 or 64 bytes, got {n}"
+                    ))
+                }
             };
             let kp = Keypair::new_from_array(secret);
-            return Ok(Self { signer: Arc::new(kp) });
+            return Ok(Self {
+                signer: Arc::new(kp),
+            });
         }
         if let Ok(b64) = std::env::var("IRONCRAB_KEYPAIR_B64") {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64)
                 .context("decode IRONCRAB_KEYPAIR_B64")?;
             let secret: [u8; 32] = match bytes.len() {
-                32 => <[u8;32]>::try_from(bytes.as_slice()).unwrap(),
-                64 => <[u8;32]>::try_from(&bytes[..32]).unwrap(),
-                n => return Err(anyhow!("IRONCRAB_KEYPAIR_B64 must decode to 32 or 64 bytes, got {n}")),
+                32 => <[u8; 32]>::try_from(bytes.as_slice()).unwrap(),
+                64 => <[u8; 32]>::try_from(&bytes[..32]).unwrap(),
+                n => {
+                    return Err(anyhow!(
+                        "IRONCRAB_KEYPAIR_B64 must decode to 32 or 64 bytes, got {n}"
+                    ))
+                }
             };
             let kp = Keypair::new_from_array(secret);
-            return Ok(Self { signer: Arc::new(kp) });
+            return Ok(Self {
+                signer: Arc::new(kp),
+            });
         }
         if let Ok(bs58) = std::env::var("IRONCRAB_KEYPAIR_BASE58") {
             // Expects secret key in base58 (64 bytes) per solana-keypair API
             let kp = Keypair::from_base58_string(&bs58);
-            return Ok(Self { signer: Arc::new(kp) });
+            return Ok(Self {
+                signer: Arc::new(kp),
+            });
         }
         if let Ok(p) = std::env::var("IRONCRAB_KEYPAIR_PATH") {
-            let strict = std::env::var("IRONCRAB_KEYPAIR_STRICT").map(|v| v=="1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+            let strict = std::env::var("IRONCRAB_KEYPAIR_STRICT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
             return Self::load_secure(&p, strict);
         }
         Err(anyhow!("No keypair env provided; set IRONCRAB_KEYPAIR_JSON, IRONCRAB_KEYPAIR_B64, or IRONCRAB_KEYPAIR_PATH"))
@@ -120,20 +155,29 @@ impl Treasury {
     fn validate_keypair_path(path: &str, strict: bool) -> Result<()> {
         // Reject UNC/network paths when strict
         #[cfg(windows)]
-        if strict && path.starts_with("\\\\") { return Err(anyhow!("UNC paths are disallowed in strict mode")); }
-        let canon = std::fs::canonicalize(Path::new(path)).with_context(|| format!("canonicalize {path}"))?;
-        if !strict { return Ok(()); }
+        if strict && path.starts_with("\\\\") {
+            return Err(anyhow!("UNC paths are disallowed in strict mode"));
+        }
+        let canon = std::fs::canonicalize(Path::new(path))
+            .with_context(|| format!("canonicalize {path}"))?;
+        if !strict {
+            return Ok(());
+        }
         // Build allowed directories list
         let allowed_env = std::env::var("IRONCRAB_KEYPAIR_ALLOWED_DIRS").unwrap_or_default();
         let mut allowed: Vec<PathBuf> = allowed_env
-            .split(|c| c==';' || c==',')
+            .split(|c| c == ';' || c == ',')
             .filter(|s| !s.trim().is_empty())
             .map(|s| shellexpand::tilde(s).to_string())
             .map(PathBuf::from)
             .collect();
         if allowed.is_empty() {
-            if let Some(home) = dirs::home_dir() { allowed.push(home.join(".config").join("solana")); }
-            if let Some(appdata) = std::env::var_os("APPDATA") { allowed.push(PathBuf::from(appdata).join("Solana")); }
+            if let Some(home) = dirs::home_dir() {
+                allowed.push(home.join(".config").join("solana"));
+            }
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                allowed.push(PathBuf::from(appdata).join("Solana"));
+            }
             let mut ws = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             ws.push("secrets");
             allowed.push(ws);
@@ -141,17 +185,26 @@ impl Treasury {
         let mut ok = false;
         for base in allowed {
             if let Ok(base_c) = std::fs::canonicalize(&base) {
-                if canon.starts_with(&base_c) { ok = true; break; }
+                if canon.starts_with(&base_c) {
+                    ok = true;
+                    break;
+                }
             }
         }
-        if !ok { return Err(anyhow!("keypair path not under allowed directories (enable by setting IRONCRAB_KEYPAIR_ALLOWED_DIRS or disable strict)")); }
+        if !ok {
+            return Err(anyhow!("keypair path not under allowed directories (enable by setting IRONCRAB_KEYPAIR_ALLOWED_DIRS or disable strict)"));
+        }
         Ok(())
     }
 
-    pub fn pubkey(&self) -> SdkPubkey { self.signer.pubkey() }
+    pub fn pubkey(&self) -> SdkPubkey {
+        self.signer.pubkey()
+    }
 
     /// Expose a reference to the inner signer for transaction signing.
-    pub fn signer_ref(&self) -> &(dyn Signer + Send + Sync) { self.signer.as_ref() }
+    pub fn signer_ref(&self) -> &(dyn Signer + Send + Sync) {
+        self.signer.as_ref()
+    }
 
     /// Read SOL balance (lamports)
     pub async fn sol_balance(&self, rpc: &SolanaRpc) -> Result<u64> {
@@ -159,7 +212,11 @@ impl Treasury {
     }
 
     /// Determine token program for a given mint (spl-token vs token-2022); returns **SDK** Pubkey
-    pub async fn token_program_for_mint(&self, rpc: &SolanaRpc, mint: &SdkPubkey) -> Result<SdkPubkey> {
+    pub async fn token_program_for_mint(
+        &self,
+        rpc: &SolanaRpc,
+        mint: &SdkPubkey,
+    ) -> Result<SdkPubkey> {
         let acct = rpc.rpc.get_account(mint).await?;
         let owner_sdk: SdkPubkey = acct.owner;
 
@@ -172,12 +229,20 @@ impl Treasury {
         } else if owner_sdk == spl_token22_sdk {
             Ok(spl_token22_sdk)
         } else {
-            Err(anyhow!("Mint owner is neither spl-token nor spl-token-2022: {}", owner_sdk))
+            Err(anyhow!(
+                "Mint owner is neither spl-token nor spl-token-2022: {}",
+                owner_sdk
+            ))
         }
     }
 
     /// Compute ATA address (returns (ATA, token_program) as **SDK** Pubkeys)
-    pub async fn ata_address(&self, rpc: &SolanaRpc, owner: &SdkPubkey, mint: &SdkPubkey) -> Result<(SdkPubkey, SdkPubkey)> {
+    pub async fn ata_address(
+        &self,
+        rpc: &SolanaRpc,
+        owner: &SdkPubkey,
+        mint: &SdkPubkey,
+    ) -> Result<(SdkPubkey, SdkPubkey)> {
         let token_prog = self.token_program_for_mint(rpc, mint).await?;
         // Derive using program pubkeys, then convert back
         let ata_prog = get_associated_token_address_with_program_id(
@@ -189,7 +254,12 @@ impl Treasury {
     }
 
     /// Ensure ATA exists (idempotent). Returns ATA **SDK** Pubkey.
-    pub async fn ensure_ata(&self, rpc: &SolanaRpc, owner: &SdkPubkey, mint: &SdkPubkey) -> Result<SdkPubkey> {
+    pub async fn ensure_ata(
+        &self,
+        rpc: &SolanaRpc,
+        owner: &SdkPubkey,
+        mint: &SdkPubkey,
+    ) -> Result<SdkPubkey> {
         let (ata, token_prog) = self.ata_address(rpc, owner, mint).await?;
 
         // Already present?
@@ -204,22 +274,35 @@ impl Treasury {
             &sdk_to_spl(mint),
             &sdk_to_spl(&token_prog),
         );
-    let ix = prog_ix_to_sdk(ix_prog);
-    let bh: Hash = rpc.rpc.get_latest_blockhash().await?;
-    let mut tx = Transaction::new_with_payer(&[ix], Some(&self.pubkey()));
-    tx.try_sign(&[self.signer.as_ref()], bh)?;
-    let _sig = rpc.rpc.send_and_confirm_transaction(&tx).await?;
+        let ix = prog_ix_to_sdk(ix_prog);
+        let bh: Hash = rpc.rpc.get_latest_blockhash().await?;
+        let mut tx = Transaction::new_with_payer(&[ix], Some(&self.pubkey()));
+        tx.try_sign(&[self.signer.as_ref()], bh)?;
+        let _sig = rpc.rpc.send_and_confirm_transaction(&tx).await?;
         Ok(ata)
     }
 
     /// Transfer native SOL
-    pub async fn transfer_sol(&self, rpc: &SolanaRpc, to: &SdkPubkey, lamports: u64) -> Result<Signature> {
+    pub async fn transfer_sol(
+        &self,
+        rpc: &SolanaRpc,
+        to: &SdkPubkey,
+        lamports: u64,
+    ) -> Result<Signature> {
         // Manually craft system transfer instruction
         let ix = SdkInstruction {
             program_id: system_program_id(),
             accounts: vec![
-                SdkAccountMeta { pubkey: self.pubkey(), is_signer: true, is_writable: true },
-                SdkAccountMeta { pubkey: *to, is_signer: false, is_writable: true },
+                SdkAccountMeta {
+                    pubkey: self.pubkey(),
+                    is_signer: true,
+                    is_writable: true,
+                },
+                SdkAccountMeta {
+                    pubkey: *to,
+                    is_signer: false,
+                    is_writable: true,
+                },
             ],
             data: {
                 // system transfer: instruction enum index 2 (per historical definition) + u64 lamports little-endian
@@ -230,17 +313,23 @@ impl Treasury {
             },
         };
         let bh = rpc.rpc.get_latest_blockhash().await?;
-    let mut tx = Transaction::new_with_payer(&[ix], Some(&self.pubkey()));
-    tx.try_sign(&[self.signer.as_ref()], bh)?;
+        let mut tx = Transaction::new_with_payer(&[ix], Some(&self.pubkey()));
+        tx.try_sign(&[self.signer.as_ref()], bh)?;
         let sig = rpc.rpc.send_and_confirm_transaction(&tx).await?;
         Ok(sig)
     }
 
     /// Transfer SPL-Token (classic or 2022). `amount` in base units.
-    pub async fn transfer_spl(&self, rpc: &SolanaRpc, mint: &SdkPubkey, to_owner: &SdkPubkey, amount: u64) -> Result<Signature> {
+    pub async fn transfer_spl(
+        &self,
+        rpc: &SolanaRpc,
+        mint: &SdkPubkey,
+        to_owner: &SdkPubkey,
+        amount: u64,
+    ) -> Result<Signature> {
         // Ensure ATAs and determine token program
         let (from_ata, prog_from_sdk) = self.ata_address(rpc, &self.pubkey(), mint).await?;
-        let (to_ata,   prog_to_sdk)   = self.ata_address(rpc, to_owner, mint).await?;
+        let (to_ata, prog_to_sdk) = self.ata_address(rpc, to_owner, mint).await?;
         if prog_from_sdk != prog_to_sdk {
             return Err(anyhow!("source and destination token program mismatch"));
         }
@@ -252,30 +341,64 @@ impl Treasury {
         let decimals = self.try_mint_decimals(rpc, mint).await.ok();
 
         // Convert to program pubkeys for the token instruction builders
-    let from_ata_p = sdk_to_spl(&from_ata);
-    let to_ata_p   = sdk_to_spl(&to_ata);
-    let mint_p     = sdk_to_spl(mint);
-    let owner_p    = sdk_to_spl(&self.pubkey());
+        let from_ata_p = sdk_to_spl(&from_ata);
+        let to_ata_p = sdk_to_spl(&to_ata);
+        let mint_p = sdk_to_spl(mint);
+        let owner_p = sdk_to_spl(&self.pubkey());
 
         // Figure out which token program we're on
         let spl_token_sdk = SdkPubkey::new_from_array(spl_token_program_id().to_bytes());
         let is_classic = prog_from_sdk == spl_token_sdk;
 
-    let ix_prog = if is_classic {
+        let ix_prog = if is_classic {
             if let Some(d) = decimals {
-                spl_ix::transfer_checked(&spl_token_program_id(), &from_ata_p, &mint_p, &to_ata_p, &owner_p, &[], amount, d)?
+                spl_ix::transfer_checked(
+                    &spl_token_program_id(),
+                    &from_ata_p,
+                    &mint_p,
+                    &to_ata_p,
+                    &owner_p,
+                    &[],
+                    amount,
+                    d,
+                )?
             } else {
-                spl_ix::transfer(&spl_token_program_id(), &from_ata_p, &to_ata_p, &owner_p, &[], amount)?
+                spl_ix::transfer(
+                    &spl_token_program_id(),
+                    &from_ata_p,
+                    &to_ata_p,
+                    &owner_p,
+                    &[],
+                    amount,
+                )?
             }
         } else {
             if let Some(d) = decimals {
-                spl22_ix::transfer_checked(&spl_token_2022_program_id(), &from_ata_p, &mint_p, &to_ata_p, &owner_p, &[], amount, d)?
+                spl22_ix::transfer_checked(
+                    &spl_token_2022_program_id(),
+                    &from_ata_p,
+                    &mint_p,
+                    &to_ata_p,
+                    &owner_p,
+                    &[],
+                    amount,
+                    d,
+                )?
             } else {
                 // transfer (unchecked) is deprecated in 2022; prefer checked when possible
-                spl22_ix::transfer_checked(&spl_token_2022_program_id(), &from_ata_p, &mint_p, &to_ata_p, &owner_p, &[], amount, decimals.unwrap_or(0))?
+                spl22_ix::transfer_checked(
+                    &spl_token_2022_program_id(),
+                    &from_ata_p,
+                    &mint_p,
+                    &to_ata_p,
+                    &owner_p,
+                    &[],
+                    amount,
+                    decimals.unwrap_or(0),
+                )?
             }
         };
-    let ix = prog_ix_to_sdk(ix_prog);
+        let ix = prog_ix_to_sdk(ix_prog);
         let bh = rpc.rpc.get_latest_blockhash().await?;
         let mut tx = Transaction::new_with_payer(&[ix], Some(&self.pubkey()));
         tx.try_sign(&[self.signer.as_ref()], bh)?;
@@ -293,8 +416,16 @@ impl Treasury {
         let ix_transfer = SdkInstruction {
             program_id: system_program_id(),
             accounts: vec![
-                SdkAccountMeta { pubkey: owner, is_signer: true, is_writable: true },
-                SdkAccountMeta { pubkey: ata, is_signer: false, is_writable: true },
+                SdkAccountMeta {
+                    pubkey: owner,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                SdkAccountMeta {
+                    pubkey: ata,
+                    is_signer: false,
+                    is_writable: true,
+                },
             ],
             data: {
                 let mut d = Vec::with_capacity(1 + 8);
@@ -304,18 +435,22 @@ impl Treasury {
             },
         };
         // 2) sync native (needs program pubkey for ATA)
-    let ata_prog = sdk_to_spl(&ata);
-    let ix_sync = prog_ix_to_sdk(spl_ix::sync_native(&spl_token_program_id(), &ata_prog)?);
+        let ata_prog = sdk_to_spl(&ata);
+        let ix_sync = prog_ix_to_sdk(spl_ix::sync_native(&spl_token_program_id(), &ata_prog)?);
 
         let bh = rpc.rpc.get_latest_blockhash().await?;
-    let mut tx = Transaction::new_with_payer(&[ix_transfer, ix_sync], Some(&owner));
-    tx.try_sign(&[self.signer.as_ref()], bh)?;
+        let mut tx = Transaction::new_with_payer(&[ix_transfer, ix_sync], Some(&owner));
+        tx.try_sign(&[self.signer.as_ref()], bh)?;
         let sig = rpc.rpc.send_and_confirm_transaction(&tx).await?;
         Ok((ata, sig))
     }
 
     /// Unwrap WSOL → SOL (close ATA to recipient or self)
-    pub async fn unwrap_wsol(&self, rpc: &SolanaRpc, recipient: Option<SdkPubkey>) -> Result<Signature> {
+    pub async fn unwrap_wsol(
+        &self,
+        rpc: &SolanaRpc,
+        recipient: Option<SdkPubkey>,
+    ) -> Result<Signature> {
         let wsol_mint_sdk = SdkPubkey::new_from_array(spl_token::native_mint::id().to_bytes());
         let owner = self.pubkey();
         let (ata, prog_sdk) = self.ata_address(rpc, &owner, &wsol_mint_sdk).await?;
@@ -326,11 +461,17 @@ impl Treasury {
         }
 
         let dest = recipient.unwrap_or(owner);
-    let ata_p = sdk_to_spl(&ata);
-    let dest_p = sdk_to_spl(&dest);
-    let owner_p = sdk_to_spl(&owner);
+        let ata_p = sdk_to_spl(&ata);
+        let dest_p = sdk_to_spl(&dest);
+        let owner_p = sdk_to_spl(&owner);
 
-    let ix = prog_ix_to_sdk(spl_ix::close_account(&spl_token_program_id(), &ata_p, &dest_p, &owner_p, &[])?);
+        let ix = prog_ix_to_sdk(spl_ix::close_account(
+            &spl_token_program_id(),
+            &ata_p,
+            &dest_p,
+            &owner_p,
+            &[],
+        )?);
         let bh = rpc.rpc.get_latest_blockhash().await?;
         let mut tx = Transaction::new_with_payer(&[ix], Some(&owner));
         tx.try_sign(&[self.signer.as_ref()], bh)?;

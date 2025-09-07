@@ -1,23 +1,22 @@
-
-use std::{sync::Arc, time::Duration};
 use anyhow::Result;
+use std::{sync::Arc, time::Duration};
 use tokio::time::{interval, Duration as TokioDuration};
 use tracing::{info, warn, Instrument as _};
 
 use crate::config::{Config, StrategyDef};
-use crate::wallet::Treasury;
-use crate::types::TradeIntent;
-use crate::solana::rpc::SolanaRpc;
 use crate::solana::arbitrage::ArbitrageEngine;
-use crate::solana::sniper::{run_sniper, SniperCfg};
-use crate::solana::dex::{raydium::Raydium, orca::Orca, Dex};
 use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
+use crate::solana::dex::{orca::Orca, raydium::Raydium, Dex};
+use crate::solana::rpc::SolanaRpc;
+use crate::solana::sniper::{run_sniper, SniperCfg};
+use crate::types::TradeIntent;
+use crate::wallet::Treasury;
 
 pub mod allocator;
-pub mod strategy;
 #[cfg(feature = "python")]
 pub mod py_strategy;
+pub mod strategy;
 
 use allocator::Allocator;
 use strategy::Strategy;
@@ -32,32 +31,52 @@ pub struct EngineContext {
 pub struct Engine {
     ctx: Arc<EngineContext>,
     allocator: Arc<Allocator>,
-    strategies: Vec<Arc<dyn Strategy>>,    // pro Markt konfigurierbar
+    strategies: Vec<Arc<dyn Strategy>>, // pro Markt konfigurierbar
 }
 
 impl Engine {
     pub async fn new(cfg: Arc<Config>, rpc: Arc<SolanaRpc>, treasury: Treasury) -> Result<Self> {
         let allocator = Arc::new(Allocator::new(cfg.allocator.clone()));
-        let ctx = Arc::new(EngineContext { cfg: cfg.clone(), rpc, treasury });
-        Ok(Self { ctx, allocator, strategies: vec![] })
+        let ctx = Arc::new(EngineContext {
+            cfg: cfg.clone(),
+            rpc,
+            treasury,
+        });
+        Ok(Self {
+            ctx,
+            allocator,
+            strategies: vec![],
+        })
     }
 
     pub async fn build_strategies(&mut self) -> Result<()> {
         for m in &self.ctx.cfg.markets {
-            let sdef: &StrategyDef = self.ctx.cfg.strategies.get(&m.strategy)
+            let sdef: &StrategyDef = self
+                .ctx
+                .cfg
+                .strategies
+                .get(&m.strategy)
                 .ok_or_else(|| anyhow::anyhow!("unknown strategy {}", m.strategy))?;
             match sdef.kind.as_str() {
                 "rust" => {
                     // Platzhalter: dummy Strategie pro Markt
-                    let s = Arc::new(DummyRustStrategy { name: format!("{}-{}", m.name, m.strategy) });
+                    let s = Arc::new(DummyRustStrategy {
+                        name: format!("{}-{}", m.name, m.strategy),
+                    });
                     self.strategies.push(s);
                 }
                 "python" => {
                     #[cfg(feature = "python")]
                     {
                         use crate::engine::py_strategy::py::PyStrategy;
-                        let module = sdef.module.clone().ok_or_else(|| anyhow::anyhow!("python strategy needs module"))?;
-                        let class  = sdef.class.clone().ok_or_else(|| anyhow::anyhow!("python strategy needs class"))?;
+                        let module = sdef
+                            .module
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("python strategy needs module"))?;
+                        let class = sdef
+                            .class
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("python strategy needs class"))?;
                         let params = serde_json::to_value(&sdef.params)?;
                         let s = PyStrategy::new(m.strategy.clone(), module, class, params).await?;
                         self.strategies.push(Arc::new(s));
@@ -79,7 +98,9 @@ impl Engine {
 
         // Strategy init hooks (best-effort)
         for s in &self.strategies {
-            if let Err(e) = s.init(self.ctx.clone()) { tracing::warn!(?e, name = s.name(), "strategy init failed"); }
+            if let Err(e) = s.init(self.ctx.clone()) {
+                tracing::warn!(?e, name = s.name(), "strategy init failed");
+            }
         }
 
         // Rebalancing Loop (mit RPC-Referenz)
@@ -105,8 +126,12 @@ impl Engine {
                 let mut iv = interval(Duration::from_secs(10));
                 loop {
                     iv.tick().await;
-                    if let Err(e) = rdx.refresh_pools().await { tracing::debug!(?e, "raydium refresh"); }
-                    if let Err(e) = orc.refresh_pools().await { tracing::debug!(?e, "orca refresh"); }
+                    if let Err(e) = rdx.refresh_pools().await {
+                        tracing::debug!(?e, "raydium refresh");
+                    }
+                    if let Err(e) = orc.refresh_pools().await {
+                        tracing::debug!(?e, "orca refresh");
+                    }
                 }
             });
         }
@@ -119,13 +144,18 @@ impl Engine {
                 let ray = Arc::new(Raydium::new(rpc.clone()));
                 let orc = Arc::new(Orca::new(rpc.clone()));
                 let arb = ArbitrageEngine::new(rpc, vec![ray.clone(), orc.clone()]);
-                let interval_ms = cfg_pairs.as_ref().and_then(|c| c.interval_ms).unwrap_or(2000);
+                let interval_ms = cfg_pairs
+                    .as_ref()
+                    .and_then(|c| c.interval_ms)
+                    .unwrap_or(2000);
                 let pairs = cfg_pairs.map(|c| c.pairs).unwrap_or_default();
                 let mut iv = interval(Duration::from_millis(interval_ms));
                 loop {
                     iv.tick().await;
                     for p in &pairs {
-                        if let Ok(Some(edge)) = arb.best_edge(&p.in_mint, &p.out_mint, p.ui_amount).await {
+                        if let Ok(Some(edge)) =
+                            arb.best_edge(&p.in_mint, &p.out_mint, p.ui_amount).await
+                        {
                             tracing::info!(?edge, pair = %format!("{}->{}", p.in_mint, p.out_mint), "arb candidate");
                         }
                     }
@@ -142,7 +172,15 @@ impl Engine {
             let treasury_arc = Arc::new(self.ctx.treasury.clone());
             tokio::spawn(async move {
                 let cfg: SniperCfg = (&sn_cfg).into();
-                if let Err(e) = run_sniper(rpc_clone, cfg, Some(raydium_ref), Some(orca_ref), treasury_arc).await {
+                if let Err(e) = run_sniper(
+                    rpc_clone,
+                    cfg,
+                    Some(raydium_ref),
+                    Some(orca_ref),
+                    treasury_arc,
+                )
+                .await
+                {
                     tracing::warn!(?e, "sniper exited");
                 }
             });
@@ -151,8 +189,18 @@ impl Engine {
         // Strategy Tick Loop
         let mut iv = interval(Duration::from_millis(600));
         // Simple per-strategy circuit breakers (local state)
-        struct Circuit { failures: u32, opened_until: Option<std::time::Instant> }
-        let mut circuits: Vec<Circuit> = self.strategies.iter().map(|_| Circuit { failures: 0, opened_until: None }).collect();
+        struct Circuit {
+            failures: u32,
+            opened_until: Option<std::time::Instant>,
+        }
+        let mut circuits: Vec<Circuit> = self
+            .strategies
+            .iter()
+            .map(|_| Circuit {
+                failures: 0,
+                opened_until: None,
+            })
+            .collect();
         const FAIL_THRESHOLD: u32 = 5;
         const OPEN_MS: u64 = 5_000;
         loop {
@@ -161,41 +209,57 @@ impl Engine {
             for (idx, s) in self.strategies.iter().enumerate() {
                 // circuit open?
                 if let Some(until) = circuits[idx].opened_until {
-                    if std::time::Instant::now() < until { continue; }
+                    if std::time::Instant::now() < until {
+                        continue;
+                    }
                     circuits[idx].opened_until = None; // half-open reset
                 }
                 // per-tick timeout budget
                 let span = tracing::info_span!("strategy_tick", name = s.name());
                 let s_arc = s.clone();
                 let ctx = self.ctx.clone();
-                let handle = tokio::spawn(async move {
-                    Strategy::on_tick(&*s_arc, ctx).await
-                }.instrument(span));
+                let handle = tokio::spawn(
+                    async move { Strategy::on_tick(&*s_arc, ctx).await }.instrument(span),
+                );
                 match tokio::time::timeout(TokioDuration::from_millis(500), handle).await {
-                    Err(_) => { // timeout
+                    Err(_) => {
+                        // timeout
                         tracing::warn!(name = s.name(), "strategy tick timed out");
-                        crate::metrics::STRATEGY_TICK_TIMEOUTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::metrics::STRATEGY_TICK_TIMEOUTS_TOTAL
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         circuits[idx].failures += 1;
                     }
-                    Ok(Err(join_err)) => { // panic
+                    Ok(Err(join_err)) => {
+                        // panic
                         tracing::warn!(name = s.name(), panic = %join_err, "strategy tick panicked");
-                        crate::metrics::STRATEGY_TICK_PANICS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::metrics::STRATEGY_TICK_PANICS_TOTAL
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         circuits[idx].failures += 1;
                     }
-                    Ok(Ok(Err(e))) => { // returned error
+                    Ok(Ok(Err(e))) => {
+                        // returned error
                         tracing::warn!(?e, name = s.name(), "strategy tick error");
                         circuits[idx].failures += 1;
                     }
-                    Ok(Ok(Ok(intents))) => { // success
+                    Ok(Ok(Ok(intents))) => {
+                        // success
                         circuits[idx].failures = 0;
-                        for ti in intents { self.execute(ti).await?; }
+                        for ti in intents {
+                            self.execute(ti).await?;
+                        }
                     }
                 }
                 if circuits[idx].failures >= FAIL_THRESHOLD {
                     circuits[idx].failures = 0;
-                    circuits[idx].opened_until = Some(std::time::Instant::now() + TokioDuration::from_millis(OPEN_MS));
-                    crate::metrics::STRATEGY_CIRCUIT_OPENS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::warn!(name = s.name(), open_ms = OPEN_MS, "strategy circuit opened due to repeated failures");
+                    circuits[idx].opened_until =
+                        Some(std::time::Instant::now() + TokioDuration::from_millis(OPEN_MS));
+                    crate::metrics::STRATEGY_CIRCUIT_OPENS_TOTAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        name = s.name(),
+                        open_ms = OPEN_MS,
+                        "strategy circuit opened due to repeated failures"
+                    );
                 }
             }
         }
@@ -208,10 +272,14 @@ impl Engine {
     }
 }
 
-struct DummyRustStrategy { name: String }
+struct DummyRustStrategy {
+    name: String,
+}
 #[async_trait::async_trait]
 impl Strategy for DummyRustStrategy {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
     async fn on_tick(&self, _ctx: Arc<EngineContext>) -> anyhow::Result<Vec<TradeIntent>> {
         Ok(vec![]) // keine Trades – nur Vorlage
     }

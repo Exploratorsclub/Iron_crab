@@ -39,16 +39,32 @@ impl Default for EstimatorConfig {
     }
 }
 
-pub fn estimate_from_instructions(ixs: &[Instruction], hops: usize, notional_in: u64, cfg: EstimatorConfig) -> ComputeEstimate {
+pub fn estimate_from_instructions(
+    ixs: &[Instruction],
+    hops: usize,
+    notional_in: u64,
+    cfg: EstimatorConfig,
+) -> ComputeEstimate {
     let mut limit = cfg.base_single_swap_cu;
-    if hops > 1 { limit += cfg.per_hop_increment_cu * (hops as u32 - 1); }
+    if hops > 1 {
+        limit += cfg.per_hop_increment_cu * (hops as u32 - 1);
+    }
     let extra_ix = ixs.len().saturating_sub(1) as u32; // beyond first
     limit = limit.saturating_add(extra_ix * cfg.per_extra_ix_cu);
-    if limit < cfg.min_limit { limit = cfg.min_limit; }
-    if limit > cfg.max_limit { limit = cfg.max_limit; }
+    if limit < cfg.min_limit {
+        limit = cfg.min_limit;
+    }
+    if limit > cfg.max_limit {
+        limit = cfg.max_limit;
+    }
     let mut price = cfg.default_cu_price_micro_lamports;
-    if notional_in >= cfg.large_notional_threshold { price = price.saturating_mul(cfg.large_notional_multiplier); }
-    ComputeEstimate { compute_unit_limit: limit, compute_unit_price_micro_lamports: price }
+    if notional_in >= cfg.large_notional_threshold {
+        price = price.saturating_mul(cfg.large_notional_multiplier);
+    }
+    ComputeEstimate {
+        compute_unit_limit: limit,
+        compute_unit_price_micro_lamports: price,
+    }
 }
 
 pub fn estimate_single_swap(notional_in: u64) -> ComputeEstimate {

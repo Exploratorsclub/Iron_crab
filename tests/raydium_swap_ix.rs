@@ -13,25 +13,27 @@ fn raydium_build_swap_instruction_placeholder() {
     let r = Raydium::new(rpc);
     // Without pools this should fail, so test just ensures method absence doesn't panic at compile-time.
     // Real unit requires exposing a test helper to push a SimplePool. Mark ignored until helper exists.
-    assert!(r.build_swap_instruction(
-        Pubkey::new_unique(),
-        Pubkey::new_unique(),
-        Pubkey::new_unique(),
-        1_000_000,
-        900_000,
-        Pubkey::new_unique(),
-        Pubkey::new_unique(),
-        Pubkey::new_unique(),
-        Pubkey::new_unique(),
-        Pubkey::new_unique(),
-        Pubkey::new_unique(),
-        SerumMarketAccounts {
-            bids: Pubkey::new_unique(),
-            asks: Pubkey::new_unique(),
-            event_queue: Pubkey::new_unique(),
-            base_vault: Pubkey::new_unique(),
-            quote_vault: Pubkey::new_unique(),
-        },
-        None,
-    ).is_err());
+    assert!(r
+        .build_swap_instruction(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            1_000_000,
+            900_000,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            SerumMarketAccounts {
+                bids: Pubkey::new_unique(),
+                asks: Pubkey::new_unique(),
+                event_queue: Pubkey::new_unique(),
+                base_vault: Pubkey::new_unique(),
+                quote_vault: Pubkey::new_unique(),
+            },
+            None,
+        )
+        .is_err());
 }
