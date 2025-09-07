@@ -29,8 +29,8 @@ jobs:
       - name: Format check
         run: cargo fmt -- --check
 
-      - name: Clippy
-        run: cargo clippy --all-features -- -D warnings
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Tests (default features)
         run: cargo test --quiet
@@ -40,3 +40,41 @@ jobs:
 
       - name: Build release
         run: cargo build --release
+
+  python-backend:
+    name: Python backend (pyo3)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-py
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Show Python version
+        run: python --version
+
+      - name: Clippy (python feature)
+        env:
+          PYO3_PYTHON: python
+        run: cargo clippy --all-targets --features python -- -D warnings
+
+      - name: Tests (python feature)
+        env:
+          PYO3_PYTHON: python
+        run: cargo test --features python --quiet

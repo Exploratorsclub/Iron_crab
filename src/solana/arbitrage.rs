@@ -209,6 +209,7 @@ impl ArbitrageEngine {
 
     /// Assemble a transaction plan for a profitable triangle (A->B->C->A) using best hop quotes.
     /// Returns None if not profitable after filters or if any hop instructions can't be built.
+    #[allow(clippy::too_many_arguments)]
     pub async fn assemble_triangle_plan(
         &self,
         a: &str,

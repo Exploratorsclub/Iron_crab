@@ -5,7 +5,7 @@ pub fn assert_close(a: u128, b: u128, tol_bps: u64) {
     if a == b {
         return;
     }
-    let diff = if a > b { a - b } else { b - a };
+    let diff = a.abs_diff(b);
     let max = a.max(b);
     let bps = diff * 10_000 / max;
     assert!(

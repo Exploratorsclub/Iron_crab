@@ -38,6 +38,7 @@ impl CfmAdapter {
     pub fn new() -> Self {
         Self { pools: vec![] }
     }
+
     pub fn upsert_pool(&mut self, p: CfmPool) {
         if let Some(pos) = self.pools.iter().position(|x| x.pool == p.pool) {
             // Merge: preserve existing tick_spacing if incoming is None (e.g., generic CFM JSON overrides)
@@ -78,6 +79,12 @@ impl CfmAdapter {
                 tick_spacing: s.tick_spacing,
             });
         }
+    }
+}
+
+impl Default for CfmAdapter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 impl MarketAdapter for CfmAdapter {

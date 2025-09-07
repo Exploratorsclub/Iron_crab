@@ -6,7 +6,7 @@ pub mod py {
     use pyo3::prelude::*;
     use std::sync::Arc;
 
-    use super::{EngineContext, Strategy};
+    use crate::engine::{EngineContext, Strategy};
     use crate::types::TradeIntent;
 
     pub struct PyStrategy {

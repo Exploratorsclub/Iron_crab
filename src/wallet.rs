@@ -166,7 +166,7 @@ impl Treasury {
         // Build allowed directories list
         let allowed_env = std::env::var("IRONCRAB_KEYPAIR_ALLOWED_DIRS").unwrap_or_default();
         let mut allowed: Vec<PathBuf> = allowed_env
-            .split(|c| c == ';' || c == ',')
+            .split([';', ','].as_ref())
             .filter(|s| !s.trim().is_empty())
             .map(|s| shellexpand::tilde(s).to_string())
             .map(PathBuf::from)
@@ -372,31 +372,29 @@ impl Treasury {
                     amount,
                 )?
             }
+        } else if let Some(d) = decimals {
+            spl22_ix::transfer_checked(
+                &spl_token_2022_program_id(),
+                &from_ata_p,
+                &mint_p,
+                &to_ata_p,
+                &owner_p,
+                &[],
+                amount,
+                d,
+            )?
         } else {
-            if let Some(d) = decimals {
-                spl22_ix::transfer_checked(
-                    &spl_token_2022_program_id(),
-                    &from_ata_p,
-                    &mint_p,
-                    &to_ata_p,
-                    &owner_p,
-                    &[],
-                    amount,
-                    d,
-                )?
-            } else {
-                // transfer (unchecked) is deprecated in 2022; prefer checked when possible
-                spl22_ix::transfer_checked(
-                    &spl_token_2022_program_id(),
-                    &from_ata_p,
-                    &mint_p,
-                    &to_ata_p,
-                    &owner_p,
-                    &[],
-                    amount,
-                    decimals.unwrap_or(0),
-                )?
-            }
+            // transfer (unchecked) is deprecated in 2022; prefer checked when possible
+            spl22_ix::transfer_checked(
+                &spl_token_2022_program_id(),
+                &from_ata_p,
+                &mint_p,
+                &to_ata_p,
+                &owner_p,
+                &[],
+                amount,
+                decimals.unwrap_or(0),
+            )?
         };
         let ix = prog_ix_to_sdk(ix_prog);
         let bh = rpc.rpc.get_latest_blockhash().await?;
@@ -482,7 +480,7 @@ impl Treasury {
     async fn try_mint_decimals(&self, rpc: &SolanaRpc, mint: &SdkPubkey) -> Result<u8> {
         // Prefer RPC supply (avoids SPL struct unpack differences)
         if let Ok(supply) = rpc.rpc.get_token_supply(mint).await {
-            return Ok(supply.decimals as u8);
+            return Ok(supply.decimals);
         }
         // Fallback: raw account read (decimals at offset 44 in mint layout)
         let acct = rpc.rpc.get_account(mint).await?;

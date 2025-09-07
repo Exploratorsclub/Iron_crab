@@ -70,6 +70,12 @@ impl Portfolio {
     }
 }
 
+impl Default for Portfolio {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionSwap {
     pub pool: String,

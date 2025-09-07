@@ -199,7 +199,7 @@ impl<S: BacktestStrategy, M: MarketAdapter> BacktestEngine<S, M> {
                                     self.impact_settings.slot_ms,
                                 ) {
                                     if slot_ms > 0 {
-                                        let slots = ((lat_ms + slot_ms - 1) / slot_ms) as u32;
+                                        let slots = lat_ms.div_ceil(slot_ms) as u32;
                                         let penalty = (slots.saturating_mul(10)).min(500); // 10 bps per slot, cap 500 bps
                                         slippage_bps = slippage_bps.saturating_add(penalty);
                                     }

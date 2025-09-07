@@ -482,7 +482,7 @@ impl SolanaRpc {
         let mut attempt = 0u32;
         loop {
             match self
-                .with_timeout(self.rpc.get_transaction_with_config(sig, cfg.clone()))
+                .with_timeout(self.rpc.get_transaction_with_config(sig, cfg))
                 .await
             {
                 Some(Ok(tx)) => {

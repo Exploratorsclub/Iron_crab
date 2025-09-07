@@ -39,7 +39,7 @@ use serde_json::json;
 
 // Simple global blacklist (extendable via config later)
 #[allow(dead_code)]
-static MINT_BLACKLIST: Lazy<HashSet<String>> = Lazy::new(|| HashSet::new());
+static MINT_BLACKLIST: Lazy<HashSet<String>> = Lazy::new(HashSet::new);
 
 #[derive(Clone)]
 pub struct SniperCfg {
@@ -280,9 +280,7 @@ impl SniperEngine {
         // First mutate lot only
         {
             let mut rs = self.risk.write();
-            let Some(v) = rs.open.get_mut(mint) else {
-                return None;
-            };
+            let v = rs.open.get_mut(mint)?;
             if lot_idx >= v.len() {
                 return None;
             }
@@ -390,7 +388,7 @@ impl SniperEngine {
                     rs.last_sharpe = mean / std * n.sqrt();
                 }
             }
-            return Some((ret, rs.last_sharpe, rs.recent_realized.len()));
+            Some((ret, rs.last_sharpe, rs.recent_realized.len()))
         }
     }
 
@@ -814,7 +812,7 @@ impl SniperEngine {
                     let price_bytes: [u8; 8] = acc.data[208 + 4..208 + 12].try_into().ok()?;
                     let price = i64::from_le_bytes(price_bytes);
                     // price * 10^expo
-                    let scale = 10f64.powi(expo as i32);
+                    let scale = 10f64.powi(expo);
                     let v = (price as f64) * scale;
                     if v.is_finite() && v > 0.0 {
                         return Some(v);
@@ -1065,35 +1063,32 @@ impl SniperEngine {
                 let _ = old_pm;
             }
             if let Some(r) = &ray {
-                if let Ok(new_plan_opt) = r.build_swap_plan_auto(
+                if let Ok(Some(new_pm)) = r.build_swap_plan_auto(
                     &sol_mint.to_string(),
                     &mint.to_string(),
                     lamports_in,
                     msb,
                 ) {
-                    if let Some(new_pm) = new_plan_opt {
-                        // metrics: compare min_out
-                        if let Some(old_pm) = plan_effective.as_ref().or(plan_meta.as_ref()) {
-                            crate::metrics::REQUOTE_EVENTS_TOTAL
+                    // metrics: compare min_out
+                    if let Some(old_pm) = plan_effective.as_ref().or(plan_meta.as_ref()) {
+                        crate::metrics::REQUOTE_EVENTS_TOTAL
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let old = old_pm.min_out.max(1);
+                        let newv = new_pm.min_out.max(1);
+                        if newv >= old {
+                            crate::metrics::REQUOTE_IMPROVED_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let old = old_pm.min_out.max(1);
-                            let newv = new_pm.min_out.max(1);
-                            if newv >= old {
-                                crate::metrics::REQUOTE_IMPROVED_TOTAL
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            } else {
-                                crate::metrics::REQUOTE_WORSENED_TOTAL
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            let ratio = (newv as f64 / old as f64) - 1.0; // signed
-                            let micro = (ratio * 1_000_000.0)
-                                .clamp(i64::MIN as f64, i64::MAX as f64)
-                                as i64;
-                            crate::metrics::REQUOTE_MIN_OUT_DELTA_RATIO_MICRO_SUM
-                                .fetch_add(micro, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            crate::metrics::REQUOTE_WORSENED_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        plan_effective = Some(new_pm);
+                        let ratio = (newv as f64 / old as f64) - 1.0; // signed
+                        let micro =
+                            (ratio * 1_000_000.0).clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+                        crate::metrics::REQUOTE_MIN_OUT_DELTA_RATIO_MICRO_SUM
+                            .fetch_add(micro, std::sync::atomic::Ordering::Relaxed);
                     }
+                    plan_effective = Some(new_pm);
                 }
                 // Rebuild final_ixs if possible (full Raydium instruction) using updated min_out
                 if let (Some(pool_addr), Some(pm_eff)) = (
@@ -1416,7 +1411,7 @@ impl SniperEngine {
                                             if let Some(sn) = root.sniper.clone() {
                                                 let new_cfg: SniperCfg = (&sn).into();
                                                 let mut guard = _engine_clone_poll.cfg.write();
-                                                let diff = diff_sniper_cfg(&*guard, &new_cfg);
+                                                let diff = diff_sniper_cfg(&guard, &new_cfg);
                                                 if let Err(reason) = validate_sniper_cfg(&new_cfg) {
                                                     tracing::warn!(%reason, "rejecting config reload");
                                                 } else {
@@ -1466,7 +1461,7 @@ impl SniperEngine {
                             tracing::warn!(%reason, "rejecting config reload (SIGHUP)");
                             return;
                         }
-                        let diff = diff_sniper_cfg(&*guard, &new_cfg);
+                        let diff = diff_sniper_cfg(&guard, &new_cfg);
                         *guard = new_cfg;
                         tracing::info!(diff=%diff, "sniper hot reload applied (SIGHUP)");
                     })
@@ -1542,10 +1537,8 @@ impl SniperEngine {
                 return false;
             }
         }
-        if self.cfg.read().require_freeze_auth_none.unwrap_or(false) {
-            if freeze_auth.is_some() {
-                return false;
-            }
+        if self.cfg.read().require_freeze_auth_none.unwrap_or(false) && freeze_auth.is_some() {
+            return false;
         }
         if let Some((lo, hi)) = self.cfg.read().require_mint_decimals_range {
             if let Some(d) = mint_decimals {
@@ -1619,7 +1612,7 @@ impl SniperEngine {
             executed_tp_bps: Vec::new(),
             peak_pnl_bps: 0,
         };
-        rs.open.entry(mint).or_insert_with(Vec::new).push(lot);
+        rs.open.entry(mint).or_default().push(lot);
         let lots: usize = rs.open.values().map(|v| v.len()).sum();
         OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1723,43 +1716,39 @@ impl SniperEngine {
                                 let mint_str = mint.to_string();
                                 let mut pre_raw_opt: Option<u128> = None;
                                 let mut post_raw_opt: Option<u128> = None;
-                                match meta.pre_token_balances.as_ref() {
-                                    OptionSerializer::Some(pre) => {
-                                        for b in pre {
-                                            let owner_ok = match b.owner.as_ref() {
-                                                OptionSerializer::Some(o) => o == &owner_str,
-                                                _ => false,
-                                            };
-                                            if owner_ok && b.mint == mint_str {
-                                                if let Ok(v) =
-                                                    b.ui_token_amount.amount.parse::<u128>()
-                                                {
-                                                    pre_raw_opt = Some(v);
-                                                    break;
-                                                }
+                                if let OptionSerializer::Some(pre) =
+                                    meta.pre_token_balances.as_ref()
+                                {
+                                    for b in pre {
+                                        let owner_ok = match b.owner.as_ref() {
+                                            OptionSerializer::Some(o) => o == &owner_str,
+                                            _ => false,
+                                        };
+                                        if owner_ok && b.mint == mint_str {
+                                            if let Ok(v) = b.ui_token_amount.amount.parse::<u128>()
+                                            {
+                                                pre_raw_opt = Some(v);
+                                                break;
                                             }
                                         }
                                     }
-                                    _ => {}
                                 }
-                                match meta.post_token_balances.as_ref() {
-                                    OptionSerializer::Some(post) => {
-                                        for b in post {
-                                            let owner_ok = match b.owner.as_ref() {
-                                                OptionSerializer::Some(o) => o == &owner_str,
-                                                _ => false,
-                                            };
-                                            if owner_ok && b.mint == mint_str {
-                                                if let Ok(v) =
-                                                    b.ui_token_amount.amount.parse::<u128>()
-                                                {
-                                                    post_raw_opt = Some(v);
-                                                    break;
-                                                }
+                                if let OptionSerializer::Some(post) =
+                                    meta.post_token_balances.as_ref()
+                                {
+                                    for b in post {
+                                        let owner_ok = match b.owner.as_ref() {
+                                            OptionSerializer::Some(o) => o == &owner_str,
+                                            _ => false,
+                                        };
+                                        if owner_ok && b.mint == mint_str {
+                                            if let Ok(v) = b.ui_token_amount.amount.parse::<u128>()
+                                            {
+                                                post_raw_opt = Some(v);
+                                                break;
                                             }
                                         }
                                     }
-                                    _ => {}
                                 }
                                 if let (Some(pre_raw), Some(post_raw)) = (pre_raw_opt, post_raw_opt)
                                 {
@@ -1774,11 +1763,9 @@ impl SniperEngine {
                             }
                         }
                     }
-                    let meta_shortfall_tokens: Option<u64> = None; // placeholder retained for compatibility
-                                                                   // NOTE: OptionSerializer wrapper complicates direct access; keep fallback for now.
+                    // NOTE: OptionSerializer wrapper complicates direct access; keep fallback for now.
                     let expected_raw = pend.expected_out_tokens;
-                    let shortfall = meta_shortfall_tokens
-                        .unwrap_or_else(|| expected_raw.saturating_sub(actual_raw));
+                    let shortfall = expected_raw.saturating_sub(actual_raw);
                     let shortfall_ui = shortfall as f64 / scale;
                     let shortfall_sol = shortfall_ui * entry_price_existing;
                     // Adaptive slippage controller update (BUY fills only)
@@ -1855,7 +1842,7 @@ impl SniperEngine {
                     };
                     if fee_tokens > 0 {
                         PROTOCOL_FEE_TOKENS_TOTAL
-                            .fetch_add(fee_tokens as u64, std::sync::atomic::Ordering::Relaxed);
+                            .fetch_add(fee_tokens, std::sync::atomic::Ordering::Relaxed);
                         let fee_ui = fee_tokens as f64 / scale;
                         let fee_sol = fee_ui * entry_price_existing;
                         PROTOCOL_FEE_SOL_MICRO_TOTAL.fetch_add(
@@ -2017,7 +2004,7 @@ impl SniperEngine {
                                     }
                                 }
                                 if let Some(sel) = selected {
-                                    fraction = sel.fraction.max(0.0).min(1.0);
+                                    fraction = sel.fraction.clamp(0.0, 1.0);
                                     l.executed_tp_bps.push(sel.bps);
                                 }
                             } else if pnl_bps >= tp_bps as i64 {
@@ -2521,12 +2508,12 @@ impl SniperEngine {
                             // If still present and older than half cutoff without realized fill treat as failed
                             let mut rs = self.risk.write();
                             if let Some(persist) = rs.pending.get(mint) {
-                                if now_ts - persist.ts > half_ttl_cutoff {
-                                    if rs.pending.remove(mint).is_some() {
-                                        PENDING_FAILED_TOTAL
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        debug!(mint=%mint, sig=%p.sig, "pending trade dropped after finalize attempt (stale)");
-                                    }
+                                if now_ts - persist.ts > half_ttl_cutoff
+                                    && rs.pending.remove(mint).is_some()
+                                {
+                                    PENDING_FAILED_TOTAL
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    debug!(mint=%mint, sig=%p.sig, "pending trade dropped after finalize attempt (stale)");
                                 }
                             }
                         }
@@ -2681,19 +2668,16 @@ impl SniperEngine {
                                     .unwrap_or(0.0);
                                 let opened_ts =
                                     ent.get("opened_ts").and_then(|f| f.as_i64()).unwrap_or(0);
-                                rs.open
-                                    .entry(pk)
-                                    .or_insert_with(Vec::new)
-                                    .push(PositionLot {
-                                        entry_price_sol: entry_price,
-                                        amount_tokens,
-                                        invested_sol: invested,
-                                        token_decimals: decs,
-                                        last_unrealized_pnl_sol: last_unr,
-                                        opened_ts,
-                                        executed_tp_bps: Vec::new(),
-                                        peak_pnl_bps: 0,
-                                    });
+                                rs.open.entry(pk).or_default().push(PositionLot {
+                                    entry_price_sol: entry_price,
+                                    amount_tokens,
+                                    invested_sol: invested,
+                                    token_decimals: decs,
+                                    last_unrealized_pnl_sol: last_unr,
+                                    opened_ts,
+                                    executed_tp_bps: Vec::new(),
+                                    peak_pnl_bps: 0,
+                                });
                             }
                         }
                     }
@@ -3031,7 +3015,7 @@ impl SniperEngine {
                         let owner_auth = Pubkey::new_from_array(owner_slice.try_into().unwrap());
                         if owner_auth == incinerator {
                             class = Class::Burn;
-                        } else if known_programs.iter().any(|p| *p == owner_auth) {
+                        } else if known_programs.contains(&owner_auth) {
                             class = Class::ProgramVault;
                         } else {
                             // Fallback: fetch owner auth executable bit via separate account info if present in batch (future optimization)
@@ -3060,7 +3044,7 @@ impl SniperEngine {
             return Ok(None);
         }
         regular_amounts.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        let top1 = regular_amounts.get(0).copied().unwrap_or(0.0);
+        let top1 = regular_amounts.first().copied().unwrap_or(0.0);
         let top3_sum: f64 = regular_amounts.iter().take(3).sum();
         let top5_sum: f64 = regular_amounts.iter().take(5).sum();
         let top1_pct = if effective_supply > 0.0 {

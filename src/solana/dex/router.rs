@@ -98,7 +98,7 @@ impl Router {
         // Collect all unique mid mints
         use std::collections::HashSet;
         let mut mids = HashSet::new();
-        for (_di, d) in self.dexs.iter().enumerate() {
+        for d in self.dexs.iter() {
             for (a, b) in d.list_pairs() {
                 if a == input_mint {
                     mids.insert(b.clone());

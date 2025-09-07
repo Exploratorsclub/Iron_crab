@@ -317,7 +317,7 @@ impl Raydium {
         }
         ixs.extend(swap_ixs);
         // Try parse pool pubkey from route[0]
-        let pool = quote.route.get(0).and_then(|s| Pubkey::from_str(s).ok());
+        let pool = quote.route.first().and_then(|s| Pubkey::from_str(s).ok());
         Ok(Some(RaydiumSwapPlan {
             ixs,
             amount_in,
@@ -326,8 +326,8 @@ impl Raydium {
             price_impact_bps: quote.price_impact_bps,
             fee_bps: quote.fee_bps,
             pool,
-            compute_unit_limit: compute_unit_limit,
-            compute_unit_price_micro_lamports: compute_unit_price_micro_lamports,
+            compute_unit_limit,
+            compute_unit_price_micro_lamports,
         }))
     }
 
@@ -767,7 +767,8 @@ impl Raydium {
     ///  - account length large enough for highest offset + 32
     ///  - extracted pubkeys non-default
     ///  - bids != asks, vaults distinct
-    /// If multiple templates match we return the first.
+    ///    If multiple templates match we return the first.
+    #[allow(clippy::type_complexity)]
     fn parse_serum_market_accounts(
         data: &[u8],
     ) -> Option<(
@@ -984,6 +985,7 @@ impl Raydium {
 
 impl Raydium {
     /// Build a full Raydium swap instruction (BaseIn) using pool snapshot + explicit Serum + user accounts.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_swap_instruction(
         &self,
         pool: Pubkey,
@@ -1026,9 +1028,7 @@ impl Raydium {
         let serum_vault_signer = snap
             .serum_vault_signer
             .ok_or_else(|| anyhow!("serum_vault_signer missing in snapshot"))?;
-        let target_orders = amm_target_orders
-            .or(snap.target_orders)
-            .unwrap_or(Pubkey::default());
+        let target_orders = amm_target_orders.or(snap.target_orders).unwrap_or_default();
         let base_vault = snap.base_vault; // already present
         let quote_vault = snap.quote_vault;
         let mut data = Vec::with_capacity(1 + 8 + 8 + 1);

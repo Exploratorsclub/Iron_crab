@@ -6,11 +6,10 @@ use std::sync::Arc;
 // Helper to fabricate a Raydium instance with an injected pool snapshot.
 fn mk_raydium_with_pool(_base_res: u128, _quote_res: u128, _fee_bps: u32) -> Raydium {
     let rpc = Arc::new(SolanaRpc::new("http://localhost:8899"));
-    let r = Raydium::new(rpc);
     // Direct insert via internal map not exposed; use snapshots() ingestion pattern mimic by calling refresh not feasible here.
     // Instead, we'll construct a PoolSnapshot and manually push through a minimal internal API if later exposed.
     // For now test only presence of builder returning None without pools.
-    r
+    Raydium::new(rpc)
 }
 
 #[test]

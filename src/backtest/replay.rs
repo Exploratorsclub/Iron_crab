@@ -165,7 +165,7 @@ impl ReplayStore {
             }
         }
         // project any account entries that decode to our CfmPoolJson
-        for (_k, updates) in &self.accounts {
+        for updates in self.accounts.values() {
             for bytes in updates {
                 if let Ok(s) = std::str::from_utf8(bytes) {
                     if let Ok(pool) = serde_json::from_str::<CfmPoolJson>(s) {

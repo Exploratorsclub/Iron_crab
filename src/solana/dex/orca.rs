@@ -156,7 +156,7 @@ impl Orca {
                 let mut reserves = (0u128, 0u128);
                 let vaults =
                     replay.get_multiple_accounts(&[parsed.token_vault_a, parsed.token_vault_b]);
-                if let Some(Some(v1)) = vaults.get(0) {
+                if let Some(Some(v1)) = vaults.first() {
                     if v1.data.len() >= 72 {
                         reserves.0 = Self::parse_token_amount(&v1.data) as u128;
                     }
@@ -272,7 +272,7 @@ impl Dex for Orca {
                     .get_multiple_accounts(&[parsed.token_vault_a, parsed.token_vault_b])
                     .await
                 {
-                    if let Some(Some(v1)) = vaults.get(0).map(|o| o.as_ref()) {
+                    if let Some(Some(v1)) = vaults.first().map(|o| o.as_ref()) {
                         if v1.data.len() >= 72 {
                             reserves.0 = Self::parse_token_amount(&v1.data) as u128;
                         }
@@ -462,16 +462,14 @@ impl Dex for Orca {
         } else {
             (out_pk, in_pk)
         };
-        let user_source = self
+        let user_source = *self
             .user_token_accounts
             .get(&input_mint)
-            .ok_or_else(|| anyhow!("missing user source token account for input mint"))?
-            .clone();
-        let user_destination = self
+            .ok_or_else(|| anyhow!("missing user source token account for input mint"))?;
+        let user_destination = *self
             .user_token_accounts
             .get(&output_mint)
-            .ok_or_else(|| anyhow!("missing user destination token account for output mint"))?
-            .clone();
+            .ok_or_else(|| anyhow!("missing user destination token account for output mint"))?;
         accounts.push(AM {
             pubkey: authority,
             is_signer: true,

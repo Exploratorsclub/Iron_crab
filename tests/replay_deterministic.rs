@@ -4,14 +4,15 @@ use ironcrab::backtest::replay::{CfmPoolJson, ReplayConfig, ReplayStore, TraceEv
 #[test]
 fn replay_builds_slot_log_and_account_events() {
     // Build a small synthetic trace
-    let mut events = Vec::new();
-    events.push(TraceEvent::Slot { slot: 1 });
-    events.push(TraceEvent::Slot { slot: 2 });
-    events.push(TraceEvent::Slot { slot: 3 });
-    events.push(TraceEvent::Log {
-        slot: 2,
-        msg: "hello".into(),
-    });
+    let mut events = vec![
+        TraceEvent::Slot { slot: 1 },
+        TraceEvent::Slot { slot: 2 },
+        TraceEvent::Slot { slot: 3 },
+        TraceEvent::Log {
+            slot: 2,
+            msg: "hello".into(),
+        },
+    ];
     let pool = CfmPoolJson {
         pool: "P".into(),
         base_mint: "A".into(),

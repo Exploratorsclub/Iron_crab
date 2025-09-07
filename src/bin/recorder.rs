@@ -157,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Shutdown WS tasks and close writer channel
     for h in subs {
-        let _ = h.abort();
+        h.abort();
     }
     drop(tx);
     Ok(())
