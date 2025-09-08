@@ -1,0 +1,99 @@
+Date : 2025-09-08 23:12:47
+Directory : c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests
+Total : 65 files,  -9737 codes, -650 comments, -358 blanks, all -10745 lines
+
+Languages
++----------+------------+------------+------------+------------+------------+
+| language | files      | code       | comment    | blank      | total      |
++----------+------------+------------+------------+------------+------------+
+| Rust     |         65 |     -9,737 |       -650 |       -358 |    -10,745 |
++----------+------------+------------+------------+------------+------------+
+
+Directories
++--------------------------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| path                                                                                       | files      | code       | comment    | blank      | total      |
++--------------------------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| .                                                                                          |         65 |     -9,737 |       -650 |       -358 |    -10,745 |
+| . (Files)                                                                                  |         27 |      1,380 |        116 |        130 |      1,626 |
+| ..                                                                                         |         38 |    -11,117 |       -766 |       -488 |    -12,371 |
+| ..\src                                                                                     |         38 |    -11,117 |       -766 |       -488 |    -12,371 |
+| ..\src (Files)                                                                             |          8 |     -1,898 |       -123 |       -113 |     -2,134 |
+| ..\src\backtest                                                                            |         10 |     -1,463 |       -101 |        -89 |     -1,653 |
+| ..\src\bin                                                                                 |          4 |       -813 |        -63 |        -38 |       -914 |
+| ..\src\engine                                                                              |          4 |       -376 |        -31 |        -37 |       -444 |
+| ..\src\solana                                                                              |         12 |     -6,567 |       -448 |       -211 |     -7,226 |
+| ..\src\solana (Files)                                                                      |          7 |     -4,342 |       -287 |       -116 |     -4,745 |
+| ..\src\solana\dex                                                                          |          5 |     -2,225 |       -161 |        -95 |     -2,481 |
++--------------------------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+
+Files
++--------------------------------------------------------------------------------------------+----------+------------+------------+------------+------------+
+| filename                                                                                   | language | code       | comment    | blank      | total      |
++--------------------------------------------------------------------------------------------+----------+------------+------------+------------+------------+
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\audit.rs                            | Rust     |        -90 |         -8 |        -12 |       -110 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\engine.rs                  | Rust     |       -605 |        -32 |        -21 |       -658 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\impact.rs                  | Rust     |        -56 |         -8 |         -5 |        -69 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\market.rs                  | Rust     |       -239 |        -12 |        -12 |       -263 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\mod.rs                     | Rust     |        -10 |         -1 |         -1 |        -12 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\py_strategy.rs             | Rust     |         -3 |         -6 |         -2 |        -11 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\replay.rs                  | Rust     |       -183 |        -19 |        -11 |       -213 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\replay_rpc.rs              | Rust     |        -57 |         -5 |         -9 |        -71 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\scenario.rs                | Rust     |        -87 |         -6 |         -5 |        -98 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\types.rs                   | Rust     |       -115 |         -6 |        -17 |       -138 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\backtest\validation.rs              | Rust     |       -108 |         -6 |         -6 |       -120 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\bin\backtest_driver.rs              | Rust     |       -289 |        -26 |         -5 |       -320 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\bin\latency_stress.rs               | Rust     |       -252 |        -23 |        -13 |       -288 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\bin\raydium_pools.rs                | Rust     |       -100 |          0 |         -9 |       -109 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\bin\recorder.rs                     | Rust     |       -172 |        -14 |        -11 |       -197 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\config.rs                           | Rust     |       -488 |        -15 |        -22 |       -525 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\config_reload.rs                    | Rust     |       -133 |         -4 |         -4 |       -141 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\engine\allocator.rs                 | Rust     |        -30 |         -1 |         -4 |        -35 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\engine\mod.rs                       | Rust     |       -253 |        -17 |        -17 |       -287 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\engine\py_strategy.rs               | Rust     |        -65 |         -7 |         -7 |        -79 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\engine\strategy.rs                  | Rust     |        -28 |         -6 |         -9 |        -43 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\lib.rs                              | Rust     |         -9 |          0 |         -1 |        -10 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\main.rs                             | Rust     |        -34 |         -6 |         -9 |        -49 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\metrics.rs                          | Rust     |       -717 |        -43 |        -23 |       -783 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\arbitrage.rs                 | Rust     |       -683 |        -49 |        -21 |       -753 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\compute_budget_estimator.rs  | Rust     |        -61 |         -6 |         -6 |        -73 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\compute_budget_helper.rs     | Rust     |        -27 |          0 |         -1 |        -28 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\dex\mod.rs                   | Rust     |        -37 |         -1 |         -4 |        -42 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\dex\orca.rs                  | Rust     |       -484 |        -23 |        -25 |       -532 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\dex\orca_whirlpool_layout.rs | Rust     |       -159 |        -46 |        -10 |       -215 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\dex\raydium.rs               | Rust     |     -1,233 |        -66 |        -43 |     -1,342 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\dex\router.rs                | Rust     |       -312 |        -25 |        -13 |       -350 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\mod.rs                       | Rust     |         -9 |          0 |         -1 |        -10 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\rpc.rs                       | Rust     |       -576 |        -12 |        -29 |       -617 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\sniper.rs                    | Rust     |     -2,949 |       -215 |        -55 |     -3,219 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\solana\token_utils.rs               | Rust     |        -37 |         -5 |         -3 |        -45 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\types.rs                            | Rust     |        -26 |          0 |         -5 |        -31 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\src\wallet.rs                           | Rust     |       -401 |        -47 |        -37 |       -485 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\arbitrage_cycle_generic.rs        | Rust     |        104 |          1 |          4 |        109 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\arbitrage_cycle_pruning.rs        | Rust     |         98 |          2 |          3 |        103 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\arbitrage_edge_aggregate.rs       | Rust     |         65 |          0 |          4 |         69 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\arbitrage_profit.rs               | Rust     |         10 |          3 |          2 |         15 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\arbitrage_profit_ranking.rs       | Rust     |        110 |          6 |          4 |        120 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\backtest_engine.rs                | Rust     |         85 |          3 |          5 |         93 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\bench_quote_refresh.rs            | Rust     |         43 |          3 |          2 |         48 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\cfm_adapter.rs                    | Rust     |         39 |          0 |          4 |         43 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\common.rs                         | Rust     |         18 |          0 |          3 |         21 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\compute_budget_estimator.rs       | Rust     |         29 |          0 |          3 |         32 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\impact_model.rs                   | Rust     |         53 |          1 |          3 |         57 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\integration_buy_fill_sell.rs      | Rust     |         42 |         12 |          8 |         62 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\raydium_quote.rs                  | Rust     |         15 |          3 |          4 |         22 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\raydium_quote_validation.rs       | Rust     |         37 |          5 |          2 |         44 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\raydium_simulation.rs             | Rust     |         43 |          8 |          2 |         53 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\raydium_swap_ix.rs                | Rust     |         32 |          6 |          2 |         40 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\raydium_swap_plan.rs              | Rust     |         23 |          4 |          3 |         30 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\replay_deterministic.rs           | Rust     |         48 |          4 |          5 |         57 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\risk_drawdown_and_cooldown.rs     | Rust     |         80 |         13 |         12 |        105 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\router_best_quote.rs              | Rust     |         26 |          4 |          4 |         34 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\router_hops2_plan.rs              | Rust     |         47 |         14 |         11 |         72 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\router_min_out.rs                 | Rust     |         31 |          1 |          2 |         34 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\sniper_partial_exit.rs            | Rust     |         19 |          6 |          6 |         31 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\sniper_partial_exit_state.rs      | Rust     |         54 |          4 |          7 |         65 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\sniper_sharpe_fee_window.rs       | Rust     |         93 |          3 |         10 |        106 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\sniper_sharpe_update.rs           | Rust     |         46 |          2 |          6 |         54 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\stub_strategy_signal_quote_sim.rs | Rust     |         90 |          8 |          9 |        107 |
+| Total                                                                                      |          |     -9,737 |       -650 |       -358 |    -10,745 |
++--------------------------------------------------------------------------------------------+----------+------------+------------+------------+------------+

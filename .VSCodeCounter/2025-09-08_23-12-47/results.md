@@ -1,21 +1,21 @@
 # Summary
 
-Date : 2025-09-04 22:33:11
+Date : 2025-09-08 23:12:47
 
-Directory c:\\Users\\Robert Onuk\\Desktop\\Trading_bot\\Iron_crab\\src\\bin
+Directory c:\\Users\\Robert Onuk\\Desktop\\Trading_bot\\Iron_crab\\tests
 
-Total : 2 files,  90 codes, 2 comments, 12 blanks, all 104 lines
+Total : 27 files,  1380 codes, 116 comments, 130 blanks, all 1626 lines
 
 Summary / [Details](details.md) / [Diff Summary](diff.md) / [Diff Details](diff-details.md)
 
 ## Languages
 | language | files | code | comment | blank | total |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| Rust | 2 | 90 | 2 | 12 | 104 |
+| Rust | 27 | 1,380 | 116 | 130 | 1,626 |
 
 ## Directories
 | path | files | code | comment | blank | total |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| . | 2 | 90 | 2 | 12 | 104 |
+| . | 27 | 1,380 | 116 | 130 | 1,626 |
 
 Summary / [Details](details.md) / [Diff Summary](diff.md) / [Diff Details](diff-details.md)

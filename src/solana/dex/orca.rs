@@ -40,6 +40,8 @@ pub struct OrcaPoolSnapshot {
     pub reserve_base: u128,
     pub reserve_quote: u128,
     pub tick_spacing: Option<u16>,
+    pub vault_a: Pubkey,
+    pub vault_b: Pubkey,
 }
 
 pub struct Orca {
@@ -128,6 +130,8 @@ impl Orca {
                 reserve_base: p.reserve_base,
                 reserve_quote: p.reserve_quote,
                 tick_spacing: p.tick_spacing,
+                vault_a: p.vault_a,
+                vault_b: p.vault_b,
             })
             .collect()
     }

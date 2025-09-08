@@ -2858,6 +2858,43 @@ pub struct LpLockAssessment {
     pub program_vault_pct: f64,
 }
 
+// Test-only utilities for verifying concentration math
+#[cfg(any(test, feature = "test_helpers"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HolderClass {
+    Burn,
+    ProgramVault,
+    Regular,
+}
+
+#[cfg(any(test, feature = "test_helpers"))]
+pub fn test_compute_concentration(
+    total_supply: f64,
+    holders: &[(f64, HolderClass)],
+) -> (f64, f64, f64, f64, f64) {
+    let mut burned = 0.0;
+    let mut locked = 0.0;
+    let mut regular: Vec<f64> = Vec::new();
+    for (amt, class) in holders.iter().copied() {
+        match class {
+            HolderClass::Burn => burned += amt,
+            HolderClass::ProgramVault => locked += amt,
+            HolderClass::Regular => regular.push(amt),
+        }
+    }
+    let effective_supply = (total_supply - burned - locked).max(0.0);
+    regular.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    let top1 = regular.first().copied().unwrap_or(0.0);
+    let top3: f64 = regular.iter().take(3).sum();
+    let top5: f64 = regular.iter().take(5).sum();
+    let top1_pct = if effective_supply > 0.0 { top1 / effective_supply } else { 0.0 };
+    let top3_pct = if effective_supply > 0.0 { top3 / effective_supply } else { 0.0 };
+    let top5_pct = if effective_supply > 0.0 { top5 / effective_supply } else { 0.0 };
+    let burned_pct = if total_supply > 0.0 { burned / total_supply } else { 0.0 };
+    let locked_pct = if total_supply > 0.0 { locked / total_supply } else { 0.0 };
+    (top1_pct, top3_pct, top5_pct, burned_pct, locked_pct)
+}
+
 impl SniperEngine {
     /// Index-based (Raydium/Orca) liquidity estimation using current pool snapshots.
     /// Returns conservative SOL notionals (sum over pools: 2 * SOL_reserve for SOL pairs, stable converted to SOL via placeholder rate).
@@ -3040,6 +3077,8 @@ impl SniperEngine {
         if mint_acc.data.len() < 70 || mint_acc.data.len() > 90 {
             return Ok(None);
         }
+        // Parse minimal fields: decimals(44), mint authority(0..32 maybe Option), freeze authority(36 or 45..?)
+        // We'll rely on decimals at 44 as established; freeze authority detection is best-effort and optional.
         let decimals = mint_acc.data.get(44).cloned().unwrap_or(0);
         let supply_le_bytes = &mint_acc.data[36..44];
         let supply_raw = u64::from_le_bytes(supply_le_bytes.try_into().unwrap());
@@ -3053,6 +3092,34 @@ impl SniperEngine {
             return Ok(None);
         }
         if supply == 0.0 {
+            return Ok(None);
+        }
+        // Optional freeze authority gate (classic SPL-Token Mint layout):
+        // offsets: 0..4 mintAuthOpt, 4..36 mintAuth, 36..44 supply, 44 decimals, 45 isInit,
+        // 46..50 freezeAuthOpt, 50..82 freezeAuth
+        let freeze_auth_opt: Option<Pubkey> = if mint_acc.data.len() >= 82 {
+            let opt_bytes: [u8; 4] = mint_acc.data[46..50].try_into().unwrap_or([0u8; 4]);
+            let opt = u32::from_le_bytes(opt_bytes);
+            if opt == 0 { None } else {
+                let fa_bytes: [u8; 32] = mint_acc.data[50..82].try_into().unwrap_or([0u8; 32]);
+                let pk = Pubkey::new_from_array(fa_bytes);
+                if pk.to_bytes() == [0u8; 32] { None } else { Some(pk) }
+            }
+        } else { None };
+        if self.cfg.read().require_freeze_auth_none.unwrap_or(false) && freeze_auth_opt.is_some() {
+            return Ok(None);
+        }
+        if let Some((lo, hi)) = self.cfg.read().require_mint_decimals_range {
+            let d = decimals;
+            if d < lo || d > hi { return Ok(None); }
+        }
+        if self
+            .cfg
+            .read()
+            .blacklist_mints
+            .iter()
+            .any(|m| m == &mint.to_string())
+        {
             return Ok(None);
         }
         // Largest accounts
@@ -3094,10 +3161,24 @@ impl SniperEngine {
         };
         // Known constants
         let incinerator = Pubkey::from_str("1nc1nerator11111111111111111111111111111111").unwrap();
-        let known_programs: Vec<Pubkey> = vec![
-            Pubkey::from_str(RAYDIUM_AMM_V4).unwrap_or(Pubkey::default()),
-            Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap_or(Pubkey::default()),
-        ];
+        let raydium_prog = Pubkey::from_str(RAYDIUM_AMM_V4).unwrap_or(Pubkey::default());
+        let orca_prog = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap_or(Pubkey::default());
+        // Build a set of current known vault addresses from Raydium and Orca snapshots to classify program vault holdings precisely
+        let mut program_vaults: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
+        if let Some(r) = &self.raydium {
+            for s in r.snapshots() {
+                if let Some(v) = s.base_vault { program_vaults.insert(v); }
+                if let Some(v) = s.quote_vault { program_vaults.insert(v); }
+                if let Some(v) = s.serum_base_vault { program_vaults.insert(v); }
+                if let Some(v) = s.serum_quote_vault { program_vaults.insert(v); }
+            }
+        }
+        if let Some(o) = &self.orca {
+            for s in o.pools_snapshot() {
+                program_vaults.insert(s.vault_a);
+                program_vaults.insert(s.vault_b);
+            }
+        }
         #[derive(PartialEq)]
         enum Class {
             Burn,
@@ -3121,6 +3202,8 @@ impl SniperEngine {
             if let Ok(acc_pk) = Pubkey::from_str(addr_str) {
                 if acc_pk == incinerator {
                     class = Class::Burn;
+                } else if program_vaults.contains(&acc_pk) {
+                    class = Class::ProgramVault;
                 }
             }
             if class == Class::Regular {
@@ -3131,7 +3214,7 @@ impl SniperEngine {
                         let owner_auth = Pubkey::new_from_array(owner_slice.try_into().unwrap());
                         if owner_auth == incinerator {
                             class = Class::Burn;
-                        } else if known_programs.contains(&owner_auth) {
+                        } else if owner_auth == raydium_prog || owner_auth == orca_prog {
                             class = Class::ProgramVault;
                         } else {
                             // Fallback: fetch owner auth executable bit via separate account info if present in batch (future optimization)

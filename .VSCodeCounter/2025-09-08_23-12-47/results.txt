@@ -1,0 +1,51 @@
+Date : 2025-09-08 23:12:47
+Directory : c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests
+Total : 27 files,  1380 codes, 116 comments, 130 blanks, all 1626 lines
+
+Languages
++----------+------------+------------+------------+------------+------------+
+| language | files      | code       | comment    | blank      | total      |
++----------+------------+------------+------------+------------+------------+
+| Rust     |         27 |      1,380 |        116 |        130 |      1,626 |
++----------+------------+------------+------------+------------+------------+
+
+Directories
++--------------------------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| path                                                                                       | files      | code       | comment    | blank      | total      |
++--------------------------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| .                                                                                          |         27 |      1,380 |        116 |        130 |      1,626 |
++--------------------------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+
+Files
++--------------------------------------------------------------------------------------------+----------+------------+------------+------------+------------+
+| filename                                                                                   | language | code       | comment    | blank      | total      |
++--------------------------------------------------------------------------------------------+----------+------------+------------+------------+------------+
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\arbitrage_cycle_generic.rs        | Rust     |        104 |          1 |          4 |        109 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\arbitrage_cycle_pruning.rs        | Rust     |         98 |          2 |          3 |        103 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\arbitrage_edge_aggregate.rs       | Rust     |         65 |          0 |          4 |         69 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\arbitrage_profit.rs               | Rust     |         10 |          3 |          2 |         15 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\arbitrage_profit_ranking.rs       | Rust     |        110 |          6 |          4 |        120 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\backtest_engine.rs                | Rust     |         85 |          3 |          5 |         93 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\bench_quote_refresh.rs            | Rust     |         43 |          3 |          2 |         48 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\cfm_adapter.rs                    | Rust     |         39 |          0 |          4 |         43 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\common.rs                         | Rust     |         18 |          0 |          3 |         21 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\compute_budget_estimator.rs       | Rust     |         29 |          0 |          3 |         32 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\impact_model.rs                   | Rust     |         53 |          1 |          3 |         57 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\integration_buy_fill_sell.rs      | Rust     |         42 |         12 |          8 |         62 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\raydium_quote.rs                  | Rust     |         15 |          3 |          4 |         22 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\raydium_quote_validation.rs       | Rust     |         37 |          5 |          2 |         44 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\raydium_simulation.rs             | Rust     |         43 |          8 |          2 |         53 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\raydium_swap_ix.rs                | Rust     |         32 |          6 |          2 |         40 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\raydium_swap_plan.rs              | Rust     |         23 |          4 |          3 |         30 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\replay_deterministic.rs           | Rust     |         48 |          4 |          5 |         57 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\risk_drawdown_and_cooldown.rs     | Rust     |         80 |         13 |         12 |        105 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\router_best_quote.rs              | Rust     |         26 |          4 |          4 |         34 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\router_hops2_plan.rs              | Rust     |         47 |         14 |         11 |         72 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\router_min_out.rs                 | Rust     |         31 |          1 |          2 |         34 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\sniper_partial_exit.rs            | Rust     |         19 |          6 |          6 |         31 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\sniper_partial_exit_state.rs      | Rust     |         54 |          4 |          7 |         65 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\sniper_sharpe_fee_window.rs       | Rust     |         93 |          3 |         10 |        106 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\sniper_sharpe_update.rs           | Rust     |         46 |          2 |          6 |         54 |
+| c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab\tests\stub_strategy_signal_quote_sim.rs | Rust     |         90 |          8 |          9 |        107 |
+| Total                                                                                      |          |      1,380 |        116 |        130 |      1,626 |
++--------------------------------------------------------------------------------------------+----------+------------+------------+------------+------------+
