@@ -22,6 +22,7 @@ pub struct SwapExecutionRecord {
     pub output_mint: String,
     pub amount_in: u64,
     pub min_out: Option<u64>,
+    pub expected_out: Option<u64>,
     pub amount_out: Option<u64>, // None if rejected
     pub rejected: bool,
     pub reason: Option<String>,
@@ -160,6 +161,7 @@ impl<S: BacktestStrategy, M: MarketAdapter> BacktestEngine<S, M> {
                     StrategyAction::Swap(a) => {
                         // Pre-quote for slippage enforcement
                         let mut min_out: Option<u64> = None;
+                        let mut expected_out: Option<u64> = None; // expected output after extra_fee but before stochastic noise
                         if a.max_slippage_bps > 0 {
                             let allowed_slip =
                                 self.slippage_override_bps.unwrap_or(a.max_slippage_bps);
@@ -188,6 +190,7 @@ impl<S: BacktestStrategy, M: MarketAdapter> BacktestEngine<S, M> {
                                         / 10_000u128;
                                     base_after_extra = adj as u64;
                                 }
+                                expected_out = Some(base_after_extra);
                                 // Draw stochastic shortfall noise (bps) and add to slippage guard
                                 let mut slippage_bps = allowed_slip;
                                 if let Some(s) = self.noise_sampler.as_mut() {
@@ -236,6 +239,7 @@ impl<S: BacktestStrategy, M: MarketAdapter> BacktestEngine<S, M> {
                                     output_mint: a.output_mint.clone(),
                                     amount_in: a.amount_in,
                                     min_out: Some(m),
+                                    expected_out,
                                     amount_out: None,
                                     rejected: true,
                                     reason: Some("slippage".into()),
@@ -264,6 +268,7 @@ impl<S: BacktestStrategy, M: MarketAdapter> BacktestEngine<S, M> {
                             output_mint: a.output_mint.clone(),
                             amount_in: a.amount_in,
                             min_out,
+                            expected_out,
                             amount_out: Some(out),
                             rejected: false,
                             reason: None,

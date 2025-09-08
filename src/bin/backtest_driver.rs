@@ -63,6 +63,9 @@ struct Opts {
     sweep_slippages_bps: Option<String>,
     #[arg(long)]
     sweep_latencies_ms: Option<String>,
+    /// Optional: CSV path of live trade logs to validate simulated outputs against
+    #[arg(long)]
+    validate_live_csv: Option<String>,
 }
 
 #[tokio::main]
@@ -267,6 +270,24 @@ async fn main() -> anyhow::Result<()> {
                     iset.emulate_latency_ms = Some(lt);
                     engine.set_impact_settings(iset);
                     engine.run()?;
+                    if let Some(csv) = opts.validate_live_csv.as_ref() {
+                        use ironcrab::backtest::validation::{compare_sim_vs_live, read_live_csv};
+                        if let Ok(live) = read_live_csv(csv) {
+                            let rep = compare_sim_vs_live(&engine.executions, &live);
+                            println!(
+                                "Validation runsz={}_slip={}_lat={}: n={} mae={:.3} mape={:.2}% within1%={:.1}% within2%={:.1}% within5%={:.1}%",
+                                sz,
+                                sl,
+                                lt,
+                                rep.count,
+                                rep.mae,
+                                rep.mape * 100.0,
+                                rep.within_1pct * 100.0,
+                                rep.within_2pct * 100.0,
+                                rep.within_5pct * 100.0
+                            );
+                        }
+                    }
                     runs += 1;
                 }
             }
@@ -274,6 +295,24 @@ async fn main() -> anyhow::Result<()> {
         println!("Scenario runs completed: {}", runs);
     } else {
         engine.run()?;
+        if let Some(csv) = opts.validate_live_csv.as_ref() {
+            use ironcrab::backtest::validation::{compare_sim_vs_live, read_live_csv};
+            match read_live_csv(csv) {
+                Ok(live) => {
+                    let rep = compare_sim_vs_live(&engine.executions, &live);
+                    println!(
+                        "Validation n={} mae={:.3} mape={:.2}% within1%={:.1}% within2%={:.1}% within5%={:.1}%",
+                        rep.count,
+                        rep.mae,
+                        rep.mape * 100.0,
+                        rep.within_1pct * 100.0,
+                        rep.within_2pct * 100.0,
+                        rep.within_5pct * 100.0
+                    );
+                }
+                Err(e) => eprintln!("validation read_live_csv failed: {e}"),
+            }
+        }
         println!("Decisions: {}", engine.decisions.len());
     }
     Ok(())

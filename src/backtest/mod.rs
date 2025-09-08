@@ -8,3 +8,4 @@ pub mod replay;
 pub mod replay_rpc;
 pub mod scenario;
 pub mod types;
+pub mod validation;
