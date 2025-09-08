@@ -1,0 +1,24 @@
+[package]
+name = "ironcrab-fuzz"
+edition = "2021"
+publish = false
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.ironcrab]
+path = ".."
+features = []
+
+[workspace]
+members = ["."]
+resolver = "2"
+
+[[bin]]
+name = "fuzz_replay_log_parser"
+path = "fuzz_targets/fuzz_replay_log_parser.rs"
+
+[[bin]]
+name = "fuzz_orca_whirlpool_layout"
+path = "fuzz_targets/fuzz_orca_whirlpool_layout.rs"

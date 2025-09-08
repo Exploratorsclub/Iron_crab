@@ -213,7 +213,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 ### Tests & CI
 - [x] Unit: drawdown sizing, cooldown gating, trade_return bucketing
 - [x] Integration: Mock RPC Buy->Fill->Sell Lifecycle
-- [ ] Fuzz: Log Parser & Pool Snapshot Decoder
+- [x] Fuzz: Log Parser & Pool Snapshot Decoder (cargo-fuzz targets for replay log parser and Orca Whirlpool layout)
 - [ ] Load / Stress: Quote & Swap Latency unter Last
 - [ ] GitHub Actions: clippy, fmt, test, audit
 	- [x] Multi-Lot Partial Exit Mathe Test
