@@ -230,6 +230,16 @@ pub fn record_trade_return(ret: f64) {
     TRADE_RETURN_SUM_MICRO.fetch_add(micro_i64, Ordering::Relaxed);
 }
 
+#[cfg(any(test, feature = "test_helpers"))]
+pub fn reset_trade_return_metrics() {
+    use std::sync::atomic::Ordering;
+    for c in TRADE_RETURN_BUCKET_COUNTS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+    TRADE_RETURN_COUNT.store(0, Ordering::Relaxed);
+    TRADE_RETURN_SUM_MICRO.store(0, Ordering::Relaxed);
+}
+
 pub fn record_fee_pct(pct: f64) {
     let p = if pct.is_nan() || pct.is_infinite() || pct < 0.0 {
         0.0

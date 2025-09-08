@@ -211,7 +211,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Config Validierung (Schema + Constraints)
 
 ### Tests & CI
-- [ ] Unit: drawdown sizing, cooldown gating, trade_return bucketing
+- [x] Unit: drawdown sizing, cooldown gating, trade_return bucketing
 - [ ] Integration: Mock RPC Buy->Fill->Sell Lifecycle
 - [ ] Fuzz: Log Parser & Pool Snapshot Decoder
 - [ ] Load / Stress: Quote & Swap Latency unter Last

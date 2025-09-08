@@ -403,6 +403,33 @@ impl SniperEngine {
             .get(mint)
             .and_then(|v| v.get(lot_idx).map(|l| l.invested_sol))
     }
+
+    /// Set today's realized loss (SOL) for drawdown sizing tests.
+    pub fn test_set_realized_loss_today(&self, loss_sol: f64) {
+        let mut rs = self.risk.write();
+        rs.realized_loss_today_sol = loss_sol;
+    }
+
+    /// Expose the effective_max_buy_sol calculation for tests.
+    pub fn test_effective_max_buy_sol(&self) -> f64 {
+        self.effective_max_buy_sol()
+    }
+
+    /// Mark a mint as in cooldown using the internal logic.
+    pub fn test_mark_cooldown(&self, mint: Pubkey) {
+        self.mark_cooldown(mint);
+    }
+
+    /// Manually set cooldown until a specific timestamp (UTC seconds).
+    pub fn test_set_cooldown(&self, mint: Pubkey, until_ts: i64) {
+        let mut rs = self.risk.write();
+        rs.cooldown_until.insert(mint, until_ts);
+    }
+
+    /// Wrapper to test the gating logic for opening positions.
+    pub fn test_can_open_position_for(&self, mint: &Pubkey, planned_sol: f64) -> bool {
+        self.can_open_position_for(mint, planned_sol)
+    }
 }
 
 impl SniperEngine {
