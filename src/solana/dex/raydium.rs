@@ -476,6 +476,7 @@ impl Dex for Raydium {
     async fn refresh_pools(&self) -> Result<()> {
         use crate::metrics::{
             RAYDIUM_POOLS_LOADED, RAYDIUM_POOLS_SKIPPED_INVALID, RAYDIUM_POOLS_SKIPPED_SERUM,
+            RAYDIUM_POOLS_SKIPPED_ZERO_RESERVE,
         };
         use std::time::{Duration, SystemTime};
         tracing::trace!("raydium.refresh_pools() start");
@@ -535,8 +536,9 @@ impl Dex for Raydium {
             let base_amt = vault_amounts.get(&p.base_vault).copied().unwrap_or(0);
             let quote_amt = vault_amounts.get(&p.quote_vault).copied().unwrap_or(0);
             if base_amt == 0 || quote_amt == 0 {
-                tracing::warn!(pool = %p.address, base_amt, quote_amt, "skip pool missing vault balances (no silent fallback)");
-                RAYDIUM_POOLS_SKIPPED_INVALID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(pool = %p.address, base_amt, quote_amt, "skip pool missing/zero vault balances");
+                RAYDIUM_POOLS_SKIPPED_ZERO_RESERVE
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
             let fee_num = raw

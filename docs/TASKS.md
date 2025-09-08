@@ -115,7 +115,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] CI: `cargo fmt`, `cargo clippy`, Tests (GitHub Actions Workflow)
 - [x] Liveness / Readiness Endpoints (/live, /ready)
 - [x] Sharpe & Drawdown Gauges + +Inf Bucket & Build Info Metric
-- [ ] Grafana Dashboard Beispiel (JSON) (Skeleton committed; finalize panels & alerts PENDING)
+- [x] Grafana Dashboard Beispiel (JSON) (Panels finalized; see docs/grafana_dashboard_example.json; alert suggestions in README or Grafana alerting)
 
 ## 7) Production Hardening & Open Roadmap
 
@@ -214,15 +214,22 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Unit: drawdown sizing, cooldown gating, trade_return bucketing
 - [x] Integration: Mock RPC Buy->Fill->Sell Lifecycle
 - [x] Fuzz: Log Parser & Pool Snapshot Decoder (cargo-fuzz targets for replay log parser and Orca Whirlpool layout)
-- [ ] Load / Stress: Quote & Swap Latency unter Last
+- [x] Load / Stress: Quote & Swap Latency unter Last (Neues Binary `latency_stress` für parallele Quote-/Swap-Plan Messungen)
+	- Features: Pairs‑Pinning (`--pairs A->B`), gewichteter Mix (`--w-single|--w-hops2|--w-hops3|--w-plan2`), Dauer/Parallelität konfigurierbar
 - [ ] GitHub Actions: clippy, fmt, test, audit
 	- [x] Multi-Lot Partial Exit Mathe Test
 	- [x] Partial Exit State Mutation & Fee / Sharpe Window Tests (gated via feature)
 
 ### Resilience & Edge Cases
-- [ ] 0-Reserve Pool Handling (Skip & Metric)
-- [ ] Token ohne Decimals Info (Fallback & Warn)
-- [ ] Overflow / Extremwerte Guard für Returns & Fees
+- [x] 0-Reserve Pool Handling (Skip & Metric)
+	- Metrics: `raydium_pools_skipped_zero_reserve_total`, `orca_pools_skipped_zero_reserve_total`
+- [x] Token ohne Decimals Info (Fallback & Warn)
+	- Behavior: Use getTokenSupply.decimals; fallback to mint[44]; else default 0 with warn
+	- Metrics: `mint_decimals_source_supply_total`, `mint_decimals_source_account_total`, `mint_decimals_fallback_default_total`
+- [x] Overflow / Extremwerte Guard für Returns & Fees
+	- Returns: clamp to histogram bounds; sum saturates to i64 micro units
+	- Fees/Shortfall %: sanitize NaN/Inf; clamp to [0,1]
+	- Hinweis: Wallet und Sniper nutzen gemeinsamen Decimals‑Helper (`solana::token_utils`)
 
 ### Developer Experience / Config
 - [ ] Erweiterte Dokumentation der neuen Risk Parameter
@@ -232,6 +239,15 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- SIGHUP Signal Handler (Unix) als alternativer Trigger – implemented
 - [ ] Start Skripte (Windows/Unix) für build/run/backtest
 - [ ] Konfigurierbare Log Rotation & Retention (N Tage)
+
+#### Go‑Live Wiring (offen)
+- [ ] Engine::execute finalisieren – TradeIntent → DEX Routing (Raydium/Orca), `build_swap_plan(_auto)` + `build_swap_instruction`, TX signieren/senden, Metrics/CSV‑Logs aktualisieren
+- [ ] DummyRustStrategy ersetzen oder Beispiel‑Rust‑Strategie hinzufügen, die echte `TradeIntent`s produziert (kleine, sichere Notionals; konfigurierbar)
+- [ ] config.example.toml um minimalen `[sniper]`‑Block erweitern (sichere Defaults: Limits, Slippage, Cooldowns), Quickstart in README ergänzen
+- [ ] main.rs: Treasury‑Laden mit ENV‑Fallback erlauben (`Treasury::load_from_env().or_else(|_| Treasury::load(path))`) für `IRONCRAB_KEYPAIR_*`
+- [ ] Quickstart: Hinweis auf ausreichende SOL‑Balance (Rent+Fees), RPC/WS Erreichbarkeit, Metriken auf :9898
+- [ ] Tests: Unit‑Tests für Token‑Decimals Fallback‑Pfad (supply/account/default) und Clamping‑Logik (returns/fee/shortfall %)
+- [ ] Grafana: Panels für Zero‑Reserve Skips, Decimals‑Quellen (`mint_decimals_*`) und Quote/Swap‑Latenzen finalisieren
 
 ### Priorisierte Reihenfolge (Empfehlung)
 1. PendingTrade TTL & State Persistenz — DONE

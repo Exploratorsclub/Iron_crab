@@ -478,16 +478,7 @@ impl Treasury {
     }
 
     async fn try_mint_decimals(&self, rpc: &SolanaRpc, mint: &SdkPubkey) -> Result<u8> {
-        // Prefer RPC supply (avoids SPL struct unpack differences)
-        if let Ok(supply) = rpc.rpc.get_token_supply(mint).await {
-            return Ok(supply.decimals);
-        }
-        // Fallback: raw account read (decimals at offset 44 in mint layout)
-        let acct = rpc.rpc.get_account(mint).await?;
-        if acct.data.len() > 44 {
-            Ok(acct.data[44])
-        } else {
-            Err(anyhow!("mint account data too short to read decimals"))
-        }
+        // Delegate to centralized helper with metrics and consistent behavior
+        crate::solana::token_utils::try_token_decimals(rpc, mint).await
     }
 }

@@ -231,6 +231,7 @@ impl Orca {
 #[async_trait]
 impl Dex for Orca {
     async fn refresh_pools(&self) -> Result<()> {
+        use crate::metrics::ORCA_POOLS_SKIPPED_ZERO_RESERVE;
         use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
         use solana_client::rpc_filter::RpcFilterType;
         use solana_sdk::pubkey::Pubkey;
@@ -284,6 +285,8 @@ impl Dex for Orca {
                     }
                 }
                 if reserves.0 == 0 || reserves.1 == 0 {
+                    ORCA_POOLS_SKIPPED_ZERO_RESERVE
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
                 fee_tier_keys.push(parsed.fee_tier);

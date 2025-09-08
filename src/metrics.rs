@@ -23,6 +23,13 @@ pub static CYCLE_COMPLETED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RAYDIUM_POOLS_LOADED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RAYDIUM_POOLS_SKIPPED_SERUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RAYDIUM_POOLS_SKIPPED_INVALID: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Zero-reserve pool handling (explicit counters)
+pub static RAYDIUM_POOLS_SKIPPED_ZERO_RESERVE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ORCA_POOLS_SKIPPED_ZERO_RESERVE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Mint decimals resolution counters
+pub static MINT_DECIMALS_SOURCE_SUPPLY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MINT_DECIMALS_SOURCE_ACCOUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MINT_DECIMALS_FALLBACK_DEFAULT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 // --- New Prometheus style metrics (basic) ---
 pub static TRADES_EXECUTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -205,21 +212,28 @@ pub fn record_network_fee(lamports: u64) {
 }
 
 pub fn record_trade_return(ret: f64) {
-    // Clamp extreme outliers to last bucket range for stability
+    // Sanitize and clamp extreme values for stability
+    let min_b = TRADE_RETURN_BUCKETS[0];
+    let max_b = *TRADE_RETURN_BUCKETS.last().unwrap();
+    let p = if ret.is_finite() { ret } else { 0.0 };
+    let p = p.clamp(min_b, max_b);
+
+    // Bucket placement (cumulative style)
     let mut placed = false;
     for (i, b) in TRADE_RETURN_BUCKETS.iter().enumerate() {
-        if ret <= *b {
+        if p <= *b {
             TRADE_RETURN_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed);
             placed = true;
             break;
         }
     }
     if !placed {
-        // Overflow (> last bucket) counts only in an implicit +Inf bucket via count (Prometheus expectation). We don't keep explicit here.
+        // Should not happen due to clamp; kept for safety (+Inf via count only)
     }
     TRADE_RETURN_COUNT.fetch_add(1, Ordering::Relaxed);
-    let micro = (ret * 1_000_000.0).round();
-    // Bound to i64 range
+
+    // Maintain running sum (micro) with saturation
+    let micro = (p * 1_000_000.0).round();
     let micro_i64 = if micro > i64::MAX as f64 {
         i64::MAX
     } else if micro < i64::MIN as f64 {
@@ -241,10 +255,11 @@ pub fn reset_trade_return_metrics() {
 }
 
 pub fn record_fee_pct(pct: f64) {
+    // Clamp to [0, 1] to avoid outliers; guard NaN/Inf
     let p = if pct.is_nan() || pct.is_infinite() || pct < 0.0 {
         0.0
     } else {
-        pct
+        pct.min(1.0)
     };
     for (i, b) in FEE_PCT_BUCKETS.iter().enumerate() {
         if p <= *b {
@@ -256,10 +271,11 @@ pub fn record_fee_pct(pct: f64) {
 }
 
 pub fn record_shortfall_pct(pct: f64) {
+    // Clamp to [0, 1] to avoid outliers; guard NaN/Inf
     let p = if pct.is_nan() || pct.is_infinite() || pct < 0.0 {
         0.0
     } else {
-        pct
+        pct.min(1.0)
     };
     for (i, b) in SHORTFALL_PCT_BUCKETS.iter().enumerate() {
         if p <= *b {
@@ -316,6 +332,9 @@ pub fn snapshot() -> MetricsSnapshot {
         raydium_pools_loaded: RAYDIUM_POOLS_LOADED.load(Ordering::Relaxed),
         raydium_pools_skipped_serum: RAYDIUM_POOLS_SKIPPED_SERUM.load(Ordering::Relaxed),
         raydium_pools_skipped_invalid: RAYDIUM_POOLS_SKIPPED_INVALID.load(Ordering::Relaxed),
+        raydium_pools_skipped_zero_reserve: RAYDIUM_POOLS_SKIPPED_ZERO_RESERVE
+            .load(Ordering::Relaxed),
+        orca_pools_skipped_zero_reserve: ORCA_POOLS_SKIPPED_ZERO_RESERVE.load(Ordering::Relaxed),
         avg_quote_latency_ms: {
             let reqs = QUOTE_REQUESTS.load(Ordering::Relaxed).max(1);
             (QUOTE_LATENCY_TOTAL_NS.load(Ordering::Relaxed) / reqs) as f64 / 1_000_000.0
@@ -340,6 +359,8 @@ pub struct MetricsSnapshot {
     pub raydium_pools_loaded: u64,
     pub raydium_pools_skipped_serum: u64,
     pub raydium_pools_skipped_invalid: u64,
+    pub raydium_pools_skipped_zero_reserve: u64,
+    pub orca_pools_skipped_zero_reserve: u64,
 }
 
 /// Record one swap latency measurement (nanoseconds)
@@ -414,6 +435,26 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "raydium_pools_skipped_invalid_total",
         RAYDIUM_POOLS_SKIPPED_INVALID.load(Ordering::Relaxed)
+    );
+    line!(
+        "raydium_pools_skipped_zero_reserve_total",
+        RAYDIUM_POOLS_SKIPPED_ZERO_RESERVE.load(Ordering::Relaxed)
+    );
+    line!(
+        "orca_pools_skipped_zero_reserve_total",
+        ORCA_POOLS_SKIPPED_ZERO_RESERVE.load(Ordering::Relaxed)
+    );
+    line!(
+        "mint_decimals_source_supply_total",
+        MINT_DECIMALS_SOURCE_SUPPLY.load(Ordering::Relaxed)
+    );
+    line!(
+        "mint_decimals_source_account_total",
+        MINT_DECIMALS_SOURCE_ACCOUNT.load(Ordering::Relaxed)
+    );
+    line!(
+        "mint_decimals_fallback_default_total",
+        MINT_DECIMALS_FALLBACK_DEFAULT.load(Ordering::Relaxed)
     );
     line!(
         "trades_executed_total",

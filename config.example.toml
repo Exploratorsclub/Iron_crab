@@ -54,3 +54,41 @@ kind = "python"
 module = "strategies.sample"
 class  = "SampleStrategy"
 params = { threshold_bps = 20 }
+
+# Sniper – minimal aktiv mit defensiven Defaults
+[sniper]
+max_buy_sol = 0.02
+max_slippage_bps = 150
+blacklist_mints = []
+blacklist_owners = []
+min_pool_liquidity_sol = 20.0
+require_freeze_auth_none = true
+require_mint_decimals_range = [0, 10]
+lp_top1_max_pct = 0.60
+lp_top3_max_pct = 0.80
+lp_top5_max_pct = 0.90
+max_position_sol = 0.10
+stop_loss_bps = 3000
+take_profit_bps = 1000
+daily_loss_limit_sol = 0.30
+max_open_positions = 3
+per_mint_position_limit = 1
+stop_loss_cooldown_secs = 300
+rolling_pnl_window = 50
+hot_reload_secs = 30
+pending_trade_ttl_secs = 120
+# Optional gestaffelte TPs (Beispiel, auskommentiert)
+# take_profit_tiers = [ { bps = 500, fraction = 0.3 }, { bps = 1000, fraction = 0.3 }, { bps = 1500, fraction = 0.4 } ]
+# trailing_stop_bps = 300
+# min_exit_notional_sol = 0.02
+# Data & Pricing / Adaptive Slippage
+oracle_preference = "override"  # pyth|switchboard|override
+# oracle_pyth_sol_usd = "..."    # Pyth price account (optional)
+# oracle_switchboard_sol_usd = "..." # Switchboard aggregator (optional)
+oracle_sol_usd_override = 100.0
+adaptive_slippage_min_bps = 75
+adaptive_slippage_max_bps = 300
+adaptive_slippage_window = 20
+adaptive_slippage_target_pct = 0.002
+adaptive_slippage_step_bps = 5
+exit_eval_interval_secs = 5

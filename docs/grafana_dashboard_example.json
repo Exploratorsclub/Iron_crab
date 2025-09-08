@@ -1,15 +1,94 @@
 {
   "title": "IronCrab Overview",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
+  "time": { "from": "now-6h", "to": "now" },
   "panels": [
-    { "type": "graph", "title": "Sharpe Ratio", "targets": [{ "expr": "ironcrab_sharpe_ratio" }], "gridPos": {"h":8,"w":12,"x":0,"y":0} },
-    { "type": "graph", "title": "Drawdown %", "targets": [{ "expr": "ironcrab_drawdown_pct" }], "gridPos": {"h":8,"w":12,"x":12,"y":0} },
-    { "type": "graph", "title": "Open Positions", "targets": [{ "expr": "open_positions" }], "gridPos": {"h":6,"w":8,"x":0,"y":8} },
-    { "type": "graph", "title": "Daily Realized PnL (SOL)", "targets": [{ "expr": "daily_realized_pnl_sol" }], "gridPos": {"h":6,"w":8,"x":8,"y":8} },
-    { "type": "graph", "title": "RPC Errors", "targets": [{ "expr": "rpc_errors_total" }], "gridPos": {"h":6,"w":8,"x":16,"y":8} },
-    { "type": "graph", "title": "Trade Return Distribution", "targets": [{ "expr": "trade_return_bucket" }], "gridPos": {"h":8,"w":12,"x":0,"y":14} },
-    { "type": "graph", "title": "Swap Latency (count)", "targets": [{ "expr": "swap_latency_seconds_count" }], "gridPos": {"h":8,"w":12,"x":12,"y":14} }
+    { "type": "timeseries", "title": "Sharpe Ratio", "targets": [{ "expr": "ironcrab_sharpe_ratio" }], "gridPos": {"h":6,"w":8,"x":0,"y":0} },
+    { "type": "timeseries", "title": "Drawdown %", "targets": [{ "expr": "ironcrab_drawdown_pct" }], "gridPos": {"h":6,"w":8,"x":8,"y":0} },
+    { "type": "timeseries", "title": "Open Positions", "targets": [{ "expr": "open_positions" }], "gridPos": {"h":6,"w":8,"x":16,"y":0} },
+
+    { "type": "timeseries", "title": "Gross vs Net Realized PnL (SOL)", "targets": [
+        { "expr": "gross_realized_pnl_sol" },
+        { "expr": "net_realized_pnl_sol" }
+      ], "gridPos": {"h":6,"w":12,"x":0,"y":6} },
+    { "type": "timeseries", "title": "Daily Realized PnL (SOL)", "targets": [{ "expr": "daily_realized_pnl_sol" }], "gridPos": {"h":6,"w":12,"x":12,"y":6} },
+
+    { "type": "timeseries", "title": "Swap latency p50/p95/p99 (s)", "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(swap_latency_seconds_bucket[5m])))" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(swap_latency_seconds_bucket[5m])))" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(swap_latency_seconds_bucket[5m])))" }
+      ], "gridPos": {"h":7,"w":12,"x":0,"y":12} },
+    { "type": "timeseries", "title": "Quote latency p50/p95/p99 (s)", "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(quote_latency_seconds_bucket[5m])))" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(quote_latency_seconds_bucket[5m])))" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(quote_latency_seconds_bucket[5m])))" }
+      ], "gridPos": {"h":7,"w":12,"x":12,"y":12} },
+
+    { "type": "heatmap", "title": "Trade Return histogram (rate)", "targets": [
+        { "expr": "rate(trade_return_bucket[5m])" }
+      ], "gridPos": {"h":8,"w":12,"x":0,"y":19} },
+    { "type": "heatmap", "title": "Realized PnL SOL histogram (rate)", "targets": [
+        { "expr": "rate(realized_pnl_sol_bucket[5m])" }
+      ], "gridPos": {"h":8,"w":12,"x":12,"y":19} },
+
+    { "type": "heatmap", "title": "Shortfall % histogram (rate)", "targets": [
+        { "expr": "rate(shortfall_percent_bucket[5m])" }
+      ], "gridPos": {"h":7,"w":12,"x":0,"y":27} },
+    { "type": "heatmap", "title": "Fee % histogram (rate)", "targets": [
+        { "expr": "rate(fee_percent_bucket[5m])" }
+      ], "gridPos": {"h":7,"w":12,"x":12,"y":27} },
+
+    { "type": "timeseries", "title": "RPC errors/timeouts/rate-limits (rate)", "targets": [
+        { "refId": "A", "expr": "rate(rpc_errors_total[5m])" },
+        { "refId": "B", "expr": "rate(rpc_timeouts_total[5m])" },
+        { "refId": "C", "expr": "rate(rpc_rate_limit_hits_total[5m])" }
+      ], "gridPos": {"h":6,"w":12,"x":0,"y":34} },
+    { "type": "timeseries", "title": "RPC inflight vs allowed concurrency", "targets": [
+        { "expr": "rpc_inflight" },
+        { "expr": "rpc_allowed_concurrency" }
+      ], "gridPos": {"h":6,"w":12,"x":12,"y":34} },
+
+    { "type": "timeseries", "title": "Network fees (lamports, cumulative)", "targets": [
+        { "expr": "network_fees_lamports_total" }
+      ], "gridPos": {"h":6,"w":8,"x":0,"y":40} },
+    { "type": "timeseries", "title": "Shortfall (tokens, SOL)", "targets": [
+        { "expr": "shortfall_tokens_total" },
+        { "expr": "shortfall_sol_total" }
+      ], "gridPos": {"h":6,"w":8,"x":8,"y":40} },
+    { "type": "timeseries", "title": "Fills & Trades (rate)", "targets": [
+        { "expr": "rate(fills_total[5m])" },
+        { "expr": "rate(trades_executed_total[5m])" },
+        { "expr": "rate(trades_failed_total[5m])" }
+      ], "gridPos": {"h":6,"w":8,"x":16,"y":40} },
+
+    { "type": "timeseries", "title": "Zero-reserve pool skips (rate)", "targets": [
+        { "expr": "rate(raydium_pools_skipped_zero_reserve_total[5m])", "legendFormat": "Raydium" },
+        { "expr": "rate(orca_pools_skipped_zero_reserve_total[5m])", "legendFormat": "Orca" }
+      ], "gridPos": {"h":6,"w":12,"x":0,"y":46} },
+    { "type": "timeseries", "title": "Mint decimals source (rate)", "targets": [
+        { "expr": "rate(mint_decimals_source_supply_total[5m])", "legendFormat": "supply" },
+        { "expr": "rate(mint_decimals_source_account_total[5m])", "legendFormat": "account" },
+        { "expr": "rate(mint_decimals_fallback_default_total[5m])", "legendFormat": "fallback" }
+      ], "gridPos": {"h":6,"w":12,"x":12,"y":46} },
+
+    { "type": "timeseries", "title": "WS stability (reconnects, heartbeat misses, conn)", "targets": [
+        { "expr": "rate(ws_reconnects_total[5m])", "legendFormat": "reconnects (rate)" },
+        { "expr": "rate(ws_heartbeat_misses_total[5m])", "legendFormat": "heartbeat misses (rate)" },
+        { "expr": "ws_active_connections", "legendFormat": "active connections" }
+      ], "gridPos": {"h":6,"w":12,"x":0,"y":52} },
+
+    { "type": "timeseries", "title": "DEX selection (entry, rate)", "targets": [
+        { "expr": "rate(dex_selection_entry_raydium_total[5m])", "legendFormat": "entry raydium" },
+        { "expr": "rate(dex_selection_entry_orca_total[5m])", "legendFormat": "entry orca" }
+      ], "gridPos": {"h":6,"w":12,"x":12,"y":52} },
+    { "type": "timeseries", "title": "DEX selection (exit, rate)", "targets": [
+        { "expr": "rate(dex_selection_exit_raydium_total[5m])", "legendFormat": "exit raydium" },
+        { "expr": "rate(dex_selection_exit_orca_total[5m])", "legendFormat": "exit orca" }
+      ], "gridPos": {"h":6,"w":12,"x":0,"y":58} },
+
+    { "type": "stat", "title": "Build version", "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }, "textMode": "value" },
+      "targets": [ { "expr": "ironcrab_build_info" } ], "gridPos": {"h":4,"w":6,"x":12,"y":58} }
   ],
   "templating": { "list": [] }
 }

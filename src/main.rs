@@ -36,7 +36,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Solana RPC & Treasury
     let rpc = Arc::new(SolanaRpc::from_cfg(&cfg.solana));
-    let treasury = Treasury::load(&cfg.solana.keypair_path)?;
+    // Prefer ENV-based keypair loaders; fall back to path from config
+    let treasury =
+        Treasury::load_from_env().or_else(|_| Treasury::load(&cfg.solana.keypair_path))?;
 
     // Engine
     let mut engine = Engine::new(cfg.clone(), rpc, treasury).await?;

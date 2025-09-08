@@ -44,7 +44,8 @@ Metrics & Observability
  - Rolling PnL / Sharpe (intern) + Gauges (`ironcrab_sharpe_ratio`, `ironcrab_drawdown_pct`)
  - Brutto vs Netto Realized PnL Gauges (`gross_realized_pnl_sol`, `net_realized_pnl_sol`)
  - Fee-% Histogram (`fee_percent_bucket{le="..."}`) basierend auf Fee / Notional
- - PnL Distribution Histogram (`ironcrab_trade_return_bucket` inkl. +Inf Bucket)
+ - PnL Distribution Histogram (`ironcrab_trade_return_bucket` inkl. +Inf Bucket; Werte werden gegen Bucket‑Grenzen geklammert)
+ - Zusatz‑Zähler: Zero‑Reserve Skips und Decimals‑Quellen (`mint_decimals_*`)
  - Geplante Erweiterungen: Fee Type Breakdown (Protocol vs Referral) & zusätzliche PnL / Shortfall Histograms
 
 Trade Logging
@@ -55,6 +56,20 @@ Trade Logging
 Backtest & Tools
 - Backtest Engine + Scenario Runner (Size/Slippage Sweep, Impact-Knobs) + Tests
 - CLI: `raydium_pools`, `backtest_driver`
+
+### Load / Stress: Quote & Swap Latency
+Neues Binary `latency_stress` misst parallel Quote‑ und Swap‑Plan‑Latenzen unter Last.
+
+- RPC via `--rpc-url` oder ENV `SOLANA_RPC_URL`
+- Konfigurierbare Dauer und Parallelität: `--duration-secs`, `--concurrency`
+- Operation‑Mix gewichtet: `--w-single`, `--w-hops2`, `--w-hops3`, `--w-plan2`
+- Paar‑Pinning: `--pairs A->B,B->C` (Trennzeichen `->`, `:`, `,` unterstützt)
+
+Beispiel (PowerShell):
+```powershell
+$env:SOLANA_RPC_URL="http://127.0.0.1:8899";
+cargo run --bin latency_stress -- --duration-secs 30 --concurrency 64 --w-single 2 --w-hops2 1 --w-hops3 1 --w-plan2 1
+```
 
 ### Backtest: Replay & Impact Modelle
 - Replay Loader: JSONL/JSON Trace Dateien werden eingelesen (`backtest::replay::load_trace`). Unterstützt aktuell Slot & Log Events; Account Events folgen.
@@ -70,6 +85,30 @@ Hinweis: Ohne `--replay-trace` generiert der Driver eine minimale Slot-Sequenz. 
 ```powershell
 cargo run --release -- --config .\config.example.toml
 ```
+
+## Quickstart (Mainnet mit defensiven Defaults)
+1) Konfiguration anpassen: `config.example.toml` hat einen minimalen `[sniper]`‑Block mit konservativen Limits.
+2) Keypair bereitstellen: Entweder `solana.keypair_path` in der TOML (Datei muss existieren) oder via ENV laden (Fallback in main.rs aktiv):
+	- `IRONCRAB_KEYPAIR_JSON` (JSON Array 32/64 bytes)
+	- `IRONCRAB_KEYPAIR_B64` (Base64 32/64 bytes)
+	- `IRONCRAB_KEYPAIR_BASE58` (Base58 Secret)
+	- `IRONCRAB_KEYPAIR_PATH` (Dateipfad; optional `IRONCRAB_KEYPAIR_STRICT=1` und `IRONCRAB_KEYPAIR_ALLOWED_DIRS`)
+3) RPC/WS URLs prüfen (`[solana]` Abschnitt). Stelle sicher, dass Wallet ausreichend SOL hat (Rent + Fees).
+4) Starten:
+```powershell
+cargo run --release -- --config .\config.example.toml
+```
+5) Metrics prüfen (Prometheus Text) unter `http://127.0.0.1:9898/metrics` und Health: `/live`, `/ready`.
+
+### Grafana‑Panels (Hinweise)
+- Quote Latenz: `quote_latency_seconds_*` (Heatmap/Histogram + P50/P90)
+- Swap‑Plan Latenz: `swap_latency_seconds_*`
+- Trade Return: `trade_return_bucket` (+Inf Bucket via Count) – Note: Werte werden geklammert
+- Realized PnL (SOL): `realized_pnl_sol_bucket`, `realized_pnl_sol_sum`, `realized_pnl_sol_count`
+- Fees/Shortfall: `fee_percent_bucket`, `shortfall_percent_bucket`, Summen `network_fees_lamports_total`, `shortfall_sol_total`
+- Resilience: `raydium_pools_skipped_zero_reserve_total`, `orca_pools_skipped_zero_reserve_total`
+- Decimals‑Quellen: `mint_decimals_source_supply_total`, `mint_decimals_source_account_total`, `mint_decimals_fallback_default_total`
+- Risk Gauges: `ironcrab_sharpe_ratio`, `ironcrab_drawdown_pct`, `open_positions`
 
 ## Security: Keypair ENV loaders & redacting logger
 
@@ -215,6 +254,8 @@ Bereits implementiert:
 - `ironcrab_trade_return_bucket` – Realized Return Distribution (+Inf Bucket)
  - `gross_realized_pnl_sol`, `net_realized_pnl_sol` – Session‑aggregierte Brutto/Netto PnL (SOL)
  - `fee_percent_bucket{le=...}` – Gebührenanteil gemessen am Notional pro Trade (inkl. +Inf Bucket via Count)
+ - `realized_pnl_sol_bucket{le=...}` – Absolutes Realized PnL Histogram (SOL) inkl. Sum/Count
+ - `shortfall_percent_bucket{le=...}` – Shortfall Prozent Histogram inkl. +Inf Bucket via Count
 - Netzwerk / Shortfall / Fee Aggregationen (`*_total`)
 	- `network_fees_lamports_total` – Summierte Netzwerkgebühren (Lamports)
 	- `shortfall_tokens_total`, `shortfall_sol_total` – Aggregierte Shortfalls
@@ -224,11 +265,15 @@ Bereits implementiert:
 	- `requote_events_total`, `requote_improved_total`, `requote_worsened_total`, `requote_min_out_delta_ratio_sum` – Re‑Quote Effekte vor Signatur
 	- `dex_selection_entry_raydium_total`, `dex_selection_entry_orca_total` – DEX‑Auswahl bei Entry
 	- `dex_selection_exit_raydium_total`, `dex_selection_exit_orca_total` – DEX‑Auswahl bei Exit
+ - Latenz‑Histograms:
+	 - `quote_latency_seconds_bucket{le=...}`, `quote_latency_seconds_sum`, `quote_latency_seconds_count`
+	 - `swap_latency_seconds_bucket{le=...}`, `swap_latency_seconds_sum`, `swap_latency_seconds_count`
+ - Resilience & Data Helpers:
+	 - `raydium_pools_skipped_zero_reserve_total`, `orca_pools_skipped_zero_reserve_total`
+	 - `mint_decimals_source_supply_total`, `mint_decimals_source_account_total`, `mint_decimals_fallback_default_total`
 
 Geplant / Offen:
 - `ironcrab_fee_breakdown_total{type="protocol|network|referral"}` – Feingranulare Fee Typen
-- Absolute Realized PnL Histogram (SOL): `realized_pnl_sol_bucket{le=...}`, plus `realized_pnl_sol_sum` und `realized_pnl_sol_count` – DONE
-- Shortfall Prozent Histogram: `shortfall_percent_bucket{le=...}` – DONE
 - Weitere Route / Quote Performance Metriken
 
 Grafana Dashboard Skeleton: `docs/grafana_dashboard_example.json` (finale Panels & Alerts pending)
@@ -249,6 +294,8 @@ timestamp_utc,side,mint,dex,signature,lamports_in,lamports_out,tokens_in,tokens_
 - SOL/USD Override: `sniper.oracle_sol_usd_override` konvertiert USDC/USDT‑Reserven in SOL für Liquidity‑Schätzungen, wenn Oracles fehlen.
 - Adaptive Slippage: Rolling Mean der beobachteten BUY‑Shortfalls (tatsächlich erhaltene Tokens vs. expected) steuert die effektive Slippage‑Bps. Ziel‑Slippage `adaptive_slippage_target_pct`, Schrittweite `adaptive_slippage_step_bps`, Grenzen `adaptive_slippage_min_bps`/`max_bps`. Zustand wird im Risk‑Snapshot persistiert.
 
+- Mint Decimals Auflösung: Primär `getTokenSupply.decimals`; Fallback: Byte 44 des Mint‑Accounts; sonst 0 (Warnung). Quelle wird über `mint_decimals_*` Metriken gezählt. Wallet & Sniper nutzen denselben Helper.
+
 ## RPC Concurrency & Rate Limits
 
 Der RPC‑Client passt die erlaubte Parallelität dynamisch an. Rate‑Limit Treffer (HTTP 429/"Too Many Requests"/Throttle) und Timeouts verringern das Fenster, anhaltend erfolgreiche Requests erhöhen es schrittweise.
@@ -264,4 +311,4 @@ Konfiguration (TOML unter `[solana]`):
 Metrics:
 - `rpc_rate_limit_hits_total`, `rpc_timeouts_total`, `rpc_backoff_ms_total`
 - `rpc_inflight`, `rpc_allowed_concurrency`, `rpc_concurrency_adjustments_total`
-
+ 

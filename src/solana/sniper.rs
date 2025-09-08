@@ -1751,15 +1751,8 @@ impl SniperEngine {
             Ok(v) => v.0,
             Err(_) => return,
         };
-        let decimals = if let Ok(mint_acc) = self.rpc.get_account_retry(&mint).await {
-            if mint_acc.data.len() > 44 {
-                mint_acc.data[44]
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        let decimals =
+            crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &mint_sdk).await;
         let acc_opt = self.rpc.get_account_retry(&ata).await.ok();
         if let Some(acc) = acc_opt {
             if acc.data.len() >= 72 {
