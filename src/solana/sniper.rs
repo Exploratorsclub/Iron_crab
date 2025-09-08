@@ -21,7 +21,6 @@ use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
 use chrono::Utc as ChronoUtc;
 use futures::{SinkExt, StreamExt};
 use std::time::{Duration, Instant};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 // removed unused imports (OpenOptions, Write, OnceLazy alias, Mutex)
 use crate::metrics; // for qualified partial exit metrics usage
@@ -555,12 +554,21 @@ impl SniperEngine {
     }
 
     pub async fn subscribe_logs(&self) -> Result<()> {
-        use rand::{Rng, SeedableRng};
+        use tokio_tungstenite::tungstenite::handshake::client::Request as WsRequest;
         // Build endpoint list: primary + optional failovers
         let mut endpoints: Vec<String> = vec![Self::http_to_ws(&self.rpc.rpc.url())];
         for e in self.rpc.ws_failovers().iter() {
             endpoints.push(Self::http_to_ws(e));
         }
+        // Bounded work queue to decouple socket reading from processing; apply backpressure if slow
+    let (logs_tx, mut logs_rx) = tokio::sync::mpsc::channel::<Vec<String>>(512);
+        // Spawn a single worker that processes logs with backpressure
+        let engine_for_worker = self.clone_for_spawn();
+        tokio::spawn(async move {
+            while let Some(lines) = logs_rx.recv().await {
+                engine_for_worker.extract_and_evaluate(lines).await;
+            }
+        });
         let programs = vec![
             RAYDIUM_AMM_V4.to_string(),
             ORCA_WHIRLPOOL_PROGRAM.to_string(),
@@ -568,6 +576,10 @@ impl SniperEngine {
         for pid in programs {
             let urls = endpoints.clone();
             let engine_clone = self.clone_for_spawn();
+            // Use the real shutdown channel to allow graceful termination of WS tasks
+            let mut shutdown_rx = self.shutdown_rx.clone();
+            // Clone sender for this task
+            let logs_tx = logs_tx.clone();
             tokio::spawn(async move {
                 let sub_req = json!({
                     "jsonrpc": "2.0",
@@ -577,15 +589,25 @@ impl SniperEngine {
                 });
                 let mut attempt: u32 = 0;
                 let mut url_idx: usize = 0;
-                let mut rng = rand::rngs::StdRng::from_entropy();
                 loop {
+                    // Check for shutdown before attempting another connect
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
                     let start_connect = Instant::now();
                     let url = urls
                         .get(url_idx % urls.len())
                         .cloned()
                         .unwrap_or_else(|| urls[0].clone());
+                    // Optional headers
+                    let mut req = WsRequest::builder().method("GET").uri(&url);
+                    for (k,v) in engine_clone.rpc.ws_headers().iter() {
+                        req = req.header(k, v);
+                    }
+                    let req = req.body(())
+                        .unwrap_or_else(|_| WsRequest::builder().uri(&url).body(()).unwrap());
                     // Optional connect timeout wrapper
-                    let connect_fut = connect_async(&url);
+                    let connect_fut = tokio_tungstenite::connect_async(req);
                     let ms = engine_clone.rpc.ws_connect_timeout_ms();
                     let connect_res =
                         match tokio::time::timeout(Duration::from_millis(ms), connect_fut).await {
@@ -595,8 +617,10 @@ impl SniperEngine {
                                 "ws connect timeout",
                             ))),
                         };
+                    // default backoff class if we need to reconnect
+                    let mut backoff_class = crate::solana::rpc::ErrorClass::Other;
                     match connect_res {
-                        Ok((mut ws, _resp)) => {
+                        Ok((mut ws, resp)) => {
                             attempt = 0;
                             WS_ACTIVE_CONNECTIONS
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -605,11 +629,16 @@ impl SniperEngine {
                                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                 return;
                             }
-                            info!(program_id = %pid, url=%url, elapsed_ms = start_connect.elapsed().as_millis(), "sniper websocket connected");
+                            info!(program_id = %pid, url=%url, status=?resp.status(), elapsed_ms = start_connect.elapsed().as_millis(), "sniper websocket connected");
                             let mut last_msg = Instant::now();
                             let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+                            // Wait for subscribe confirm with id
+                            let mut subscribed: bool = false;
                             loop {
                                 tokio::select! {
+                                    _ = shutdown_rx.changed() => {
+                                        if *shutdown_rx.borrow() { break; }
+                                    }
                                     _ = heartbeat.tick() => {
                                         // heartbeats: if no message for > 90s, consider stale and break to reconnect
                                         if last_msg.elapsed() > Duration::from_secs(90) {
@@ -626,11 +655,40 @@ impl SniperEngine {
                                             Some(Ok(Message::Text(txt))) => {
                                                 WS_MESSAGES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                 last_msg = Instant::now();
+                                                if !subscribed {
+                                                    // Expect a response with a subscription id: {"result": <number>, "id": 1}
+                                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                                        if v.get("id").and_then(|x| x.as_i64()) == Some(1) {
+                                                            if v.get("result").is_some() {
+                                                                subscribed = true;
+                                                                debug!(program_id=%pid, "ws logsSubscribe confirmed");
+                                                                continue;
+                                                            } else if v.get("error").is_some() {
+                                                                warn!(text=%txt, program_id=%pid, "ws subscribe error, reconnecting");
+                                                                backoff_class = crate::solana::rpc::ErrorClass::Other;
+                                                                break; // reconnect
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                                 if txt.contains("logsNotification") {
                                                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
                                                         if let Some(arr) = v.pointer("/params/result/value/logs").and_then(|x| x.as_array()) {
-                                                            let lines: Vec<String> = arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect();
-                                                            engine_clone.extract_and_evaluate(lines).await;
+                                                            let payload: Vec<String> = arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect();
+                                                            // Apply backpressure: try fast path; if full, await send with returned payload; if closed, break
+                                                            match logs_tx.try_send(payload) {
+                                                                Ok(_) => {}
+                                                                Err(tokio::sync::mpsc::error::TrySendError::Full(p)) => {
+                                                                    if let Err(e2) = logs_tx.send(p).await {
+                                                                        warn!(?e2, program_id=%pid, "ws logs worker closed");
+                                                                        break;
+                                                                    }
+                                                                }
+                                                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_p)) => {
+                                                                    warn!(program_id=%pid, "ws logs worker closed (channel)");
+                                                                    break;
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -650,19 +708,36 @@ impl SniperEngine {
                                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         Err(e) => {
-                            warn!(?e, program_id=%pid, url=%url, "failed websocket connect");
+                            let mut status: Option<u16> = None;
+                            // Extract HTTP status if available for adaptive backoff
+                            if let WsError::Http(resp) = &e {
+                                status = Some(resp.status().as_u16());
+                            }
+                            warn!(?e, status, program_id=%pid, url=%url, "failed websocket connect");
                             // On failure, rotate endpoint after a couple attempts to avoid sticky failures
                             if attempt % 3 == 2 {
                                 url_idx = url_idx.wrapping_add(1);
                             }
+                            backoff_class = match status {
+                                Some(429) => crate::solana::rpc::ErrorClass::Http(429),
+                                Some(503) => crate::solana::rpc::ErrorClass::Http(503),
+                                Some(504) => crate::solana::rpc::ErrorClass::Http(504),
+                                Some(500) => crate::solana::rpc::ErrorClass::Http(500),
+                                Some(502) => crate::solana::rpc::ErrorClass::Http(502),
+                                _ => crate::solana::rpc::ErrorClass::Other,
+                            };
                         }
                     }
                     WS_RECONNECTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     attempt += 1;
-                    let max_backoff = engine_clone.rpc.ws_max_backoff_ms();
-                    let base = (2u64.pow(attempt.min(6)) * 250).min(max_backoff);
-                    let jitter: u64 = rng.gen_range(0..250);
-                    tokio::time::sleep(Duration::from_millis(base + jitter)).await;
+                    // Use the shared backoff helper
+                    tokio::select!{
+                        _ = crate::solana::rpc::SolanaRpc::sleep_with_backoff(attempt, backoff_class) => {},
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() { break; }
+                        }
+                    }
+                    if *shutdown_rx.borrow() { break; }
                 }
             });
         }

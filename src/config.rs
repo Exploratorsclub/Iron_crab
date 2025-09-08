@@ -32,6 +32,8 @@ pub struct SolanaCfg {
     pub ws_connect_timeout_ms: Option<u64>, // connect timeout per attempt
     #[serde(default)]
     pub ws_max_backoff_ms: Option<u64>, // cap for exponential backoff
+    #[serde(default)]
+    pub ws_headers: Option<std::collections::HashMap<String, String>>, // optional auth headers for WS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

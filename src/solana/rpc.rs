@@ -152,6 +152,7 @@ pub struct SolanaRpc {
     ws_failover_urls: Arc<Vec<String>>, // additional endpoints for PubSub
     ws_connect_timeout_ms: u64,
     ws_max_backoff_ms: u64,
+    ws_headers: Arc<std::collections::HashMap<String, String>>,
 }
 
 impl SolanaRpc {
@@ -164,6 +165,7 @@ impl SolanaRpc {
             ws_failover_urls: Arc::new(Vec::new()),
             ws_connect_timeout_ms: 8_000,
             ws_max_backoff_ms: 15_000,
+            ws_headers: Arc::new(Default::default()),
         }
     }
 
@@ -181,12 +183,14 @@ impl SolanaRpc {
         let ws_failover_urls = cfg.ws_failover_urls.clone().unwrap_or_default();
         let ws_connect_timeout_ms = cfg.ws_connect_timeout_ms.unwrap_or(8_000);
         let ws_max_backoff_ms = cfg.ws_max_backoff_ms.unwrap_or(15_000);
+        let ws_headers = cfg.ws_headers.clone().unwrap_or_default();
         Self {
             rpc: Arc::new(rpc),
             limiter: Arc::new(limiter),
             ws_failover_urls: Arc::new(ws_failover_urls),
             ws_connect_timeout_ms,
             ws_max_backoff_ms,
+            ws_headers: Arc::new(ws_headers),
         }
     }
 
@@ -199,9 +203,30 @@ impl SolanaRpc {
     pub fn ws_max_backoff_ms(&self) -> u64 {
         self.ws_max_backoff_ms
     }
+    pub fn ws_headers(&self) -> Arc<std::collections::HashMap<String, String>> {
+        self.ws_headers.clone()
+    }
 
-    async fn sleep_with_backoff(attempt: u32) {
-        let base = (2u64.pow(attempt.min(6)) * 100).min(2_000); // 100ms, 200ms, 400ms, ... up to 2s
+    pub async fn sleep_with_backoff(attempt: u32, class: ErrorClass) {
+        // Adaptive base backoff based on error class / HTTP status codes.
+        let base: u64 = match class {
+            ErrorClass::RateLimited | ErrorClass::Http(429) => {
+                // Back off more aggressively on rate limiting signals
+                (2u64.pow(attempt.min(6)) * 300).min(5_000)
+            }
+            ErrorClass::Http(code) if code == 503 || code == 504 => {
+                // Service unavailable / gateway timeout -> medium aggressive
+                (2u64.pow(attempt.min(6)) * 250).min(4_000)
+            }
+            ErrorClass::Timeout => {
+                (2u64.pow(attempt.min(6)) * 200).min(3_000)
+            }
+            ErrorClass::Http(code) if code == 500 || code == 502 => {
+                // Internal error / bad gateway – usually brief
+                (2u64.pow(attempt.min(6)) * 150).min(2_500)
+            }
+            _ => (2u64.pow(attempt.min(6)) * 100).min(2_000),
+        };
         let mut rng = rand::rngs::StdRng::from_entropy();
         let jitter: u64 = rng.gen_range(0..100);
         crate::metrics::RPC_BACKOFF_MS_TOTAL
@@ -211,13 +236,6 @@ impl SolanaRpc {
 
     fn classify_error(e: &ClientError) -> ErrorClass {
         let s = format!("{e}").to_lowercase();
-        if s.contains("429")
-            || s.contains("too many requests")
-            || s.contains("rate limit")
-            || s.contains("throttl")
-        {
-            return ErrorClass::RateLimited;
-        }
         if s.contains("timeout")
             || s.contains("timed out")
             || s.contains("deadline has elapsed")
@@ -225,14 +243,43 @@ impl SolanaRpc {
         {
             return ErrorClass::Timeout;
         }
+        if let Some(code) = Self::extract_http_status(&s) {
+            return ErrorClass::Http(code);
+        }
+        if s.contains("too many requests") || s.contains("rate limit") || s.contains("throttl") {
+            return ErrorClass::RateLimited;
+        }
         ErrorClass::Other
     }
 
+    fn extract_http_status(s: &str) -> Option<u16> {
+        // Best-effort parse: look for common HTTP status markers in error strings
+        // Examples: "status 429", "http 503", "(504 Gateway Timeout)"
+        const CODES: [u16; 7] = [429, 408, 500, 502, 503, 504, 520];
+        for c in CODES.iter() {
+            let needle = c.to_string();
+            if s.contains(&format!(" {} ", needle))
+                || s.contains(&format!("({})", needle))
+                || s.contains(&format!("status {}", needle))
+                || s.contains(&format!("http {}", needle))
+                || s.ends_with(&format!(" {}", needle))
+            {
+                return Some(*c);
+            }
+        }
+        // Keep the earlier heuristic for 429 if phrased without explicit "status"
+        if s.contains("429") {
+            return Some(429);
+        }
+        None
+    }
+
     fn is_transient_error(e: &ClientError) -> bool {
-        matches!(
-            Self::classify_error(e),
-            ErrorClass::RateLimited | ErrorClass::Timeout | ErrorClass::Other
-        )
+        match Self::classify_error(e) {
+            ErrorClass::Timeout | ErrorClass::RateLimited => true,
+            ErrorClass::Http(code) => code == 429 || code == 408 || (500..=599).contains(&code),
+            ErrorClass::Other => true,
+        }
     }
 
     async fn with_timeout<F, T>(&self, fut: F) -> Option<Result<T, ClientError>>
@@ -261,8 +308,9 @@ impl SolanaRpc {
                     return Ok(h);
                 }
                 Some(Err(e)) => {
-                    match Self::classify_error(&e) {
-                        ErrorClass::RateLimited => {
+                    let class = Self::classify_error(&e);
+                    match class {
+                        ErrorClass::RateLimited | ErrorClass::Http(429) | ErrorClass::Http(503) | ErrorClass::Http(504) => {
                             self.limiter.on_rate_limit();
                             crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -271,6 +319,7 @@ impl SolanaRpc {
                             self.limiter.on_timeout();
                         }
                         ErrorClass::Other => {}
+                        ErrorClass::Http(_) => {}
                     }
                     if !Self::is_transient_error(&e) || attempt >= 2 {
                         return Err(e);
@@ -278,7 +327,7 @@ impl SolanaRpc {
                     attempt += 1;
                     crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Self::sleep_with_backoff(attempt).await;
+                    Self::sleep_with_backoff(attempt, class).await;
                 }
                 None => {
                     // Timeout path handled via limiter + metrics; retry until attempts exhausted
@@ -288,7 +337,7 @@ impl SolanaRpc {
                     attempt += 1;
                     crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Self::sleep_with_backoff(attempt).await;
+                    Self::sleep_with_backoff(attempt, ErrorClass::Timeout).await;
                 }
             }
         }
@@ -304,8 +353,9 @@ impl SolanaRpc {
                     return Ok(f);
                 }
                 Some(Err(e)) => {
-                    match Self::classify_error(&e) {
-                        ErrorClass::RateLimited => {
+                    let class = Self::classify_error(&e);
+                    match class {
+                        ErrorClass::RateLimited | ErrorClass::Http(429) | ErrorClass::Http(503) | ErrorClass::Http(504) => {
                             self.limiter.on_rate_limit();
                             crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -314,6 +364,7 @@ impl SolanaRpc {
                             self.limiter.on_timeout();
                         }
                         ErrorClass::Other => {}
+                        ErrorClass::Http(_) => {}
                     }
                     if !Self::is_transient_error(&e) || attempt >= 2 {
                         return Err(e);
@@ -321,7 +372,7 @@ impl SolanaRpc {
                     attempt += 1;
                     crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Self::sleep_with_backoff(attempt).await;
+                    Self::sleep_with_backoff(attempt, class).await;
                 }
                 None => {
                     if attempt >= 2 {
@@ -330,7 +381,7 @@ impl SolanaRpc {
                     attempt += 1;
                     crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Self::sleep_with_backoff(attempt).await;
+                    Self::sleep_with_backoff(attempt, ErrorClass::Timeout).await;
                 }
             }
         }
@@ -349,8 +400,9 @@ impl SolanaRpc {
                     return Ok(acc);
                 }
                 Some(Err(e)) => {
-                    match Self::classify_error(&e) {
-                        ErrorClass::RateLimited => {
+                    let class = Self::classify_error(&e);
+                    match class {
+                        ErrorClass::RateLimited | ErrorClass::Http(429) | ErrorClass::Http(503) | ErrorClass::Http(504) => {
                             self.limiter.on_rate_limit();
                             crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -359,6 +411,7 @@ impl SolanaRpc {
                             self.limiter.on_timeout();
                         }
                         ErrorClass::Other => {}
+                        ErrorClass::Http(_) => {}
                     }
                     if !Self::is_transient_error(&e) || attempt >= 2 {
                         return Err(e);
@@ -366,7 +419,7 @@ impl SolanaRpc {
                     attempt += 1;
                     crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Self::sleep_with_backoff(attempt).await;
+                    Self::sleep_with_backoff(attempt, class).await;
                 }
                 None => {
                     if attempt >= 2 {
@@ -375,7 +428,7 @@ impl SolanaRpc {
                     attempt += 1;
                     crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Self::sleep_with_backoff(attempt).await;
+                    Self::sleep_with_backoff(attempt, ErrorClass::Timeout).await;
                 }
             }
         }
@@ -391,8 +444,9 @@ impl SolanaRpc {
                     return Ok(b);
                 }
                 Some(Err(e)) => {
-                    match Self::classify_error(&e) {
-                        ErrorClass::RateLimited => {
+                    let class = Self::classify_error(&e);
+                    match class {
+                        ErrorClass::RateLimited | ErrorClass::Http(429) | ErrorClass::Http(503) | ErrorClass::Http(504) => {
                             self.limiter.on_rate_limit();
                             crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -401,6 +455,7 @@ impl SolanaRpc {
                             self.limiter.on_timeout();
                         }
                         ErrorClass::Other => {}
+                        ErrorClass::Http(_) => {}
                     }
                     if !Self::is_transient_error(&e) || attempt >= 2 {
                         return Err(e);
@@ -408,7 +463,7 @@ impl SolanaRpc {
                     attempt += 1;
                     crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Self::sleep_with_backoff(attempt).await;
+                    Self::sleep_with_backoff(attempt, class).await;
                 }
                 None => {
                     if attempt >= 2 {
@@ -417,7 +472,7 @@ impl SolanaRpc {
                     attempt += 1;
                     crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Self::sleep_with_backoff(attempt).await;
+                    Self::sleep_with_backoff(attempt, ErrorClass::Timeout).await;
                 }
             }
         }
@@ -440,8 +495,9 @@ impl SolanaRpc {
                     return Ok(s);
                 }
                 Some(Err(e)) => {
-                    match Self::classify_error(&e) {
-                        ErrorClass::RateLimited => {
+                    let class = Self::classify_error(&e);
+                    match class {
+                        ErrorClass::RateLimited | ErrorClass::Http(429) | ErrorClass::Http(503) | ErrorClass::Http(504) => {
                             self.limiter.on_rate_limit();
                             crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -450,6 +506,7 @@ impl SolanaRpc {
                             self.limiter.on_timeout();
                         }
                         ErrorClass::Other => {}
+                        ErrorClass::Http(_) => {}
                     }
                     if !Self::is_transient_error(&e) || attempt >= 2 {
                         return Err(e);
@@ -457,7 +514,7 @@ impl SolanaRpc {
                     attempt += 1;
                     crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Self::sleep_with_backoff(attempt).await;
+                    Self::sleep_with_backoff(attempt, class).await;
                 }
                 None => {
                     if attempt >= 2 {
@@ -466,7 +523,7 @@ impl SolanaRpc {
                     attempt += 1;
                     crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Self::sleep_with_backoff(attempt).await;
+                    Self::sleep_with_backoff(attempt, ErrorClass::Timeout).await;
                 }
             }
         }
@@ -490,8 +547,9 @@ impl SolanaRpc {
                     return Ok(tx);
                 }
                 Some(Err(e)) => {
-                    match Self::classify_error(&e) {
-                        ErrorClass::RateLimited => {
+                    let class = Self::classify_error(&e);
+                    match class {
+                        ErrorClass::RateLimited | ErrorClass::Http(429) | ErrorClass::Http(503) | ErrorClass::Http(504) => {
                             self.limiter.on_rate_limit();
                             crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -500,6 +558,7 @@ impl SolanaRpc {
                             self.limiter.on_timeout();
                         }
                         ErrorClass::Other => {}
+                        ErrorClass::Http(_) => {}
                     }
                     if !Self::is_transient_error(&e) || attempt >= 2 {
                         return Err(e);
@@ -507,7 +566,7 @@ impl SolanaRpc {
                     attempt += 1;
                     crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Self::sleep_with_backoff(attempt).await;
+                    Self::sleep_with_backoff(attempt, class).await;
                 }
                 None => {
                     if attempt >= 2 {
@@ -516,7 +575,7 @@ impl SolanaRpc {
                     attempt += 1;
                     crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Self::sleep_with_backoff(attempt).await;
+                    Self::sleep_with_backoff(attempt, ErrorClass::Timeout).await;
                 }
             }
         }
@@ -524,9 +583,10 @@ impl SolanaRpc {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ErrorClass {
+pub enum ErrorClass {
     RateLimited,
     Timeout,
+    Http(u16),
     Other,
 }
 

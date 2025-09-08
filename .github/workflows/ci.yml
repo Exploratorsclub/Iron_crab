@@ -67,17 +67,13 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-py
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Show Python version and path
-        shell: bash
-        run: >-
-          python --version || true; python3 --version || true; which python || true; which python3 || true; echo "pythonPath=${{ steps.setup-py.outputs.python-path }}"
-
+      
       - name: Clippy (python feature)
         env:
-          PYO3_PYTHON: "${{ steps.setup-py.outputs.python-path }}"
+          PYO3_PYTHON: python
         run: cargo clippy --all-targets --features python -- -D warnings
 
       - name: Tests (python feature)
         env:
-          PYO3_PYTHON: "${{ steps.setup-py.outputs.python-path }}"
+          PYO3_PYTHON: python
         run: cargo test --features python --quiet
