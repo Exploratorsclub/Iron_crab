@@ -605,7 +605,7 @@ impl SniperEngine {
             endpoints.push(Self::http_to_ws(e));
         }
         // Bounded work queue to decouple socket reading from processing; apply backpressure if slow
-    let (logs_tx, mut logs_rx) = tokio::sync::mpsc::channel::<Vec<String>>(512);
+        let (logs_tx, mut logs_rx) = tokio::sync::mpsc::channel::<Vec<String>>(512);
         // Spawn a single worker that processes logs with backpressure
         let engine_for_worker = self.clone_for_spawn();
         tokio::spawn(async move {
@@ -645,10 +645,11 @@ impl SniperEngine {
                         .unwrap_or_else(|| urls[0].clone());
                     // Optional headers
                     let mut req = WsRequest::builder().method("GET").uri(&url);
-                    for (k,v) in engine_clone.rpc.ws_headers().iter() {
+                    for (k, v) in engine_clone.rpc.ws_headers().iter() {
                         req = req.header(k, v);
                     }
-                    let req = req.body(())
+                    let req = req
+                        .body(())
                         .unwrap_or_else(|_| WsRequest::builder().uri(&url).body(()).unwrap());
                     // Optional connect timeout wrapper
                     let connect_fut = tokio_tungstenite::connect_async(req);
@@ -775,13 +776,15 @@ impl SniperEngine {
                     WS_RECONNECTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     attempt += 1;
                     // Use the shared backoff helper
-                    tokio::select!{
+                    tokio::select! {
                         _ = crate::solana::rpc::SolanaRpc::sleep_with_backoff(attempt, backoff_class) => {},
                         _ = shutdown_rx.changed() => {
                             if *shutdown_rx.borrow() { break; }
                         }
                     }
-                    if *shutdown_rx.borrow() { break; }
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
                 }
             });
         }

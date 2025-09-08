@@ -1,5 +1,6 @@
 // Optionales Python-Strategie-Backend (ohne pyo3-asyncio, minimale Latenz-agnostische Variante)
 #[cfg(feature = "python")]
+#[allow(clippy::all)]
 pub mod py {
     use anyhow::Result;
     use async_trait::async_trait;

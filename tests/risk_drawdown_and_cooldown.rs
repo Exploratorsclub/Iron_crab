@@ -1,11 +1,14 @@
 #![cfg(feature = "test_helpers")]
-use ironcrab::metrics::{reset_trade_return_metrics, TRADE_RETURN_BUCKET_COUNTS, TRADE_RETURN_COUNT, TRADE_RETURN_SUM_MICRO, record_trade_return};
+use ironcrab::metrics::{
+    record_trade_return, reset_trade_return_metrics, TRADE_RETURN_BUCKET_COUNTS,
+    TRADE_RETURN_COUNT, TRADE_RETURN_SUM_MICRO,
+};
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::solana::sniper::{SniperCfg, SniperEngine};
 use ironcrab::wallet::Treasury;
+use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use std::time::Duration;
-use solana_sdk::pubkey::Pubkey;
 
 #[tokio::test]
 async fn drawdown_sizing_scales_max_buy() {
@@ -75,10 +78,15 @@ async fn trade_return_bucketing_records_counts_and_sum() {
     reset_trade_return_metrics();
     // Place some returns covering negative, zero, and positive buckets
     let rets = [-0.6, -0.03, 0.0, 0.015, 0.5, 3.0];
-    for r in rets { record_trade_return(r); }
+    for r in rets {
+        record_trade_return(r);
+    }
 
     // Count should equal number of samples
-    assert_eq!(TRADE_RETURN_COUNT.load(std::sync::atomic::Ordering::Relaxed), 6);
+    assert_eq!(
+        TRADE_RETURN_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        6
+    );
     // Sum micro should reflect sum(rets)
     let sum = rets.iter().sum::<f64>();
     let micro = TRADE_RETURN_SUM_MICRO.load(std::sync::atomic::Ordering::Relaxed);
@@ -87,7 +95,10 @@ async fn trade_return_bucketing_records_counts_and_sum() {
     // Check that at least some bucket counters moved (not all zero)
     let mut any = false;
     for c in TRADE_RETURN_BUCKET_COUNTS.iter() {
-        if c.load(std::sync::atomic::Ordering::Relaxed) > 0 { any = true; break; }
+        if c.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            any = true;
+            break;
+        }
     }
     assert!(any, "expected at least one bucket to be incremented");
 }

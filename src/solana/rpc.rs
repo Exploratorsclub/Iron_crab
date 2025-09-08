@@ -218,9 +218,7 @@ impl SolanaRpc {
                 // Service unavailable / gateway timeout -> medium aggressive
                 (2u64.pow(attempt.min(6)) * 250).min(4_000)
             }
-            ErrorClass::Timeout => {
-                (2u64.pow(attempt.min(6)) * 200).min(3_000)
-            }
+            ErrorClass::Timeout => (2u64.pow(attempt.min(6)) * 200).min(3_000),
             ErrorClass::Http(code) if code == 500 || code == 502 => {
                 // Internal error / bad gateway – usually brief
                 (2u64.pow(attempt.min(6)) * 150).min(2_500)
@@ -310,7 +308,10 @@ impl SolanaRpc {
                 Some(Err(e)) => {
                     let class = Self::classify_error(&e);
                     match class {
-                        ErrorClass::RateLimited | ErrorClass::Http(429) | ErrorClass::Http(503) | ErrorClass::Http(504) => {
+                        ErrorClass::RateLimited
+                        | ErrorClass::Http(429)
+                        | ErrorClass::Http(503)
+                        | ErrorClass::Http(504) => {
                             self.limiter.on_rate_limit();
                             crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -355,7 +356,10 @@ impl SolanaRpc {
                 Some(Err(e)) => {
                     let class = Self::classify_error(&e);
                     match class {
-                        ErrorClass::RateLimited | ErrorClass::Http(429) | ErrorClass::Http(503) | ErrorClass::Http(504) => {
+                        ErrorClass::RateLimited
+                        | ErrorClass::Http(429)
+                        | ErrorClass::Http(503)
+                        | ErrorClass::Http(504) => {
                             self.limiter.on_rate_limit();
                             crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -402,7 +406,10 @@ impl SolanaRpc {
                 Some(Err(e)) => {
                     let class = Self::classify_error(&e);
                     match class {
-                        ErrorClass::RateLimited | ErrorClass::Http(429) | ErrorClass::Http(503) | ErrorClass::Http(504) => {
+                        ErrorClass::RateLimited
+                        | ErrorClass::Http(429)
+                        | ErrorClass::Http(503)
+                        | ErrorClass::Http(504) => {
                             self.limiter.on_rate_limit();
                             crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -446,7 +453,10 @@ impl SolanaRpc {
                 Some(Err(e)) => {
                     let class = Self::classify_error(&e);
                     match class {
-                        ErrorClass::RateLimited | ErrorClass::Http(429) | ErrorClass::Http(503) | ErrorClass::Http(504) => {
+                        ErrorClass::RateLimited
+                        | ErrorClass::Http(429)
+                        | ErrorClass::Http(503)
+                        | ErrorClass::Http(504) => {
                             self.limiter.on_rate_limit();
                             crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -497,7 +507,10 @@ impl SolanaRpc {
                 Some(Err(e)) => {
                     let class = Self::classify_error(&e);
                     match class {
-                        ErrorClass::RateLimited | ErrorClass::Http(429) | ErrorClass::Http(503) | ErrorClass::Http(504) => {
+                        ErrorClass::RateLimited
+                        | ErrorClass::Http(429)
+                        | ErrorClass::Http(503)
+                        | ErrorClass::Http(504) => {
                             self.limiter.on_rate_limit();
                             crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -549,7 +562,10 @@ impl SolanaRpc {
                 Some(Err(e)) => {
                     let class = Self::classify_error(&e);
                     match class {
-                        ErrorClass::RateLimited | ErrorClass::Http(429) | ErrorClass::Http(503) | ErrorClass::Http(504) => {
+                        ErrorClass::RateLimited
+                        | ErrorClass::Http(429)
+                        | ErrorClass::Http(503)
+                        | ErrorClass::Http(504) => {
                             self.limiter.on_rate_limit();
                             crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

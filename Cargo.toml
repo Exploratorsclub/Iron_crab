@@ -68,3 +68,7 @@ notify_watch = ["notify"]
 version = "0.21"
 features = ["auto-initialize"]
 optional = true
+
+[package.metadata.docs.rs]
+features = ["python"]
+no-default-features = true

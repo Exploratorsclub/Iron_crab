@@ -12,7 +12,10 @@ use std::sync::Arc;
 #[tokio::test]
 async fn mock_buy_fill_sell_lifecycle() {
     let rpc = Arc::new(SolanaRpc::new("http://localhost:8899"));
-    let cfg = SniperCfg { max_buy_sol: 2.0, ..SniperCfg::default() };
+    let cfg = SniperCfg {
+        max_buy_sol: 2.0,
+        ..SniperCfg::default()
+    };
     let tmp = std::env::temp_dir().join("ironcrab_test_key_integration.json");
     if !tmp.exists() {
         let kp = solana_sdk::signature::Keypair::new();
