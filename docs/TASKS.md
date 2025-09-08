@@ -64,7 +64,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 1. Orca: Vollständige Whirlpool Layout Implementierung (strukturierter Parser, feste Offsets, verifizierte Tick Index & Liquidity Fields) – DONE (strict parser + semantic validation)
 2. Orca Swap: Ersetzen der Platzhalter User Accounts (Authority, Source/Dest Token Accounts) + Option für sqrt_price_limit – DONE (Sniper nutzt echte Authority & ATAs, min_out via Quote + Slippage)
 3. Raydium: Entfernung von Vault-Fallbacks (immer echte Vault Pubkeys) & zusätzliche Hard Validation (target_orders optional, aber loggen)
-4. Router: Depth‑2 Pfad Benchmark + Depth‑3 (erste Greedy Implementierung + Pruning) [Depth‑3 implemented]
+4. Router: Depth‑2 Pfad Benchmark + Depth‑3 (erste Greedy Implementierung + Pruning) – DONE (Depth‑3 implementiert)
 5. Arbitrage Aggregator: Triangular Path (A-B-C-A) Profit Check (greedy implemented) + Erweiterung für generische Zyklen
 	- [x] Net Profit Filter (min_profit_bps + est_tx_cost_lamports)
 	- [x] TransactionPlan Scaffold (triangle assembly)
@@ -177,7 +177,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Strategy‑Lifecycle: `init`, `on_tick`, `on_fill`, `on_exit` (+ Zeitbudget/Timeout je Call) – BACKTEST IPC implementiert (per‑Call Prozesse, Timeout konfigurierbar); Engine‑pyo3 Pfad folgt separat
 	- [~] Sandbox & Isolation: Panic/Exception Catching, Timeout‑Abbruch, Circuit Breaker bei Fehlerhäufung – PARTIAL (Runtime: tick timeout + panic catch + per‑strategy circuit breaker; Backtest IPC: per‑call timeout + breaker stub)
 	- [x] Beispielstrategie (`strategies/sample.py`, `strategies/sample_worker.py`) + README mit Interface‑Spec
-	- [ ] Tests: Stub‑Strategy (deterministische Signale) + Integrationstest (Signal → Quote → Sim)
+	- [x] Tests: Stub‑Strategy (deterministische Signale) + Integrationstest (Signal → Quote → Sim)
 - [ ] Deterministischer Replay-Modus (Slot Iterator)
 	- [x] Slot‑Iterator (Start..End) mit lokalem Cache für Blöcke/Transaktionen/Logs (in‑memory `ReplayStore` für Slots/Logs/Accounts)
 	- [~] Mock `SolanaRpc` für Replays (get_account/get_program_accounts/logs aus Trace‑Dateien)
@@ -200,7 +200,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 		- Neue Flags: `--impact-extra-fee-bps` (Output‑Abschlag) und Nutzung `--replay-slot-ms` für Latenzmodell (`10 bps/Slot`, Kappung)
 	- [x] Shortfall‑Noise: Stochastischer Aufschlag (Normalverteilung, 0‑trunkiert) auf `max_slippage_bps`
 		- Flags: `--impact-noise-mean-bps`, `--impact-noise-std-bps`, Seed via `--replay-seed` (deterministisch)
-	- [~] Szenario‑Runner: Grundgerüst vorhanden (`backtest::scenario`), weitere Parametrisierung TODO
+	- [x] Szenario‑Runner: Parametrisierte Sweeps (Size, Slippage Bps) + ScenarioMeta‑Injection; Impact‑Knobs (extra fees, noise, latency)
 	- [ ] Validierung: Vergleich Backtest‑PnL vs. historische Live‑Trades (Fehlerbänder)
 
 ### Security & Key Handling

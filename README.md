@@ -14,10 +14,11 @@ Core
 DEX & Routing
 - Raydium: Pool Scan, Quotes, Swap Plan (Compute Budget), Full Swap IX
 - Orca Whirlpool: Strukturierter Parser, Fee Tier Accounts, Swap IX Builder (Tick Arrays + Oracle PDAs)
-- Routing: Single-Hop + Depth‑2 Multi-Hop (finales globales min_out)
+- Routing: Single-Hop + Depth‑2/3 Multi-Hop (finales globales min_out)
 
 Sniper & Risk
 - WS Log Subscription (Pool Create Events)
+- WS Resilience: Subscribe-ACK Gating, Bounded Backpressure, Heartbeat/Staleness, Multi-Endpoint Failover, optionale Auth-Header
 - Heuristiken (Blacklist, Liquidity, FreezeAuth, Decimals Range)
 - SL/TP Evaluation (Stop-Loss / Take-Profit Trigger BPS)
 - Liquidity Index (Raydium + Orca Snapshot)
@@ -52,12 +53,13 @@ Trade Logging
 - Shortfall Analyse (expected vs actual Fill Tokens) & Fee Schätzung (`get_fee_for_message`)
 
 Backtest & Tools
-- Backtest Engine + Tests (Slippage Enforcement)
+- Backtest Engine + Scenario Runner (Size/Slippage Sweep, Impact-Knobs) + Tests
 - CLI: `raydium_pools`, `backtest_driver`
 
 ### Backtest: Replay & Impact Modelle
 - Replay Loader: JSONL/JSON Trace Dateien werden eingelesen (`backtest::replay::load_trace`). Unterstützt aktuell Slot & Log Events; Account Events folgen.
 - Impact Model: Pluggable Slippage/Impact Modell für Backtests. CLI Schalter `--impact cpmm|clmm|none` auf `backtest_driver`.
+- Scenario Runner: Parametrisierte Läufe (Sizes, Slippage Bps, Impact-Profile) inkl. ScenarioMeta-Injektion. Siehe auch `docs/BACKTESTING.md` (Quickstart).
 - Beispiel (PowerShell):
 ```powershell
 cargo run --bin backtest_driver -- --replay-trace .\traces\sample.jsonl --replay-start 250000000 --replay-end 250000120 --impact cpmm
