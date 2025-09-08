@@ -36,7 +36,10 @@ async fn router_builds_hops2_plan_with_min_out() {
     }
 
     // Router with both Orca connectors
-    let router = Router::new(vec![orca0.clone() as Arc<dyn Dex>, orca1.clone() as Arc<dyn Dex>]);
+    let router = Router::new(vec![
+        orca0.clone() as Arc<dyn Dex>,
+        orca1.clone() as Arc<dyn Dex>,
+    ]);
 
     let amount_in: u64 = 100_000; // input amount in A
     let slippage_bps: u32 = 100; // 1%
@@ -52,10 +55,17 @@ async fn router_builds_hops2_plan_with_min_out() {
     // Expect 2 hops with non-zero expected_out and min_out (min_out applies slippage to final out)
     assert_eq!(plan.hops.len(), 2, "expected two-hop plan");
     assert!(plan.expected_out > 0, "expected_out must be positive");
-    let expected_min = (plan.expected_out as u128 * (10_000u128 - slippage_bps as u128)
-        / 10_000u128) as u64;
-    assert_eq!(plan.min_out, expected_min, "min_out should apply 1% slippage to final out");
+    let expected_min =
+        (plan.expected_out as u128 * (10_000u128 - slippage_bps as u128) / 10_000u128) as u64;
+    assert_eq!(
+        plan.min_out, expected_min,
+        "min_out should apply 1% slippage to final out"
+    );
 
     // Plan should contain two swap instructions (one per hop) for Orca
-    assert_eq!(plan.ixs.len(), 2, "should build two instructions (one per hop)");
+    assert_eq!(
+        plan.ixs.len(),
+        2,
+        "should build two instructions (one per hop)"
+    );
 }

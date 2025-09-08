@@ -1,6 +1,8 @@
 use ironcrab::backtest::engine::make_swap;
 use ironcrab::backtest::market::CfmPool;
-use ironcrab::backtest::types::{BacktestStrategy, Portfolio, SimContext, SimEvent, SimEventKind, StrategyDecision};
+use ironcrab::backtest::types::{
+    BacktestStrategy, Portfolio, SimContext, SimEvent, SimEventKind, StrategyDecision,
+};
 use ironcrab::backtest::{engine::BacktestEngine, market::CfmAdapter};
 use std::sync::Mutex;
 
@@ -63,20 +65,21 @@ fn stub_strategy_signal_quote_sim_chain_executes() {
     };
     let portfolio = Portfolio::new();
     let events = mk_events(2);
-    let strategy = StubStrategy { fired: Mutex::new(false) };
+    let strategy = StubStrategy {
+        fired: Mutex::new(false),
+    };
     let mut engine = BacktestEngine::new(strategy, market, portfolio, events);
 
     engine.run().expect("engine should run");
 
     // We expect two actions to have been proposed; depending on reserves and slippage, both should execute.
     // Assert at least one non-rejected execution and no catastrophic failures.
-    assert!(engine.decisions.len() >= 1);
-    let non_rejected: Vec<_> = engine
-        .executions
-        .iter()
-        .filter(|r| !r.rejected)
-        .collect();
-    assert!(non_rejected.len() >= 1, "expected at least one executed swap");
+    assert!(!engine.decisions.is_empty());
+    let non_rejected: Vec<_> = engine.executions.iter().filter(|r| !r.rejected).collect();
+    assert!(
+        !non_rejected.is_empty(),
+        "expected at least one executed swap"
+    );
 
     // If both swaps executed, C position should be > 0; at minimum, ensure portfolio changed.
     let c_pos = engine
