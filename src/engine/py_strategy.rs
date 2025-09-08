@@ -30,8 +30,9 @@ pub mod py {
             // Synchronous init unter GIL (einmalig)
             let py_obj = Python::with_gil(|py| -> PyResult<PyObject> {
                 // Use non-deprecated bound import API
-                let m = PyModule::import_bound(py, &module_path)?;
-                let cls = m.getattr(&class_name)?;
+                // pyo3 0.21 expects IntoPy<Py<PyString>>; pass &str, not &String
+                let m = PyModule::import_bound(py, module_path.as_str())?;
+                let cls = m.getattr(class_name.as_str())?;
                 // Serialize params; map JSON errors into a Python ValueError
                 let params_str = serde_json::to_string(&params).map_err(|e| {
                     pyo3::exceptions::PyValueError::new_err(format!(
