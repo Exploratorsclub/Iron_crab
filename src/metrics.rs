@@ -212,16 +212,17 @@ pub fn record_network_fee(lamports: u64) {
 }
 
 pub fn record_trade_return(ret: f64) {
-    // Sanitize and clamp extreme values for stability
+    // Bucket placement uses clamped value to keep distribution stable,
+    // but the sum/average should reflect the actual (unclamped) return.
     let min_b = TRADE_RETURN_BUCKETS[0];
     let max_b = *TRADE_RETURN_BUCKETS.last().unwrap();
-    let p = if ret.is_finite() { ret } else { 0.0 };
-    let p = p.clamp(min_b, max_b);
+    let actual = if ret.is_finite() { ret } else { 0.0 };
+    let bkt_val = actual.clamp(min_b, max_b);
 
     // Bucket placement (cumulative style)
     let mut placed = false;
     for (i, b) in TRADE_RETURN_BUCKETS.iter().enumerate() {
-        if p <= *b {
+        if bkt_val <= *b {
             TRADE_RETURN_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed);
             placed = true;
             break;
@@ -232,8 +233,8 @@ pub fn record_trade_return(ret: f64) {
     }
     TRADE_RETURN_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    // Maintain running sum (micro) with saturation
-    let micro = (p * 1_000_000.0).round();
+    // Maintain running sum (micro) with saturation using the actual value
+    let micro = (actual * 1_000_000.0).round();
     let micro_i64 = if micro > i64::MAX as f64 {
         i64::MAX
     } else if micro < i64::MIN as f64 {
