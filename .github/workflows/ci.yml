@@ -98,6 +98,8 @@ jobs:
         run: cargo clippy --all-targets --features python -- -D warnings
 
       - name: Tests (python feature)
+        shell: bash
         env:
           PYO3_PYTHON: python
-  run: cargo test --features python --lib --tests --quiet
+        run: |
+          cargo test --features python --lib --tests --quiet
