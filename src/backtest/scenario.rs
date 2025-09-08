@@ -32,15 +32,16 @@ impl Scenario {
         engine.events.insert(
             0,
             SimEvent {
-                ts_ms: engine.events.first().map(|e| e.ts_ms.saturating_sub(1)).unwrap_or(0),
+                ts_ms: engine
+                    .events
+                    .first()
+                    .map(|e| e.ts_ms.saturating_sub(1))
+                    .unwrap_or(0),
                 kind: SimEventKind::ScenarioMeta {
                     name: self.name,
                     size,
                     slippage_bps,
-                    latency_ms: engine
-                        .impact_settings
-                        .emulate_latency_ms
-                        .unwrap_or(0),
+                    latency_ms: engine.impact_settings.emulate_latency_ms.unwrap_or(0),
                 },
             },
         );
@@ -50,7 +51,10 @@ impl Scenario {
 
     /// Run a parameter sweep over all (size, slippage_bps) pairs by creating a fresh engine via a user-provided factory.
     /// This avoids requiring BacktestEngine to be Clone.
-    pub fn run_for_each<S, M, F>(self, mut make_engine: F) -> anyhow::Result<Vec<BacktestEngine<S, M>>>
+    pub fn run_for_each<S, M, F>(
+        self,
+        mut make_engine: F,
+    ) -> anyhow::Result<Vec<BacktestEngine<S, M>>>
     where
         S: BacktestStrategy,
         M: MarketAdapter,
@@ -61,14 +65,15 @@ impl Scenario {
             for sl in &self.slippages_bps {
                 let mut eng = make_engine(*sz, *sl);
                 // announce scenario to the strategy
-                let latency_ms = eng
-                    .impact_settings
-                    .emulate_latency_ms
-                    .unwrap_or(0);
+                let latency_ms = eng.impact_settings.emulate_latency_ms.unwrap_or(0);
                 eng.events.insert(
                     0,
                     SimEvent {
-                        ts_ms: eng.events.first().map(|e| e.ts_ms.saturating_sub(1)).unwrap_or(0),
+                        ts_ms: eng
+                            .events
+                            .first()
+                            .map(|e| e.ts_ms.saturating_sub(1))
+                            .unwrap_or(0),
                         kind: SimEventKind::ScenarioMeta {
                             name: self.name.clone(),
                             size: *sz,
