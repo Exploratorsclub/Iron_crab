@@ -404,6 +404,23 @@ impl SniperEngine {
             .and_then(|v| v.get(lot_idx).map(|l| l.invested_sol))
     }
 
+    /// Get number of open lots for a mint.
+    pub fn test_open_lot_count(&self, mint: &Pubkey) -> usize {
+        let rs = self.risk.read();
+        rs.open.get(mint).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Get total open lots across all mints.
+    pub fn test_total_open_positions(&self) -> usize {
+        let rs = self.risk.read();
+        rs.open.values().map(|v| v.len()).sum()
+    }
+
+    /// Access realized PnL (SOL) accumulated in RiskState.
+    pub fn test_get_realized_pnl_sol(&self) -> f64 {
+        self.risk.read().realized_pnl_sol
+    }
+
     /// Set today's realized loss (SOL) for drawdown sizing tests.
     pub fn test_set_realized_loss_today(&self, loss_sol: f64) {
         let mut rs = self.risk.write();
