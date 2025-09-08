@@ -29,7 +29,8 @@ pub mod py {
         ) -> Result<Self> {
             // Synchronous init unter GIL (einmalig)
             let py_obj = Python::with_gil(|py| -> PyResult<PyObject> {
-                let m = PyModule::import(py, &module_path)?;
+                // Use non-deprecated bound import API
+                let m = PyModule::import_bound(py, &module_path)?;
                 let cls = m.getattr(&class_name)?;
                 // Serialize params; map JSON errors into a Python ValueError
                 let params_str = serde_json::to_string(&params).map_err(|e| {
@@ -37,9 +38,11 @@ pub mod py {
                         "failed to serialize params to JSON: {e}"
                     ))
                 })?;
-                let inst = cls.call1((params_str,))?;
+                // Call class constructor with JSON params; convert to owned PyObject
+                let inst = cls.call1((params_str,))?.unbind();
                 Ok(inst.into())
-            })?;
+            })
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
             Ok(Self {
                 name,
@@ -66,7 +69,8 @@ pub mod py {
                     PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad json: {e}"))
                 })?;
                 Ok(intents)
-            })?;
+            })
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             Ok(intents)
         }
     }
