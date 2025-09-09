@@ -3094,18 +3094,60 @@ impl SniperEngine {
         if supply == 0.0 {
             return Ok(None);
         }
-        // Optional freeze authority gate (classic SPL-Token Mint layout):
-        // offsets: 0..4 mintAuthOpt, 4..36 mintAuth, 36..44 supply, 44 decimals, 45 isInit,
-        // 46..50 freezeAuthOpt, 50..82 freezeAuth
-        let freeze_auth_opt: Option<Pubkey> = if mint_acc.data.len() >= 82 {
-            let opt_bytes: [u8; 4] = mint_acc.data[46..50].try_into().unwrap_or([0u8; 4]);
-            let opt = u32::from_le_bytes(opt_bytes);
-            if opt == 0 { None } else {
-                let fa_bytes: [u8; 32] = mint_acc.data[50..82].try_into().unwrap_or([0u8; 32]);
-                let pk = Pubkey::new_from_array(fa_bytes);
-                if pk.to_bytes() == [0u8; 32] { None } else { Some(pk) }
+        // Mint layout (SPL Token):
+        // 0..4   COption tag for mint_authority (0=None, 1=Some)
+        // 4..36  mint_authority pubkey (if Some)
+        // 36..44 supply u64 LE
+        // 44     decimals u8
+        // 45     is_initialized bool
+        // 46..50 COption tag for freeze_authority
+        // 50..82 freeze_authority pubkey (if Some)
+        // Parse mint_authority (owner blacklist target) and freeze_authority
+        let mint_auth_opt: Option<Pubkey> = if mint_acc.data.len() >= 36 {
+            let tag = u32::from_le_bytes(
+                mint_acc.data[0..4].try_into().unwrap_or([0u8; 4]),
+            );
+            if tag == 0 {
+                None
+            } else {
+                let key = Pubkey::new_from_array(
+                    mint_acc.data[4..36].try_into().unwrap_or([0u8; 32]),
+                );
+                if key.to_bytes() == [0u8; 32] { None } else { Some(key) }
             }
-        } else { None };
+        } else {
+            None
+        };
+        let freeze_auth_opt: Option<Pubkey> = if mint_acc.data.len() >= 82 {
+            let tag = u32::from_le_bytes(
+                mint_acc.data[46..50].try_into().unwrap_or([0u8; 4]),
+            );
+            if tag == 0 {
+                None
+            } else {
+                let key = Pubkey::new_from_array(
+                    mint_acc.data[50..82].try_into().unwrap_or([0u8; 32]),
+                );
+                if key.to_bytes() == [0u8; 32] { None } else { Some(key) }
+            }
+        } else {
+            None
+        };
+        // Owner blacklist: reject if mint_authority or freeze_authority is in configured blacklist_owners
+        if let Some(owner_list) = Some(self.cfg.read().blacklist_owners.clone()) {
+            if !owner_list.is_empty() {
+                if let Some(ma) = mint_auth_opt.as_ref() {
+                    if owner_list.iter().any(|o| o == &ma.to_string()) {
+                        return Ok(None);
+                    }
+                }
+                if let Some(fa) = freeze_auth_opt.as_ref() {
+                    if owner_list.iter().any(|o| o == &fa.to_string()) {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
         if self.cfg.read().require_freeze_auth_none.unwrap_or(false) && freeze_auth_opt.is_some() {
             return Ok(None);
         }
