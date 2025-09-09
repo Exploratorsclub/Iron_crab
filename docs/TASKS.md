@@ -201,7 +201,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Shortfall‑Noise: Stochastischer Aufschlag (Normalverteilung, 0‑trunkiert) auf `max_slippage_bps`
 		- Flags: `--impact-noise-mean-bps`, `--impact-noise-std-bps`, Seed via `--replay-seed` (deterministisch)
 	- [x] Szenario‑Runner: Parametrisierte Sweeps (Size, Slippage Bps) + ScenarioMeta‑Injection; Impact‑Knobs (extra fees, noise, latency)
-	- [ ] Validierung: Vergleich Backtest‑PnL vs. historische Live‑Trades (Fehlerbänder)
+	- [x] Validierung: Vergleich Backtest‑PnL vs. historische Live‑Trades (Fehlerbänder) – DONE (Backtest-Driver `--validate-live-csv`; Report: n, MAE, MAPE, within 1/2/5%)
 
 ### Security & Key Handling
 - [~] Gesicherte Keypair Ladepfade / optional KMS
