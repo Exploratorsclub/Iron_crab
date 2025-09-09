@@ -139,6 +139,19 @@ pub static REALIZED_PNL_SOL_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
 });
 pub static REALIZED_PNL_SOL_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static REALIZED_PNL_SOL_SUM_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
+// Replay / Backtest driver metrics (populated by backtest driver/engine)
+pub static REPLAY_MODE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0)); // 1=replay, 0=live
+pub static REPLAY_START_SLOT_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REPLAY_END_SLOT_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REPLAY_SLOT_MS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REPLAY_SEED_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REPLAY_EVENTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REPLAY_SLOTS_SEEN_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REPLAY_NEW_POOLS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REPLAY_PRICE_UPDATES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REPLAY_RAYDIUM_POOLS_INGESTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REPLAY_ORCA_POOLS_INGESTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REPLAY_TRACE_POOLS_JSON_INGESTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Fee percent histogram (fee / notional), common percent buckets
 const FEE_PCT_BUCKETS: &[f64] = &[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1];
 pub static FEE_PCT_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
@@ -643,6 +656,43 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "net_realized_pnl_sol",
         NET_REALIZED_PNL_SOL_MICRO.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
+    // Replay/backtest metrics
+    line!("replay_mode", REPLAY_MODE.load(Ordering::Relaxed));
+    line!(
+        "replay_start_slot",
+        REPLAY_START_SLOT_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "replay_end_slot",
+        REPLAY_END_SLOT_GAUGE.load(Ordering::Relaxed)
+    );
+    line!("replay_slot_ms", REPLAY_SLOT_MS_GAUGE.load(Ordering::Relaxed));
+    line!("replay_seed", REPLAY_SEED_GAUGE.load(Ordering::Relaxed));
+    line!("replay_events_total", REPLAY_EVENTS_TOTAL.load(Ordering::Relaxed));
+    line!(
+        "replay_slots_seen_total",
+        REPLAY_SLOTS_SEEN_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "replay_new_pools_total",
+        REPLAY_NEW_POOLS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "replay_price_updates_total",
+        REPLAY_PRICE_UPDATES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "replay_raydium_pools_ingested",
+        REPLAY_RAYDIUM_POOLS_INGESTED.load(Ordering::Relaxed)
+    );
+    line!(
+        "replay_orca_pools_ingested",
+        REPLAY_ORCA_POOLS_INGESTED.load(Ordering::Relaxed)
+    );
+    line!(
+        "replay_trace_pools_json_ingested",
+        REPLAY_TRACE_POOLS_JSON_INGESTED.load(Ordering::Relaxed)
     );
     // Fee percent histogram
     for (i, b) in FEE_PCT_BUCKETS.iter().enumerate() {
