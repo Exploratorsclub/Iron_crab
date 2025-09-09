@@ -170,14 +170,14 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Interne Sharpe Validierung (Fee Impact & Rolling Window Truncation Tests)
 
 ### Backtesting & Strategy
-- [ ] `py_strategy` FFI (pyo3 oder IPC) für externe Signale
-	- [~] API‑Contract definieren: Inputs (Preis‑Snapshots, Pool‑State, Positions‑State), Outputs (Entry/Exit‑Signale, Size, min_out bps) – PARTIAL (Backtest akzeptiert `StrategyDecision` JSON, siehe README)
-	- [~] Schnittstelle (Serde Schema): JSON/MessagePack; Versionierung + Kompatibilitätscheck – PARTIAL (JSON für Backtest IPC)
-	- [~] pyo3 Modul‑Skeleton (+ Feature‑Flag `py_strategy`); Alternative IPC (lokaler TCP/Named Pipe) mit Request/Response – PARTIAL (Engine pyo3 Adapter + Backtest IPC Prozess‑Adapter)
-	- [x] Strategy‑Lifecycle: `init`, `on_tick`, `on_fill`, `on_exit` (+ Zeitbudget/Timeout je Call) – BACKTEST IPC implementiert (per‑Call Prozesse, Timeout konfigurierbar); Engine‑pyo3 Pfad folgt separat
-	- [~] Sandbox & Isolation: Panic/Exception Catching, Timeout‑Abbruch, Circuit Breaker bei Fehlerhäufung – PARTIAL (Runtime: tick timeout + panic catch + per‑strategy circuit breaker; Backtest IPC: per‑call timeout + breaker stub)
-	- [x] Beispielstrategie (`strategies/sample.py`, `strategies/sample_worker.py`) + README mit Interface‑Spec
-	- [x] Tests: Stub‑Strategy (deterministische Signale) + Integrationstest (Signal → Quote → Sim)
+- [x] `py_strategy` FFI (pyo3 oder IPC) für externe Signale
+	- [x] API‑Contract: JSON Schema für `StrategyDecision` (Backtest akzeptiert JSON; Engine-pyo3 erwartet `on_tick()->JSON`)
+	- [x] IPC Pfad (Feature `python_ipc`): Persistenter Subprozess mit Line‑Protocol; Timeout + Circuit Breaker
+	- [x] pyo3 Pfad (Feature `python`): `engine::py_strategy::PyStrategy` lädt Modul/Klasse und ruft `on_tick()` unter GIL; Param‑JSON Übergabe
+	- [x] Strategy‑Lifecycle: `init`, `on_tick`, `on_fill`, `on_exit` – Backtest IPC voll integriert; Engine‑pyo3 Tick integriert
+	- [x] Sandbox & Isolation: Backtest IPC per‑call Timeout + Restart/Circuit; Engine Runtime Timeout/Panic‑Catch + Circuit
+	- [x] Beispielstrategie (`strategies/sample.py`, `strategies/sample_worker.py`) + README‑Hinweis
+	- [x] CLI (Backtest): `--py-script` schaltet Python‑IPC Strategie ein
 - [ ] Deterministischer Replay-Modus (Slot Iterator)
 	- [x] Slot‑Iterator (Start..End) mit lokalem Cache für Blöcke/Transaktionen/Logs (in‑memory `ReplayStore` für Slots/Logs/Accounts)
 	- [~] Mock `SolanaRpc` für Replays (get_account/get_program_accounts/logs aus Trace‑Dateien)
