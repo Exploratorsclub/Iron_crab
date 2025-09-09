@@ -178,12 +178,12 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Sandbox & Isolation: Backtest IPC per‑call Timeout + Restart/Circuit; Engine Runtime Timeout/Panic‑Catch + Circuit
 	- [x] Beispielstrategie (`strategies/sample.py`, `strategies/sample_worker.py`) + README‑Hinweis
 	- [x] CLI (Backtest): `--py-script` schaltet Python‑IPC Strategie ein
-- [ ] Deterministischer Replay-Modus (Slot Iterator)
+- [x] Deterministischer Replay-Modus (Slot Iterator)
 	- [x] Slot‑Iterator (Start..End) mit lokalem Cache für Blöcke/Transaktionen/Logs (in‑memory `ReplayStore` für Slots/Logs/Accounts)
-	- [~] Mock `SolanaRpc` für Replays (get_account/get_program_accounts/logs aus Trace‑Dateien)
+	- [x] Mock `SolanaRpc` für Replays (get_account/get_multiple_accounts/logs + `all_latest()` aus Trace)
 		- Implementiert: `ReplayRpc` mit `get_account`, `get_multiple_accounts`, `logs_in_range`, `all_latest` (genutzt für Decoding)
-		- Offen: direktes `get_program_accounts` API (ersetzt durch `all_latest` + Filter)
-	- [~] Determinismus: feste Timestamps via `slot_ms`, seedbares RNG Feld reserviert (für Impact/Noise); deterministischer Ablauf im Backtest (erste Version aktiv)
+		- Offen: optionales direktes `get_program_accounts` API (derzeit durch `all_latest` + Filter ersetzt)
+	- [x] Determinismus: feste Timestamps via `slot_ms`, seedbares RNG Feld reserviert (für Impact/Noise); deterministischer Ablauf im Backtest
 	- [x] Recorder‑Tool: Live‑Stream (Blöcke/Logs/Accounts) in Dateien schreiben (kompakt, komprimiert)
 		- Neues Binary `ironcrab-recorder`: schreibt JSONL‑Trace (gzip, .jsonl.gz) kompatibel zu `TraceEvent` (Slot/Log/Account base64)
 		- Logs via WS logsSubscribe (Raydium/Orca), Accounts via periodischem get_program_accounts Dump
