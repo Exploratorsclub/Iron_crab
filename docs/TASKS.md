@@ -192,7 +192,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Golden Tests: Minimaler Replay‑Test (Deterministische Slot‑TS, Account‑Mapping)
 	- [x] Raydium Replay Refresh: Pool‑Snapshots aus `ReplayRpc` lesen (`fetch_pools_replay`/`refresh_pools_replay`) und im Backtest‑Driver vorinitialisieren
 	- [x] Orca Replay Refresh: Whirlpool‑Snapshots aus `ReplayRpc` lesen (`refresh_pools_replay`) und im Backtest‑Driver vorinitialisieren
-- [ ] Impact / Slippage Modell im Backtest
+- [x] Impact / Slippage Modell im Backtest
 	- [x] DEX‑spezifische Modelle: Raydium (CPMM) vs. Orca Whirlpool (konzentrierte Liquidität, Tick‑Kreuzungen)
 		- Implementiert: Pluggable ImpactModel (CPMM exakt, CLMM mit konservativer Zusatz‑Penalty für große Trades)
 		- CLI: `--impact cpmm|clmm|none` wählt Modell für min_out‑Berechnung
