@@ -187,7 +187,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Recorder‑Tool: Live‑Stream (Blöcke/Logs/Accounts) in Dateien schreiben (kompakt, komprimiert)
 		- Neues Binary `ironcrab-recorder`: schreibt JSONL‑Trace (gzip, .jsonl.gz) kompatibel zu `TraceEvent` (Slot/Log/Account base64)
 		- Logs via WS logsSubscribe (Raydium/Orca), Accounts via periodischem get_program_accounts Dump
-	- [~] CLI/Config: `--replay*` Flags (Slot‑Range, Quelle, slot_ms, seed) implementiert: `--replay-trace`, `--replay-start`, `--replay-end`, `--replay-slot-ms`, `--replay-seed` (Metriken TODO)
+	- [x] CLI/Config: `--replay*` Flags (Slot‑Range, Quelle, slot_ms, seed) implementiert: `--replay-trace`, `--replay-start`, `--replay-end`, `--replay-slot-ms`, `--replay-seed` (Metriken DONE: replay_mode, start/end slot, slot_ms, seed, events/slots/new_pools/price_updates, ingested pools)
 	- [x] Trace Loader: JSON/JSONL → TraceEvent → SimEvent (Slots, Logs, Account→NewPool+CfmPriceUpdate)
 	- [x] Golden Tests: Minimaler Replay‑Test (Deterministische Slot‑TS, Account‑Mapping)
 	- [x] Raydium Replay Refresh: Pool‑Snapshots aus `ReplayRpc` lesen (`fetch_pools_replay`/`refresh_pools_replay`) und im Backtest‑Driver vorinitialisieren
