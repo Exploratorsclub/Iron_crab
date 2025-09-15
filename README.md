@@ -56,6 +56,116 @@ Backtest & Tools
 - Backtest Engine + Scenario Runner (Size/Slippage Sweep, Impact-Knobs) + Tests
 - CLI: `raydium_pools`, `backtest_driver`
 
+## 🚀 Quickstart Guide
+
+### Prerequisites
+1. **Rust Installation**: Ensure you have Rust installed (latest stable)
+2. **Solana Wallet**: Have a Solana keypair with sufficient SOL balance
+3. **RPC Access**: Local node (recommended) or RPC provider endpoint
+
+### Step 1: Configuration Setup
+Copy and customize the configuration file:
+```powershell
+# Copy example config
+cp config.example.toml my_config.toml
+```
+
+**Critical Settings to Review** (in `my_config.toml`):
+```toml
+[solana]
+rpc_url = "http://127.0.0.1:8899"     # Your RPC endpoint
+ws_url  = "ws://127.0.0.1:8900"       # WebSocket endpoint  
+keypair_path = "path/to/your/id.json" # Your wallet keypair
+
+[sniper]
+# START SMALL - These are CONSERVATIVE defaults
+max_buy_sol = 0.02                    # Max 0.02 SOL per trade
+max_position_sol = 0.10               # Max 0.1 SOL total position
+daily_loss_limit_sol = 0.30           # Stop trading if lose 0.3 SOL/day
+stop_loss_bps = 3000                  # -30% stop loss (AGGRESSIVE!)
+take_profit_bps = 1000                # +10% take profit
+```
+
+### Step 2: Wallet Setup
+Choose one of the following methods to provide your keypair:
+
+**Option A: Config File** (simplest)
+```toml
+[solana]
+keypair_path = "~/.config/solana/id.json"
+```
+
+**Option B: Environment Variables** (more secure)
+```powershell
+# JSON format (recommended)
+$env:IRONCRAB_KEYPAIR_JSON='[123,45,67,...]'  # Your 64-byte keypair
+
+# Or Base64
+$env:IRONCRAB_KEYPAIR_B64='YOUR_BASE64_KEY_HERE'
+
+# Or file path with security
+$env:IRONCRAB_KEYPAIR_PATH='C:\secure\path\id.json'
+$env:IRONCRAB_KEYPAIR_STRICT='1'
+$env:IRONCRAB_KEYPAIR_ALLOWED_DIRS='C:\secure\path'
+```
+
+### Step 3: Verify Wallet Balance
+Ensure your wallet has adequate SOL:
+- **Minimum**: 0.5 SOL (for rent + fees + initial positions)
+- **Recommended**: 2-5 SOL for proper testing
+- **Note**: The bot will use `max_buy_sol` × `max_open_positions` maximum
+
+### Step 4: Build and Run
+```powershell
+# Build (first time)
+cargo build --release
+
+# Run with your config
+cargo run --release -- --config my_config.toml
+```
+
+### Step 5: Monitor the Bot
+Once running, monitor these endpoints:
+
+1. **Logs**: Check console output for trade activity
+2. **Metrics**: `http://localhost:9898/metrics` (Prometheus format)
+3. **Health**: 
+   - `http://localhost:9898/live` (liveness check)
+   - `http://localhost:9898/ready` (readiness check)
+4. **Trade Logs**: `./trade_logs/trades-YYYYMMDD.csv`
+
+### Step 6: Safety Checklist ⚠️
+Before going live, verify:
+- [ ] `max_buy_sol` is appropriately small for your risk tolerance
+- [ ] `daily_loss_limit_sol` will protect your capital  
+- [ ] `stop_loss_bps` is not too aggressive (consider 1500-2000 instead of 3000)
+- [ ] Your RPC endpoint is reliable and fast
+- [ ] You understand that sniper trading is HIGH RISK
+- [ ] You've tested with small amounts first
+
+### Common Commands
+```powershell
+# Run with Python strategies enabled
+cargo run --release --features python -- --config my_config.toml
+
+# Run with file watching for hot config reload  
+cargo run --release --features notify_watch -- --config my_config.toml
+
+# Check pool information
+cargo run --bin raydium_pools -- --rpc-url http://127.0.0.1:8899
+
+# Stress test latency
+cargo run --bin latency_stress -- --duration-secs 30 --concurrency 16
+```
+
+### Troubleshooting
+- **Connection Issues**: Verify RPC/WS URLs are accessible
+- **Insufficient Balance**: Ensure wallet has enough SOL for trades + fees
+- **No Trades**: Check if pools meet your filtering criteria (`min_pool_liquidity_sol`, etc.)
+- **High CPU**: Reduce `rpc_max_concurrency` or increase `exit_eval_interval_secs`
+
+---
+
 ### Load / Stress: Quote & Swap Latency
 Neues Binary `latency_stress` misst parallel Quote‑ und Swap‑Plan‑Latenzen unter Last.
 
@@ -82,22 +192,10 @@ Hinweis: Ohne `--replay-trace` generiert der Driver eine minimale Slot-Sequenz. 
 
 ## Build & Run (PowerShell)
 ```powershell
-cargo run --release -- --config .\config.example.toml
-```
-
-## Quickstart (Mainnet mit defensiven Defaults)
-1) Konfiguration anpassen: `config.example.toml` hat einen minimalen `[sniper]`‑Block mit konservativen Limits.
-2) Keypair bereitstellen: Entweder `solana.keypair_path` in der TOML (Datei muss existieren) oder via ENV laden (Fallback in main.rs aktiv):
-	- `IRONCRAB_KEYPAIR_JSON` (JSON Array 32/64 bytes)
-	- `IRONCRAB_KEYPAIR_B64` (Base64 32/64 bytes)
-	- `IRONCRAB_KEYPAIR_BASE58` (Base58 Secret)
-	- `IRONCRAB_KEYPAIR_PATH` (Dateipfad; optional `IRONCRAB_KEYPAIR_STRICT=1` und `IRONCRAB_KEYPAIR_ALLOWED_DIRS`)
-3) RPC/WS URLs prüfen (`[solana]` Abschnitt). Stelle sicher, dass Wallet ausreichend SOL hat (Rent + Fees).
-4) Starten:
+## Build & Run (PowerShell)
 ```powershell
 cargo run --release -- --config .\config.example.toml
 ```
-5) Metrics prüfen (Prometheus Text) unter `http://127.0.0.1:9898/metrics` und Health: `/live`, `/ready`.
 
 ### Grafana‑Panels (Hinweise)
 - Quote Latenz: `quote_latency_seconds_*` (Heatmap/Histogram + P50/P90)

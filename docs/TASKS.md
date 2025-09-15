@@ -240,10 +240,10 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Konfigurierbare Log Rotation & Retention (N Tage)
 
 #### Go‑Live Wiring (offen)
-- [ ] Engine::execute finalisieren – TradeIntent → DEX Routing (Raydium/Orca), `build_swap_plan(_auto)` + `build_swap_instruction`, TX signieren/senden, Metrics/CSV‑Logs aktualisieren
+- [x] Engine::execute finalisieren – TradeIntent → DEX Routing (Raydium/Orca), `build_swap_plan(_auto)` + `build_swap_instruction`, TX signieren/senden, Metrics/CSV‑Logs aktualisieren
+- [x] config.example.toml um minimalen `[sniper]`‑Block erweitern (sichere Defaults: Limits, Slippage, Cooldowns), Quickstart in README ergänzen
 - [ ] DummyRustStrategy ersetzen oder Beispiel‑Rust‑Strategie hinzufügen, die echte `TradeIntent`s produziert (kleine, sichere Notionals; konfigurierbar)
-- [ ] config.example.toml um minimalen `[sniper]`‑Block erweitern (sichere Defaults: Limits, Slippage, Cooldowns), Quickstart in README ergänzen
-- [ ] main.rs: Treasury‑Laden mit ENV‑Fallback erlauben (`Treasury::load_from_env().or_else(|_| Treasury::load(path))`) für `IRONCRAB_KEYPAIR_*`
+- [x] main.rs: Treasury‑Laden mit ENV‑Fallback erlauben (`Treasury::load_from_env().or_else(|_| Treasury::load(path))`) für `IRONCRAB_KEYPAIR_*`
 - [ ] Quickstart: Hinweis auf ausreichende SOL‑Balance (Rent+Fees), RPC/WS Erreichbarkeit, Metriken auf :9898
 - [ ] Tests: Unit‑Tests für Token‑Decimals Fallback‑Pfad (supply/account/default) und Clamping‑Logik (returns/fee/shortfall %)
 - [ ] Grafana: Panels für Zero‑Reserve Skips, Decimals‑Quellen (`mint_decimals_*`) und Quote/Swap‑Latenzen finalisieren

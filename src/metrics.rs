@@ -120,6 +120,9 @@ pub static DEX_SELECTION_EXIT_ORCA_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU
 pub static STRATEGY_TICK_TIMEOUTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static STRATEGY_TICK_PANICS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static STRATEGY_CIRCUIT_OPENS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static STRATEGY_EXECUTIONS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static STRATEGY_EXECUTION_SUCCESSES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static STRATEGY_EXECUTION_FAILURES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static PY_STRAT_TIMEOUTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static PY_STRAT_FAILS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static PY_STRAT_CIRCUIT_OPENS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -394,6 +397,23 @@ pub fn record_swap_latency(ns: u64) {
     }
 }
 
+/// Record swap latency from Duration
+pub fn record_swap_latency_duration(duration: std::time::Duration) {
+    record_swap_latency(duration.as_nanos() as u64);
+}
+
+/// Record price impact measurement (basis points)
+pub fn record_price_impact(_price_impact_bps: f64) {
+    // For now, we'll just track in the trade success metrics
+    // Could add a separate histogram for price impact if needed
+}
+
+/// Record slippage measurement (basis points)  
+pub fn record_slippage(_slippage_bps: f64) {
+    // For now, we'll just track in the trade success metrics
+    // Could add a separate histogram for slippage if needed
+}
+
 async fn metrics_response() -> Response<Body> {
     // Build Prometheus exposition text
     let mut out = String::with_capacity(4096);
@@ -636,6 +656,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "strategy_circuit_opens_total",
         STRATEGY_CIRCUIT_OPENS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "strategy_executions_total",
+        STRATEGY_EXECUTIONS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "strategy_execution_successes_total",
+        STRATEGY_EXECUTION_SUCCESSES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "strategy_execution_failures_total",
+        STRATEGY_EXECUTION_FAILURES_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "py_strat_timeouts_total",

@@ -1,10 +1,10 @@
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration, Utc};
     use ironcrab::log_manager::LogManager;
     use std::fs::File;
     use std::io::Write;
     use tempfile::TempDir;
-    use chrono::{Duration, Utc};
 
     #[tokio::test]
     async fn test_log_cleanup_removes_old_files() {
@@ -44,7 +44,7 @@ mod tests {
         let log_manager = LogManager::new(log_dir, 7, 24);
 
         // Run cleanup
-        log_manager.cleanup_old_logs().await;
+        let _ = log_manager.cleanup_old_logs().await;
 
         // Verify old file was removed, recent files kept
         assert!(!old_file_path.exists(), "Old file should be removed");
@@ -58,9 +58,9 @@ mod tests {
         let log_dir = temp_dir.path().to_str().unwrap();
 
         let log_manager = LogManager::new(log_dir, 7, 24);
-        
+
         // Should not panic or error on empty directory
-        log_manager.cleanup_old_logs().await;
+        let _ = log_manager.cleanup_old_logs().await;
     }
 
     #[tokio::test]
@@ -71,12 +71,12 @@ mod tests {
         // Create non-trade files that should be ignored
         let other_file = temp_dir.path().join("other-20240101.csv");
         File::create(&other_file).unwrap();
-        
+
         let config_file = temp_dir.path().join("config.toml");
         File::create(&config_file).unwrap();
 
         let log_manager = LogManager::new(log_dir, 7, 24);
-        log_manager.cleanup_old_logs().await;
+        let _ = log_manager.cleanup_old_logs().await;
 
         // Non-trade files should remain untouched
         assert!(other_file.exists());

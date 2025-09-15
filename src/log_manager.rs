@@ -24,8 +24,8 @@ impl LogManager {
 
     /// Create LogManager from sniper config with defaults
     pub fn from_sniper_config(sniper_cfg: &crate::config::SniperSettings) -> Self {
-        let log_dir = std::env::var("IRONCRAB_TRADE_LOG_DIR")
-            .unwrap_or_else(|_| "trade_logs".to_string());
+        let log_dir =
+            std::env::var("IRONCRAB_TRADE_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string());
         let retention_days = sniper_cfg.log_retention_days.unwrap_or(30);
         let cleanup_interval_hours = sniper_cfg.log_cleanup_interval_hours.unwrap_or(24);
 
@@ -47,15 +47,17 @@ impl LogManager {
 
         loop {
             interval_timer.tick().await;
-            
+
             if let Err(e) = self.cleanup_old_logs().await {
                 warn!(error = %e, "Failed to cleanup old logs");
             }
 
             // Update current log info metrics after cleanup
             if let Ok(info) = self.get_log_info().await {
-                crate::metrics::LOG_FILES_CURRENT_COUNT.store(info.total_files as u64, Ordering::Relaxed);
-                crate::metrics::LOG_FILES_CURRENT_SIZE_BYTES.store(info.total_size_bytes, Ordering::Relaxed);
+                crate::metrics::LOG_FILES_CURRENT_COUNT
+                    .store(info.total_files as u64, Ordering::Relaxed);
+                crate::metrics::LOG_FILES_CURRENT_SIZE_BYTES
+                    .store(info.total_size_bytes, Ordering::Relaxed);
             }
         }
     }
@@ -78,10 +80,10 @@ impl LogManager {
         );
 
         let mut read_dir = tokio::fs::read_dir(&self.log_dir).await?;
-        
+
         while let Some(entry) = read_dir.next_entry().await? {
             let path = entry.path();
-            
+
             // Only process CSV files that match the trade log pattern
             if !path.is_file() || path.extension().map_or(true, |ext| ext != "csv") {
                 continue;
@@ -99,7 +101,7 @@ impl LogManager {
 
             // Extract the date from filename (trades-YYYYMMDD.csv)
             let date_str = &filename[7..15]; // Extract YYYYMMDD part
-            
+
             if let Ok(file_date) = parse_date_from_filename(date_str) {
                 if file_date < cutoff_date {
                     // File is older than retention period, remove it
@@ -134,7 +136,8 @@ impl LogManager {
         if files_removed > 0 {
             // Update cleanup metrics
             crate::metrics::LOG_FILES_CLEANED_TOTAL.fetch_add(files_removed, Ordering::Relaxed);
-            crate::metrics::LOG_CLEANUP_SIZE_BYTES_TOTAL.fetch_add(total_size_removed, Ordering::Relaxed);
+            crate::metrics::LOG_CLEANUP_SIZE_BYTES_TOTAL
+                .fetch_add(total_size_removed, Ordering::Relaxed);
 
             info!(
                 files_removed = files_removed,
@@ -169,10 +172,10 @@ impl LogManager {
         let mut newest_date: Option<DateTime<ChronoUtc>> = None;
 
         let mut read_dir = tokio::fs::read_dir(&self.log_dir).await?;
-        
+
         while let Some(entry) = read_dir.next_entry().await? {
             let path = entry.path();
-            
+
             // Only process CSV files that match the trade log pattern
             if !path.is_file() || path.extension().map_or(true, |ext| ext != "csv") {
                 continue;
@@ -192,7 +195,7 @@ impl LogManager {
             let date_str = &filename[7..15];
             if let Ok(file_date) = parse_date_from_filename(date_str) {
                 total_files += 1;
-                
+
                 let metadata = tokio::fs::metadata(&path).await?;
                 total_size += metadata.len();
 
@@ -227,7 +230,10 @@ pub struct LogInfo {
 fn parse_date_from_filename(date_str: &str) -> Result<DateTime<ChronoUtc>, chrono::ParseError> {
     let naive_date = chrono::NaiveDate::parse_from_str(date_str, "%Y%m%d")?;
     let naive_datetime = naive_date.and_hms_opt(0, 0, 0).unwrap();
-    Ok(DateTime::from_naive_utc_and_offset(naive_datetime, ChronoUtc))
+    Ok(DateTime::from_naive_utc_and_offset(
+        naive_datetime,
+        ChronoUtc,
+    ))
 }
 
 #[cfg(test)]
@@ -240,7 +246,7 @@ mod tests {
     fn test_parse_date_from_filename() {
         let date = parse_date_from_filename("20231215").unwrap();
         assert_eq!(date.format("%Y-%m-%d").to_string(), "2023-12-15");
-        
+
         assert!(parse_date_from_filename("invalid").is_err());
         assert!(parse_date_from_filename("20231301").is_err()); // Invalid month
     }
@@ -253,17 +259,17 @@ mod tests {
         // Create some test files
         let old_date = ChronoUtc::now() - chrono::Duration::days(10);
         let recent_date = ChronoUtc::now() - chrono::Duration::days(3);
-        
+
         let old_filename = format!("trades-{}.csv", old_date.format("%Y%m%d"));
         let recent_filename = format!("trades-{}.csv", recent_date.format("%Y%m%d"));
-        
+
         let old_path = temp_dir.path().join(&old_filename);
         let recent_path = temp_dir.path().join(&recent_filename);
-        
+
         // Create test files
         fs::write(&old_path, "test,data\n1,2\n").await.unwrap();
         fs::write(&recent_path, "test,data\n3,4\n").await.unwrap();
-        
+
         // Also create a non-matching file that should be ignored
         let other_path = temp_dir.path().join("other.csv");
         fs::write(&other_path, "other,data\n").await.unwrap();
@@ -285,18 +291,18 @@ mod tests {
         // Create test files
         let date1 = ChronoUtc::now() - chrono::Duration::days(5);
         let date2 = ChronoUtc::now() - chrono::Duration::days(2);
-        
+
         let filename1 = format!("trades-{}.csv", date1.format("%Y%m%d"));
         let filename2 = format!("trades-{}.csv", date2.format("%Y%m%d"));
-        
+
         let path1 = temp_dir.path().join(&filename1);
         let path2 = temp_dir.path().join(&filename2);
-        
+
         fs::write(&path1, "test,data\n1,2\n").await.unwrap();
         fs::write(&path2, "test,data\n3,4,5\n").await.unwrap();
 
         let info = log_manager.get_log_info().await.unwrap();
-        
+
         assert_eq!(info.total_files, 2);
         assert!(info.total_size_bytes > 0);
         assert!(info.oldest_date.is_some());
