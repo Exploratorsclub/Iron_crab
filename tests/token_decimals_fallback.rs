@@ -76,7 +76,7 @@ mod tests {
         // let mint = Pubkey::new_unique();
         // let decimals = get_token_decimals_or_default(&rpc, &mint).await;
         // assert_eq!(decimals, 6);
-        // 
+        //
         // let metrics = get_decimals_metrics();
         // assert_eq!(metrics.0, 1); // supply source incremented
         // assert_eq!(metrics.1, 0); // account source not used
@@ -96,7 +96,7 @@ mod tests {
         // let mint = Pubkey::new_unique();
         // let decimals = get_token_decimals_or_default(&rpc, &mint).await;
         // assert_eq!(decimals, 9);
-        // 
+        //
         // let metrics = get_decimals_metrics();
         // assert_eq!(metrics.0, 0); // supply source failed, not incremented
         // assert_eq!(metrics.1, 1); // account source incremented
@@ -116,7 +116,7 @@ mod tests {
         // let mint = Pubkey::new_unique();
         // let decimals = get_token_decimals_or_default(&rpc, &mint).await;
         // assert_eq!(decimals, 0);
-        // 
+        //
         // let metrics = get_decimals_metrics();
         // assert_eq!(metrics.0, 0); // supply source failed
         // assert_eq!(metrics.1, 0); // account source failed
@@ -136,7 +136,7 @@ mod tests {
         // let mint = Pubkey::new_unique();
         // let decimals = get_token_decimals_or_default(&rpc, &mint).await;
         // assert_eq!(decimals, 0);
-        // 
+        //
         // let metrics = get_decimals_metrics();
         // assert_eq!(metrics.0, 0); // supply source failed
         // assert_eq!(metrics.1, 0); // account source failed (too short)
@@ -161,7 +161,7 @@ mod tests {
         // Test that metrics counters are thread-safe and atomic
         // Since these are global counters that may be affected by other tests,
         // we test relative changes rather than absolute values
-        
+
         let initial_metrics = get_decimals_metrics();
 
         // Simulate concurrent access
@@ -207,7 +207,7 @@ mod tests {
         // Test that our assumptions about SPL Token mint layout are correct
         // SPL Token mint layout:
         // - mint_authority: 36 bytes (4 + 32) at offset 0
-        // - supply: 8 bytes at offset 36  
+        // - supply: 8 bytes at offset 36
         // - decimals: 1 byte at offset 44
         // - is_initialized: 1 byte at offset 45
         // - freeze_authority: 36 bytes (4 + 32) at offset 46

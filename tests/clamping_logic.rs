@@ -47,7 +47,7 @@ mod tests {
     fn test_shortfall_pct_clamping_normal_values() {
         // Test normal shortfall percentages
         metrics::record_shortfall_pct(0.0); // No shortfall
-        metrics::record_shortfall_pct(0.1); // 0.1% shortfall  
+        metrics::record_shortfall_pct(0.1); // 0.1% shortfall
         metrics::record_shortfall_pct(0.5); // 0.5% shortfall
         metrics::record_shortfall_pct(1.0); // 1.0% shortfall
 
@@ -179,7 +179,7 @@ mod tests {
         metrics::record_trade_return(100.0); // Preserved as 100.0
     }
 
-    #[test] 
+    #[test]
     fn test_concurrent_clamping_safety() {
         use std::thread;
 
@@ -216,7 +216,7 @@ mod tests {
         metrics::record_fee_pct(1.5); // -> 1.0
 
         // From record_shortfall_pct: same logic as fee_pct
-        metrics::record_shortfall_pct(-0.1); // -> 0.0  
+        metrics::record_shortfall_pct(-0.1); // -> 0.0
         metrics::record_shortfall_pct(0.5); // -> 0.5 (unchanged)
         metrics::record_shortfall_pct(1.5); // -> 1.0
 
@@ -251,7 +251,7 @@ mod tests {
         let very_large = 1e20; // This * 1_000_000 would overflow i64
         metrics::record_trade_return(very_large);
 
-        let very_small = -1e20; // This * 1_000_000 would underflow i64  
+        let very_small = -1e20; // This * 1_000_000 would underflow i64
         metrics::record_trade_return(very_small);
 
         // Should handle with saturation, not panic
