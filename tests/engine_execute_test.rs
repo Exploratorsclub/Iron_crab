@@ -10,7 +10,6 @@ mod tests {
     use rust_decimal::prelude::{FromStr, ToPrimitive};
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio;
 
     // Mock configuration for testing
     fn create_test_config() -> Config {

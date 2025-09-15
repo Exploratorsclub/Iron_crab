@@ -244,7 +244,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] config.example.toml um minimalen `[sniper]`‑Block erweitern (sichere Defaults: Limits, Slippage, Cooldowns), Quickstart in README ergänzen
 - [ ] DummyRustStrategy ersetzen oder Beispiel‑Rust‑Strategie hinzufügen, die echte `TradeIntent`s produziert (kleine, sichere Notionals; konfigurierbar)
 - [x] main.rs: Treasury‑Laden mit ENV‑Fallback erlauben (`Treasury::load_from_env().or_else(|_| Treasury::load(path))`) für `IRONCRAB_KEYPAIR_*`
-- [ ] Quickstart: Hinweis auf ausreichende SOL‑Balance (Rent+Fees), RPC/WS Erreichbarkeit, Metriken auf :9898
+- [x] Quickstart: Hinweis auf ausreichende SOL‑Balance (Rent+Fees), RPC/WS Erreichbarkeit, Metriken auf :9898
 - [ ] Tests: Unit‑Tests für Token‑Decimals Fallback‑Pfad (supply/account/default) und Clamping‑Logik (returns/fee/shortfall %)
 - [ ] Grafana: Panels für Zero‑Reserve Skips, Decimals‑Quellen (`mint_decimals_*`) und Quote/Swap‑Latenzen finalisieren
 

@@ -76,7 +76,7 @@ mod tests {
         env::remove_var("IRONCRAB_KEYPAIR_JSON");
 
         // Test Base64 format
-        let base64_string = base64::engine::general_purpose::STANDARD.encode(&keypair_bytes);
+        let base64_string = base64::engine::general_purpose::STANDARD.encode(keypair_bytes);
         env::set_var("IRONCRAB_KEYPAIR_B64", &base64_string);
         assert!(Treasury::load_from_env().is_ok());
         env::remove_var("IRONCRAB_KEYPAIR_B64");

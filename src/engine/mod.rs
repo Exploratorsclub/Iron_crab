@@ -406,9 +406,9 @@ impl Engine {
     ) -> Result<u64> {
         let multiplier = 10u64.pow(decimals as u32);
         let raw_amount = ui_amount * rust_decimal::Decimal::from(multiplier);
-        Ok(raw_amount
+        raw_amount
             .to_u64()
-            .ok_or_else(|| anyhow::anyhow!("Amount overflow"))?)
+            .ok_or_else(|| anyhow::anyhow!("Amount overflow"))
     }
 
     fn apply_slippage(&self, amount_out: u64, slippage_bps: u32) -> u64 {
@@ -501,11 +501,12 @@ impl Engine {
             Side::Sell => "SELL",
         };
 
+        let pair = format!("{}/{}", intent.base.symbol, intent.quote.symbol);
         let line = format!(
             "{},{},{},{},{},{},{},{},{},{},{},{}",
             timestamp,
             intent.market,
-            format!("{}/{}", intent.base.symbol, intent.quote.symbol),
+            pair,
             side_str,
             intent.amount.ui,
             quote.amount_out,

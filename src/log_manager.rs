@@ -85,7 +85,7 @@ impl LogManager {
             let path = entry.path();
 
             // Only process CSV files that match the trade log pattern
-            if !path.is_file() || path.extension().map_or(true, |ext| ext != "csv") {
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "csv") {
                 continue;
             }
 
@@ -177,7 +177,7 @@ impl LogManager {
             let path = entry.path();
 
             // Only process CSV files that match the trade log pattern
-            if !path.is_file() || path.extension().map_or(true, |ext| ext != "csv") {
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "csv") {
                 continue;
             }
 
