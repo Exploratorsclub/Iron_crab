@@ -40,7 +40,7 @@ pub mod py {
                 })?;
                 // Call class constructor with JSON params; convert to owned PyObject
                 let inst = cls.call1((params_str,))?;
-                Ok(inst.into_py(py))
+                Ok(inst.into_any().unbind())
             })
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
@@ -64,7 +64,7 @@ pub mod py {
             let intents = Python::with_gil(|py| -> PyResult<Vec<TradeIntent>> {
                 let obj_guard = self.py_obj.lock();
                 let out = obj_guard.call_method0(py, "on_tick")?;
-                let s: String = out.extract()?;
+                let s: String = out.extract(py)?;
                 let intents: Vec<TradeIntent> = serde_json::from_str(&s).map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad json: {e}"))
                 })?;
