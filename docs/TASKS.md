@@ -1,4 +1,3 @@
-
 # IronCrab – Tasks & Meilensteine
 
 ## 1) Treasury & Transfers
@@ -41,7 +40,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Grund-SniperEngine Skeleton + Config Struct
 - [x] WS-Logs Subscribe (Pool-Create) via raw WebSocket (manual logsSubscribe JSON-RPC)
 - [x] Heuristiken: Config Felder (Blacklist Mints/Owners, Min Liquidity, FreezeAuth None, Decimals Range) implementiert; Runtime Checks integriert – echte Pool Account / Mint Fetch & LP-Lock Analyse implementiert
-- [~] Pool Account & Mint Fetch (Owner, FreezeAuth, Decimals, Supply, Liquidity) – WebSocket detection in place; detailed account fetch & liquidity calc pending
+- [x] Pool Account & Mint Fetch (Owner, FreezeAuth, Decimals, Supply, Liquidity) – WebSocket detection in place; detailed account fetch & liquidity calc implemented
 		- [x] Liquidity Heuristik: Index-basierte SOL/Stable Schätzung (Raydium Pools + Fallback largest accounts; Orca TODO Snaps) (Oracle TODO)
 - [x] LP-Lock / Konzentrations-Heuristik (Top1/Top3/Top5 via largestAccounts + Log-Integration)
 - [~] LP-Lock / Token Distribution Heuristik (Burn + Program-Owned Vault Erkennung integriert in Konzentrationsberechnung; weitere Verfeinerung offen)
@@ -216,7 +215,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] Fuzz: Log Parser & Pool Snapshot Decoder (cargo-fuzz targets for replay log parser and Orca Whirlpool layout)
 - [x] Load / Stress: Quote & Swap Latency unter Last (Neues Binary `latency_stress` für parallele Quote-/Swap-Plan Messungen)
 	- Features: Pairs‑Pinning (`--pairs A->B`), gewichteter Mix (`--w-single|--w-hops2|--w-hops3|--w-plan2`), Dauer/Parallelität konfigurierbar
-- [ ] GitHub Actions: clippy, fmt, test, audit
+- [x] GitHub Actions: clippy, fmt, test, audit
 	- [x] Multi-Lot Partial Exit Mathe Test
 	- [x] Partial Exit State Mutation & Fee / Sharpe Window Tests (gated via feature)
 
@@ -232,7 +231,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- Hinweis: Wallet und Sniper nutzen gemeinsamen Decimals‑Helper (`solana::token_utils`)
 
 ### Developer Experience / Config
-- [ ] Erweiterte Dokumentation der neuen Risk Parameter
+- [x] Erweiterte Dokumentation der neuen Risk Parameter
 - [x] Diff Logging bei Hot Reload (was hat sich geändert?)
 	- Implementiert: `diff_sniper_cfg` vergleicht Felder & loggt Änderungen (Hot Reload Task)
 	- Optional Echtzeit File Watch via Feature `notify_watch` (aktivieren mit `--features notify_watch`)

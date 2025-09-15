@@ -1,4 +1,3 @@
-
 # IronCrab – Solana‑First Tradingbot (Rust)
 
 Version: **0.3.1-dev** (Agave / Solana 3.x line)  
@@ -311,4 +310,74 @@ Konfiguration (TOML unter `[solana]`):
 Metrics:
 - `rpc_rate_limit_hits_total`, `rpc_timeouts_total`, `rpc_backoff_ms_total`
 - `rpc_inflight`, `rpc_allowed_concurrency`, `rpc_concurrency_adjustments_total`
- 
+
+## Erweiterte Risk-Parameter (Sniper)
+
+Diese Parameter steuern Notional-Limits, Tagesverlust-Gating, Positionsanzahl, Cooldowns sowie eine dynamische Drawdown-Skalierung der Kaufgröße. Alle Felder sind optional, konservative Defaults blockieren keine Käufe, sofern nicht gesetzt.
+
+Konfiguration (TOML unter `[sniper]`):
+
+- max_position_sol (f64)
+  - Cap pro neuer Position (Notional in SOL). Wenn gesetzt, wird vor einem neuen BUY geprüft, ob die geplante Lot-Größe darüber liegt; andernfalls wird der Einstieg verworfen.
+- daily_loss_limit_sol (f64)
+  - Harte Tagesverlust-Grenze in SOL. Überschreitet `realized_loss_today_sol` diese Grenze, werden neue Einstiege blockiert. Dient auch als Basis für die Drawdown-Skalierung (s. unten).
+- max_open_positions (usize)
+  - Obergrenze paralleler offener Positionen. Bei Erreichen werden weitere Einstiege gesperrt.
+- per_mint_position_limit (u32)
+  - Anzahl erlaubter Lots pro Mint (Mehrfachkäufe). Bei Erreichen: keine neuen Lots für diesen Mint.
+- stop_loss_cooldown_secs (u64)
+  - Nach einem SL-Exit wird der betroffene Mint für `secs` in einen Cooldown versetzt (keine Re-Entries). Wird intern automatisch gesetzt und per Risk-State persistiert.
+- drawdown_scale_start (f64, Anteil 0..1)
+  - Ab welchem Anteil des `daily_loss_limit_sol` die Lot-Kaufgröße linear reduziert wird. Beispiel: 0.30 bedeutet, dass bis 30% Verlust keine Reduktion erfolgt; darüber beginnt die Skalierung bis zur Maximalreduktion.
+- drawdown_max_reduction (f64, Anteil 0..1)
+  - Maximale Reduktion der Kaufgröße bei 100% des Tagesverlust-Limits (oberhalb `drawdown_scale_start`). Beispiel: 0.7 entspricht bis zu 70% Reduktion.
+- rolling_pnl_window (usize)
+  - Fenstergröße für die Sharpe-Approximation und Rolling-Return-Metriken (persistiert im Risk-State; beeinflusst Visualisierung, nicht die Gating-Logik).
+
+Formel: dynamische Kaufgröße
+- Die effektive Kaufgröße wird intern als `effective_max_buy_sol()` berechnet. Pseudocode:
+  - Wenn `daily_loss_limit_sol`, `drawdown_scale_start`, `drawdown_max_reduction` gesetzt:
+    - `ratio = clamp(realized_loss_today_sol / daily_loss_limit_sol, 0..1)`
+    - Ist `ratio <= drawdown_scale_start`, nutze `max_buy_sol` unverändert
+    - Sonst: `frac = (ratio - start) / (1 - start)`; `reduction = drawdown_max_reduction * frac`
+    - Effektive Größe: `max_buy_sol * (1 - reduction)`
+  - Andernfalls: `max_buy_sol`
+
+Gating-Reihenfolge (vereinfacht)
+1) Cooldown je Mint (falls aktiv) und per-mint-Limit
+2) max_open_positions und max_position_sol
+3) daily_loss_limit_sol (harte Sperre)
+4) Drawdown-Skalierung der Kaufgröße (wirkt nur dämpfend, nicht sperrend)
+
+Persistenz & ENV
+- Risk-State Snapshot wird periodisch gespeichert (Autosave) und beim Start geladen:
+  - IRONCRAB_RISK_STATE_PATH: Datei-Pfad (Default: `state/risk_state.json`)
+  - IRONCRAB_RISK_AUTOSAVE_SECS: Intervall in Sekunden für Autosave (0 = aus)
+- Metriken: `ironcrab_drawdown_pct` zeigt den aktuellen Drawdown-Anteil relativ zum konfigurierten Tagesverlust-Limit an.
+
+Beispiel (TOML)
+```toml
+[sniper]
+# Kern-Limits
+max_buy_sol = 0.5
+max_position_sol = 1.0
+max_open_positions = 4
+per_mint_position_limit = 2
+stop_loss_cooldown_secs = 600
+
+# Tagesverlust & Drawdown Skalierung
+daily_loss_limit_sol = 2.0
+drawdown_scale_start = 0.30
+drawdown_max_reduction = 0.70
+
+# Rolling Fenster (Metriken)
+rolling_pnl_window = 200
+```
+
+Hinweise & Best Practices
+- Setze `daily_loss_limit_sol` konservativ (z. B. 1–3 SOL) für klare Tagesrisiko-Kappung.
+- Wähle `drawdown_scale_start` nicht zu niedrig; sinnvoll sind 0.2–0.5. Kombiniere mit `drawdown_max_reduction` zwischen 0.4–0.8.
+- `max_open_positions` begrenzt Exponierung über Mints hinweg; in illiquiden Phasen reduzieren.
+- `stop_loss_cooldown_secs` verhindert sofortige Re-Entries in fallende Messer. 5–15 Minuten sind praktikable Startwerte.
+- Änderungen per Hot-Reload möglich; Unterschiede werden im Log über `diff_sniper_cfg` ausgegeben.
+
