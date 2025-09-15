@@ -152,6 +152,11 @@ pub static REPLAY_PRICE_UPDATES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64:
 pub static REPLAY_RAYDIUM_POOLS_INGESTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static REPLAY_ORCA_POOLS_INGESTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static REPLAY_TRACE_POOLS_JSON_INGESTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Log management metrics
+pub static LOG_FILES_CLEANED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static LOG_CLEANUP_SIZE_BYTES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static LOG_FILES_CURRENT_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static LOG_FILES_CURRENT_SIZE_BYTES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Fee percent histogram (fee / notional), common percent buckets
 const FEE_PCT_BUCKETS: &[f64] = &[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1];
 pub static FEE_PCT_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> =
@@ -699,6 +704,23 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "replay_trace_pools_json_ingested",
         REPLAY_TRACE_POOLS_JSON_INGESTED.load(Ordering::Relaxed)
+    );
+    // Log management metrics
+    line!(
+        "log_files_cleaned_total",
+        LOG_FILES_CLEANED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "log_cleanup_size_bytes_total",
+        LOG_CLEANUP_SIZE_BYTES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "log_files_current_count",
+        LOG_FILES_CURRENT_COUNT.load(Ordering::Relaxed)
+    );
+    line!(
+        "log_files_current_size_bytes",
+        LOG_FILES_CURRENT_SIZE_BYTES.load(Ordering::Relaxed)
     );
     // Fee percent histogram
     for (i, b) in FEE_PCT_BUCKETS.iter().enumerate() {

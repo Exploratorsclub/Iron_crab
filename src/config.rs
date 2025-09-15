@@ -173,6 +173,11 @@ pub struct SniperSettings {
     pub oracle_switchboard_sol_usd: Option<String>, // Switchboard aggregator pubkey for SOL/USD
     #[serde(default)]
     pub oracle_preference: Option<String>, // "pyth" | "switchboard" | "override"
+    // Log Rotation & Retention
+    #[serde(default)]
+    pub log_retention_days: Option<u32>, // Anzahl Tage für Log-Aufbewahrung (default: 30)
+    #[serde(default)]
+    pub log_cleanup_interval_hours: Option<u32>, // Cleanup-Intervall in Stunden (default: 24)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

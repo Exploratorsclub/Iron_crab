@@ -3,6 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use ironcrab::config::Config;
 use ironcrab::engine::Engine;
+use ironcrab::log_manager::LogManager;
 use ironcrab::metrics::serve_metrics;
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::wallet::Treasury;
@@ -33,6 +34,16 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(?e, "metrics server exited");
         }
     });
+
+    // Start log cleanup task if sniper is configured
+    if let Some(sniper_cfg) = &cfg.sniper {
+        let log_manager = LogManager::from_sniper_config(sniper_cfg);
+        tokio::spawn(async move {
+            if let Err(e) = log_manager.start_cleanup_task().await {
+                tracing::warn!(?e, "log cleanup task exited");
+            }
+        });
+    }
 
     // Solana RPC & Treasury
     let rpc = Arc::new(SolanaRpc::from_cfg(&cfg.solana));

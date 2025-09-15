@@ -92,3 +92,6 @@ adaptive_slippage_window = 20
 adaptive_slippage_target_pct = 0.002
 adaptive_slippage_step_bps = 5
 exit_eval_interval_secs = 5
+# Log Rotation & Retention
+log_retention_days = 30          # Keep trade logs for 30 days (default)
+log_cleanup_interval_hours = 24  # Check for old logs every 24 hours (default)

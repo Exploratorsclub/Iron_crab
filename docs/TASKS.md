@@ -237,7 +237,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- Optional Echtzeit File Watch via Feature `notify_watch` (aktivieren mit `--features notify_watch`)
 	- SIGHUP Signal Handler (Unix) als alternativer Trigger – implemented
 - [x] Start Skripte (Windows/Unix) für build/run/backtest
-- [ ] Konfigurierbare Log Rotation & Retention (N Tage)
+- [x] Konfigurierbare Log Rotation & Retention (N Tage)
 
 #### Go‑Live Wiring (offen)
 - [ ] Engine::execute finalisieren – TradeIntent → DEX Routing (Raydium/Orca), `build_swap_plan(_auto)` + `build_swap_instruction`, TX signieren/senden, Metrics/CSV‑Logs aktualisieren
