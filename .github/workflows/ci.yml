@@ -30,6 +30,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Versions
+        run: |
+          rustc -Vv
+          cargo -V
+          rustfmt -V || true
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -97,12 +103,12 @@ jobs:
 
       - name: Clippy (python feature)
         env:
-          PYO3_PYTHON: python
+          PYO3_PYTHON: ${{ steps.setup-py.outputs.python-path }}
         run: cargo clippy --all-targets --features python -- -D warnings
 
       - name: Tests (python feature)
         env:
-          PYO3_PYTHON: python
+          PYO3_PYTHON: ${{ steps.setup-py.outputs.python-path }}
         run: cargo test --features python --lib --tests --quiet
 
   security-audit:
@@ -120,17 +126,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo
-        id: cache
-        continue-on-error: true
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-audit
-          restore-keys: ${{ runner.os }}-cargo-
+  # Cache is optional here; remove to avoid flakiness causing job failure
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
