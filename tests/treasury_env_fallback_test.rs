@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use ironcrab::wallet::Treasury;
     use base64::Engine;
+    use ironcrab::wallet::Treasury;
     use std::env;
     use tempfile::TempDir;
 
@@ -20,9 +20,9 @@ mod tests {
         let test_keypair = solana_sdk::signer::keypair::Keypair::new();
         let keypair_bytes: Vec<u8> = test_keypair.to_bytes().to_vec();
         let json_string = serde_json::to_string(&keypair_bytes).unwrap();
-        
+
         env::set_var("IRONCRAB_KEYPAIR_JSON", &json_string);
-        
+
         // Should load successfully from JSON env var
         let treasury_from_env = Treasury::load_from_env();
         assert!(treasury_from_env.is_ok());
@@ -30,24 +30,28 @@ mod tests {
         // Test 3: Test fallback pattern (ENV first, then file)
         // Clear env var to force fallback
         env::remove_var("IRONCRAB_KEYPAIR_JSON");
-        
+
         // Create a temporary keypair file
         let temp_dir = TempDir::new().unwrap();
         let keypair_path = temp_dir.path().join("test_keypair.json");
-        std::fs::write(&keypair_path, serde_json::to_string(&keypair_bytes).unwrap()).unwrap();
-        
+        std::fs::write(
+            &keypair_path,
+            serde_json::to_string(&keypair_bytes).unwrap(),
+        )
+        .unwrap();
+
         // Test the actual fallback pattern used in main.rs
-        let treasury_fallback = Treasury::load_from_env()
-            .or_else(|_| Treasury::load(keypair_path.to_str().unwrap()));
-        
+        let treasury_fallback =
+            Treasury::load_from_env().or_else(|_| Treasury::load(keypair_path.to_str().unwrap()));
+
         assert!(treasury_fallback.is_ok());
 
         // Test 4: ENV takes precedence over file path
         env::set_var("IRONCRAB_KEYPAIR_JSON", &json_string);
-        
-        let treasury_env_priority = Treasury::load_from_env()
-            .or_else(|_| Treasury::load(keypair_path.to_str().unwrap()));
-        
+
+        let treasury_env_priority =
+            Treasury::load_from_env().or_else(|_| Treasury::load(keypair_path.to_str().unwrap()));
+
         assert!(treasury_env_priority.is_ok());
 
         // Cleanup
@@ -96,26 +100,34 @@ mod tests {
         // Create a test keypair file
         let test_keypair = solana_sdk::signer::keypair::Keypair::new();
         let keypair_bytes: Vec<u8> = test_keypair.to_bytes().to_vec();
-        
+
         let temp_dir = TempDir::new().unwrap();
         let keypair_path = temp_dir.path().join("test_keypair.json");
-        std::fs::write(&keypair_path, serde_json::to_string(&keypair_bytes).unwrap()).unwrap();
+        std::fs::write(
+            &keypair_path,
+            serde_json::to_string(&keypair_bytes).unwrap(),
+        )
+        .unwrap();
 
         // Simulate the exact pattern from main.rs:
         // Treasury::load_from_env().or_else(|_| Treasury::load(&cfg.solana.keypair_path))
-        let treasury_result = Treasury::load_from_env()
-            .or_else(|_| Treasury::load(keypair_path.to_str().unwrap()));
-        
+
+        // First, clear ENV to test file fallback
+        env::remove_var("IRONCRAB_KEYPAIR_JSON");
+
+        let treasury_result =
+            Treasury::load_from_env().or_else(|_| Treasury::load(keypair_path.to_str().unwrap()));
+
         // Should succeed by falling back to file
         assert!(treasury_result.is_ok());
 
         // Now test ENV priority - set env var and verify it takes precedence
         let json_string = serde_json::to_string(&keypair_bytes).unwrap();
         env::set_var("IRONCRAB_KEYPAIR_JSON", &json_string);
-        
-        let treasury_result = Treasury::load_from_env()
-            .or_else(|_| Treasury::load(keypair_path.to_str().unwrap()));
-        
+
+        let treasury_result =
+            Treasury::load_from_env().or_else(|_| Treasury::load(keypair_path.to_str().unwrap()));
+
         // Should still succeed, with ENV taking priority
         assert!(treasury_result.is_ok());
 
