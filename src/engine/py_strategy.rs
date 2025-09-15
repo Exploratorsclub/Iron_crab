@@ -29,9 +29,8 @@ pub mod py {
         ) -> Result<Self> {
             // Synchronous init unter GIL (einmalig)
             let py_obj = Python::with_gil(|py| -> PyResult<PyObject> {
-                // Use non-deprecated bound import API
-                // pyo3 0.21 expects IntoPy<Py<PyString>>; pass &str, not &String
-                let m = PyModule::import_bound(py, module_path.as_str())?;
+                // Import module and fetch class using pyo3 0.24 API
+                let m = PyModule::import(py, module_path.as_str())?;
                 let cls = m.getattr(class_name.as_str())?;
                 // Serialize params; map JSON errors into a Python ValueError
                 let params_str = serde_json::to_string(&params).map_err(|e| {
@@ -40,8 +39,8 @@ pub mod py {
                     ))
                 })?;
                 // Call class constructor with JSON params; convert to owned PyObject
-                let inst = cls.call1((params_str,))?.unbind();
-                Ok(inst.into())
+                let inst = cls.call1((params_str,))?;
+                Ok(inst.into_py(py))
             })
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
@@ -62,10 +61,10 @@ pub mod py {
         }
 
         async fn on_tick(&self, _ctx: Arc<EngineContext>) -> Result<Vec<TradeIntent>> {
-            let obj = self.py_obj.lock().clone();
             let intents = Python::with_gil(|py| -> PyResult<Vec<TradeIntent>> {
-                let out = obj.call_method0(py, "on_tick")?;
-                let s: String = out.extract(py)?;
+                let obj_guard = self.py_obj.lock();
+                let out = obj_guard.call_method0(py, "on_tick")?;
+                let s: String = out.extract()?;
                 let intents: Vec<TradeIntent> = serde_json::from_str(&s).map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad json: {e}"))
                 })?;

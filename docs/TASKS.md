@@ -236,7 +236,7 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- Implementiert: `diff_sniper_cfg` vergleicht Felder & loggt Änderungen (Hot Reload Task)
 	- Optional Echtzeit File Watch via Feature `notify_watch` (aktivieren mit `--features notify_watch`)
 	- SIGHUP Signal Handler (Unix) als alternativer Trigger – implemented
-- [ ] Start Skripte (Windows/Unix) für build/run/backtest
+- [x] Start Skripte (Windows/Unix) für build/run/backtest
 - [ ] Konfigurierbare Log Rotation & Retention (N Tage)
 
 #### Go‑Live Wiring (offen)
