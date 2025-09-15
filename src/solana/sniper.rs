@@ -227,6 +227,99 @@ impl Default for RiskState {
     }
 }
 
+// --- Pure helpers (module-level, not cfg-gated) -------------------------------------------
+/// Parse SPL-Token Mint fields from raw account data.
+/// Returns (mint_authority, freeze_authority, decimals, supply_raw)
+fn parse_spl_mint_fields(data: &[u8]) -> (Option<Pubkey>, Option<Pubkey>, u8, u64) {
+    if data.len() < 45 {
+        return (None, None, 0, 0);
+    }
+    // Supply and decimals
+    let supply = if data.len() >= 44 {
+        u64::from_le_bytes(data[36..44].try_into().unwrap_or([0u8; 8]))
+    } else {
+        0
+    };
+    let decimals = *data.get(44).unwrap_or(&0);
+    // COption mint_authority
+    let mint_auth = if data.len() >= 36 {
+        let tag = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0u8; 4]));
+        if tag == 0 {
+            None
+        } else {
+            let key = Pubkey::new_from_array(data[4..36].try_into().unwrap_or([0u8; 32]));
+            if key.to_bytes() == [0u8; 32] {
+                None
+            } else {
+                Some(key)
+            }
+        }
+    } else {
+        None
+    };
+    // COption freeze_authority
+    let freeze_auth = if data.len() >= 82 {
+        let tag = u32::from_le_bytes(data[46..50].try_into().unwrap_or([0u8; 4]));
+        if tag == 0 {
+            None
+        } else {
+            let key = Pubkey::new_from_array(data[50..82].try_into().unwrap_or([0u8; 32]));
+            if key.to_bytes() == [0u8; 32] {
+                None
+            } else {
+                Some(key)
+            }
+        }
+    } else {
+        None
+    };
+    (mint_auth, freeze_auth, decimals, supply)
+}
+
+/// Check if any authority is blacklisted by configured owners list.
+fn owner_blacklisted(
+    owners: &[String],
+    mint_auth: Option<&Pubkey>,
+    freeze_auth: Option<&Pubkey>,
+) -> bool {
+    if owners.is_empty() {
+        return false;
+    }
+    if let Some(ma) = mint_auth {
+        if owners.iter().any(|o| o == &ma.to_string()) {
+            return true;
+        }
+    }
+    if let Some(fa) = freeze_auth {
+        if owners.iter().any(|o| o == &fa.to_string()) {
+            return true;
+        }
+    }
+    false
+}
+
+// Tiny pure gating helper for tests: mirrors early checks in lp_lock_check without RPC.
+#[cfg(any(test, feature = "test_helpers"))]
+pub fn test_gate_freeze_and_decimals(
+    require_freeze_none: bool,
+    decimals_range: Option<(u8, u8)>,
+    mint_data: &[u8],
+) -> bool {
+    let (_ma, fa, decimals, supply_raw) = parse_spl_mint_fields(mint_data);
+    if supply_raw == 0 {
+        return false;
+    }
+    if require_freeze_none && fa.is_some() {
+        return false;
+    }
+    if let Some((lo, hi)) = decimals_range {
+        if decimals < lo || decimals > hi {
+            return false;
+        }
+    }
+    true
+}
+
 pub struct SniperEngine {
     pub rpc: Arc<SolanaRpc>,
     cfg: parking_lot::RwLock<SniperCfg>,
@@ -2887,11 +2980,31 @@ pub fn test_compute_concentration(
     let top1 = regular.first().copied().unwrap_or(0.0);
     let top3: f64 = regular.iter().take(3).sum();
     let top5: f64 = regular.iter().take(5).sum();
-    let top1_pct = if effective_supply > 0.0 { top1 / effective_supply } else { 0.0 };
-    let top3_pct = if effective_supply > 0.0 { top3 / effective_supply } else { 0.0 };
-    let top5_pct = if effective_supply > 0.0 { top5 / effective_supply } else { 0.0 };
-    let burned_pct = if total_supply > 0.0 { burned / total_supply } else { 0.0 };
-    let locked_pct = if total_supply > 0.0 { locked / total_supply } else { 0.0 };
+    let top1_pct = if effective_supply > 0.0 {
+        top1 / effective_supply
+    } else {
+        0.0
+    };
+    let top3_pct = if effective_supply > 0.0 {
+        top3 / effective_supply
+    } else {
+        0.0
+    };
+    let top5_pct = if effective_supply > 0.0 {
+        top5 / effective_supply
+    } else {
+        0.0
+    };
+    let burned_pct = if total_supply > 0.0 {
+        burned / total_supply
+    } else {
+        0.0
+    };
+    let locked_pct = if total_supply > 0.0 {
+        locked / total_supply
+    } else {
+        0.0
+    };
     (top1_pct, top3_pct, top5_pct, burned_pct, locked_pct)
 }
 
@@ -3073,87 +3186,47 @@ impl SniperEngine {
                 return Ok(None);
             }
         };
-        // SPL Mint length heuristic (approx range) & manual decode subset (legacy Token program)
+        // SPL Mint length heuristic (approx range)
         if mint_acc.data.len() < 70 || mint_acc.data.len() > 90 {
             return Ok(None);
         }
-        // Parse minimal fields: decimals(44), mint authority(0..32 maybe Option), freeze authority(36 or 45..?)
-        // We'll rely on decimals at 44 as established; freeze authority detection is best-effort and optional.
-        let decimals = mint_acc.data.get(44).cloned().unwrap_or(0);
-        let supply_le_bytes = &mint_acc.data[36..44];
-        let supply_raw = u64::from_le_bytes(supply_le_bytes.try_into().unwrap());
-        let supply_tokens = if decimals == 0 {
-            supply_raw as f64
+        // Parse fields using helper and prefer RPC supply/decimals if available
+        let (mint_auth_opt, freeze_auth_opt, parsed_decimals, parsed_supply_raw) =
+            parse_spl_mint_fields(&mint_acc.data);
+        // Try authoritative RPC getTokenSupply for decimals and amount
+        let mut decimals_eff = parsed_decimals;
+        let mut supply = if parsed_decimals == 0 {
+            parsed_supply_raw as f64
         } else {
-            (supply_raw as f64) / 10f64.powi(decimals as i32)
+            (parsed_supply_raw as f64) / 10f64.powi(parsed_decimals as i32)
         };
-        let supply = supply_tokens;
-        if supply == 0.0 {
-            return Ok(None);
+        if let Ok(s) = self.rpc.rpc.get_token_supply(mint).await {
+            // Use RPC decimals and amount if parse succeeds
+            decimals_eff = s.decimals;
+            if let Ok(v) = s.amount.parse::<u128>() {
+                supply = if s.decimals == 0 {
+                    v as f64
+                } else {
+                    (v as f64) / 10f64.powi(s.decimals as i32)
+                };
+            }
         }
         if supply == 0.0 {
             return Ok(None);
         }
-        // Mint layout (SPL Token):
-        // 0..4   COption tag for mint_authority (0=None, 1=Some)
-        // 4..36  mint_authority pubkey (if Some)
-        // 36..44 supply u64 LE
-        // 44     decimals u8
-        // 45     is_initialized bool
-        // 46..50 COption tag for freeze_authority
-        // 50..82 freeze_authority pubkey (if Some)
-        // Parse mint_authority (owner blacklist target) and freeze_authority
-        let mint_auth_opt: Option<Pubkey> = if mint_acc.data.len() >= 36 {
-            let tag = u32::from_le_bytes(
-                mint_acc.data[0..4].try_into().unwrap_or([0u8; 4]),
-            );
-            if tag == 0 {
-                None
-            } else {
-                let key = Pubkey::new_from_array(
-                    mint_acc.data[4..36].try_into().unwrap_or([0u8; 32]),
-                );
-                if key.to_bytes() == [0u8; 32] { None } else { Some(key) }
-            }
-        } else {
-            None
-        };
-        let freeze_auth_opt: Option<Pubkey> = if mint_acc.data.len() >= 82 {
-            let tag = u32::from_le_bytes(
-                mint_acc.data[46..50].try_into().unwrap_or([0u8; 4]),
-            );
-            if tag == 0 {
-                None
-            } else {
-                let key = Pubkey::new_from_array(
-                    mint_acc.data[50..82].try_into().unwrap_or([0u8; 32]),
-                );
-                if key.to_bytes() == [0u8; 32] { None } else { Some(key) }
-            }
-        } else {
-            None
-        };
-        // Owner blacklist: reject if mint_authority or freeze_authority is in configured blacklist_owners
-        if let Some(owner_list) = Some(self.cfg.read().blacklist_owners.clone()) {
-            if !owner_list.is_empty() {
-                if let Some(ma) = mint_auth_opt.as_ref() {
-                    if owner_list.iter().any(|o| o == &ma.to_string()) {
-                        return Ok(None);
-                    }
-                }
-                if let Some(fa) = freeze_auth_opt.as_ref() {
-                    if owner_list.iter().any(|o| o == &fa.to_string()) {
-                        return Ok(None);
-                    }
-                }
-            }
+        // Owner blacklist gate
+        let owners = self.cfg.read().blacklist_owners.clone();
+        if owner_blacklisted(&owners, mint_auth_opt.as_ref(), freeze_auth_opt.as_ref()) {
+            return Ok(None);
         }
         if self.cfg.read().require_freeze_auth_none.unwrap_or(false) && freeze_auth_opt.is_some() {
             return Ok(None);
         }
         if let Some((lo, hi)) = self.cfg.read().require_mint_decimals_range {
-            let d = decimals;
-            if d < lo || d > hi { return Ok(None); }
+            let d = decimals_eff;
+            if d < lo || d > hi {
+                return Ok(None);
+            }
         }
         if self
             .cfg
@@ -3206,13 +3279,22 @@ impl SniperEngine {
         let raydium_prog = Pubkey::from_str(RAYDIUM_AMM_V4).unwrap_or(Pubkey::default());
         let orca_prog = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap_or(Pubkey::default());
         // Build a set of current known vault addresses from Raydium and Orca snapshots to classify program vault holdings precisely
-        let mut program_vaults: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
+        let mut program_vaults: std::collections::HashSet<Pubkey> =
+            std::collections::HashSet::new();
         if let Some(r) = &self.raydium {
             for s in r.snapshots() {
-                if let Some(v) = s.base_vault { program_vaults.insert(v); }
-                if let Some(v) = s.quote_vault { program_vaults.insert(v); }
-                if let Some(v) = s.serum_base_vault { program_vaults.insert(v); }
-                if let Some(v) = s.serum_quote_vault { program_vaults.insert(v); }
+                if let Some(v) = s.base_vault {
+                    program_vaults.insert(v);
+                }
+                if let Some(v) = s.quote_vault {
+                    program_vaults.insert(v);
+                }
+                if let Some(v) = s.serum_base_vault {
+                    program_vaults.insert(v);
+                }
+                if let Some(v) = s.serum_quote_vault {
+                    program_vaults.insert(v);
+                }
             }
         }
         if let Some(o) = &self.orca {
@@ -3236,10 +3318,10 @@ impl SniperEngine {
         let mut program_locked_total = 0f64;
         for (idx, (addr_str, raw_amount)) in holder_accts.iter().enumerate() {
             let mut class = Class::Regular;
-            let amt_tokens = if decimals == 0 {
+            let amt_tokens = if decimals_eff == 0 {
                 *raw_amount as f64
             } else {
-                *raw_amount as f64 / 10f64.powi(decimals as i32)
+                *raw_amount as f64 / 10f64.powi(decimals_eff as i32)
             };
             if let Ok(acc_pk) = Pubkey::from_str(addr_str) {
                 if acc_pk == incinerator {
@@ -3337,6 +3419,119 @@ pub async fn run_sniper(
 ) -> Result<()> {
     let engine = SniperEngine::new(rpc, cfg, raydium, orca, treasury);
     engine.run().await
+}
+
+// --------------------------- Tests (unit) ----------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_mint_bytes(
+        mint_auth: Option<Pubkey>,
+        freeze_auth: Option<Pubkey>,
+        decimals: u8,
+        supply: u64,
+    ) -> Vec<u8> {
+        // Minimal SPL Mint layout for our fields; pad to 82 bytes
+        let mut data = vec![0u8; 82];
+        // mint_authority COption
+        if let Some(ma) = mint_auth {
+            data[0..4].copy_from_slice(&1u32.to_le_bytes());
+            data[4..36].copy_from_slice(&ma.to_bytes());
+        } else {
+            data[0..4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        // supply
+        data[36..44].copy_from_slice(&supply.to_le_bytes());
+        // decimals
+        data[44] = decimals;
+        // freeze_authority COption
+        if let Some(fa) = freeze_auth {
+            data[46..50].copy_from_slice(&1u32.to_le_bytes());
+            data[50..82].copy_from_slice(&fa.to_bytes());
+        } else {
+            data[46..50].copy_from_slice(&0u32.to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn test_parse_spl_mint_fields_none() {
+        let data = build_mint_bytes(None, None, 6, 1_000_000);
+        let (ma, fa, dec, supply) = super::parse_spl_mint_fields(&data);
+        assert!(ma.is_none());
+        assert!(fa.is_none());
+        assert_eq!(dec, 6);
+        assert_eq!(supply, 1_000_000);
+    }
+
+    #[test]
+    fn test_parse_spl_mint_fields_some() {
+        let ma = Pubkey::new_unique();
+        let fa = Pubkey::new_unique();
+        let data = build_mint_bytes(Some(ma), Some(fa), 9, 42);
+        let (ma2, fa2, dec, supply) = super::parse_spl_mint_fields(&data);
+        assert_eq!(ma2.unwrap(), ma);
+        assert_eq!(fa2.unwrap(), fa);
+        assert_eq!(dec, 9);
+        assert_eq!(supply, 42);
+    }
+
+    #[test]
+    fn test_owner_blacklisted_matches_mint_or_freeze() {
+        let ma = Pubkey::new_unique();
+        let fa = Pubkey::new_unique();
+        let owners = vec![ma.to_string(), "SomeOther".into()];
+        assert!(super::owner_blacklisted(&owners, Some(&ma), None));
+        assert!(super::owner_blacklisted(&owners, None, Some(&ma))); // listing wrong authority as string should still match when same value
+        let owners2 = vec![fa.to_string()];
+        assert!(super::owner_blacklisted(&owners2, None, Some(&fa)));
+        let owners3: Vec<String> = vec![];
+        assert!(!super::owner_blacklisted(&owners3, Some(&ma), Some(&fa)));
+    }
+
+    #[test]
+    fn test_parse_spl_mint_fields_decimals_zero_edge() {
+        let data = build_mint_bytes(None, None, 0, 1_234_567);
+        let (_ma, _fa, dec, supply) = super::parse_spl_mint_fields(&data);
+        assert_eq!(dec, 0);
+        assert_eq!(supply, 1_234_567);
+    }
+
+    #[test]
+    fn test_gate_freeze_auth_none_blocks_when_present() {
+        let fa = Pubkey::new_unique();
+        let data = build_mint_bytes(None, Some(fa), 6, 10);
+        // require freeze auth to be none => should reject
+        let ok = super::test_gate_freeze_and_decimals(true, None, &data);
+        assert!(!ok);
+        // when not required, should pass
+        let ok2 = super::test_gate_freeze_and_decimals(false, None, &data);
+        assert!(ok2);
+    }
+
+    #[test]
+    fn test_gate_decimals_range_edges() {
+        // Range [0,9] accepts 0 and 9, rejects 10
+        let d0 = build_mint_bytes(None, None, 0, 10);
+        let d9 = build_mint_bytes(None, None, 9, 10);
+        let d10 = build_mint_bytes(None, None, 10, 10);
+        assert!(super::test_gate_freeze_and_decimals(
+            false,
+            Some((0, 9)),
+            &d0
+        ));
+        assert!(super::test_gate_freeze_and_decimals(
+            false,
+            Some((0, 9)),
+            &d9
+        ));
+        assert!(!super::test_gate_freeze_and_decimals(
+            false,
+            Some((0, 9)),
+            &d10
+        ));
+    }
 }
 
 // final file closing brace for module (no additional opens)

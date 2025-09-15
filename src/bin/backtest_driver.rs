@@ -82,10 +82,18 @@ async fn main() -> anyhow::Result<()> {
     let using_replay = opts.replay_trace.is_some();
     // Replay mode metric flags
     ironcrab::metrics::REPLAY_MODE.store(using_replay as u64, std::sync::atomic::Ordering::Relaxed);
-    if let Some(s) = opts.replay_start { ironcrab::metrics::REPLAY_START_SLOT_GAUGE.store(s, std::sync::atomic::Ordering::Relaxed); }
-    if let Some(e) = opts.replay_end { ironcrab::metrics::REPLAY_END_SLOT_GAUGE.store(e, std::sync::atomic::Ordering::Relaxed); }
-    if let Some(ms) = opts.replay_slot_ms { ironcrab::metrics::REPLAY_SLOT_MS_GAUGE.store(ms, std::sync::atomic::Ordering::Relaxed); }
-    if let Some(seed) = opts.replay_seed { ironcrab::metrics::REPLAY_SEED_GAUGE.store(seed, std::sync::atomic::Ordering::Relaxed); }
+    if let Some(s) = opts.replay_start {
+        ironcrab::metrics::REPLAY_START_SLOT_GAUGE.store(s, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(e) = opts.replay_end {
+        ironcrab::metrics::REPLAY_END_SLOT_GAUGE.store(e, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(ms) = opts.replay_slot_ms {
+        ironcrab::metrics::REPLAY_SLOT_MS_GAUGE.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(seed) = opts.replay_seed {
+        ironcrab::metrics::REPLAY_SEED_GAUGE.store(seed, std::sync::atomic::Ordering::Relaxed);
+    }
     if !using_replay {
         let ray = Raydium::new(rpc.clone());
         if let Err(e) = ray.refresh_pools().await {
@@ -93,8 +101,9 @@ async fn main() -> anyhow::Result<()> {
         }
         let snaps = ray.snapshots();
         adapter.ingest_raydium(&snaps);
-    println!("Loaded {} Raydium pools", snaps.len());
-    ironcrab::metrics::REPLAY_RAYDIUM_POOLS_INGESTED.store(snaps.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        println!("Loaded {} Raydium pools", snaps.len());
+        ironcrab::metrics::REPLAY_RAYDIUM_POOLS_INGESTED
+            .store(snaps.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     let portfolio = Portfolio::new();
     // events: from replay file if provided, otherwise simple slot advance
@@ -109,28 +118,35 @@ async fn main() -> anyhow::Result<()> {
             slot_ms: opts.replay_slot_ms,
             seed: opts.replay_seed,
         };
-    let (store, sim_events) = build_events_from_trace(&cfg)?;
-    ironcrab::metrics::REPLAY_EVENTS_TOTAL.store(sim_events.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let (store, sim_events) = build_events_from_trace(&cfg)?;
+        ironcrab::metrics::REPLAY_EVENTS_TOTAL.store(
+            sim_events.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let replay_rpc = ReplayRpc::new(std::sync::Arc::new(store.clone()));
         // Populate Raydium snapshots from replay
         let ray = Raydium::new(rpc.clone());
         if let Err(e) = ray.refresh_pools_replay(&replay_rpc) {
             eprintln!("raydium refresh_pools_replay failed: {e}");
         }
-    let ray_snaps = ray.snapshots();
+        let ray_snaps = ray.snapshots();
         adapter.ingest_raydium(&ray_snaps);
-    ironcrab::metrics::REPLAY_RAYDIUM_POOLS_INGESTED.store(ray_snaps.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        ironcrab::metrics::REPLAY_RAYDIUM_POOLS_INGESTED
+            .store(ray_snaps.len() as u64, std::sync::atomic::Ordering::Relaxed);
         // Populate Orca snapshots from replay
         let orca = Orca::new(rpc.clone());
         if let Err(e) = orca.refresh_pools_replay(&replay_rpc) {
             eprintln!("orca refresh_pools_replay failed: {e}");
         }
-    let orca_snaps = orca.pools_snapshot();
+        let orca_snaps = orca.pools_snapshot();
         adapter.ingest_orca(&orca_snaps);
-    ironcrab::metrics::REPLAY_ORCA_POOLS_INGESTED.store(orca_snaps.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        ironcrab::metrics::REPLAY_ORCA_POOLS_INGESTED.store(
+            orca_snaps.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Pre-ingest any account JSONs that match CfmPoolJson for deterministic pool state
         let mut added = 0usize;
-    for (_k, updates) in store.accounts.iter() {
+        for (_k, updates) in store.accounts.iter() {
             for bytes in updates {
                 if let Ok(s) = std::str::from_utf8(bytes) {
                     if let Ok(pool) = serde_json::from_str::<CfmPoolJson>(s) {
@@ -155,7 +171,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        ironcrab::metrics::REPLAY_TRACE_POOLS_JSON_INGESTED.store(added as u64, std::sync::atomic::Ordering::Relaxed);
+        ironcrab::metrics::REPLAY_TRACE_POOLS_JSON_INGESTED
+            .store(added as u64, std::sync::atomic::Ordering::Relaxed);
         println!(
             "Replay mode: preloaded {added} pools from trace accounts; ray={} orca={}",
             ray_snaps.len(),
@@ -168,7 +185,9 @@ async fn main() -> anyhow::Result<()> {
             }]
         } else {
             // Count some event types
-            let mut slots = 0u64; let mut newp = 0u64; let mut price = 0u64;
+            let mut slots = 0u64;
+            let mut newp = 0u64;
+            let mut price = 0u64;
             for ev in sim_events.iter() {
                 match &ev.kind {
                     SimEventKind::SlotAdvance { .. } => slots += 1,

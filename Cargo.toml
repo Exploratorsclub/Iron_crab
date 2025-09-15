@@ -66,7 +66,7 @@ jito = []
 notify_watch = ["notify"]
 
 [dependencies.pyo3]
-version = "0.21"
+version = "0.24.2"
 features = ["auto-initialize"]
 optional = true
 

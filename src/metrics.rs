@@ -667,9 +667,15 @@ async fn metrics_response() -> Response<Body> {
         "replay_end_slot",
         REPLAY_END_SLOT_GAUGE.load(Ordering::Relaxed)
     );
-    line!("replay_slot_ms", REPLAY_SLOT_MS_GAUGE.load(Ordering::Relaxed));
+    line!(
+        "replay_slot_ms",
+        REPLAY_SLOT_MS_GAUGE.load(Ordering::Relaxed)
+    );
     line!("replay_seed", REPLAY_SEED_GAUGE.load(Ordering::Relaxed));
-    line!("replay_events_total", REPLAY_EVENTS_TOTAL.load(Ordering::Relaxed));
+    line!(
+        "replay_events_total",
+        REPLAY_EVENTS_TOTAL.load(Ordering::Relaxed)
+    );
     line!(
         "replay_slots_seen_total",
         REPLAY_SLOTS_SEEN_TOTAL.load(Ordering::Relaxed)
