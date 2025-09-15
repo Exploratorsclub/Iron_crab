@@ -197,7 +197,7 @@ mod tests {
         let final_count = test_counter.load(Ordering::Relaxed);
         // We expect 5 threads * 3 increments = 15, but allow for early termination
         assert!(
-            final_count >= 10 && final_count <= 15,
+            (10..=15).contains(&final_count),
             "Expected counter between 10-15, got {}",
             final_count
         );
