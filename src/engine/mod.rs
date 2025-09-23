@@ -707,7 +707,7 @@ impl Strategy for SampleRustStrategy {
             .clone()
             .unwrap_or_else(|| "QUOTE".to_string());
         let amount_ui = rust_decimal::Decimal::from_f64_retain(self.cfg.amount_ui)
-            .unwrap_or_else(|| rust_decimal::Decimal::ZERO);
+            .unwrap_or(rust_decimal::Decimal::ZERO);
 
         let ti = TradeIntent {
             market: self.name.clone(),
