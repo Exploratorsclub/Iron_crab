@@ -70,10 +70,13 @@ impl Engine {
                 .ok_or_else(|| anyhow::anyhow!("unknown strategy {}", m.strategy))?;
             match sdef.kind.as_str() {
                 "rust" => {
-                    // Platzhalter: dummy Strategie pro Markt
-                    let s = Arc::new(DummyRustStrategy {
-                        name: format!("{}-{}", m.name, m.strategy),
-                    });
+                    // Beispiel-Rust-Strategie mit konfigurierbaren Parametern
+                    let params: SampleRustStrategyCfg =
+                        sdef.params.clone().try_into().unwrap_or_default();
+                    let s = Arc::new(SampleRustStrategy::new(
+                        format!("{}-{}", m.name, m.strategy),
+                        params,
+                    ));
                     self.strategies.push(s);
                 }
                 "python" => {
@@ -555,15 +558,262 @@ impl Engine {
     }
 }
 
-struct DummyRustStrategy {
-    name: String,
+// (Ehemalige DummyRustStrategy entfernt; SampleRustStrategy ersetzt diese Vorlage)
+
+// ---------------- SampleRustStrategy ----------------
+
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+struct SampleRustStrategyCfg {
+    // Required mints for the pair
+    base_mint: String,
+    quote_mint: String,
+    // Optional symbols (purely cosmetic)
+    #[serde(default)]
+    base_symbol: Option<String>,
+    #[serde(default)]
+    quote_symbol: Option<String>,
+    // Optional decimals (if omitted, fetched lazily via RPC helper)
+    #[serde(default)]
+    base_decimals: Option<u8>,
+    #[serde(default)]
+    quote_decimals: Option<u8>,
+    // Side and sizing
+    #[serde(default = "SampleRustStrategyCfg::default_side")]
+    side: String, // "buy" | "sell"
+    #[serde(default = "SampleRustStrategyCfg::default_amount")]
+    amount_ui: f64, // small, safe notionals
+    #[serde(default = "SampleRustStrategyCfg::default_slippage")]
+    max_slippage_bps: u32,
+    // Throttle
+    #[serde(default = "SampleRustStrategyCfg::default_interval")]
+    interval_ms: u64,
+    // Enable/disable
+    #[serde(default = "SampleRustStrategyCfg::default_enabled")]
+    enabled: bool,
 }
+
+impl SampleRustStrategyCfg {
+    fn default_side() -> String {
+        "buy".to_string()
+    }
+    fn default_amount() -> f64 {
+        0.01
+    }
+    fn default_slippage() -> u32 {
+        100
+    }
+    fn default_interval() -> u64 {
+        10_000
+    }
+    fn default_enabled() -> bool {
+        true
+    }
+}
+
+struct SampleRustStrategy {
+    name: String,
+    cfg: SampleRustStrategyCfg,
+    // Cached decimals; lazily resolved
+    decimals: parking_lot::Mutex<(Option<u8>, Option<u8>)>,
+    last_emit: parking_lot::Mutex<Option<std::time::Instant>>,
+}
+
+impl SampleRustStrategy {
+    fn new(name: String, cfg: SampleRustStrategyCfg) -> Self {
+        Self {
+            name,
+            decimals: parking_lot::Mutex::new((cfg.base_decimals, cfg.quote_decimals)),
+            cfg,
+            last_emit: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
 #[async_trait::async_trait]
-impl Strategy for DummyRustStrategy {
+impl Strategy for SampleRustStrategy {
     fn name(&self) -> &str {
         &self.name
     }
-    async fn on_tick(&self, _ctx: Arc<EngineContext>) -> anyhow::Result<Vec<TradeIntent>> {
-        Ok(vec![]) // keine Trades – nur Vorlage
+
+    async fn on_tick(&self, ctx: Arc<EngineContext>) -> anyhow::Result<Vec<TradeIntent>> {
+        if !self.cfg.enabled {
+            return Ok(vec![]);
+        }
+        // Throttle by interval
+        let now = std::time::Instant::now();
+        let should_emit = {
+            let last = self.last_emit.lock();
+            if let Some(prev) = *last {
+                now.duration_since(prev).as_millis() >= self.cfg.interval_ms as u128
+            } else {
+                true
+            }
+        };
+        if !should_emit {
+            return Ok(vec![]);
+        }
+
+        // Ensure decimals
+        // Snapshot missing flags without holding the lock across await
+        let (need_base, need_quote) = {
+            let decs = self.decimals.lock();
+            (decs.0.is_none(), decs.1.is_none())
+        };
+        use crate::solana::token_utils::get_token_decimals_or_default;
+        use solana_sdk::pubkey::Pubkey as SdkPubkey;
+        let mut fetched_base: Option<u8> = None;
+        let mut fetched_quote: Option<u8> = None;
+        if need_base {
+            fetched_base = if let Ok(pk) = self.cfg.base_mint.parse::<SdkPubkey>() {
+                Some(get_token_decimals_or_default(&ctx.rpc, &pk).await)
+            } else {
+                Some(6)
+            };
+        }
+        if need_quote {
+            fetched_quote = if let Ok(pk) = self.cfg.quote_mint.parse::<SdkPubkey>() {
+                Some(get_token_decimals_or_default(&ctx.rpc, &pk).await)
+            } else {
+                Some(6)
+            };
+        }
+        if fetched_base.is_some() || fetched_quote.is_some() {
+            let mut decs = self.decimals.lock();
+            if decs.0.is_none() {
+                decs.0 = fetched_base;
+            }
+            if decs.1.is_none() {
+                decs.1 = fetched_quote;
+            }
+        }
+
+        // Build TradeIntent
+        let (base_dec, quote_dec) = *self.decimals.lock();
+        let base_dec = base_dec.unwrap_or(6);
+        let quote_dec = quote_dec.unwrap_or(6);
+
+        let side = match self.cfg.side.to_ascii_lowercase().as_str() {
+            "sell" => crate::types::Side::Sell,
+            _ => crate::types::Side::Buy,
+        };
+        let base_symbol = self
+            .cfg
+            .base_symbol
+            .clone()
+            .unwrap_or_else(|| "BASE".to_string());
+        let quote_symbol = self
+            .cfg
+            .quote_symbol
+            .clone()
+            .unwrap_or_else(|| "QUOTE".to_string());
+        let amount_ui = rust_decimal::Decimal::from_f64_retain(self.cfg.amount_ui)
+            .unwrap_or_else(|| rust_decimal::Decimal::ZERO);
+
+        let ti = TradeIntent {
+            market: self.name.clone(),
+            base: crate::types::Token {
+                symbol: base_symbol,
+                mint: self.cfg.base_mint.clone(),
+                decimals: base_dec,
+            },
+            quote: crate::types::Token {
+                symbol: quote_symbol,
+                mint: self.cfg.quote_mint.clone(),
+                decimals: quote_dec,
+            },
+            side,
+            amount: crate::types::Amount { ui: amount_ui },
+            max_slippage_bps: self.cfg.max_slippage_bps,
+        };
+
+        {
+            let mut last = self.last_emit.lock();
+            *last = Some(now);
+        }
+        Ok(vec![ti])
+    }
+}
+
+// ---------------- Tests ----------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sample_rust_strategy_emits_intent_from_config() {
+        // Config with explicit decimals to avoid RPC dependency
+        let cfg = SampleRustStrategyCfg {
+            base_mint: "So11111111111111111111111111111111111111112".to_string(),
+            quote_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            base_symbol: Some("SOL".to_string()),
+            quote_symbol: Some("USDC".to_string()),
+            base_decimals: Some(9),
+            quote_decimals: Some(6),
+            side: "buy".to_string(),
+            amount_ui: 0.01,
+            max_slippage_bps: 100,
+            interval_ms: 0,
+            enabled: true,
+        };
+        let strat = SampleRustStrategy::new("TEST-MKT".to_string(), cfg);
+
+        // Minimal EngineContext; rpc will not be used due to explicit decimals
+        let app_cfg = crate::config::AppCfg {
+            name: "t".into(),
+            log_level: "info".into(),
+            autosave_state_secs: 60,
+        };
+        let sol_cfg = crate::config::SolanaCfg {
+            rpc_url: "http://127.0.0.1:8899".into(),
+            ws_url: "ws://127.0.0.1:8900".into(),
+            keypair_path: "./secrets/dummy.json".into(),
+            rpc_min_concurrency: None,
+            rpc_max_concurrency: None,
+            rpc_initial_concurrency: None,
+            rpc_inc_every_successes: None,
+            rpc_dec_on_rate_limit: None,
+            rpc_timeout_ms: None,
+            ws_failover_urls: None,
+            ws_connect_timeout_ms: None,
+            ws_max_backoff_ms: None,
+            ws_headers: None,
+        };
+        let cfg_all = crate::config::Config {
+            app: app_cfg,
+            solana: sol_cfg,
+            markets: vec![],
+            allocator: crate::config::AllocatorCfg {
+                mode: "fixed".into(),
+                rebalance_secs: 60,
+                min_transfer_sol: 0.0,
+            },
+            strategies: std::collections::HashMap::new(),
+            arbitrage: None,
+            sniper: None,
+        };
+        let rpc = Arc::new(crate::solana::rpc::SolanaRpc::new("http://127.0.0.1:8899"));
+        let signer = Arc::new(solana_sdk::signature::Keypair::new());
+        let treasury = crate::wallet::Treasury::from_signer(signer);
+        let ctx = Arc::new(EngineContext {
+            cfg: Arc::new(cfg_all),
+            rpc,
+            treasury,
+        });
+
+        let intents = strat.on_tick(ctx).await.expect("tick ok");
+        assert_eq!(intents.len(), 1);
+        let ti = &intents[0];
+        assert_eq!(ti.market, "TEST-MKT");
+        assert_eq!(ti.base.symbol, "SOL");
+        assert_eq!(ti.quote.symbol, "USDC");
+        assert_eq!(ti.base.decimals, 9);
+        assert_eq!(ti.quote.decimals, 6);
+        match ti.side {
+            crate::types::Side::Buy => {}
+            _ => panic!("expected buy"),
+        }
+        assert!(ti.amount.ui > rust_decimal::Decimal::ZERO);
+        assert_eq!(ti.max_slippage_bps, 100);
     }
 }

@@ -207,6 +207,31 @@ cargo run --release -- --config .\config.example.toml
 - Decimals‑Quellen: `mint_decimals_source_supply_total`, `mint_decimals_source_account_total`, `mint_decimals_fallback_default_total`
 - Risk Gauges: `ironcrab_sharpe_ratio`, `ironcrab_drawdown_pct`, `open_positions`
 
+### Beispiel: SampleRustStrategy konfigurieren
+Füge in deiner TOML Config unter `[strategies]` einen Eintrag mit `kind = "rust"` hinzu und setze Parameter:
+
+```toml
+[strategies.sample_rust]
+kind = "rust"
+params = { base_mint = "So11111111111111111111111111111111111111112", quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", base_symbol = "SOL", quote_symbol = "USDC", side = "buy", amount_ui = 0.01, max_slippage_bps = 100, interval_ms = 15000 }
+
+[[markets]]
+name = "SOL-USDC"
+allocation_pct = 100
+strategy = "sample_rust"
+```
+
+Hinweise:
+- `interval_ms` limitiert die Tick‑Emission (ein Intent alle N Millisekunden).
+- `base_decimals`/`quote_decimals` sind optional; fehlen sie, werden sie über RPC ermittelt (mit robustem Fallback).
+- `side` akzeptiert `buy` oder `sell`.
+
+Dashboard Import (Kurz):
+- Grafana → Dashboards → Import
+- Datei: `docs/grafana_dashboard_example.json`
+- Prometheus‑Datasource auswählen/anpassen (Name/Alias)
+- Enthält u. a.: Zero‑Reserve Skips, Decimals‑Quellen (`mint_decimals_*`), Quote/Swap‑Latenzen
+
 ## Security: Keypair ENV loaders & redacting logger
 
 - Keypair sources (priority):
@@ -373,7 +398,7 @@ Geplant / Offen:
 - `ironcrab_fee_breakdown_total{type="protocol|network|referral"}` – Feingranulare Fee Typen
 - Weitere Route / Quote Performance Metriken
 
-Grafana Dashboard Skeleton: `docs/grafana_dashboard_example.json` (finale Panels & Alerts pending)
+Grafana Dashboard: `docs/grafana_dashboard_example.json` (Panels finalisiert; optionale Alerts pending)
 
 ## Fee / Meta‑Parsing
 BUY‑FILLs nutzen `postTokenBalances - preTokenBalances` (Transaction Meta, JsonParsed) für die tatsächlich erhaltene Tokenmenge (Treasury‑Owner). Shortfall & Protokoll‑Fees werden daraus bzw. heuristisch über `fee_bps` abgeleitet und in `protocol_fee_tokens_total`/`protocol_fee_sol_total` aggregiert. Exakte Referral/Protocol‑Splits sind DEX‑spezifisch und folgen.

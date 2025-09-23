@@ -1,0 +1,106 @@
+# IronCrab minimal production config (conservative defaults)
+# Review every section before going live.
+
+# --- Application ---
+[app]
+name = "ironcrab-prod"
+log_level = "info"          # trace|debug|info|warn|error
+autosave_state_secs = 30
+
+# --- Solana RPC & Keypair ---
+# IMPORTANT:
+# - Use reliable RPC/WS endpoints (paid provider recommended for live trading)
+# - keypair_path must point to an existing file; on Windows, do NOT use ~
+[solana]
+rpc_url = "https://api.mainnet-beta.solana.com"
+ws_url  = "wss://api.mainnet-beta.solana.com"
+keypair_path = "C:\\Users\\Robert Onuk\\.config\\solana\\id.json"
+# Optional adaptive concurrency (safe defaults)
+# rpc_min_concurrency = 8
+# rpc_max_concurrency = 64
+# rpc_initial_concurrency = 16
+# rpc_inc_every_successes = 64
+# rpc_dec_on_rate_limit = 4
+# rpc_timeout_ms = 10000
+
+# --- Markets (sum must be 100) ---
+[[markets]]
+name = "solana-sniper"
+allocation_pct = 100
+strategy = "snipe-default"
+
+# --- Allocator ---
+[allocator]
+mode = "static_pct"
+rebalance_secs = 60
+min_transfer_sol = 0.05
+
+# --- Strategies ---
+# Keep the example Rust strategy defined but unused (for reference)
+[strategies.sample-rust]
+kind = "rust"
+# Example params (not used unless referenced by a market)
+# params = { base_mint = "So11111111111111111111111111111111111111112", quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", side = "buy", amount_ui = 0.01, max_slippage_bps = 100, interval_ms = 60000 }
+params = {}
+
+# Production default: Sniper engine (Rust)
+[strategies.snipe-default]
+kind = "rust"
+# The sniper behavior is configured via the global [sniper] block below.
+params = { }
+
+# --- Sniper settings (CRITICAL SAFETY DEFAULTS) ---
+[sniper]
+# Position & Risk Limits (START SMALL)
+max_buy_sol = 0.02                    # Max SOL per buy
+max_position_sol = 0.10               # Max total position per token
+max_open_positions = 3                # Max concurrent positions
+per_mint_position_limit = 1           # Max positions per token
+
+# Daily risk
+daily_loss_limit_sol = 0.30           # Auto-stop trading for the day after this loss
+
+# Slippage & Price Protection
+max_slippage_bps = 150                # 1.5% absolute cap
+adaptive_slippage_min_bps = 75        # 0.75% min
+adaptive_slippage_max_bps = 300       # 3.0% max
+adaptive_slippage_window = 20
+adaptive_slippage_target_pct = 0.002  # 0.2%
+adaptive_slippage_step_bps = 5
+
+# Stop Loss & Take Profit (basis points; 10000 = 100%)
+stop_loss_bps = 2000                   # -20%
+take_profit_bps = 1000                 # +10%
+stop_loss_cooldown_secs = 300          # 5 min cooldown after SL
+
+# Pool Quality Filters (Anti-Rug)
+min_pool_liquidity_sol = 20.0          # Minimum pool liquidity in SOL
+require_freeze_auth_none = true        # Reject tokens with freeze authority
+require_mint_decimals_range = [0, 10]  # Disallow suspicious decimal counts
+lp_top1_max_pct = 0.60                 # Top1 holder <= 60%
+lp_top3_max_pct = 0.80                 # Top3 holders <= 80%
+lp_top5_max_pct = 0.90                 # Top5 holders <= 90%
+
+# Blacklists
+blacklist_mints = []
+blacklist_owners = []
+
+# Timing & Evaluation
+exit_eval_interval_secs = 5
+pending_trade_ttl_secs = 120
+hot_reload_secs = 30
+
+# Pricing & Oracles
+oracle_preference = "override"
+oracle_sol_usd_override = 100.0        # Update to current market
+# oracle_pyth_sol_usd = "..."
+# oracle_switchboard_sol_usd = "..."
+
+# Log Management
+log_retention_days = 30
+log_cleanup_interval_hours = 24
+
+# Advanced (optional)
+# take_profit_tiers = [ { bps = 500, fraction = 0.3 }, { bps = 1000, fraction = 0.3 }, { bps = 1500, fraction = 0.4 } ]
+# trailing_stop_bps = 300
+# min_exit_notional_sol = 0.02

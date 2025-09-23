@@ -242,11 +242,12 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 #### Go‑Live Wiring (offen)
 - [x] Engine::execute finalisieren – TradeIntent → DEX Routing (Raydium/Orca), `build_swap_plan(_auto)` + `build_swap_instruction`, TX signieren/senden, Metrics/CSV‑Logs aktualisieren
 - [x] config.example.toml um minimalen `[sniper]`‑Block erweitern (sichere Defaults: Limits, Slippage, Cooldowns), Quickstart in README ergänzen
-- [ ] DummyRustStrategy ersetzen oder Beispiel‑Rust‑Strategie hinzufügen, die echte `TradeIntent`s produziert (kleine, sichere Notionals; konfigurierbar)
+- [x] DummyRustStrategy ersetzen oder Beispiel‑Rust‑Strategie hinzufügen, die echte `TradeIntent`s produziert (kleine, sichere Notionals; konfigurierbar)
 - [x] main.rs: Treasury‑Laden mit ENV‑Fallback erlauben (`Treasury::load_from_env().or_else(|_| Treasury::load(path))`) für `IRONCRAB_KEYPAIR_*`
 - [x] Quickstart: Hinweis auf ausreichende SOL‑Balance (Rent+Fees), RPC/WS Erreichbarkeit, Metriken auf :9898
 - [x] Tests: Unit‑Tests für Token‑Decimals Fallback‑Pfad (supply/account/default) und Clamping‑Logik (returns/fee/shortfall %)
-- [ ] Grafana: Panels für Zero‑Reserve Skips, Decimals‑Quellen (`mint_decimals_*`) und Quote/Swap‑Latenzen finalisieren
+- [x] Grafana: Panels für Zero‑Reserve Skips, Decimals‑Quellen (`mint_decimals_*`) und Quote/Swap‑Latenzen finalisieren
+	- Hinweis: Importiere `docs/grafana_dashboard_example.json` in Grafana (Dashboards → Import) und stelle den Prometheus‑Datasource‑Alias entsprechend ein; relevante Panels: Zero‑Reserve Skips, Decimals‑Quellen, Quote/Swap‑Latenzen.
 
 ### Priorisierte Reihenfolge (Empfehlung)
 1. PendingTrade TTL & State Persistenz — DONE
