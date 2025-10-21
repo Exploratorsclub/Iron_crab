@@ -1,0 +1,81 @@
+# IronCrab server config (Debian) — uses your provided RPC
+# Adjust WS port if your validator exposes a different one.
+
+# --- Application ---
+[app]
+name = "ironcrab-prod"
+log_level = "info"
+autosave_state_secs = 30
+
+# --- Solana RPC & Keypair (Linux paths) ---
+[solana]
+rpc_url = "http://109.230.239.43:8899"
+ws_url  = "ws://109.230.239.43:8900"   # Assumed default WS port; change if different
+keypair_path = "/home/ironcrab/.config/solana/id.json"  # adjust to your user/path
+# Conservative concurrency (tune later)
+rpc_min_concurrency = 8
+rpc_max_concurrency = 32
+rpc_initial_concurrency = 12
+rpc_timeout_ms = 12000
+
+# --- Markets (sum must be 100) ---
+[[markets]]
+name = "solana-sniper"
+allocation_pct = 100
+strategy = "snipe-default"
+
+# --- Allocator ---
+[allocator]
+mode = "static_pct"
+rebalance_secs = 60
+min_transfer_sol = 0.05
+
+# --- Strategies ---
+[strategies.snipe-default]
+kind = "rust"
+params = { }
+
+# (Optional reference; not used unless referenced by a market)
+[strategies.sample-rust]
+kind = "rust"
+params = { }
+
+# --- Sniper settings (conservative) ---
+[sniper]
+max_buy_sol = 0.02
+max_position_sol = 0.10
+max_open_positions = 3
+per_mint_position_limit = 1
+
+daily_loss_limit_sol = 0.30
+
+max_slippage_bps = 150
+adaptive_slippage_min_bps = 75
+adaptive_slippage_max_bps = 300
+adaptive_slippage_window = 20
+adaptive_slippage_target_pct = 0.002
+adaptive_slippage_step_bps = 5
+
+stop_loss_bps = 2000
+take_profit_bps = 1000
+stop_loss_cooldown_secs = 300
+
+min_pool_liquidity_sol = 20.0
+require_freeze_auth_none = true
+require_mint_decimals_range = [0, 10]
+lp_top1_max_pct = 0.60
+lp_top3_max_pct = 0.80
+lp_top5_max_pct = 0.90
+
+blacklist_mints = []
+blacklist_owners = []
+
+exit_eval_interval_secs = 5
+pending_trade_ttl_secs = 120
+hot_reload_secs = 30
+
+oracle_preference = "override"
+oracle_sol_usd_override = 100.0
+
+log_retention_days = 30
+log_cleanup_interval_hours = 24
