@@ -692,8 +692,12 @@ impl SniperEngine {
 
     pub async fn subscribe_logs(&self) -> Result<()> {
         use tokio_tungstenite::tungstenite::handshake::client::Request as WsRequest;
-        // Build endpoint list: primary + optional failovers
-        let mut endpoints: Vec<String> = vec![Self::http_to_ws(&self.rpc.rpc.url())];
+        // Build endpoint list: prefer explicit primary WS from config, else derive from RPC URL; then add failovers
+        let mut endpoints: Vec<String> = if let Some(primary) = self.rpc.primary_ws_url() {
+            vec![primary]
+        } else {
+            vec![Self::http_to_ws(&self.rpc.rpc.url())]
+        };
         for e in self.rpc.ws_failovers().iter() {
             endpoints.push(Self::http_to_ws(e));
         }
