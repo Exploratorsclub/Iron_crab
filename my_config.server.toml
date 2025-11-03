@@ -20,6 +20,8 @@ rpc_min_concurrency = 8
 rpc_max_concurrency = 32
 rpc_initial_concurrency = 12
 rpc_timeout_ms = 12000
+## Some RPC/Proxies require WS subprotocol header "jsonrpc" for PubSub
+ws_headers = { "Sec-WebSocket-Protocol" = "jsonrpc" }
 
 # --- Markets (sum must be 100) ---
 [[markets]]
