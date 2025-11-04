@@ -742,8 +742,20 @@ impl SniperEngine {
                         .unwrap_or_else(|| urls[0].clone());
                     // Optional headers
                     let mut req = WsRequest::builder().method("GET").uri(&url);
+                    // Only allow safe, non-reserved headers to avoid corrupting the WS handshake.
+                    // Reserved headers like Sec-WebSocket-Key/Version/Accept/Connection/Upgrade are managed by the client library.
                     for (k, v) in engine_clone.rpc.ws_headers().iter() {
-                        req = req.header(k, v);
+                        let k_lc = k.to_ascii_lowercase();
+                        let allow = k_lc == "sec-websocket-protocol" || k_lc == "authorization" || k_lc == "user-agent";
+                        if allow {
+                            req = req.header(k, v);
+                        } else if k_lc.starts_with("sec-websocket-") || k_lc == "connection" || k_lc == "upgrade" || k_lc == "host" {
+                            // Skip reserved/unsafe headers
+                            tracing::debug!(key=%k, "skipping reserved websocket header from config");
+                        } else {
+                            // Be conservative; only a small allowlist to reduce handshake issues across servers
+                            tracing::debug!(key=%k, "skipping non-allowlisted websocket header from config");
+                        }
                     }
                     let req = req
                         .body(())
