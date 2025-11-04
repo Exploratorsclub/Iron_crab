@@ -9,10 +9,10 @@ autosave_state_secs = 30
 
 # --- Solana RPC & Keypair (Linux paths) ---
 [solana]
-rpc_url = "http://109.230.239.43:8899"
-# Note: The bot derives a WS URL from rpc_url (http->ws) as primary. To use a different WS port,
-# add it to ws_failover_urls. The ws_url field is currently not used as primary by the code.
-ws_url  = "ws://109.230.239.43:8900"   # informational only
+rpc_url = "http://127.0.0.1:8899"
+# The bot prefers ws_url as the primary WebSocket endpoint (then derives from rpc_url, then uses failovers).
+ws_url  = "ws://127.0.0.1:8900"
+# Keep the public IP as a fallback in case you run the bot off-box or need external access temporarily.
 ws_failover_urls = ["ws://109.230.239.43:8900"]
 keypair_path = "/home/ironcrab/.config/solana/id.json"  # adjust to your user/path
 # Conservative concurrency (tune later)
