@@ -13,14 +13,6 @@ use std::str::FromStr;
 use std::{collections::HashSet, sync::Arc};
 use tracing::{debug, info, warn};
 // (log subscription stub – real PubSub integration to be reintroduced with correct crate paths)
-use once_cell::sync::Lazy;
-use regex::Regex;
-use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
-use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
-use std::time::{Duration, Instant};
-use chrono::Utc as ChronoUtc;
-use futures::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use crate::metrics; // keep metrics module in scope for qualified uses
 use crate::metrics::{
     record_fee_pct, record_network_fee, record_realized_gross_net, record_realized_pnl_sol,
@@ -31,8 +23,16 @@ use crate::metrics::{
     TRADES_FAILED_TOTAL, WS_ACTIVE_CONNECTIONS, WS_HEARTBEAT_MISSES_TOTAL, WS_MESSAGES_TOTAL,
     WS_RECONNECTS_TOTAL,
 };
+use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
+use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
+use chrono::Utc as ChronoUtc;
+use futures::{SinkExt, StreamExt};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::time::{Duration, Instant};
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 // Simple global blacklist (extendable via config later)
 #[allow(dead_code)]
@@ -689,8 +689,8 @@ impl SniperEngine {
     }
 
     pub async fn subscribe_logs(&self) -> Result<()> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
         // Build endpoint list: prefer explicit primary WS from config, else derive from RPC URL; then add failovers
         let mut endpoints: Vec<String> = if let Some(primary) = self.rpc.primary_ws_url() {
             vec![primary]
@@ -700,9 +700,9 @@ impl SniperEngine {
         for e in self.rpc.ws_failovers().iter() {
             endpoints.push(Self::http_to_ws(e));
         }
-    // Bounded work queue to decouple socket reading from processing; apply backpressure if slow
-    // Include program id with each batch for better observability
-    let (logs_tx, mut logs_rx) = tokio::sync::mpsc::channel::<(String, Vec<String>)>(512);
+        // Bounded work queue to decouple socket reading from processing; apply backpressure if slow
+        // Include program id with each batch for better observability
+        let (logs_tx, mut logs_rx) = tokio::sync::mpsc::channel::<(String, Vec<String>)>(512);
         // Spawn a single worker that processes logs with backpressure
         let engine_for_worker = self.clone_for_spawn();
         tokio::spawn(async move {
@@ -750,7 +750,11 @@ impl SniperEngine {
                             // rotate endpoint
                             attempt = attempt.wrapping_add(1);
                             WS_RECONNECTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let _ = crate::solana::rpc::SolanaRpc::sleep_with_backoff(attempt, crate::solana::rpc::ErrorClass::Other).await;
+                            let _ = crate::solana::rpc::SolanaRpc::sleep_with_backoff(
+                                attempt,
+                                crate::solana::rpc::ErrorClass::Other,
+                            )
+                            .await;
                             continue;
                         }
                     };
@@ -759,7 +763,9 @@ impl SniperEngine {
                         let headers = req.headers_mut();
                         for (k, v) in engine_clone.rpc.ws_headers().iter() {
                             let k_lc = k.to_ascii_lowercase();
-                            let allow = k_lc == "sec-websocket-protocol" || k_lc == "authorization" || k_lc == "user-agent";
+                            let allow = k_lc == "sec-websocket-protocol"
+                                || k_lc == "authorization"
+                                || k_lc == "user-agent";
                             if allow {
                                 if let (Ok(name), Ok(value)) = (
                                     HeaderName::from_bytes(k.as_bytes()),
@@ -769,7 +775,11 @@ impl SniperEngine {
                                 } else {
                                     tracing::debug!(key=%k, "skipping invalid websocket header value from config");
                                 }
-                            } else if k_lc.starts_with("sec-websocket-") || k_lc == "connection" || k_lc == "upgrade" || k_lc == "host" {
+                            } else if k_lc.starts_with("sec-websocket-")
+                                || k_lc == "connection"
+                                || k_lc == "upgrade"
+                                || k_lc == "host"
+                            {
                                 tracing::debug!(key=%k, "skipping reserved websocket header from config");
                             } else {
                                 tracing::debug!(key=%k, "skipping non-allowlisted websocket header from config");
@@ -1061,7 +1071,8 @@ impl SniperEngine {
                                             "BUY_ATTEMPT",
                                             "passes concentration+liquidity",
                                         );
-                                        if let Err(e) = self.attempt_initial_buy(&pk, liq_sol).await {
+                                        if let Err(e) = self.attempt_initial_buy(&pk, liq_sol).await
+                                        {
                                             warn!(mint = %pk, error = ?e, "sniper: initial buy failed");
                                         }
                                     } else {

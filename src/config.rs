@@ -404,7 +404,10 @@ impl Config {
                 if d.enable {
                     if let Some(mode) = &d.mode {
                         if mode != "discovery-only" && mode != "full-auto" {
-                            errs.push("arbitrage.discovery.mode must be 'discovery-only' or 'full-auto'".into());
+                            errs.push(
+                                "arbitrage.discovery.mode must be 'discovery-only' or 'full-auto'"
+                                    .into(),
+                            );
                         }
                     }
                     if let Some(s) = d.interval_secs {

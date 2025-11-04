@@ -4,8 +4,8 @@ use std::{io::Write, sync::Arc, time::Duration};
 use tokio::time::{interval, Duration as TokioDuration};
 use tracing::{debug, error, info, warn, Instrument as _};
 
-use crate::config::{Config, StrategyDef};
 use crate::config::{ArbDiscoveryCfg, ArbPairCfg};
+use crate::config::{Config, StrategyDef};
 use crate::solana::arbitrage::ArbitrageEngine;
 use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
@@ -180,14 +180,25 @@ impl Engine {
                                 // Build candidates
                                 let mut pairs: Vec<(String, String, f64, String)> = Vec::new();
                                 // Helper to push candidate edges (both directions)
-                                let push_pair = |pairs: &mut Vec<(String, String, f64, String)>,
-                                                 a: &str,
-                                                 b: &str,
-                                                 liq: f64,
-                                                 dex: &str| {
-                                    pairs.push((a.to_string(), b.to_string(), liq, dex.to_string()));
-                                    pairs.push((b.to_string(), a.to_string(), liq, dex.to_string()));
-                                };
+                                let push_pair =
+                                    |pairs: &mut Vec<(String, String, f64, String)>,
+                                     a: &str,
+                                     b: &str,
+                                     liq: f64,
+                                     dex: &str| {
+                                        pairs.push((
+                                            a.to_string(),
+                                            b.to_string(),
+                                            liq,
+                                            dex.to_string(),
+                                        ));
+                                        pairs.push((
+                                            b.to_string(),
+                                            a.to_string(),
+                                            liq,
+                                            dex.to_string(),
+                                        ));
+                                    };
                                 // Allowed base tokens filter (empty => allow all)
                                 let base_allow: std::collections::HashSet<String> =
                                     disc_cfg.base_tokens.iter().cloned().collect();
@@ -208,7 +219,9 @@ impl Engine {
                                     if a == sol_mint || b == sol_mint {
                                         if let Some(min_sol) = disc_cfg.min_liquidity_sol {
                                             let sol_side = if a == sol_mint { b_ui } else { a_ui };
-                                            ok = (a_ui + b_ui) > 0.0 && (a_ui + b_ui) >= (2.0 * min_sol) || sol_side >= min_sol;
+                                            ok = (a_ui + b_ui) > 0.0
+                                                && (a_ui + b_ui) >= (2.0 * min_sol)
+                                                || sol_side >= min_sol;
                                         }
                                     } else if a == usdc || a == usdt || b == usdc || b == usdt {
                                         if let Some(min_usd) = disc_cfg.min_liquidity_usd {
@@ -239,27 +252,38 @@ impl Engine {
                                     if a == sol_mint || b == sol_mint {
                                         if let Some(min_sol) = disc_cfg.min_liquidity_sol {
                                             let sol_side = if a == sol_mint { b_ui } else { a_ui };
-                                            ok = (a_ui + b_ui) > 0.0 && (a_ui + b_ui) >= (2.0 * min_sol) || sol_side >= min_sol;
+                                            ok = (a_ui + b_ui) > 0.0
+                                                && (a_ui + b_ui) >= (2.0 * min_sol)
+                                                || sol_side >= min_sol;
                                         }
                                     } else if a == usdc || a == usdt || b == usdc || b == usdt {
                                         if let Some(min_usd) = disc_cfg.min_liquidity_usd {
                                             ok = (a_ui + b_ui) >= (2.0 * min_usd);
                                         }
                                     }
-                                    if !ok { continue; }
+                                    if !ok {
+                                        continue;
+                                    }
                                     if !base_allow.is_empty()
                                         && !(base_allow.contains(&a) || base_allow.contains(&b))
-                                    { continue; }
+                                    {
+                                        continue;
+                                    }
                                     let liq = a_ui + b_ui;
                                     push_pair(&mut pairs, &a, &b, liq, "ORCA");
                                 }
                                 // Rank per base if requested
                                 if let Some(k) = disc_cfg.top_n_per_base {
                                     use std::collections::HashMap;
-                                    let mut by_base: HashMap<String, Vec<(String, String, f64, String)>> =
-                                        HashMap::new();
+                                    let mut by_base: HashMap<
+                                        String,
+                                        Vec<(String, String, f64, String)>,
+                                    > = HashMap::new();
                                     for (i, o, liq, dex) in pairs.into_iter() {
-                                        by_base.entry(i.clone()).or_default().push((i, o, liq, dex));
+                                        by_base
+                                            .entry(i.clone())
+                                            .or_default()
+                                            .push((i, o, liq, dex));
                                     }
                                     pairs = Vec::new();
                                     for (_b, mut v) in by_base.into_iter() {
@@ -271,10 +295,15 @@ impl Engine {
                                     pairs.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap());
                                 }
                                 // Map into config pairs
-                                let default_amt = disc_cfg.default_ui_amount.unwrap_or(0.05).max(0.000001);
+                                let default_amt =
+                                    disc_cfg.default_ui_amount.unwrap_or(0.05).max(0.000001);
                                 let mut out: Vec<ArbPairCfg> = Vec::new();
                                 for (i, o, _liq, _dex) in pairs.iter() {
-                                    out.push(ArbPairCfg { in_mint: i.clone(), out_mint: o.clone(), ui_amount: default_amt });
+                                    out.push(ArbPairCfg {
+                                        in_mint: i.clone(),
+                                        out_mint: o.clone(),
+                                        ui_amount: default_amt,
+                                    });
                                 }
                                 // Swap atomically
                                 {
@@ -300,7 +329,10 @@ impl Engine {
                     .as_ref()
                     .and_then(|c| c.interval_ms)
                     .unwrap_or(2000);
-                let static_pairs = cfg_pairs.as_ref().map(|c| c.pairs.clone()).unwrap_or_default();
+                let static_pairs = cfg_pairs
+                    .as_ref()
+                    .map(|c| c.pairs.clone())
+                    .unwrap_or_default();
                 let disc_cfg = cfg_pairs.and_then(|c| c.discovery);
                 let mut iv = interval(Duration::from_millis(interval_ms));
                 loop {
@@ -712,13 +744,20 @@ fn append_arb_pair_record(in_mint: &str, out_mint: &str, liquidity_ui: f64, dex:
     static PAIRS_LOG_LOCK: once_cell::sync::Lazy<std::sync::Mutex<()>> =
         once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
     let _g = PAIRS_LOG_LOCK.lock().unwrap();
-    let dir_name = std::env::var("IRONCRAB_TRADE_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string());
+    let dir_name =
+        std::env::var("IRONCRAB_TRADE_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string());
     let dir = std::path::Path::new(&dir_name);
-    if !dir.exists() { let _ = std::fs::create_dir_all(dir); }
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let date = chrono::Utc::now().format("%Y%m%d");
     let file_path = dir.join(format!("arb_pairs-{}.csv", date));
     let new_file = !file_path.exists();
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&file_path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file_path)
+    {
         if new_file {
             let _ = writeln!(f, "timestamp_utc,in_mint,out_mint,liquidity_ui,dex");
         }
