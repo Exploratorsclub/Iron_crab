@@ -26,8 +26,9 @@ jobs:
           df -h
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.89.0
           components: rustfmt, clippy
 
       - name: Versions
@@ -81,8 +82,9 @@ jobs:
           df -h
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.89.0
           components: rustfmt, clippy
 
       - name: Setup Python
@@ -122,8 +124,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.89.0
           components: rustfmt, clippy
 
   # Cache is optional here; remove to avoid flakiness causing job failure
