@@ -5,6 +5,7 @@ use tokio::time::{interval, Duration as TokioDuration};
 use tracing::{debug, error, info, warn, Instrument as _};
 
 use crate::config::{Config, StrategyDef};
+use crate::config::{ArbDiscoveryCfg, ArbPairCfg};
 use crate::solana::arbitrage::ArbitrageEngine;
 use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
@@ -150,10 +151,147 @@ impl Engine {
             });
         }
 
-        // Leichter Arbitrage-Scan-Loop (nur Logs; verwendet Struct & Methoden)
+        // Leichter Arbitrage-Scan-Loop (mit optionaler Auto-Discovery)
         {
             let rpc = self.ctx.rpc.clone();
             let cfg_pairs = self.ctx.cfg.arbitrage.clone();
+            // Shared buffer for dynamically discovered pairs
+            let discovered: Arc<parking_lot::RwLock<Vec<ArbPairCfg>>> =
+                Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+            // Optional discovery loop
+            if let Some(ref arb_cfg) = cfg_pairs {
+                if let Some(ref disc) = arb_cfg.discovery {
+                    if disc.enable {
+                        let disc_cfg = disc.clone();
+                        let rpc_d = rpc.clone();
+                        let discovered_d = discovered.clone();
+                        tokio::spawn(async move {
+                            let ray = Raydium::new(rpc_d.clone());
+                            let orc = Orca::new(rpc_d.clone());
+                            let mut iv = interval(std::time::Duration::from_secs(
+                                disc_cfg.interval_secs.unwrap_or(30).max(1),
+                            ));
+                            loop {
+                                iv.tick().await;
+                                // Refresh pools best-effort
+                                let _ = ray.refresh_pools().await;
+                                let _ = orc.refresh_pools().await;
+                                // Build candidates
+                                let mut pairs: Vec<(String, String, f64, String)> = Vec::new();
+                                // Helper to push candidate edges (both directions)
+                                let push_pair = |pairs: &mut Vec<(String, String, f64, String)>,
+                                                 a: &str,
+                                                 b: &str,
+                                                 liq: f64,
+                                                 dex: &str| {
+                                    pairs.push((a.to_string(), b.to_string(), liq, dex.to_string()));
+                                    pairs.push((b.to_string(), a.to_string(), liq, dex.to_string()));
+                                };
+                                // Allowed base tokens filter (empty => allow all)
+                                let base_allow: std::collections::HashSet<String> =
+                                    disc_cfg.base_tokens.iter().cloned().collect();
+                                let sol_mint = "So11111111111111111111111111111111111111112";
+                                let usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+                                let usdt = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+                                // Raydium
+                                for s in ray.snapshots() {
+                                    let a = s.base_mint.to_string();
+                                    let b = s.quote_mint.to_string();
+                                    // UI reserves
+                                    let a_ui = s.reserve_base as f64
+                                        / 10f64.powi(if a == usdc || a == usdt { 6 } else { 9 });
+                                    let b_ui = s.reserve_quote as f64
+                                        / 10f64.powi(if b == usdc || b == usdt { 6 } else { 9 });
+                                    // Liquidity gate by side (SOL or USD stable)
+                                    let mut ok = true;
+                                    if a == sol_mint || b == sol_mint {
+                                        if let Some(min_sol) = disc_cfg.min_liquidity_sol {
+                                            let sol_side = if a == sol_mint { b_ui } else { a_ui };
+                                            ok = (a_ui + b_ui) > 0.0 && (a_ui + b_ui) >= (2.0 * min_sol) || sol_side >= min_sol;
+                                        }
+                                    } else if a == usdc || a == usdt || b == usdc || b == usdt {
+                                        if let Some(min_usd) = disc_cfg.min_liquidity_usd {
+                                            ok = (a_ui + b_ui) >= (2.0 * min_usd);
+                                        }
+                                    }
+                                    if !ok {
+                                        continue;
+                                    }
+                                    // base token filter
+                                    if !base_allow.is_empty()
+                                        && !(base_allow.contains(&a) || base_allow.contains(&b))
+                                    {
+                                        continue;
+                                    }
+                                    let liq = a_ui + b_ui;
+                                    push_pair(&mut pairs, &a, &b, liq, "RAYDIUM");
+                                }
+                                // Orca
+                                for s in orc.pools_snapshot() {
+                                    let a = s.base_mint.to_string();
+                                    let b = s.quote_mint.to_string();
+                                    let a_ui = s.reserve_base as f64
+                                        / 10f64.powi(if a == usdc || a == usdt { 6 } else { 9 });
+                                    let b_ui = s.reserve_quote as f64
+                                        / 10f64.powi(if b == usdc || b == usdt { 6 } else { 9 });
+                                    let mut ok = true;
+                                    if a == sol_mint || b == sol_mint {
+                                        if let Some(min_sol) = disc_cfg.min_liquidity_sol {
+                                            let sol_side = if a == sol_mint { b_ui } else { a_ui };
+                                            ok = (a_ui + b_ui) > 0.0 && (a_ui + b_ui) >= (2.0 * min_sol) || sol_side >= min_sol;
+                                        }
+                                    } else if a == usdc || a == usdt || b == usdc || b == usdt {
+                                        if let Some(min_usd) = disc_cfg.min_liquidity_usd {
+                                            ok = (a_ui + b_ui) >= (2.0 * min_usd);
+                                        }
+                                    }
+                                    if !ok { continue; }
+                                    if !base_allow.is_empty()
+                                        && !(base_allow.contains(&a) || base_allow.contains(&b))
+                                    { continue; }
+                                    let liq = a_ui + b_ui;
+                                    push_pair(&mut pairs, &a, &b, liq, "ORCA");
+                                }
+                                // Rank per base if requested
+                                if let Some(k) = disc_cfg.top_n_per_base {
+                                    use std::collections::HashMap;
+                                    let mut by_base: HashMap<String, Vec<(String, String, f64, String)>> =
+                                        HashMap::new();
+                                    for (i, o, liq, dex) in pairs.into_iter() {
+                                        by_base.entry(i.clone()).or_default().push((i, o, liq, dex));
+                                    }
+                                    pairs = Vec::new();
+                                    for (_b, mut v) in by_base.into_iter() {
+                                        v.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap());
+                                        pairs.extend(v.into_iter().take(k));
+                                    }
+                                } else {
+                                    // Global sort by liquidity
+                                    pairs.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap());
+                                }
+                                // Map into config pairs
+                                let default_amt = disc_cfg.default_ui_amount.unwrap_or(0.05).max(0.000001);
+                                let mut out: Vec<ArbPairCfg> = Vec::new();
+                                for (i, o, _liq, _dex) in pairs.iter() {
+                                    out.push(ArbPairCfg { in_mint: i.clone(), out_mint: o.clone(), ui_amount: default_amt });
+                                }
+                                // Swap atomically
+                                {
+                                    let mut w = discovered_d.write();
+                                    *w = out;
+                                }
+                                // Optional CSV logging in discovery-only mode
+                                if disc_cfg.mode.as_deref() == Some("discovery-only") {
+                                    for (i, o, liq, dex) in pairs.iter().take(100) {
+                                        append_arb_pair_record(i, o, *liq, dex);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
             tokio::spawn(async move {
                 let ray = Arc::new(Raydium::new(rpc.clone()));
                 let orc = Arc::new(Orca::new(rpc.clone()));
@@ -162,11 +300,22 @@ impl Engine {
                     .as_ref()
                     .and_then(|c| c.interval_ms)
                     .unwrap_or(2000);
-                let pairs = cfg_pairs.map(|c| c.pairs).unwrap_or_default();
+                let static_pairs = cfg_pairs.as_ref().map(|c| c.pairs.clone()).unwrap_or_default();
+                let disc_cfg = cfg_pairs.and_then(|c| c.discovery);
                 let mut iv = interval(Duration::from_millis(interval_ms));
                 loop {
                     iv.tick().await;
-                    for p in &pairs {
+                    // Choose source of pairs
+                    let use_pairs: Vec<ArbPairCfg> = if let Some(dc) = &disc_cfg {
+                        if dc.enable && dc.mode.as_deref() == Some("full-auto") {
+                            discovered.read().clone()
+                        } else {
+                            static_pairs.clone()
+                        }
+                    } else {
+                        static_pairs.clone()
+                    };
+                    for p in &use_pairs {
                         if let Ok(Some(edge)) =
                             arb.best_edge(&p.in_mint, &p.out_mint, p.ui_amount).await
                         {
@@ -555,6 +704,33 @@ impl Engine {
         } else {
             error!("Failed to open trade log file: {}", file_path.display());
         }
+    }
+}
+
+fn append_arb_pair_record(in_mint: &str, out_mint: &str, liquidity_ui: f64, dex: &str) {
+    use std::io::Write as _;
+    static PAIRS_LOG_LOCK: once_cell::sync::Lazy<std::sync::Mutex<()>> =
+        once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
+    let _g = PAIRS_LOG_LOCK.lock().unwrap();
+    let dir_name = std::env::var("IRONCRAB_TRADE_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string());
+    let dir = std::path::Path::new(&dir_name);
+    if !dir.exists() { let _ = std::fs::create_dir_all(dir); }
+    let date = chrono::Utc::now().format("%Y%m%d");
+    let file_path = dir.join(format!("arb_pairs-{}.csv", date));
+    let new_file = !file_path.exists();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&file_path) {
+        if new_file {
+            let _ = writeln!(f, "timestamp_utc,in_mint,out_mint,liquidity_ui,dex");
+        }
+        let _ = writeln!(
+            f,
+            "{},{},{},{:.6},{}",
+            chrono::Utc::now().to_rfc3339(),
+            in_mint,
+            out_mint,
+            liquidity_ui,
+            dex
+        );
     }
 }
 

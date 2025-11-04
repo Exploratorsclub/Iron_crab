@@ -14,6 +14,7 @@ DEX & Routing
 - Raydium: Pool Scan, Quotes, Swap Plan (Compute Budget), Full Swap IX
 - Orca Whirlpool: Strukturierter Parser, Fee Tier Accounts, Swap IX Builder (Tick Arrays + Oracle PDAs)
 - Routing: Single-Hop + Depth‑2/3 Multi-Hop (finales globales min_out)
+ - Arbitrage Auto‑Discovery: Optionaler Discovery‑Loop (Raydium + Orca) filtert liquide Paare und füttert den Scanner (Modus: CSV‑only oder Full‑Auto)
 
 Sniper & Risk
 - WS Log Subscription (Pool Create Events)
@@ -84,6 +85,28 @@ max_position_sol = 0.10               # Max 0.1 SOL total position
 daily_loss_limit_sol = 0.30           # Stop trading if lose 0.3 SOL/day
 stop_loss_bps = 3000                  # -30% stop loss (AGGRESSIVE!)
 take_profit_bps = 1000                # +10% take profit
+```
+
+Optional: enable Arbitrage Auto‑Discovery
+```toml
+[arbitrage]
+interval_ms = 2000
+min_profit_bps = 10
+est_tx_cost_lamports = 10000
+
+[arbitrage.discovery]
+enable = true
+mode = "discovery-only"   # use "full-auto" to feed discovered pairs into the scanner
+base_tokens = [
+	"So11111111111111111111111111111111111111112", # SOL
+	"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", # USDC
+	"Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", # USDT
+]
+min_liquidity_sol = 20.0
+min_liquidity_usd = 10000.0
+default_ui_amount = 0.05
+top_n_per_base = 20
+interval_secs = 30
 ```
 
 ### Step 2: Wallet Setup
@@ -163,6 +186,7 @@ cargo run --bin latency_stress -- --duration-secs 30 --concurrency 16
 - **Insufficient Balance**: Ensure wallet has enough SOL for trades + fees
 - **No Trades**: Check if pools meet your filtering criteria (`min_pool_liquidity_sol`, etc.)
 - **High CPU**: Reduce `rpc_max_concurrency` or increase `exit_eval_interval_secs`
+ - **No arbitrage pairs**: In discovery‑only mode we only log CSVs (`trade_logs/arb_pairs-YYYYMMDD.csv`). Switch to `full-auto` to scan discovered pairs.
 
 ---
 

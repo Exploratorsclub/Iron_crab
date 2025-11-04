@@ -112,3 +112,29 @@ log_cleanup_interval_hours = 24       # Check for old logs every 24 hours
 # take_profit_tiers = [ { bps = 500, fraction = 0.3 }, { bps = 1000, fraction = 0.3 }, { bps = 1500, fraction = 0.4 } ]
 # trailing_stop_bps = 300
 # min_exit_notional_sol = 0.02
+
+# Arbitrage scanning (optional)
+[arbitrage]
+# Static pairs (optional; ignored if discovery.mode = "full-auto")
+pairs = [
+	# { in_mint = "So11111111111111111111111111111111111111112", out_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", ui_amount = 0.05 }, # SOL->USDC
+]
+interval_ms = 2000
+min_profit_bps = 10
+est_tx_cost_lamports = 10000
+
+[arbitrage.discovery]
+enable = true
+# "discovery-only" logs to CSV; "full-auto" feeds discovered pairs into the scanner
+mode = "discovery-only"
+# Focus anchors; empty = allow all
+base_tokens = [
+	"So11111111111111111111111111111111111111112", # SOL
+	"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", # USDC
+	"Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", # USDT
+]
+min_liquidity_sol = 20.0      # if SOL is one side, require >= 20 SOL total reserves
+min_liquidity_usd = 10_000.0  # if USDC/USDT is one side, require >= $10k total reserves
+default_ui_amount = 0.05      # scan amount used for quotes on discovered pairs
+top_n_per_base = 20           # cap per base to avoid combinatorial explosion
+interval_secs = 30            # discovery refresh interval

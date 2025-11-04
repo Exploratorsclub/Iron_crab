@@ -95,6 +95,35 @@ pub struct ArbCfg {
     pub min_profit_bps: Option<u32>,
     #[serde(default)]
     pub est_tx_cost_lamports: Option<u64>,
+    #[serde(default)]
+    pub discovery: Option<ArbDiscoveryCfg>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ArbDiscoveryCfg {
+    #[serde(default)]
+    pub enable: bool,
+    /// Mode: "discovery-only" (only log/CSV) or "full-auto" (feed discovered pairs into scanner)
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// List of base/anchor tokens to focus on (e.g., SOL, USDC, USDT mints)
+    #[serde(default)]
+    pub base_tokens: Vec<String>,
+    /// Minimum pool liquidity threshold when one side is SOL (in SOL)
+    #[serde(default)]
+    pub min_liquidity_sol: Option<f64>,
+    /// Minimum pool liquidity threshold when one side is USD-stable (in USD)
+    #[serde(default)]
+    pub min_liquidity_usd: Option<f64>,
+    /// Default UI amount to use when generating edges for scanning
+    #[serde(default)]
+    pub default_ui_amount: Option<f64>,
+    /// Limit number of discovered pairs per base token
+    #[serde(default)]
+    pub top_n_per_base: Option<usize>,
+    /// Discovery loop interval in seconds
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -202,15 +231,6 @@ impl Config {
         // --- app ---
         if self.app.name.trim().is_empty() {
             errs.push("app.name must not be empty".into());
-        }
-        if !matches!(
-            self.app.log_level.to_ascii_lowercase().as_str(),
-            "trace" | "debug" | "info" | "warn" | "error"
-        ) {
-            errs.push(format!(
-                "app.log_level invalid: {} (allowed: trace|debug|info|warn|error)",
-                self.app.log_level
-            ));
         }
         if self.app.autosave_state_secs == 0 {
             errs.push("app.autosave_state_secs must be > 0".into());
@@ -377,6 +397,31 @@ impl Config {
             if let Some(intv) = a.interval_ms {
                 if intv == 0 {
                     errs.push("arbitrage.interval_ms must be > 0".into());
+                }
+            }
+            // discovery sub-config
+            if let Some(d) = &a.discovery {
+                if d.enable {
+                    if let Some(mode) = &d.mode {
+                        if mode != "discovery-only" && mode != "full-auto" {
+                            errs.push("arbitrage.discovery.mode must be 'discovery-only' or 'full-auto'".into());
+                        }
+                    }
+                    if let Some(s) = d.interval_secs {
+                        if s == 0 {
+                            errs.push("arbitrage.discovery.interval_secs must be > 0".into());
+                        }
+                    }
+                    if let Some(n) = d.top_n_per_base {
+                        if n == 0 {
+                            errs.push("arbitrage.discovery.top_n_per_base must be > 0".into());
+                        }
+                    }
+                    if let Some(v) = d.default_ui_amount {
+                        if !(v > 0.0) {
+                            errs.push("arbitrage.discovery.default_ui_amount must be > 0".into());
+                        }
+                    }
                 }
             }
         }
