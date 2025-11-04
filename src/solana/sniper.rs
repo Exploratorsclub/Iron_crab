@@ -691,7 +691,8 @@ impl SniperEngine {
     }
 
     pub async fn subscribe_logs(&self) -> Result<()> {
-        use tokio_tungstenite::tungstenite::handshake::client::Request as WsRequest;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
         // Build endpoint list: prefer explicit primary WS from config, else derive from RPC URL; then add failovers
         let mut endpoints: Vec<String> = if let Some(primary) = self.rpc.primary_ws_url() {
             vec![primary]
@@ -740,26 +741,40 @@ impl SniperEngine {
                         .get(url_idx % urls.len())
                         .cloned()
                         .unwrap_or_else(|| urls[0].clone());
-                    // Optional headers
-                    let mut req = WsRequest::builder().method("GET").uri(&url);
-                    // Only allow safe, non-reserved headers to avoid corrupting the WS handshake.
-                    // Reserved headers like Sec-WebSocket-Key/Version/Accept/Connection/Upgrade are managed by the client library.
-                    for (k, v) in engine_clone.rpc.ws_headers().iter() {
-                        let k_lc = k.to_ascii_lowercase();
-                        let allow = k_lc == "sec-websocket-protocol" || k_lc == "authorization" || k_lc == "user-agent";
-                        if allow {
-                            req = req.header(k, v);
-                        } else if k_lc.starts_with("sec-websocket-") || k_lc == "connection" || k_lc == "upgrade" || k_lc == "host" {
-                            // Skip reserved/unsafe headers
-                            tracing::debug!(key=%k, "skipping reserved websocket header from config");
-                        } else {
-                            // Be conservative; only a small allowlist to reduce handshake issues across servers
-                            tracing::debug!(key=%k, "skipping non-allowlisted websocket header from config");
+                    // Build a proper client request so tungstenite generates required WS headers
+                    let mut req = match url.as_str().into_client_request() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(?e, url=%url, "invalid websocket URL");
+                            // rotate endpoint
+                            attempt = attempt.wrapping_add(1);
+                            WS_RECONNECTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = crate::solana::rpc::SolanaRpc::sleep_with_backoff(attempt, crate::solana::rpc::ErrorClass::Other).await;
+                            continue;
+                        }
+                    };
+                    {
+                        // Only allow safe, non-reserved headers to avoid corrupting the WS handshake.
+                        let headers = req.headers_mut();
+                        for (k, v) in engine_clone.rpc.ws_headers().iter() {
+                            let k_lc = k.to_ascii_lowercase();
+                            let allow = k_lc == "sec-websocket-protocol" || k_lc == "authorization" || k_lc == "user-agent";
+                            if allow {
+                                if let (Ok(name), Ok(value)) = (
+                                    HeaderName::from_bytes(k.as_bytes()),
+                                    HeaderValue::from_str(v),
+                                ) {
+                                    headers.insert(name, value);
+                                } else {
+                                    tracing::debug!(key=%k, "skipping invalid websocket header value from config");
+                                }
+                            } else if k_lc.starts_with("sec-websocket-") || k_lc == "connection" || k_lc == "upgrade" || k_lc == "host" {
+                                tracing::debug!(key=%k, "skipping reserved websocket header from config");
+                            } else {
+                                tracing::debug!(key=%k, "skipping non-allowlisted websocket header from config");
+                            }
                         }
                     }
-                    let req = req
-                        .body(())
-                        .unwrap_or_else(|_| WsRequest::builder().uri(&url).body(()).unwrap());
                     // Optional connect timeout wrapper
                     let connect_fut = tokio_tungstenite::connect_async(req);
                     let ms = engine_clone.rpc.ws_connect_timeout_ms();
