@@ -232,11 +232,10 @@ impl Engine {
                                         continue;
                                     }
                                     // base token filter
-                                    if !(
-                                        base_allow.is_empty()
-                                            || base_allow.contains(&a)
-                                            || base_allow.contains(&b)
-                                    ) {
+                                    if !(base_allow.is_empty()
+                                        || base_allow.contains(&a)
+                                        || base_allow.contains(&b))
+                                    {
                                         continue;
                                     }
                                     let liq = a_ui + b_ui;
@@ -266,11 +265,10 @@ impl Engine {
                                     if !ok {
                                         continue;
                                     }
-                                    if !(
-                                        base_allow.is_empty()
-                                            || base_allow.contains(&a)
-                                            || base_allow.contains(&b)
-                                    ) {
+                                    if !(base_allow.is_empty()
+                                        || base_allow.contains(&a)
+                                        || base_allow.contains(&b))
+                                    {
                                         continue;
                                     }
                                     let liq = a_ui + b_ui;

@@ -1398,7 +1398,7 @@ impl SniperEngine {
         } else {
             None
         };
-        
+
         if plan_opt.is_none() && orca.is_none() {
             debug!(mint=%mint, "no raydium or orca route");
             return Ok(());
