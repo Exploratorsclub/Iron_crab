@@ -15,15 +15,13 @@ use tracing::{debug, info, warn};
 // (log subscription stub – real PubSub integration to be reintroduced with correct crate paths)
 use once_cell::sync::Lazy;
 use regex::Regex;
-
-use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
+use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
+use std::time::{Duration, Instant};
 use chrono::Utc as ChronoUtc;
 use futures::{SinkExt, StreamExt};
-use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-// removed unused imports (OpenOptions, Write, OnceLazy alias, Mutex)
-use crate::metrics; // for qualified partial exit metrics usage
+use crate::metrics; // keep metrics module in scope for qualified uses
 use crate::metrics::{
     record_fee_pct, record_network_fee, record_realized_gross_net, record_realized_pnl_sol,
     record_shortfall, record_shortfall_pct, record_swap_latency, record_trade_return,
@@ -702,13 +700,16 @@ impl SniperEngine {
         for e in self.rpc.ws_failovers().iter() {
             endpoints.push(Self::http_to_ws(e));
         }
-        // Bounded work queue to decouple socket reading from processing; apply backpressure if slow
-        let (logs_tx, mut logs_rx) = tokio::sync::mpsc::channel::<Vec<String>>(512);
+    // Bounded work queue to decouple socket reading from processing; apply backpressure if slow
+    // Include program id with each batch for better observability
+    let (logs_tx, mut logs_rx) = tokio::sync::mpsc::channel::<(String, Vec<String>)>(512);
         // Spawn a single worker that processes logs with backpressure
         let engine_for_worker = self.clone_for_spawn();
         tokio::spawn(async move {
-            while let Some(lines) = logs_rx.recv().await {
-                engine_for_worker.extract_and_evaluate(lines).await;
+            while let Some((program_id, lines)) = logs_rx.recv().await {
+                engine_for_worker
+                    .extract_and_evaluate_with_program(&program_id, lines)
+                    .await;
             }
         });
         let programs = vec![
@@ -845,9 +846,10 @@ impl SniperEngine {
                                                         if let Some(arr) = v.pointer("/params/result/value/logs").and_then(|x| x.as_array()) {
                                                             let payload: Vec<String> = arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect();
                                                             // Apply backpressure: try fast path; if full, await send with returned payload; if closed, break
-                                                            match logs_tx.try_send(payload) {
+                                                            match logs_tx.try_send((pid.clone(), payload)) {
                                                                 Ok(_) => {}
                                                                 Err(tokio::sync::mpsc::error::TrySendError::Full(p)) => {
+                                                                    // p is already the full message (pid, payload)
                                                                     if let Err(e2) = logs_tx.send(p).await {
                                                                         warn!(?e2, program_id=%pid, "ws logs worker closed");
                                                                         break;
@@ -918,6 +920,206 @@ impl SniperEngine {
     #[allow(dead_code)]
     async fn handle_logs_static(_logs: Vec<String>) {
         // deprecated placeholder
+    }
+
+    fn program_label_for(pid: &str) -> &'static str {
+        if pid == RAYDIUM_AMM_V4 {
+            "RAYDIUM"
+        } else if pid == ORCA_WHIRLPOOL_PROGRAM {
+            "ORCA"
+        } else {
+            "UNKNOWN"
+        }
+    }
+
+    fn append_pool_candidate_record(
+        &self,
+        program_label: &str,
+        mint: &Pubkey,
+        top1: Option<f64>,
+        top3: Option<f64>,
+        top5: Option<f64>,
+        burned: Option<f64>,
+        program_locked: Option<f64>,
+        liq_sol: Option<f64>,
+        decision: &str,
+        notes: &str,
+    ) {
+        use std::io::Write as _;
+        static POOL_LOG_LOCK: once_cell::sync::Lazy<std::sync::Mutex<()>> =
+            once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
+        let _g = POOL_LOG_LOCK.lock().unwrap();
+        let dir_name =
+            std::env::var("IRONCRAB_TRADE_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string());
+        let dir = std::path::Path::new(&dir_name);
+        if !dir.exists() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let date = ChronoUtc::now().format("%Y%m%d");
+        let file_path = dir.join(format!("pools_found-{}.csv", date));
+        let new_file = !file_path.exists();
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file_path)
+        {
+            if new_file {
+                let _ = writeln!(f, "timestamp_utc,program,mint,top1_pct,top3_pct,top5_pct,burned_pct,program_locked_pct,liquidity_sol,decision,notes");
+            }
+            let _ = writeln!(
+                f,
+                "{ts},{prog},{mint},{top1},{top3},{top5},{burned},{plocked},{liq},{decision},{notes}",
+                ts = ChronoUtc::now().to_rfc3339(),
+                prog = program_label,
+                mint = mint,
+                top1 = top1.unwrap_or(0.0),
+                top3 = top3.unwrap_or(0.0),
+                top5 = top5.unwrap_or(0.0),
+                burned = burned.unwrap_or(0.0),
+                plocked = program_locked.unwrap_or(0.0),
+                liq = liq_sol.unwrap_or(0.0),
+                decision = decision,
+                notes = notes,
+            );
+        }
+    }
+
+    async fn extract_and_evaluate_with_program(&self, program_id: &str, logs: Vec<String>) {
+        let program_label = Self::program_label_for(program_id);
+        static BASE58_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"[1-9A-HJ-NP-Za-km-z]{32,44}").unwrap());
+        for line in logs {
+            let lower = line.to_ascii_lowercase();
+            if !(lower.contains("init") || lower.contains("initialize")) {
+                continue;
+            }
+            if !(lower.contains("pool") || lower.contains("whirlpool")) {
+                continue;
+            }
+            debug!(line = %line, program=%program_label, "sniper: init-like log");
+            let mut seen = std::collections::HashSet::new();
+            for m in BASE58_RE.find_iter(&line) {
+                let s = m.as_str();
+                if !seen.insert(s) {
+                    continue;
+                }
+                if let Ok(pk) = Pubkey::from_str(s) {
+                    // Run LP concentration check (if thresholds configured)
+                    match self.lp_lock_check(&pk).await {
+                        Ok(Some(assess)) => {
+                            let mut liq_sol: Option<f64> = None;
+                            if assess.concentration_ok {
+                                // Attempt liquidity estimation if configured
+                                if self.cfg.read().min_pool_liquidity_sol.is_some() {
+                                    match self.estimate_liquidity_index(&pk).await {
+                                        Ok(v) => liq_sol = v,
+                                        Err(_) => {
+                                            liq_sol = self
+                                                .estimate_liquidity_for_mint(&pk)
+                                                .await
+                                                .ok()
+                                                .flatten();
+                                        }
+                                    }
+                                }
+                                let liq_ok = self
+                                    .cfg
+                                    .read()
+                                    .min_pool_liquidity_sol
+                                    .map(|thr| liq_sol.unwrap_or(0.0) >= thr)
+                                    .unwrap_or(true);
+                                if liq_ok {
+                                    let base_buy = self.effective_max_buy_sol();
+                                    if !self.can_open_position_for(&pk, base_buy) {
+                                        // Risk gate blocked
+                                        self.append_pool_candidate_record(
+                                            program_label,
+                                            &pk,
+                                            Some(assess.top1_pct),
+                                            Some(assess.top3_pct),
+                                            Some(assess.top5_pct),
+                                            Some(assess.burned_pct),
+                                            Some(assess.program_vault_pct),
+                                            liq_sol,
+                                            "REJECT_RISK",
+                                            "risk gate blocked",
+                                        );
+                                        debug!(mint=%pk, "sniper: risk gate blocked new position (notional/daily loss)");
+                                        continue;
+                                    }
+                                    if !self.purchased.read().contains(&pk) {
+                                        // Log candidate before attempting buy
+                                        self.append_pool_candidate_record(
+                                            program_label,
+                                            &pk,
+                                            Some(assess.top1_pct),
+                                            Some(assess.top3_pct),
+                                            Some(assess.top5_pct),
+                                            Some(assess.burned_pct),
+                                            Some(assess.program_vault_pct),
+                                            liq_sol,
+                                            "BUY_ATTEMPT",
+                                            "passes concentration+liquidity",
+                                        );
+                                        if let Err(e) = self.attempt_initial_buy(&pk, liq_sol).await {
+                                            warn!(mint = %pk, error = ?e, "sniper: initial buy failed");
+                                        }
+                                    } else {
+                                        self.append_pool_candidate_record(
+                                            program_label,
+                                            &pk,
+                                            Some(assess.top1_pct),
+                                            Some(assess.top3_pct),
+                                            Some(assess.top5_pct),
+                                            Some(assess.burned_pct),
+                                            Some(assess.program_vault_pct),
+                                            liq_sol,
+                                            "SKIP_DUPLICATE",
+                                            "already purchased",
+                                        );
+                                        debug!(mint = %pk, "sniper: already purchased, skip");
+                                    }
+                                } else {
+                                    self.append_pool_candidate_record(
+                                        program_label,
+                                        &pk,
+                                        Some(assess.top1_pct),
+                                        Some(assess.top3_pct),
+                                        Some(assess.top5_pct),
+                                        Some(assess.burned_pct),
+                                        Some(assess.program_vault_pct),
+                                        liq_sol,
+                                        "REJECT_LIQUIDITY",
+                                        "below min liquidity",
+                                    );
+                                    debug!(mint = %pk, liq_sol, "sniper: below min liquidity -> no buy");
+                                }
+                            } else {
+                                self.append_pool_candidate_record(
+                                    program_label,
+                                    &pk,
+                                    Some(assess.top1_pct),
+                                    Some(assess.top3_pct),
+                                    Some(assess.top5_pct),
+                                    Some(assess.burned_pct),
+                                    Some(assess.program_vault_pct),
+                                    None,
+                                    "REJECT_CONCENTRATION",
+                                    "concentration thresholds not met",
+                                );
+                                debug!(mint = %pk, top1 = assess.top1_pct, top3 = assess.top3_pct, top5 = assess.top5_pct, "sniper: rejected by concentration");
+                            }
+                        }
+                        Ok(None) => {
+                            debug!(mint = %pk, "sniper: no lp thresholds configured or insufficient data");
+                        }
+                        Err(e) => {
+                            debug!(mint = %pk, error = ?e, "sniper: lp check error");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn extract_and_evaluate(&self, logs: Vec<String>) {
