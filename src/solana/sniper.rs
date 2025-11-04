@@ -942,6 +942,7 @@ impl SniperEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_pool_candidate_record(
         &self,
         program_label: &str,
@@ -1133,6 +1134,7 @@ impl SniperEngine {
         }
     }
 
+    #[allow(dead_code)]
     async fn extract_and_evaluate(&self, logs: Vec<String>) {
         static BASE58_RE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"[1-9A-HJ-NP-Za-km-z]{32,44}").unwrap());
@@ -1396,6 +1398,7 @@ impl SniperEngine {
         } else {
             None
         };
+        
         if plan_opt.is_none() && orca.is_none() {
             debug!(mint=%mint, "no raydium or orca route");
             return Ok(());

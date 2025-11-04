@@ -4,7 +4,7 @@ use std::{io::Write, sync::Arc, time::Duration};
 use tokio::time::{interval, Duration as TokioDuration};
 use tracing::{debug, error, info, warn, Instrument as _};
 
-use crate::config::{ArbDiscoveryCfg, ArbPairCfg};
+use crate::config::ArbPairCfg;
 use crate::config::{Config, StrategyDef};
 use crate::solana::arbitrage::ArbitrageEngine;
 use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
@@ -232,9 +232,11 @@ impl Engine {
                                         continue;
                                     }
                                     // base token filter
-                                    if !base_allow.is_empty()
-                                        && !(base_allow.contains(&a) || base_allow.contains(&b))
-                                    {
+                                    if !(
+                                        base_allow.is_empty()
+                                            || base_allow.contains(&a)
+                                            || base_allow.contains(&b)
+                                    ) {
                                         continue;
                                     }
                                     let liq = a_ui + b_ui;
@@ -264,9 +266,11 @@ impl Engine {
                                     if !ok {
                                         continue;
                                     }
-                                    if !base_allow.is_empty()
-                                        && !(base_allow.contains(&a) || base_allow.contains(&b))
-                                    {
+                                    if !(
+                                        base_allow.is_empty()
+                                            || base_allow.contains(&a)
+                                            || base_allow.contains(&b)
+                                    ) {
                                         continue;
                                     }
                                     let liq = a_ui + b_ui;

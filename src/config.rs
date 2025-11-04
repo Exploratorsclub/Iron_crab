@@ -421,7 +421,7 @@ impl Config {
                         }
                     }
                     if let Some(v) = d.default_ui_amount {
-                        if !(v > 0.0) {
+                        if v <= 0.0 {
                             errs.push("arbitrage.discovery.default_ui_amount must be > 0".into());
                         }
                     }
