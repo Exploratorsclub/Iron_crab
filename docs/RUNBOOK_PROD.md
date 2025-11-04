@@ -29,13 +29,37 @@ This short runbook helps you go live safely with conservative defaults. Read eve
 - Release build (recommended for live):
   - `./build.ps1 -Release`
 
-## Run
+## Run (Windows)
 - Debug binary with custom config:
   - `./run.ps1 -Config "my_config.toml"`
 - Release binary:
   - `./run.ps1 -Release -Config "my_config.toml"`
 
 The bot serves Prometheus metrics at http://localhost:9898/metrics
+
+## Run (Linux server) & systemd service
+- Debug/Release Build:
+  - `./build.sh` oder `./build.sh --release`
+- Manuell starten:
+  - `./run.sh --release --config my_config.server.toml`
+
+### Als systemd Service betreiben
+1) Datei anpassen und installieren:
+   - Vorlage: `docs/systemd/ironcrab.service`
+   - Passe `User`, `Group`, `WorkingDirectory`, `ExecStart` an deine Pfade an
+   - Kopiere sie nach `/etc/systemd/system/ironcrab.service`
+2) Aktivieren und starten:
+```
+sudo systemctl daemon-reload
+sudo systemctl enable --now ironcrab
+sudo systemctl status ironcrab --no-pager
+```
+3) Logs ansehen:
+```
+journalctl -u ironcrab -f
+```
+
+Der Metrics‑Exporter läuft standardmäßig auf `0.0.0.0:9898` mit Pfad `/metrics`.
 
 ## Safety checklist
 - Start with very small limits: `sniper.max_buy_sol = 0.02`, strict filters enabled.

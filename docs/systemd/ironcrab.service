@@ -1,0 +1,22 @@
+[Unit]
+Description=IronCrab Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Passe den Benutzer und die Pfade an deine Umgebung an
+User=ironcrab
+Group=ironcrab
+WorkingDirectory=/home/ironcrab/Iron_crab
+ExecStart=/home/ironcrab/Iron_crab/run.sh --release --config /home/ironcrab/Iron_crab/my_config.server.toml
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=5
+
+# Basis-Hardening (optional, vorsichtig erweitern)
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
