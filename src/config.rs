@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
-use std::str::FromStr;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppCfg {
