@@ -726,10 +726,12 @@ impl SniperEngine {
             .program_ids
             .clone()
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| vec![
-                RAYDIUM_AMM_V4.to_string(),
-                ORCA_WHIRLPOOL_PROGRAM.to_string(),
-            ]);
+            .unwrap_or_else(|| {
+                vec![
+                    RAYDIUM_AMM_V4.to_string(),
+                    ORCA_WHIRLPOOL_PROGRAM.to_string(),
+                ]
+            });
         for pid in programs {
             let urls = endpoints.clone();
             let engine_clone = self.clone_for_spawn();

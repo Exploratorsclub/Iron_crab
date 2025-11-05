@@ -213,76 +213,94 @@ impl Engine {
                                 let usdt = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
                                 // Raydium
                                 if use_ray {
-                                for s in ray.snapshots() {
-                                    let a = s.base_mint.to_string();
-                                    let b = s.quote_mint.to_string();
-                                    // UI reserves
-                                    let a_ui = s.reserve_base as f64
-                                        / 10f64.powi(if a == usdc || a == usdt { 6 } else { 9 });
-                                    let b_ui = s.reserve_quote as f64
-                                        / 10f64.powi(if b == usdc || b == usdt { 6 } else { 9 });
-                                    // Liquidity gate by side (SOL or USD stable)
-                                    let mut ok = true;
-                                    if a == sol_mint || b == sol_mint {
-                                        if let Some(min_sol) = disc_cfg.min_liquidity_sol {
-                                            let sol_side = if a == sol_mint { b_ui } else { a_ui };
-                                            ok = (a_ui + b_ui) > 0.0
-                                                && (a_ui + b_ui) >= (2.0 * min_sol)
-                                                || sol_side >= min_sol;
+                                    for s in ray.snapshots() {
+                                        let a = s.base_mint.to_string();
+                                        let b = s.quote_mint.to_string();
+                                        // UI reserves
+                                        let a_ui = s.reserve_base as f64
+                                            / 10f64.powi(if a == usdc || a == usdt {
+                                                6
+                                            } else {
+                                                9
+                                            });
+                                        let b_ui = s.reserve_quote as f64
+                                            / 10f64.powi(if b == usdc || b == usdt {
+                                                6
+                                            } else {
+                                                9
+                                            });
+                                        // Liquidity gate by side (SOL or USD stable)
+                                        let mut ok = true;
+                                        if a == sol_mint || b == sol_mint {
+                                            if let Some(min_sol) = disc_cfg.min_liquidity_sol {
+                                                let sol_side =
+                                                    if a == sol_mint { b_ui } else { a_ui };
+                                                ok = (a_ui + b_ui) > 0.0
+                                                    && (a_ui + b_ui) >= (2.0 * min_sol)
+                                                    || sol_side >= min_sol;
+                                            }
+                                        } else if a == usdc || a == usdt || b == usdc || b == usdt {
+                                            if let Some(min_usd) = disc_cfg.min_liquidity_usd {
+                                                ok = (a_ui + b_ui) >= (2.0 * min_usd);
+                                            }
                                         }
-                                    } else if a == usdc || a == usdt || b == usdc || b == usdt {
-                                        if let Some(min_usd) = disc_cfg.min_liquidity_usd {
-                                            ok = (a_ui + b_ui) >= (2.0 * min_usd);
+                                        if !ok {
+                                            continue;
                                         }
+                                        // base token filter
+                                        if !(base_allow.is_empty()
+                                            || base_allow.contains(&a)
+                                            || base_allow.contains(&b))
+                                        {
+                                            continue;
+                                        }
+                                        let liq = a_ui + b_ui;
+                                        push_pair(&mut pairs, &a, &b, liq, "RAYDIUM");
                                     }
-                                    if !ok {
-                                        continue;
-                                    }
-                                    // base token filter
-                                    if !(base_allow.is_empty()
-                                        || base_allow.contains(&a)
-                                        || base_allow.contains(&b))
-                                    {
-                                        continue;
-                                    }
-                                    let liq = a_ui + b_ui;
-                                    push_pair(&mut pairs, &a, &b, liq, "RAYDIUM");
-                                }
                                 }
                                 // Orca
                                 if use_orc {
-                                for s in orc.pools_snapshot() {
-                                    let a = s.base_mint.to_string();
-                                    let b = s.quote_mint.to_string();
-                                    let a_ui = s.reserve_base as f64
-                                        / 10f64.powi(if a == usdc || a == usdt { 6 } else { 9 });
-                                    let b_ui = s.reserve_quote as f64
-                                        / 10f64.powi(if b == usdc || b == usdt { 6 } else { 9 });
-                                    let mut ok = true;
-                                    if a == sol_mint || b == sol_mint {
-                                        if let Some(min_sol) = disc_cfg.min_liquidity_sol {
-                                            let sol_side = if a == sol_mint { b_ui } else { a_ui };
-                                            ok = (a_ui + b_ui) > 0.0
-                                                && (a_ui + b_ui) >= (2.0 * min_sol)
-                                                || sol_side >= min_sol;
+                                    for s in orc.pools_snapshot() {
+                                        let a = s.base_mint.to_string();
+                                        let b = s.quote_mint.to_string();
+                                        let a_ui = s.reserve_base as f64
+                                            / 10f64.powi(if a == usdc || a == usdt {
+                                                6
+                                            } else {
+                                                9
+                                            });
+                                        let b_ui = s.reserve_quote as f64
+                                            / 10f64.powi(if b == usdc || b == usdt {
+                                                6
+                                            } else {
+                                                9
+                                            });
+                                        let mut ok = true;
+                                        if a == sol_mint || b == sol_mint {
+                                            if let Some(min_sol) = disc_cfg.min_liquidity_sol {
+                                                let sol_side =
+                                                    if a == sol_mint { b_ui } else { a_ui };
+                                                ok = (a_ui + b_ui) > 0.0
+                                                    && (a_ui + b_ui) >= (2.0 * min_sol)
+                                                    || sol_side >= min_sol;
+                                            }
+                                        } else if a == usdc || a == usdt || b == usdc || b == usdt {
+                                            if let Some(min_usd) = disc_cfg.min_liquidity_usd {
+                                                ok = (a_ui + b_ui) >= (2.0 * min_usd);
+                                            }
                                         }
-                                    } else if a == usdc || a == usdt || b == usdc || b == usdt {
-                                        if let Some(min_usd) = disc_cfg.min_liquidity_usd {
-                                            ok = (a_ui + b_ui) >= (2.0 * min_usd);
+                                        if !ok {
+                                            continue;
                                         }
+                                        if !(base_allow.is_empty()
+                                            || base_allow.contains(&a)
+                                            || base_allow.contains(&b))
+                                        {
+                                            continue;
+                                        }
+                                        let liq = a_ui + b_ui;
+                                        push_pair(&mut pairs, &a, &b, liq, "ORCA");
                                     }
-                                    if !ok {
-                                        continue;
-                                    }
-                                    if !(base_allow.is_empty()
-                                        || base_allow.contains(&a)
-                                        || base_allow.contains(&b))
-                                    {
-                                        continue;
-                                    }
-                                    let liq = a_ui + b_ui;
-                                    push_pair(&mut pairs, &a, &b, liq, "ORCA");
-                                }
                                 }
                                 // Rank per base if requested
                                 if let Some(k) = disc_cfg.top_n_per_base {
