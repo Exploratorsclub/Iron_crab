@@ -175,8 +175,14 @@ impl Engine {
                             loop {
                                 iv.tick().await;
                                 // Refresh pools best-effort
-                                let _ = ray.refresh_pools().await;
-                                let _ = orc.refresh_pools().await;
+                                let use_ray = disc_cfg.enable_raydium.unwrap_or(true);
+                                let use_orc = disc_cfg.enable_orca.unwrap_or(true);
+                                if use_ray {
+                                    let _ = ray.refresh_pools().await;
+                                }
+                                if use_orc {
+                                    let _ = orc.refresh_pools().await;
+                                }
                                 // Build candidates
                                 let mut pairs: Vec<(String, String, f64, String)> = Vec::new();
                                 // Helper to push candidate edges (both directions)
@@ -206,6 +212,7 @@ impl Engine {
                                 let usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
                                 let usdt = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
                                 // Raydium
+                                if use_ray {
                                 for s in ray.snapshots() {
                                     let a = s.base_mint.to_string();
                                     let b = s.quote_mint.to_string();
@@ -241,7 +248,9 @@ impl Engine {
                                     let liq = a_ui + b_ui;
                                     push_pair(&mut pairs, &a, &b, liq, "RAYDIUM");
                                 }
+                                }
                                 // Orca
+                                if use_orc {
                                 for s in orc.pools_snapshot() {
                                     let a = s.base_mint.to_string();
                                     let b = s.quote_mint.to_string();
@@ -273,6 +282,7 @@ impl Engine {
                                     }
                                     let liq = a_ui + b_ui;
                                     push_pair(&mut pairs, &a, &b, liq, "ORCA");
+                                }
                                 }
                                 // Rank per base if requested
                                 if let Some(k) = disc_cfg.top_n_per_base {
@@ -367,8 +377,19 @@ impl Engine {
             let raydium_ref = Arc::new(Raydium::new(rpc_clone.clone()));
             let orca_ref = Arc::new(Orca::new(rpc_clone.clone()));
             let treasury_arc = Arc::new(self.ctx.treasury.clone());
+            // Read diagnostic flag outside the task to avoid capturing &self
+            let log_all_inits_flag = self
+                .ctx
+                .cfg
+                .arbitrage
+                .as_ref()
+                .and_then(|a| a.discovery.as_ref())
+                .map(|d| d.log_all_inits)
+                .unwrap_or(false);
             tokio::spawn(async move {
-                let cfg: SniperCfg = (&sn_cfg).into();
+                let mut cfg: SniperCfg = (&sn_cfg).into();
+                // propagate diagnostic flag from arbitrage.discovery to sniper config
+                cfg.log_all_inits = log_all_inits_flag;
                 if let Err(e) = run_sniper(
                     rpc_clone,
                     cfg,

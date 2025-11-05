@@ -42,6 +42,9 @@ static MINT_BLACKLIST: Lazy<HashSet<String>> = Lazy::new(HashSet::new);
 pub struct SniperCfg {
     pub max_buy_sol: f64,
     pub max_slippage_bps: u32,
+    pub log_all_inits: bool, // diagnostic: also log any init-like lines even without pool/whirlpool
+    // Log subscription: if provided, override default program list
+    pub program_ids: Option<Vec<String>>,
     pub blacklist_mints: Vec<String>,
     pub blacklist_owners: Vec<String>,
     pub min_pool_liquidity_sol: Option<f64>,
@@ -83,6 +86,8 @@ impl Default for SniperCfg {
         Self {
             max_buy_sol: 1.0,
             max_slippage_bps: 100,
+            log_all_inits: false,
+            program_ids: None,
             blacklist_mints: Vec::new(),
             blacklist_owners: Vec::new(),
             min_pool_liquidity_sol: None,
@@ -125,6 +130,8 @@ impl From<&crate::config::SniperSettings> for SniperCfg {
         Self {
             max_buy_sol: c.max_buy_sol,
             max_slippage_bps: c.max_slippage_bps,
+            log_all_inits: false,
+            program_ids: c.program_ids.clone(),
             blacklist_mints: c.blacklist_mints.clone(),
             blacklist_owners: c.blacklist_owners.clone(),
             min_pool_liquidity_sol: c.min_pool_liquidity_sol,
@@ -712,10 +719,17 @@ impl SniperEngine {
                     .await;
             }
         });
-        let programs = vec![
-            RAYDIUM_AMM_V4.to_string(),
-            ORCA_WHIRLPOOL_PROGRAM.to_string(),
-        ];
+        // Build program list: config override if present, else defaults (Raydium AMM v4 + Orca Whirlpool)
+        let programs: Vec<String> = self
+            .cfg
+            .read()
+            .program_ids
+            .clone()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec![
+                RAYDIUM_AMM_V4.to_string(),
+                ORCA_WHIRLPOOL_PROGRAM.to_string(),
+            ]);
         for pid in programs {
             let urls = endpoints.clone();
             let engine_clone = self.clone_for_spawn();
@@ -999,22 +1013,41 @@ impl SniperEngine {
         let program_label = Self::program_label_for(program_id);
         static BASE58_RE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"[1-9A-HJ-NP-Za-km-z]{32,44}").unwrap());
+        // Config flag: if true, also log any init-like lines even without 'pool'/'whirlpool' tokens
+        let allow_all_inits = self.cfg.read().log_all_inits;
         for line in logs {
             let lower = line.to_ascii_lowercase();
             if !(lower.contains("init") || lower.contains("initialize")) {
                 continue;
             }
-            if !(lower.contains("pool") || lower.contains("whirlpool")) {
+            if !(allow_all_inits || lower.contains("pool") || lower.contains("whirlpool")) {
                 continue;
             }
             debug!(line = %line, program=%program_label, "sniper: init-like log");
             let mut seen = std::collections::HashSet::new();
+            let mut did_log_init = false;
             for m in BASE58_RE.find_iter(&line) {
                 let s = m.as_str();
                 if !seen.insert(s) {
                     continue;
                 }
                 if let Ok(pk) = Pubkey::from_str(s) {
+                    if allow_all_inits && !did_log_init {
+                        // Diagnostic: log the first init-like occurrence even without classification
+                        self.append_pool_candidate_record(
+                            program_label,
+                            &pk,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            "INIT_ONLY",
+                            "raw_init (diagnostic)",
+                        );
+                        did_log_init = true;
+                    }
                     // Run LP concentration check (if thresholds configured)
                     match self.lp_lock_check(&pk).await {
                         Ok(Some(assess)) => {

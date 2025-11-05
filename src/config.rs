@@ -106,6 +106,10 @@ pub struct ArbDiscoveryCfg {
     /// Mode: "discovery-only" (only log/CSV) or "full-auto" (feed discovered pairs into scanner)
     #[serde(default)]
     pub mode: Option<String>,
+    /// Debug/diagnostic: also log any init-like lines even if they don't contain 'pool'/'whirlpool'
+    /// This can generate noisy CSVs but helps verify WS pipeline end-to-end
+    #[serde(default)]
+    pub log_all_inits: bool,
     /// List of base/anchor tokens to focus on (e.g., SOL, USDC, USDT mints)
     #[serde(default)]
     pub base_tokens: Vec<String>,
@@ -124,12 +128,21 @@ pub struct ArbDiscoveryCfg {
     /// Discovery loop interval in seconds
     #[serde(default)]
     pub interval_secs: Option<u64>,
+    /// Discovery sources: enable/disable individual DEX connectors (defaults: both enabled)
+    #[serde(default)]
+    pub enable_raydium: Option<bool>,
+    #[serde(default)]
+    pub enable_orca: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SniperSettings {
     pub max_buy_sol: f64,
     pub max_slippage_bps: u32,
+    /// Optional: Program IDs to subscribe to for logs (DEX pool init events)
+    /// Defaults to Raydium AMM v4 and Orca Whirlpool when omitted.
+    #[serde(default)]
+    pub program_ids: Option<Vec<String>>,
     #[serde(default)]
     pub blacklist_mints: Vec<String>,
     #[serde(default)]
@@ -402,6 +415,11 @@ impl Config {
             // discovery sub-config
             if let Some(d) = &a.discovery {
                 if d.enable {
+                    let ray_enabled = d.enable_raydium.unwrap_or(true);
+                    let orca_enabled = d.enable_orca.unwrap_or(true);
+                    if !ray_enabled && !orca_enabled {
+                        errs.push("arbitrage.discovery: at least one of enable_raydium or enable_orca must be true".into());
+                    }
                     if let Some(mode) = &d.mode {
                         if mode != "discovery-only" && mode != "full-auto" {
                             errs.push(
@@ -564,6 +582,25 @@ impl Config {
                     other => errs.push(format!(
                         "sniper.oracle_preference invalid: {other} (pyth|switchboard|override)"
                     )),
+                }
+            }
+        }
+
+        // Validate optional sniper.program_ids if provided
+        if let Some(s) = &self.sniper {
+            if let Some(pids) = s.program_ids.as_ref() {
+                for (i, pid) in pids.iter().enumerate() {
+                    if pid.trim().is_empty() {
+                        errs.push(format!("sniper.program_ids[{i}] must not be empty"));
+                        continue;
+                    }
+                    // Basic Pubkey validation
+                    if let Err(_) = solana_sdk::pubkey::Pubkey::from_str(pid) {
+                        errs.push(format!(
+                            "sniper.program_ids[{i}] is not a valid Solana pubkey: {}",
+                            pid
+                        ));
+                    }
                 }
             }
         }

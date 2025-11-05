@@ -70,6 +70,13 @@ max_slippage_bps = 150                # Maximum slippage tolerance (1.5%)
 adaptive_slippage_min_bps = 75        # Minimum adaptive slippage (0.75%)
 adaptive_slippage_max_bps = 300       # Maximum adaptive slippage (3%)
 
+# Program IDs to subscribe to (optional). If omitted, defaults to Raydium AMM v4 and Orca Whirlpool.
+# Uncomment and edit to control which DEX logs are listened to by the sniper.
+# program_ids = [
+#   "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM v4
+#   "whirLbMiicV3QDeqAD9nukHf8stYwh5GozfX6rS3SAm",  # Orca Whirlpool
+# ]
+
 # Stop Loss & Take Profit (BASIS POINTS: 10000 = 100%)
 stop_loss_bps = 3000                  # Stop loss at -30% (AGGRESSIVE - consider 1500-2000)
 take_profit_bps = 1000                # Take profit at +10%
@@ -127,6 +134,9 @@ est_tx_cost_lamports = 10000
 enable = true
 # "discovery-only" logs to CSV; "full-auto" feeds discovered pairs into the scanner
 mode = "discovery-only"
+# Diagnostic option: also log any init-like lines even if they don't contain 'pool'/'whirlpool'.
+# Generates noisy CSVs, but useful to verify WS pipeline. Default: false
+# log_all_inits = true
 # Focus anchors; empty = allow all
 base_tokens = [
 	"So11111111111111111111111111111111111111112", # SOL
@@ -138,3 +148,7 @@ min_liquidity_usd = 10_000.0  # if USDC/USDT is one side, require >= $10k total 
 default_ui_amount = 0.05      # scan amount used for quotes on discovered pairs
 top_n_per_base = 20           # cap per base to avoid combinatorial explosion
 interval_secs = 30            # discovery refresh interval
+
+# Discovery sources (optional; default: both enabled)
+# enable_raydium = true
+# enable_orca = true
