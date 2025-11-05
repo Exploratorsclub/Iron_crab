@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -595,7 +596,7 @@ impl Config {
                         continue;
                     }
                     // Basic Pubkey validation
-                    if let Err(_) = solana_sdk::pubkey::Pubkey::from_str(pid) {
+                    if solana_sdk::pubkey::Pubkey::from_str(pid).is_err() {
                         errs.push(format!(
                             "sniper.program_ids[{i}] is not a valid Solana pubkey: {}",
                             pid
