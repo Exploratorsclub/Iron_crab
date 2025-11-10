@@ -14,6 +14,15 @@ Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=5
 
+# Resource controls: lower priority and limit CPU/IO share vs validator
+# 64 cores: pin bot to CPUs 48-63 (upper quarter)
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUWeight=100
+IOWeight=100
+CPUAffinity=48-63
+
 # Basis-Hardening (optional, vorsichtig erweitern)
 NoNewPrivileges=yes
 PrivateTmp=yes
