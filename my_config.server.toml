@@ -4,7 +4,7 @@
 # --- Application ---
 [app]
 name = "ironcrab-prod"
-log_level = "info"
+log_level = "debug"  # temporär für WS/Discovery Fehlersuche
 autosave_state_secs = 30
 
 # --- Solana RPC & Keypair (Linux paths) ---
@@ -85,6 +85,12 @@ oracle_sol_usd_override = 100.0
 log_retention_days = 30
 log_cleanup_interval_hours = 24
 
+# Explizit abonnierte DEX Programme (Raydium AMM v4 & Orca Whirlpool)
+program_ids = [
+	"675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+	"whirLbMiicV3QDeqAD9nukHf8stYwh5GozfX6rS3SAm",
+]
+
 # --- Arbitrage scanning with Auto-Discovery ---
 [arbitrage]
 interval_ms = 2000
@@ -94,7 +100,8 @@ pairs = []  # ignored when discovery.mode = "full-auto"
 
 [arbitrage.discovery]
 enable = true
-mode = "full-auto"  # feed discovered pairs automatically into scanner
+mode = "discovery-only"  # nur CSV Logging für Vergleich alt/neu
+log_all_inits = true      # diagnostisch: alle init-ähnlichen Logs erfassen
 base_tokens = [
 	"So11111111111111111111111111111111111111112",  # SOL
 	"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
