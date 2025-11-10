@@ -15,11 +15,13 @@ ws_url  = "ws://127.0.0.1:8900"
 # Keep the public IP as a fallback in case you run the bot off-box or need external access temporarily.
 ws_failover_urls = ["ws://109.230.239.43:8900"]
 keypair_path = "/home/ironcrab/.config/solana/id.json"  # adjust to your user/path
-# Conservative concurrency (tune later)
-rpc_min_concurrency = 8
-rpc_max_concurrency = 32
-rpc_initial_concurrency = 12
-rpc_timeout_ms = 20000  # Raised from 12s -> 20s to better tolerate slow block production / local IO
+# Tuned concurrency & timeout (heavier getProgramAccounts was timing out)
+rpc_min_concurrency = 4         # lower floor
+rpc_max_concurrency = 16        # cap parallel pressure
+rpc_initial_concurrency = 8     # start moderate
+rpc_inc_every_successes = 128   # slower ramp-up
+rpc_dec_on_rate_limit = 4
+rpc_timeout_ms = 30000          # allow heavy program scan (30s)
 ## Some RPC/Proxies require WS subprotocol header "jsonrpc" for PubSub
 ws_headers = { "Sec-WebSocket-Protocol" = "jsonrpc" }
 
@@ -100,7 +102,7 @@ pairs = []  # ignored when discovery.mode = "full-auto"
 
 [arbitrage.discovery]
 enable = true
-mode = "discovery-only"  # nur CSV Logging für Vergleich alt/neu
+mode = "discovery-only"  # bleibt vorerst beim Logging
 log_all_inits = true      # diagnostisch: alle init-ähnlichen Logs erfassen
 base_tokens = [
 	"So11111111111111111111111111111111111111112",  # SOL
@@ -111,4 +113,4 @@ min_liquidity_sol = 20.0
 min_liquidity_usd = 10000.0
 default_ui_amount = 0.05
 top_n_per_base = 20
-interval_secs = 30
+interval_secs = 60        # entlastet RPC (Raydium/Orca Scans seltener)
