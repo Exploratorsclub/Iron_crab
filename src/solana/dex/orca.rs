@@ -260,8 +260,7 @@ impl Dex for Orca {
         };
         let accounts = self
             .rpc
-            .rpc
-            .get_program_accounts_with_config(&program_id, cfg)
+            .get_program_accounts_with_config_retry(&program_id, cfg)
             .await?;
         let mut added = 0u32;
         let mut fee_tier_keys: Vec<Pubkey> = Vec::new();

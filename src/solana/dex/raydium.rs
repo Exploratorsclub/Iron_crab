@@ -495,8 +495,7 @@ impl Dex for Raydium {
         let program_id = Pubkey::from_str(RAYDIUM_AMM_V4)?;
         let accounts = self
             .rpc
-            .rpc
-            .get_program_accounts_with_config(&program_id, cfg)
+            .get_program_accounts_with_config_retry(&program_id, cfg)
             .await?;
         // Collect decodable pool state + raw bytes for fee extraction
         let mut decoded: Vec<(reader::PoolV4, Vec<u8>)> = Vec::with_capacity(accounts.len());

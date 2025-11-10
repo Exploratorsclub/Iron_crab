@@ -1,4 +1,5 @@
 use solana_client::client_error::ClientError;
+use solana_client::rpc_config::RpcProgramAccountsConfig;
 use solana_client::rpc_config::RpcTransactionConfig;
 use solana_client::rpc_response::Response;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
@@ -593,6 +594,62 @@ impl SolanaRpc {
                 }
                 None => {
                     if attempt >= 2 {
+                        return Err(e_against_timeout());
+                    }
+                    attempt += 1;
+                    crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Self::sleep_with_backoff(attempt, ErrorClass::Timeout).await;
+                }
+            }
+        }
+    }
+
+    /// Heavy call: wraps get_program_accounts_with_config with timeout, retries and backoff.
+    pub async fn get_program_accounts_with_config_retry(
+        &self,
+        program_id: &Pubkey,
+        cfg: RpcProgramAccountsConfig,
+    ) -> Result<Vec<(Pubkey, solana_sdk::account::Account)>, ClientError> {
+        let _permit = self.limiter.acquire().await;
+        let mut attempt = 0u32;
+        loop {
+            match self
+                .with_timeout(self.rpc.get_program_accounts_with_config(program_id, cfg.clone()))
+                .await
+            {
+                Some(Ok(v)) => {
+                    self.limiter.on_success();
+                    return Ok(v);
+                }
+                Some(Err(e)) => {
+                    let class = Self::classify_error(&e);
+                    match class {
+                        ErrorClass::RateLimited
+                        | ErrorClass::Http(429)
+                        | ErrorClass::Http(503)
+                        | ErrorClass::Http(504) => {
+                            self.limiter.on_rate_limit();
+                            crate::metrics::RPC_RATE_LIMIT_HITS_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        ErrorClass::Timeout => {
+                            self.limiter.on_timeout();
+                        }
+                        ErrorClass::Other => {}
+                        ErrorClass::Http(_) => {}
+                    }
+                    // Allow one more retry for heavy calls
+                    if !Self::is_transient_error(&e) || attempt >= 3 {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                    crate::metrics::RPC_RETRY_ATTEMPTS_TOTAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Self::sleep_with_backoff(attempt, class).await;
+                }
+                None => {
+                    if attempt >= 3 {
                         return Err(e_against_timeout());
                     }
                     attempt += 1;
