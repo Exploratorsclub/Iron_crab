@@ -4,7 +4,7 @@
 # --- Application ---
 [app]
 name = "ironcrab-prod"
-log_level = "info"          # trace|debug|info|warn|error
+log_level = "debug"          # trace|debug|info|warn|error (temporär für Fehlersuche)
 autosave_state_secs = 30
 
 # --- Solana RPC & Keypair ---
@@ -12,8 +12,9 @@ autosave_state_secs = 30
 # - Use reliable RPC/WS endpoints (paid provider recommended for live trading)
 # - keypair_path must point to an existing file; on Windows, do NOT use ~
 [solana]
-rpc_url = "https://api.mainnet-beta.solana.com"
-ws_url  = "wss://api.mainnet-beta.solana.com"
+# Lokale Node: HTTP RPC auf 8899, PubSub (WS) auf 8900
+rpc_url = "http://127.0.0.1:8899"
+ws_url  = "ws://127.0.0.1:8900"
 keypair_path = "C:\\Users\\Robert Onuk\\.config\\solana\\id.json"
 # Optional adaptive concurrency (safe defaults)
 # rpc_min_concurrency = 8
@@ -22,6 +23,10 @@ keypair_path = "C:\\Users\\Robert Onuk\\.config\\solana\\id.json"
 # rpc_inc_every_successes = 64
 # rpc_dec_on_rate_limit = 4
 # rpc_timeout_ms = 10000
+# Optional: WS-Failover (nicht genutzt bei lokaler Node)
+# ws_failover_urls = []
+# ws_connect_timeout_ms = 8000
+# ws_max_backoff_ms = 20000
 
 # --- Markets (sum must be 100) ---
 [[markets]]
@@ -104,3 +109,34 @@ log_cleanup_interval_hours = 24
 # take_profit_tiers = [ { bps = 500, fraction = 0.3 }, { bps = 1000, fraction = 0.3 }, { bps = 1500, fraction = 0.4 } ]
 # trailing_stop_bps = 300
 # min_exit_notional_sol = 0.02
+
+# Explizit abonnierte DEX-Programme für WS-Logs (Raydium AMM v4, Orca Whirlpool)
+program_ids = [
+	"675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM v4
+	"whirLbMiicV3QDeqAD9nukHf8stYwh5GozfX6rS3SAm",  # Orca Whirlpool
+]
+
+# --- Arbitrage (nur zur Discovery/Fehlersuche aktiviert) ---
+[arbitrage]
+pairs = []                # keine statischen Paare im Debug
+interval_ms = 2000
+min_profit_bps = 10
+est_tx_cost_lamports = 10000
+
+[arbitrage.discovery]
+enable = true
+mode = "discovery-only"   # nur CSV-Logging, keine automatische Ausführung
+log_all_inits = true       # diagnostisch: alle init-ähnlichen Logs erfassen
+# Fokus-Anchor (leer = alle erlaubt)
+base_tokens = [
+	"So11111111111111111111111111111111111111112", # SOL
+	"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", # USDC
+	"Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", # USDT
+]
+min_liquidity_sol = 20.0      # wenn SOL-Seite, min. 20 SOL Gesamtreserven
+min_liquidity_usd = 10000.0   # wenn USD-Stable-Seite, min. 10k USD
+default_ui_amount = 0.05      # Scan-Menge
+top_n_per_base = 20           # Ranking-Kappe pro Base
+interval_secs = 30            # Discovery-Intervall
+enable_raydium = true
+enable_orca = true
