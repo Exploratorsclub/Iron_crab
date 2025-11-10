@@ -19,7 +19,7 @@ keypair_path = "/home/ironcrab/.config/solana/id.json"  # adjust to your user/pa
 rpc_min_concurrency = 8
 rpc_max_concurrency = 32
 rpc_initial_concurrency = 12
-rpc_timeout_ms = 12000
+rpc_timeout_ms = 20000  # Raised from 12s -> 20s to better tolerate slow block production / local IO
 ## Some RPC/Proxies require WS subprotocol header "jsonrpc" for PubSub
 ws_headers = { "Sec-WebSocket-Protocol" = "jsonrpc" }
 

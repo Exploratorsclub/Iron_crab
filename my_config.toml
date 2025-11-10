@@ -22,7 +22,7 @@ keypair_path = "C:\\Users\\Robert Onuk\\.config\\solana\\id.json"
 # rpc_initial_concurrency = 16
 # rpc_inc_every_successes = 64
 # rpc_dec_on_rate_limit = 4
-# rpc_timeout_ms = 10000
+rpc_timeout_ms = 20000  # Increase HTTP RPC timeout to 20s to reduce spurious timeouts on local node
 # Optional: WS-Failover (nicht genutzt bei lokaler Node)
 # ws_failover_urls = []
 # ws_connect_timeout_ms = 8000
