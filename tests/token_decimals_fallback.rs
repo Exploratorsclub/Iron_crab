@@ -67,12 +67,12 @@ mod tests {
         // This would require mocking the RPC client to return a successful token supply response
 
         // For demonstration, let's check the metrics tracking works correctly
-    // Due to parallel test execution, global metrics may be incremented by
-    // other tests running concurrently. We only assert that metrics are readable.
-    let initial_metrics = get_decimals_metrics();
-    assert!(initial_metrics.0 < u64::MAX);
-    assert!(initial_metrics.1 < u64::MAX);
-    assert!(initial_metrics.2 < u64::MAX);
+        // Due to parallel test execution, global metrics may be incremented by
+        // other tests running concurrently. We only assert that metrics are readable.
+        let initial_metrics = get_decimals_metrics();
+        assert!(initial_metrics.0 < u64::MAX);
+        assert!(initial_metrics.1 < u64::MAX);
+        assert!(initial_metrics.2 < u64::MAX);
 
         // In a real test with proper mocking:
         // let mock_client = MockRpcClient::new().with_supply_success(6);

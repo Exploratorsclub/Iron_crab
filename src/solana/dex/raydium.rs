@@ -1146,11 +1146,11 @@ impl Raydium {
 pub mod reader {
     use crate::backtest::replay_rpc::ReplayRpc;
     use anyhow::{anyhow, Result};
+    use solana_account_decoder::UiAccountEncoding; // Needed for Base64 account encoding switch
     use solana_client::rpc_client::RpcClient;
     use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
     use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
     use solana_sdk::{account::Account, pubkey::Pubkey};
-    use solana_account_decoder::UiAccountEncoding; // Needed for Base64 account encoding switch
     use std::str::FromStr;
 
     pub const LIQ_STATE_V4_SIZE: usize = 752;

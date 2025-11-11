@@ -18,6 +18,7 @@ Thumbs.db
 *.log
 *.tmp
 *.cache
+docs/Log
 
 # Python (strategies folder may use virtual envs)
 __pycache__/
