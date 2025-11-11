@@ -5,6 +5,46 @@ Legacy (Solana 1.18 baseline): tag `v0.2.1-solana1_18`.
 
 > Migration in progress. See `MIGRATION.md` for details on the upgrade from the legacy 1.18 toolchain to Agave / 3.x crates. The active development branch is `solana3x_clean` (may be renamed / merged soon).
 
+## Validator Entry Point Latency Testing
+To select the fastest Solana mainnet-beta entrypoints (Gossip port 8001) from your Frankfurt host you can use the helper script:
+
+```bash
+docs/tools/entrypoint_latency_test_v2.sh --with-gossip --rpc
+```
+
+Features:
+- TCP handshake timing (ms) for Gossip (8001) and optional RPC (8899)
+- CSV output saved to `/tmp/entrypoints_latency.csv`
+- Sorted recommendation list (top 4 printed as ready `--entrypoint host:8001` lines)
+- Optional gossip peer discovery (requires `solana-gossip` in PATH)
+
+Common usage patterns:
+
+```bash
+# Default entrypoints only (Gossip latency)
+docs/tools/entrypoint_latency_test_v2.sh
+
+# Also measure RPC port connect times
+docs/tools/entrypoint_latency_test_v2.sh --rpc
+
+# Discover additional low-latency peers via gossip
+docs/tools/entrypoint_latency_test_v2.sh --with-gossip
+
+# Custom host list
+docs/tools/entrypoint_latency_test_v2.sh --host entrypoint.mainnet-beta.anza.xyz,entrypoint3.mainnet-beta.anza.xyz --rpc
+
+# Limit default list to first N (e.g. 4)
+docs/tools/entrypoint_latency_test_v2.sh --limit 4
+```
+
+Interpreting results:
+- Prefer TCP 8001 connect times < 70ms (Frankfurt typical best ~15ms).
+- Keep 3–6 entrypoints: 2–3 very low latency + 1–2 backups.
+- Re-run occasionally; anycast routing can shift.
+- After adding peers: validator peer count should exceed ~40 quickly for faster snapshot propagation.
+
+Add lines produced by the script into your validator launch (each as separate `--entrypoint host:8001`). Review trust & stability before adding unknown peers.
+
 ## Features (aktueller Stand)
 Core
 - Treasury: ATA Erstellung, SPL Transfers, WSOL wrap/unwrap
