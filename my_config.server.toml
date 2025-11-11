@@ -4,7 +4,7 @@
 # --- Application ---
 [app]
 name = "ironcrab-prod"
-log_level = "debug"  # temporär für WS/Discovery Fehlersuche
+log_level = "info"  # zurück auf normales Niveau
 autosave_state_secs = 30
 
 # --- Solana RPC & Keypair (Linux paths) ---
@@ -102,8 +102,8 @@ pairs = []  # ignored when discovery.mode = "full-auto"
 
 [arbitrage.discovery]
 enable = true
-mode = "discovery-only"  # bleibt vorerst beim Logging
-log_all_inits = true      # diagnostisch: alle init-ähnlichen Logs erfassen
+mode = "discovery-only"
+log_all_inits = false     # reduziert: nur relevante Kandidaten/Filter Logs
 base_tokens = [
 	"So11111111111111111111111111111111111111112",  # SOL
 	"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC

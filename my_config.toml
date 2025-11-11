@@ -4,7 +4,7 @@
 # --- Application ---
 [app]
 name = "ironcrab-prod"
-log_level = "debug"          # trace|debug|info|warn|error (temporär für Fehlersuche)
+log_level = "info"            # zurück auf normales Produktionsniveau
 autosave_state_secs = 30
 
 # --- Solana RPC & Keypair ---
@@ -125,8 +125,8 @@ est_tx_cost_lamports = 10000
 
 [arbitrage.discovery]
 enable = true
-mode = "discovery-only"   # nur CSV-Logging, keine automatische Ausführung
-log_all_inits = true       # diagnostisch: alle init-ähnlichen Logs erfassen
+mode = "discovery-only"
+log_all_inits = false      # reduziert: nur wesentliche Discovery Logs
 # Fokus-Anchor (leer = alle erlaubt)
 base_tokens = [
 	"So11111111111111111111111111111111111111112", # SOL
