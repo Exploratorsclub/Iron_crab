@@ -16,7 +16,6 @@ MemoryHigh=220G
 # Restart strategy
 Restart=always
 RestartSec=15s
-StartLimitIntervalSec=300
 StartLimitBurst=5
 
 # File descriptor limit (large for many connections)
@@ -36,11 +35,11 @@ IOSchedulingPriority=4
 # These lines show safe options reducing memory usage; DO NOT duplicate ExecStart here unless overriding.
 # --no-voting if you only need an RPC node (not producing blocks)
 # --full-rpc-api for complete RPC features, or omit for lighter footprint
+# --pubsub-port <PORT> (deprecated/removed in Agave; WebSocket shares --rpc-port)
 # --accounts-index-path /mnt/fastssd/accounts-index
 # --accounts-index-memory-limit-mb 65536
 # --limit-ledger-size 50000000
 # --tpu-disable-quic (if QUIC not required / causing churn)
-# --no-os-network-limits
 # --rocksdb-shred-compaction (if supported by your version)
 # --geyser-plugin <remove for now to reduce memory>
 

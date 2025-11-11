@@ -14,6 +14,8 @@ LOG_FILE=/home/sol/solana-rpc.log
 # --- Networking ---
 RPC_BIND=127.0.0.1           # local-only; expose via reverse proxy if needed
 RPC_PORT=8899
+# NOTE: Agave/modern solana-validator serves WebSocket on the same RPC port;
+# no separate --pubsub-port flag is supported. WS_PORT kept for reference only.
 WS_PORT=8900
 GOSSIP_PORT=8001
 DYN_PORT_RANGE=8000-8020
@@ -41,7 +43,6 @@ exec "$BIN" \
   --limit-ledger-size "$LEDGER_LIMIT" \
   --rpc-port "$RPC_PORT" \
   --rpc-bind-address "$RPC_BIND" \
-  --pubsub-port "$WS_PORT" \
   --gossip-port "$GOSSIP_PORT" \
   --dynamic-port-range "$DYN_PORT_RANGE" \
   --full-rpc-api \
@@ -51,7 +52,6 @@ exec "$BIN" \
   --account-index-include-key "$RAYDIUM_AMM_V4" \
   --account-index-include-key "$ORCA_WHIRL" \
   $( $DISABLE_QUIC && echo --tpu-disable-quic ) \
-  --no-os-network-limits \
   --entrypoint entrypoint.mainnet-beta.anza.xyz:8001 \
   --entrypoint entrypoint2.mainnet-beta.anza.xyz:8001 \
   --entrypoint entrypoint3.mainnet-beta.anza.xyz:8001 \
