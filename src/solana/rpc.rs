@@ -615,7 +615,10 @@ impl SolanaRpc {
         let mut attempt = 0u32;
         loop {
             match self
-                .with_timeout(self.rpc.get_program_accounts_with_config(program_id, cfg.clone()))
+                .with_timeout(
+                    self.rpc
+                        .get_program_accounts_with_config(program_id, cfg.clone()),
+                )
                 .await
             {
                 Some(Ok(v)) => {
