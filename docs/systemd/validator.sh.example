@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Example launch script for Agave/Solana validator as RPC node.
+# Use this as a template and call it from your systemd unit ExecStart.
+
+# --- Paths (adjust to your filesystem) ---
+LEDGER_DIR=/mnt/solana/ledger
+ACCOUNTS_DIR=/mnt/solana/accounts
+ACCOUNTS_INDEX_DIR=/mnt/solana/accounts-index
+
+# --- Networking ---
+RPC_BIND=127.0.0.1
+RPC_PORT=8899
+WS_PORT=8900
+# TPU/QUIC may be disabled if not needed for your RPC workload.
+DISABLE_QUIC=true
+
+# --- Memory / Index tuning ---
+ACCOUNTS_INDEX_MEM_MB=65536   # 64G; tune to your RAM
+LEDGER_LIMIT=50000000         # prune, keeps disk use in check
+
+# --- Mode ---
+RPC_ONLY=true   # if true, add --no-voting
+FULL_RPC=true   # if true, add --full-rpc-api
+
+BIN=${BIN:-/usr/local/bin/solana-validator}
+
+exec "$BIN" \
+  --ledger "$LEDGER_DIR" \
+  --accounts "$ACCOUNTS_DIR" \
+  --accounts-index-path "$ACCOUNTS_INDEX_DIR" \
+  --accounts-index-memory-limit-mb "$ACCOUNTS_INDEX_MEM_MB" \
+  --limit-ledger-size "$LEDGER_LIMIT" \
+  $( $RPC_ONLY && echo --no-voting ) \
+  $( $FULL_RPC && echo --full-rpc-api ) \
+  --rpc-bind-address "$RPC_BIND" \
+  --rpc-port "$RPC_PORT" \
+  --pubsub-port "$WS_PORT" \
+  $( $DISABLE_QUIC && echo --tpu-disable-quic ) \
+  --no-os-network-limits \
+  --dynamic-port-range 8000-8020 \
+  --log -
+
+# Notes:
+# 1) Prefer setting MALLOC_CONF via systemd (Environment=) rather than here.
+# 2) Ensure LEDGER_DIR, ACCOUNTS_DIR, ACCOUNTS_INDEX_DIR live on fast SSD/NVMe.
+# 3) If you run a full validator (not only RPC), remove --no-voting and QUIC disable.
+# 4) If you use geyser/plugins, add them later once stable.
