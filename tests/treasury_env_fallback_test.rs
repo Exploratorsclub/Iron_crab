@@ -4,8 +4,11 @@ mod tests {
     use ironcrab::wallet::Treasury;
     use std::env;
     use tempfile::TempDir;
+    // Serialize tests that mutate process-wide environment variables to avoid CI flakiness
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_treasury_env_fallback_pattern() {
         // Clear any existing env vars
         env::remove_var("IRONCRAB_KEYPAIR_JSON");
@@ -59,6 +62,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_treasury_env_formats() {
         // Clear env vars
         env::remove_var("IRONCRAB_KEYPAIR_JSON");
@@ -89,6 +93,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_main_rs_fallback_pattern() {
         // This test specifically verifies the pattern used in main.rs works
         // Clear env vars
