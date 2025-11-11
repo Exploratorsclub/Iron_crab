@@ -235,7 +235,8 @@ impl Orca {
 #[async_trait]
 impl Dex for Orca {
     async fn refresh_pools(&self) -> Result<()> {
-        use crate::metrics::ORCA_POOLS_SKIPPED_ZERO_RESERVE;
+    use crate::metrics::ORCA_POOLS_SKIPPED_ZERO_RESERVE;
+    use solana_account_decoder::UiAccountEncoding;
         use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
         use solana_client::rpc_filter::RpcFilterType;
         use solana_sdk::pubkey::Pubkey;
@@ -247,7 +248,7 @@ impl Dex for Orca {
         let size_filter = RpcFilterType::DataSize(WHIRLPOOL_ACCOUNT_MAX_SIZE as u64);
         let filters = Some(vec![size_filter]);
         let acc_cfg = RpcAccountInfoConfig {
-            encoding: None,
+            encoding: Some(UiAccountEncoding::Base64),
             data_slice: None,
             commitment: None,
             min_context_slot: None,

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use super::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 use dashmap::DashMap;
+use solana_account_decoder::UiAccountEncoding;
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
 use solana_sdk::instruction::Instruction;
@@ -481,7 +482,7 @@ impl Dex for Raydium {
         use std::time::{Duration, SystemTime};
         tracing::trace!("raydium.refresh_pools() start");
         let acc_cfg = RpcAccountInfoConfig {
-            encoding: None,
+            encoding: Some(UiAccountEncoding::Base64),
             data_slice: None,
             commitment: None,
             min_context_slot: None,
@@ -1149,6 +1150,7 @@ pub mod reader {
     use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
     use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
     use solana_sdk::{account::Account, pubkey::Pubkey};
+    use solana_account_decoder::UiAccountEncoding; // Needed for Base64 account encoding switch
     use std::str::FromStr;
 
     pub const LIQ_STATE_V4_SIZE: usize = 752;
@@ -1251,7 +1253,7 @@ pub mod reader {
         }
 
         let acc_cfg = RpcAccountInfoConfig {
-            encoding: None,
+            encoding: Some(UiAccountEncoding::Base64),
             data_slice: None,
             commitment: None, // use node default
             min_context_slot: None,
