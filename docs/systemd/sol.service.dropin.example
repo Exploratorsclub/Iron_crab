@@ -1,0 +1,68 @@
+# systemd drop-in for sol.service to mitigate OOM and stabilize Agave/Solana RPC
+# Place this file as: /etc/systemd/system/sol.service.d/override.conf
+# Then run: sudo systemctl daemon-reload && sudo systemctl restart sol
+# Adjust memory limits and paths to match your hardware.
+
+[Service]
+# jemalloc tuning: background thread reduces fragmentation, decay trims memory
+Environment="MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000"
+
+# Memory guardrails (tune to your RAM; example for a 512G machine)
+MemoryMax=256G
+MemoryHigh=220G
+# If you want kill-on-limit sooner: MemorySwapMax=0 (disables swap usage for the unit)
+#MemorySwapMax=0
+
+# Restart strategy
+Restart=always
+RestartSec=15s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# File descriptor limit (large for many connections)
+LimitNOFILE=1000000
+
+# CPU / IO priorities (validator vs bot separation)
+Nice=0
+IOSchedulingClass=best-effort
+IOSchedulingPriority=4
+# Optionally pin validator to lower half cores if bot uses upper half:
+#CPUAffinity=0-47
+
+# Environment directory (optional)
+#EnvironmentFile=-/etc/solana/validator.env
+
+# Example additional ExecStart flags (EDIT your main unit instead if needed):
+# These lines show safe options reducing memory usage; DO NOT duplicate ExecStart here unless overriding.
+# --no-voting if you only need an RPC node (not producing blocks)
+# --full-rpc-api for complete RPC features, or omit for lighter footprint
+# --accounts-index-path /mnt/fastssd/accounts-index
+# --accounts-index-memory-limit-mb 65536
+# --limit-ledger-size 50000000
+# --tpu-disable-quic (if QUIC not required / causing churn)
+# --no-os-network-limits
+# --rocksdb-shred-compaction (if supported by your version)
+# --geyser-plugin <remove for now to reduce memory>
+
+# If you need to override ExecStart completely, create a separate override file with: 
+# ExecStart=
+# ExecStart=/usr/local/bin/solana-validator <FLAGS>
+
+# Diagnostics: expose memory current value via cgroup path:
+# cat /sys/fs/cgroup/system.slice/sol.service/memory.current
+
+# OOM policy (log and restart instead of immediate kill cascade)
+OOMPolicy=continue
+
+# Security hardening (optional)
+# NoNewPrivileges=true
+# ProtectKernelTunables=true
+# ProtectControlGroups=true
+# ProtectHome=true
+# PrivateTmp=true
+
+# Notes:
+# 1. MemoryMax prevents runaway RSS; tune after observing steady-state usage.
+# 2. Lower accounts-index-memory-limit-mb if still OOM; 32G = 32768.
+# 3. If ledger directory is huge, prune with --limit-ledger-size and use snapshots.
+# 4. QUIC disable can reduce resource churn; test with/without.
