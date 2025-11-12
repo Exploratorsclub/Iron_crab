@@ -4,13 +4,14 @@
 # Adjust memory limits and paths to match your hardware.
 
 [Service]
-# jemalloc tuning: background thread reduces fragmentation, decay trims memory
-Environment="MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000"
+# jemalloc tuning: background thread reduces fragmentation, decay trims memory faster under pressure
+Environment="MALLOC_CONF=background_thread:true,dirty_decay_ms:500,muzzy_decay_ms:500"
 
-# Memory guardrails (tune to your RAM; example for a 512G machine)
+# Memory guardrails (tune to your RAM; start conservative and raise gradually)
+# Example for a 512G machine; adjust High ~10–20% below Max to avoid swap thrash.
 MemoryMax=256G
 MemoryHigh=220G
-# If you want kill-on-limit sooner: MemorySwapMax=0 (disables swap usage for the unit)
+# To avoid swap thrash entirely for this unit, disable swap accounting for it:
 #MemorySwapMax=0
 
 # Restart strategy
@@ -25,7 +26,9 @@ LimitNOFILE=1000000
 Nice=0
 IOSchedulingClass=best-effort
 IOSchedulingPriority=4
-# Optionally pin validator to lower half cores if bot uses upper half:
+# NUMA note: On multi-socket systems, pinning all threads to a single socket can
+# increase remote memory access and memory pressure. Prefer not pinning, or pin
+# per-NUMA domain with numactl. Only set CPUAffinity if you know your topology.
 #CPUAffinity=0-47
 
 # Environment directory (optional)
@@ -65,3 +68,8 @@ OOMPolicy=continue
 # 2. Lower accounts-index-memory-limit-mb if still OOM; 32G = 32768.
 # 3. If ledger directory is huge, prune with --limit-ledger-size and use snapshots.
 # 4. QUIC disable can reduce resource churn; test with/without.
+# 5. If you see high swap usage (MemoryHigh hit frequently), set MemorySwapMax=0
+#    and raise MemoryHigh slightly; also cap validator with:
+#      --accounts-index-path /fastssd/accounts-index
+#      --accounts-index-memory-limit-mb 32768
+#      --accounts-db-cache-limit-mb 16384
