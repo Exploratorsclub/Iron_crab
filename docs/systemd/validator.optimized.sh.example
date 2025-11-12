@@ -22,7 +22,9 @@ DYN_PORT_RANGE=8000-8020
 DISABLE_QUIC=true            # reduce TPU churn for RPC-only
 
 # --- Memory / Index ---
-ACCOUNTS_INDEX_MEM_MB=32768  # 32G; increase to 64G if stable
+# Hinweis: Agave 2.3.11 unterstützt KEIN --accounts-index-memory-limit-mb.
+# Wir fügen das Flag nur hinzu, wenn die Binary es unterstützt (siehe have_flag unten).
+ACCOUNTS_INDEX_MEM_MB=32768  # nur wirksam, wenn Flag vorhanden
 ACCOUNTS_DB_CACHE_MB=32768   # 32G; keep balanced with index
 LEDGER_LIMIT=50000000
 
@@ -33,13 +35,16 @@ ORCA_WHIRL=whirLbMiicV3QDeqAD9nukHf8stYwh5GozfX6rS3SAm
 
 BIN=${BIN:-/home/sol/src/agave/target/release/agave-validator}
 
+have_flag() {
+  "$BIN" --help 2>/dev/null | grep -q -- "$1"
+}
+
 # Build args in an array to avoid fragile line-continuations with comments
 ARGS=(
   --identity "$IDENTITY"
   --ledger "$LEDGER_DIR"
   --accounts "$ACCOUNTS_DIR"
   --accounts-index-path "$ACCOUNTS_INDEX_DIR"
-  --accounts-index-memory-limit-mb "$ACCOUNTS_INDEX_MEM_MB"
   --accounts-db-cache-limit-mb "$ACCOUNTS_DB_CACHE_MB"
   --limit-ledger-size "$LEDGER_LIMIT"
   --rpc-port "$RPC_PORT"
@@ -50,6 +55,11 @@ ARGS=(
   --no-voting
   --private-rpc
 )
+
+# Nur setzen, wenn Flag vorhanden ist (neuere Agave-Versionen)
+if have_flag "--accounts-index-memory-limit-mb"; then
+  ARGS+=(--accounts-index-memory-limit-mb "$ACCOUNTS_INDEX_MEM_MB")
+fi
 
 # Optional: program-id index (RAM-intense). Enable AFTER stable catch-up.
 # ARGS+=(--account-index program-id)
