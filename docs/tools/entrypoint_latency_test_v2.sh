@@ -6,13 +6,16 @@ set -euo pipefail
 # Optionally discovers additional low-latency peers via solana-gossip.
 #
 # Usage:
-#   ./entrypoint_latency_test_v2.sh [--with-gossip] [--host host1,host2,...] [--rpc] [--limit N]
+#   ./entrypoint_latency_test_v2.sh [--with-gossip] [--host host1,host2,...] [--rpc] [--limit N] [--gossip-cmd CMD] [--gossip-timeout SEC] [--debug]
 #
 # Flags:
 #   --with-gossip   Run solana-gossip spy to discover fast peers
 #   --host list     Comma-separated host list (override defaults)
 #   --rpc           Also measure RPC port (8899) TCP connect
 #   --limit N       Limit number of default hosts used
+#   --gossip-cmd        Override gossip command (e.g. "sudo -u sol -H solana-gossip" or absolute path)
+#   --gossip-timeout    Seconds to run gossip spy (default 10)
+#   --debug             Keep raw gossip output & extra diagnostics (/tmp/gossip_raw.txt)
 #
 # Output:
 #   CSV: host,tcp8001_ms[,tcp8899_ms]
@@ -28,6 +31,9 @@ WITH_GOSSIP=false
 MEASURE_RPC=false
 CUSTOM_HOSTS=""
 LIMIT_DEFAULT=0
+GOSSIP_CMD=${GOSSIP_CMD:-solana-gossip}
+GOSSIP_TIMEOUT=10
+DEBUG=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -35,6 +41,9 @@ while [[ $# -gt 0 ]]; do
     --host) CUSTOM_HOSTS="$2"; shift 2 ;;
     --rpc) MEASURE_RPC=true; shift ;;
     --limit) LIMIT_DEFAULT="$2"; shift 2 ;;
+  --gossip-cmd) GOSSIP_CMD="$2"; shift 2 ;;
+  --gossip-timeout) GOSSIP_TIMEOUT="$2"; shift 2 ;;
+  --debug) DEBUG=true; shift ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
@@ -109,32 +118,66 @@ awk -F, 'NR>1 && $2!="" {print $1,$2}' "$CSV_FILE" | sort -k2,2n | head -4 | awk
 
 echo
 if $WITH_GOSSIP; then
-  if command -v solana-gossip >/dev/null 2>&1; then
-    echo "Discovering additional low-latency peers via solana-gossip (10s)..."
-    solana-gossip spy --entrypoint "$FASTEST:${GOSSIP_PORT}" --num-nodes 200 --timeout 10 --extended 2>/dev/null \
-      | awk '/:8001/ && /ms$/ { \
-          host=""; ms=""; \
-          for (i=1;i<=NF;i++){ \
-            if ($i ~ /:8001$/) host=$i; \
-            if ($i ~ /ms$/) ms=$i; \
-          } \
-          gsub(/ms$/, "", ms); \
-          if (host != "" && ms != "") print host "," ms; \
-        }' \
-      | sort -t, -k2,2n | head -15 > /tmp/gossip_peers.csv || true
+  gossip_available() { bash -lc "$GOSSIP_CMD --version" >/dev/null 2>&1; }
+  run_gossip() { bash -lc "$GOSSIP_CMD $*"; }
+  if gossip_available; then
+    echo "Discovering additional low-latency peers via solana-gossip (${GOSSIP_TIMEOUT}s)..."
+    RAW_GOSSIP=/tmp/gossip_raw.txt
+    # Capture raw output for robust parsing and optional debugging
+    if $DEBUG; then
+      echo "[debug] Using gossip command: $GOSSIP_CMD" >&2
+      echo "[debug] Writing raw gossip output to $RAW_GOSSIP" >&2
+    fi
+    run_gossip spy --entrypoint "$FASTEST:${GOSSIP_PORT}" --num-nodes 200 --timeout ${GOSSIP_TIMEOUT} --extended 2>/dev/null | tee "$RAW_GOSSIP" >/dev/null || true
+
+    # Parse multiple possible formats:
+    # - tokens like host:8001 ... 12ms or 12.3ms (anywhere in line)
+    # - strip trailing commas/parentheses from tokens
+    awk '
+      {
+        host=""; ms="";
+        # find host token first
+        for (i=1;i<=NF;i++) {
+          if ($i ~ /:8001[),]*$/) {
+            h=$i; gsub(/[),]$/, "", h); host=h; break;
+          }
+        }
+        # find first ms token
+        for (i=1;i<=NF && ms=="";i++) {
+          if ($i ~ /^[0-9]+(\.[0-9]+)?ms[),]*$/) {
+            m=$i; gsub(/[),]/, "", m); gsub(/ms$/, "", m); ms=m;
+          }
+        }
+        if (host != "" && ms != "") print host "," ms;
+      }
+    ' "$RAW_GOSSIP" | sort -u | sort -t, -k2,2n | head -15 > /tmp/gossip_peers.csv || true
+
+    # Fallback: try a more lenient grep-based extraction if nothing parsed
+    if [[ ! -s /tmp/gossip_peers.csv ]]; then
+      if $DEBUG; then echo "[debug] First 20 lines of raw gossip output:" >&2; head -20 "$RAW_GOSSIP" >&2; fi
+      paste <(
+        grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}:8001|[A-Za-z0-9.-]+:8001' "$RAW_GOSSIP" | head -200
+      ) <(
+        grep -Eo '[0-9]+(\.[0-9]+)?ms' "$RAW_GOSSIP" | sed 's/ms$//' | head -200
+      ) 2>/dev/null \
+      | awk '{print $1","$2}' \
+      | grep -E ":8001,([0-9]+(\.[0-9]+)?)$" \
+      | sort -u | sort -t, -k2,2n | head -15 > /tmp/gossip_peers.csv || true
+    fi
     if [[ -s /tmp/gossip_peers.csv ]]; then
       echo "Top gossip-derived peers:"; column -t -s, /tmp/gossip_peers.csv
       echo
       echo "Add lines (review trust & stability before using):"
       awk -F, '{printf "--entrypoint %s\n", $1}' /tmp/gossip_peers.csv
     else
-      echo "No peers parsed (output format may have changed)."
+      echo "No peers parsed (output format may have changed). Try --debug to inspect raw output at $RAW_GOSSIP."
     fi
   else
-    echo "solana-gossip not installed; skipping gossip discovery."
+    echo "gossip command not available: $GOSSIP_CMD ; skipping gossip discovery."
   fi
 else
   echo "(Skip gossip discovery; run with --with-gossip to enable)"
 fi
 
-echo "\nDone. CSV stored at $CSV_FILE"
+echo
+echo "Done. CSV stored at $CSV_FILE"
