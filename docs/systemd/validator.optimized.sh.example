@@ -33,30 +33,47 @@ ORCA_WHIRL=whirLbMiicV3QDeqAD9nukHf8stYwh5GozfX6rS3SAm
 
 BIN=${BIN:-/home/sol/src/agave/target/release/agave-validator}
 
-exec "$BIN" \
-  --identity "$IDENTITY" \
-  --ledger "$LEDGER_DIR" \
-  --accounts "$ACCOUNTS_DIR" \
-  --accounts-index-path "$ACCOUNTS_INDEX_DIR" \
-  --accounts-index-memory-limit-mb "$ACCOUNTS_INDEX_MEM_MB" \
-  --accounts-db-cache-limit-mb "$ACCOUNTS_DB_CACHE_MB" \
-  --limit-ledger-size "$LEDGER_LIMIT" \
-  --rpc-port "$RPC_PORT" \
-  --rpc-bind-address "$RPC_BIND" \
-  --gossip-port "$GOSSIP_PORT" \
-  --dynamic-port-range "$DYN_PORT_RANGE" \
-  --full-rpc-api \
-  --no-voting \
-  --private-rpc \
-  --account-index program-id \
-  --account-index-include-key "$RAYDIUM_AMM_V4" \
-  --account-index-include-key "$ORCA_WHIRL" \
-  $( $DISABLE_QUIC && echo --tpu-disable-quic ) \
-  --entrypoint entrypoint.mainnet-beta.anza.xyz:8001 \
-  --entrypoint entrypoint2.mainnet-beta.anza.xyz:8001 \
-  --entrypoint entrypoint3.mainnet-beta.anza.xyz:8001 \
-  --entrypoint entrypoint4.mainnet-beta.anza.xyz:8001 \
-  --log "$LOG_FILE"
+# Build args in an array to avoid fragile line-continuations with comments
+ARGS=(
+  --identity "$IDENTITY"
+  --ledger "$LEDGER_DIR"
+  --accounts "$ACCOUNTS_DIR"
+  --accounts-index-path "$ACCOUNTS_INDEX_DIR"
+  --accounts-index-memory-limit-mb "$ACCOUNTS_INDEX_MEM_MB"
+  --accounts-db-cache-limit-mb "$ACCOUNTS_DB_CACHE_MB"
+  --limit-ledger-size "$LEDGER_LIMIT"
+  --rpc-port "$RPC_PORT"
+  --rpc-bind-address "$RPC_BIND"
+  --gossip-port "$GOSSIP_PORT"
+  --dynamic-port-range "$DYN_PORT_RANGE"
+  --full-rpc-api
+  --no-voting
+  --private-rpc
+)
+
+# Optional: program-id index (RAM-intense). Enable AFTER stable catch-up.
+# ARGS+=(--account-index program-id)
+# ARGS+=(--account-index-include-key "$RAYDIUM_AMM_V4")
+# ARGS+=(--account-index-include-key "$ORCA_WHIRL")
+
+# TPU QUIC often unnecessary for RPC-only
+if [ "${DISABLE_QUIC}" = true ]; then
+  ARGS+=(--tpu-disable-quic)
+fi
+
+# Primary Frankfurt-low RTT anycast entrypoints (14-15ms observed)
+ARGS+=(--entrypoint entrypoint.mainnet-beta.anza.xyz:8001)
+ARGS+=(--entrypoint entrypoint3.mainnet-beta.anza.xyz:8001)
+ARGS+=(--entrypoint entrypoint4.mainnet-beta.anza.xyz:8001)
+# Backup anycast (kept for redundancy; slightly higher latency acceptable)
+ARGS+=(--entrypoint entrypoint2.mainnet-beta.anza.xyz:8001)
+
+# (Optional) Add discovered low-latency EU peers below after running 'solana-gossip spy'
+# ARGS+=(--entrypoint <eu-peer-host>:8001)
+
+ARGS+=(--log "$LOG_FILE")
+
+exec "$BIN" "${ARGS[@]}"
 
 # Notes:
 # - Remove the OpenBook index to avoid huge memory footprint.
@@ -64,3 +81,5 @@ exec "$BIN" \
 # - If stable, you can raise ACCOUNTS_INDEX_MEM_MB to 65536.
 # - Keep RPC bind local and front with a proxy if you need external access.
 # - QUIC disable reduces TPU worker channel saturation for RPC-only setups.
+# - To prune high-latency entrypoints: measure TCP connect times (<70ms ideal) and remove slower ones.
+# - After adding custom peers: restart validator; confirm peer count >40 within first minutes for faster snapshot propagation.
