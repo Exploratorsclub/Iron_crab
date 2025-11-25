@@ -9,10 +9,10 @@ Environment="MALLOC_CONF=background_thread:true,dirty_decay_ms:500,muzzy_decay_m
 
 # Memory guardrails (tune to your RAM; start conservative and raise gradually)
 # Example for a 512G machine; adjust High ~10–20% below Max to avoid swap thrash.
-MemoryMax=256G
-MemoryHigh=220G
-# To avoid swap thrash entirely for this unit, disable swap accounting for it:
-#MemorySwapMax=0
+MemoryMax=480G
+MemoryHigh=400G
+# To avoid swap thrash entirely for this unit, disable swap accounting (strongly recommended):
+MemorySwapMax=0
 
 # Restart strategy
 Restart=always
@@ -23,13 +23,19 @@ StartLimitBurst=5
 LimitNOFILE=1000000
 
 # CPU / IO priorities (validator vs bot separation)
-Nice=0
+Nice=-5
 IOSchedulingClass=best-effort
-IOSchedulingPriority=4
-# NUMA note: On multi-socket systems, pinning all threads to a single socket can
-# increase remote memory access and memory pressure. Prefer not pinning, or pin
-# per-NUMA domain with numactl. Only set CPUAffinity if you know your topology.
+IOSchedulingPriority=0
+
+# CPUAffinity: AVOID unless you have a clear NUMA topology plan.
+# Pinning all threads to one socket increases remote memory access and RAM pressure.
+# Prefer letting the kernel schedule freely, or use numactl per-NUMA-domain pinning.
+# DO NOT set CPUAffinity blindly.
 #CPUAffinity=0-47
+
+# CPU/IO weights (cgroups v2)
+CPUWeight=1000
+IOWeight=1000
 
 # Environment directory (optional)
 #EnvironmentFile=-/etc/solana/validator.env
@@ -55,6 +61,7 @@ IOSchedulingPriority=4
 
 # OOM policy (log and restart instead of immediate kill cascade)
 OOMPolicy=continue
+OOMScoreAdjust=-500
 
 # Security hardening (optional)
 # NoNewPrivileges=true
@@ -64,12 +71,12 @@ OOMPolicy=continue
 # PrivateTmp=true
 
 # Notes:
-# 1. MemoryMax prevents runaway RSS; tune after observing steady-state usage.
-# 2. Lower accounts-index-memory-limit-mb if still OOM; 32G = 32768.
-# 3. If ledger directory is huge, prune with --limit-ledger-size and use snapshots.
-# 4. QUIC disable can reduce resource churn; test with/without.
-# 5. If you see high swap usage (MemoryHigh hit frequently), set MemorySwapMax=0
-#    and raise MemoryHigh slightly; also cap validator with:
-#      --accounts-index-path /fastssd/accounts-index
-#      --accounts-index-memory-limit-mb 32768
-#      --accounts-db-cache-limit-mb 16384
+# 1. MemorySwapMax=0 is strongly recommended to prevent swap-thrashing.
+# 2. MemoryHigh should be 10-20% below MemoryMax for best performance.
+# 3. OOMScoreAdjust=-500 protects validator from OOM killer without being too aggressive.
+# 4. For Agave 2.3.11: use --accounts-db-cache-limit-mb 16384 initially.
+#    Agave 2.3.11 lacks --accounts-index-memory-limit-mb flag.
+# 5. After stable catch-up: raise cache to 32768, enable --full-rpc-api and program-id indexes.
+# 6. DO NOT use CPUAffinity unless you understand NUMA topology - causes RAM pressure issues.
+# 7. Place accounts-index-path on fast SSD/NVMe for best performance.
+# 8. Monitor with: cat /sys/fs/cgroup/system.slice/sol.service/memory.current

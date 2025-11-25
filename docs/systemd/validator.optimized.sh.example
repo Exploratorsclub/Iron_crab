@@ -23,9 +23,9 @@ DISABLE_QUIC=true            # reduce TPU churn for RPC-only
 
 # --- Memory / Index ---
 # Hinweis: Agave 2.3.11 unterstützt KEIN --accounts-index-memory-limit-mb.
-# Wir fügen das Flag nur hinzu, wenn die Binary es unterstützt (siehe have_flag unten).
-ACCOUNTS_INDEX_MEM_MB=32768  # nur wirksam, wenn Flag vorhanden
-ACCOUNTS_DB_CACHE_MB=32768   # 32G; keep balanced with index
+# Konservativ für ersten stabilen Catch-up starten, dann schrittweise erhöhen.
+ACCOUNTS_INDEX_MEM_MB=32768  # nur wirksam, wenn Flag vorhanden (nicht in 2.3.11)
+ACCOUNTS_DB_CACHE_MB=16384   # 16G konservativ; nach Catch-up auf 32G erhöhen
 LEDGER_LIMIT=50000000
 
 # --- DEX Programs to index (Raydium v4, Orca Whirlpool); DO NOT index OpenBook for now ---
@@ -51,17 +51,19 @@ ARGS=(
   --rpc-bind-address "$RPC_BIND"
   --gossip-port "$GOSSIP_PORT"
   --dynamic-port-range "$DYN_PORT_RANGE"
-  --full-rpc-api
   --no-voting
   --private-rpc
 )
 
-# Nur setzen, wenn Flag vorhanden ist (neuere Agave-Versionen)
+# Nur setzen, wenn Flag vorhanden ist (neuere Agave-Versionen; nicht in 2.3.11)
 if have_flag "--accounts-index-memory-limit-mb"; then
   ARGS+=(--accounts-index-memory-limit-mb "$ACCOUNTS_INDEX_MEM_MB")
 fi
 
-# Optional: program-id index (RAM-intense). Enable AFTER stable catch-up.
+# --full-rpc-api: Aktiviere NACH stabilem Catch-up (reduziert Last beim Replay)
+# ARGS+=(--full-rpc-api)
+
+# Optional: program-id index (RAM-intensiv). Enable AFTER stable catch-up.
 # ARGS+=(--account-index program-id)
 # ARGS+=(--account-index-include-key "$RAYDIUM_AMM_V4")
 # ARGS+=(--account-index-include-key "$ORCA_WHIRL")
@@ -86,10 +88,11 @@ ARGS+=(--log "$LOG_FILE")
 exec "$BIN" "${ARGS[@]}"
 
 # Notes:
-# - Remove the OpenBook index to avoid huge memory footprint.
 # - Place ACCOUNTS_INDEX_DIR on fast SSD/NVMe; ensure directory exists and owned by 'sol'.
-# - If stable, you can raise ACCOUNTS_INDEX_MEM_MB to 65536.
-# - Keep RPC bind local and front with a proxy if you need external access.
+# - Start with ACCOUNTS_DB_CACHE_MB=16384; after stable catch-up raise to 32768.
+# - Agave 2.3.11 lacks --accounts-index-memory-limit-mb (script guards it).
+# - Enable --full-rpc-api and program-id indexes AFTER catch-up completes.
+# - Keep RPC bind local (127.0.0.1) and front with a reverse proxy for external access.
 # - QUIC disable reduces TPU worker channel saturation for RPC-only setups.
-# - To prune high-latency entrypoints: measure TCP connect times (<70ms ideal) and remove slower ones.
-# - After adding custom peers: restart validator; confirm peer count >40 within first minutes for faster snapshot propagation.
+# - To prune high-latency entrypoints: use entrypoint_latency_test_v2.sh (<70ms ideal).
+# - After adding custom peers: restart validator; confirm peer count >40 for faster propagation.
