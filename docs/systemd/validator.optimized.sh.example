@@ -24,7 +24,6 @@ DISABLE_QUIC=true            # reduce TPU churn for RPC-only
 # --- Memory / Index ---
 # Hinweis: Agave 2.3.11 unterstützt KEIN --accounts-index-memory-limit-mb.
 # Konservativ für ersten stabilen Catch-up starten, dann schrittweise erhöhen.
-ACCOUNTS_INDEX_MEM_MB=32768  # nur wirksam, wenn Flag vorhanden (nicht in 2.3.11)
 ACCOUNTS_DB_CACHE_MB=16384   # 16G konservativ; nach Catch-up auf 32G erhöhen
 LEDGER_LIMIT=50000000
 
@@ -34,10 +33,6 @@ ORCA_WHIRL=whirLbMiicV3QDeqAD9nukHf8stYwh5GozfX6rS3SAm
 # OPENBOOK_V3=9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin  # disabled intentionally
 
 BIN=${BIN:-/home/sol/src/agave/target/release/agave-validator}
-
-have_flag() {
-  "$BIN" --help 2>/dev/null | grep -q -- "$1"
-}
 
 # Build args in an array to avoid fragile line-continuations with comments
 ARGS=(
@@ -55,21 +50,19 @@ ARGS=(
   --private-rpc
 )
 
-# Nur setzen, wenn Flag vorhanden ist (neuere Agave-Versionen; nicht in 2.3.11)
-if have_flag "--accounts-index-memory-limit-mb"; then
-  ARGS+=(--accounts-index-memory-limit-mb "$ACCOUNTS_INDEX_MEM_MB")
-fi
+# Agave 2.3.11 hat kein --accounts-index-memory-limit-mb (würde Exit 1 verursachen)
+# Falls neuere Version: manuell hinzufügen nach Bestätigung mit agave-validator --help
 
-# --full-rpc-api: Aktiviere NACH stabilem Catch-up (reduziert Last beim Replay)
-# ARGS+=(--full-rpc-api)
-
-# Optional: program-id index (RAM-intensiv). Enable AFTER stable catch-up.
+# Optional: program-id index (RAM-intense). Enable AFTER stable catch-up.
 # ARGS+=(--account-index program-id)
 # ARGS+=(--account-index-include-key "$RAYDIUM_AMM_V4")
 # ARGS+=(--account-index-include-key "$ORCA_WHIRL")
 
+# Optional: --full-rpc-api (enable AFTER stable catch-up to reduce initial load)
+# ARGS+=(--full-rpc-api)
+
 # TPU QUIC often unnecessary for RPC-only
-if [ "${DISABLE_QUIC}" = true ]; then
+if [ "$DISABLE_QUIC" = true ]; then
   ARGS+=(--tpu-disable-quic)
 fi
 
@@ -89,10 +82,11 @@ exec "$BIN" "${ARGS[@]}"
 
 # Notes:
 # - Place ACCOUNTS_INDEX_DIR on fast SSD/NVMe; ensure directory exists and owned by 'sol'.
-# - Start with ACCOUNTS_DB_CACHE_MB=16384; after stable catch-up raise to 32768.
-# - Agave 2.3.11 lacks --accounts-index-memory-limit-mb (script guards it).
-# - Enable --full-rpc-api and program-id indexes AFTER catch-up completes.
-# - Keep RPC bind local (127.0.0.1) and front with a reverse proxy for external access.
+# - Phased approach: stable catch-up first (16GB cache, no program-index, no full-rpc-api),
+#   then gradually enable features and increase cache to 32GB.
+# - Agave 2.3.11 limitations: no --accounts-index-memory-limit-mb support.
+# - Keep RPC bind local (127.0.0.1) and front with a proxy if you need external access.
 # - QUIC disable reduces TPU worker channel saturation for RPC-only setups.
 # - To prune high-latency entrypoints: use entrypoint_latency_test_v2.sh (<70ms ideal).
 # - After adding custom peers: restart validator; confirm peer count >40 for faster propagation.
+# - Monitor: journalctl -u sol -f, solana catchup --our-localhost, check VmRSS/VmSwap.
