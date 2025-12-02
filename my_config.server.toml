@@ -4,7 +4,7 @@
 # --- Application ---
 [app]
 name = "ironcrab-prod"
-log_level = "info"  # zurück auf normales Niveau
+log_level = "debug"  # temporarily raise to see discovery details
 autosave_state_secs = 30
 
 # --- Solana RPC & Keypair (Linux paths) ---
@@ -103,7 +103,7 @@ pairs = []  # ignored when discovery.mode = "full-auto"
 [arbitrage.discovery]
 enable = true
 mode = "discovery-only"
-log_all_inits = false     # reduziert: nur relevante Kandidaten/Filter Logs
+log_all_inits = true     # enable to see what pools are found
 base_tokens = [
 	"So11111111111111111111111111111111111111112",  # SOL
 	"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
@@ -115,4 +115,4 @@ default_ui_amount = 0.05
 top_n_per_base = 10
 interval_secs = 120        # entlastet RPC (Raydium/Orca Scans seltener)
 enable_raydium = true
-enable_orca = false
+enable_orca = true
