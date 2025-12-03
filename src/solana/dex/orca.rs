@@ -10,9 +10,9 @@ use crate::solana::rpc::SolanaRpc;
 use solana_sdk::instruction::Instruction;
 
 pub const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"; // corrected
-                                                                                        // Approximate Whirlpool account size (may vary by version). Adjust if mismatch logged repeatedly.
-pub const WHIRLPOOL_ACCOUNT_MIN_SIZE: usize = 400; // conservative lower bound
-pub const WHIRLPOOL_ACCOUNT_MAX_SIZE: usize = 800; // safety upper bound
+                                                                                        // Whirlpool account size is 653 bytes
+pub const WHIRLPOOL_ACCOUNT_MIN_SIZE: usize = 650; // lower bound
+pub const WHIRLPOOL_ACCOUNT_MAX_SIZE: usize = 653; // exact size
 
 use super::orca_whirlpool_layout as layout;
 use dashmap::DashMap;
