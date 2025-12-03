@@ -132,20 +132,58 @@ impl Engine {
             }
         });
 
-        // DEX Connectors: Periodische Pool-Refreshs (Skeleton)
+        // DEX Connectors: Periodische Pool-Refreshs (honor config flags)
         {
             let rpc = self.ctx.rpc.clone();
+            let cfg = self.ctx.cfg.clone();
             tokio::spawn(async move {
                 let rdx = Raydium::new(rpc.clone());
                 let orc = Orca::new(rpc.clone());
                 let mut iv = interval(Duration::from_secs(10));
                 loop {
                     iv.tick().await;
-                    if let Err(e) = rdx.refresh_pools().await {
-                        tracing::debug!(?e, "raydium refresh");
+                    // Read discovery flags if present; default to true when unspecified
+                    let (use_ray, use_orc) = if let Some(arb) = &cfg.arbitrage {
+                        if let Some(disc) = &arb.discovery {
+                            (
+                                disc.enable_raydium.unwrap_or(true),
+                                disc.enable_orca.unwrap_or(true),
+                            )
+                        } else {
+                            (true, true)
+                        }
+                    } else {
+                        (true, true)
+                    };
+
+                    if use_ray {
+                        match rdx.refresh_pools().await {
+                            Ok(()) => {
+                                // Emit an info line similar to Orca for visibility
+                                let total = rdx.snapshots().len();
+                                tracing::info!(
+                                    message = "raydium.refresh_pools() done",
+                                    added = total,
+                                    total = total,
+                                    target = "ironcrab::solana::dex::raydium"
+                                );
+                            }
+                            Err(e) => tracing::warn!(?e, "raydium refresh failed"),
+                        }
                     }
-                    if let Err(e) = orc.refresh_pools().await {
-                        tracing::debug!(?e, "orca refresh");
+
+                    if use_orc {
+                        if let Err(e) = orc.refresh_pools().await {
+                            tracing::warn!(?e, "orca refresh failed");
+                        } else {
+                            let total = orc.pools_snapshot().len();
+                            tracing::info!(
+                                message = "orca.refresh_pools() done",
+                                added = total,
+                                total = total,
+                                target = "ironcrab::solana::dex::orca"
+                            );
+                        }
                     }
                 }
             });
