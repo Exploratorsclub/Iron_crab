@@ -149,33 +149,33 @@ pub fn sanity_mints_vaults(ma: &Pubkey, va: &Pubkey, mb: &Pubkey, vb: &Pubkey) -
 }
 
 // Allowed tick spacings observed in production (used for stricter validation)
-const ALLOWED_TICK_SPACINGS: [u16; 8] = [1, 8, 16, 32, 64, 128, 256, 512];
+// const ALLOWED_TICK_SPACINGS: [u16; 8] = [1, 8, 16, 32, 64, 128, 256, 512];
 
 /// Convert sqrt_price (Q64.64) to an approximate tick value (Uniswap v3 style)
 /// tick ~= log_{1.0001}(price) where price = (sqrt_price^2 / 2^128).
-fn approximate_tick(sqrt_price_q64: u128) -> Option<i32> {
-    if sqrt_price_q64 == 0 {
-        return None;
-    }
-    // Avoid overflow: cast to f64 progressively.
-    let sp = sqrt_price_q64 as f64;
-    // sqrt_price is scaled by 2^64
-    let scale = (1u128 << 64) as f64;
-    let ratio = sp / scale; // sqrt(price)
-    if ratio <= 0.0 {
-        return None;
-    }
-    let price = ratio * ratio;
-    if !price.is_finite() || price <= 0.0 {
-        return None;
-    }
-    // ln(price)/ln(1.0001)
-    let tick = (price.ln() / 0.0001f64.ln()).round();
-    if tick.abs() > 10_000_000.0 {
-        return None;
-    }
-    Some(tick as i32)
-}
+// fn approximate_tick(sqrt_price_q64: u128) -> Option<i32> {
+//     if sqrt_price_q64 == 0 {
+//         return None;
+//     }
+//     // Avoid overflow: cast to f64 progressively.
+//     let sp = sqrt_price_q64 as f64;
+//     // sqrt_price is scaled by 2^64
+//     let scale = (1u128 << 64) as f64;
+//     let ratio = sp / scale; // sqrt(price)
+//     if ratio <= 0.0 {
+//         return None;
+//     }
+//     let price = ratio * ratio;
+//     if !price.is_finite() || price <= 0.0 {
+//         return None;
+//     }
+//     // ln(price)/ln(1.0001)
+//     let tick = (price.ln() / 0.0001f64.ln()).round();
+//     if tick.abs() > 10_000_000.0 {
+//         return None;
+//     }
+//     Some(tick as i32)
+// }
 
 /// Strict parser with deeper structural & semantic validation.
 /// Centralizes safety checks so callers (e.g. refresh_pools) don't need to duplicate them.
