@@ -7,14 +7,34 @@ mod tests {
     // Serialize tests that mutate process-wide environment variables to avoid CI flakiness
     use serial_test::serial;
 
+    // Test-only helpers to centralize env mutations behind a single unsafe block,
+    // satisfying linting that treats std::env changes as unsafe in this project.
+    fn clear_env_vars_all() {
+        unsafe {
+            env::remove_var("IRONCRAB_KEYPAIR_JSON");
+            env::remove_var("IRONCRAB_KEYPAIR_B64");
+            env::remove_var("IRONCRAB_KEYPAIR_BASE58");
+            env::remove_var("IRONCRAB_KEYPAIR_PATH");
+        }
+    }
+
+    fn set_env_var(key: &str, val: &str) {
+        unsafe {
+            env::set_var(key, val);
+        }
+    }
+
+    fn remove_env_var(key: &str) {
+        unsafe {
+            env::remove_var(key);
+        }
+    }
+
     #[test]
     #[serial]
     fn test_treasury_env_fallback_pattern() {
         // Clear any existing env vars
-        env::remove_var("IRONCRAB_KEYPAIR_JSON");
-        env::remove_var("IRONCRAB_KEYPAIR_B64");
-        env::remove_var("IRONCRAB_KEYPAIR_BASE58");
-        env::remove_var("IRONCRAB_KEYPAIR_PATH");
+        clear_env_vars_all();
 
         // Test 1: When no env vars are set, load_from_env should fail
         assert!(Treasury::load_from_env().is_err());
@@ -24,7 +44,7 @@ mod tests {
         let keypair_bytes: Vec<u8> = test_keypair.to_bytes().to_vec();
         let json_string = serde_json::to_string(&keypair_bytes).unwrap();
 
-        env::set_var("IRONCRAB_KEYPAIR_JSON", &json_string);
+        set_env_var("IRONCRAB_KEYPAIR_JSON", &json_string);
 
         // Should load successfully from JSON env var
         let treasury_from_env = Treasury::load_from_env();
@@ -32,7 +52,7 @@ mod tests {
 
         // Test 3: Test fallback pattern (ENV first, then file)
         // Clear env var to force fallback
-        env::remove_var("IRONCRAB_KEYPAIR_JSON");
+        remove_env_var("IRONCRAB_KEYPAIR_JSON");
 
         // Create a temporary keypair file
         let temp_dir = TempDir::new().unwrap();
@@ -50,7 +70,7 @@ mod tests {
         assert!(treasury_fallback.is_ok());
 
         // Test 4: ENV takes precedence over file path
-        env::set_var("IRONCRAB_KEYPAIR_JSON", &json_string);
+        set_env_var("IRONCRAB_KEYPAIR_JSON", &json_string);
 
         let treasury_env_priority =
             Treasury::load_from_env().or_else(|_| Treasury::load(keypair_path.to_str().unwrap()));
@@ -58,38 +78,35 @@ mod tests {
         assert!(treasury_env_priority.is_ok());
 
         // Cleanup
-        env::remove_var("IRONCRAB_KEYPAIR_JSON");
+        remove_env_var("IRONCRAB_KEYPAIR_JSON");
     }
 
     #[test]
     #[serial]
     fn test_treasury_env_formats() {
         // Clear env vars
-        env::remove_var("IRONCRAB_KEYPAIR_JSON");
-        env::remove_var("IRONCRAB_KEYPAIR_B64");
-        env::remove_var("IRONCRAB_KEYPAIR_BASE58");
-        env::remove_var("IRONCRAB_KEYPAIR_PATH");
+        clear_env_vars_all();
 
         let test_keypair = solana_sdk::signer::keypair::Keypair::new();
         let keypair_bytes = test_keypair.to_bytes();
 
         // Test JSON format
         let json_string = serde_json::to_string(&keypair_bytes.to_vec()).unwrap();
-        env::set_var("IRONCRAB_KEYPAIR_JSON", &json_string);
+        set_env_var("IRONCRAB_KEYPAIR_JSON", &json_string);
         assert!(Treasury::load_from_env().is_ok());
-        env::remove_var("IRONCRAB_KEYPAIR_JSON");
+        remove_env_var("IRONCRAB_KEYPAIR_JSON");
 
         // Test Base64 format
         let base64_string = base64::engine::general_purpose::STANDARD.encode(keypair_bytes);
-        env::set_var("IRONCRAB_KEYPAIR_B64", &base64_string);
+        set_env_var("IRONCRAB_KEYPAIR_B64", &base64_string);
         assert!(Treasury::load_from_env().is_ok());
-        env::remove_var("IRONCRAB_KEYPAIR_B64");
+        remove_env_var("IRONCRAB_KEYPAIR_B64");
 
         // Test Base58 format
         let base58_string = test_keypair.to_base58_string();
-        env::set_var("IRONCRAB_KEYPAIR_BASE58", &base58_string);
+        set_env_var("IRONCRAB_KEYPAIR_BASE58", &base58_string);
         assert!(Treasury::load_from_env().is_ok());
-        env::remove_var("IRONCRAB_KEYPAIR_BASE58");
+        remove_env_var("IRONCRAB_KEYPAIR_BASE58");
     }
 
     #[test]
@@ -97,10 +114,7 @@ mod tests {
     fn test_main_rs_fallback_pattern() {
         // This test specifically verifies the pattern used in main.rs works
         // Clear env vars
-        env::remove_var("IRONCRAB_KEYPAIR_JSON");
-        env::remove_var("IRONCRAB_KEYPAIR_B64");
-        env::remove_var("IRONCRAB_KEYPAIR_BASE58");
-        env::remove_var("IRONCRAB_KEYPAIR_PATH");
+        clear_env_vars_all();
 
         // Create a test keypair file
         let test_keypair = solana_sdk::signer::keypair::Keypair::new();
@@ -118,7 +132,7 @@ mod tests {
         // Treasury::load_from_env().or_else(|_| Treasury::load(&cfg.solana.keypair_path))
 
         // First, clear ENV to test file fallback
-        env::remove_var("IRONCRAB_KEYPAIR_JSON");
+        remove_env_var("IRONCRAB_KEYPAIR_JSON");
 
         let treasury_result =
             Treasury::load_from_env().or_else(|_| Treasury::load(keypair_path.to_str().unwrap()));
@@ -128,7 +142,7 @@ mod tests {
 
         // Now test ENV priority - set env var and verify it takes precedence
         let json_string = serde_json::to_string(&keypair_bytes).unwrap();
-        env::set_var("IRONCRAB_KEYPAIR_JSON", &json_string);
+        set_env_var("IRONCRAB_KEYPAIR_JSON", &json_string);
 
         let treasury_result =
             Treasury::load_from_env().or_else(|_| Treasury::load(keypair_path.to_str().unwrap()));
@@ -137,6 +151,6 @@ mod tests {
         assert!(treasury_result.is_ok());
 
         // Cleanup
-        env::remove_var("IRONCRAB_KEYPAIR_JSON");
+        remove_env_var("IRONCRAB_KEYPAIR_JSON");
     }
 }
