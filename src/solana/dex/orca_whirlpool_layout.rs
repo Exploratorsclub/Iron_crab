@@ -30,13 +30,14 @@
 
 use solana_sdk::pubkey::Pubkey;
 
-pub const MIN_WHIRLPOOL_ACCOUNT_LEN: usize = 251; // up to end of fee_tier
+pub const MIN_WHIRLPOOL_ACCOUNT_LEN: usize = 261; // up to end of fee_tier
 
 // Absolute offsets (already include discriminator region)
 pub const OFF_CFG: usize = 8; // whirlpools_config
 pub const OFF_BUMP: usize = OFF_CFG + 32; // u8
 pub const OFF_TICK_SPACING: usize = OFF_BUMP + 1; // u16
-pub const OFF_FEE_RATE: usize = OFF_TICK_SPACING + 2; // u16
+pub const OFF_TICK_SPACING_SEED: usize = OFF_TICK_SPACING + 2; // [u8;2]
+pub const OFF_FEE_RATE: usize = OFF_TICK_SPACING_SEED + 2; // u16
 pub const OFF_PROTOCOL_FEE_RATE: usize = OFF_FEE_RATE + 2; // u16
 pub const OFF_LIQUIDITY: usize = OFF_PROTOCOL_FEE_RATE + 2; // u128
 pub const OFF_SQRT_PRICE: usize = OFF_LIQUIDITY + 16; // u128
