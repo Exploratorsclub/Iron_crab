@@ -521,7 +521,11 @@ impl Dex for Raydium {
                 wrong_size += 1;
             }
         }
-        tracing::info!(decoded = decoded.len(), wrong_size, "raydium.refresh_pools decoded candidate pools");
+        tracing::info!(
+            decoded = decoded.len(),
+            wrong_size,
+            "raydium.refresh_pools decoded candidate pools"
+        );
         // Batch vault fetch
         let mut vaults: Vec<Pubkey> = Vec::with_capacity(decoded.len() * 2);
         for (p, _) in &decoded {
@@ -539,7 +543,11 @@ impl Dex for Raydium {
                     }
                 }
             }
-            tracing::info!(vaults = vaults.len(), balances = vault_amounts.len(), "raydium.refresh_pools fetched vault balances");
+            tracing::info!(
+                vaults = vaults.len(),
+                balances = vault_amounts.len(),
+                "raydium.refresh_pools fetched vault balances"
+            );
         }
         // Insert/update (with optional serum market fetch per pool)
         let mut loaded = 0u32;
