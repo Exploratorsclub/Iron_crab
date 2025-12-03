@@ -107,7 +107,7 @@ pairs = []  # ignored when discovery.mode = "full-auto"
 
 [arbitrage.discovery]
 enable = true
-mode = "discovery-only"
+mode = "full-auto"  # full-auto für aktive Discovery + Scans, discovery-only nur für CSV-Logs
 log_all_inits = true     # enable to see what pools are found
 base_tokens = [
 	"So11111111111111111111111111111111111111112",  # SOL
