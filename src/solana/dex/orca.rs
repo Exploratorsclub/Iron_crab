@@ -299,11 +299,12 @@ impl Dex for Orca {
                             }
                         }
                     }
+                    // If either reserve is zero, record it but still add the pool.
+                    // This lets us discover pools even when the validator doesn't expose vault balances.
                     if reserves.0 == 0 || reserves.1 == 0 {
                         ORCA_POOLS_SKIPPED_ZERO_RESERVE
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         zero_reserve += 1;
-                        continue;
                     }
                     fee_tier_keys.push(parsed.fee_tier);
                     let id = addr;
