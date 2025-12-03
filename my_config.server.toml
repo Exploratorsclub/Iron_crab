@@ -95,7 +95,7 @@ log_cleanup_interval_hours = 24
 # Explizit abonnierte DEX Programme (Raydium AMM v4 & Orca Whirlpool)
 program_ids = [
 	"675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
-	"whirLbMiicV3QDeqAD9nukHf8stYwh5GozfX6rS3SAm",
+	"whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
 ]
 
 # --- Arbitrage scanning with Auto-Discovery ---

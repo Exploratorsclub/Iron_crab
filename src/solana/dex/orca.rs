@@ -9,7 +9,7 @@ use super::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 use solana_sdk::instruction::Instruction;
 
-pub const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicV3QDeqAD9nukHf8stYwh5GozfX6rS3SAm"; // verify
+pub const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"; // corrected
                                                                                         // Approximate Whirlpool account size (may vary by version). Adjust if mismatch logged repeatedly.
 pub const WHIRLPOOL_ACCOUNT_MIN_SIZE: usize = 400; // conservative lower bound
 pub const WHIRLPOOL_ACCOUNT_MAX_SIZE: usize = 800; // safety upper bound

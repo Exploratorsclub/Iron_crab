@@ -113,7 +113,7 @@ log_cleanup_interval_hours = 24
 # Explizit abonnierte DEX-Programme für WS-Logs (Raydium AMM v4, Orca Whirlpool)
 program_ids = [
 	"675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM v4
-	"whirLbMiicV3QDeqAD9nukHf8stYwh5GozfX6rS3SAm",  # Orca Whirlpool
+	"whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  # Orca Whirlpool
 ]
 
 # --- Arbitrage (nur zur Discovery/Fehlersuche aktiviert) ---

@@ -74,7 +74,7 @@ adaptive_slippage_max_bps = 300       # Maximum adaptive slippage (3%)
 # Uncomment and edit to control which DEX logs are listened to by the sniper.
 # program_ids = [
 #   "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM v4
-#   "whirLbMiicV3QDeqAD9nukHf8stYwh5GozfX6rS3SAm",  # Orca Whirlpool
+#   "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  # Orca Whirlpool
 # ]
 
 # Stop Loss & Take Profit (BASIS POINTS: 10000 = 100%)
