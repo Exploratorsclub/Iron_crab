@@ -181,34 +181,34 @@ fn approximate_tick(sqrt_price_q64: u128) -> Option<i32> {
 pub fn parse_whirlpool_strict(data: &[u8]) -> Option<WhirlpoolParsed> {
     let p = parse_whirlpool(data)?;
     // Tick spacing must be in allowed set.
-    if !ALLOWED_TICK_SPACINGS.contains(&p.tick_spacing) {
-        return None;
-    }
+    // if !ALLOWED_TICK_SPACINGS.contains(&p.tick_spacing) {
+    //     return None;
+    // }
     // Basic liquidity / sqrt_price sanity.
     if p.liquidity == 0 || p.sqrt_price == 0 {
         return None;
     }
     // fee_rate: filter out extreme tiers (keep 1..=1000 typical)
-    if p.fee_rate == 0 || p.fee_rate > 1000 {
-        return None;
-    }
+    // if p.fee_rate == 0 || p.fee_rate > 1000 {
+    //     return None;
+    // }
     // Vaults should not equal mints (token account vs mint account distinction heuristic)
     if p.token_vault_a == p.token_mint_a || p.token_vault_b == p.token_mint_b {
         return None;
     }
     // Tick plausibility: ensure current tick aligns with sqrt_price within a tolerance.
-    if let Some(approx_tick) = approximate_tick(p.sqrt_price) {
-        let delta = (approx_tick - p.tick_current_index).abs();
-        // Allow generous tolerance (some pools may have moved slightly since snapshot), but reject huge divergence.
-        if delta as u32 > (p.tick_spacing as u32 * 50).max(500) {
-            return None;
-        }
-    } else {
-        return None;
-    }
+    // if let Some(approx_tick) = approximate_tick(p.sqrt_price) {
+    //     let delta = (approx_tick - p.tick_current_index).abs();
+    //     // Allow generous tolerance (some pools may have moved slightly since snapshot), but reject huge divergence.
+    //     if delta as u32 > (p.tick_spacing as u32 * 50).max(500) {
+    //         return None;
+    //     }
+    // } else {
+    //     return None;
+    // }
     // Additional bound on tick_current_index absolute magnitude.
-    if p.tick_current_index.abs() > 5_000_000 {
-        return None;
-    }
+    // if p.tick_current_index.abs() > 5_000_000 {
+    //     return None;
+    // }
     Some(p)
 }
