@@ -498,8 +498,14 @@ impl Dex for Raydium {
             .rpc
             .get_program_accounts_with_config_retry(&program_id, cfg)
             .await?;
+        tracing::info!(
+            program = %program_id,
+            fetched = accounts.len(),
+            "raydium.refresh_pools fetched program accounts"
+        );
         // Collect decodable pool state + raw bytes for fee extraction
         let mut decoded: Vec<(reader::PoolV4, Vec<u8>)> = Vec::with_capacity(accounts.len());
+        let mut wrong_size = 0u32;
         for (addr, acc) in &accounts {
             if acc.data.len() == reader::LIQ_STATE_V4_SIZE {
                 if let Ok(p) = reader::PoolV4::decode(*addr, &acc.data) {
@@ -511,8 +517,11 @@ impl Dex for Raydium {
                         decoded.push((p, acc.data.clone()));
                     }
                 }
+            } else {
+                wrong_size += 1;
             }
         }
+        tracing::info!(decoded = decoded.len(), wrong_size, "raydium.refresh_pools decoded candidate pools");
         // Batch vault fetch
         let mut vaults: Vec<Pubkey> = Vec::with_capacity(decoded.len() * 2);
         for (p, _) in &decoded {
@@ -530,8 +539,13 @@ impl Dex for Raydium {
                     }
                 }
             }
+            tracing::info!(vaults = vaults.len(), balances = vault_amounts.len(), "raydium.refresh_pools fetched vault balances");
         }
         // Insert/update (with optional serum market fetch per pool)
+        let mut loaded = 0u32;
+        let mut skipped_zero = 0u32;
+        let mut skipped_serum = 0u32;
+        let mut skipped_fee = 0u32;
         for (p, raw) in decoded {
             let base_amt = vault_amounts.get(&p.base_vault).copied().unwrap_or(0);
             let quote_amt = vault_amounts.get(&p.quote_vault).copied().unwrap_or(0);
@@ -539,6 +553,7 @@ impl Dex for Raydium {
                 tracing::warn!(pool = %p.address, base_amt, quote_amt, "skip pool missing/zero vault balances");
                 RAYDIUM_POOLS_SKIPPED_ZERO_RESERVE
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                skipped_zero += 1;
                 continue;
             }
             let fee_num = raw
@@ -553,11 +568,13 @@ impl Dex for Raydium {
                 .unwrap_or_default();
             if fee_num == 0 || fee_den == 0 || fee_num > fee_den {
                 tracing::warn!(pool = %p.address, fee_num, fee_den, "invalid fee ratio -> skip");
+                skipped_fee += 1;
                 continue;
             }
             let fee_bps_calc = ((fee_num * 10_000) / fee_den) as u32;
             if !(1..=1000).contains(&fee_bps_calc) {
                 tracing::warn!(pool = %p.address, fee_bps_calc, "fee_bps out of supported range -> skip");
+                skipped_fee += 1;
                 continue;
             }
             let fee_bps = fee_bps_calc;
@@ -572,6 +589,7 @@ impl Dex for Raydium {
             if p.market_id == Pubkey::default() || p.market_program_id == Pubkey::default() {
                 tracing::warn!(pool=%p.address, "skip pool: missing serum market linkage");
                 RAYDIUM_POOLS_SKIPPED_SERUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                skipped_serum += 1;
                 continue;
             }
             // Attempt Serum market account fetch (single account RPC) for orderbook + vault pointers
@@ -592,6 +610,7 @@ impl Dex for Raydium {
             if !serum_ok {
                 tracing::warn!(pool=%p.address, market=%p.market_id, "skip pool: incomplete serum market accounts");
                 RAYDIUM_POOLS_SKIPPED_SERUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                skipped_serum += 1;
                 continue;
             }
             let obj = SimplePool {
@@ -619,6 +638,7 @@ impl Dex for Raydium {
             };
             self.pools.insert(p.address, obj);
             RAYDIUM_POOLS_LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            loaded += 1;
         }
         // Cleanup stale (>15m)
         let cutoff = SystemTime::now() - Duration::from_secs(15 * 60);
@@ -645,6 +665,10 @@ impl Dex for Raydium {
         tracing::info!(
             pools = self.pools.len(),
             removed,
+            loaded,
+            skipped_zero,
+            skipped_serum,
+            skipped_fee,
             "raydium.refresh_pools done"
         );
         Ok(())

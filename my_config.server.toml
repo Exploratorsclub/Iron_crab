@@ -4,7 +4,7 @@
 # --- Application ---
 [app]
 name = "ironcrab-prod"
-log_level = "debug"  # temporarily raise to see discovery details
+log_level = "trace"  # maximum logging for deep diagnostics
 autosave_state_secs = 30
 
 # --- Solana RPC & Keypair (Linux paths) ---
