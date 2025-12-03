@@ -27,8 +27,13 @@ ws_headers = { "Sec-WebSocket-Protocol" = "jsonrpc" }
 
 # --- Markets (sum must be 100) ---
 [[markets]]
+name = "solana-arb"
+allocation_pct = 60
+strategy = "sample-rust"
+
+[[markets]]
 name = "solana-sniper"
-allocation_pct = 100
+allocation_pct = 40
 strategy = "snipe-default"
 
 # --- Allocator ---
