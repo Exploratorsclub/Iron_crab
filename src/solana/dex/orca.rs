@@ -373,6 +373,58 @@ impl Dex for Orca {
             total = self.pools.len(),
             "orca.refresh_pools() done"
         );
+        // Backfill: fetch vault balances for pools with zero reserves, in batches.
+        if zero_reserve > 0 && !self.pools.is_empty() {
+            use solana_sdk::account::ReadableAccount;
+            let mut targets: Vec<(Pubkey, Pubkey)> = Vec::new();
+            for p in self.pools.iter() {
+                if p.reserve_base == 0 || p.reserve_quote == 0 {
+                    targets.push((p.vault_a, p.vault_b));
+                }
+            }
+            let mut updated = 0u32;
+            const BATCH: usize = 50;
+            for chunk in targets.chunks(BATCH) {
+                let mut keys: Vec<Pubkey> = Vec::with_capacity(chunk.len() * 2);
+                for (a, b) in chunk.iter() {
+                    keys.push(*a);
+                    keys.push(*b);
+                }
+                if let Ok(accts) = self.rpc.rpc.get_multiple_accounts(&keys).await {
+                    for pair in chunk.iter() {
+                        // indices in accts correspond to order in keys
+                        let ia = keys.iter().position(|k| k == &pair.0);
+                        let ib = keys.iter().position(|k| k == &pair.1);
+                        if let (Some(ia), Some(ib)) = (ia, ib) {
+                            let va = accts.get(ia).and_then(|o| o.as_ref());
+                            let vb = accts.get(ib).and_then(|o| o.as_ref());
+                            let mut ra = 0u128;
+                            let mut rb = 0u128;
+                            if let Some(a) = va {
+                                let d = a.data();
+                                if d.len() >= 72 { ra = Self::parse_token_amount(d) as u128; }
+                            }
+                            if let Some(b) = vb {
+                                let d = b.data();
+                                if d.len() >= 72 { rb = Self::parse_token_amount(d) as u128; }
+                            }
+                            if ra > 0 || rb > 0 {
+                                // Update corresponding pool
+                                for mut p in self.pools.iter_mut() {
+                                    if p.vault_a == pair.0 && p.vault_b == pair.1 {
+                                        if p.reserve_base == 0 && ra > 0 { p.reserve_base = ra; }
+                                        if p.reserve_quote == 0 && rb > 0 { p.reserve_quote = rb; }
+                                        updated += 1;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            tracing::info!(updated, "orca.backfill_vaults() updated pools with reserves");
+        }
         Ok(())
     }
 
