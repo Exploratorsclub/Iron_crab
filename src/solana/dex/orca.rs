@@ -264,11 +264,22 @@ impl Dex for Orca {
             .get_program_accounts_with_config_retry(&program_id, cfg)
             .await?;
         let mut added = 0u32;
+        let mut total_accounts = 0u32;
+        let mut parsed_ok = 0u32;
+        let mut strict_ok = 0u32;
+        let mut zero_reserve = 0u32;
         let mut fee_tier_keys: Vec<Pubkey> = Vec::new();
         self.mint_index.clear();
         for (addr, acc) in accounts.into_iter().take(5000) {
             // safety limit
-            if let Some(parsed) = layout::parse_whirlpool_strict(&acc.data) {
+            total_accounts += 1;
+            if acc.data.len() < WHIRLPOOL_ACCOUNT_MIN_SIZE || acc.data.len() > WHIRLPOOL_ACCOUNT_MAX_SIZE {
+                continue;
+            }
+            if let Some(_parsed) = layout::parse_whirlpool(&acc.data) {
+                parsed_ok += 1;
+                if let Some(parsed) = layout::parse_whirlpool_strict(&acc.data) {
+                    strict_ok += 1;
                 // Fetch vault balances (SPL token accounts) to approximate reserves
                 let mut reserves = (0u128, 0u128);
                 if let Ok(vaults) = self
@@ -291,6 +302,7 @@ impl Dex for Orca {
                 if reserves.0 == 0 || reserves.1 == 0 {
                     ORCA_POOLS_SKIPPED_ZERO_RESERVE
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    zero_reserve += 1;
                     continue;
                 }
                 fee_tier_keys.push(parsed.fee_tier);
@@ -346,7 +358,15 @@ impl Dex for Orca {
                 }
             }
         }
-        tracing::info!(added, total = self.pools.len(), "orca.refresh_pools() done");
+        tracing::info!(
+            total_accounts,
+            parsed_ok,
+            strict_ok,
+            zero_reserve,
+            added,
+            total = self.pools.len(),
+            "orca.refresh_pools() done"
+        );
         Ok(())
     }
 
