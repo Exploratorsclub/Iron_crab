@@ -280,61 +280,55 @@ impl Dex for Orca {
                 parsed_ok += 1;
                 if let Some(parsed) = layout::parse_whirlpool_strict(&acc.data) {
                     strict_ok += 1;
-                    // Fetch vault balances (SPL token accounts) to approximate reserves
-                    let mut reserves = (0u128, 0u128);
-                    if let Ok(vaults) = self
-                        .rpc
-                        .rpc
-                        .get_multiple_accounts(&[parsed.token_vault_a, parsed.token_vault_b])
-                        .await
-                    {
-                        if let Some(Some(v1)) = vaults.first().map(|o| o.as_ref()) {
-                            if v1.data.len() >= 72 {
-                                reserves.0 = Self::parse_token_amount(&v1.data) as u128;
-                            }
-                        }
-                        if let Some(Some(v2)) = vaults.get(1).map(|o| o.as_ref()) {
-                            if v2.data.len() >= 72 {
-                                reserves.1 = Self::parse_token_amount(&v2.data) as u128;
-                            }
+                // Fetch vault balances (SPL token accounts) to approximate reserves
+                let mut reserves = (0u128, 0u128);
+                if let Ok(vaults) = self
+                    .rpc
+                    .rpc
+                    .get_multiple_accounts(&[parsed.token_vault_a, parsed.token_vault_b])
+                    .await
+                {
+                    if let Some(Some(v1)) = vaults.first().map(|o| o.as_ref()) {
+                        if v1.data.len() >= 72 {
+                            reserves.0 = Self::parse_token_amount(&v1.data) as u128;
                         }
                     }
-                    // If either reserve is zero, record it but still add the pool.
-                    // This lets us discover pools even when the validator doesn't expose vault balances.
-                    if reserves.0 == 0 || reserves.1 == 0 {
-                        ORCA_POOLS_SKIPPED_ZERO_RESERVE
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        zero_reserve += 1;
+                    if let Some(Some(v2)) = vaults.get(1).map(|o| o.as_ref()) {
+                        if v2.data.len() >= 72 {
+                            reserves.1 = Self::parse_token_amount(&v2.data) as u128;
+                        }
                     }
-                    fee_tier_keys.push(parsed.fee_tier);
-                    let id = addr;
-                    self.pools.insert(
-                        id,
-                        OrcaPool {
-                            base_mint: parsed.token_mint_a,
-                            quote_mint: parsed.token_mint_b,
-                            reserve_base: reserves.0,
-                            reserve_quote: reserves.1,
-                            fee_bps: parsed.fee_rate as u32,
-                            fee_tier: Some(parsed.fee_tier),
-                            tick_spacing: Some(parsed.tick_spacing),
-                            vault_a: parsed.token_vault_a,
-                            vault_b: parsed.token_vault_b,
-                            tick_current_index: Some(parsed.tick_current_index),
-                        },
-                    );
-                    for m in [parsed.token_mint_a, parsed.token_mint_b] {
-                        self.mint_index
-                            .entry(m)
-                            .or_insert_with(|| Vec::with_capacity(2))
-                            .push(id);
-                    }
-                    added += 1;
-                } else {
-                    tracing::debug!("orca pool strict parse failed for {}", addr);
                 }
-            } else {
-                tracing::debug!("orca pool parse failed for {}", addr);
+                if reserves.0 == 0 || reserves.1 == 0 {
+                    ORCA_POOLS_SKIPPED_ZERO_RESERVE
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    zero_reserve += 1;
+                    continue;
+                }
+                fee_tier_keys.push(parsed.fee_tier);
+                let id = addr;
+                self.pools.insert(
+                    id,
+                    OrcaPool {
+                        base_mint: parsed.token_mint_a,
+                        quote_mint: parsed.token_mint_b,
+                        reserve_base: reserves.0,
+                        reserve_quote: reserves.1,
+                        fee_bps: parsed.fee_rate as u32,
+                        fee_tier: Some(parsed.fee_tier),
+                        tick_spacing: Some(parsed.tick_spacing),
+                        vault_a: parsed.token_vault_a,
+                        vault_b: parsed.token_vault_b,
+                        tick_current_index: Some(parsed.tick_current_index),
+                    },
+                );
+                for m in [parsed.token_mint_a, parsed.token_mint_b] {
+                    self.mint_index
+                        .entry(m)
+                        .or_insert_with(|| Vec::with_capacity(2))
+                        .push(id);
+                }
+                added += 1;
             }
         }
         // Deduplicate & fetch fee tier accounts
@@ -373,58 +367,6 @@ impl Dex for Orca {
             total = self.pools.len(),
             "orca.refresh_pools() done"
         );
-        // Backfill: fetch vault balances for pools with zero reserves, in batches.
-        if zero_reserve > 0 && !self.pools.is_empty() {
-            use solana_sdk::account::ReadableAccount;
-            let mut targets: Vec<(Pubkey, Pubkey)> = Vec::new();
-            for p in self.pools.iter() {
-                if p.reserve_base == 0 || p.reserve_quote == 0 {
-                    targets.push((p.vault_a, p.vault_b));
-                }
-            }
-            let mut updated = 0u32;
-            const BATCH: usize = 50;
-            for chunk in targets.chunks(BATCH) {
-                let mut keys: Vec<Pubkey> = Vec::with_capacity(chunk.len() * 2);
-                for (a, b) in chunk.iter() {
-                    keys.push(*a);
-                    keys.push(*b);
-                }
-                if let Ok(accts) = self.rpc.rpc.get_multiple_accounts(&keys).await {
-                    for pair in chunk.iter() {
-                        // indices in accts correspond to order in keys
-                        let ia = keys.iter().position(|k| k == &pair.0);
-                        let ib = keys.iter().position(|k| k == &pair.1);
-                        if let (Some(ia), Some(ib)) = (ia, ib) {
-                            let va = accts.get(ia).and_then(|o| o.as_ref());
-                            let vb = accts.get(ib).and_then(|o| o.as_ref());
-                            let mut ra = 0u128;
-                            let mut rb = 0u128;
-                            if let Some(a) = va {
-                                let d = a.data();
-                                if d.len() >= 72 { ra = Self::parse_token_amount(d) as u128; }
-                            }
-                            if let Some(b) = vb {
-                                let d = b.data();
-                                if d.len() >= 72 { rb = Self::parse_token_amount(d) as u128; }
-                            }
-                            if ra > 0 || rb > 0 {
-                                // Update corresponding pool
-                                for mut p in self.pools.iter_mut() {
-                                    if p.vault_a == pair.0 && p.vault_b == pair.1 {
-                                        if p.reserve_base == 0 && ra > 0 { p.reserve_base = ra; }
-                                        if p.reserve_quote == 0 && rb > 0 { p.reserve_quote = rb; }
-                                        updated += 1;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            tracing::info!(updated, "orca.backfill_vaults() updated pools with reserves");
-        }
         Ok(())
     }
 
