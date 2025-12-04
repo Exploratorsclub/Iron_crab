@@ -30,6 +30,9 @@ struct OrcaPool {
     vault_a: Pubkey,
     vault_b: Pubkey,
     tick_current_index: Option<i32>,
+    // Lazy-loading for reserve balances (loaded on-demand from vaults)
+    cached_reserves: Option<(u128, u128)>,
+    last_reserve_fetch: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +110,8 @@ impl Orca {
                 vault_a: Pubkey::new_unique(),
                 vault_b: Pubkey::new_unique(),
                 tick_current_index: None,
+                cached_reserves: Some((reserve_base, reserve_quote)),
+                last_reserve_fetch: Some(std::time::SystemTime::now()),
             },
         );
     }
@@ -134,6 +139,69 @@ impl Orca {
                 vault_b: p.vault_b,
             })
             .collect()
+    }
+
+    /// Lazy-load reserves from vaults if not cached or cache expired.
+    /// Returns (reserve_base, reserve_quote) or falls back to pool's static reserves.
+    /// Cache TTL: 5 minutes to avoid excessive RPC calls.
+    async fn load_reserves_if_needed(&self, pool_id: &Pubkey, pool: &OrcaPool) -> (u128, u128) {
+        const CACHE_TTL_SECS: u64 = 300; // 5 minutes
+
+        // Check if we have fresh cached reserves
+        if let Some((cached_base, cached_quote)) = pool.cached_reserves {
+            if let Some(fetch_time) = pool.last_reserve_fetch {
+                if let Ok(elapsed) = fetch_time.elapsed() {
+                    if elapsed.as_secs() < CACHE_TTL_SECS {
+                        tracing::trace!(
+                            pool = %pool_id,
+                            cached_base,
+                            cached_quote,
+                            "orca reserves from cache"
+                        );
+                        return (cached_base, cached_quote);
+                    }
+                }
+            }
+        }
+
+        // Fetch fresh reserves from RPC
+        match self
+            .rpc
+            .rpc
+            .get_multiple_accounts(&[pool.vault_a, pool.vault_b])
+            .await
+        {
+            Ok(vaults) => {
+                let mut reserves = (0u128, 0u128);
+                if let Some(Some(v1)) = vaults.first() {
+                    if v1.data.len() >= 72 {
+                        reserves.0 = Self::parse_token_amount(&v1.data) as u128;
+                    }
+                }
+                if let Some(Some(v2)) = vaults.get(1) {
+                    if v2.data.len() >= 72 {
+                        reserves.1 = Self::parse_token_amount(&v2.data) as u128;
+                    }
+                }
+                tracing::trace!(
+                    pool = %pool_id,
+                    vault_a_balance = reserves.0,
+                    vault_b_balance = reserves.1,
+                    "orca reserves loaded on-demand"
+                );
+                // Note: We can't update the cached reserves here directly because OrcaPool is immutable in the DashMap.
+                // In production, you could use Arc<Mutex<>> for mutable fields, but for now we just return the fresh values.
+                reserves
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pool = %pool_id,
+                    error = %e,
+                    "orca reserve fetch failed, using static reserves"
+                );
+                (pool.reserve_base, pool.reserve_quote)
+            }
+        }
     }
 
     /// Replay: refresh Orca (Whirlpool) pools from a ReplayRpc store.
@@ -183,6 +251,16 @@ impl Orca {
                         vault_a: parsed.token_vault_a,
                         vault_b: parsed.token_vault_b,
                         tick_current_index: Some(parsed.tick_current_index),
+                        cached_reserves: if reserves.0 > 0 || reserves.1 > 0 {
+                            Some(reserves)
+                        } else {
+                            None
+                        },
+                        last_reserve_fetch: if reserves.0 > 0 || reserves.1 > 0 {
+                            Some(std::time::SystemTime::now())
+                        } else {
+                            None
+                        },
                     },
                 );
                 for m in [parsed.token_mint_a, parsed.token_mint_b] {
@@ -308,6 +386,16 @@ impl Dex for Orca {
                         vault_a: parsed.token_vault_a,
                         vault_b: parsed.token_vault_b,
                         tick_current_index: Some(parsed.tick_current_index),
+                        cached_reserves: if reserves.0 > 0 || reserves.1 > 0 {
+                            Some(reserves)
+                        } else {
+                            None
+                        },
+                        last_reserve_fetch: if reserves.0 > 0 || reserves.1 > 0 {
+                            Some(std::time::SystemTime::now())
+                        } else {
+                            None
+                        },
                     },
                 );
                 for m in [parsed.token_mint_a, parsed.token_mint_b] {
@@ -344,10 +432,15 @@ impl Dex for Orca {
             None => return Ok(None),
         };
         let (pid, forward, p) = pool;
-        let (rin, rout) = if forward {
-            (p.reserve_base, p.reserve_quote)
-        } else {
-            (p.reserve_quote, p.reserve_base)
+
+        // Lazy-load fresh reserves if not cached
+        let (rin, rout) = {
+            let (base, quote) = self.load_reserves_if_needed(&pid, &p).await;
+            if forward {
+                (base, quote)
+            } else {
+                (quote, base)
+            }
         };
         if rin == 0 || rout == 0 {
             return Ok(None);
