@@ -418,10 +418,12 @@ impl Engine {
                 }
             }
             tokio::spawn(async move {
+                // Arbitrage scanning task (opportunities detection without execution for now)
                 let ray = Arc::new(Raydium::new(rpc.clone()));
                 let orc = Arc::new(Orca::new(rpc.clone()));
                 let arb = ArbitrageEngine::new(rpc.clone(), vec![ray.clone(), orc.clone()])
                     .with_profit_params(10, 5_000_000); // min 10 bps, est 0.05 SOL tx cost
+
                 let interval_ms = cfg_pairs
                     .as_ref()
                     .and_then(|c| c.interval_ms)
@@ -432,8 +434,10 @@ impl Engine {
                     .unwrap_or_default();
                 let disc_cfg = cfg_pairs.and_then(|c| c.discovery);
                 let mut iv = interval(Duration::from_millis(interval_ms));
+
                 loop {
                     iv.tick().await;
+
                     // Choose base tokens from discovered/static pairs
                     let use_pairs: Vec<ArbPairCfg> = if let Some(dc) = &disc_cfg {
                         if dc.enable && dc.mode.as_deref() == Some("full-auto") {
@@ -458,31 +462,36 @@ impl Engine {
                         continue;
                     }
 
-                    // Scan for triangular arbitrage cycles (amount = 1 SOL = 1,000,000 lamports)
-                    match arb.enumerate_triangular_cycles(&base_list, 1_000_000).await {
+                    // Scan for profitable arbitrage cycles (1 SOL = 1B lamports test amount)
+                    match arb
+                        .enumerate_triangular_cycles(&base_list, 1_000_000_000)
+                        .await
+                    {
                         Ok(cycles) => {
                             let mut profitable: Vec<_> = cycles
                                 .into_iter()
                                 .filter(|c| c.net_profit.is_some() && c.net_profit.unwrap() > 0)
                                 .collect();
 
-                            // Sort by net profit (descending)
+                            // Sort by net profit descending
                             profitable.sort_by(|a, b| {
                                 let a_net = a.net_profit.unwrap_or(0);
                                 let b_net = b.net_profit.unwrap_or(0);
                                 b_net.cmp(&a_net)
                             });
 
-                            // Log and count top opportunities
-                            for cycle in profitable.into_iter().take(10) {
+                            // Log top opportunities
+                            for cycle in profitable.into_iter().take(5) {
                                 let (a, b, c) = &cycle.path;
                                 let net_profit = cycle.net_profit.unwrap_or(0);
+                                let roi_bps =
+                                    (net_profit as f64 / 1_000_000_000.0 * 10000.0) as u32;
 
                                 tracing::info!(
                                     path = %format!("{} -> {} -> {} -> {}", a, b, c, a),
                                     gross_profit_lamports = cycle.gross_profit,
                                     net_profit_lamports = net_profit,
-                                    roi_bps = (net_profit as f64 / 1_000_000.0 * 10000.0) as u32,
+                                    roi_bps = roi_bps,
                                     "arbitrage cycle opportunity detected"
                                 );
                                 crate::metrics::ARB_TRIANGLE_OPPORTUNITIES
@@ -490,7 +499,7 @@ impl Engine {
                             }
                         }
                         Err(e) => {
-                            tracing::debug!(?e, "triangular cycle enumeration error");
+                            tracing::debug!(?e, "triangular cycle enumeration failed");
                         }
                     }
                 }
