@@ -1,0 +1,59 @@
+[Unit]
+Description=Agave Validator (Non-Voting RPC) - Optimized for Arbitrage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=sol
+Group=sol
+WorkingDirectory=/home/sol
+
+# Limits - OPTIMIZED FOR 500GB RAM, 64 CPU
+LimitNOFILE=1000000
+LimitMEMLOCK=infinity
+Restart=on-failure
+RestartSec=5
+
+Environment=RUST_BACKTRACE=1
+
+# OPTIMIZED agave-validator command for arbitrage performance
+# Key changes for Iron_crab:
+# 1. --rpc-threads increased (more RPC concurrency)
+# 2. --accounts-db-cache-limit-mb increased (use available RAM)
+# 3. Added --geyser-plugin-config (real-time updates - CRITICAL!)
+# 4. Added TPU optimizations for faster TX submission
+# 5. Removed ledger size limit (keep full history for queries)
+
+ExecStart=/usr/local/bin/agave-validator \
+  --identity /home/sol/validator-keypair.json \
+  --ledger /var/solana/ledger \
+  --accounts /var/solana/accounts \
+  --no-voting \
+  --rpc-port 8899 \
+  --rpc-bind-address 0.0.0.0 \
+  --full-rpc-api \
+  --rpc-threads 32 \
+  --rpc-max-slots-in-block-history-for-rpc-subscription-notifications 300 \
+  --account-index program-id \
+  --account-index-include-key 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 \
+  --account-index-include-key whirLbMiicVdio4KfUbuPvNKVrQNq8zz34jZoUavd7t \
+  --accounts-db-cache-limit-mb 262144 \
+  --accounts-index-scan-results-limit-mb 8192 \
+  --dynamic-port-range 8000-8025 \
+  --tpu-use-quic \
+  --tpu-max-connections 1000000 \
+  --tpu-connection-pool-size 1024 \
+  --turbine-disabled-quic-clients-ratio 0 \
+  --enable-cpi-and-log-recovery \
+  --no-port-check \
+  --entrypoint entrypoint.mainnet-beta.solana.com:8001 \
+  --entrypoint entrypoint2.mainnet-beta.solana.com:8001 \
+  --entrypoint entrypoint3.mainnet-beta.solana.com:8001 \
+  --log /var/solana/validator.log
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agave-validator
+
+[Install]
+WantedBy=multi-user.target

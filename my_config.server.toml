@@ -15,13 +15,13 @@ ws_url  = "ws://127.0.0.1:8900"
 # Keep the public IP as a fallback in case you run the bot off-box or need external access temporarily.
 ws_failover_urls = ["ws://109.230.239.43:8900"]
 keypair_path = "/home/ironcrab/.config/solana/id.json"  # adjust to your user/path
-# Tuned concurrency & timeout (heavier getProgramAccounts was timing out)
-rpc_min_concurrency = 4         # lower floor
-rpc_max_concurrency = 8         # further cap to reduce validator pressure
-rpc_initial_concurrency = 6     # start lower
-rpc_inc_every_successes = 128   # slower ramp-up
-rpc_dec_on_rate_limit = 4
-rpc_timeout_ms = 40000          # allow heavy program scan (40s)
+# Tuned concurrency & timeout for high-end validator (500GB RAM, 64 CPUs)
+rpc_min_concurrency = 32        # can handle much more on local validator
+rpc_max_concurrency = 96        # utilize the 64 CPU cores (1.5x oversubscribe)
+rpc_initial_concurrency = 48    # start higher, we trust our own validator
+rpc_inc_every_successes = 32    # ramp up faster
+rpc_dec_on_rate_limit = 2       # be conservative on backoff
+rpc_timeout_ms = 15000          # 15s timeout (local validator is fast)
 ## Some RPC/Proxies require WS subprotocol header "jsonrpc" for PubSub
 ws_headers = { "Sec-WebSocket-Protocol" = "jsonrpc" }
 
