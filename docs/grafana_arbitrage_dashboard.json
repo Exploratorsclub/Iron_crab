@@ -1,252 +1,32 @@
 {
-  "dashboard": {
-    "title": "IronCrab Arbitrage Engine",
-    "tags": ["ironcrab", "arbitrage", "solana"],
-    "timezone": "browser",
-    "schemaVersion": 38,
-    "version": 1,
-    "refresh": "10s",
-    "panels": [
-      {
-        "id": 1,
-        "type": "stat",
-        "title": "Total Opportunities Detected",
-        "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
-        "targets": [
-          {
-            "expr": "arb_triangle_opportunities_total",
-            "refId": "A"
-          }
-        ],
-        "options": {
-          "reduceOptions": {
-            "values": false,
-            "calcs": ["lastNotNull"]
-          },
-          "orientation": "auto",
-          "textMode": "value_and_name",
-          "colorMode": "value",
-          "graphMode": "area",
-          "justifyMode": "auto"
-        },
-        "fieldConfig": {
-          "defaults": {
-            "color": {"mode": "thresholds"},
-            "thresholds": {
-              "mode": "absolute",
-              "steps": [
-                {"value": 0, "color": "red"},
-                {"value": 10, "color": "yellow"},
-                {"value": 50, "color": "green"}
-              ]
-            },
-            "unit": "short"
-          }
-        }
-      },
-      {
-        "id": 2,
-        "type": "timeseries",
-        "title": "Arbitrage Opportunities Rate (per minute)",
-        "gridPos": {"x": 6, "y": 0, "w": 18, "h": 8},
-        "targets": [
-          {
-            "expr": "rate(arb_triangle_opportunities_total[1m]) * 60",
-            "legendFormat": "Opportunities/min",
-            "refId": "A"
-          }
-        ],
-        "options": {
-          "legend": {"displayMode": "list", "placement": "bottom"},
-          "tooltip": {"mode": "single"}
-        },
-        "fieldConfig": {
-          "defaults": {
-            "color": {"mode": "palette-classic"},
-            "custom": {
-              "axisCenteredZero": false,
-              "axisColorMode": "text",
-              "axisLabel": "",
-              "axisPlacement": "auto",
-              "fillOpacity": 20,
-              "gradientMode": "none",
-              "lineInterpolation": "smooth",
-              "lineWidth": 2,
-              "pointSize": 5,
-              "scaleDistribution": {"type": "linear"},
-              "showPoints": "auto",
-              "spanNulls": false,
-              "stacking": {"mode": "none", "group": "A"},
-              "thresholdsStyle": {"mode": "off"}
-            },
-            "unit": "ops/m"
-          }
-        }
-      },
-      {
-        "id": 3,
-        "type": "stat",
-        "title": "Attempts (Total)",
-        "gridPos": {"x": 0, "y": 4, "w": 3, "h": 4},
-        "targets": [
-          {
-            "expr": "arb_triangle_attempts_total",
-            "refId": "A"
-          }
-        ],
-        "options": {
-          "reduceOptions": {
-            "values": false,
-            "calcs": ["lastNotNull"]
-          },
-          "textMode": "value_and_name",
-          "colorMode": "background"
-        },
-        "fieldConfig": {
-          "defaults": {
-            "color": {"mode": "thresholds"},
-            "thresholds": {
-              "mode": "absolute",
-              "steps": [
-                {"value": 0, "color": "blue"}
-              ]
-            }
-          }
-        }
-      },
-      {
-        "id": 4,
-        "type": "stat",
-        "title": "Profitable Executions",
-        "gridPos": {"x": 3, "y": 4, "w": 3, "h": 4},
-        "targets": [
-          {
-            "expr": "arb_triangle_profitable_total",
-            "refId": "A"
-          }
-        ],
-        "options": {
-          "reduceOptions": {
-            "values": false,
-            "calcs": ["lastNotNull"]
-          },
-          "textMode": "value_and_name",
-          "colorMode": "background"
-        },
-        "fieldConfig": {
-          "defaults": {
-            "color": {"mode": "thresholds"},
-            "thresholds": {
-              "mode": "absolute",
-              "steps": [
-                {"value": 0, "color": "red"},
-                {"value": 1, "color": "green"}
-              ]
-            }
-          }
-        }
-      },
-      {
-        "id": 5,
-        "type": "timeseries",
-        "title": "Opportunities Found (Last Hour)",
-        "gridPos": {"x": 0, "y": 8, "w": 12, "h": 6},
-        "targets": [
-          {
-            "expr": "increase(arb_triangle_opportunities_total[5m])",
-            "legendFormat": "Opportunities (5min windows)",
-            "refId": "A"
-          }
-        ],
-        "options": {
-          "legend": {"displayMode": "list", "placement": "bottom"}
-        },
-        "fieldConfig": {
-          "defaults": {
-            "color": {"mode": "palette-classic"},
-            "custom": {
-              "drawStyle": "bars",
-              "lineInterpolation": "linear",
-              "barAlignment": 0,
-              "fillOpacity": 80,
-              "gradientMode": "none",
-              "lineWidth": 1,
-              "pointSize": 5,
-              "showPoints": "auto",
-              "spanNulls": false
-            },
-            "unit": "short"
-          }
-        }
-      },
-      {
-        "id": 6,
-        "type": "gauge",
-        "title": "Opportunities Rate (Current)",
-        "gridPos": {"x": 12, "y": 8, "w": 6, "h": 6},
-        "targets": [
-          {
-            "expr": "rate(arb_triangle_opportunities_total[1m]) * 60",
-            "refId": "A"
-          }
-        ],
-        "options": {
-          "showThresholdLabels": false,
-          "showThresholdMarkers": true
-        },
-        "fieldConfig": {
-          "defaults": {
-            "color": {"mode": "thresholds"},
-            "thresholds": {
-              "mode": "absolute",
-              "steps": [
-                {"value": 0, "color": "red"},
-                {"value": 5, "color": "yellow"},
-                {"value": 20, "color": "green"}
-              ]
-            },
-            "unit": "ops/m",
-            "min": 0,
-            "max": 100
-          }
-        }
-      },
-      {
-        "id": 7,
-        "type": "stat",
-        "title": "Success Rate",
-        "gridPos": {"x": 18, "y": 8, "w": 6, "h": 6},
-        "targets": [
-          {
-            "expr": "(arb_triangle_profitable_total / (arb_triangle_attempts_total + 1)) * 100",
-            "refId": "A"
-          }
-        ],
-        "options": {
-          "reduceOptions": {
-            "values": false,
-            "calcs": ["lastNotNull"]
-          },
-          "textMode": "value",
-          "colorMode": "background",
-          "graphMode": "none"
-        },
-        "fieldConfig": {
-          "defaults": {
-            "color": {"mode": "thresholds"},
-            "thresholds": {
-              "mode": "absolute",
-              "steps": [
-                {"value": 0, "color": "red"},
-                {"value": 30, "color": "yellow"},
-                {"value": 60, "color": "green"}
-              ]
-            },
-            "unit": "percent",
-            "decimals": 1
-          }
-        }
-      }
-    ]
-  }
+  "title": "IronCrab Arbitrage Engine",
+  "schemaVersion": 39,
+  "version": 2,
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    { "type": "stat", "title": "Total Opportunities Detected", "targets": [{ "expr": "arb_triangle_opportunities_total", "refId": "A" }], "gridPos": {"h":6,"w":6,"x":0,"y":0} },
+    { "type": "stat", "title": "Attempts (Total)", "targets": [{ "expr": "arb_triangle_attempts_total", "refId": "A" }], "gridPos": {"h":6,"w":6,"x":6,"y":0} },
+    { "type": "stat", "title": "Profitable Executions", "targets": [{ "expr": "arb_triangle_profitable_total", "refId": "A" }], "gridPos": {"h":6,"w":6,"x":12,"y":0} },
+    { "type": "stat", "title": "Success Rate %", "targets": [{ "expr": "(arb_triangle_profitable_total / (arb_triangle_attempts_total + 1)) * 100", "refId": "A" }], "gridPos": {"h":6,"w":6,"x":18,"y":0} },
+
+    { "type": "timeseries", "title": "Opportunities Rate (per minute)", "targets": [
+        { "expr": "rate(arb_triangle_opportunities_total[1m]) * 60", "legendFormat": "Opportunities/min", "refId": "A" }
+      ], "gridPos": {"h":8,"w":12,"x":0,"y":6} },
+    { "type": "timeseries", "title": "Attempts vs Profitable (rate)", "targets": [
+        { "expr": "rate(arb_triangle_attempts_total[5m])", "legendFormat": "Attempts" },
+        { "expr": "rate(arb_triangle_profitable_total[5m])", "legendFormat": "Profitable" }
+      ], "gridPos": {"h":8,"w":12,"x":12,"y":6} },
+
+    { "type": "timeseries", "title": "Cumulative Opportunities Found", "targets": [
+        { "expr": "increase(arb_triangle_opportunities_total[5m])", "legendFormat": "Opportunities (5min windows)", "refId": "A" }
+      ], "gridPos": {"h":7,"w":24,"x":0,"y":14} },
+
+    { "type": "timeseries", "title": "Detection Rate Trend (1min avg)", "targets": [
+        { "expr": "rate(arb_triangle_opportunities_total[1m]) * 60", "legendFormat": "Current rate", "refId": "A" }
+      ], "gridPos": {"h":7,"w":12,"x":0,"y":21} },
+    { "type": "timeseries", "title": "Success % Trend", "targets": [
+        { "expr": "(rate(arb_triangle_profitable_total[5m]) / (rate(arb_triangle_attempts_total[5m]) + 0.0001)) * 100", "legendFormat": "Success %", "refId": "A" }
+      ], "gridPos": {"h":7,"w":12,"x":12,"y":21} }
+  ],
+  "templating": { "list": [] }
 }
