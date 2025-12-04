@@ -37,6 +37,7 @@ pub struct Engine {
     allocator: Arc<Allocator>,
     strategies: Vec<Arc<dyn Strategy>>, // pro Markt konfigurierbar
     router: Router,                     // DEX router for best execution
+    orca: Arc<Orca>,                    // Direct reference for prefetching
 }
 
 impl Engine {
@@ -50,14 +51,26 @@ impl Engine {
 
         // Initialize DEX connectors for router
         let raydium = Arc::new(Raydium::new(rpc.clone()));
-        let orca = Arc::new(Orca::new(rpc.clone()));
-        let router = Router::new(vec![raydium, orca]);
+
+        // Initialize Orca with optional persistent cache
+        let orca_cache_path = if cfg.orca.enable_reserve_cache {
+            cfg.orca
+                .cache_path
+                .clone()
+                .or_else(|| Some("orca_reserves.db".to_string()))
+        } else {
+            None
+        };
+        let orca = Arc::new(Orca::new_with_cache(rpc.clone(), orca_cache_path));
+
+        let router = Router::new(vec![raydium, orca.clone()]);
 
         Ok(Self {
             ctx,
             allocator,
             strategies: vec![],
             router,
+            orca,
         })
     }
 

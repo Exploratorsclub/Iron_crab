@@ -78,7 +78,8 @@ impl OrcaReserveCache {
         if let Some((addr_str, base, quote, cached_at_str)) = result {
             let cached_at = DateTime::parse_from_rfc3339(&cached_at_str)
                 .ok()
-                .and_then(|dt| Some(dt.with_timezone(&Utc)))?;
+                .and_then(|dt| Some(dt.with_timezone(&Utc)))
+                .ok_or_else(|| anyhow::anyhow!("failed to parse cached_at timestamp"))?;
 
             let elapsed = now.signed_duration_since(cached_at);
             if elapsed.num_seconds() < self.cache_ttl_secs as i64 {

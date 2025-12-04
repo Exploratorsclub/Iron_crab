@@ -78,6 +78,8 @@ pub struct Config {
     pub arbitrage: Option<ArbCfg>,
     #[serde(default)]
     pub sniper: Option<SniperSettings>,
+    #[serde(default)]
+    pub orca: OrcaCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -223,10 +225,26 @@ pub struct SniperSettings {
     pub log_cleanup_interval_hours: Option<u32>, // Cleanup-Intervall in Stunden (default: 24)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TakeProfitTier {
     pub bps: u32,      // Gewinnschwelle (>= bps löst diese Stufe aus)
     pub fraction: f64, // Anteil der ursprünglichen Lot-Größe, der an dieser Stufe verkauft wird (nicht kumulativ)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OrcaCfg {
+    /// Enable persistent SQLite cache for Orca vault reserves.
+    /// Reduces RPC load and improves latency by caching balances across restarts.
+    #[serde(default)]
+    pub enable_reserve_cache: bool,
+    /// Path to SQLite database for reserve cache (relative to config dir).
+    /// Only used if enable_reserve_cache=true. Default: "orca_reserves.db"
+    #[serde(default)]
+    pub cache_path: Option<String>,
+    /// Number of top pools to prefetch reserves for on startup.
+    /// Higher values = more cache warming but slower startup. Default: 100
+    #[serde(default)]
+    pub prefetch_top_pools: Option<usize>,
 }
 
 impl Config {
