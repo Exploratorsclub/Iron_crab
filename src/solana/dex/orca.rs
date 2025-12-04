@@ -154,7 +154,7 @@ impl Orca {
             {
                 continue;
             }
-            if let Some(parsed) = layout::parse_whirlpool_strict(&bytes) {
+            if let Some(parsed) = layout::parse_whirlpool(&bytes) {
                 let address = Pubkey::from_str(&addr_str).unwrap_or_else(|_| Pubkey::new_unique());
                 // Try to fetch vault balances from replay if vault accounts are present in trace
                 let mut reserves = (0u128, 0u128);
@@ -280,7 +280,7 @@ impl Dex for Orca {
             }
             if let Some(_parsed) = layout::parse_whirlpool(&acc.data) {
                 parsed_ok += 1;
-                if let Some(parsed) = layout::parse_whirlpool_strict(&acc.data) {
+                if let Some(parsed) = layout::parse_whirlpool(&acc.data) {
                     strict_ok += 1;
                     // Fetch vault balances (SPL token accounts) to approximate reserves
                     let mut reserves = (0u128, 0u128);
