@@ -23,9 +23,9 @@ pub static CYCLE_COMPLETED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RAYDIUM_POOLS_LOADED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RAYDIUM_POOLS_SKIPPED_SERUM: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RAYDIUM_POOLS_SKIPPED_INVALID: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-// Zero-reserve pool handling (explicit counters)
-pub static RAYDIUM_POOLS_SKIPPED_ZERO_RESERVE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
-pub static ORCA_POOLS_SKIPPED_ZERO_RESERVE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Total pools currently loaded in memory
+pub static RAYDIUM_POOLS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ORCA_POOLS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Mint decimals resolution counters
 pub static MINT_DECIMALS_SOURCE_SUPPLY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MINT_DECIMALS_SOURCE_ACCOUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -354,9 +354,8 @@ pub fn snapshot() -> MetricsSnapshot {
         raydium_pools_loaded: RAYDIUM_POOLS_LOADED.load(Ordering::Relaxed),
         raydium_pools_skipped_serum: RAYDIUM_POOLS_SKIPPED_SERUM.load(Ordering::Relaxed),
         raydium_pools_skipped_invalid: RAYDIUM_POOLS_SKIPPED_INVALID.load(Ordering::Relaxed),
-        raydium_pools_skipped_zero_reserve: RAYDIUM_POOLS_SKIPPED_ZERO_RESERVE
-            .load(Ordering::Relaxed),
-        orca_pools_skipped_zero_reserve: ORCA_POOLS_SKIPPED_ZERO_RESERVE.load(Ordering::Relaxed),
+        raydium_pools_total: RAYDIUM_POOLS_TOTAL.load(Ordering::Relaxed),
+        orca_pools_total: ORCA_POOLS_TOTAL.load(Ordering::Relaxed),
         avg_quote_latency_ms: {
             let reqs = QUOTE_REQUESTS.load(Ordering::Relaxed).max(1);
             (QUOTE_LATENCY_TOTAL_NS.load(Ordering::Relaxed) / reqs) as f64 / 1_000_000.0
@@ -381,8 +380,8 @@ pub struct MetricsSnapshot {
     pub raydium_pools_loaded: u64,
     pub raydium_pools_skipped_serum: u64,
     pub raydium_pools_skipped_invalid: u64,
-    pub raydium_pools_skipped_zero_reserve: u64,
-    pub orca_pools_skipped_zero_reserve: u64,
+    pub raydium_pools_total: u64,
+    pub orca_pools_total: u64,
 }
 
 /// Record one swap latency measurement (nanoseconds)
@@ -476,13 +475,10 @@ async fn metrics_response() -> Response<Body> {
         RAYDIUM_POOLS_SKIPPED_INVALID.load(Ordering::Relaxed)
     );
     line!(
-        "raydium_pools_skipped_zero_reserve_total",
-        RAYDIUM_POOLS_SKIPPED_ZERO_RESERVE.load(Ordering::Relaxed)
+        "raydium_pools_total",
+        RAYDIUM_POOLS_TOTAL.load(Ordering::Relaxed)
     );
-    line!(
-        "orca_pools_skipped_zero_reserve_total",
-        ORCA_POOLS_SKIPPED_ZERO_RESERVE.load(Ordering::Relaxed)
-    );
+    line!("orca_pools_total", ORCA_POOLS_TOTAL.load(Ordering::Relaxed));
     line!(
         "mint_decimals_source_supply_total",
         MINT_DECIMALS_SOURCE_SUPPLY.load(Ordering::Relaxed)

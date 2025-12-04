@@ -173,6 +173,7 @@ impl Raydium {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)]
     fn parse_token_account_amount(data: &[u8]) -> Result<u64> {
         if data.len() < 72 {
             return Err(anyhow!("token account data too short"));
@@ -612,6 +613,13 @@ impl Dex for Raydium {
                 .or_insert_with(|| Vec::with_capacity(2))
                 .push(p.address);
         }
+
+        // Update pools_total metric
+        crate::metrics::RAYDIUM_POOLS_TOTAL.store(
+            self.pools.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         tracing::info!(
             pools = self.pools.len(),
             removed,

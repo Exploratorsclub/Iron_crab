@@ -268,6 +268,12 @@ impl Orca {
             }
         }
 
+        // Update pools_total metric
+        crate::metrics::ORCA_POOLS_TOTAL.store(
+            self.pools.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         tracing::info!(
             prefetched,
             total = self.pools.len(),
@@ -354,6 +360,13 @@ impl Orca {
                 added += 1;
             }
         }
+
+        // Update pools_total metric
+        crate::metrics::ORCA_POOLS_TOTAL.store(
+            self.pools.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         tracing::info!(
             added,
             total = self.pools.len(),
@@ -488,6 +501,13 @@ impl Dex for Orca {
                 added += 1;
             }
         }
+
+        // Update pools_total metric
+        crate::metrics::ORCA_POOLS_TOTAL.store(
+            self.pools.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         tracing::info!(
             total_accounts,
             parsed_ok,
