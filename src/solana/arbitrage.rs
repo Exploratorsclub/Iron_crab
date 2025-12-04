@@ -451,46 +451,42 @@ impl ArbitrageEngine {
     }
 
     /// Fetch token decimals for a mint address, with hardcoded values for common tokens.
-    /// Returns decimals, using 9 as default for unknown tokens (SOL standard).
+    /// Returns decimals, defaulting to 6 (most common for SPL tokens on Raydium/Orca).
     fn get_mint_decimals_fast(&self, mint_str: &str) -> u8 {
         // Hardcode common tokens to avoid RPC calls
         match mint_str {
-            // SOL
+            // SOL - 9 decimals
             "So11111111111111111111111111111111111111112" => 9,
-            // USDC
-            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => 6,
-            // USDT
-            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" => 6,
-            // PYUSD
-            "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo" => 6,
-            // mSOL (Marinade)
+            // mSOL (Marinade) - 9 decimals
             "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So" => 9,
-            // bSOL (BlazeStake)
+            // bSOL (BlazeStake) - 9 decimals
             "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1" => 9,
-            // jitoSOL
+            // jitoSOL - 9 decimals
             "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn" => 9,
-            // bonkSOL
+            // bonkSOL - 5 decimals
             "BonK1YhkXEGLZzwtcvRTip3gAL9nCeQD7ppZBLXhtTs" => 5,
-            // USDS (Saber)
-            "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA" => 6,
-            // USDH (Hubble)
-            "USDH1SM1ojwWUga67PGrgFWUHibbjqMvuMaDkRJTgkX" => 6,
-            // ORCA
-            "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE" => 6,
-            // MNDE (Marinade)
+            // MNDE (Marinade) - 9 decimals
             "MNDEFzGvMt87ueuHvVU9VcTqsAP5b3fTGPsHuuPA5ey" => 9,
-            // JUP (Jupiter)
-            "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN" => 6,
-            // WEN
-            "WENWENvqqNya429ubCdR81ZmD69brwQaaBYY6p3LCpk" => 5,
-            // JTO (Jito)
+            // JTO (Jito) - 9 decimals
             "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL" => 9,
-            // PYTH
-            "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3" => 6,
-            // Pump.fun token
-            "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn" => 6,
-            // Default: assume 9 decimals (SOL standard) for unknown tokens
-            _ => 9,
+            // ORCA - 6 decimals
+            "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE" => 6,
+            // JUP (Jupiter) - 6 decimals
+            "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN" => 6,
+            // WEN - 5 decimals
+            "WENWENvqqNya429ubCdR81ZmD69brwQaaBYY6p3LCpk" => 5,
+            // USDC - 6 decimals
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => 6,
+            // USDT - 6 decimals
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" => 6,
+            // PYUSD - 6 decimals
+            "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo" => 6,
+            // USDS (Saber) - 6 decimals
+            "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA" => 6,
+            // USDH (Hubble) - 6 decimals
+            "USDH1SM1ojwWUga67PGrgFWUHibbjqMvuMaDkRJTgkX" => 6,
+            // Default: 6 decimals (most common for SPL tokens, NOT 9!)
+            _ => 6,
         }
     }
 
