@@ -194,15 +194,6 @@ impl Raydium {
 
     /// Hard validation (errors) + soft warnings for pool structural invariants.
     fn validate_pool_state(p: &reader::PoolV4) -> Result<()> {
-        // Debug: log actual values for problematic pools
-        if p.base_mint == p.quote_mint {
-            tracing::warn!(
-                pool = %p.address,
-                base_mint = %p.base_mint,
-                quote_mint = %p.quote_mint,
-                "DIAGNOSTIC: base_mint == quote_mint"
-            );
-        }
         ensure!(p.base_mint != p.quote_mint, "pool base_mint == quote_mint");
         ensure!(
             p.base_vault != p.quote_vault,
@@ -535,16 +526,6 @@ impl Dex for Raydium {
             "raydium.refresh_pools decoded candidate pools"
         );
 
-        // DIAGNOSTIC: Log first pool's mint values for offset verification
-        if let Some((first_p, _)) = decoded.first() {
-            tracing::warn!(
-                pool = %first_p.address,
-                base_mint = %first_p.base_mint,
-                quote_mint = %first_p.quote_mint,
-                "DIAGNOSTIC: First pool mints (offset check)"
-            );
-        }
-
         // Batch vault fetch
         let mut vaults: Vec<Pubkey> = Vec::with_capacity(decoded.len() * 2);
         for (p, _) in &decoded {
@@ -571,8 +552,7 @@ impl Dex for Raydium {
         // Insert/update (with optional serum market fetch per pool)
         let mut loaded = 0u32;
         let mut skipped_serum = 0u32;
-        let mut skipped_fee = 0u32;
-        for (p, raw) in decoded {
+        for (p, _) in decoded {
             let base_amt = vault_amounts.get(&p.base_vault).copied().unwrap_or(0);
             let quote_amt = vault_amounts.get(&p.quote_vault).copied().unwrap_or(0);
 
@@ -581,28 +561,9 @@ impl Dex for Raydium {
                 tracing::debug!(pool = %p.address, base_amt, quote_amt, "raydium pool has zero/missing reserves (will fetch on-demand)");
             }
 
-            let fee_num = raw
-                .get(8..16)
-                .and_then(|s| s.try_into().ok())
-                .map(u64::from_le_bytes)
-                .unwrap_or_default();
-            let fee_den = raw
-                .get(16..24)
-                .and_then(|s| s.try_into().ok())
-                .map(u64::from_le_bytes)
-                .unwrap_or_default();
-            if fee_num == 0 || fee_den == 0 || fee_num > fee_den {
-                tracing::warn!(pool = %p.address, fee_num, fee_den, "invalid fee ratio -> skip");
-                skipped_fee += 1;
-                continue;
-            }
-            let fee_bps_calc = ((fee_num * 10_000) / fee_den) as u32;
-            if !(1..=1000).contains(&fee_bps_calc) {
-                tracing::warn!(pool = %p.address, fee_bps_calc, "fee_bps out of supported range -> skip");
-                skipped_fee += 1;
-                continue;
-            }
-            let fee_bps = fee_bps_calc;
+            // Raydium AMM v4 uses a hardcoded fee of 25 basis points (0.25%)
+            // The fee structure is fixed in the program, not stored per-pool
+            let fee_bps = 25u32;
             let (amm_auth, _) = Self::derive_amm_authority();
             let serum_vault_signer = if p.market_program_id != Pubkey::default() {
                 let (v, _) = Self::derive_serum_vault_signer(&p.market_id, &p.market_program_id);
@@ -692,7 +653,6 @@ impl Dex for Raydium {
             removed,
             loaded,
             skipped_serum,
-            skipped_fee,
             "raydium.refresh_pools done"
         );
         Ok(())
