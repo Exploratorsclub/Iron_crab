@@ -450,21 +450,48 @@ impl ArbitrageEngine {
         Ok((safe_amount_pct, slippage_pct))
     }
 
-    /// Fetch token decimals for a mint address, with caching for performance.
+    /// Fetch token decimals for a mint address, with hardcoded values for common tokens.
     /// Returns decimals, using 9 as default for unknown tokens (SOL standard).
-    async fn get_mint_decimals(&self, mint_str: &str) -> u8 {
-        use solana_sdk::pubkey::Pubkey as SdkPubkey;
-        use std::str::FromStr;
-
-        let mint = match SdkPubkey::from_str(mint_str) {
-            Ok(pk) => pk,
-            Err(_) => {
-                tracing::warn!(mint = %mint_str, "invalid mint pubkey, defaulting to 9 decimals");
-                return 9;
-            }
-        };
-
-        crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &mint).await
+    fn get_mint_decimals_fast(&self, mint_str: &str) -> u8 {
+        // Hardcode common tokens to avoid RPC calls
+        match mint_str {
+            // SOL
+            "So11111111111111111111111111111111111111112" => 9,
+            // USDC
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => 6,
+            // USDT
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" => 6,
+            // PYUSD
+            "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo" => 6,
+            // mSOL (Marinade)
+            "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So" => 9,
+            // bSOL (BlazeStake)
+            "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1" => 9,
+            // jitoSOL
+            "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn" => 9,
+            // bonkSOL
+            "BonK1YhkXEGLZzwtcvRTip3gAL9nCeQD7ppZBLXhtTs" => 5,
+            // USDS (Saber)
+            "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA" => 6,
+            // USDH (Hubble)
+            "USDH1SM1ojwWUga67PGrgFWUHibbjqMvuMaDkRJTgkX" => 6,
+            // ORCA
+            "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE" => 6,
+            // MNDE (Marinade)
+            "MNDEFzGvMt87ueuHvVU9VcTqsAP5b3fTGPsHuuPA5ey" => 9,
+            // JUP (Jupiter)
+            "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN" => 6,
+            // WEN
+            "WENWENvqqNya429ubCdR81ZmD69brwQaaBYY6p3LCpk" => 5,
+            // JTO (Jito)
+            "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL" => 9,
+            // PYTH
+            "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3" => 6,
+            // Pump.fun token
+            "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn" => 6,
+            // Default: assume 9 decimals (SOL standard) for unknown tokens
+            _ => 9,
+        }
     }
 
     /// Normalize amount from source decimals to target decimals.
@@ -562,10 +589,10 @@ impl ArbitrageEngine {
                         continue;
                     }
 
-                    // Fetch decimals for all tokens in the cycle
-                    let base_decimals = self.get_mint_decimals(base).await;
-                    let mid1_decimals = self.get_mint_decimals(mid1).await;
-                    let mid2_decimals = self.get_mint_decimals(mid2).await;
+                    // Fetch decimals for all tokens in the cycle (using fast lookup)
+                    let base_decimals = self.get_mint_decimals_fast(base);
+                    let mid1_decimals = self.get_mint_decimals_fast(mid1);
+                    let mid2_decimals = self.get_mint_decimals_fast(mid2);
 
                     // Normalize all amounts to 9 decimals (SOL standard) for comparison
                     const TARGET_DECIMALS: u8 = 9;
@@ -584,40 +611,44 @@ impl ArbitrageEngine {
                         continue;
                     }
 
-                    // Sanity check: filter cycles with extreme price movements in normalized space
-                    // If any hop changes value by >100x, it's suspicious
-                    if h1_out_norm > amount_in_norm * 100 || h1_out_norm < amount_in_norm / 100 {
+                    // Sanity check: filter cycles with EXTREME price movements in normalized space
+                    // Only reject if price changes by >10,000x (likely decimal error)
+                    if h1_out_norm > amount_in_norm * 10_000
+                        || h1_out_norm < amount_in_norm / 10_000
+                    {
                         tracing::debug!(
                             path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
                             amount_in_norm,
                             h1_out_norm,
                             base_decimals,
                             mid1_decimals,
-                            "arbitrage: rejecting cycle - h1 price change >100x (normalized)"
+                            "arbitrage: rejecting cycle - h1 price change >10000x (normalized)"
                         );
                         continue;
                     }
 
-                    if h2_out_norm > h1_out_norm * 100 || h2_out_norm < h1_out_norm / 100 {
+                    if h2_out_norm > h1_out_norm * 10_000 || h2_out_norm < h1_out_norm / 10_000 {
                         tracing::debug!(
                             path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
                             h1_out_norm,
                             h2_out_norm,
                             mid1_decimals,
                             mid2_decimals,
-                            "arbitrage: rejecting cycle - h2 price change >100x (normalized)"
+                            "arbitrage: rejecting cycle - h2 price change >10000x (normalized)"
                         );
                         continue;
                     }
 
-                    if final_out_norm > h2_out_norm * 100 || final_out_norm < h2_out_norm / 100 {
+                    if final_out_norm > h2_out_norm * 10_000
+                        || final_out_norm < h2_out_norm / 10_000
+                    {
                         tracing::debug!(
                             path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
                             h2_out_norm,
                             final_out_norm,
                             mid2_decimals,
                             base_decimals,
-                            "arbitrage: rejecting cycle - h3 price change >100x (normalized)"
+                            "arbitrage: rejecting cycle - h3 price change >10000x (normalized)"
                         );
                         continue;
                     }
