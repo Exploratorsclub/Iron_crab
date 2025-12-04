@@ -989,7 +989,7 @@ pub fn compute_net_profit_with_slippage(
 
     // Apply slippage to final_out
     let slippage_factor = (100.0 - slippage_pct) / 100.0;
-    let slippage_factor = slippage_factor.max(0.0).min(1.0);
+    let slippage_factor = slippage_factor.clamp(0.0, 1.0);
     let final_out_after_slippage = (final_out as f64 * slippage_factor) as u64;
 
     if final_out_after_slippage <= amount_in {
