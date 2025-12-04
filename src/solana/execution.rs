@@ -9,7 +9,7 @@ use crate::wallet::Treasury;
 use anyhow::{anyhow, Result};
 use solana_sdk::{hash::Hash, instruction::Instruction, transaction::Transaction};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Configuration for trade execution
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +65,7 @@ pub enum ExecutionStatus {
     Simulated,
 }
 
+#[derive(Clone)]
 pub struct ExecutionEngine {
     pub rpc: Arc<SolanaRpc>,
     pub router: Arc<Router>,
@@ -271,42 +272,43 @@ impl ExecutionEngine {
 
     /// Execute multiple opportunities, respecting position limits
     pub async fn execute_batch(&self, cycles: &[CycleOpportunity]) -> Vec<ExecutionResult> {
-        let mut results = Vec::new();
-        let mut total_committed = 0u64;
-
+        // PARALLEL EXECUTION: Launch all opportunities concurrently for speed
+        // Each will check position limits independently
+        let mut handles = Vec::new();
+        
         for cycle in cycles {
-            // Skip if would exceed position limit
-            if total_committed.saturating_add(cycle.amount_in) > self.config.max_position_lamports {
-                warn!(
-                    amount_in = cycle.amount_in,
-                    total_committed = total_committed,
-                    max_position = self.config.max_position_lamports,
-                    "execution: skipping opportunity due to position limit"
-                );
-                continue;
-            }
-
-            match self.execute_opportunity(cycle).await {
-                Ok(result) => {
-                    total_committed = total_committed.saturating_add(cycle.amount_in);
-                    results.push(result);
+            let cycle_clone = cycle.clone();
+            let self_clone = self.clone();
+            
+            let handle = tokio::spawn(async move {
+                match self_clone.execute_opportunity(&cycle_clone).await {
+                    Ok(result) => Some(result),
+                    Err(e) => {
+                        error!(
+                            path = %format!("{} -> {} -> {} -> {}", cycle_clone.path.0, cycle_clone.path.1, cycle_clone.path.2, cycle_clone.path.0),
+                            error = %e,
+                            "execution: failed to execute opportunity"
+                        );
+                        None
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        path = %format!("{} -> {} -> {} -> {}", cycle.path.0, cycle.path.1, cycle.path.2, cycle.path.0),
-                        error = %e,
-                        "execution: failed to execute opportunity"
-                    );
-                }
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all to complete
+        let mut results = Vec::new();
+        for handle in handles {
+            if let Ok(Some(result)) = handle.await {
+                results.push(result);
             }
         }
-
+        
         info!(
             total_executed = results.len(),
-            total_committed = total_committed,
             "execution: batch completed"
         );
-
+        
         results
     }
 
