@@ -1,4 +1,5 @@
 pub mod arbitrage;
+pub mod execution;
 pub mod rpc;
 pub mod sniper;
 #[cfg(any(test, feature = "test_helpers"))]
