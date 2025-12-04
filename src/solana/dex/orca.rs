@@ -53,6 +53,7 @@ pub struct OrcaPoolSnapshot {
 pub struct Orca {
     rpc: Arc<SolanaRpc>,
     pools: Arc<DashMap<Pubkey, OrcaPool>>, // keyed by a pseudo pool id (mint xor) for now
+    #[allow(dead_code)]
     fee_tiers: Arc<DashMap<Pubkey, (u32, u16)>>,
     user_authority: Arc<std::sync::RwLock<Option<Pubkey>>>,
     user_token_accounts: Arc<DashMap<Pubkey, Pubkey>>, // mint -> user token account (ATA)
@@ -396,7 +397,6 @@ impl Dex for Orca {
         let mut total_accounts = 0u32;
         let mut parsed_ok = 0u32;
         let mut zero_reserve = 0u32;
-        let mut fee_tier_keys: Vec<Pubkey> = Vec::new();
         self.mint_index.clear();
         for (addr, acc) in accounts.into_iter().take(5000) {
             // safety limit

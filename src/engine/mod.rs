@@ -37,7 +37,8 @@ pub struct Engine {
     allocator: Arc<Allocator>,
     strategies: Vec<Arc<dyn Strategy>>, // pro Markt konfigurierbar
     router: Router,                     // DEX router for best execution
-    orca: Arc<Orca>,                    // Direct reference for prefetching
+    #[allow(dead_code)]
+    orca: Arc<Orca>, // Direct reference for prefetching (used in background tasks)
 }
 
 impl Engine {
@@ -1098,6 +1099,7 @@ mod tests {
             strategies: std::collections::HashMap::new(),
             arbitrage: None,
             sniper: None,
+            orca: Default::default(),
         };
         let rpc = Arc::new(crate::solana::rpc::SolanaRpc::new("http://127.0.0.1:8899"));
         let signer = Arc::new(solana_sdk::signature::Keypair::new());
