@@ -391,6 +391,10 @@ impl ArbitrageEngine {
                 pairs.insert((a.clone(), b.clone()));
             }
         }
+        tracing::debug!(
+            total_pairs_available = pairs.len(),
+            "arbitrage engine: pairs loaded from connectors"
+        );
         // Build adjacency
         let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
         for (a, b) in pairs.iter() {
@@ -400,6 +404,7 @@ impl ArbitrageEngine {
         let mut cycles = Vec::new();
         for base in base_tokens {
             if !adj.contains_key(base) {
+                tracing::trace!(base_token = %base, "base token not in adjacency graph");
                 continue;
             }
             let neigh1 = adj.get(base).unwrap();
@@ -455,6 +460,12 @@ impl ArbitrageEngine {
                         self.min_profit_bps,
                         self.est_tx_cost_lamports,
                     );
+                    tracing::trace!(
+                        path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
+                        gross_profit,
+                        net_profit = ?net,
+                        "arbitrage: candidate cycle evaluated"
+                    );
                     cycles.push(CycleOpportunity {
                         path: (base.clone(), mid1.clone(), mid2.clone()),
                         amount_in,
@@ -465,6 +476,10 @@ impl ArbitrageEngine {
                 }
             }
         }
+        tracing::debug!(
+            cycles_found = cycles.len(),
+            "arbitrage engine: cycle enumeration completed"
+        );
         // Deduplicate cycles (A,B,C) vs (A,C,B): enforce order mid1 < mid2 lexicographically
         let mut uniq: HashMap<(String, String, String), CycleOpportunity> = HashMap::new();
         for c in cycles.into_iter() {

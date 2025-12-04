@@ -459,8 +459,16 @@ impl Engine {
                     let base_list: Vec<String> = base_tokens.into_iter().take(20).collect();
 
                     if base_list.is_empty() {
+                        tracing::debug!(
+                            "arbitrage: no base tokens available from discovered pairs"
+                        );
                         continue;
                     }
+
+                    tracing::debug!(
+                        base_tokens_count = base_list.len(),
+                        "arbitrage: starting cycle enumeration"
+                    );
 
                     // Scan for profitable arbitrage cycles (1 SOL = 1B lamports test amount)
                     match arb
@@ -468,10 +476,19 @@ impl Engine {
                         .await
                     {
                         Ok(cycles) => {
+                            tracing::debug!(
+                                total_cycles_found = cycles.len(),
+                                "arbitrage: cycle enumeration completed"
+                            );
                             let mut profitable: Vec<_> = cycles
                                 .into_iter()
                                 .filter(|c| c.net_profit.is_some() && c.net_profit.unwrap() > 0)
                                 .collect();
+
+                            tracing::debug!(
+                                profitable_cycles = profitable.len(),
+                                "arbitrage: filtered for profitability"
+                            );
 
                             // Sort by net profit descending
                             profitable.sort_by(|a, b| {
@@ -499,7 +516,7 @@ impl Engine {
                             }
                         }
                         Err(e) => {
-                            tracing::debug!(?e, "triangular cycle enumeration failed");
+                            tracing::warn!(?e, "triangular cycle enumeration failed");
                         }
                     }
                 }
