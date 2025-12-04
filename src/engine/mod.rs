@@ -449,24 +449,38 @@ impl Engine {
                         static_pairs.clone()
                     };
 
-                    // Extract unique base tokens (SOL, stables, etc.)
+                    // Extract unique base tokens from pairs
                     let mut base_tokens: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
                     for p in &use_pairs {
                         base_tokens.insert(p.in_mint.clone());
                         base_tokens.insert(p.out_mint.clone());
                     }
+
+                    // Fallback to configured base_tokens if discovery hasn't populated yet
+                    if base_tokens.is_empty() {
+                        if let Some(dc) = &disc_cfg {
+                            for bt in &dc.base_tokens {
+                                base_tokens.insert(bt.clone());
+                            }
+                            tracing::debug!(
+                                "arbitrage: using configured base_tokens (discovery not yet ready)"
+                            );
+                        }
+                    }
+
                     let base_list: Vec<String> = base_tokens.into_iter().take(20).collect();
 
                     if base_list.is_empty() {
                         tracing::debug!(
-                            "arbitrage: no base tokens available from discovered pairs"
+                            "arbitrage: no base tokens available from discovered pairs or config"
                         );
                         continue;
                     }
 
                     tracing::debug!(
                         base_tokens_count = base_list.len(),
+                        base_tokens = ?base_list.iter().take(5).collect::<Vec<_>>(),
                         "arbitrage: starting cycle enumeration"
                     );
 
