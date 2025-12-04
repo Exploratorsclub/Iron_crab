@@ -705,9 +705,9 @@ impl ArbitrageEngine {
                     );
                     cycles.push(CycleOpportunity {
                         path: (base.clone(), mid1.clone(), mid2.clone()),
-                        amount_in,
-                        gross_out: final_out,
-                        gross_profit: gross_profit_norm, // Store normalized profit
+                        amount_in: amount_in_norm, // CRITICAL: Store normalized amount_in
+                        gross_out: final_out_norm, // CRITICAL: Store normalized final_out
+                        gross_profit: gross_profit_norm, // Store normalized profit (already normalized)
                         net_profit: net_norm,            // Store normalized net profit
                     });
                 }

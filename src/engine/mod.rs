@@ -571,30 +571,12 @@ impl Engine {
                                 let (a, b, c) = &cycle.path;
                                 let net_profit_norm = cycle.net_profit.unwrap_or(0);
                                 let gross_profit_norm = cycle.gross_profit;
+                                let amount_in_norm = cycle.amount_in; // Now normalized to 9 decimals
 
-                                // Note: gross_profit and net_profit are already normalized to 9 decimals
-                                // For a realistic ROI calculation, we need a normalized amount_in
-                                // Since we don't have it stored, calculate ROI from gross_profit_norm
-                                // assuming amount_in was also normalized (which it was during calculation)
-                                // ROI = (net_profit_norm / amount_in_norm) * 10000
-                                // Since we can't recover amount_in_norm easily, use the ratio:
-                                // ROI ≈ (net_profit_norm / gross_out_norm) * return_multiple * 10000
-
-                                // Simple approximation: if gross_profit exists, use it as basis
-                                let roi_bps = if gross_profit_norm > 0 && net_profit_norm > 0 {
-                                    // Estimate: net_profit / (gross_out - gross_profit) ≈ net / amount_in_norm
-                                    let gross_out_norm = cycle.gross_out;
-                                    let amount_in_norm = if gross_out_norm > gross_profit_norm {
-                                        gross_out_norm - gross_profit_norm
-                                    } else {
-                                        gross_out_norm // fallback
-                                    };
-                                    if amount_in_norm > 0 {
-                                        ((net_profit_norm as f64 / amount_in_norm as f64) * 10000.0)
-                                            as u32
-                                    } else {
-                                        0
-                                    }
+                                // Simple ROI calculation with all values in normalized 9-decimal space
+                                let roi_bps = if amount_in_norm > 0 && net_profit_norm > 0 {
+                                    ((net_profit_norm as f64 / amount_in_norm as f64) * 10_000.0)
+                                        as u32
                                 } else {
                                     0
                                 };
@@ -603,7 +585,7 @@ impl Engine {
                                     path = %format!("{} -> {} -> {} -> {}", a, b, c, a),
                                     gross_profit_lamports = gross_profit_norm,
                                     net_profit_lamports = net_profit_norm,
-                                    amount_in_lamports = cycle.amount_in,
+                                    amount_in_lamports = amount_in_norm,
                                     roi_bps = roi_bps,
                                     "arbitrage cycle opportunity detected"
                                 );
