@@ -583,6 +583,12 @@ impl Engine {
                                 b_net.cmp(&a_net)
                             });
 
+                            // Increment metric for ALL detected profitable opportunities
+                            for _ in &profitable {
+                                crate::metrics::ARB_TRIANGLE_OPPORTUNITIES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+
                             // Execute top opportunities if they meet profitability threshold
                             if !profitable.is_empty() {
                                 let opportunities_to_execute: Vec<_> = profitable
@@ -654,8 +660,6 @@ impl Engine {
                                     roi_bps = roi_bps,
                                     "arbitrage cycle opportunity detected"
                                 );
-                                crate::metrics::ARB_TRIANGLE_OPPORTUNITIES
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                         Err(e) => {
