@@ -524,40 +524,16 @@ impl Dex for Raydium {
             "raydium.refresh_pools decoded candidate pools"
         );
 
-        // Batch vault fetch
-        let mut vaults: Vec<Pubkey> = Vec::with_capacity(decoded.len() * 2);
-        for (p, _) in &decoded {
-            vaults.push(p.base_vault);
-            vaults.push(p.quote_vault);
-        }
-        let mut vault_amounts = std::collections::HashMap::new();
-        if !vaults.is_empty() {
-            if let Ok(accts) = self.rpc.rpc.get_multiple_accounts(&vaults).await {
-                for (i, acc_opt) in accts.into_iter().enumerate() {
-                    if let Some(a) = acc_opt {
-                        if let Ok(val) = Self::parse_token_account_amount(&a.data) {
-                            vault_amounts.insert(vaults[i], val as u128);
-                        }
-                    }
-                }
-            }
-            tracing::info!(
-                vaults = vaults.len(),
-                balances = vault_amounts.len(),
-                "raydium.refresh_pools fetched vault balances"
-            );
-        }
-        // Insert/update (with optional serum market fetch per pool)
+        // Don't fetch vault balances upfront - use lazy-loading like Orca
+        // Reserves will be fetched on-demand when pools are evaluated for quotes
+        tracing::info!(
+            decoded = decoded.len(),
+            "raydium.refresh_pools decoded pools (reserves lazy-loaded)"
+        );
+
+        // Insert/update pools with zero reserves (will be fetched on-demand)
         let mut loaded = 0u32;
         for (p, _) in decoded {
-            let base_amt = vault_amounts.get(&p.base_vault).copied().unwrap_or(0);
-            let quote_amt = vault_amounts.get(&p.quote_vault).copied().unwrap_or(0);
-
-            // Track zero reserves but don't skip - they will be fetched on-demand (like Orca)
-            if base_amt == 0 || quote_amt == 0 {
-                tracing::debug!(pool = %p.address, base_amt, quote_amt, "raydium pool has zero/missing reserves (will fetch on-demand)");
-            }
-
             // Raydium AMM v4 uses a hardcoded fee of 25 basis points (0.25%)
             // The fee structure is fixed in the program, not stored per-pool
             let fee_bps = 25u32;
@@ -594,8 +570,8 @@ impl Dex for Raydium {
                 quote_vault: p.quote_vault,
                 lp_reserve: p.lp_reserve,
                 address: p.address,
-                reserve_base: base_amt,
-                reserve_quote: quote_amt,
+                reserve_base: 0,  // Lazy-loaded on-demand
+                reserve_quote: 0, // Lazy-loaded on-demand
                 fee_bps,
                 last_update: SystemTime::now(),
                 open_orders: Some(p.open_orders),
