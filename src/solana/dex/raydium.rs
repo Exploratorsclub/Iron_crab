@@ -477,7 +477,6 @@ impl Dex for Raydium {
     async fn refresh_pools(&self) -> Result<()> {
         use crate::metrics::{
             RAYDIUM_POOLS_LOADED, RAYDIUM_POOLS_SKIPPED_INVALID, RAYDIUM_POOLS_SKIPPED_SERUM,
-            RAYDIUM_POOLS_SKIPPED_ZERO_RESERVE,
         };
         use std::time::{Duration, SystemTime};
         tracing::trace!("raydium.refresh_pools() start");
@@ -551,19 +550,19 @@ impl Dex for Raydium {
         }
         // Insert/update (with optional serum market fetch per pool)
         let mut loaded = 0u32;
-        let mut skipped_zero = 0u32;
+        let mut zero_reserve = 0u32;
         let mut skipped_serum = 0u32;
         let mut skipped_fee = 0u32;
         for (p, raw) in decoded {
             let base_amt = vault_amounts.get(&p.base_vault).copied().unwrap_or(0);
             let quote_amt = vault_amounts.get(&p.quote_vault).copied().unwrap_or(0);
+
+            // Track zero reserves but don't skip - they will be fetched on-demand (like Orca)
             if base_amt == 0 || quote_amt == 0 {
-                tracing::warn!(pool = %p.address, base_amt, quote_amt, "skip pool missing/zero vault balances");
-                RAYDIUM_POOLS_SKIPPED_ZERO_RESERVE
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                skipped_zero += 1;
-                continue;
+                tracing::debug!(pool = %p.address, base_amt, quote_amt, "raydium pool has zero/missing reserves (will fetch on-demand)");
+                zero_reserve += 1;
             }
+
             let fee_num = raw
                 .get(8..16)
                 .and_then(|s| s.try_into().ok())
@@ -674,7 +673,6 @@ impl Dex for Raydium {
             pools = self.pools.len(),
             removed,
             loaded,
-            skipped_zero,
             skipped_serum,
             skipped_fee,
             "raydium.refresh_pools done"
