@@ -160,15 +160,18 @@ impl ExecutionEngine {
         };
 
         // Now build the third hop: mid2 -> base
-        let plan_hop3 = self
-            .router
-            .build_best_hops2_plan_exact_in(
-                mid2,
-                base,
-                final_out_hop2,
-                self.config.max_slippage_bps,
-            )
-            .await?;
+        let plan_hop3 = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.router
+                .build_best_hops2_plan_exact_in(
+                    mid2,
+                    base,
+                    final_out_hop2,
+                    self.config.max_slippage_bps,
+                )
+        )
+        .await
+        .map_err(|_| anyhow!("Timeout building plan for {}->{}", mid2, base))??;
 
         let (ixs_hop3, final_out_actual) = match plan_hop3 {
             Some(p) => (p.ixs, p.expected_out),
