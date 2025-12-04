@@ -377,6 +377,70 @@ impl ArbitrageEngine {
         Ok(results)
     }
 
+    /// Estimate slippage by comparing quotes at different amounts.
+    /// Returns (safe_amount_bps, estimated_slippage_percent)
+    /// safe_amount_bps: percentage of balance that keeps slippage under 5%
+    pub async fn estimate_slippage_for_pair(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        test_amount: u64,
+    ) -> Result<(u32, f64)> {
+        // Get baseline quote at test_amount
+        let baseline = match self
+            .router
+            .best_quote_exact_in(input_mint, output_mint, test_amount)
+            .await?
+        {
+            Some(q) => q,
+            None => {
+                // No liquidity at all
+                return Ok((0, 100.0));
+            }
+        };
+
+        let baseline_price = baseline.quote.amount_out as f64 / test_amount as f64;
+
+        // Try 10x amount to see impact
+        let large_amount = test_amount * 10;
+        let large_quote = match self
+            .router
+            .best_quote_exact_in(input_mint, output_mint, large_amount)
+            .await?
+        {
+            Some(q) => q,
+            None => {
+                // Can't handle 10x - liquidity is very limited
+                return Ok((10, 50.0)); // only 10% of test amount, 50% slippage estimate
+            }
+        };
+
+        let large_price = large_quote.quote.amount_out as f64 / large_amount as f64;
+
+        // Calculate slippage: (baseline_price - actual_price) / baseline_price * 100
+        let slippage_pct = ((baseline_price - large_price) / baseline_price) * 100.0;
+
+        // If slippage is <5% at 10x, we can go higher
+        let safe_amount_pct = if slippage_pct < 5.0 {
+            100
+        } else if slippage_pct < 10.0 {
+            50
+        } else if slippage_pct < 20.0 {
+            20
+        } else {
+            5 // very illiquid
+        };
+
+        tracing::debug!(
+            pair = %format!("{} -> {}", input_mint, output_mint),
+            slippage_at_10x = slippage_pct,
+            safe_amount_pct,
+            "arbitrage: slippage estimate"
+        );
+
+        Ok((safe_amount_pct, slippage_pct))
+    }
+
     /// Enumerate triangular cycles (A->B->C->A) over discovered token graph and return profitable opportunities (gross > in).
     /// Decimals assumed homogeneous (6) for now; future: per-mint decimals map.
     pub async fn enumerate_triangular_cycles(
@@ -752,6 +816,41 @@ pub fn compute_net_profit(
     }
     let gross = final_out - amount_in;
     // bps = (gross / amount_in) * 10_000
+    let bps = (gross as u128 * 10_000u128 / amount_in as u128) as u32;
+    if bps < min_profit_bps {
+        return None;
+    }
+    if gross <= est_tx_cost_lamports {
+        return None;
+    }
+    let net = gross - est_tx_cost_lamports;
+    if net == 0 {
+        return None;
+    }
+    Some(net)
+}
+
+pub fn compute_net_profit_with_slippage(
+    amount_in: u64,
+    final_out: u64,
+    slippage_pct: f64,
+    min_profit_bps: u32,
+    est_tx_cost_lamports: u64,
+) -> Option<u64> {
+    if final_out <= amount_in {
+        return None;
+    }
+
+    // Apply slippage to final_out
+    let slippage_factor = (100.0 - slippage_pct) / 100.0;
+    let slippage_factor = slippage_factor.max(0.0).min(1.0);
+    let final_out_after_slippage = (final_out as f64 * slippage_factor) as u64;
+
+    if final_out_after_slippage <= amount_in {
+        return None; // No profit after slippage
+    }
+
+    let gross = final_out_after_slippage - amount_in;
     let bps = (gross as u128 * 10_000u128 / amount_in as u128) as u32;
     if bps < min_profit_bps {
         return None;
