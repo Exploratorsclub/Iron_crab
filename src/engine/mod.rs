@@ -445,11 +445,11 @@ impl Engine {
                 // Initialize execution engine with config optimized for test environment
                 // With 0.072 SOL, we need very conservative position sizes
                 let exec_config = ExecutionConfig {
-                    max_slippage_bps: 500,                 // 5% slippage tolerance
-                    min_profit_bps_to_execute: 100,        // 1% minimum profit to execute
-                    max_position_lamports: 10_000_000,     // 0.01 SOL max per trade (was 5 SOL)
-                    dry_run: true,                         // Start in dry-run mode for testing
-                    priority_fee_micro_lamports: 1_000,    // Low priority fee
+                    max_slippage_bps: 500,              // 5% slippage tolerance
+                    min_profit_bps_to_execute: 100,     // 1% minimum profit to execute
+                    max_position_lamports: 10_000_000,  // 0.01 SOL max per trade (was 5 SOL)
+                    dry_run: true,                      // Start in dry-run mode for testing
+                    priority_fee_micro_lamports: 1_000, // Low priority fee
                 };
                 let executor = ExecutionEngine::new(
                     rpc.clone(),
@@ -581,9 +581,24 @@ impl Engine {
                         }
                     }
 
-                    // Scan for profitable arbitrage cycles (1 SOL = 1B lamports test amount)
+                    // Scan for profitable arbitrage cycles
+                    // Read default_ui_amount from discovery config, convert to lamports
+                    let scan_amount_lamports = if let Some(dc) = &disc_cfg {
+                        let ui_amount = dc.default_ui_amount.unwrap_or(0.05);
+                        // Convert UI amount (in SOL) to raw lamports
+                        (ui_amount * 1_000_000_000.0) as u64
+                    } else {
+                        1_000_000_000 // Fallback: 1 SOL if no config
+                    };
+
+                    tracing::debug!(
+                        scan_amount_sol = scan_amount_lamports as f64 / 1_000_000_000.0,
+                        scan_amount_lamports = scan_amount_lamports,
+                        "arbitrage: starting cycle enumeration"
+                    );
+
                     match arb
-                        .enumerate_triangular_cycles(&base_list, 1_000_000_000)
+                        .enumerate_triangular_cycles(&base_list, scan_amount_lamports)
                         .await
                     {
                         Ok(cycles) => {
