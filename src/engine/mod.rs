@@ -642,6 +642,7 @@ impl Engine {
                                         };
                                         roi_bps >= exec_config.min_profit_bps_to_execute
                                     })
+                                    .take(3)  // PERFORMANCE: Only execute top 3 opportunities to avoid staleness
                                     .cloned()
                                     .collect();
 
