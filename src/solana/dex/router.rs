@@ -116,8 +116,13 @@ impl Router {
         }
         mids.remove(input_mint);
         mids.remove(output_mint);
+        
+        // PERFORMANCE: Limit to first 20 mid tokens to avoid timeout
+        // TODO: Sort by liquidity/volume before limiting
+        let mid_vec: Vec<String> = mids.into_iter().take(20).collect();
+        
         let mut best: Option<(Vec<(usize, Quote)>, u64)> = None;
-        for mid in mids {
+        for mid in mid_vec {
             // First hop quotes
             let mut first_hop: Option<(usize, Quote)> = None;
             for (i, d) in self.dexs.iter().enumerate() {
@@ -211,9 +216,13 @@ impl Router {
             }
         }
         // candidate mid2 tokens appear in neighbors_to_output; mid1 in neighbors_from_input
+        
+        // PERFORMANCE: Limit to first 15 mid1 tokens to avoid timeout
+        let mid1_vec: Vec<String> = neighbors_from_input.into_iter().take(15).collect();
+        
         let mut best: Option<(Vec<(usize, Quote)>, u64)> = None;
         // iterate mid1 first
-        for mid1 in neighbors_from_input.iter() {
+        for mid1 in &mid1_vec {
             // hop1
             let mut hop1_best: Option<(usize, Quote)> = None;
             for (i, d) in self.dexs.iter().enumerate() {
