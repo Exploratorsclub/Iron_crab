@@ -518,17 +518,29 @@ impl ArbitrageEngine {
                         continue;
                     }
                     let gross_profit = final_out - amount_in;
-                    let net = compute_net_profit(
+
+                    // CRITICAL: Estimate slippage for first leg (most impactful)
+                    let (safe_amount_pct, slippage_pct) = self
+                        .estimate_slippage_for_pair(base, mid1, amount_in)
+                        .await
+                        .unwrap_or((100, 0.0));
+
+                    // Use slippage-adjusted profit calculation
+                    let net = compute_net_profit_with_slippage(
                         amount_in,
                         final_out,
+                        slippage_pct,
                         self.min_profit_bps,
                         self.est_tx_cost_lamports,
                     );
+
                     tracing::trace!(
                         path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
                         gross_profit,
                         net_profit = ?net,
-                        "arbitrage: candidate cycle evaluated"
+                        slippage_pct = ?slippage_pct,
+                        safe_amount_pct,
+                        "arbitrage: candidate cycle evaluated with slippage"
                     );
                     cycles.push(CycleOpportunity {
                         path: (base.clone(), mid1.clone(), mid2.clone()),
