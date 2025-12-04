@@ -3,10 +3,13 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use super::orca_reserve_cache::{OrcaReserveCache, ReserveEntry};
 use super::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
+use chrono::Utc;
 use solana_sdk::instruction::Instruction;
 
 pub const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"; // corrected
@@ -54,10 +57,22 @@ pub struct Orca {
     user_authority: Arc<std::sync::RwLock<Option<Pubkey>>>,
     user_token_accounts: Arc<DashMap<Pubkey, Pubkey>>, // mint -> user token account (ATA)
     mint_index: Arc<DashMap<Pubkey, Vec<Pubkey>>>,     // mint -> pools containing it
+    reserve_cache: Option<Arc<OrcaReserveCache>>,
+    cache_hits: Arc<AtomicU64>,
+    cache_misses: Arc<AtomicU64>,
 }
 
 impl Orca {
     pub fn new(rpc: Arc<SolanaRpc>) -> Self {
+        Self::new_with_cache(rpc, None)
+    }
+
+    /// Create Orca instance with optional persistent reserve cache.
+    pub fn new_with_cache(rpc: Arc<SolanaRpc>, cache_path: Option<String>) -> Self {
+        let reserve_cache = cache_path
+            .and_then(|path| OrcaReserveCache::new(&path, 300).ok())
+            .map(Arc::new);
+
         Self {
             rpc,
             pools: Arc::new(DashMap::new()),
@@ -65,6 +80,9 @@ impl Orca {
             user_authority: Arc::new(std::sync::RwLock::new(None)),
             user_token_accounts: Arc::new(DashMap::new()),
             mint_index: Arc::new(DashMap::new()),
+            reserve_cache,
+            cache_hits: Arc::new(AtomicU64::new(0)),
+            cache_misses: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -141,22 +159,39 @@ impl Orca {
             .collect()
     }
 
-    /// Lazy-load reserves from vaults if not cached or cache expired.
+    /// Lazy-load reserves from vaults with persistent SQLite cache fallback.
     /// Returns (reserve_base, reserve_quote) or falls back to pool's static reserves.
-    /// Cache TTL: 5 minutes to avoid excessive RPC calls.
+    /// Priority: (1) SQLite persistent cache (2) In-memory cache (3) RPC fetch
     async fn load_reserves_if_needed(&self, pool_id: &Pubkey, pool: &OrcaPool) -> (u128, u128) {
         const CACHE_TTL_SECS: u64 = 300; // 5 minutes
 
-        // Check if we have fresh cached reserves
+        // Try persistent SQLite cache first (survives restarts)
+        if let Some(ref db_cache) = self.reserve_cache {
+            if let Ok(Some(entry)) = db_cache.get(pool_id) {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                tracing::trace!(
+                    pool = %pool_id,
+                    reserve_base = entry.reserve_base,
+                    reserve_quote = entry.reserve_quote,
+                    source = "persistent_cache",
+                    "orca reserves loaded"
+                );
+                return (entry.reserve_base, entry.reserve_quote);
+            }
+        }
+
+        // Check if we have fresh in-memory cached reserves
         if let Some((cached_base, cached_quote)) = pool.cached_reserves {
             if let Some(fetch_time) = pool.last_reserve_fetch {
                 if let Ok(elapsed) = fetch_time.elapsed() {
                     if elapsed.as_secs() < CACHE_TTL_SECS {
+                        self.cache_hits.fetch_add(1, Ordering::Relaxed);
                         tracing::trace!(
                             pool = %pool_id,
                             cached_base,
                             cached_quote,
-                            "orca reserves from cache"
+                            source = "memory_cache",
+                            "orca reserves loaded"
                         );
                         return (cached_base, cached_quote);
                     }
@@ -164,7 +199,8 @@ impl Orca {
             }
         }
 
-        // Fetch fresh reserves from RPC
+        // Cache miss: Fetch fresh reserves from RPC
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
         match self
             .rpc
             .rpc
@@ -183,14 +219,23 @@ impl Orca {
                         reserves.1 = Self::parse_token_amount(&v2.data) as u128;
                     }
                 }
+                // Store in persistent cache
+                if let Some(ref db_cache) = self.reserve_cache {
+                    let entry = ReserveEntry {
+                        pool_address: *pool_id,
+                        reserve_base: reserves.0,
+                        reserve_quote: reserves.1,
+                        cached_at: Utc::now(),
+                    };
+                    let _ = db_cache.set(&entry);
+                }
                 tracing::trace!(
                     pool = %pool_id,
                     vault_a_balance = reserves.0,
                     vault_b_balance = reserves.1,
-                    "orca reserves loaded on-demand"
+                    source = "rpc_fetch",
+                    "orca reserves loaded"
                 );
-                // Note: We can't update the cached reserves here directly because OrcaPool is immutable in the DashMap.
-                // In production, you could use Arc<Mutex<>> for mutable fields, but for now we just return the fresh values.
                 reserves
             }
             Err(e) => {
@@ -202,6 +247,42 @@ impl Orca {
                 (pool.reserve_base, pool.reserve_quote)
             }
         }
+    }
+
+    /// Background task to prefetch reserves for top liquidity pools.
+    /// Reduces latency during evaluation by warming up the cache.
+    pub async fn prefetch_top_pools(&self, limit: usize) -> Result<()> {
+        let pools_to_fetch: Vec<Pubkey> = self
+            .pools
+            .iter()
+            .take(limit)
+            .map(|entry| *entry.key())
+            .collect();
+
+        let mut prefetched = 0;
+        for pool_id in pools_to_fetch {
+            if let Some(pool) = self.pools.get(&pool_id) {
+                let _ = self.load_reserves_if_needed(&pool_id, &pool).await;
+                prefetched += 1;
+            }
+        }
+
+        tracing::info!(
+            prefetched,
+            total = self.pools.len(),
+            cache_hits = self.cache_hits.load(Ordering::Relaxed),
+            cache_misses = self.cache_misses.load(Ordering::Relaxed),
+            "orca prefetch_top_pools() done"
+        );
+        Ok(())
+    }
+
+    /// Get cache statistics for monitoring.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        (
+            self.cache_hits.load(Ordering::Relaxed),
+            self.cache_misses.load(Ordering::Relaxed),
+        )
     }
 
     /// Replay: refresh Orca (Whirlpool) pools from a ReplayRpc store.

@@ -57,6 +57,9 @@ spl-token = { version = "8", features = ["no-entrypoint"] }
 spl-token-2022 = { version = "9", features = ["no-entrypoint"] }
 notify = { version = "6", optional = true }
 
+# Database for reserve cache persistence
+rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+
 [features]
 default = []
 test_helpers = []
