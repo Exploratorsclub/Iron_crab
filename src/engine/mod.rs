@@ -457,6 +457,30 @@ impl Engine {
                     exec_config,
                 );
 
+                // Log wallet status for execution diagnostics
+                let wallet_pubkey = ctx_arb.treasury.pubkey();
+                match rpc.get_balance_retry(&wallet_pubkey).await {
+                    Ok(balance) => {
+                        let balance_sol = balance as f64 / 1_000_000_000.0;
+                        if balance > 0 {
+                            tracing::info!(
+                                wallet = %wallet_pubkey,
+                                balance_lamports = balance,
+                                balance_sol = balance_sol,
+                                "execution engine ready – treasury wallet funded"
+                            );
+                        } else {
+                            tracing::warn!(
+                                wallet = %wallet_pubkey,
+                                "execution engine initialized but treasury wallet has 0 SOL – fund wallet to execute trades"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(?e, wallet = %wallet_pubkey, "failed to check treasury wallet balance");
+                    }
+                }
+
                 let interval_ms = cfg_pairs
                     .as_ref()
                     .and_then(|c| c.interval_ms)
