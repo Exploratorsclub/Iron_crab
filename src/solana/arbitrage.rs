@@ -520,10 +520,18 @@ impl ArbitrageEngine {
                     let gross_profit = final_out - amount_in;
 
                     // CRITICAL: Estimate slippage for first leg (most impactful)
-                    let (safe_amount_pct, slippage_pct) = self
-                        .estimate_slippage_for_pair(base, mid1, amount_in)
-                        .await
-                        .unwrap_or((100, 0.0));
+                    let (safe_amount_pct, slippage_pct) =
+                        match self.estimate_slippage_for_pair(base, mid1, amount_in).await {
+                            Ok(result) => result,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    pair = %format!("{} -> {}", base, mid1),
+                                    "arbitrage: slippage estimation failed, using 0%"
+                                );
+                                (100, 0.0)
+                            }
+                        };
 
                     // Use slippage-adjusted profit calculation
                     let net = compute_net_profit_with_slippage(
@@ -534,13 +542,13 @@ impl ArbitrageEngine {
                         self.est_tx_cost_lamports,
                     );
 
-                    tracing::trace!(
+                    tracing::info!(
                         path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
-                        gross_profit,
-                        net_profit = ?net,
-                        slippage_pct = ?slippage_pct,
+                        gross_profit_lamports = gross_profit,
+                        net_profit_lamports = ?net,
+                        slippage_pct = format!("{:.2}%", slippage_pct),
                         safe_amount_pct,
-                        "arbitrage: candidate cycle evaluated with slippage"
+                        "arbitrage cycle opportunity detected"
                     );
                     cycles.push(CycleOpportunity {
                         path: (base.clone(), mid1.clone(), mid2.clone()),

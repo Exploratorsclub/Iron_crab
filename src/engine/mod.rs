@@ -570,13 +570,18 @@ impl Engine {
                             for cycle in profitable.into_iter().take(5) {
                                 let (a, b, c) = &cycle.path;
                                 let net_profit = cycle.net_profit.unwrap_or(0);
-                                let roi_bps =
-                                    (net_profit as f64 / 1_000_000_000.0 * 10000.0) as u32;
+                                // Calculate ROI correctly: (net_profit / amount_in) * 10000
+                                let roi_bps = if cycle.amount_in > 0 {
+                                    (net_profit as f64 / cycle.amount_in as f64 * 10000.0) as u32
+                                } else {
+                                    0
+                                };
 
                                 tracing::info!(
                                     path = %format!("{} -> {} -> {} -> {}", a, b, c, a),
                                     gross_profit_lamports = cycle.gross_profit,
                                     net_profit_lamports = net_profit,
+                                    amount_in_lamports = cycle.amount_in,
                                     roi_bps = roi_bps,
                                     "arbitrage cycle opportunity detected"
                                 );
