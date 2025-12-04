@@ -526,6 +526,41 @@ impl ArbitrageEngine {
                     if final_out <= amount_in {
                         continue;
                     }
+
+                    // Sanity check: filter cycles with extreme decimal mismatches
+                    // If h1_out is tiny (<1% of amount_in), likely decimal mismatch
+                    if h1.quote.amount_out < amount_in / 100 {
+                        tracing::debug!(
+                            path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
+                            amount_in,
+                            h1_out = h1.quote.amount_out,
+                            "arbitrage: rejecting cycle - h1_out too small (likely decimal mismatch)"
+                        );
+                        continue;
+                    }
+
+                    // If h2_out is massive (>10000x h1_out), likely decimal mismatch
+                    if h2.quote.amount_out > h1.quote.amount_out * 10_000 {
+                        tracing::debug!(
+                            path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
+                            h1_out = h1.quote.amount_out,
+                            h2_out = h2.quote.amount_out,
+                            "arbitrage: rejecting cycle - h2_out extreme (likely decimal mismatch)"
+                        );
+                        continue;
+                    }
+
+                    // If final_out is >1000x amount_in, extremely suspicious
+                    if final_out > amount_in * 1_000 {
+                        tracing::debug!(
+                            path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
+                            amount_in,
+                            final_out,
+                            "arbitrage: rejecting cycle - final_out extreme (likely decimal mismatch)"
+                        );
+                        continue;
+                    }
+
                     let gross_profit = final_out - amount_in;
 
                     // CRITICAL: Estimate slippage for first leg (most impactful)
