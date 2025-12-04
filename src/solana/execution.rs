@@ -120,13 +120,16 @@ impl ExecutionEngine {
             ));
         }
 
-        // 3. Check wallet balance
+        // 3. Check wallet balance (SOL for gas fees)
+        // NOTE: We skip checking token balances here as they are checked during transaction simulation
+        // We only verify we have enough SOL for gas fees (estimate ~0.01 SOL for 3-hop swap)
         let wallet_balance = self.rpc.get_balance_retry(&self.wallet.pubkey()).await?;
-        if wallet_balance < amount_in {
+        let estimated_gas = self.estimate_gas_cost(5); // 3-hop swap ~5 instructions
+        if wallet_balance < estimated_gas {
             return Err(anyhow!(
-                "Insufficient balance: have {} lamports, need {}",
+                "Insufficient SOL for gas: have {} lamports, need ~{} lamports",
                 wallet_balance,
-                amount_in
+                estimated_gas
             ));
         }
 
