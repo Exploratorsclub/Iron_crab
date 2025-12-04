@@ -411,6 +411,11 @@ impl ArbitrageEngine {
             Some(q) => q,
             None => {
                 // Can't handle 10x - liquidity is very limited
+                tracing::debug!(
+                    pair = %format!("{} -> {}", input_mint, output_mint),
+                    test_amount,
+                    "arbitrage: slippage estimation - 10x amount had no liquidity"
+                );
                 return Ok((10, 50.0)); // only 10% of test amount, 50% slippage estimate
             }
         };
@@ -433,7 +438,11 @@ impl ArbitrageEngine {
 
         tracing::debug!(
             pair = %format!("{} -> {}", input_mint, output_mint),
-            slippage_at_10x = slippage_pct,
+            test_amount,
+            baseline_price = format!("{:.6}", baseline_price),
+            large_amount,
+            large_price = format!("{:.6}", large_price),
+            slippage_pct = format!("{:.2}%", slippage_pct),
             safe_amount_pct,
             "arbitrage: slippage estimate"
         );
@@ -544,6 +553,10 @@ impl ArbitrageEngine {
 
                     tracing::info!(
                         path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
+                        amount_in = amount_in,
+                        h1_out = h1.quote.amount_out,
+                        h2_out = h2.quote.amount_out,
+                        final_out = final_out,
                         gross_profit_lamports = gross_profit,
                         net_profit_lamports = ?net,
                         slippage_pct = format!("{:.2}%", slippage_pct),
