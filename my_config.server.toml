@@ -54,12 +54,12 @@ params = { }
 
 # --- Sniper settings (conservative) ---
 [sniper]
-max_buy_sol = 0.02
-max_position_sol = 0.10
+max_buy_sol = 0.005  # Reduced for testing with 0.072 SOL
+max_position_sol = 0.02  # 20k lamports max per sniper position
 max_open_positions = 3
 per_mint_position_limit = 1
 
-daily_loss_limit_sol = 0.30
+daily_loss_limit_sol = 0.05  # 5% of test capital
 
 max_slippage_bps = 150
 adaptive_slippage_min_bps = 75
@@ -101,7 +101,7 @@ program_ids = [
 # --- Arbitrage scanning with Auto-Discovery ---
 [arbitrage]
 interval_ms = 2000
-min_profit_bps = 10
+min_profit_bps = 50  # Increased from 10bps to filter small trades with high slippage
 est_tx_cost_lamports = 10000
 pairs = []  # ignored when discovery.mode = "full-auto"
 
@@ -116,7 +116,7 @@ base_tokens = [
 ]
 min_liquidity_sol = 20.0
 min_liquidity_usd = 10000.0
-default_ui_amount = 0.05
+default_ui_amount = 0.005  # 5k lamports per arbitrage cycle for small test
 top_n_per_base = 10
 interval_secs = 120        # entlastet RPC (Raydium/Orca Scans seltener)
 enable_raydium = true

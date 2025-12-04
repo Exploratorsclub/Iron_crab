@@ -442,13 +442,14 @@ impl Engine {
                 let arb = ArbitrageEngine::new(rpc.clone(), vec![ray.clone(), orc.clone()])
                     .with_profit_params(10, 5_000_000); // min 10 bps, est 0.05 SOL tx cost
 
-                // Initialize execution engine with default config (can be customized from config)
+                // Initialize execution engine with config optimized for test environment
+                // With 0.072 SOL, we need very conservative position sizes
                 let exec_config = ExecutionConfig {
-                    max_slippage_bps: 500,                // 5% slippage tolerance
-                    min_profit_bps_to_execute: 100,       // 1% minimum profit to execute
-                    max_position_lamports: 5_000_000_000, // 5 SOL max per trade
-                    dry_run: true,                        // Start in dry-run mode
-                    priority_fee_micro_lamports: 1_000,   // Low priority fee
+                    max_slippage_bps: 500,                 // 5% slippage tolerance
+                    min_profit_bps_to_execute: 100,        // 1% minimum profit to execute
+                    max_position_lamports: 10_000_000,     // 0.01 SOL max per trade (was 5 SOL)
+                    dry_run: true,                         // Start in dry-run mode for testing
+                    priority_fee_micro_lamports: 1_000,    // Low priority fee
                 };
                 let executor = ExecutionEngine::new(
                     rpc.clone(),
