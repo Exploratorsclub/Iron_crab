@@ -475,9 +475,7 @@ impl Raydium {
 #[async_trait]
 impl Dex for Raydium {
     async fn refresh_pools(&self) -> Result<()> {
-        use crate::metrics::{
-            RAYDIUM_POOLS_LOADED, RAYDIUM_POOLS_SKIPPED_INVALID, RAYDIUM_POOLS_SKIPPED_SERUM,
-        };
+        use crate::metrics::{RAYDIUM_POOLS_LOADED, RAYDIUM_POOLS_SKIPPED_INVALID};
         use std::time::{Duration, SystemTime};
         tracing::trace!("raydium.refresh_pools() start");
         let acc_cfg = RpcAccountInfoConfig {
@@ -551,7 +549,6 @@ impl Dex for Raydium {
         }
         // Insert/update (with optional serum market fetch per pool)
         let mut loaded = 0u32;
-        let mut skipped_serum = 0u32;
         for (p, _) in decoded {
             let base_amt = vault_amounts.get(&p.base_vault).copied().unwrap_or(0);
             let quote_amt = vault_amounts.get(&p.quote_vault).copied().unwrap_or(0);
@@ -565,40 +562,31 @@ impl Dex for Raydium {
             // The fee structure is fixed in the program, not stored per-pool
             let fee_bps = 25u32;
             let (amm_auth, _) = Self::derive_amm_authority();
-            let serum_vault_signer = if p.market_program_id != Pubkey::default() {
-                let (v, _) = Self::derive_serum_vault_signer(&p.market_id, &p.market_program_id);
-                Some(v)
-            } else {
-                None
-            };
-            // Enforce: pools must have valid Serum market linkage and all required Serum accounts
-            if p.market_id == Pubkey::default() || p.market_program_id == Pubkey::default() {
-                tracing::warn!(pool=%p.address, "skip pool: missing serum market linkage");
-                RAYDIUM_POOLS_SKIPPED_SERUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                skipped_serum += 1;
-                continue;
-            }
-            // Attempt Serum market account fetch (single account RPC) for orderbook + vault pointers
+            // Serum market is optional in modern Raydium v4 - try to fetch if available, but don't skip if missing
             let (
                 serum_bids,
                 serum_asks,
                 serum_event_queue,
                 serum_base_vault,
                 serum_quote_vault,
-                serum_ok,
-            ) = match self.rpc.rpc.get_account(&p.market_id).await {
-                Ok(acct) => match Self::parse_serum_market_accounts(&acct.data) {
-                    Some((b, a, e, bv, qv)) => (b, a, e, bv, qv, true),
-                    None => (None, None, None, None, None, false),
-                },
-                Err(_) => (None, None, None, None, None, false),
+                serum_vault_signer,
+            ) = if p.market_id != Pubkey::default() && p.market_program_id != Pubkey::default() {
+                // Try to fetch and parse Serum market accounts
+                match self.rpc.rpc.get_account(&p.market_id).await {
+                    Ok(acct) => match Self::parse_serum_market_accounts(&acct.data) {
+                        Some((b, a, e, bv, qv)) => {
+                            let (v, _) =
+                                Self::derive_serum_vault_signer(&p.market_id, &p.market_program_id);
+                            (b, a, e, bv, qv, Some(v))
+                        }
+                        None => (None, None, None, None, None, None),
+                    },
+                    Err(_) => (None, None, None, None, None, None),
+                }
+            } else {
+                // No Serum market linkage - that's fine
+                (None, None, None, None, None, None)
             };
-            if !serum_ok {
-                tracing::warn!(pool=%p.address, market=%p.market_id, "skip pool: incomplete serum market accounts");
-                RAYDIUM_POOLS_SKIPPED_SERUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                skipped_serum += 1;
-                continue;
-            }
             let obj = SimplePool {
                 base_mint: p.base_mint,
                 quote_mint: p.quote_mint,
@@ -652,7 +640,6 @@ impl Dex for Raydium {
             pools = self.pools.len(),
             removed,
             loaded,
-            skipped_serum,
             "raydium.refresh_pools done"
         );
         Ok(())
