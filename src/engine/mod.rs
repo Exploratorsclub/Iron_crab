@@ -419,6 +419,8 @@ impl Engine {
             }
             tokio::spawn(async move {
                 // Arbitrage scanning task (opportunities detection without execution for now)
+                tracing::info!("arbitrage_task: starting arbitrage scanning loop");
+
                 let ray = Arc::new(Raydium::new(rpc.clone()));
                 let orc = Arc::new(Orca::new(rpc.clone()));
                 let arb = ArbitrageEngine::new(rpc.clone(), vec![ray.clone(), orc.clone()])
@@ -435,8 +437,18 @@ impl Engine {
                 let disc_cfg = cfg_pairs.and_then(|c| c.discovery);
                 let mut iv = interval(Duration::from_millis(interval_ms));
 
+                let mut loop_count = 0u64;
+
                 loop {
                     iv.tick().await;
+                    loop_count += 1;
+
+                    if loop_count % 10 == 0 {
+                        tracing::info!(
+                            loop_iteration = loop_count,
+                            "arbitrage_task: cycle scan iteration"
+                        );
+                    }
 
                     // Choose base tokens from discovered/static pairs
                     let use_pairs: Vec<ArbPairCfg> = if let Some(dc) = &disc_cfg {
@@ -484,6 +496,35 @@ impl Engine {
                         "arbitrage: starting cycle enumeration"
                     );
 
+                    // Quick diagnostic: test router connectivity with a simple quote
+                    if loop_count == 1 {
+                        tracing::info!("arbitrage_diagnostic: testing router with test quote");
+                        let test_result = arb
+                            .router
+                            .best_quote_exact_in(
+                                "So11111111111111111111111111111111111111112",  // SOL
+                                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+                                1_000_000_000,                                  // 1 SOL
+                            )
+                            .await;
+                        match test_result {
+                            Ok(Some(q)) => tracing::info!(
+                                quote_found = true,
+                                input_mint = %q.quote.input_mint,
+                                output_mint = %q.quote.output_mint,
+                                amount_out = q.quote.amount_out,
+                                "arbitrage_diagnostic: test quote successful"
+                            ),
+                            Ok(None) => tracing::warn!(
+                                "arbitrage_diagnostic: test quote returned None (no liquidity?)"
+                            ),
+                            Err(e) => tracing::error!(
+                                error = %e,
+                                "arbitrage_diagnostic: test quote failed"
+                            ),
+                        }
+                    }
+
                     // Scan for profitable arbitrage cycles (1 SOL = 1B lamports test amount)
                     match arb
                         .enumerate_triangular_cycles(&base_list, 1_000_000_000)
@@ -530,7 +571,12 @@ impl Engine {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(?e, "triangular cycle enumeration failed");
+                            tracing::error!(
+                                error = %e,
+                                error_debug = ?e,
+                                loop_iteration = loop_count,
+                                "arbitrage_task: triangular cycle enumeration failed - THIS IS CRITICAL"
+                            );
                         }
                     }
                 }
