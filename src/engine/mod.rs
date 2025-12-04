@@ -448,7 +448,7 @@ impl Engine {
                     max_slippage_bps: 500,              // 5% slippage tolerance
                     min_profit_bps_to_execute: 100,     // 1% minimum profit to execute
                     max_position_lamports: 10_000_000,  // 0.01 SOL max per trade (was 5 SOL)
-                    dry_run: true,                      // Start in dry-run mode for testing
+                    dry_run: false,                     // LIVE TRADING - set to true to disable
                     priority_fee_micro_lamports: 1_000, // Low priority fee
                 };
                 let executor = ExecutionEngine::new(
