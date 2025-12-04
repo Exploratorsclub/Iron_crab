@@ -11,6 +11,7 @@ use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
 use crate::solana::dex::router::Router;
 use crate::solana::dex::{orca::Orca, raydium::Raydium, Dex};
+use crate::solana::execution::{ExecutionConfig, ExecutionEngine};
 use crate::solana::rpc::SolanaRpc;
 use crate::solana::sniper::{run_sniper, SniperCfg};
 use crate::types::{Side, TradeIntent};
@@ -221,7 +222,8 @@ impl Engine {
         {
             let rpc = self.ctx.rpc.clone();
             let cfg_pairs = self.ctx.cfg.arbitrage.clone();
-            // Shared buffer for dynamically discovered pairs
+            let ctx_arb = self.ctx.clone(); // Clone for arbitrage task
+                                            // Shared buffer for dynamically discovered pairs
             let discovered: Arc<parking_lot::RwLock<Vec<ArbPairCfg>>> =
                 Arc::new(parking_lot::RwLock::new(Vec::new()));
 
@@ -440,6 +442,21 @@ impl Engine {
                 let arb = ArbitrageEngine::new(rpc.clone(), vec![ray.clone(), orc.clone()])
                     .with_profit_params(10, 5_000_000); // min 10 bps, est 0.05 SOL tx cost
 
+                // Initialize execution engine with default config (can be customized from config)
+                let exec_config = ExecutionConfig {
+                    max_slippage_bps: 500,                // 5% slippage tolerance
+                    min_profit_bps_to_execute: 100,       // 1% minimum profit to execute
+                    max_position_lamports: 5_000_000_000, // 5 SOL max per trade
+                    dry_run: true,                        // Start in dry-run mode
+                    priority_fee_micro_lamports: 1_000,   // Low priority fee
+                };
+                let executor = ExecutionEngine::new(
+                    rpc.clone(),
+                    Arc::new(Router::new(vec![ray.clone(), orc.clone()])),
+                    ctx_arb.treasury.clone(),
+                    exec_config,
+                );
+
                 let interval_ms = cfg_pairs
                     .as_ref()
                     .and_then(|c| c.interval_ms)
@@ -566,7 +583,55 @@ impl Engine {
                                 b_net.cmp(&a_net)
                             });
 
-                            // Log top opportunities
+                            // Execute top opportunities if they meet profitability threshold
+                            if !profitable.is_empty() {
+                                let opportunities_to_execute: Vec<_> = profitable
+                                    .iter()
+                                    .filter(|c| {
+                                        let roi_bps = if c.amount_in > 0 && c.net_profit.is_some() {
+                                            let net = c.net_profit.unwrap_or(0);
+                                            ((net as f64 / c.amount_in as f64) * 10_000.0) as u32
+                                        } else {
+                                            0
+                                        };
+                                        roi_bps >= exec_config.min_profit_bps_to_execute
+                                    })
+                                    .cloned()
+                                    .collect();
+
+                                if !opportunities_to_execute.is_empty() {
+                                    tracing::info!(
+                                        count = opportunities_to_execute.len(),
+                                        "arbitrage_task: executing profitable opportunities"
+                                    );
+
+                                    let execution_results =
+                                        executor.execute_batch(&opportunities_to_execute).await;
+
+                                    for result in execution_results {
+                                        let status_str = match result.status {
+                                            crate::solana::execution::ExecutionStatus::Confirmed => "confirmed",
+                                            crate::solana::execution::ExecutionStatus::Pending => "pending",
+                                            crate::solana::execution::ExecutionStatus::DryRun => "dry_run",
+                                            crate::solana::execution::ExecutionStatus::Simulated => "simulated",
+                                            crate::solana::execution::ExecutionStatus::Failed(ref e) => e.as_str(),
+                                        };
+
+                                        tracing::info!(
+                                            path = %format!("{} -> {} -> {} -> {}", result.path.0, result.path.1, result.path.2, result.path.0),
+                                            signature = %result.signature,
+                                            amount_in = result.amount_in,
+                                            expected_out = result.expected_out,
+                                            gas_cost = result.gas_cost,
+                                            net_profit = ?result.net_profit,
+                                            status = status_str,
+                                            "arbitrage_task: execution result"
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Log top opportunities for monitoring
                             for cycle in profitable.into_iter().take(5) {
                                 let (a, b, c) = &cycle.path;
                                 let net_profit_norm = cycle.net_profit.unwrap_or(0);

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// Configuration for trade execution
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ExecutionConfig {
     /// Maximum slippage tolerance in basis points (e.g., 500 = 5%)
     pub max_slippage_bps: u32,
