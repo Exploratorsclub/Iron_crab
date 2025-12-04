@@ -569,18 +569,40 @@ impl Engine {
                             // Log top opportunities
                             for cycle in profitable.into_iter().take(5) {
                                 let (a, b, c) = &cycle.path;
-                                let net_profit = cycle.net_profit.unwrap_or(0);
-                                // Calculate ROI correctly: (net_profit / amount_in) * 10000
-                                let roi_bps = if cycle.amount_in > 0 {
-                                    (net_profit as f64 / cycle.amount_in as f64 * 10000.0) as u32
+                                let net_profit_norm = cycle.net_profit.unwrap_or(0);
+                                let gross_profit_norm = cycle.gross_profit;
+
+                                // Note: gross_profit and net_profit are already normalized to 9 decimals
+                                // For a realistic ROI calculation, we need a normalized amount_in
+                                // Since we don't have it stored, calculate ROI from gross_profit_norm
+                                // assuming amount_in was also normalized (which it was during calculation)
+                                // ROI = (net_profit_norm / amount_in_norm) * 10000
+                                // Since we can't recover amount_in_norm easily, use the ratio:
+                                // ROI ≈ (net_profit_norm / gross_out_norm) * return_multiple * 10000
+
+                                // Simple approximation: if gross_profit exists, use it as basis
+                                let roi_bps = if gross_profit_norm > 0 && net_profit_norm > 0 {
+                                    // Estimate: net_profit / (gross_out - gross_profit) ≈ net / amount_in_norm
+                                    let gross_out_norm = cycle.gross_out;
+                                    let amount_in_norm = if gross_out_norm > gross_profit_norm {
+                                        gross_out_norm - gross_profit_norm
+                                    } else {
+                                        gross_out_norm // fallback
+                                    };
+                                    if amount_in_norm > 0 {
+                                        ((net_profit_norm as f64 / amount_in_norm as f64) * 10000.0)
+                                            as u32
+                                    } else {
+                                        0
+                                    }
                                 } else {
                                     0
                                 };
 
                                 tracing::info!(
                                     path = %format!("{} -> {} -> {} -> {}", a, b, c, a),
-                                    gross_profit_lamports = cycle.gross_profit,
-                                    net_profit_lamports = net_profit,
+                                    gross_profit_lamports = gross_profit_norm,
+                                    net_profit_lamports = net_profit_norm,
                                     amount_in_lamports = cycle.amount_in,
                                     roi_bps = roi_bps,
                                     "arbitrage cycle opportunity detected"
