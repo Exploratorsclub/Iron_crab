@@ -273,62 +273,65 @@ impl Dex for Orca {
         for (addr, acc) in accounts.into_iter().take(5000) {
             // safety limit
             total_accounts += 1;
-            if acc.data.len() < WHIRLPOOL_ACCOUNT_MIN_SIZE || acc.data.len() > WHIRLPOOL_ACCOUNT_MAX_SIZE {
+            if acc.data.len() < WHIRLPOOL_ACCOUNT_MIN_SIZE
+                || acc.data.len() > WHIRLPOOL_ACCOUNT_MAX_SIZE
+            {
                 continue;
             }
             if let Some(_parsed) = layout::parse_whirlpool(&acc.data) {
                 parsed_ok += 1;
                 if let Some(parsed) = layout::parse_whirlpool_strict(&acc.data) {
                     strict_ok += 1;
-                // Fetch vault balances (SPL token accounts) to approximate reserves
-                let mut reserves = (0u128, 0u128);
-                if let Ok(vaults) = self
-                    .rpc
-                    .rpc
-                    .get_multiple_accounts(&[parsed.token_vault_a, parsed.token_vault_b])
-                    .await
-                {
-                    if let Some(Some(v1)) = vaults.first().map(|o| o.as_ref()) {
-                        if v1.data.len() >= 72 {
-                            reserves.0 = Self::parse_token_amount(&v1.data) as u128;
+                    // Fetch vault balances (SPL token accounts) to approximate reserves
+                    let mut reserves = (0u128, 0u128);
+                    if let Ok(vaults) = self
+                        .rpc
+                        .rpc
+                        .get_multiple_accounts(&[parsed.token_vault_a, parsed.token_vault_b])
+                        .await
+                    {
+                        if let Some(Some(v1)) = vaults.first().map(|o| o.as_ref()) {
+                            if v1.data.len() >= 72 {
+                                reserves.0 = Self::parse_token_amount(&v1.data) as u128;
+                            }
+                        }
+                        if let Some(Some(v2)) = vaults.get(1).map(|o| o.as_ref()) {
+                            if v2.data.len() >= 72 {
+                                reserves.1 = Self::parse_token_amount(&v2.data) as u128;
+                            }
                         }
                     }
-                    if let Some(Some(v2)) = vaults.get(1).map(|o| o.as_ref()) {
-                        if v2.data.len() >= 72 {
-                            reserves.1 = Self::parse_token_amount(&v2.data) as u128;
-                        }
+                    if reserves.0 == 0 || reserves.1 == 0 {
+                        ORCA_POOLS_SKIPPED_ZERO_RESERVE
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        zero_reserve += 1;
+                        continue;
                     }
+                    fee_tier_keys.push(parsed.fee_tier);
+                    let id = addr;
+                    self.pools.insert(
+                        id,
+                        OrcaPool {
+                            base_mint: parsed.token_mint_a,
+                            quote_mint: parsed.token_mint_b,
+                            reserve_base: reserves.0,
+                            reserve_quote: reserves.1,
+                            fee_bps: parsed.fee_rate as u32,
+                            fee_tier: Some(parsed.fee_tier),
+                            tick_spacing: Some(parsed.tick_spacing),
+                            vault_a: parsed.token_vault_a,
+                            vault_b: parsed.token_vault_b,
+                            tick_current_index: Some(parsed.tick_current_index),
+                        },
+                    );
+                    for m in [parsed.token_mint_a, parsed.token_mint_b] {
+                        self.mint_index
+                            .entry(m)
+                            .or_insert_with(|| Vec::with_capacity(2))
+                            .push(id);
+                    }
+                    added += 1;
                 }
-                if reserves.0 == 0 || reserves.1 == 0 {
-                    ORCA_POOLS_SKIPPED_ZERO_RESERVE
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    zero_reserve += 1;
-                    continue;
-                }
-                fee_tier_keys.push(parsed.fee_tier);
-                let id = addr;
-                self.pools.insert(
-                    id,
-                    OrcaPool {
-                        base_mint: parsed.token_mint_a,
-                        quote_mint: parsed.token_mint_b,
-                        reserve_base: reserves.0,
-                        reserve_quote: reserves.1,
-                        fee_bps: parsed.fee_rate as u32,
-                        fee_tier: Some(parsed.fee_tier),
-                        tick_spacing: Some(parsed.tick_spacing),
-                        vault_a: parsed.token_vault_a,
-                        vault_b: parsed.token_vault_b,
-                        tick_current_index: Some(parsed.tick_current_index),
-                    },
-                );
-                for m in [parsed.token_mint_a, parsed.token_mint_b] {
-                    self.mint_index
-                        .entry(m)
-                        .or_insert_with(|| Vec::with_capacity(2))
-                        .push(id);
-                }
-                added += 1;
             }
         }
         // Deduplicate & fetch fee tier accounts
