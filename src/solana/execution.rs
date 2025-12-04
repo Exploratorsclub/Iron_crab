@@ -143,10 +143,13 @@ impl ExecutionEngine {
         );
 
         // Build 3-hop swap plan (base -> mid1 -> mid2 -> base)
-        let plan = self
-            .router
-            .build_best_hops2_plan_exact_in(base, mid1, amount_in, self.config.max_slippage_bps)
-            .await?;
+        let plan = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.router
+                .build_best_hops2_plan_exact_in(base, mid1, amount_in, self.config.max_slippage_bps)
+        )
+        .await
+        .map_err(|_| anyhow!("Timeout building plan for {}->{}", base, mid1))??;
 
         let (ixs_hop1_hop2, final_out_hop2) = match plan {
             Some(p) => (p.ixs, p.expected_out),
