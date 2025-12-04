@@ -121,3 +121,16 @@ top_n_per_base = 10
 interval_secs = 120        # entlastet RPC (Raydium/Orca Scans seltener)
 enable_raydium = true
 enable_orca = true
+
+# --- Orca Reserve Cache (Persistent SQLite) ---
+[orca]
+# Enable persistent SQLite cache for vault reserves
+# Reduces RPC load and improves latency by caching balances across restarts
+enable_reserve_cache = true
+
+# Path to SQLite database (relative to working directory)
+cache_path = "orca_reserves.db"
+
+# Number of top pools to prefetch reserves for on startup
+# Higher values = better cache warmth but slower startup
+prefetch_top_pools = 100
