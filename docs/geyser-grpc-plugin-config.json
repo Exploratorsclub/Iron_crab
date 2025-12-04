@@ -1,0 +1,28 @@
+{
+  "libPath": "/home/sol/geyser-plugins/solana_geyser_plugin_grpc.so",
+  "bind_address": "127.0.0.1:10001",
+  "accounts": [
+    {
+      "owner": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+    },
+    {
+      "owner": "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+    }
+  ],
+  "transaction_filters": [],
+  "blocks": {
+    "block_filters": []
+  },
+  "block_metadata_notifier": {
+    "enabled": true
+  },
+  "transaction_notifier": {
+    "enabled": true
+  },
+  "entry_notifier": {
+    "enabled": false
+  },
+  "slot_notifier": {
+    "enabled": true
+  }
+}

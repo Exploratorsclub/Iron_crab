@@ -24,6 +24,12 @@ Environment=RUST_BACKTRACE=1
 # 4. Added TPU optimizations for faster TX submission
 # 5. Removed ledger size limit (keep full history for queries)
 
+# NOTE: Geyser plugin setup:
+# 1. Download: https://github.com/solana-labs/solana-geyser-plugin-grpc/releases
+# 2. Place .so file in /home/sol/geyser-plugins/
+# 3. Create config file at /home/sol/geyser-grpc-plugin-config.json
+# 4. Uncomment --geyser-plugin-config line below
+
 ExecStart=/usr/local/bin/agave-validator \
   --identity /home/sol/validator-keypair.json \
   --ledger /var/solana/ledger \
@@ -45,6 +51,7 @@ ExecStart=/usr/local/bin/agave-validator \
   --tpu-connection-pool-size 1024 \
   --turbine-disabled-quic-clients-ratio 0 \
   --enable-cpi-and-log-recovery \
+  --geyser-plugin-config /home/sol/geyser-grpc-plugin-config.json \
   --no-port-check \
   --entrypoint entrypoint.mainnet-beta.solana.com:8001 \
   --entrypoint entrypoint2.mainnet-beta.solana.com:8001 \
