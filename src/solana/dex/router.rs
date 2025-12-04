@@ -121,7 +121,11 @@ impl Router {
             // First hop quotes
             let mut first_hop: Option<(usize, Quote)> = None;
             for (i, d) in self.dexs.iter().enumerate() {
-                if let Ok(Some(q)) = d.quote_exact_in(input_mint, &mid, amount_in).await {
+                let quote_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    d.quote_exact_in(input_mint, &mid, amount_in)
+                ).await;
+                if let Ok(Ok(Some(q))) = quote_result {
                     let rep = first_hop
                         .as_ref()
                         .map(|(_, b)| b.amount_out < q.amount_out)
@@ -138,7 +142,11 @@ impl Router {
             // Second hop quotes using q1.amount_out as input
             let mut second_hop: Option<(usize, Quote)> = None;
             for (i, d) in self.dexs.iter().enumerate() {
-                if let Ok(Some(q)) = d.quote_exact_in(&mid, output_mint, q1.amount_out).await {
+                let quote_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    d.quote_exact_in(&mid, output_mint, q1.amount_out)
+                ).await;
+                if let Ok(Ok(Some(q))) = quote_result {
                     let rep = second_hop
                         .as_ref()
                         .map(|(_, b)| b.amount_out < q.amount_out)
@@ -209,7 +217,11 @@ impl Router {
             // hop1
             let mut hop1_best: Option<(usize, Quote)> = None;
             for (i, d) in self.dexs.iter().enumerate() {
-                if let Ok(Some(q)) = d.quote_exact_in(input_mint, mid1, amount_in).await {
+                let quote_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    d.quote_exact_in(input_mint, mid1, amount_in)
+                ).await;
+                if let Ok(Ok(Some(q))) = quote_result {
                     if hop1_best
                         .as_ref()
                         .map(|(_, b)| b.amount_out < q.amount_out)
@@ -248,9 +260,11 @@ impl Router {
                 // hop2
                 let mut hop2_best: Option<(usize, Quote)> = None;
                 for (i, d) in self.dexs.iter().enumerate() {
-                    if let Ok(Some(q)) =
-                        d.quote_exact_in(&q1.output_mint, mid2, q1.amount_out).await
-                    {
+                    let quote_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        d.quote_exact_in(&q1.output_mint, mid2, q1.amount_out)
+                    ).await;
+                    if let Ok(Ok(Some(q))) = quote_result {
                         if hop2_best
                             .as_ref()
                             .map(|(_, b)| b.amount_out < q.amount_out)
@@ -270,10 +284,11 @@ impl Router {
                 // hop3
                 let mut hop3_best: Option<(usize, Quote)> = None;
                 for (i, d) in self.dexs.iter().enumerate() {
-                    if let Ok(Some(q)) = d
-                        .quote_exact_in(&q2.output_mint, output_mint, q2.amount_out)
-                        .await
-                    {
+                    let quote_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        d.quote_exact_in(&q2.output_mint, output_mint, q2.amount_out)
+                    ).await;
+                    if let Ok(Ok(Some(q))) = quote_result {
                         if hop3_best
                             .as_ref()
                             .map(|(_, b)| b.amount_out < q.amount_out)
