@@ -66,13 +66,27 @@ impl Engine {
 
         let router = Router::new(vec![raydium, orca.clone()]);
 
-        Ok(Self {
+        let engine = Self {
             ctx,
             allocator,
             strategies: vec![],
             router,
-            orca,
-        })
+            orca: orca.clone(),
+        };
+
+        // Prefetch top pools if configured
+        if cfg.orca.enable_reserve_cache {
+            let prefetch_limit = cfg.orca.prefetch_top_pools.unwrap_or(100);
+            tracing::info!(prefetch_limit, "orca prefetching top pools in background");
+            let orca_prefetch = orca.clone();
+            tokio::spawn(async move {
+                if let Err(e) = orca_prefetch.prefetch_top_pools(prefetch_limit).await {
+                    tracing::warn!(?e, "orca prefetch failed");
+                }
+            });
+        }
+
+        Ok(engine)
     }
 
     pub async fn build_strategies(&mut self) -> Result<()> {
