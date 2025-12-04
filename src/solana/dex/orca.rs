@@ -286,27 +286,42 @@ impl Dex for Orca {
                     .get_multiple_accounts(&[parsed.token_vault_a, parsed.token_vault_b])
                     .await
                 {
+                    tracing::trace!(
+                        pool = %addr,
+                        vault_a = %parsed.token_vault_a,
+                        vault_b = %parsed.token_vault_b,
+                        vault_a_exists = vaults.first().map(|v| v.is_some()),
+                        vault_b_exists = vaults.get(1).map(|v| v.is_some()),
+                        "orca vault fetch result"
+                    );
                     if let Some(Some(v1)) = vaults.first().map(|o| o.as_ref()) {
                         if v1.data.len() >= 72 {
                             reserves.0 = Self::parse_token_amount(&v1.data) as u128;
+                            tracing::trace!(pool = %addr, vault_a_balance = reserves.0, "vault_a parsed");
+                        } else {
+                            tracing::trace!(pool = %addr, vault_a_size = v1.data.len(), "vault_a data too small");
                         }
                     }
                     if let Some(Some(v2)) = vaults.get(1).map(|o| o.as_ref()) {
                         if v2.data.len() >= 72 {
                             reserves.1 = Self::parse_token_amount(&v2.data) as u128;
+                            tracing::trace!(pool = %addr, vault_b_balance = reserves.1, "vault_b parsed");
+                        } else {
+                            tracing::trace!(pool = %addr, vault_b_size = v2.data.len(), "vault_b data too small");
                         }
                     }
+                } else {
+                    tracing::trace!(
+                        pool = %addr,
+                        vault_a = %parsed.token_vault_a,
+                        vault_b = %parsed.token_vault_b,
+                        "orca vault fetch failed"
+                    );
                 }
                 // Add pool even if reserves are zero (validator may not index token accounts)
                 // Reserves will be updated later via batch refresh or on-demand fetches
                 if reserves.0 == 0 || reserves.1 == 0 {
                     zero_reserve += 1;
-                    tracing::debug!(
-                        pool = %addr,
-                        vault_a = %parsed.token_vault_a,
-                        vault_b = %parsed.token_vault_b,
-                        "orca pool added with zero reserves - vault data not available from RPC"
-                    );
                 }
                 fee_tier_keys.push(parsed.fee_tier);
                 let id = addr;
