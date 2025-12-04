@@ -235,7 +235,6 @@ impl Orca {
 #[async_trait]
 impl Dex for Orca {
     async fn refresh_pools(&self) -> Result<()> {
-        use crate::metrics::ORCA_POOLS_SKIPPED_ZERO_RESERVE;
         use solana_account_decoder::UiAccountEncoding;
         use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
         use solana_client::rpc_filter::RpcFilterType;
@@ -298,11 +297,16 @@ impl Dex for Orca {
                         }
                     }
                 }
+                // Add pool even if reserves are zero (validator may not index token accounts)
+                // Reserves will be updated later via batch refresh or on-demand fetches
                 if reserves.0 == 0 || reserves.1 == 0 {
-                    ORCA_POOLS_SKIPPED_ZERO_RESERVE
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     zero_reserve += 1;
-                    continue;
+                    tracing::debug!(
+                        pool = %addr,
+                        vault_a = %parsed.token_vault_a,
+                        vault_b = %parsed.token_vault_b,
+                        "orca pool added with zero reserves - vault data not available from RPC"
+                    );
                 }
                 fee_tier_keys.push(parsed.fee_tier);
                 let id = addr;
