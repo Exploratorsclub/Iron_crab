@@ -423,6 +423,20 @@ impl Engine {
 
                 let ray = Arc::new(Raydium::new(rpc.clone()));
                 let orc = Arc::new(Orca::new(rpc.clone()));
+
+                // CRITICAL: Warm up pools by forcing initial refresh
+                tracing::info!("arbitrage_task: warming up DEX connectors (loading pool data)");
+                if let Err(e) = ray.refresh_pools().await {
+                    tracing::error!(error = %e, "arbitrage_task: failed to refresh Raydium pools");
+                } else {
+                    tracing::info!("arbitrage_task: Raydium pools refreshed successfully");
+                }
+                if let Err(e) = orc.refresh_pools().await {
+                    tracing::error!(error = %e, "arbitrage_task: failed to refresh Orca pools");
+                } else {
+                    tracing::info!("arbitrage_task: Orca pools refreshed successfully");
+                }
+
                 let arb = ArbitrageEngine::new(rpc.clone(), vec![ray.clone(), orc.clone()])
                     .with_profit_params(10, 5_000_000); // min 10 bps, est 0.05 SOL tx cost
 
