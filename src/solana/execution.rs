@@ -328,9 +328,9 @@ mod tests {
         let config = ExecutionConfig::default();
         // Note: This test requires a valid keypair. In practice, use Treasury::load() or from_signer()
         // For now, we just test the gas estimation function directly
-        let gas_2ix = config; // Use config directly to test
-        let gas_2ix_cost = 5_000_000 + (2 as u64 * 1_000_000);
-        let gas_5ix_cost = 5_000_000 + (5 as u64 * 1_000_000);
+        let _gas_2ix = config; // Use config directly to test
+        let gas_2ix_cost = 5_000_000 + (2_u64 * 1_000_000);
+        let gas_5ix_cost = 5_000_000 + (5_u64 * 1_000_000);
 
         assert_eq!(gas_2ix_cost, 5_000_000 + 2_000_000); // 7M
         assert_eq!(gas_5ix_cost, 5_000_000 + 5_000_000); // 10M
