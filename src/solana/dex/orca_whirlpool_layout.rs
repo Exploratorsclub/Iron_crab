@@ -4,50 +4,53 @@
 //! Whirlpool account required for quoting & swap planning. Source: public
 //! open‑source Orca Whirlpool program / IDL (simplified, only the needed subset).
 //!
-//! Layout (sequential after 8‑byte Anchor discriminator):
-//!   0   .. 32  whirlpools_config (Pubkey)
-//!   32  .. 33  bump (u8)
-//!   33  .. 35  tick_spacing (u16 LE)
-//!   35  .. 37  fee_rate (u16 LE, in hundredths of a bip? -> treat as raw bps)
-//!   37  .. 39  protocol_fee_rate (u16 LE)
-//!   39  .. 55  liquidity (u128 LE)
-//!   55  .. 71  sqrt_price (u128 LE)
-//!   71  .. 75  tick_current_index (i32 LE)
-//!   75  .. 83  protocol_fee_owed_a (u64 LE)
-//!   83  .. 91  protocol_fee_owed_b (u64 LE)
-//!   91  .. 123 token_mint_a (Pubkey)
-//!   123 .. 155 token_vault_a (Pubkey)
-//!   155 .. 187 token_mint_b (Pubkey)
-//!   187 .. 219 token_vault_b (Pubkey)
-//!   219 .. 251 fee_tier (Pubkey)
-//! (remaining bytes: reward infos, padding, etc. not parsed here)
+//! Layout (sequential, includes 8‑byte Anchor discriminator):
+//!   0   .. 8   discriminator (Anchor)
+//!   8   .. 40  whirlpools_config (Pubkey)
+//!   40  .. 41  whirlpool_bump (u8)
+//!   41  .. 43  tick_spacing (u16 LE)
+//!   43  .. 45  fee_tier_index_seed (u8[2])
+//!   45  .. 47  fee_rate (u16 LE, in bips)
+//!   47  .. 49  protocol_fee_rate (u16 LE)
+//!   49  .. 65  liquidity (u128 LE)
+//!   65  .. 81  sqrt_price (u128 LE)
+//!   81  .. 85  tick_current_index (i32 LE)
+//!   85  .. 93  protocol_fee_owed_a (u64 LE)
+//!   93  .. 101 protocol_fee_owed_b (u64 LE)
+//!   101 .. 133 token_mint_a (Pubkey)
+//!   133 .. 165 token_vault_a (Pubkey)
+//!   165 .. 181 fee_growth_global_a (u128 LE)
+//!   181 .. 213 token_mint_b (Pubkey)
+//!   213 .. 245 token_vault_b (Pubkey)
+//!   245 .. 261 fee_growth_global_b (u128 LE)
+//!   261 .. 269 reward_last_updated_timestamp (u64 LE)
+//!   269 .. 653 reward_infos[3] (128 bytes each, not parsed here)
 //!
-//! NOTE: Offsets include the 8‑byte discriminator, so actual absolute offsets
-//! below already account for it.
-//!
-//! Safety: If the account is smaller than the minimum required span we return None.
-//! If parsed values look invalid (zero pubkeys, identical mints) we also return None.
+//! Reference: https://github.com/orca-so/whirlpools/blob/main/programs/whirlpool/src/state/whirlpool.rs#L36-L54
 
 use solana_sdk::pubkey::Pubkey;
 
-pub const MIN_WHIRLPOOL_ACCOUNT_LEN: usize = 251; // up to end of fee_tier
+pub const MIN_WHIRLPOOL_ACCOUNT_LEN: usize = 245; // up to end of token_vault_b
 
-// Absolute offsets (already include discriminator region)
-pub const OFF_CFG: usize = 8; // whirlpools_config
-pub const OFF_BUMP: usize = OFF_CFG + 32; // u8
-pub const OFF_TICK_SPACING: usize = OFF_BUMP + 1; // u16
-pub const OFF_FEE_RATE: usize = OFF_TICK_SPACING + 2; // u16
-pub const OFF_PROTOCOL_FEE_RATE: usize = OFF_FEE_RATE + 2; // u16
-pub const OFF_LIQUIDITY: usize = OFF_PROTOCOL_FEE_RATE + 2; // u128
-pub const OFF_SQRT_PRICE: usize = OFF_LIQUIDITY + 16; // u128
-pub const OFF_TICK_CURRENT: usize = OFF_SQRT_PRICE + 16; // i32
-pub const OFF_PROTOCOL_FEE_OWED_A: usize = OFF_TICK_CURRENT + 4; // u64
-pub const OFF_PROTOCOL_FEE_OWED_B: usize = OFF_PROTOCOL_FEE_OWED_A + 8; // u64
-pub const OFF_TOKEN_MINT_A: usize = OFF_PROTOCOL_FEE_OWED_B + 8; // Pubkey
-pub const OFF_TOKEN_VAULT_A: usize = OFF_TOKEN_MINT_A + 32; // Pubkey
-pub const OFF_TOKEN_MINT_B: usize = OFF_TOKEN_VAULT_A + 32; // Pubkey
-pub const OFF_TOKEN_VAULT_B: usize = OFF_TOKEN_MINT_B + 32; // Pubkey
-pub const OFF_FEE_TIER: usize = OFF_TOKEN_VAULT_B + 32; // Pubkey
+// Absolute offsets
+pub const OFF_DISCRIMINATOR: usize = 0; // 8 bytes
+pub const OFF_CONFIG: usize = 8; // whirlpools_config
+pub const OFF_BUMP: usize = 40; // whirlpool_bump (u8)
+pub const OFF_TICK_SPACING: usize = 41; // u16
+pub const OFF_FEE_TIER_INDEX_SEED: usize = 43; // u8[2]
+pub const OFF_FEE_RATE: usize = 45; // u16
+pub const OFF_PROTOCOL_FEE_RATE: usize = 47; // u16
+pub const OFF_LIQUIDITY: usize = 49; // u128
+pub const OFF_SQRT_PRICE: usize = 65; // u128
+pub const OFF_TICK_CURRENT: usize = 81; // i32
+pub const OFF_PROTOCOL_FEE_OWED_A: usize = 85; // u64
+pub const OFF_PROTOCOL_FEE_OWED_B: usize = 93; // u64
+pub const OFF_TOKEN_MINT_A: usize = 101; // Pubkey
+pub const OFF_TOKEN_VAULT_A: usize = 133; // Pubkey
+pub const OFF_FEE_GROWTH_GLOBAL_A: usize = 165; // u128
+pub const OFF_TOKEN_MINT_B: usize = 181; // Pubkey
+pub const OFF_TOKEN_VAULT_B: usize = 213; // Pubkey
+pub const OFF_FEE_GROWTH_GLOBAL_B: usize = 245; // u128
 
 #[derive(Debug, Clone)]
 pub struct WhirlpoolParsed {
@@ -55,7 +58,6 @@ pub struct WhirlpoolParsed {
     pub token_mint_b: Pubkey,
     pub token_vault_a: Pubkey,
     pub token_vault_b: Pubkey,
-    pub fee_tier: Pubkey,
     pub fee_rate: u16,
     pub protocol_fee_rate: u16,
     pub tick_spacing: u16,
@@ -97,7 +99,6 @@ pub fn parse_whirlpool(data: &[u8]) -> Option<WhirlpoolParsed> {
     {
         return None;
     }
-    let fee_tier = pk!(OFF_FEE_TIER);
     let u16_le = |o: usize| -> Option<u16> {
         let b = slice(o, 2)?;
         Some(u16::from_le_bytes([b[0], b[1]]))
@@ -127,7 +128,6 @@ pub fn parse_whirlpool(data: &[u8]) -> Option<WhirlpoolParsed> {
         token_mint_b,
         token_vault_a,
         token_vault_b,
-        fee_tier,
         fee_rate,
         protocol_fee_rate,
         tick_spacing,

@@ -146,7 +146,6 @@ impl Orca {
         // Clear current index but keep pools map; we'll upsert
         self.mint_index.clear();
         let all = replay.all_latest();
-        let mut fee_tier_keys: Vec<Pubkey> = Vec::new();
         let mut added = 0u32;
         for (addr_str, bytes) in all.into_iter() {
             // Fast size gate to reduce decode attempts
@@ -170,8 +169,6 @@ impl Orca {
                         reserves.1 = Self::parse_token_amount(&v2.data) as u128;
                     }
                 }
-                // Record fee tier to refine fee/tick spacing if available in trace
-                fee_tier_keys.push(parsed.fee_tier);
                 // Insert/overwrite pool
                 self.pools.insert(
                     address,
@@ -180,8 +177,8 @@ impl Orca {
                         quote_mint: parsed.token_mint_b,
                         reserve_base: reserves.0,
                         reserve_quote: reserves.1,
-                        fee_bps: parsed.fee_rate as u32, // may be overridden by fee tier account below
-                        fee_tier: Some(parsed.fee_tier),
+                        fee_bps: parsed.fee_rate as u32,
+                        fee_tier: None,
                         tick_spacing: Some(parsed.tick_spacing),
                         vault_a: parsed.token_vault_a,
                         vault_b: parsed.token_vault_b,
@@ -195,32 +192,6 @@ impl Orca {
                         .push(address);
                 }
                 added += 1;
-            }
-        }
-        // Deduplicate and fetch fee tier accounts via replay to set authoritative fee_bps & tick_spacing
-        fee_tier_keys.sort_unstable();
-        fee_tier_keys.dedup();
-        if !fee_tier_keys.is_empty() {
-            let accts = replay.get_multiple_accounts(&fee_tier_keys);
-            for (i, acc_opt) in accts.into_iter().enumerate() {
-                if let Some(acc) = acc_opt {
-                    if acc.data.len() >= 4 {
-                        let tick = u16::from_le_bytes([acc.data[0], acc.data[1]]);
-                        let fee = u16::from_le_bytes([acc.data[2], acc.data[3]]) as u32;
-                        if (1..=1000).contains(&fee) {
-                            self.fee_tiers.insert(fee_tier_keys[i], (fee, tick));
-                        }
-                    }
-                }
-            }
-            // Patch pools with authoritative values
-            for mut p in self.pools.iter_mut() {
-                if let Some(key) = p.fee_tier {
-                    if let Some((fee, tick)) = self.fee_tiers.get(&key).map(|v| *v) {
-                        p.fee_bps = fee;
-                        p.tick_spacing = Some(tick);
-                    }
-                }
             }
         }
         tracing::info!(
@@ -323,7 +294,6 @@ impl Dex for Orca {
                 if reserves.0 == 0 || reserves.1 == 0 {
                     zero_reserve += 1;
                 }
-                fee_tier_keys.push(parsed.fee_tier);
                 let id = addr;
                 self.pools.insert(
                     id,
@@ -333,7 +303,7 @@ impl Dex for Orca {
                         reserve_base: reserves.0,
                         reserve_quote: reserves.1,
                         fee_bps: parsed.fee_rate as u32,
-                        fee_tier: Some(parsed.fee_tier),
+                        fee_tier: None,
                         tick_spacing: Some(parsed.tick_spacing),
                         vault_a: parsed.token_vault_a,
                         vault_b: parsed.token_vault_b,
@@ -347,33 +317,6 @@ impl Dex for Orca {
                         .push(id);
                 }
                 added += 1;
-            }
-        }
-        // Deduplicate & fetch fee tier accounts
-        fee_tier_keys.sort_unstable();
-        fee_tier_keys.dedup();
-        if !fee_tier_keys.is_empty() {
-            if let Ok(accts) = self.rpc.rpc.get_multiple_accounts(&fee_tier_keys).await {
-                for (i, acc_opt) in accts.into_iter().enumerate() {
-                    if let Some(acc) = acc_opt {
-                        if acc.data.len() >= 4 {
-                            let tick = u16::from_le_bytes([acc.data[0], acc.data[1]]);
-                            let fee = u16::from_le_bytes([acc.data[2], acc.data[3]]) as u32;
-                            if (1..=1000).contains(&fee) {
-                                self.fee_tiers.insert(fee_tier_keys[i], (fee, tick));
-                            }
-                        }
-                    }
-                }
-            }
-            // Patch pools with authoritative values
-            for mut p in self.pools.iter_mut() {
-                if let Some(key) = p.fee_tier {
-                    if let Some((fee, tick)) = self.fee_tiers.get(&key).map(|v| *v) {
-                        p.fee_bps = fee;
-                        p.tick_spacing = Some(tick);
-                    }
-                }
             }
         }
         tracing::info!(
