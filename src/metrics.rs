@@ -13,6 +13,7 @@ pub static ROUTER_HOPS2: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ROUTER_HOPS3: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRIANGLE_ATTEMPTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRIANGLE_PROFITABLE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TRIANGLE_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static QUOTE_LATENCY_TOTAL_NS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Generic cycle search metrics
 pub static CYCLE_PARTIAL_EXAMINED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -347,6 +348,7 @@ pub fn snapshot() -> MetricsSnapshot {
         router_hops3: ROUTER_HOPS3.load(Ordering::Relaxed),
         arb_triangle_attempts: ARB_TRIANGLE_ATTEMPTS.load(Ordering::Relaxed),
         arb_triangle_profitable: ARB_TRIANGLE_PROFITABLE.load(Ordering::Relaxed),
+        arb_triangle_opportunities: ARB_TRIANGLE_OPPORTUNITIES.load(Ordering::Relaxed),
         cycle_partial_examined: CYCLE_PARTIAL_EXAMINED.load(Ordering::Relaxed),
         cycle_pruned_dominance: CYCLE_PRUNED_DOMINANCE.load(Ordering::Relaxed),
         cycle_pruned_bound: CYCLE_PRUNED_BOUND.load(Ordering::Relaxed),
@@ -372,6 +374,7 @@ pub struct MetricsSnapshot {
     pub router_hops3: u64,
     pub arb_triangle_attempts: u64,
     pub arb_triangle_profitable: u64,
+    pub arb_triangle_opportunities: u64,
     pub cycle_partial_examined: u64,
     pub cycle_pruned_dominance: u64,
     pub cycle_pruned_bound: u64,
@@ -445,6 +448,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_triangle_profitable_total",
         ARB_TRIANGLE_PROFITABLE.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_triangle_opportunities_total",
+        ARB_TRIANGLE_OPPORTUNITIES.load(Ordering::Relaxed)
     );
     line!(
         "cycle_partial_examined_total",

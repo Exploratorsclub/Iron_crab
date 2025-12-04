@@ -420,7 +420,8 @@ impl Engine {
             tokio::spawn(async move {
                 let ray = Arc::new(Raydium::new(rpc.clone()));
                 let orc = Arc::new(Orca::new(rpc.clone()));
-                let arb = ArbitrageEngine::new(rpc, vec![ray.clone(), orc.clone()]);
+                let arb = ArbitrageEngine::new(rpc.clone(), vec![ray.clone(), orc.clone()])
+                    .with_profit_params(10, 5_000_000); // min 10 bps, est 0.05 SOL tx cost
                 let interval_ms = cfg_pairs
                     .as_ref()
                     .and_then(|c| c.interval_ms)
@@ -433,7 +434,7 @@ impl Engine {
                 let mut iv = interval(Duration::from_millis(interval_ms));
                 loop {
                     iv.tick().await;
-                    // Choose source of pairs
+                    // Choose base tokens from discovered/static pairs
                     let use_pairs: Vec<ArbPairCfg> = if let Some(dc) = &disc_cfg {
                         if dc.enable && dc.mode.as_deref() == Some("full-auto") {
                             discovered.read().clone()
@@ -443,11 +444,53 @@ impl Engine {
                     } else {
                         static_pairs.clone()
                     };
+
+                    // Extract unique base tokens (SOL, stables, etc.)
+                    let mut base_tokens: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
                     for p in &use_pairs {
-                        if let Ok(Some(edge)) =
-                            arb.best_edge(&p.in_mint, &p.out_mint, p.ui_amount).await
-                        {
-                            tracing::info!(?edge, pair = %format!("{}->{}", p.in_mint, p.out_mint), "arb candidate");
+                        base_tokens.insert(p.in_mint.clone());
+                        base_tokens.insert(p.out_mint.clone());
+                    }
+                    let base_list: Vec<String> = base_tokens.into_iter().take(20).collect();
+
+                    if base_list.is_empty() {
+                        continue;
+                    }
+
+                    // Scan for triangular arbitrage cycles (amount = 1 SOL = 1,000,000 lamports)
+                    match arb.enumerate_triangular_cycles(&base_list, 1_000_000).await {
+                        Ok(cycles) => {
+                            let mut profitable: Vec<_> = cycles
+                                .into_iter()
+                                .filter(|c| c.net_profit.is_some() && c.net_profit.unwrap() > 0)
+                                .collect();
+
+                            // Sort by net profit (descending)
+                            profitable.sort_by(|a, b| {
+                                let a_net = a.net_profit.unwrap_or(0);
+                                let b_net = b.net_profit.unwrap_or(0);
+                                b_net.cmp(&a_net)
+                            });
+
+                            // Log and count top opportunities
+                            for cycle in profitable.into_iter().take(10) {
+                                let (a, b, c) = &cycle.path;
+                                let net_profit = cycle.net_profit.unwrap_or(0);
+
+                                tracing::info!(
+                                    path = %format!("{} -> {} -> {} -> {}", a, b, c, a),
+                                    gross_profit_lamports = cycle.gross_profit,
+                                    net_profit_lamports = net_profit,
+                                    roi_bps = (net_profit as f64 / 1_000_000.0 * 10000.0) as u32,
+                                    "arbitrage cycle opportunity detected"
+                                );
+                                crate::metrics::ARB_TRIANGLE_OPPORTUNITIES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(?e, "triangular cycle enumeration error");
                         }
                     }
                 }
