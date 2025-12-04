@@ -450,8 +450,43 @@ impl ArbitrageEngine {
         Ok((safe_amount_pct, slippage_pct))
     }
 
-    /// Enumerate triangular cycles (A->B->C->A) over discovered token graph and return profitable opportunities (gross > in).
-    /// Decimals assumed homogeneous (6) for now; future: per-mint decimals map.
+    /// Fetch token decimals for a mint address, with caching for performance.
+    /// Returns decimals, using 9 as default for unknown tokens (SOL standard).
+    async fn get_mint_decimals(&self, mint_str: &str) -> u8 {
+        use solana_sdk::pubkey::Pubkey as SdkPubkey;
+        use std::str::FromStr;
+
+        let mint = match SdkPubkey::from_str(mint_str) {
+            Ok(pk) => pk,
+            Err(_) => {
+                tracing::warn!(mint = %mint_str, "invalid mint pubkey, defaulting to 9 decimals");
+                return 9;
+            }
+        };
+
+        crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &mint).await
+    }
+
+    /// Normalize amount from source decimals to target decimals.
+    /// Example: 1_000_000 (6 decimals) -> 1_000_000_000 (9 decimals) = multiply by 1000
+    fn normalize_amount(amount: u64, from_decimals: u8, to_decimals: u8) -> u64 {
+        if from_decimals == to_decimals {
+            return amount;
+        }
+
+        if from_decimals < to_decimals {
+            // Scale up
+            let scale = 10u64.pow((to_decimals - from_decimals) as u32);
+            amount.saturating_mul(scale)
+        } else {
+            // Scale down
+            let scale = 10u64.pow((from_decimals - to_decimals) as u32);
+            amount / scale
+        }
+    }
+
+    /// Enumerate triangular cycles (A->B->C->A) with proper decimal normalization.
+    /// All amounts are normalized to 9 decimals (SOL standard) for profit calculations.
     pub async fn enumerate_triangular_cycles(
         &self,
         base_tokens: &[String],
@@ -527,41 +562,67 @@ impl ArbitrageEngine {
                         continue;
                     }
 
-                    // Sanity check: filter cycles with extreme decimal mismatches
-                    // If h1_out is tiny (<1% of amount_in), likely decimal mismatch
-                    if h1.quote.amount_out < amount_in / 100 {
+                    // Fetch decimals for all tokens in the cycle
+                    let base_decimals = self.get_mint_decimals(base).await;
+                    let mid1_decimals = self.get_mint_decimals(mid1).await;
+                    let mid2_decimals = self.get_mint_decimals(mid2).await;
+
+                    // Normalize all amounts to 9 decimals (SOL standard) for comparison
+                    const TARGET_DECIMALS: u8 = 9;
+
+                    let amount_in_norm =
+                        Self::normalize_amount(amount_in, base_decimals, TARGET_DECIMALS);
+                    let h1_out_norm =
+                        Self::normalize_amount(h1.quote.amount_out, mid1_decimals, TARGET_DECIMALS);
+                    let h2_out_norm =
+                        Self::normalize_amount(h2.quote.amount_out, mid2_decimals, TARGET_DECIMALS);
+                    let final_out_norm =
+                        Self::normalize_amount(final_out, base_decimals, TARGET_DECIMALS);
+
+                    // Now check profitability in normalized space
+                    if final_out_norm <= amount_in_norm {
+                        continue;
+                    }
+
+                    // Sanity check: filter cycles with extreme price movements in normalized space
+                    // If any hop changes value by >100x, it's suspicious
+                    if h1_out_norm > amount_in_norm * 100 || h1_out_norm < amount_in_norm / 100 {
                         tracing::debug!(
                             path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
-                            amount_in,
-                            h1_out = h1.quote.amount_out,
-                            "arbitrage: rejecting cycle - h1_out too small (likely decimal mismatch)"
+                            amount_in_norm,
+                            h1_out_norm,
+                            base_decimals,
+                            mid1_decimals,
+                            "arbitrage: rejecting cycle - h1 price change >100x (normalized)"
                         );
                         continue;
                     }
 
-                    // If h2_out is massive (>10000x h1_out), likely decimal mismatch
-                    if h2.quote.amount_out > h1.quote.amount_out * 10_000 {
+                    if h2_out_norm > h1_out_norm * 100 || h2_out_norm < h1_out_norm / 100 {
                         tracing::debug!(
                             path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
-                            h1_out = h1.quote.amount_out,
-                            h2_out = h2.quote.amount_out,
-                            "arbitrage: rejecting cycle - h2_out extreme (likely decimal mismatch)"
+                            h1_out_norm,
+                            h2_out_norm,
+                            mid1_decimals,
+                            mid2_decimals,
+                            "arbitrage: rejecting cycle - h2 price change >100x (normalized)"
                         );
                         continue;
                     }
 
-                    // If final_out is >1000x amount_in, extremely suspicious
-                    if final_out > amount_in * 1_000 {
+                    if final_out_norm > h2_out_norm * 100 || final_out_norm < h2_out_norm / 100 {
                         tracing::debug!(
                             path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
-                            amount_in,
-                            final_out,
-                            "arbitrage: rejecting cycle - final_out extreme (likely decimal mismatch)"
+                            h2_out_norm,
+                            final_out_norm,
+                            mid2_decimals,
+                            base_decimals,
+                            "arbitrage: rejecting cycle - h3 price change >100x (normalized)"
                         );
                         continue;
                     }
 
-                    let gross_profit = final_out - amount_in;
+                    let gross_profit_norm = final_out_norm - amount_in_norm;
 
                     // CRITICAL: Estimate slippage for first leg (most impactful)
                     let (safe_amount_pct, slippage_pct) =
@@ -577,14 +638,25 @@ impl ArbitrageEngine {
                             }
                         };
 
-                    // Use slippage-adjusted profit calculation
-                    let net = compute_net_profit_with_slippage(
-                        amount_in,
-                        final_out,
+                    // Use slippage-adjusted profit calculation on NORMALIZED amounts
+                    let net_norm = compute_net_profit_with_slippage(
+                        amount_in_norm,
+                        final_out_norm,
                         slippage_pct,
                         self.min_profit_bps,
                         self.est_tx_cost_lamports,
                     );
+
+                    // Calculate ROI in normalized space for logging
+                    let roi_bps = if let Some(profit) = net_norm {
+                        if amount_in_norm > 0 {
+                            ((profit as f64 / amount_in_norm as f64) * 10_000.0) as u32
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
 
                     tracing::info!(
                         path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
@@ -592,8 +664,14 @@ impl ArbitrageEngine {
                         h1_out = h1.quote.amount_out,
                         h2_out = h2.quote.amount_out,
                         final_out = final_out,
-                        gross_profit_lamports = gross_profit,
-                        net_profit_lamports = ?net,
+                        amount_in_norm,
+                        h1_out_norm,
+                        h2_out_norm,
+                        final_out_norm,
+                        decimals = format!("{}/{}/{}/{}", base_decimals, mid1_decimals, mid2_decimals, base_decimals),
+                        gross_profit_norm,
+                        net_profit_norm = ?net_norm,
+                        roi_bps,
                         slippage_pct = format!("{:.2}%", slippage_pct),
                         safe_amount_pct,
                         "arbitrage cycle opportunity detected"
@@ -602,8 +680,8 @@ impl ArbitrageEngine {
                         path: (base.clone(), mid1.clone(), mid2.clone()),
                         amount_in,
                         gross_out: final_out,
-                        gross_profit,
-                        net_profit: net,
+                        gross_profit: gross_profit_norm, // Store normalized profit
+                        net_profit: net_norm,            // Store normalized net profit
                     });
                 }
             }
