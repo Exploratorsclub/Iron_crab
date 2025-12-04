@@ -194,6 +194,15 @@ impl Raydium {
 
     /// Hard validation (errors) + soft warnings for pool structural invariants.
     fn validate_pool_state(p: &reader::PoolV4) -> Result<()> {
+        // Debug: log actual values for problematic pools
+        if p.base_mint == p.quote_mint {
+            tracing::warn!(
+                pool = %p.address,
+                base_mint = %p.base_mint,
+                quote_mint = %p.quote_mint,
+                "DIAGNOSTIC: base_mint == quote_mint"
+            );
+        }
         ensure!(p.base_mint != p.quote_mint, "pool base_mint == quote_mint");
         ensure!(
             p.base_vault != p.quote_vault,
@@ -525,6 +534,17 @@ impl Dex for Raydium {
             wrong_size,
             "raydium.refresh_pools decoded candidate pools"
         );
+
+        // DIAGNOSTIC: Log first pool's mint values for offset verification
+        if let Some((first_p, _)) = decoded.first() {
+            tracing::warn!(
+                pool = %first_p.address,
+                base_mint = %first_p.base_mint,
+                quote_mint = %first_p.quote_mint,
+                "DIAGNOSTIC: First pool mints (offset check)"
+            );
+        }
+
         // Batch vault fetch
         let mut vaults: Vec<Pubkey> = Vec::with_capacity(decoded.len() * 2);
         for (p, _) in &decoded {
@@ -550,7 +570,6 @@ impl Dex for Raydium {
         }
         // Insert/update (with optional serum market fetch per pool)
         let mut loaded = 0u32;
-        let mut zero_reserve = 0u32;
         let mut skipped_serum = 0u32;
         let mut skipped_fee = 0u32;
         for (p, raw) in decoded {
@@ -560,7 +579,6 @@ impl Dex for Raydium {
             // Track zero reserves but don't skip - they will be fetched on-demand (like Orca)
             if base_amt == 0 || quote_amt == 0 {
                 tracing::debug!(pool = %p.address, base_amt, quote_amt, "raydium pool has zero/missing reserves (will fetch on-demand)");
-                zero_reserve += 1;
             }
 
             let fee_num = raw
