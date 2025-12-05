@@ -100,10 +100,11 @@ program_ids = [
 
 # --- Arbitrage scanning with Auto-Discovery ---
 [arbitrage]
-interval_ms = 2000
+interval_ms = 200  # Fast scanning: 200ms = 5 scans/sec (event-driven reacts even faster)
 min_profit_bps = 50  # Increased from 10bps to filter small trades with high slippage
 est_tx_cost_lamports = 10000
 pairs = []  # ignored when discovery.mode = "full-auto"
+event_driven = true  # EVENT-DRIVEN: React to WebSocket pool updates for <100ms latency
 
 [arbitrage.execution]
 max_slippage_bps = 150              # 1.5% Slippage-Toleranz im Mini-Mode

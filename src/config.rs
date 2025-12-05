@@ -102,6 +102,13 @@ pub struct ArbCfg {
     pub discovery: Option<ArbDiscoveryCfg>,
     #[serde(default)]
     pub execution: Option<ExecutionCfg>,
+    /// Enable event-driven execution via WebSocket pool updates (much faster than polling)
+    #[serde(default = "default_event_driven")]
+    pub event_driven: bool,
+}
+
+fn default_event_driven() -> bool {
+    true // Event-driven is now default for professional performance
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

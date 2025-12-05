@@ -420,8 +420,8 @@ impl Engine {
                 }
             }
             tokio::spawn(async move {
-                // Arbitrage scanning task (opportunities detection without execution for now)
-                tracing::info!("arbitrage_task: starting arbitrage scanning loop");
+                // Event-driven arbitrage scanning task with WebSocket pool updates
+                tracing::info!("arbitrage_task: starting EVENT-DRIVEN arbitrage engine");
 
                 let ray = Arc::new(Raydium::new(rpc.clone()));
                 let orc = Arc::new(Orca::new(rpc.clone()));
@@ -439,8 +439,10 @@ impl Engine {
                     tracing::info!("arbitrage_task: Orca pools refreshed successfully");
                 }
 
-                let arb = ArbitrageEngine::new(rpc.clone(), vec![ray.clone(), orc.clone()])
-                    .with_profit_params(10, 5_000_000); // min 10 bps, est 0.05 SOL tx cost
+                let arb = Arc::new(
+                    ArbitrageEngine::new(rpc.clone(), vec![ray.clone(), orc.clone()])
+                        .with_profit_params(10, 5_000_000),
+                ); // min 10 bps, est 0.05 SOL tx cost
 
                 // Build execution config from TOML (centralized configuration)
                 let exec_config = if let Some(ref arb_cfg) = ctx_arb.cfg.arbitrage {
@@ -458,12 +460,12 @@ impl Engine {
                 } else {
                     ExecutionConfig::default()
                 };
-                let executor = ExecutionEngine::new(
+                let executor = Arc::new(ExecutionEngine::new(
                     rpc.clone(),
                     Arc::new(Router::new(vec![ray.clone(), orc.clone()])),
                     ctx_arb.treasury.clone(),
                     exec_config,
-                );
+                ));
 
                 // Log wallet status for execution diagnostics
                 let wallet_pubkey = ctx_arb.treasury.pubkey();
@@ -492,18 +494,92 @@ impl Engine {
                 let interval_ms = cfg_pairs
                     .as_ref()
                     .and_then(|c| c.interval_ms)
-                    .unwrap_or(2000);
+                    .unwrap_or(200); // Default 200ms for fast scanning
                 let static_pairs = cfg_pairs
                     .as_ref()
                     .map(|c| c.pairs.clone())
                     .unwrap_or_default();
                 let disc_cfg = cfg_pairs.and_then(|c| c.discovery);
-                let mut iv = interval(Duration::from_millis(interval_ms));
+
+                // Setup WebSocket listener for pool updates
+                let ws_url = rpc
+                    .rpc
+                    .url()
+                    .replace("http://", "ws://")
+                    .replace("https://", "wss://")
+                    .replace(":8899", ":8900");
+
+                let raydium_program = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+                    .parse()
+                    .expect("Invalid Raydium program ID");
+                let whirlpool_program = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+                    .parse()
+                    .expect("Invalid Whirlpool program ID");
+
+                let (listener, mut pool_updates) =
+                    crate::solana::account_listener::AccountListener::new(
+                        ws_url.clone(),
+                        vec![raydium_program, whirlpool_program],
+                    );
+                let listener = Arc::new(listener);
+
+                // Spawn WebSocket listener task
+                let listener_clone = listener.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = listener_clone.run().await {
+                        tracing::error!(error = %e, "arbitrage_task: WebSocket listener crashed");
+                    }
+                });
+
+                tracing::info!(
+                    ws_url = %ws_url,
+                    interval_ms = interval_ms,
+                    "arbitrage_task: EVENT-DRIVEN mode enabled - listening for pool updates"
+                );
+
+                // Debouncing: scan after pool update burst settles
+                let mut last_scan = tokio::time::Instant::now();
+                let min_scan_interval = tokio::time::Duration::from_millis(interval_ms);
+                let mut pending_scan = false;
 
                 let mut loop_count = 0u64;
 
                 loop {
-                    iv.tick().await;
+                    // Wait for pool update event OR timeout for periodic scans
+                    let event_received =
+                        tokio::time::timeout(min_scan_interval, pool_updates.recv()).await;
+
+                    match event_received {
+                        Ok(Ok(_event)) => {
+                            // Pool update received - mark for scan
+                            pending_scan = true;
+
+                            // Debounce: if we just scanned recently, wait a bit
+                            if last_scan.elapsed() < min_scan_interval {
+                                continue;
+                            }
+                        }
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                            tracing::warn!(
+                                skipped_events = skipped,
+                                "arbitrage_task: pool update buffer overflowed - scanning immediately"
+                            );
+                            pending_scan = true;
+                        }
+                        Err(_timeout) => {
+                            // Timeout reached - periodic scan
+                            pending_scan = true;
+                        }
+                        _ => continue,
+                    }
+
+                    // Skip scan if nothing pending
+                    if !pending_scan {
+                        continue;
+                    }
+
+                    pending_scan = false;
+                    last_scan = tokio::time::Instant::now();
                     loop_count += 1;
 
                     if loop_count % 10 == 0 {
@@ -512,6 +588,18 @@ impl Engine {
                             "arbitrage_task: cycle scan iteration"
                         );
                     }
+
+                    // Refresh pools from DEX connectors
+                    // NOTE: This is fast now (reads from cached data updated by WebSocket)
+                    let refresh_start = tokio::time::Instant::now();
+                    let _ = ray.refresh_pools().await;
+                    let _ = orc.refresh_pools().await;
+                    let refresh_elapsed = refresh_start.elapsed();
+
+                    tracing::debug!(
+                        refresh_ms = refresh_elapsed.as_millis(),
+                        "arbitrage_task: pool refresh completed"
+                    );
 
                     // Choose base tokens from discovered/static pairs
                     let use_pairs: Vec<ArbPairCfg> = if let Some(dc) = &disc_cfg {
