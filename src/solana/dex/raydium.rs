@@ -10,7 +10,7 @@ use crate::solana::rpc::SolanaRpc;
 use dashmap::DashMap;
 use solana_account_decoder::UiAccountEncoding;
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
-use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
+use solana_client::rpc_filter::RpcFilterType;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey; // SDK Pubkey (not Address wrapper)
 
@@ -183,14 +183,10 @@ impl Raydium {
     }
 
     fn pool_filters() -> Vec<RpcFilterType> {
-        let mut filters = vec![RpcFilterType::DataSize(reader::LIQ_STATE_V4_SIZE as u64)];
-        // active status == 6
-        let status = 6u64.to_le_bytes().to_vec();
-        filters.push(RpcFilterType::Memcmp(Memcmp::new(
-            reader::offs::STATUS,
-            MemcmpEncodedBytes::Bytes(status),
-        )));
-        filters
+        // Only filter by data size - status filtering excluded as it's unreliable
+        // Raydium AMM v4 pools have fixed size 752 bytes
+        // We validate pool state (including status) after decoding
+        vec![RpcFilterType::DataSize(reader::LIQ_STATE_V4_SIZE as u64)]
     }
 
     /// Hard validation (errors) + soft warnings for pool structural invariants.
