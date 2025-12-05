@@ -567,23 +567,25 @@ impl Engine {
 
                 loop {
                     // Wait for pool update event OR timeout for periodic scans
-                    let event_received =
-                        tokio::time::timeout(min_scan_interval, pool_updates.recv()).await;
+                    let event_received = tokio::select! {
+                        recv_result = pool_updates.recv() => Some(recv_result),
+                        _ = tokio::time::sleep(min_scan_interval) => None,
+                    };
 
                     match event_received {
-                        Ok(Ok(_event)) => {
+                        Some(Ok(_event)) => {
                             // Pool update received - debounce if we just scanned
                             if last_scan.elapsed() < min_scan_interval {
                                 continue;
                             }
                         }
-                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                        Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
                             tracing::warn!(
                                 skipped_events = skipped,
                                 "arbitrage_task: pool update buffer overflowed - scanning immediately"
                             );
                         }
-                        Err(_timeout) => {
+                        None => {
                             // Timeout reached - periodic scan
                         }
                         _ => continue,
