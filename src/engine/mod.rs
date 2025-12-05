@@ -439,6 +439,28 @@ impl Engine {
                     tracing::info!("arbitrage_task: Orca pools refreshed successfully");
                 }
 
+                // PROFESSIONAL: Setup real-time vault balance subscriptions (batched)
+                tracing::info!("arbitrage_task: starting background vault balance refresh task");
+                
+                let orc_for_refresh = orc.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+                    interval.tick().await; // Skip first tick (immediate)
+                    
+                    loop {
+                        interval.tick().await;
+                        
+                        match orc_for_refresh.batch_refresh_vault_balances().await {
+                            Ok(()) => {},
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to batch refresh vault balances");
+                            }
+                        }
+                    }
+                });
+                
+                tracing::info!("arbitrage_task: background vault refresh task started (5s interval)");
+
                 let arb = Arc::new(
                     ArbitrageEngine::new(rpc.clone(), vec![ray.clone(), orc.clone()])
                         .with_profit_params(10, 5_000_000),

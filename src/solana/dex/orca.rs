@@ -292,6 +292,110 @@ impl Orca {
         )
     }
 
+    /// Background task: Batch-refresh vault balances for all pools (professional solution)
+    /// Fetches vault balances in batches of 100 to minimize RPC load
+    pub async fn batch_refresh_vault_balances(&self) -> Result<()> {
+        let vaults: Vec<(Pubkey, Pubkey, Pubkey)> = self
+            .pools
+            .iter()
+            .map(|entry| (*entry.key(), entry.vault_a, entry.vault_b))
+            .collect();
+
+        if vaults.is_empty() {
+            return Ok(());
+        }
+
+        tracing::debug!(
+            vault_count = vaults.len() * 2,
+            "orca: batch refreshing vault balances"
+        );
+
+        let mut updated_pools = 0;
+        let start = std::time::Instant::now();
+
+        // Batch fetch vaults in chunks of 100
+        for chunk in vaults.chunks(100) {
+            let vault_pubkeys: Vec<Pubkey> = chunk
+                .iter()
+                .flat_map(|(_, va, vb)| vec![*va, *vb])
+                .collect();
+
+            match self.rpc.rpc.get_multiple_accounts(&vault_pubkeys).await {
+                Ok(accounts) => {
+                    // Process results (accounts come in pairs: vault_a, vault_b)
+                    for (i, (pool_id, _va, _vb)) in chunk.iter().enumerate() {
+                        let vault_a_account = accounts.get(i * 2).and_then(|a| a.as_ref());
+                        let vault_b_account = accounts.get(i * 2 + 1).and_then(|a| a.as_ref());
+
+                        let reserve_a = vault_a_account
+                            .and_then(|acc| {
+                                if acc.data.len() >= 72 {
+                                    Some(Self::parse_token_amount(&acc.data) as u128)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+
+                        let reserve_b = vault_b_account
+                            .and_then(|acc| {
+                                if acc.data.len() >= 72 {
+                                    Some(Self::parse_token_amount(&acc.data) as u128)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+
+                        if reserve_a > 0 || reserve_b > 0 {
+                            if let Some(mut pool) = self.pools.get_mut(pool_id) {
+                                pool.reserve_base = reserve_a;
+                                pool.reserve_quote = reserve_b;
+                                pool.cached_reserves = Some((reserve_a, reserve_b));
+                                pool.last_reserve_fetch = Some(std::time::SystemTime::now());
+                                updated_pools += 1;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, chunk_size = chunk.len(), "Failed to fetch vault batch");
+                }
+            }
+
+            // Small delay between batches to avoid overwhelming RPC
+            if vaults.len() > 100 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        let elapsed = start.elapsed();
+        tracing::info!(
+            updated_pools,
+            total_pools = vaults.len(),
+            elapsed_ms = elapsed.as_millis(),
+            "orca: batch vault refresh completed"
+        );
+
+        Ok(())
+    }
+
+    /// Get all vault addresses from current pools (for subscription)
+    pub fn get_all_vaults(&self) -> Vec<Pubkey> {
+        let mut vaults = Vec::new();
+        
+        for pool in self.pools.iter() {
+            vaults.push(pool.vault_a);
+            vaults.push(pool.vault_b);
+        }
+        
+        // Deduplicate
+        vaults.sort();
+        vaults.dedup();
+        
+        vaults
+    }
+
     /// Replay: refresh Orca (Whirlpool) pools from a ReplayRpc store.
     /// Scans latest accounts, decodes Whirlpool states, optionally reads vault balances if present,
     /// and populates in-memory snapshots similar to live refresh.
@@ -421,51 +525,10 @@ impl Dex for Orca {
             }
             if let Some(parsed) = layout::parse_whirlpool(&acc.data) {
                 parsed_ok += 1;
-                // Fetch vault balances (SPL token accounts) to approximate reserves
-                let mut reserves = (0u128, 0u128);
-                if let Ok(vaults) = self
-                    .rpc
-                    .rpc
-                    .get_multiple_accounts(&[parsed.token_vault_a, parsed.token_vault_b])
-                    .await
-                {
-                    tracing::trace!(
-                        pool = %addr,
-                        vault_a = %parsed.token_vault_a,
-                        vault_b = %parsed.token_vault_b,
-                        vault_a_exists = vaults.first().map(|v| v.is_some()),
-                        vault_b_exists = vaults.get(1).map(|v| v.is_some()),
-                        "orca vault fetch result"
-                    );
-                    if let Some(Some(v1)) = vaults.first().map(|o| o.as_ref()) {
-                        if v1.data.len() >= 72 {
-                            reserves.0 = Self::parse_token_amount(&v1.data) as u128;
-                            tracing::trace!(pool = %addr, vault_a_balance = reserves.0, "vault_a parsed");
-                        } else {
-                            tracing::trace!(pool = %addr, vault_a_size = v1.data.len(), "vault_a data too small");
-                        }
-                    }
-                    if let Some(Some(v2)) = vaults.get(1).map(|o| o.as_ref()) {
-                        if v2.data.len() >= 72 {
-                            reserves.1 = Self::parse_token_amount(&v2.data) as u128;
-                            tracing::trace!(pool = %addr, vault_b_balance = reserves.1, "vault_b parsed");
-                        } else {
-                            tracing::trace!(pool = %addr, vault_b_size = v2.data.len(), "vault_b data too small");
-                        }
-                    }
-                } else {
-                    tracing::trace!(
-                        pool = %addr,
-                        vault_a = %parsed.token_vault_a,
-                        vault_b = %parsed.token_vault_b,
-                        "orca vault fetch failed"
-                    );
-                }
-                // Add pool even if reserves are zero (validator may not index token accounts)
-                // Reserves will be updated later via batch refresh or on-demand fetches
-                if reserves.0 == 0 || reserves.1 == 0 {
-                    zero_reserve += 1;
-                }
+                // SKIP vault fetching during initial refresh (too slow - 5000+ RPC calls!)
+                // Reserves will be loaded on-demand when needed for quotes
+                let reserves = (0u128, 0u128);
+                zero_reserve += 1;
                 let id = addr;
                 self.pools.insert(
                     id,
