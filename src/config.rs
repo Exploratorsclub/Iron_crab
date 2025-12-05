@@ -13,6 +13,11 @@ pub struct AppCfg {
 pub struct SolanaCfg {
     pub rpc_url: String,
     pub ws_url: String,
+    /// Optional Geyser gRPC endpoint for <10ms account updates
+    /// If set, uses Geyser instead of WebSocket for pool updates
+    /// Example: "http://127.0.0.1:10000"
+    #[serde(default)]
+    pub geyser_grpc_url: Option<String>,
     pub keypair_path: String,
     #[serde(default)]
     pub rpc_min_concurrency: Option<usize>,

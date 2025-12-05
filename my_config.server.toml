@@ -14,6 +14,12 @@ rpc_url = "http://127.0.0.1:8899"
 ws_url  = "ws://127.0.0.1:8900"
 # Keep the public IP as a fallback in case you run the bot off-box or need external access temporarily.
 ws_failover_urls = ["ws://109.230.239.43:8900"]
+
+# Geyser gRPC (RECOMMENDED for <10ms latency)
+# Uncomment to use native Agave 3.0 Geyser instead of WebSocket
+# Requires: --geyser-plugin-config flag in validator service
+geyser_grpc_url = "http://127.0.0.1:10000"
+
 keypair_path = "/home/ironcrab/.config/solana/id.json"  # adjust to your user/path
 # Tuned concurrency & timeout for high-end validator (500GB RAM, 64 CPUs)
 rpc_min_concurrency = 32        # can handle much more on local validator

@@ -540,23 +540,71 @@ impl Engine {
                     .parse()
                     .expect("Invalid Whirlpool program ID");
 
-                let (listener, mut pool_updates) =
-                    crate::solana::account_listener::AccountListener::new(
-                        ws_url.clone(),
-                        vec![raydium_program, whirlpool_program],
-                    );
-                let listener = Arc::new(listener);
+                // Create unified update channel (works for both Geyser and WebSocket)
+                let (update_tx, mut pool_updates) = tokio::sync::broadcast::channel(50000);
 
-                // Spawn WebSocket listener task
-                let listener_clone = listener.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = listener_clone.run().await {
-                        tracing::error!(error = %e, "arbitrage_task: WebSocket listener crashed");
-                    }
-                });
+                // Use Geyser gRPC if configured, otherwise fall back to WebSocket
+                let geyser_url = cfg.solana.geyser_grpc_url.clone();
+                
+                if let Some(geyser_endpoint) = geyser_url {
+                    // Use Geyser gRPC for <10ms latency
+                    tracing::info!(
+                        geyser_endpoint = %geyser_endpoint,
+                        "arbitrage_task: using Geyser gRPC for account updates"
+                    );
+
+                    let (listener, geyser_rx) =
+                        crate::solana::geyser_listener::GeyserListener::new(
+                            geyser_endpoint.clone(),
+                            vec![raydium_program, whirlpool_program],
+                        );
+
+                    // Spawn Geyser listener task
+                    tokio::spawn(async move {
+                        if let Err(e) = listener.start().await {
+                            tracing::error!(error = %e, "arbitrage_task: Geyser listener crashed");
+                        }
+                    });
+
+                    // Forward Geyser updates to unified channel (simplified for now)
+                    tokio::spawn(async move {
+                        let mut rx = geyser_rx;
+                        while let Ok(_geyser_update) = rx.recv().await {
+                            // Trigger scan on any update (simplified event)
+                            let _ = update_tx.send(());
+                        }
+                    });
+                } else {
+                    // Fall back to WebSocket
+                    tracing::info!(
+                        ws_url = %ws_url,
+                        "arbitrage_task: using WebSocket for account updates (consider enabling Geyser for <10ms latency)"
+                    );
+
+                    let (listener, ws_rx) =
+                        crate::solana::account_listener::AccountListener::new(
+                            ws_url.clone(),
+                            vec![raydium_program, whirlpool_program],
+                        );
+                    let listener = Arc::new(listener);
+
+                    // Spawn WebSocket listener task
+                    let listener_clone = listener.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = listener_clone.run().await {
+                            tracing::error!(error = %e, "arbitrage_task: WebSocket listener crashed");
+                        }
+                    });
+
+                    // Forward WebSocket events to unified channel
+                    tokio::spawn(async move {
+                        let mut rx = ws_rx;
+                        while let Ok(_ws_event) = rx.recv().await {
+                            let _ = update_tx.send(());
+                        }
+                }
 
                 tracing::info!(
-                    ws_url = %ws_url,
                     interval_ms = interval_ms,
                     "arbitrage_task: EVENT-DRIVEN mode enabled - listening for pool updates"
                 );
