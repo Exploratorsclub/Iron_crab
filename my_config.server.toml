@@ -52,14 +52,14 @@ params = { }
 kind = "rust"
 params = { }
 
-# --- Sniper settings (TEST MODE - relaxed filters) ---
+# --- Sniper settings (BALANCED - catches real projects, filters obvious scams) ---
 [sniper]
-max_buy_sol = 0.005  # 5 millis per buy
+max_buy_sol = 0.005  # 5 millis per buy (small test size)
 max_position_sol = 0.02  # 20 millis max per position
 max_open_positions = 2  # Only 2 positions max (you have 72 millis total)
 per_mint_position_limit = 1
 
-daily_loss_limit_sol = 0.05  # 50 millis max loss per day
+daily_loss_limit_sol = 0.05  # 50 millis max loss per day (70% of capital)
 
 max_slippage_bps = 150
 adaptive_slippage_min_bps = 75
@@ -68,21 +68,51 @@ adaptive_slippage_window = 20
 adaptive_slippage_target_pct = 0.002
 adaptive_slippage_step_bps = 5
 
-stop_loss_bps = 2000  # -20% stop loss
-take_profit_bps = 1000  # +10% take profit
+# EXIT STRATEGY - YOUR BEST RUG PROTECTION:
+stop_loss_bps = 1500  # -15% stop loss (tighter than -20%, less loss on rugs)
+take_profit_bps = 2000  # +20% take profit (take money off table quickly)
 stop_loss_cooldown_secs = 300
 
-# CRITICAL FIXES:
-min_pool_liquidity_sol = 1.0  # 20 SOL -> 1 SOL (more realistic for new pools)
-require_freeze_auth_none = false  # Allow freeze authority for testing
-require_mint_decimals_range = [0, 10]
-lp_top1_max_pct = 0.95  # 60% -> 95% (allow concentrated holdings at launch)
-lp_top3_max_pct = 0.98  # 80% -> 98%
-lp_top5_max_pct = 0.99  # 90% -> 99%
-lp_burned_min_pct = 0.00  # NEW: Don't require burned tokens (many legit projects don't burn)
+# MULTI-LAYER RUG FILTERING (ordered by importance):
+
+## 1. LP CONCENTRATION - MOST IMPORTANT RUG INDICATOR
+lp_top1_max_pct = 0.85  # Top holder max 85% (balanced)
+# Why 85%: Catches most rugs but allows legit presales
+# - >90% = almost certain rug
+# - 70-85% = risky but some legit projects at launch
+# - <70% = more distributed (safer)
+
+lp_top3_max_pct = 0.93  # Top 3 holders max 93%
+lp_top5_max_pct = 0.97  # Top 5 holders max 97%
+# If 5 wallets control 97%+ = coordinated rug team
+
+## 2. LIQUIDITY AMOUNT - COMMITMENT SIGNAL
+min_pool_liquidity_sol = 2.0  # Minimum 2 SOL (~$280)
+# Why 2 SOL:
+# - <1 SOL = zero-effort scam (filtered)
+# - 1-5 SOL = low commitment (risky but catches some gems)
+# - >5 SOL = serious project (fewer opportunities)
+# Sweet spot: 2 SOL filters trash, keeps real launches
+
+## 3. TOKEN AUTHORITY CHECKS - SECONDARY INDICATORS
+require_freeze_auth_none = false  # Don't require (filters too many good projects)
+# Many legit projects keep freeze authority for:
+# - Regulatory compliance
+# - Security (freeze hacked wallets)
+# - Team vesting locks
+# INSTEAD: Rely on LP concentration + stop loss
+
+require_mint_decimals_range = [6, 9]  # Standard token decimals
+# Weird decimals (0-5 or >9) = red flag
+# Most legit tokens: 6-9 decimals (like USDC=6, SOL=9)
+
+## 4. OPTIONAL BURN CHECK - DISABLED FOR FLEXIBILITY
+# lp_burned_min_pct = 0.20  # Uncomment to require 20% burned
+# Trade-off: Filters some rugs BUT also filters legit new launches
+# Recommendation: Keep disabled initially, enable after seeing false positives
 
 # Enable diagnostic logging:
-log_all_inits = true  # Log ALL init events (not just pools)
+log_all_inits = true  # See what pools are being evaluated
 
 blacklist_mints = []
 blacklist_owners = []
