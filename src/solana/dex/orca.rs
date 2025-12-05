@@ -313,8 +313,9 @@ impl Orca {
         let mut updated_pools = 0;
         let start = std::time::Instant::now();
 
-        // Batch fetch vaults in chunks of 100
-        for chunk in vaults.chunks(100) {
+        // Batch fetch vaults in chunks of 50 pools (= 100 vault accounts)
+        // RPC limit is 100 accounts, each pool has 2 vaults
+        for chunk in vaults.chunks(50) {
             let vault_pubkeys: Vec<Pubkey> = chunk
                 .iter()
                 .flat_map(|(_, va, vb)| vec![*va, *vb])
