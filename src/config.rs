@@ -100,6 +100,50 @@ pub struct ArbCfg {
     pub est_tx_cost_lamports: Option<u64>,
     #[serde(default)]
     pub discovery: Option<ArbDiscoveryCfg>,
+    #[serde(default)]
+    pub execution: Option<ExecutionCfg>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionCfg {
+    #[serde(default = "default_max_slippage_bps")]
+    pub max_slippage_bps: u32,
+    #[serde(default = "default_min_profit_bps_to_execute")]
+    pub min_profit_bps_to_execute: u32,
+    #[serde(default = "default_max_position_lamports")]
+    pub max_position_lamports: u64,
+    #[serde(default = "default_dry_run")]
+    pub dry_run: bool,
+    #[serde(default = "default_priority_fee_micro_lamports")]
+    pub priority_fee_micro_lamports: u64,
+}
+
+fn default_max_slippage_bps() -> u32 {
+    500
+}
+fn default_min_profit_bps_to_execute() -> u32 {
+    50
+}
+fn default_max_position_lamports() -> u64 {
+    5_000_000_000
+}
+fn default_dry_run() -> bool {
+    true
+}
+fn default_priority_fee_micro_lamports() -> u64 {
+    1_000
+}
+
+impl Default for ExecutionCfg {
+    fn default() -> Self {
+        Self {
+            max_slippage_bps: default_max_slippage_bps(),
+            min_profit_bps_to_execute: default_min_profit_bps_to_execute(),
+            max_position_lamports: default_max_position_lamports(),
+            dry_run: default_dry_run(),
+            priority_fee_micro_lamports: default_priority_fee_micro_lamports(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

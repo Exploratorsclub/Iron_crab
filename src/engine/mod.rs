@@ -442,14 +442,21 @@ impl Engine {
                 let arb = ArbitrageEngine::new(rpc.clone(), vec![ray.clone(), orc.clone()])
                     .with_profit_params(10, 5_000_000); // min 10 bps, est 0.05 SOL tx cost
 
-                // Initialize execution engine with config optimized for test environment
-                // With 0.072 SOL, we need very conservative position sizes
-                let exec_config = ExecutionConfig {
-                    max_slippage_bps: 500,              // 5% slippage tolerance
-                    min_profit_bps_to_execute: 100,     // 1% minimum profit to execute
-                    max_position_lamports: 10_000_000,  // 0.01 SOL max per trade (was 5 SOL)
-                    dry_run: false,                     // LIVE TRADING - set to true to disable
-                    priority_fee_micro_lamports: 1_000, // Low priority fee
+                // Build execution config from TOML (centralized configuration)
+                let exec_config = if let Some(ref arb_cfg) = ctx_arb.cfg.arbitrage {
+                    if let Some(ref exec_cfg) = arb_cfg.execution {
+                        ExecutionConfig {
+                            max_slippage_bps: exec_cfg.max_slippage_bps,
+                            min_profit_bps_to_execute: exec_cfg.min_profit_bps_to_execute,
+                            max_position_lamports: exec_cfg.max_position_lamports,
+                            dry_run: exec_cfg.dry_run,
+                            priority_fee_micro_lamports: exec_cfg.priority_fee_micro_lamports,
+                        }
+                    } else {
+                        ExecutionConfig::default()
+                    }
+                } else {
+                    ExecutionConfig::default()
                 };
                 let executor = ExecutionEngine::new(
                     rpc.clone(),
