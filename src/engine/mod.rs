@@ -540,7 +540,6 @@ impl Engine {
                 // Debouncing: scan after pool update burst settles
                 let mut last_scan = tokio::time::Instant::now();
                 let min_scan_interval = tokio::time::Duration::from_millis(interval_ms);
-                let mut pending_scan = false;
 
                 let mut loop_count = 0u64;
 
@@ -551,10 +550,7 @@ impl Engine {
 
                     match event_received {
                         Ok(Ok(_event)) => {
-                            // Pool update received - mark for scan
-                            pending_scan = true;
-
-                            // Debounce: if we just scanned recently, wait a bit
+                            // Pool update received - debounce if we just scanned
                             if last_scan.elapsed() < min_scan_interval {
                                 continue;
                             }
@@ -564,21 +560,14 @@ impl Engine {
                                 skipped_events = skipped,
                                 "arbitrage_task: pool update buffer overflowed - scanning immediately"
                             );
-                            pending_scan = true;
                         }
                         Err(_timeout) => {
                             // Timeout reached - periodic scan
-                            pending_scan = true;
                         }
                         _ => continue,
                     }
 
-                    // Skip scan if nothing pending
-                    if !pending_scan {
-                        continue;
-                    }
-
-                    pending_scan = false;
+                    // Execute scan
                     last_scan = tokio::time::Instant::now();
                     loop_count += 1;
 
