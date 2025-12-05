@@ -510,6 +510,7 @@ impl ArbitrageEngine {
 
     /// Enumerate triangular cycles (A->B->C->A) with proper decimal normalization.
     /// All amounts are normalized to 9 decimals (SOL standard) for profit calculations.
+    /// IMPORTANT: amount_in should be in the native decimals of the base token being scanned.
     pub async fn enumerate_triangular_cycles(
         &self,
         base_tokens: &[String],
@@ -608,9 +609,10 @@ impl ArbitrageEngine {
                     }
 
                     // Sanity check: filter cycles with EXTREME price movements in normalized space
-                    // Only reject if price changes by >10,000x (likely decimal error)
-                    if h1_out_norm > amount_in_norm * 10_000
-                        || h1_out_norm < amount_in_norm / 10_000
+                    // Reject if any hop changes by >100x (likely decimal error or unrealistic arb)
+                    const MAX_PRICE_CHANGE: u64 = 100;
+                    if h1_out_norm > amount_in_norm * MAX_PRICE_CHANGE
+                        || h1_out_norm < amount_in_norm / MAX_PRICE_CHANGE
                     {
                         tracing::debug!(
                             path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
@@ -618,25 +620,27 @@ impl ArbitrageEngine {
                             h1_out_norm,
                             base_decimals,
                             mid1_decimals,
-                            "arbitrage: rejecting cycle - h1 price change >10000x (normalized)"
+                            "arbitrage: rejecting cycle - h1 price change >100x (normalized)"
                         );
                         continue;
                     }
 
-                    if h2_out_norm > h1_out_norm * 10_000 || h2_out_norm < h1_out_norm / 10_000 {
+                    if h2_out_norm > h1_out_norm * MAX_PRICE_CHANGE
+                        || h2_out_norm < h1_out_norm / MAX_PRICE_CHANGE
+                    {
                         tracing::debug!(
                             path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
                             h1_out_norm,
                             h2_out_norm,
                             mid1_decimals,
                             mid2_decimals,
-                            "arbitrage: rejecting cycle - h2 price change >10000x (normalized)"
+                            "arbitrage: rejecting cycle - h2 price change >100x (normalized)"
                         );
                         continue;
                     }
 
-                    if final_out_norm > h2_out_norm * 10_000
-                        || final_out_norm < h2_out_norm / 10_000
+                    if final_out_norm > h2_out_norm * MAX_PRICE_CHANGE
+                        || final_out_norm < h2_out_norm / MAX_PRICE_CHANGE
                     {
                         tracing::debug!(
                             path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
@@ -644,7 +648,7 @@ impl ArbitrageEngine {
                             final_out_norm,
                             mid2_decimals,
                             base_decimals,
-                            "arbitrage: rejecting cycle - h3 price change >10000x (normalized)"
+                            "arbitrage: rejecting cycle - h3 price change >100x (normalized)"
                         );
                         continue;
                     }
@@ -652,20 +656,26 @@ impl ArbitrageEngine {
                     let gross_profit_norm = final_out_norm - amount_in_norm;
 
                     // CRITICAL: Estimate slippage for first leg (most impactful)
-                    let (safe_amount_pct, slippage_pct) =
-                        match self.estimate_slippage_for_pair(base, mid1, amount_in).await {
-                            Ok(result) => result,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    pair = %format!("{} -> {}", base, mid1),
-                                    "arbitrage: slippage estimation failed, using 0%"
-                                );
-                                (100, 0.0)
-                            }
-                        };
+                    // NOTE: safe_amount_pct indicates what % of amount_in is safe to trade
+                    // Currently we don't reduce amount_in based on this - consider implementing
+                    // dynamic sizing based on safe_amount_pct for better risk management
+                    let (safe_amount_pct, slippage_pct) = match self
+                        .estimate_slippage_for_pair(base, mid1, amount_in)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                pair = %format!("{} -> {}", base, mid1),
+                                "arbitrage: slippage estimation failed, using conservative 20% slippage"
+                            );
+                            (100, 20.0)
+                        }
+                    };
 
                     // Use slippage-adjusted profit calculation on NORMALIZED amounts
+                    // Slippage is applied as a reduction to final_out
                     let net_norm = compute_net_profit_with_slippage(
                         amount_in_norm,
                         final_out_norm,
