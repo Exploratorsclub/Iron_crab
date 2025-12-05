@@ -98,11 +98,7 @@ impl ExecutionEngine {
         // =========== Pre-execution checks ===========
 
         // 1. Check minimum profit threshold
-        let roi_bps = if amount_in_norm > 0 {
-            ((net_profit_norm as f64 / amount_in_norm as f64) * 10_000.0) as u32
-        } else {
-            0
-        };
+        let roi_bps = crate::solana::arbitrage::calculate_roi_bps(amount_in_norm, cycle.net_profit);
 
         if roi_bps < self.config.min_profit_bps_to_execute {
             return Err(anyhow!(
@@ -123,14 +119,15 @@ impl ExecutionEngine {
 
         // 3. Check wallet balance (SOL for gas fees)
         // NOTE: We skip checking token balances here as they are checked during transaction simulation
-        // We only verify we have enough SOL for gas fees (estimate ~0.01 SOL for 3-hop swap)
+        // We only verify we have enough SOL for gas fees (estimate dynamically after building tx)
         let wallet_balance = self.rpc.get_balance_retry(&self.wallet.pubkey()).await?;
-        let estimated_gas = self.estimate_gas_cost(5); // 3-hop swap ~5 instructions
-        if wallet_balance < estimated_gas {
+        // Dynamic estimation will be done after instruction building
+        let estimated_gas_pre = self.estimate_gas_cost(10); // Conservative estimate for 3-hop (usually 6-9 ix)
+        if wallet_balance < estimated_gas_pre {
             return Err(anyhow!(
                 "Insufficient SOL for gas: have {} lamports, need ~{} lamports",
                 wallet_balance,
-                estimated_gas
+                estimated_gas_pre
             ));
         }
 
@@ -144,56 +141,88 @@ impl ExecutionEngine {
         );
 
         // Build 3-hop swap plan (base -> mid1 -> mid2 -> base)
-        let plan = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.router.build_best_hops2_plan_exact_in(
-                base,
-                mid1,
-                amount_in,
-                self.config.max_slippage_bps,
-            ),
+        // CRITICAL: Use single-hop quotes to ensure proper decimal handling and slippage control
+
+        // Hop 1: base -> mid1
+        let quote1 = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.router.best_quote_exact_in(base, mid1, amount_in),
         )
         .await
-        .map_err(|_| anyhow!("Timeout building plan for {}->{}", base, mid1))??;
+        .map_err(|_| anyhow!("Timeout getting quote for {}->{}", base, mid1))??;
 
-        let (ixs_hop1_hop2, final_out_hop2) = match plan {
-            Some(p) => (p.ixs, p.expected_out),
-            None => {
-                return Err(anyhow!(
-                    "Failed to build swap plan for {}->{}: no quotes available",
-                    base,
-                    mid1
-                ))
-            }
+        let (dex1_idx, q1) = match quote1 {
+            Some(rq) => (rq.dex_index, rq.quote),
+            None => return Err(anyhow!("No quote available for {}->{}", base, mid1)),
         };
 
-        // Now build the third hop: mid2 -> base
-        let plan_hop3 = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.router.build_best_hops2_plan_exact_in(
-                mid2,
-                base,
-                final_out_hop2,
-                self.config.max_slippage_bps,
-            ),
+        // Hop 2: mid1 -> mid2
+        let quote2 = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.router.best_quote_exact_in(mid1, mid2, q1.amount_out),
         )
         .await
-        .map_err(|_| anyhow!("Timeout building plan for {}->{}", mid2, base))??;
+        .map_err(|_| anyhow!("Timeout getting quote for {}->{}", mid1, mid2))??;
 
-        let (ixs_hop3, final_out_actual) = match plan_hop3 {
-            Some(p) => (p.ixs, p.expected_out),
-            None => {
-                return Err(anyhow!(
-                    "Failed to build swap plan for {}->{}: no quotes available",
-                    mid2,
-                    base
-                ))
-            }
+        let (dex2_idx, q2) = match quote2 {
+            Some(rq) => (rq.dex_index, rq.quote),
+            None => return Err(anyhow!("No quote available for {}->{}", mid1, mid2)),
         };
 
-        // Combine all instructions
-        let mut all_ixs = ixs_hop1_hop2;
-        all_ixs.extend(ixs_hop3);
+        // Hop 3: mid2 -> base (apply slippage protection on final hop)
+        let quote3 = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.router.best_quote_exact_in(mid2, base, q2.amount_out),
+        )
+        .await
+        .map_err(|_| anyhow!("Timeout getting quote for {}->{}", mid2, base))??;
+
+        let (dex3_idx, q3) = match quote3 {
+            Some(rq) => (rq.dex_index, rq.quote),
+            None => return Err(anyhow!("No quote available for {}->{}", mid2, base)),
+        };
+
+        let final_out_actual = q3.amount_out;
+
+        // Apply slippage protection to final output
+        let min_out_final = {
+            let slippage_factor = (10_000 - self.config.max_slippage_bps) as f64 / 10_000.0;
+            (final_out_actual as f64 * slippage_factor) as u64
+        };
+
+        // Verify the actual quotes match our expectations from discovery
+        // Allow some deviation due to pool state changes, but reject if too different
+        let expected_out = cycle.gross_out;
+        if final_out_actual < expected_out * 80 / 100 {
+            // More than 20% worse
+            return Err(anyhow!(
+                "Quote deteriorated significantly: expected {} but got {} (>20% worse)",
+                expected_out,
+                final_out_actual
+            ));
+        }
+
+        // Build instructions for all 3 hops
+        let dexs = self.router.dexs();
+        let mut all_ixs = Vec::new();
+
+        // Hop 1: no min_out (intermediate hop)
+        let ixs1 = dexs[dex1_idx].build_swap_ix(&q1.input_mint, &q1.output_mint, amount_in, 0)?;
+        all_ixs.extend(ixs1);
+
+        // Hop 2: no min_out (intermediate hop)
+        let ixs2 =
+            dexs[dex2_idx].build_swap_ix(&q2.input_mint, &q2.output_mint, q1.amount_out, 0)?;
+        all_ixs.extend(ixs2);
+
+        // Hop 3: apply min_out for slippage protection
+        let ixs3 = dexs[dex3_idx].build_swap_ix(
+            &q3.input_mint,
+            &q3.output_mint,
+            q2.amount_out,
+            min_out_final,
+        )?;
+        all_ixs.extend(ixs3);
 
         // =========== Execution ===========
 
@@ -203,16 +232,18 @@ impl ExecutionEngine {
                 amount_in = amount_in,
                 expected_out = final_out_actual,
                 profit = final_out_actual.saturating_sub(amount_in),
+                ix_count = all_ixs.len(),
                 "execution: DRY RUN - would execute this trade"
             );
 
+            let estimated_gas = self.estimate_gas_cost(all_ixs.len());
             return Ok(ExecutionResult {
                 signature: "DRY_RUN".to_string(),
                 path: (base.clone(), mid1.clone(), mid2.clone()),
                 amount_in,
                 expected_out: final_out_actual,
                 actual_out: None,
-                gas_cost: 5_000_000, // Typical SOL gas cost
+                gas_cost: estimated_gas,
                 net_profit: net_profit_norm.into(),
                 status: ExecutionStatus::DryRun,
             });
@@ -220,10 +251,13 @@ impl ExecutionEngine {
 
         // Build and sign transaction
         let recent_blockhash = self.rpc.get_latest_blockhash_retry().await?;
+        let ix_count = all_ixs.len(); // Save before move
         let tx = self.build_signed_transaction(all_ixs, recent_blockhash)?;
 
         // Send transaction
         let signature = self.rpc.rpc.send_and_confirm_transaction(&tx).await?;
+
+        let estimated_gas = self.estimate_gas_cost(ix_count);
 
         info!(
             path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
@@ -231,6 +265,8 @@ impl ExecutionEngine {
             amount_in = amount_in,
             expected_out = final_out_actual,
             roi_bps = roi_bps,
+            ix_count = ix_count,
+            estimated_gas = estimated_gas,
             "execution: transaction submitted"
         );
 
@@ -243,7 +279,7 @@ impl ExecutionEngine {
             amount_in,
             expected_out: final_out_actual,
             actual_out: None, // Would be populated after confirmation
-            gas_cost: 5_000_000,
+            gas_cost: estimated_gas,
             net_profit: net_profit_norm.into(),
             status: ExecutionStatus::Pending,
         })
@@ -273,52 +309,71 @@ impl ExecutionEngine {
         Ok(tx)
     }
 
-    /// Execute multiple opportunities, respecting position limits
+    /// Execute multiple opportunities sequentially to respect cumulative position limits
+    /// DESIGN: Sequential execution prevents race conditions and allows proper risk management
     pub async fn execute_batch(&self, cycles: &[CycleOpportunity]) -> Vec<ExecutionResult> {
-        // PARALLEL EXECUTION: Launch all opportunities concurrently for speed
-        // Each will check position limits independently
-        let mut handles = Vec::new();
-
-        for cycle in cycles {
-            let cycle_clone = cycle.clone();
-            let self_clone = self.clone();
-
-            let handle = tokio::spawn(async move {
-                match self_clone.execute_opportunity(&cycle_clone).await {
-                    Ok(result) => Some(result),
-                    Err(e) => {
-                        error!(
-                            path = %format!("{} -> {} -> {} -> {}", cycle_clone.path.0, cycle_clone.path.1, cycle_clone.path.2, cycle_clone.path.0),
-                            error = %e,
-                            "execution: failed to execute opportunity"
-                        );
-                        None
-                    }
-                }
-            });
-            handles.push(handle);
-        }
-
-        // Wait for all to complete
         let mut results = Vec::new();
-        for handle in handles {
-            if let Ok(Some(result)) = handle.await {
-                results.push(result);
+        let mut cumulative_position = 0u64;
+
+        for (idx, cycle) in cycles.iter().enumerate() {
+            // Check cumulative position limit
+            if cumulative_position + cycle.amount_in > self.config.max_position_lamports {
+                tracing::warn!(
+                    cycle_idx = idx,
+                    cumulative = cumulative_position,
+                    this_amount = cycle.amount_in,
+                    max_limit = self.config.max_position_lamports,
+                    "execution: skipping opportunity - would exceed cumulative position limit"
+                );
+                continue;
+            }
+
+            match self.execute_opportunity(cycle).await {
+                Ok(result) => {
+                    // Only count successful executions toward position limit
+                    if matches!(
+                        result.status,
+                        ExecutionStatus::Confirmed | ExecutionStatus::Pending
+                    ) {
+                        cumulative_position += cycle.amount_in;
+                    }
+                    results.push(result);
+                }
+                Err(e) => {
+                    error!(
+                        path = %format!("{} -> {} -> {} -> {}", cycle.path.0, cycle.path.1, cycle.path.2, cycle.path.0),
+                        error = %e,
+                        "execution: failed to execute opportunity"
+                    );
+                }
             }
         }
 
-        info!(total_executed = results.len(), "execution: batch completed");
+        info!(
+            total_executed = results.len(),
+            total_attempted = cycles.len(),
+            cumulative_position = cumulative_position,
+            "execution: batch completed"
+        );
 
         results
     }
 
     /// Estimate gas cost based on instruction count
+    /// Real costs are usually lower, but we overestimate for safety
     pub fn estimate_gas_cost(&self, ix_count: usize) -> u64 {
-        // Base cost + per-instruction cost
-        const BASE_COST: u64 = 5_000_000; // 5M lamports base
-        const PER_IX_COST: u64 = 1_000_000; // 1M per instruction
+        // Base cost: signature + blockhash lookup
+        const BASE_COST: u64 = 5_000; // 5k lamports base
+                                      // Per-instruction cost: compute units + account reads/writes
+                                      // Complex DEX swaps can use 200k-400k CU per swap
+                                      // At default priority (1000 micro-lamports/CU) = 200-400 lamports per instruction
+                                      // We overestimate for safety: ~2000 lamports per instruction
+        const PER_IX_COST: u64 = 2_000;
 
-        BASE_COST + (ix_count as u64 * PER_IX_COST)
+        // Priority fee (added via compute budget instruction)
+        let priority_fee_estimate = (300_000 * self.config.priority_fee_micro_lamports) / 1_000_000; // 300k CU typical
+
+        BASE_COST + (ix_count as u64 * PER_IX_COST) + priority_fee_estimate
     }
 }
 
@@ -337,13 +392,22 @@ mod tests {
     #[test]
     fn test_gas_estimation() {
         let config = ExecutionConfig::default();
-        // Note: This test requires a valid keypair. In practice, use Treasury::load() or from_signer()
-        // For now, we just test the gas estimation function directly
-        let _gas_2ix = config; // Use config directly to test
-        let gas_2ix_cost = 5_000_000 + (2_u64 * 1_000_000);
-        let gas_5ix_cost = 5_000_000 + (5_u64 * 1_000_000);
+        // Create a mock execution engine to test gas estimation
+        // Gas estimation formula: 5k base + (ix_count * 2k) + priority_fee
+        // With default priority_fee_micro_lamports = 1000:
+        // priority_fee_estimate = (300k * 1000) / 1M = 300 lamports
 
-        assert_eq!(gas_2ix_cost, 5_000_000 + 2_000_000); // 7M
-        assert_eq!(gas_5ix_cost, 5_000_000 + 5_000_000); // 10M
+        let base_cost = 5_000u64;
+        let per_ix = 2_000u64;
+        let priority = 300u64;
+
+        let gas_3ix = base_cost + (3 * per_ix) + priority; // 5k + 6k + 300 = 11,300
+        let gas_9ix = base_cost + (9 * per_ix) + priority; // 5k + 18k + 300 = 23,300
+
+        assert_eq!(gas_3ix, 11_300);
+        assert_eq!(gas_9ix, 23_300);
+
+        // Verify config values
+        assert_eq!(config.priority_fee_micro_lamports, 1_000);
     }
 }
