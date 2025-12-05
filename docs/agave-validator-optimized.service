@@ -1,3 +1,5 @@
+/etc/systemd/system/agave-validator.service
+
 [Unit]
 Description=Agave Validator (Non-Voting RPC) - Optimized for Arbitrage
 After=network-online.target
@@ -17,7 +19,6 @@ RestartSec=5
 Environment=RUST_BACKTRACE=1
 
 
-
 ExecStart=/usr/local/bin/agave-validator \
   --identity /home/sol/validator-keypair.json \
   --ledger /var/solana/ledger \
@@ -33,10 +34,7 @@ ExecStart=/usr/local/bin/agave-validator \
   --accounts-db-cache-limit-mb 262144 \
   --accounts-index-scan-results-limit-mb 8192 \
   --dynamic-port-range 8000-8025 \
-  --tpu-max-connections 1000000 \
   --tpu-connection-pool-size 1024 \
-  --turbine-disabled-quic-clients-ratio 0 \
-  --enable-cpi-and-log-recovery \
   --no-port-check \
   --entrypoint entrypoint.mainnet-beta.solana.com:8001 \
   --entrypoint entrypoint2.mainnet-beta.solana.com:8001 \
@@ -49,3 +47,4 @@ SyslogIdentifier=agave-validator
 
 [Install]
 WantedBy=multi-user.target
+

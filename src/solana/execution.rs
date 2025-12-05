@@ -146,8 +146,12 @@ impl ExecutionEngine {
         // Build 3-hop swap plan (base -> mid1 -> mid2 -> base)
         let plan = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            self.router
-                .build_best_hops2_plan_exact_in(base, mid1, amount_in, self.config.max_slippage_bps)
+            self.router.build_best_hops2_plan_exact_in(
+                base,
+                mid1,
+                amount_in,
+                self.config.max_slippage_bps,
+            ),
         )
         .await
         .map_err(|_| anyhow!("Timeout building plan for {}->{}", base, mid1))??;
@@ -166,13 +170,12 @@ impl ExecutionEngine {
         // Now build the third hop: mid2 -> base
         let plan_hop3 = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            self.router
-                .build_best_hops2_plan_exact_in(
-                    mid2,
-                    base,
-                    final_out_hop2,
-                    self.config.max_slippage_bps,
-                )
+            self.router.build_best_hops2_plan_exact_in(
+                mid2,
+                base,
+                final_out_hop2,
+                self.config.max_slippage_bps,
+            ),
         )
         .await
         .map_err(|_| anyhow!("Timeout building plan for {}->{}", mid2, base))??;
@@ -275,11 +278,11 @@ impl ExecutionEngine {
         // PARALLEL EXECUTION: Launch all opportunities concurrently for speed
         // Each will check position limits independently
         let mut handles = Vec::new();
-        
+
         for cycle in cycles {
             let cycle_clone = cycle.clone();
             let self_clone = self.clone();
-            
+
             let handle = tokio::spawn(async move {
                 match self_clone.execute_opportunity(&cycle_clone).await {
                     Ok(result) => Some(result),
@@ -295,7 +298,7 @@ impl ExecutionEngine {
             });
             handles.push(handle);
         }
-        
+
         // Wait for all to complete
         let mut results = Vec::new();
         for handle in handles {
@@ -303,12 +306,9 @@ impl ExecutionEngine {
                 results.push(result);
             }
         }
-        
-        info!(
-            total_executed = results.len(),
-            "execution: batch completed"
-        );
-        
+
+        info!(total_executed = results.len(), "execution: batch completed");
+
         results
     }
 

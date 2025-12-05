@@ -105,6 +105,13 @@ min_profit_bps = 50  # Increased from 10bps to filter small trades with high sli
 est_tx_cost_lamports = 10000
 pairs = []  # ignored when discovery.mode = "full-auto"
 
+[arbitrage.execution]
+max_slippage_bps = 150              # 1.5% Slippage-Toleranz im Mini-Mode
+min_profit_bps_to_execute = 50      # passt zu arbitrage.min_profit_bps
+max_position_lamports = 5000000     # 0.005 SOL Maximalgröße pro Trade
+dry_run = false                     # echte Ausführung statt nur Simulation
+priority_fee_micro_lamports = 1000  # kleine Priority Fee
+
 [arbitrage.discovery]
 enable = true
 mode = "full-auto"  # full-auto für aktive Discovery + Scans, discovery-only nur für CSV-Logs

@@ -116,11 +116,11 @@ impl Router {
         }
         mids.remove(input_mint);
         mids.remove(output_mint);
-        
+
         // PERFORMANCE: Limit to first 20 mid tokens to avoid timeout
         // TODO: Sort by liquidity/volume before limiting
         let mid_vec: Vec<String> = mids.into_iter().take(20).collect();
-        
+
         let mut best: Option<(Vec<(usize, Quote)>, u64)> = None;
         for mid in mid_vec {
             // First hop quotes
@@ -128,8 +128,9 @@ impl Router {
             for (i, d) in self.dexs.iter().enumerate() {
                 let quote_result = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
-                    d.quote_exact_in(input_mint, &mid, amount_in)
-                ).await;
+                    d.quote_exact_in(input_mint, &mid, amount_in),
+                )
+                .await;
                 if let Ok(Ok(Some(q))) = quote_result {
                     let rep = first_hop
                         .as_ref()
@@ -149,8 +150,9 @@ impl Router {
             for (i, d) in self.dexs.iter().enumerate() {
                 let quote_result = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
-                    d.quote_exact_in(&mid, output_mint, q1.amount_out)
-                ).await;
+                    d.quote_exact_in(&mid, output_mint, q1.amount_out),
+                )
+                .await;
                 if let Ok(Ok(Some(q))) = quote_result {
                     let rep = second_hop
                         .as_ref()
@@ -216,10 +218,10 @@ impl Router {
             }
         }
         // candidate mid2 tokens appear in neighbors_to_output; mid1 in neighbors_from_input
-        
+
         // PERFORMANCE: Limit to first 15 mid1 tokens to avoid timeout
         let mid1_vec: Vec<String> = neighbors_from_input.into_iter().take(15).collect();
-        
+
         let mut best: Option<(Vec<(usize, Quote)>, u64)> = None;
         // iterate mid1 first
         for mid1 in &mid1_vec {
@@ -228,8 +230,9 @@ impl Router {
             for (i, d) in self.dexs.iter().enumerate() {
                 let quote_result = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
-                    d.quote_exact_in(input_mint, mid1, amount_in)
-                ).await;
+                    d.quote_exact_in(input_mint, mid1, amount_in),
+                )
+                .await;
                 if let Ok(Ok(Some(q))) = quote_result {
                     if hop1_best
                         .as_ref()
@@ -271,8 +274,9 @@ impl Router {
                 for (i, d) in self.dexs.iter().enumerate() {
                     let quote_result = tokio::time::timeout(
                         std::time::Duration::from_secs(3),
-                        d.quote_exact_in(&q1.output_mint, mid2, q1.amount_out)
-                    ).await;
+                        d.quote_exact_in(&q1.output_mint, mid2, q1.amount_out),
+                    )
+                    .await;
                     if let Ok(Ok(Some(q))) = quote_result {
                         if hop2_best
                             .as_ref()
@@ -295,8 +299,9 @@ impl Router {
                 for (i, d) in self.dexs.iter().enumerate() {
                     let quote_result = tokio::time::timeout(
                         std::time::Duration::from_secs(3),
-                        d.quote_exact_in(&q2.output_mint, output_mint, q2.amount_out)
-                    ).await;
+                        d.quote_exact_in(&q2.output_mint, output_mint, q2.amount_out),
+                    )
+                    .await;
                     if let Ok(Ok(Some(q))) = quote_result {
                         if hop3_best
                             .as_ref()
