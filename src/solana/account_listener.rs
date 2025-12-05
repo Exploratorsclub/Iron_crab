@@ -33,7 +33,9 @@ impl AccountListener {
         ws_url: String,
         program_ids: Vec<Pubkey>,
     ) -> (Self, broadcast::Receiver<PoolUpdateEvent>) {
-        let (tx, rx) = broadcast::channel(1000); // Buffer 1000 events
+        // Increased buffer for high-volume trading (700k+ pools)
+        // At 1000 events/sec, 10k buffer = 10 second tolerance before overflow
+        let (tx, rx) = broadcast::channel(10000); // Buffer 10k events (was 1000)
 
         (
             Self {
