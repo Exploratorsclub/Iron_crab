@@ -641,12 +641,10 @@ impl Engine {
                                 let opportunities_to_execute: Vec<_> = profitable
                                     .iter()
                                     .filter(|c| {
-                                        let roi_bps = if c.amount_in > 0 && c.net_profit.is_some() {
-                                            let net = c.net_profit.unwrap_or(0);
-                                            ((net as f64 / c.amount_in as f64) * 10_000.0) as u32
-                                        } else {
-                                            0
-                                        };
+                                        let roi_bps = crate::solana::arbitrage::calculate_roi_bps(
+                                            c.amount_in,
+                                            c.net_profit,
+                                        );
                                         roi_bps >= exec_config.min_profit_bps_to_execute
                                     })
                                     .take(3) // PERFORMANCE: Only execute top 3 opportunities to avoid staleness
@@ -692,13 +690,11 @@ impl Engine {
                                 let gross_profit_norm = cycle.gross_profit;
                                 let amount_in_norm = cycle.amount_in; // Now normalized to 9 decimals
 
-                                // Simple ROI calculation with all values in normalized 9-decimal space
-                                let roi_bps = if amount_in_norm > 0 && net_profit_norm > 0 {
-                                    ((net_profit_norm as f64 / amount_in_norm as f64) * 10_000.0)
-                                        as u32
-                                } else {
-                                    0
-                                };
+                                // Calculate ROI using centralized helper
+                                let roi_bps = crate::solana::arbitrage::calculate_roi_bps(
+                                    amount_in_norm,
+                                    cycle.net_profit,
+                                );
 
                                 tracing::info!(
                                     path = %format!("{} -> {} -> {} -> {}", a, b, c, a),

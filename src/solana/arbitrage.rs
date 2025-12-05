@@ -655,11 +655,9 @@ impl ArbitrageEngine {
 
                     let gross_profit_norm = final_out_norm - amount_in_norm;
 
-                    // CRITICAL: Estimate slippage for first leg (most impactful)
-                    // NOTE: safe_amount_pct indicates what % of amount_in is safe to trade
-                    // Currently we don't reduce amount_in based on this - consider implementing
-                    // dynamic sizing based on safe_amount_pct for better risk management
-                    let (safe_amount_pct, slippage_pct) = match self
+                    // CRITICAL: Estimate slippage for ALL 3 legs to get accurate cumulative slippage
+                    // Each leg returns (safe_amount_pct, slippage_pct)
+                    let (safe_pct_1, slip_1) = match self
                         .estimate_slippage_for_pair(base, mid1, amount_in)
                         .await
                     {
@@ -668,32 +666,65 @@ impl ArbitrageEngine {
                             tracing::warn!(
                                 error = %e,
                                 pair = %format!("{} -> {}", base, mid1),
-                                "arbitrage: slippage estimation failed, using conservative 20% slippage"
+                                "arbitrage: slippage estimation failed, using conservative fallback"
                             );
-                            (100, 20.0)
+                            (50, 20.0)
                         }
+                    };
+
+                    let (safe_pct_2, slip_2) = match self
+                        .estimate_slippage_for_pair(mid1, mid2, h1.quote.amount_out)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                pair = %format!("{} -> {}", mid1, mid2),
+                                "arbitrage: slippage estimation failed, using conservative fallback"
+                            );
+                            (50, 20.0)
+                        }
+                    };
+
+                    let (safe_pct_3, slip_3) = match self
+                        .estimate_slippage_for_pair(mid2, base, h2.quote.amount_out)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                pair = %format!("{} -> {}", mid2, base),
+                                "arbitrage: slippage estimation failed, using conservative fallback"
+                            );
+                            (50, 20.0)
+                        }
+                    };
+
+                    // Calculate cumulative slippage and minimum safe amount
+                    let total_slippage_pct = slip_1 + slip_2 + slip_3;
+                    let safe_amount_pct = safe_pct_1.min(safe_pct_2).min(safe_pct_3);
+
+                    // DESIGN FIX: Apply safe_amount_pct to dynamically reduce trade size
+                    let adjusted_amount_in_norm = if safe_amount_pct < 100 {
+                        (amount_in_norm as f64 * (safe_amount_pct as f64 / 100.0)) as u64
+                    } else {
+                        amount_in_norm
                     };
 
                     // Use slippage-adjusted profit calculation on NORMALIZED amounts
                     // Slippage is applied as a reduction to final_out
                     let net_norm = compute_net_profit_with_slippage(
-                        amount_in_norm,
+                        adjusted_amount_in_norm,
                         final_out_norm,
-                        slippage_pct,
+                        total_slippage_pct,
                         self.min_profit_bps,
                         self.est_tx_cost_lamports,
                     );
 
-                    // Calculate ROI in normalized space for logging
-                    let roi_bps = if let Some(profit) = net_norm {
-                        if amount_in_norm > 0 {
-                            ((profit as f64 / amount_in_norm as f64) * 10_000.0) as u32
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    };
+                    // DESIGN FIX: Use centralized ROI helper function
+                    let roi_bps = calculate_roi_bps(adjusted_amount_in_norm, net_norm);
 
                     tracing::info!(
                         path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
@@ -702,6 +733,7 @@ impl ArbitrageEngine {
                         h2_out = h2.quote.amount_out,
                         final_out = final_out,
                         amount_in_norm,
+                        adjusted_amount_in_norm,
                         h1_out_norm,
                         h2_out_norm,
                         final_out_norm,
@@ -709,16 +741,16 @@ impl ArbitrageEngine {
                         gross_profit_norm,
                         net_profit_norm = ?net_norm,
                         roi_bps,
-                        slippage_pct = format!("{:.2}%", slippage_pct),
+                        slippage_pct = format!("{:.2}%", total_slippage_pct),
                         safe_amount_pct,
                         "arbitrage cycle opportunity detected"
                     );
                     cycles.push(CycleOpportunity {
                         path: (base.clone(), mid1.clone(), mid2.clone()),
-                        amount_in: amount_in_norm, // CRITICAL: Store normalized amount_in
-                        gross_out: final_out_norm, // CRITICAL: Store normalized final_out
-                        gross_profit: gross_profit_norm, // Store normalized profit (already normalized)
-                        net_profit: net_norm,            // Store normalized net profit
+                        amount_in: adjusted_amount_in_norm, // Store adjusted amount after safe_amount_pct
+                        gross_out: final_out_norm,
+                        gross_profit: gross_profit_norm,
+                        net_profit: net_norm,
                     });
                 }
             }
@@ -983,6 +1015,18 @@ impl ArbitrageEngine {
             cycles.truncate(limit);
         }
         Ok(cycles)
+    }
+}
+
+/// Calculate ROI in basis points from normalized amounts.
+/// Returns 0 if amount_in is 0 or net_profit is None.
+pub fn calculate_roi_bps(amount_in_norm: u64, net_profit_norm: Option<u64>) -> u32 {
+    if amount_in_norm == 0 {
+        return 0;
+    }
+    match net_profit_norm {
+        Some(profit) if profit > 0 => ((profit as f64 / amount_in_norm as f64) * 10_000.0) as u32,
+        _ => 0,
     }
 }
 
