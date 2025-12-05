@@ -138,9 +138,9 @@ program_ids = [
 interval_ms = 200  # Fast scanning: 200ms = 5 scans/sec (event-driven reacts even faster)
 # NOTE: If seeing "buffer overflowed" warnings, increase to 500ms (reduces CPU load)
 
-min_profit_bps = 100  # 1.0% minimum profit (filters noise, was 50bps)
-# Why 100bps: With 700k pools, lower threshold = too many false positives
-# Most real arbitrage: 1-5% profit windows
+min_profit_bps = 150  # 1.5% minimum profit (filters noise, was 100bps)
+# Why 150bps: With 700k pools + high event volume, need higher threshold
+# Most real arbitrage: 1-5% profit windows, <1.5% often scam pools
 
 est_tx_cost_lamports = 10000  # ~0.01 millis (conservative estimate)
 pairs = []  # ignored when discovery.mode = "full-auto"
