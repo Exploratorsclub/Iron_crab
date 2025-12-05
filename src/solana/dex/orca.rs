@@ -384,16 +384,16 @@ impl Orca {
     /// Get all vault addresses from current pools (for subscription)
     pub fn get_all_vaults(&self) -> Vec<Pubkey> {
         let mut vaults = Vec::new();
-        
+
         for pool in self.pools.iter() {
             vaults.push(pool.vault_a);
             vaults.push(pool.vault_b);
         }
-        
+
         // Deduplicate
         vaults.sort();
         vaults.dedup();
-        
+
         vaults
     }
 
@@ -741,7 +741,7 @@ impl Dex for Orca {
         // Performance optimization: Filter out low-liquidity pools (<1 SOL total reserves)
         // This reduces arbitrage scan workload by ~80% with minimal missed opportunities
         const MIN_LIQUIDITY_LAMPORTS: u128 = 1_000_000_000; // 1 SOL = 1B lamports
-        
+
         self.pools
             .iter()
             .filter(|entry| {

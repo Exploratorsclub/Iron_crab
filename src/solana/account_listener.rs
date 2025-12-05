@@ -16,6 +16,9 @@ pub struct PoolUpdateEvent {
     pub program_id: Pubkey,
     pub account_pubkey: Pubkey,
     pub slot: u64,
+    /// Raw account data from WebSocket (base64-decoded)
+    /// This eliminates the need for separate RPC calls to fetch account data
+    pub account_data: Option<Vec<u8>>,
 }
 
 /// WebSocket listener for Solana account updates
@@ -131,6 +134,27 @@ impl AccountListener {
                                         .and_then(|p| p.as_str())
                                         .and_then(|s| s.parse::<Pubkey>().ok());
 
+                                    // Extract account data from WebSocket response (base64-encoded)
+                                    let account_data = result
+                                        .get("value")
+                                        .and_then(|v| v.get("account"))
+                                        .and_then(|acc| acc.get("data"))
+                                        .and_then(|data| {
+                                            // Data is [base64_string, "base64"] format
+                                            if let Some(arr) = data.as_array() {
+                                                arr.first().and_then(|s| s.as_str()).and_then(
+                                                    |b64| {
+                                                        base64::Engine::decode(
+                                                        &base64::engine::general_purpose::STANDARD,
+                                                        b64
+                                                    ).ok()
+                                                    },
+                                                )
+                                            } else {
+                                                None
+                                            }
+                                        });
+
                                     if let Some(account_pubkey) = account_key {
                                         // Determine which program this belongs to (simplified)
                                         // In production, track subscription IDs properly
@@ -140,6 +164,7 @@ impl AccountListener {
                                             program_id,
                                             account_pubkey,
                                             slot,
+                                            account_data,
                                         };
 
                                         // Broadcast event (non-blocking)

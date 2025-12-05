@@ -732,7 +732,7 @@ impl Dex for Raydium {
         // Performance optimization: Filter out low-liquidity pools (<1 SOL total reserves)
         // This reduces arbitrage scan workload by ~80% with minimal missed opportunities
         const MIN_LIQUIDITY_LAMPORTS: u128 = 1_000_000_000; // 1 SOL = 1B lamports
-        
+
         self.pools
             .iter()
             .filter(|p| {
