@@ -1088,27 +1088,37 @@ impl SniperEngine {
         let program_label = Self::program_label_for(program_id);
         static BASE58_RE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"[1-9A-HJ-NP-Za-km-z]{32,44}").unwrap());
-        // Config flag: if true, also log any init-like lines even without 'pool'/'whirlpool' tokens
-        let allow_all_inits = self.cfg.read().log_all_inits;
         
-        // Check if ANY line contains init + pool/whirlpool
-        let has_relevant_init = logs.iter().any(|line| {
+        // Check if ANY line contains POOL init (not just any init like InitializeAccount)
+        let has_pool_init = logs.iter().any(|line| {
             let lower = line.to_ascii_lowercase();
-            (lower.contains("init") || lower.contains("initialize"))
-                && (allow_all_inits || lower.contains("pool") || lower.contains("whirlpool"))
+            // Orca: InitializePoolV2, CreatePool, etc.
+            // Raydium: initialize2, initialize (with "amm" context)
+            if lower.contains("initializepool") 
+                || lower.contains("initializepoolv2")
+                || lower.contains("createpool")
+                || lower.contains("create_pool") {
+                return true;
+            }
+            // Raydium AMM initialize with context
+            if lower.contains("initialize2") || (lower.contains("initialize") && lower.contains("amm")) {
+                return true;
+            }
+            false
         });
         
-        if !has_relevant_init {
+        if !has_pool_init {
             return;
         }
         
-        // Log the init event
+        // Log the pool init event
         if let Some(init_line) = logs.iter().find(|line| {
             let lower = line.to_ascii_lowercase();
-            (lower.contains("init") || lower.contains("initialize"))
-                && (allow_all_inits || lower.contains("pool") || lower.contains("whirlpool"))
+            lower.contains("initializepool") 
+                || lower.contains("createpool")
+                || lower.contains("initialize2")
         }) {
-            debug!(line = %init_line, program=%program_label, "sniper: init-like log detected in transaction");
+            debug!(line = %init_line, program=%program_label, "sniper: POOL init detected in transaction");
         }
         
         // Collect ALL addresses from ALL lines in this transaction logs
@@ -1133,7 +1143,6 @@ impl SniperEngine {
         
         debug!(program=%program_label, address_count=all_addresses.len(), "sniper: found addresses in transaction logs");
         
-        let mut did_log_init = false;
         let mut candidates_to_check: Vec<Pubkey> = Vec::new();
         
         // Check each address - could be pool or mint
@@ -1168,22 +1177,6 @@ impl SniperEngine {
         
         // Now check all candidate mints
         for pk in candidates_to_check {
-            // Diagnostic: log the first init-like occurrence even without classification
-            if allow_all_inits && !did_log_init {
-                self.append_pool_candidate_record(
-                    program_label,
-                    &pk,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    "INIT_ONLY",
-                    "raw_init (diagnostic)",
-                );
-                did_log_init = true;
-            }
             // Run LP concentration check (if thresholds configured)
             match self.lp_lock_check(&pk).await {
                 Ok(Some(assess)) => {
