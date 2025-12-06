@@ -1029,6 +1029,214 @@ impl SniperEngine {
         Ok(())
     }
 
+    /// NEW: Geyser gRPC-based pool discovery (replaces WebSocket logsSubscribe)
+    async fn run_with_geyser(&self, geyser_url: &str) -> Result<()> {
+        use crate::solana::geyser_pool_discovery::{GeyserPoolDiscovery, PoolDiscoveryEvent};
+
+        // Build program list from config (default: Raydium, Orca, Pump.fun)
+        let programs: Vec<Pubkey> = self
+            .cfg
+            .read()
+            .program_ids
+            .clone()
+            .filter(|v| !v.is_empty())
+            .and_then(|ids| {
+                ids.iter()
+                    .filter_map(|s| Pubkey::from_str(s).ok())
+                    .collect::<Vec<_>>()
+                    .into()
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    Pubkey::from_str(RAYDIUM_AMM_V4).unwrap(),
+                    Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap(),
+                    // Pump.fun: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+                    Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap(),
+                ]
+            });
+
+        info!(
+            programs=?programs.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+            "sniper: creating Geyser pool discovery with program filters"
+        );
+
+        // Create Geyser pool discovery listener
+        let (discovery, mut event_rx) = GeyserPoolDiscovery::new(geyser_url, programs).await?;
+
+        // Start Geyser listener in background
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = discovery.start().await {
+                tracing::error!(?e, "geyser pool discovery task failed");
+            }
+        });
+
+        info!("sniper: Geyser pool discovery active, processing events...");
+
+        // Process pool discovery events
+        loop {
+            tokio::select! {
+                Some(event) = event_rx.recv() => {
+                    self.handle_pool_discovery(event).await;
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("sniper: Geyser pool discovery shutting down");
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process a pool discovery event from Geyser
+    async fn handle_pool_discovery(&self, event: PoolDiscoveryEvent) {
+        let program_label = match event.dex_type.as_str() {
+            "Raydium" => "RAYDIUM",
+            "Orca" => "ORCA",
+            "PumpFun" => "PUMPFUN",
+            _ => "UNKNOWN",
+        };
+
+        info!(
+            pool=%event.pool_address,
+            dex=%event.dex_type,
+            base=%event.base_mint,
+            quote=%event.quote_mint,
+            liq_sol=?event.liquidity_sol,
+            "sniper: new pool discovered via Geyser"
+        );
+
+        let mint = match Pubkey::from_str(&event.base_mint) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(?e, base_mint=%event.base_mint, "sniper: invalid base mint pubkey");
+                return;
+            }
+        };
+
+        // Check blacklist
+        if self.cfg.read().blacklist_mints.contains(&event.base_mint) {
+            info!(mint=%mint, "sniper: mint blacklisted");
+            self.append_pool_candidate_record(
+                program_label,
+                &mint,
+                None, None, None, None, None,
+                event.liquidity_sol,
+                "SKIP",
+                "blacklisted",
+            );
+            return;
+        }
+
+        // Check minimum liquidity
+        if let Some(min_liq) = self.cfg.read().min_pool_liquidity_sol {
+            if let Some(liq) = event.liquidity_sol {
+                if liq < min_liq {
+                    info!(mint=%mint, liq_sol=liq, min_liq=min_liq, "sniper: liquidity below threshold");
+                    self.append_pool_candidate_record(
+                        program_label,
+                        &mint,
+                        None, None, None, None, None,
+                        event.liquidity_sol,
+                        "SKIP",
+                        &format!("liquidity {} < {}", liq, min_liq),
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Run LP concentration check
+        let lp_check = match self.lp_lock_check(&mint).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(?e, mint=%mint, "sniper: lp_lock_check failed");
+                self.append_pool_candidate_record(
+                    program_label,
+                    &mint,
+                    None, None, None, None, None,
+                    event.liquidity_sol,
+                    "ERROR",
+                    "lp_check_failed",
+                );
+                return;
+            }
+        };
+
+        info!(
+            mint=%mint,
+            top1=lp_check.top1_pct,
+            top3=lp_check.top3_pct,
+            top5=lp_check.top5_pct,
+            burned=lp_check.burned_pct,
+            program_locked=lp_check.program_locked_pct,
+            "sniper: LP concentration check complete"
+        );
+
+        // Apply filters
+        let cfg = self.cfg.read();
+        if let Some(max_top1) = cfg.max_top1_pct {
+            if lp_check.top1_pct > max_top1 {
+                info!(mint=%mint, top1=lp_check.top1_pct, max=max_top1, "sniper: top1 holder too concentrated");
+                self.append_pool_candidate_record(
+                    program_label,
+                    &mint,
+                    Some(lp_check.top1_pct),
+                    Some(lp_check.top3_pct),
+                    Some(lp_check.top5_pct),
+                    Some(lp_check.burned_pct),
+                    Some(lp_check.program_locked_pct),
+                    event.liquidity_sol,
+                    "SKIP",
+                    &format!("top1 {:.2}% > {:.2}%", lp_check.top1_pct, max_top1),
+                );
+                return;
+            }
+        }
+
+        if let Some(min_burned) = cfg.min_burned_pct {
+            if lp_check.burned_pct < min_burned {
+                info!(mint=%mint, burned=lp_check.burned_pct, min=min_burned, "sniper: insufficient burn");
+                self.append_pool_candidate_record(
+                    program_label,
+                    &mint,
+                    Some(lp_check.top1_pct),
+                    Some(lp_check.top3_pct),
+                    Some(lp_check.top5_pct),
+                    Some(lp_check.burned_pct),
+                    Some(lp_check.program_locked_pct),
+                    event.liquidity_sol,
+                    "SKIP",
+                    &format!("burned {:.2}% < {:.2}%", lp_check.burned_pct, min_burned),
+                );
+                return;
+            }
+        }
+        drop(cfg);
+
+        // All checks passed - attempt buy
+        info!(mint=%mint, "sniper: all filters passed, attempting buy");
+        self.append_pool_candidate_record(
+            program_label,
+            &mint,
+            Some(lp_check.top1_pct),
+            Some(lp_check.top3_pct),
+            Some(lp_check.top5_pct),
+            Some(lp_check.burned_pct),
+            Some(lp_check.program_locked_pct),
+            event.liquidity_sol,
+            "BUY",
+            "filters_passed",
+        );
+
+        if let Err(e) = self.attempt_initial_buy(&mint).await {
+            warn!(?e, mint=%mint, "sniper: initial buy failed");
+        }
+    }
+
     #[allow(dead_code)]
     async fn handle_logs_static(_logs: Vec<String>) {
         // deprecated placeholder
@@ -2012,7 +2220,14 @@ impl SniperEngine {
 
     pub async fn run(&self) -> Result<()> {
         self.try_load_risk_state();
-        self.subscribe_logs().await?;
+        // NEW: Use Geyser gRPC if configured, otherwise fallback to WebSocket
+        if let Some(geyser_url) = &self.rpc.geyser_url {
+            info!(url=%geyser_url, "sniper: using Geyser gRPC for pool discovery");
+            return self.run_with_geyser(geyser_url).await;
+        } else {
+            warn!("sniper: using deprecated WebSocket logsSubscribe (high latency, false positives)");
+            self.subscribe_logs().await?;
+        }
         info!("sniper engine running (skeleton)");
         // Main loop heartbeat (lightweight)
         let mut iv = tokio::time::interval(Duration::from_secs(15));
