@@ -26,38 +26,23 @@ netstat -tuln | grep 10000  # Check if gRPC port is open
 
 ```json
 {
-  "libpath": "/path/to/libyellowstone_grpc_geyser.so",
+  "libpath": "/opt/solana/plugins/libyellowstone_grpc_geyser.so",
   "bind_address": "127.0.0.1:10000",
-  "max_decoding_message_size": 4194304,
-  "channel_capacity": 100000,
-  "filters": {
-    "accounts": {
-      "raydium_pools": {
-        "owner": ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"],
-        "commitment": "processed"
-      },
-      "orca_pools": {
-        "owner": ["whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"],
-        "commitment": "processed"
-      },
-      "pumpfun": {
-        "owner": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"],
-        "commitment": "processed"
-      }
-    },
-    "transactions": {
-      "pool_events": {
-        "mentions": [
-          "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
-          "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
-          "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-        ],
-        "commitment": "processed"
-      }
-    }
-  }
+  "log": {
+    "level": "info"
+  },
+  "grpc": {
+    "max_decoding_message_size": "4_194_304",
+    "channel_capacity": "100_000",
+    "unary_concurrency_limit": 100,
+    "unary_disabled": false
+  },
+  "block_fail_action": "log"
 }
 ```
+
+**Important:** Account filters are set in the **client code**, NOT in this config file!
+The bot's `GeyserListener` handles the subscription filters.
 
 ### Validator Startup Flag:
 

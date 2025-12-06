@@ -52,28 +52,21 @@ Create `/home/ironcrab/geyser-grpc-config.json`:
 {
   "libpath": "/opt/solana/plugins/libyellowstone_grpc_geyser.so",
   "bind_address": "127.0.0.1:10000",
-  "max_decoding_message_size": 4194304,
-  "channel_capacity": 100000,
-  "unary_concurrency_limit": 100,
-  "unary_disabled": false,
-  "filters": {
-    "accounts": {
-      "raydium_amm_v4": {
-        "owner": ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"],
-        "commitment": "processed"
-      },
-      "orca_whirlpool": {
-        "owner": ["whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"],
-        "commitment": "processed"
-      },
-      "pumpfun": {
-        "owner": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"],
-        "commitment": "processed"
-      }
-    }
-  }
+  "log": {
+    "level": "info"
+  },
+  "grpc": {
+    "max_decoding_message_size": "4_194_304",
+    "channel_capacity": "100_000",
+    "unary_concurrency_limit": 100,
+    "unary_disabled": false
+  },
+  "block_fail_action": "log"
 }
 ```
+
+**Note:** Yellowstone Geyser does NOT support account filters in the config file!
+Filters are applied in the **client subscription request** (the bot handles this).
 
 ### Step 3: Add Geyser Flag to Validator
 
