@@ -1090,177 +1090,156 @@ impl SniperEngine {
             Lazy::new(|| Regex::new(r"[1-9A-HJ-NP-Za-km-z]{32,44}").unwrap());
         // Config flag: if true, also log any init-like lines even without 'pool'/'whirlpool' tokens
         let allow_all_inits = self.cfg.read().log_all_inits;
-        for line in logs {
+        
+        // Check if ANY line contains init + pool/whirlpool
+        let has_relevant_init = logs.iter().any(|line| {
             let lower = line.to_ascii_lowercase();
-            if !(lower.contains("init") || lower.contains("initialize")) {
-                continue;
-            }
-            if !(allow_all_inits || lower.contains("pool") || lower.contains("whirlpool")) {
-                continue;
-            }
-            debug!(line = %line, program=%program_label, "sniper: init-like log");
-            
-            // Debug: Show how many addresses we find in this line
-            let addr_count = BASE58_RE.find_iter(&line).count();
-            if addr_count == 0 {
-                debug!(line = %line, "sniper: no base58 addresses found in this log line");
-            } else {
-                debug!(line = %line, addr_count, "sniper: found addresses in log line");
-            }
-            
-            let mut seen = std::collections::HashSet::new();
-            let mut did_log_init = false;
-            let mut candidates_to_check: Vec<Pubkey> = Vec::new();
-
-            for m in BASE58_RE.find_iter(&line) {
+            (lower.contains("init") || lower.contains("initialize"))
+                && (allow_all_inits || lower.contains("pool") || lower.contains("whirlpool"))
+        });
+        
+        if !has_relevant_init {
+            return;
+        }
+        
+        // Log the init event
+        if let Some(init_line) = logs.iter().find(|line| {
+            let lower = line.to_ascii_lowercase();
+            (lower.contains("init") || lower.contains("initialize"))
+                && (allow_all_inits || lower.contains("pool") || lower.contains("whirlpool"))
+        }) {
+            debug!(line = %init_line, program=%program_label, "sniper: init-like log detected in transaction");
+        }
+        
+        // Collect ALL addresses from ALL lines in this transaction logs
+        let mut seen = std::collections::HashSet::new();
+        let mut all_addresses: Vec<Pubkey> = Vec::new();
+        
+        for line in &logs {
+            for m in BASE58_RE.find_iter(line) {
                 let s = m.as_str();
                 if !seen.insert(s) {
                     continue;
                 }
                 if let Ok(pk) = Pubkey::from_str(s) {
-                    debug!(addr=%pk, "sniper: checking address from InitializePoolV2 log");
-                    // First, try to fetch account and check if it's a Whirlpool pool
-                    match self.rpc.get_account_retry(&pk).await {
-                        Ok(acc) => {
-                            debug!(addr=%pk, data_len=acc.data.len(), "sniper: fetched account");
-                            // Check if it's an Orca Whirlpool pool account
-                            if acc.data.len() >= 261 && acc.data.len() <= 1024 {
-                                if let Some(parsed) =
-                                    crate::solana::dex::orca_whirlpool_layout::parse_whirlpool(
-                                        &acc.data,
-                                    )
-                                {
-                                    debug!(pool=%pk, mint_a=%parsed.token_mint_a, mint_b=%parsed.token_mint_b, "sniper: detected Orca pool init, extracting mints");
-                                    // Check both mints from the pool
-                                    candidates_to_check.push(parsed.token_mint_a);
-                                    candidates_to_check.push(parsed.token_mint_b);
-                                    continue; // Skip treating this as a direct mint
-                                } else {
-                                    debug!(addr=%pk, data_len=acc.data.len(), "sniper: account size matches but parse_whirlpool failed");
-                                }
-                            } else {
-                                debug!(addr=%pk, data_len=acc.data.len(), "sniper: account size outside whirlpool range (261-1024)");
-                            }
-                        }
-                        Err(e) => {
-                            debug!(addr=%pk, error=?e, "sniper: failed to fetch account (might not exist yet)");
-                        }
-                    }
-                    // If not a pool, treat as potential mint address
-                    debug!(addr=%pk, "sniper: treating as potential mint address");
-                    candidates_to_check.push(pk);
+                    all_addresses.push(pk);
                 }
             }
-
-            // Now check all candidate mints
-            for pk in candidates_to_check {
-                if let Ok(pk) = Pubkey::from_str(&pk.to_string()) {
-                    if allow_all_inits && !did_log_init {
-                        // Diagnostic: log the first init-like occurrence even without classification
-                        self.append_pool_candidate_record(
-                            program_label,
-                            &pk,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            "INIT_ONLY",
-                            "raw_init (diagnostic)",
-                        );
-                        did_log_init = true;
+        }
+        
+        debug!(program=%program_label, address_count=all_addresses.len(), "sniper: found addresses in transaction logs");
+        
+        let mut did_log_init = false;
+        let mut candidates_to_check: Vec<Pubkey> = Vec::new();
+        
+        // Check each address - could be pool or mint
+        for pk in all_addresses {
+            debug!(addr=%pk, "sniper: checking address from transaction");
+            // First, try to fetch account and check if it's a Whirlpool pool
+            match self.rpc.get_account_retry(&pk).await {
+                Ok(acc) => {
+                    debug!(addr=%pk, data_len=acc.data.len(), "sniper: fetched account");
+                    // Check if it's an Orca Whirlpool pool account
+                    if acc.data.len() >= 261 && acc.data.len() <= 1024 {
+                        if let Some(parsed) =
+                            crate::solana::dex::orca_whirlpool_layout::parse_whirlpool(&acc.data)
+                        {
+                            debug!(pool=%pk, mint_a=%parsed.token_mint_a, mint_b=%parsed.token_mint_b, "sniper: detected Orca pool init, extracting mints");
+                            // Add both mints from the pool to check
+                            candidates_to_check.push(parsed.token_mint_a);
+                            candidates_to_check.push(parsed.token_mint_b);
+                            continue; // Skip treating pool address as mint
+                        }
                     }
-                    // Run LP concentration check (if thresholds configured)
-                    match self.lp_lock_check(&pk).await {
-                        Ok(Some(assess)) => {
-                            let mut liq_sol: Option<f64> = None;
-                            if assess.concentration_ok {
-                                // Attempt liquidity estimation if configured
-                                if self.cfg.read().min_pool_liquidity_sol.is_some() {
-                                    match self.estimate_liquidity_index(&pk).await {
-                                        Ok(v) => liq_sol = v,
-                                        Err(_) => {
-                                            liq_sol = self
-                                                .estimate_liquidity_for_mint(&pk)
-                                                .await
-                                                .ok()
-                                                .flatten();
-                                        }
-                                    }
+                }
+                Err(e) => {
+                    debug!(addr=%pk, error=?e, "sniper: failed to fetch account (might not exist yet or not relevant)");
+                }
+            }
+            // If not identified as pool, treat as potential mint address
+            candidates_to_check.push(pk);
+        }
+        
+        debug!(program=%program_label, mint_candidate_count=candidates_to_check.len(), "sniper: checking mint candidates");
+        
+        // Now check all candidate mints
+        for pk in candidates_to_check {
+            // Diagnostic: log the first init-like occurrence even without classification
+            if allow_all_inits && !did_log_init {
+                self.append_pool_candidate_record(
+                    program_label,
+                    &pk,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "INIT_ONLY",
+                    "raw_init (diagnostic)",
+                );
+                did_log_init = true;
+            }
+            // Run LP concentration check (if thresholds configured)
+            match self.lp_lock_check(&pk).await {
+                Ok(Some(assess)) => {
+                    let mut liq_sol: Option<f64> = None;
+                    if assess.concentration_ok {
+                        // Attempt liquidity estimation if configured
+                        if self.cfg.read().min_pool_liquidity_sol.is_some() {
+                            match self.estimate_liquidity_index(&pk).await {
+                                Ok(v) => liq_sol = v,
+                                Err(_) => {
+                                    liq_sol = self
+                                        .estimate_liquidity_for_mint(&pk)
+                                        .await
+                                        .ok()
+                                        .flatten();
                                 }
-                                let liq_ok = self
-                                    .cfg
-                                    .read()
-                                    .min_pool_liquidity_sol
-                                    .map(|thr| liq_sol.unwrap_or(0.0) >= thr)
-                                    .unwrap_or(true);
-                                if liq_ok {
-                                    let base_buy = self.effective_max_buy_sol();
-                                    if !self.can_open_position_for(&pk, base_buy) {
-                                        // Risk gate blocked
-                                        self.append_pool_candidate_record(
-                                            program_label,
-                                            &pk,
-                                            Some(assess.top1_pct),
-                                            Some(assess.top3_pct),
-                                            Some(assess.top5_pct),
-                                            Some(assess.burned_pct),
-                                            Some(assess.program_vault_pct),
-                                            liq_sol,
-                                            "REJECT_RISK",
-                                            "risk gate blocked",
-                                        );
-                                        debug!(mint=%pk, "sniper: risk gate blocked new position (notional/daily loss)");
-                                        continue;
-                                    }
-                                    if !self.purchased.read().contains(&pk) {
-                                        // Log candidate before attempting buy
-                                        self.append_pool_candidate_record(
-                                            program_label,
-                                            &pk,
-                                            Some(assess.top1_pct),
-                                            Some(assess.top3_pct),
-                                            Some(assess.top5_pct),
-                                            Some(assess.burned_pct),
-                                            Some(assess.program_vault_pct),
-                                            liq_sol,
-                                            "BUY_ATTEMPT",
-                                            "passes concentration+liquidity",
-                                        );
-                                        if let Err(e) = self.attempt_initial_buy(&pk, liq_sol).await
-                                        {
-                                            warn!(mint = %pk, error = ?e, "sniper: initial buy failed");
-                                        }
-                                    } else {
-                                        self.append_pool_candidate_record(
-                                            program_label,
-                                            &pk,
-                                            Some(assess.top1_pct),
-                                            Some(assess.top3_pct),
-                                            Some(assess.top5_pct),
-                                            Some(assess.burned_pct),
-                                            Some(assess.program_vault_pct),
-                                            liq_sol,
-                                            "SKIP_DUPLICATE",
-                                            "already purchased",
-                                        );
-                                        debug!(mint = %pk, "sniper: already purchased, skip");
-                                    }
-                                } else {
-                                    self.append_pool_candidate_record(
-                                        program_label,
-                                        &pk,
-                                        Some(assess.top1_pct),
-                                        Some(assess.top3_pct),
-                                        Some(assess.top5_pct),
-                                        Some(assess.burned_pct),
-                                        Some(assess.program_vault_pct),
-                                        liq_sol,
-                                        "REJECT_LIQUIDITY",
-                                        "below min liquidity",
-                                    );
-                                    debug!(mint = %pk, liq_sol, "sniper: below min liquidity -> no buy");
+                            }
+                        }
+                        let liq_ok = self
+                            .cfg
+                            .read()
+                            .min_pool_liquidity_sol
+                            .map(|thr| liq_sol.unwrap_or(0.0) >= thr)
+                            .unwrap_or(true);
+                        if liq_ok {
+                            let base_buy = self.effective_max_buy_sol();
+                            if !self.can_open_position_for(&pk, base_buy) {
+                                // Risk gate blocked
+                                self.append_pool_candidate_record(
+                                    program_label,
+                                    &pk,
+                                    Some(assess.top1_pct),
+                                    Some(assess.top3_pct),
+                                    Some(assess.top5_pct),
+                                    Some(assess.burned_pct),
+                                    Some(assess.program_vault_pct),
+                                    liq_sol,
+                                    "REJECT_RISK",
+                                    "risk gate blocked",
+                                );
+                                debug!(mint=%pk, "sniper: risk gate blocked new position (notional/daily loss)");
+                                continue;
+                            }
+                            if !self.purchased.read().contains(&pk) {
+                                // Log candidate before attempting buy
+                                self.append_pool_candidate_record(
+                                    program_label,
+                                    &pk,
+                                    Some(assess.top1_pct),
+                                    Some(assess.top3_pct),
+                                    Some(assess.top5_pct),
+                                    Some(assess.burned_pct),
+                                    Some(assess.program_vault_pct),
+                                    liq_sol,
+                                    "BUY_ATTEMPT",
+                                    "passes concentration+liquidity",
+                                );
+                                if let Err(e) = self.attempt_initial_buy(&pk, liq_sol).await
+                                {
+                                    warn!(mint = %pk, error = ?e, "sniper: initial buy failed");
                                 }
                             } else {
                                 self.append_pool_candidate_record(
@@ -1271,20 +1250,48 @@ impl SniperEngine {
                                     Some(assess.top5_pct),
                                     Some(assess.burned_pct),
                                     Some(assess.program_vault_pct),
-                                    None,
-                                    "REJECT_CONCENTRATION",
-                                    "concentration thresholds not met",
+                                    liq_sol,
+                                    "SKIP_DUPLICATE",
+                                    "already purchased",
                                 );
-                                debug!(mint = %pk, top1 = assess.top1_pct, top3 = assess.top3_pct, top5 = assess.top5_pct, "sniper: rejected by concentration");
+                                debug!(mint = %pk, "sniper: already purchased, skip");
                             }
+                        } else {
+                            self.append_pool_candidate_record(
+                                program_label,
+                                &pk,
+                                Some(assess.top1_pct),
+                                Some(assess.top3_pct),
+                                Some(assess.top5_pct),
+                                Some(assess.burned_pct),
+                                Some(assess.program_vault_pct),
+                                liq_sol,
+                                "REJECT_LIQUIDITY",
+                                "below min liquidity",
+                            );
+                            debug!(mint = %pk, liq_sol, "sniper: below min liquidity -> no buy");
                         }
-                        Ok(None) => {
-                            debug!(mint = %pk, "sniper: no lp thresholds configured or insufficient data");
-                        }
-                        Err(e) => {
-                            debug!(mint = %pk, error = ?e, "sniper: lp check error");
-                        }
+                    } else {
+                        self.append_pool_candidate_record(
+                            program_label,
+                            &pk,
+                            Some(assess.top1_pct),
+                            Some(assess.top3_pct),
+                            Some(assess.top5_pct),
+                            Some(assess.burned_pct),
+                            Some(assess.program_vault_pct),
+                            None,
+                            "REJECT_CONCENTRATION",
+                            "concentration thresholds not met",
+                        );
+                        debug!(mint = %pk, top1 = assess.top1_pct, top3 = assess.top3_pct, top5 = assess.top5_pct, "sniper: rejected by concentration");
                     }
+                }
+                Ok(None) => {
+                    debug!(mint = %pk, "sniper: no lp thresholds configured or insufficient data");
+                }
+                Err(e) => {
+                    debug!(mint = %pk, error = ?e, "sniper: lp check error");
                 }
             }
         }
