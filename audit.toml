@@ -1,0 +1,5 @@
+# Cargo audit configuration
+[advisories]
+ignore = [
+    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained - acceptable for now
+]
