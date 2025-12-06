@@ -5,7 +5,7 @@
 use crate::types::{fee_vaults, FeeBreakdown};
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::{
-    EncodedConfirmedTransactionWithStatusMeta, UiTransactionTokenBalance, UiTransactionStatusMeta,
+    EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding, UiTransactionTokenBalance,
 };
 use std::str::FromStr;
 
@@ -21,7 +21,8 @@ pub fn parse_fee_breakdown(
         breakdown.network_fee_lamports = meta.fee;
 
         // 2. Extract compute units consumed for overhead calculation
-        if let Some(compute_units) = meta.compute_units_consumed.as_ref() {
+        // OptionSerializer in Solana SDK 3.x: convert to Option with .into()
+        if let Some(compute_units) = Option::<u64>::from(meta.compute_units_consumed) {
             // Approximate compute overhead: compute_units * priority_fee_per_unit
             // Note: Priority fee is embedded in total fee, this is an approximation
             // Heuristic: ~5000 micro lamports per CU for typical priority
@@ -30,13 +31,13 @@ pub fn parse_fee_breakdown(
         }
 
         // 3. Parse token balance changes for protocol fee attribution
-        if let (Some(pre_balances), Some(post_balances)) = (
-            meta.pre_token_balances.as_ref(),
-            meta.post_token_balances.as_ref(),
-        ) {
+        let pre_balances_opt = Option::<Vec<UiTransactionTokenBalance>>::from(meta.pre_token_balances.clone());
+        let post_balances_opt = Option::<Vec<UiTransactionTokenBalance>>::from(meta.post_token_balances.clone());
+        
+        if let (Some(pre_balances), Some(post_balances)) = (pre_balances_opt, post_balances_opt) {
             breakdown.protocol_fee_total_sol_micro += parse_protocol_fees_from_balances(
-                pre_balances,
-                post_balances,
+                &pre_balances,
+                &post_balances,
                 treasury_owner,
                 &mut breakdown,
             )?;
@@ -66,15 +67,15 @@ fn parse_protocol_fees_from_balances(
     for pre in pre_balances {
         if let Some(post) = post_by_account.get(&(pre.account_index as usize)) {
             // Parse owner from pre/post if available
-            // In Solana SDK 3.x, owner is OptionSerializer<String>, access via as_ref()
-            let pre_owner_opt = pre.owner.as_ref();
-            let post_owner_opt = post.owner.as_ref();
+            // In Solana SDK 3.x, owner is OptionSerializer<String>, convert to Option
+            let pre_owner_opt = Option::<String>::from(pre.owner.clone());
+            let post_owner_opt = Option::<String>::from(post.owner.clone());
             
             if let (Some(pre_owner_str), Some(post_owner_str)) = (pre_owner_opt, post_owner_opt) {
                 // Try to parse owner pubkeys
                 if let (Ok(pre_owner), Ok(post_owner)) = (
-                    Pubkey::from_str(pre_owner_str),
-                    Pubkey::from_str(post_owner_str),
+                    Pubkey::from_str(&pre_owner_str),
+                    Pubkey::from_str(&post_owner_str),
                 ) {
                     // Skip treasury accounts (those are our trades)
                     if pre_owner == *treasury_owner || post_owner == *treasury_owner {

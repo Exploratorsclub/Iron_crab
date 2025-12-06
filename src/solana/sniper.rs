@@ -2435,47 +2435,9 @@ impl SniperEngine {
                         );
                     }
                     
-                    // Extended fee breakdown: parse transaction metadata for detailed attribution
-                    let mut dex_fee_breakdown_str = String::new();
-                    if let Ok(breakdown) = tx_fee_parser::parse_fee_breakdown(
-                        &tx_meta,
-                        &self.treasury.pubkey(),
-                    ) {
-                        // Update DEX-specific metrics
-                        if breakdown.raydium_protocol_fee_sol_micro > 0 {
-                            RAYDIUM_PROTOCOL_FEE_SOL_MICRO_TOTAL.fetch_add(
-                                breakdown.raydium_protocol_fee_sol_micro,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                        if breakdown.orca_protocol_fee_sol_micro > 0 {
-                            ORCA_PROTOCOL_FEE_SOL_MICRO_TOTAL.fetch_add(
-                                breakdown.orca_protocol_fee_sol_micro,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                        if breakdown.referrer_fee_sol_micro > 0 {
-                            REFERRER_FEE_SOL_MICRO_TOTAL.fetch_add(
-                                breakdown.referrer_fee_sol_micro,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                        if breakdown.compute_overhead_sol_micro > 0 {
-                            COMPUTE_OVERHEAD_SOL_MICRO_TOTAL.fetch_add(
-                                breakdown.compute_overhead_sol_micro,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                        
-                        // Format for CSV log
-                        dex_fee_breakdown_str = format!(
-                            "raydium_fee={:.9};orca_fee={:.9};referrer_fee={:.9};compute_overhead={:.9}",
-                            breakdown.raydium_protocol_fee_sol_micro as f64 / 1_000_000.0,
-                            breakdown.orca_protocol_fee_sol_micro as f64 / 1_000_000.0,
-                            breakdown.referrer_fee_sol_micro as f64 / 1_000_000.0,
-                            breakdown.compute_overhead_sol_micro as f64 / 1_000_000.0,
-                        );
-                    }
+                    // Note: Extended fee breakdown (DEX-specific vaults) would require transaction metadata
+                    // which is not available at this point. Fee breakdown can be done via separate RPC call
+                    // using tx_fee_parser::fetch_and_parse_fee_breakdown() if needed.
                     
                     record_shortfall(shortfall, shortfall_sol);
                     let line = format!(

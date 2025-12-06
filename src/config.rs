@@ -279,6 +279,17 @@ pub struct SniperSettings {
     pub log_retention_days: Option<u32>, // Anzahl Tage für Log-Aufbewahrung (default: 30)
     #[serde(default)]
     pub log_cleanup_interval_hours: Option<u32>, // Cleanup-Intervall in Stunden (default: 24)
+    // Quantile-based slippage (statistical learning)
+    #[serde(default)]
+    pub quantile_slippage_enabled: Option<bool>, // Enable quantile-based min_out calculation
+    #[serde(default)]
+    pub quantile_confidence_level: Option<f64>, // P95 = 0.95 (95th percentile)
+    #[serde(default)]
+    pub quantile_min_samples: Option<usize>, // Minimum historical fills before using quantile
+    #[serde(default)]
+    pub quantile_max_sample_age_secs: Option<u64>, // Maximum age of samples in seconds
+    #[serde(default)]
+    pub quantile_fallback_slippage_bps: Option<u32>, // Fallback slippage when insufficient data
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
