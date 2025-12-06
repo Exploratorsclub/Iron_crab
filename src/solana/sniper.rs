@@ -1138,11 +1138,17 @@ impl SniperEngine {
                 if !seen.insert(s) {
                     continue;
                 }
-                // Validate: must be exactly 32 or 44 characters (typical Pubkey base58 lengths)
-                // AND must decode to valid Pubkey
-                if s.len() >= 43 && s.len() <= 44 {
+                // Strict validation: must be exactly 44 chars AND decode to valid 32-byte Pubkey
+                if s.len() == 44 {
                     if let Ok(pk) = Pubkey::from_str(s) {
-                        all_addresses.push(pk);
+                        // Additional check: verify it's not all zeros or invalid patterns
+                        let bytes = pk.to_bytes();
+                        let all_zeros = bytes.iter().all(|&b| b == 0);
+                        let mostly_zeros = bytes.iter().filter(|&&b| b == 0).count() > 28;
+                        
+                        if !all_zeros && !mostly_zeros {
+                            all_addresses.push(pk);
+                        }
                     }
                 }
             }
