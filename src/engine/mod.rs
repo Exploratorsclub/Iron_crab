@@ -605,54 +605,68 @@ impl Engine {
 
                 tracing::info!(
                     interval_ms = interval_ms,
-                    "arbitrage_task: EVENT-DRIVEN mode enabled - listening for pool updates"
+                    "arbitrage_task: EVENT-DRIVEN mode with batching enabled"
                 );
 
-                // Debouncing: scan after pool update burst settles
-                let mut last_scan = tokio::time::Instant::now();
-                let min_scan_interval = tokio::time::Duration::from_millis(interval_ms);
-
+                // Batching: collect events for interval_ms, then scan once
+                let batch_interval = tokio::time::Duration::from_millis(interval_ms);
                 let mut loop_count = 0u64;
 
                 loop {
-                    // Wait for pool update event OR timeout for periodic scans
-                    let event_received = tokio::select! {
-                        recv_result = pool_updates.recv() => Some(recv_result),
-                        _ = tokio::time::sleep(min_scan_interval) => None,
-                    };
+                    let batch_start = tokio::time::Instant::now();
+                    let mut events_in_batch = 0usize;
+                    
+                    // Collect events for batch_interval duration
+                    loop {
+                        let remaining = batch_interval.saturating_sub(batch_start.elapsed());
+                        if remaining.is_zero() {
+                            break;
+                        }
 
-                    match event_received {
-                        Some(Ok(_event)) => {
-                            // Pool update received - debounce if we just scanned
-                            if last_scan.elapsed() < min_scan_interval {
-                                continue;
+                        let event_received = tokio::select! {
+                            recv_result = pool_updates.recv() => Some(recv_result),
+                            _ = tokio::time::sleep(remaining) => None,
+                        };
+
+                        match event_received {
+                            Some(Ok(_event)) => {
+                                events_in_batch += 1;
+                                // Continue collecting events until batch interval elapsed
                             }
+                            Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                                tracing::debug!(
+                                    skipped_events = skipped,
+                                    "arbitrage_task: buffer lagged (normal during high activity)"
+                                );
+                                events_in_batch += skipped;
+                                break; // Scan immediately after lag
+                            }
+                            None => {
+                                // Batch interval elapsed
+                                break;
+                            }
+                            _ => continue,
                         }
-                        Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
-                            tracing::warn!(
-                                skipped_events = skipped,
-                                "arbitrage_task: pool update buffer overflowed - scanning immediately"
-                            );
-                        }
-                        None => {
-                            // Timeout reached - periodic scan
-                        }
-                        _ => continue,
                     }
 
-                    // Execute scan
-                    last_scan = tokio::time::Instant::now();
+                    // Execute scan if we received events or it's time for periodic scan
                     loop_count += 1;
 
                     if loop_count % 10 == 0 {
                         tracing::info!(
                             loop_iteration = loop_count,
-                            "arbitrage_task: cycle scan iteration"
+                            events_in_batch = events_in_batch,
+                            "arbitrage_task: batch scan iteration"
+                        );
+                    } else {
+                        tracing::debug!(
+                            events_in_batch = events_in_batch,
+                            "arbitrage_task: processing event batch"
                         );
                     }
 
                     // Refresh pools from DEX connectors
-                    // NOTE: This is fast now (reads from cached data updated by WebSocket)
+                    // NOTE: Pools updated via Geyser/WebSocket events in background
                     let refresh_start = tokio::time::Instant::now();
                     let _ = ray.refresh_pools().await;
                     let _ = orc.refresh_pools().await;
