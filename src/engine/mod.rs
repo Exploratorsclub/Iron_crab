@@ -602,6 +602,7 @@ impl Engine {
                         while let Ok(_ws_event) = rx.recv().await {
                             let _ = update_tx.send(());
                         }
+                    });
                 }
 
                 tracing::info!(
