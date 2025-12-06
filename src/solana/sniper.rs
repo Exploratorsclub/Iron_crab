@@ -1955,7 +1955,7 @@ impl SniperEngine {
         }
         // If Raydium was chosen but we couldn't assemble a full instruction, abort Raydium path and try Orca below.
         if used_raydium && final_ixs.is_empty() {
-            tracing::info!(mint=%mint, "raydium full instruction unavailable; falling back to orca/pseudo plan");
+            warn!(mint=%mint, "raydium full instruction unavailable (missing serum accounts); falling back to orca/pseudo plan");
             used_raydium = false;
         }
         // Re-Quote unmittelbar vor Signatur: aktualisiere min_out/Route
@@ -2157,7 +2157,7 @@ impl SniperEngine {
                 ) {
                     Ok(ixs) => ixs,
                     Err(e) => {
-                        debug!(?e, mint=%mint, "orca build_swap_ix failed");
+                        warn!(?e, mint=%mint, "orca build_swap_ix failed");
                         Vec::new()
                     }
                 }
@@ -2166,7 +2166,7 @@ impl SniperEngine {
             }
         };
         if tx_ixs.is_empty() {
-            debug!(mint=%mint, "no swap instructions built");
+            warn!(mint=%mint, "no swap instructions built - neither raydium nor orca route available");
             return Ok(());
         }
         // Prepare message for fee estimate before signing
