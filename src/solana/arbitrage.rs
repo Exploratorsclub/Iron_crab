@@ -668,7 +668,7 @@ impl ArbitrageEngine {
                                 pair = %format!("{} -> {}", base, mid1),
                                 "arbitrage: slippage estimation failed, using conservative fallback"
                             );
-                            (50, 20.0)
+                            (50, 5.0)
                         }
                     };
 
@@ -683,7 +683,7 @@ impl ArbitrageEngine {
                                 pair = %format!("{} -> {}", mid1, mid2),
                                 "arbitrage: slippage estimation failed, using conservative fallback"
                             );
-                            (50, 20.0)
+                            (50, 5.0)
                         }
                     };
 
@@ -698,12 +698,17 @@ impl ArbitrageEngine {
                                 pair = %format!("{} -> {}", mid2, base),
                                 "arbitrage: slippage estimation failed, using conservative fallback"
                             );
-                            (50, 20.0)
+                            (50, 5.0)
                         }
                     };
 
-                    // Calculate cumulative slippage and minimum safe amount
-                    let total_slippage_pct = slip_1 + slip_2 + slip_3;
+                    // Calculate cumulative slippage using multiplicative compounding (NOT additive)
+                    // If each leg loses X%, total = 1 - (1-slip1/100)*(1-slip2/100)*(1-slip3/100)
+                    let slip_factor_1 = (100.0 - slip_1) / 100.0;
+                    let slip_factor_2 = (100.0 - slip_2) / 100.0;
+                    let slip_factor_3 = (100.0 - slip_3) / 100.0;
+                    let combined_factor = slip_factor_1 * slip_factor_2 * slip_factor_3;
+                    let total_slippage_pct = (1.0 - combined_factor) * 100.0;
                     let safe_amount_pct = safe_pct_1.min(safe_pct_2).min(safe_pct_3);
 
                     // DESIGN FIX: Apply safe_amount_pct to dynamically reduce trade size
