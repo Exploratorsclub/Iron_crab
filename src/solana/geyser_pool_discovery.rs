@@ -6,8 +6,9 @@ use crate::solana::rpc::SolanaRpc;
 use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
+use std::str::FromStr;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Pool discovery via Geyser account updates
 pub struct GeyserPoolDiscovery {
@@ -213,7 +214,8 @@ impl GeyserPoolDiscovery {
         let base_mint = Pubkey::new_from_array(data[40..72].try_into().ok()?);
         
         // Quote mint is always SOL for Pump.fun
-        let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
+        let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+            .unwrap_or_else(|_| Pubkey::new_from_array([0u8; 32]));
 
         // Sanity checks
         if base_mint.to_bytes() == [0u8; 32] {

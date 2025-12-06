@@ -1269,7 +1269,7 @@ impl SniperEngine {
         let coin_balance = rpc.rpc.get_token_account_balance(coin_vault).await?;
         let pc_balance = rpc.rpc.get_token_account_balance(pc_vault).await?;
 
-        let coin_amount: u64 = coin_balance.amount.parse()
+        let _coin_amount: u64 = coin_balance.amount.parse()
             .map_err(|e| anyhow::anyhow!("parse coin balance: {}", e))?;
         let pc_amount: u64 = pc_balance.amount.parse()
             .map_err(|e| anyhow::anyhow!("parse pc balance: {}", e))?;
