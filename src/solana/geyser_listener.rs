@@ -97,7 +97,7 @@ impl GeyserListener {
         };
 
         // Subscribe and process stream
-        let (_, mut stream) = client
+        let mut stream = client
             .subscribe_once(request)
             .await
             .map_err(|e| anyhow!("Failed to subscribe: {}", e))?;

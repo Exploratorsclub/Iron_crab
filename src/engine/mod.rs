@@ -544,7 +544,7 @@ impl Engine {
                 let (update_tx, mut pool_updates) = tokio::sync::broadcast::channel(50000);
 
                 // Use Geyser gRPC if configured, otherwise fall back to WebSocket
-                let geyser_url = arb_cfg.solana.geyser_grpc_url.clone();
+                let geyser_url = ctx_arb.cfg.solana.geyser_grpc_url.clone();
 
                 if let Some(geyser_endpoint) = geyser_url {
                     // Use Geyser gRPC for <10ms latency
