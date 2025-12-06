@@ -3,10 +3,9 @@
 //! Extracts protocol fees, referrer fees, and compute overhead from transaction metadata.
 
 use crate::types::{fee_vaults, FeeBreakdown};
-use solana_client::rpc_response::{RpcConfirmedTransactionStatusWithSignature, UiTransactionEncoding};
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::{
-    EncodedConfirmedTransactionWithStatusMeta, UiTransactionTokenBalance,
+    EncodedConfirmedTransactionWithStatusMeta, UiTransactionTokenBalance, UiTransactionStatusMeta,
 };
 use std::str::FromStr;
 
@@ -22,7 +21,7 @@ pub fn parse_fee_breakdown(
         breakdown.network_fee_lamports = meta.fee;
 
         // 2. Extract compute units consumed for overhead calculation
-        if let Some(compute_units) = meta.compute_units_consumed {
+        if let Some(compute_units) = meta.compute_units_consumed.as_ref() {
             // Approximate compute overhead: compute_units * priority_fee_per_unit
             // Note: Priority fee is embedded in total fee, this is an approximation
             // Heuristic: ~5000 micro lamports per CU for typical priority
@@ -32,8 +31,8 @@ pub fn parse_fee_breakdown(
 
         // 3. Parse token balance changes for protocol fee attribution
         if let (Some(pre_balances), Some(post_balances)) = (
-            &meta.pre_token_balances,
-            &meta.post_token_balances,
+            meta.pre_token_balances.as_ref(),
+            meta.post_token_balances.as_ref(),
         ) {
             breakdown.protocol_fee_total_sol_micro += parse_protocol_fees_from_balances(
                 pre_balances,
@@ -67,7 +66,11 @@ fn parse_protocol_fees_from_balances(
     for pre in pre_balances {
         if let Some(post) = post_by_account.get(&(pre.account_index as usize)) {
             // Parse owner from pre/post if available
-            if let (Some(pre_owner_str), Some(post_owner_str)) = (&pre.owner, &post.owner) {
+            // In Solana SDK 3.x, owner is OptionSerializer<String>, access via as_ref()
+            let pre_owner_opt = pre.owner.as_ref();
+            let post_owner_opt = post.owner.as_ref();
+            
+            if let (Some(pre_owner_str), Some(post_owner_str)) = (pre_owner_opt, post_owner_opt) {
                 // Try to parse owner pubkeys
                 if let (Ok(pre_owner), Ok(post_owner)) = (
                     Pubkey::from_str(pre_owner_str),

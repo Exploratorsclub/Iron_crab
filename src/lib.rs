@@ -5,6 +5,7 @@ pub mod config_reload;
 pub mod engine;
 pub mod log_manager;
 pub mod metrics;
+pub mod quantile_impact;
 pub mod solana;
 pub mod tx_fee_parser;
 pub mod types;

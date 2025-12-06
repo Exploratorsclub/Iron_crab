@@ -90,7 +90,15 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 	- [x] Cooldown pro Mint nach SL Exit (Konfig `stop_loss_cooldown_secs`)
 	- [x] Dynamischer Size-Scaler (Drawdown Adjust: `drawdown_scale_start`, `drawdown_max_reduction`)
 11. Sniper: Orca Pools in Index-Liquidität aufnehmen – DONE (Snapshot integriert)
-12. Sniper: Verbesserte min_out Berechnung für Raydium & Orca (quantile impact) – PARTIAL (Orca basic slippage, quantile TODO)
+12. Sniper: Verbesserte min_out Berechnung für Raydium & Orca (quantile impact) – DONE (P95/P99 statistical learning implemented)
+	- [x] Quantile calculator module with historical observation tracking
+	- [x] Per-pool learning with size-aware categorization (Small/Medium/Large)
+	- [x] Percentile-based min_out calculation (P95/P99 configurable)
+	- [x] Orca buy/sell integration with `compute_min_out()` helper
+	- [x] Fill observation recording in transaction reconciliation
+	- [x] Config options with adaptive slippage fallback
+	- [x] Export/import for persistence across restarts
+	- [x] Config example in `config.example.toml`
 
 ### Neue Folge-Themen
 - Persistenz: Speichern offener Positionen & Tages-PnL in lokaler DB (sled oder sqlite)

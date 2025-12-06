@@ -105,6 +105,17 @@ adaptive_slippage_window = 20         # Window for adaptive slippage calculation
 adaptive_slippage_target_pct = 0.002  # Target shortfall percentage (0.2%)
 adaptive_slippage_step_bps = 5        # Slippage adjustment step size
 
+# Quantile-Based Slippage (Statistical Learning)
+# Instead of fixed slippage percentages, learns from historical fills per pool
+# and uses statistical confidence levels (e.g., P95 = 95% of trades should succeed)
+quantile_slippage_enabled = false            # Set true to enable quantile-based min_out
+quantile_confidence_level = 0.95             # P95 (95th percentile) - most conservative
+quantile_min_samples = 20                    # Minimum historical fills before using quantile
+quantile_max_sample_age_secs = 86400        # Only use fills from last 24 hours
+quantile_fallback_slippage_bps = 100        # Fallback to 1% if insufficient data
+# Note: When enabled, replaces adaptive_slippage_bps with pool-specific learned values
+# Each pool learns its own shortfall distribution independently
+
 # Pricing & Oracles
 oracle_preference = "override"        # Use override price for SOL/USD
 oracle_sol_usd_override = 100.0       # Fixed SOL/USD price (update for current market)

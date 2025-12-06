@@ -81,6 +81,12 @@ pub struct SniperCfg {
     pub oracle_pyth_sol_usd: Option<String>,
     pub oracle_switchboard_sol_usd: Option<String>,
     pub oracle_preference: Option<String>,
+    // Quantile-based slippage
+    pub quantile_slippage_enabled: Option<bool>,
+    pub quantile_confidence_level: Option<f64>,
+    pub quantile_min_samples: Option<usize>,
+    pub quantile_max_sample_age_secs: Option<u64>,
+    pub quantile_fallback_slippage_bps: Option<u32>,
 }
 
 impl Default for SniperCfg {
@@ -123,6 +129,11 @@ impl Default for SniperCfg {
             oracle_pyth_sol_usd: None,
             oracle_switchboard_sol_usd: None,
             oracle_preference: None,
+            quantile_slippage_enabled: None,
+            quantile_confidence_level: None,
+            quantile_min_samples: None,
+            quantile_max_sample_age_secs: None,
+            quantile_fallback_slippage_bps: None,
         }
     }
 }
@@ -167,6 +178,11 @@ impl From<&crate::config::SniperSettings> for SniperCfg {
             oracle_pyth_sol_usd: c.oracle_pyth_sol_usd.clone(),
             oracle_switchboard_sol_usd: c.oracle_switchboard_sol_usd.clone(),
             oracle_preference: c.oracle_preference.clone(),
+            quantile_slippage_enabled: c.quantile_slippage_enabled,
+            quantile_confidence_level: c.quantile_confidence_level,
+            quantile_min_samples: c.quantile_min_samples,
+            quantile_max_sample_age_secs: c.quantile_max_sample_age_secs,
+            quantile_fallback_slippage_bps: c.quantile_fallback_slippage_bps,
         }
     }
 }
@@ -337,6 +353,7 @@ pub struct SniperEngine {
     risk: parking_lot::RwLock<RiskState>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    quantile_calc: Arc<crate::quantile_impact::QuantileImpactCalculator>,
 }
 
 // --- Test Helpers (feature-gated) -----------------------------------------------------------
@@ -561,6 +578,39 @@ impl SniperEngine {
         };
         cur.clamp(min_b, max_b)
     }
+    
+    /// Compute min_out using quantile-based slippage if enabled, otherwise use adaptive slippage
+    fn compute_min_out(&self, pool_id: &str, expected_out: u64, amount_in: u64, pool_liquidity: u128) -> u64 {
+        let cfg = self.cfg.read();
+        
+        // Check if quantile slippage is enabled
+        if cfg.quantile_slippage_enabled.unwrap_or(false) {
+            // Determine size category based on trade size vs pool liquidity
+            let size_category = if pool_liquidity > 0 {
+                let trade_pct = (amount_in as f64 / pool_liquidity as f64) * 100.0;
+                if trade_pct < 1.0 {
+                    crate::quantile_impact::SizeCategory::Small
+                } else if trade_pct < 5.0 {
+                    crate::quantile_impact::SizeCategory::Medium
+                } else {
+                    crate::quantile_impact::SizeCategory::Large
+                }
+            } else {
+                crate::quantile_impact::SizeCategory::Small
+            };
+            
+            // Try quantile-based calculation
+            if let Ok(min_out) = self.quantile_calc.compute_min_out(pool_id, expected_out, size_category) {
+                return min_out;
+            }
+        }
+        
+        // Fallback to adaptive slippage
+        let slip = self.adaptive_slippage_bps() as u128;
+        let min_out = ((expected_out as u128) * (10_000 - slip) / 10_000) as u64;
+        min_out.max(1)
+    }
+    
     async fn rpc_retry_tx(
         &self,
         tx: &Transaction,
@@ -655,6 +705,16 @@ impl SniperEngine {
         treasury: Arc<Treasury>,
     ) -> Self {
         let (tx, rx) = tokio::sync::watch::channel(false);
+        
+        // Initialize quantile calculator with config
+        let quantile_config = crate::quantile_impact::QuantileConfig {
+            confidence_level: cfg.quantile_confidence_level.unwrap_or(0.95),
+            min_samples: cfg.quantile_min_samples.unwrap_or(20),
+            max_sample_age_secs: cfg.quantile_max_sample_age_secs.unwrap_or(86400),
+            max_samples_per_pool: 500,
+            fallback_slippage_bps: cfg.quantile_fallback_slippage_bps.unwrap_or(100),
+        };
+        
         Self {
             rpc,
             cfg: parking_lot::RwLock::new(cfg),
@@ -665,6 +725,7 @@ impl SniperEngine {
             risk: parking_lot::RwLock::new(RiskState::default()),
             shutdown_tx: tx,
             shutdown_rx: rx,
+            quantile_calc: Arc::new(crate::quantile_impact::QuantileImpactCalculator::new(quantile_config)),
         }
     }
 
@@ -680,6 +741,7 @@ impl SniperEngine {
             risk: parking_lot::RwLock::new(RiskState::default()),
             shutdown_tx: tx,
             shutdown_rx: rx,
+            quantile_calc: self.quantile_calc.clone(),
         }
     }
 
@@ -1662,8 +1724,11 @@ impl SniperEngine {
                     .quote_exact_in(&sol_mint.to_string(), &mint.to_string(), lamports_in)
                     .await
                 {
-                    let slip = self.adaptive_slippage_bps() as u128;
-                    min_out_orca = ((q.amount_out as u128) * (10_000 - slip) / 10_000) as u64;
+                    // Use quantile-based min_out if enabled, otherwise adaptive slippage
+                    let pool_id = format!("orca_{}_{}", sol_mint, mint);
+                    // Estimate pool liquidity from quote (if available) or use conservative default
+                    let pool_liquidity = 100_000_000_000u128; // 100 SOL equivalent as default
+                    min_out_orca = self.compute_min_out(&pool_id, q.amount_out, lamports_in, pool_liquidity);
                     if min_out_orca == 0 {
                         min_out_orca = 1;
                     }
@@ -1733,8 +1798,10 @@ impl SniperEngine {
                     .quote_exact_in(&sol_mint.to_string(), &mint.to_string(), lamports_in)
                     .await
                 {
-                    let slip = self.cfg.read().max_slippage_bps as u128;
-                    min_out_orca = ((q.amount_out as u128) * (10_000 - slip) / 10_000) as u64;
+                    // Use quantile-based min_out if enabled, otherwise adaptive slippage
+                    let pool_id = format!("orca_{}_{}", sol_mint, mint);
+                    let pool_liquidity = 100_000_000_000u128; // 100 SOL equivalent as default
+                    min_out_orca = self.compute_min_out(&pool_id, q.amount_out, lamports_in, pool_liquidity);
                     if min_out_orca == 0 {
                         min_out_orca = 1;
                     }
@@ -2266,6 +2333,30 @@ impl SniperEngine {
                     let expected_safe = expected_raw.max(1) as f64;
                     let observed_slip = (shortfall as f64 / expected_safe).max(0.0);
                     record_shortfall_pct(observed_slip);
+                    
+                    // Record fill observation for quantile calculator
+                    if self.cfg.read().quantile_slippage_enabled.unwrap_or(false) {
+                        // Determine pool ID (use DEX + mint pair as identifier)
+                        let pool_id = format!("{}_{}", pend.dex, mint);
+                        
+                        // Determine size category (approximate from invested lamports)
+                        let size_category = if pend.lamports_in < 1_000_000_000 {
+                            crate::quantile_impact::SizeCategory::Small
+                        } else if pend.lamports_in < 5_000_000_000 {
+                            crate::quantile_impact::SizeCategory::Medium
+                        } else {
+                            crate::quantile_impact::SizeCategory::Large
+                        };
+                        
+                        self.quantile_calc.record_fill(
+                            pool_id,
+                            expected_raw,
+                            actual_raw,
+                            size_category,
+                        );
+                    }
+                    // Note: tx_meta not available here; fee breakdown handled separately
+                    
                     {
                         let mut rs = self.risk.write();
                         // Maintain rolling window
@@ -2771,8 +2862,10 @@ impl SniperEngine {
                     .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), sell_tokens)
                     .await
                 {
-                    let msb3 = self.adaptive_slippage_bps() as u128;
-                    min_out = ((q.amount_out as u128) * (10_000 - msb3) / 10_000) as u64;
+                    // Use quantile-based min_out if enabled, otherwise adaptive slippage
+                    let pool_id = format!("orca_{}_{}", mint, sol_mint);
+                    let pool_liquidity = 100_000_000_000u128; // 100 SOL equivalent as default
+                    min_out = self.compute_min_out(&pool_id, q.amount_out, sell_tokens, pool_liquidity);
                     if min_out == 0 {
                         min_out = 1;
                     }

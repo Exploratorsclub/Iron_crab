@@ -638,7 +638,7 @@ impl Engine {
                                     skipped_events = skipped,
                                     "arbitrage_task: buffer lagged (normal during high activity)"
                                 );
-                                events_in_batch += skipped;
+                                events_in_batch += skipped as usize;
                                 break; // Scan immediately after lag
                             }
                             None => {
