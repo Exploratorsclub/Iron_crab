@@ -2,6 +2,7 @@
 //! Uses Agave 3.0's native Geyser integration for <10ms latency
 
 use anyhow::{anyhow, Result};
+use futures::StreamExt;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use tokio::sync::broadcast;
@@ -110,7 +111,7 @@ impl GeyserListener {
         let mut update_count = 0u64;
 
         // Process incoming updates
-        while let Some(message) = stream.recv().await {
+        while let Some(message) = stream.next().await {
             match message {
                 Ok(msg) => {
                     if let Some(update) = msg.update_oneof {
