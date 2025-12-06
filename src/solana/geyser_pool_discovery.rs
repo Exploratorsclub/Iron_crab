@@ -178,6 +178,16 @@ pub enum DexType {
     PumpFun,
 }
 
+impl std::fmt::Display for DexType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DexType::RaydiumAmmV4 => write!(f, "Raydium"),
+            DexType::OrcaWhirlpool => write!(f, "Orca"),
+            DexType::PumpFun => write!(f, "PumpFun"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PoolDiscoveryEvent {
     pub pool_address: Pubkey,
