@@ -1121,8 +1121,12 @@ impl SniperEngine {
                 if !seen.insert(s) {
                     continue;
                 }
-                if let Ok(pk) = Pubkey::from_str(s) {
-                    all_addresses.push(pk);
+                // Validate: must be exactly 32 or 44 characters (typical Pubkey base58 lengths)
+                // AND must decode to valid Pubkey
+                if s.len() >= 43 && s.len() <= 44 {
+                    if let Ok(pk) = Pubkey::from_str(s) {
+                        all_addresses.push(pk);
+                    }
                 }
             }
         }
