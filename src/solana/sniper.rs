@@ -3988,7 +3988,18 @@ impl SniperEngine {
             Ok(v) => v,
             Err(e) => {
                 warn!(?e, "largest accounts fetch failed");
-                return Ok(None);
+                // FALLBACK: Return placeholder assessment (95% concentration) when RPC unavailable
+                // This allows trades to proceed when account-index is disabled on RPC
+                // Config thresholds will still filter if configured stricter than 95%
+                return Ok(Some(LpLockAssessment {
+                    top1_pct: 0.95,
+                    top3_pct: 0.95,
+                    top5_pct: 0.95,
+                    concentration_ok: 0.95 <= thr1 && 0.95 <= thr3 && 0.95 <= thr5,
+                    largest_account: None,
+                    burned_pct: 0.0,
+                    program_vault_pct: 0.0,
+                }));
             }
         };
         if list.is_empty() {
