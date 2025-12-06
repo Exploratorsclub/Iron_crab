@@ -426,9 +426,10 @@ impl Treasury {
                 },
             ],
             data: {
-                let mut d = Vec::with_capacity(1 + 8);
-                d.push(2u8);
-                d.extend_from_slice(&lamports.to_le_bytes());
+                // System Program Transfer instruction: u32 discriminator (2) + u64 lamports
+                let mut d = Vec::with_capacity(4 + 8);
+                d.extend_from_slice(&2u32.to_le_bytes()); // Transfer discriminator
+                d.extend_from_slice(&lamports.to_le_bytes()); // Amount
                 d
             },
         };
