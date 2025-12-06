@@ -1094,6 +1094,7 @@ impl SniperEngine {
             let lower = line.to_ascii_lowercase();
             // Orca: InitializePoolV2, CreatePool, etc.
             // Raydium: initialize2, initialize (with "amm" context)
+            // Pump.fun: create (token launch event)
             if lower.contains("initializepool") 
                 || lower.contains("initializepoolv2")
                 || lower.contains("createpool")
@@ -1102,6 +1103,11 @@ impl SniperEngine {
             }
             // Raydium AMM initialize with context
             if lower.contains("initialize2") || (lower.contains("initialize") && lower.contains("amm")) {
+                return true;
+            }
+            // Pump.fun: "Program log: Instruction: Create" or "create" events
+            if (lower.contains("instruction:") && lower.contains("create")) 
+                || lower.contains("program invoke") && lower.contains("create") {
                 return true;
             }
             false
@@ -1117,6 +1123,7 @@ impl SniperEngine {
             lower.contains("initializepool") 
                 || lower.contains("createpool")
                 || lower.contains("initialize2")
+                || (lower.contains("instruction:") && lower.contains("create"))
         }) {
             debug!(line = %init_line, program=%program_label, "sniper: POOL init detected in transaction");
         }

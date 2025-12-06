@@ -18,8 +18,7 @@ ws_failover_urls = ["ws://109.230.239.43:8900"]
 # Geyser gRPC (RECOMMENDED for <10ms latency)
 # Uncomment to use native Agave 3.0 Geyser instead of WebSocket
 # Requires: --geyser-plugin-config flag in validator service
-# DISABLED: Geyser not configured yet, using WebSocket for now
-# geyser_grpc_url = "http://127.0.0.1:10000"
+geyser_grpc_url = "http://127.0.0.1:10000"
 
 keypair_path = "/home/ironcrab/.config/solana/id.json"  # adjust to your user/path
 # Tuned concurrency & timeout for high-end validator (500GB RAM, 64 CPUs)
@@ -134,10 +133,11 @@ oracle_sol_usd_override = 100.0
 log_retention_days = 30
 log_cleanup_interval_hours = 24
 
-# Explizit abonnierte DEX Programme (Raydium AMM v4 & Orca Whirlpool)
+# Explizit abonnierte DEX Programme (Raydium AMM v4, Orca Whirlpool, Pump.fun)
 program_ids = [
-	"675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
-	"whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+	"675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM v4
+	"whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  # Orca Whirlpool
+	"6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun
 ]
 
 # --- Arbitrage scanning with Auto-Discovery ---
