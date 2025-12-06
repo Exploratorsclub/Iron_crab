@@ -3620,15 +3620,20 @@ impl SniperEngine {
             )
         };
         // Fetch mint account
+        debug!(mint=%mint, "sniper: fetching mint account for LP check");
         let mint_acc = match self.rpc.get_account_retry(mint).await {
-            Ok(a) => a,
+            Ok(a) => {
+                debug!(mint=%mint, data_len=a.data.len(), "sniper: mint account fetched successfully");
+                a
+            }
             Err(e) => {
-                warn!(?e, "mint account fetch failed");
+                warn!(mint=%mint, error=?e, "sniper: mint account fetch failed");
                 return Ok(None);
             }
         };
         // SPL Mint length heuristic (approx range)
         if mint_acc.data.len() < 70 || mint_acc.data.len() > 90 {
+            debug!(mint=%mint, data_len=mint_acc.data.len(), "sniper: mint account size invalid (expected 70-90 bytes for SPL token)");
             return Ok(None);
         }
         // Parse fields using helper and prefer RPC supply/decimals if available
