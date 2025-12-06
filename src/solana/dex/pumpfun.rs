@@ -267,25 +267,42 @@ impl Dex for PumpFunDex {
         let token_mint = Pubkey::from_str(token_mint_str)?;
         let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
 
+        debug!(
+            token_mint=%token_mint_str, 
+            bonding_curve=%bonding_curve,
+            buy_token,
+            "pump.fun: attempting to fetch bonding curve"
+        );
+
         // Fetch bonding curve state
         let state = match self.fetch_bonding_curve(&bonding_curve).await {
             Ok(s) => s,
             Err(e) => {
-                debug!(token_mint=%token_mint_str, error=?e, "failed to fetch bonding curve");
+                debug!(token_mint=%token_mint_str, bonding_curve=%bonding_curve, error=?e, "pump.fun: failed to fetch bonding curve (account may not exist)");
                 return Ok(None);
             }
         };
 
         // Check if bonding curve is complete (migrated to Raydium)
         if state.complete {
-            debug!(token_mint=%token_mint_str, "bonding curve completed, migrated to raydium");
+            debug!(token_mint=%token_mint_str, bonding_curve=%bonding_curve, "pump.fun: bonding curve completed, migrated to raydium");
             return Ok(None);
         }
 
         // Calculate output
         let amount_out = state.calculate_output(amount_in, buy_token);
 
+        debug!(
+            token_mint=%token_mint_str,
+            amount_in,
+            amount_out,
+            virtual_sol=state.virtual_sol_reserves,
+            virtual_token=state.virtual_token_reserves,
+            "pump.fun: calculated swap output"
+        );
+
         if amount_out == 0 {
+            debug!(token_mint=%token_mint_str, "pump.fun: amount_out is zero, no quote");
             return Ok(None);
         }
 
