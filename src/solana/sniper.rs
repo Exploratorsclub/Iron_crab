@@ -1819,16 +1819,14 @@ impl SniperEngine {
         {
             Ok(a) => a,
             Err(e) => {
-                debug!(?e, mint=%mint, "ensure dest ATA fail");
-                return Ok(());
+                return Err(anyhow::anyhow!("ensure dest ATA failed: {:?}", e));
             }
         };
         // Wrap SOL into WSOL ATA (Raydium expects token account)
         let (wsol_ata_sdk, _wrap_sig) = match self.treasury.wrap_sol(&self.rpc, lamports_in).await {
             Ok(v) => v,
             Err(e) => {
-                debug!(?e, lamports_in, "wrap_sol failed");
-                return Ok(());
+                return Err(anyhow::anyhow!("wrap_sol failed with {} lamports: {:?}", lamports_in, e));
             }
         };
         // Build auto plan for min_out computation & pool selection (Raydium)
@@ -1840,8 +1838,7 @@ impl SniperEngine {
         };
 
         if plan_opt.is_none() && orca.is_none() {
-            debug!(mint=%mint, "no raydium or orca route");
-            return Ok(());
+            return Err(anyhow::anyhow!("no raydium or orca connector available"));
         }
         let plan_meta = plan_opt;
         // Dynamic route selection: compare Raydium vs Orca quotes and pick higher expected_out
@@ -2166,8 +2163,7 @@ impl SniperEngine {
             }
         };
         if tx_ixs.is_empty() {
-            warn!(mint=%mint, "no swap instructions built - neither raydium nor orca route available");
-            return Ok(());
+            return Err(anyhow::anyhow!("no swap instructions built - neither raydium nor orca route available"));
         }
         // Prepare message for fee estimate before signing
         let message = solana_sdk::message::Message::new(&tx_ixs, Some(&self.treasury.pubkey()));
