@@ -942,8 +942,21 @@ impl SniperEngine {
                                                 }
                                                 if txt.contains("logsNotification") {
                                                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                                        // Extract signature first - we'll need it for fetching full tx
+                                                        let sig = v.pointer("/params/result/value/signature")
+                                                            .and_then(|s| s.as_str())
+                                                            .map(|s| s.to_string());
+                                                        
                                                         if let Some(arr) = v.pointer("/params/result/value/logs").and_then(|x| x.as_array()) {
                                                             let payload: Vec<String> = arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect();
+                                                            
+                                                            // Send (program_id, logs, signature) for processing
+                                                            // For now, still use old format but we have sig available
+                                                            // TODO: Refactor to use signature-based fetching
+                                                            if let Some(signature) = sig {
+                                                                debug!(sig=%signature, program_id=%pid, "received tx with logs");
+                                                            }
+                                                            
                                                             // Apply backpressure: try fast path; if full, await send with returned payload; if closed, break
                                                             match logs_tx.try_send((pid.clone(), payload)) {
                                                                 Ok(_) => {}
