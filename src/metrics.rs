@@ -101,6 +101,13 @@ pub static WS_ACTIVE_CONNECTIONS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(
 // Protocol / LP fee (aggregated lamports-equivalent or raw tokens? We aggregate lamports-equivalent for SOL side, plus raw token fee counts)
 pub static PROTOCOL_FEE_TOKENS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static PROTOCOL_FEE_SOL_MICRO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Extended fee breakdown: DEX-specific protocol fees
+pub static RAYDIUM_PROTOCOL_FEE_SOL_MICRO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ORCA_PROTOCOL_FEE_SOL_MICRO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Referrer fees (from transaction meta)
+pub static REFERRER_FEE_SOL_MICRO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Compute budget overhead (compute units * priority fee)
+pub static COMPUTE_OVERHEAD_SOL_MICRO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static PENDING_RECONCILIATIONS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static PENDING_FAILED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Partial exit metrics
@@ -597,6 +604,23 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "protocol_fee_sol_total",
         PROTOCOL_FEE_SOL_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
+    // Extended fee breakdown
+    line!(
+        "raydium_protocol_fee_sol_total",
+        RAYDIUM_PROTOCOL_FEE_SOL_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
+    line!(
+        "orca_protocol_fee_sol_total",
+        ORCA_PROTOCOL_FEE_SOL_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
+    line!(
+        "referrer_fee_sol_total",
+        REFERRER_FEE_SOL_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
+    line!(
+        "compute_overhead_sol_total",
+        COMPUTE_OVERHEAD_SOL_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
     );
     line!(
         "pending_reconciliations_total",

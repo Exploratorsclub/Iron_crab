@@ -52,10 +52,13 @@ Status: Kernfunktionen der DEX-Connectoren (Quote, Swap-Plan, Swap-IX, Multi-Hop
 - [x] PendingTrade Map für FILL Shortfall (expected vs actual Tokens) – integriert
 - [x] Shortfall Berechnung (Tokens & SOL Äquivalent) bei FILL
 - [x] Netzwerk Fee Schätzung via `get_fee_for_message`
-- [ ] Erweiterte Fee Aufschlüsselung (Protocol Fee, Referrer, Compute Budget Overhead via Meta)
+- - [x] Erweiterte Fee Aufschlüsselung (Protocol Fee, Referrer, Compute Budget Overhead via Meta)
 	- [x] Grundlegende Protokoll Fee Approx (Output Token Fee Heuristik + Metrics `protocol_fee_tokens_total`, `protocol_fee_sol_total`)
 	- [x] Exakte Network Fee (Transaction Meta)
-	- [~] Token Fee via postTokenBalances (wrapper type TODO; fallback heuristic retained)
+	- [x] Token Fee via postTokenBalances (DEX-specific vault attribution implemented)
+	- [x] DEX-specific protocol fees (Raydium vs Orca fee vaults)
+	- [x] Referrer fee extraction (from transaction token balance changes)
+	- [x] Compute Budget overhead (compute units * priority fee from meta)
 - [x] Partielle Exit-Unterstützung (erste Version: teilweiser TP (50%), vollständiger SL Exit); weitere gestaffelte SELL Reihenfolge optional
 - [x] Persistenter Positionssnapshot (Reload nach Neustart, multi-lot Unterstützung)
   

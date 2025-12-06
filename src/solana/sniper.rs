@@ -17,12 +17,14 @@ use crate::metrics; // keep metrics module in scope for qualified uses
 use crate::metrics::{
     record_fee_pct, record_network_fee, record_realized_gross_net, record_realized_pnl_sol,
     record_shortfall, record_shortfall_pct, record_swap_latency, record_trade_return,
-    DAILY_REALIZED_PNL_SOL_MICRO, LIQUIDITY_ESTIMATE_SOL_MICRO, OPEN_POSITIONS_GAUGE,
+    COMPUTE_OVERHEAD_SOL_MICRO_TOTAL, DAILY_REALIZED_PNL_SOL_MICRO,
+    LIQUIDITY_ESTIMATE_SOL_MICRO, OPEN_POSITIONS_GAUGE, ORCA_PROTOCOL_FEE_SOL_MICRO_TOTAL,
     PENDING_FAILED_TOTAL, PENDING_RECONCILIATIONS_TOTAL, PROTOCOL_FEE_SOL_MICRO_TOTAL,
-    PROTOCOL_FEE_TOKENS_TOTAL, RPC_ERRORS_TOTAL, RPC_RETRY_ATTEMPTS_TOTAL, TRADES_EXECUTED_TOTAL,
-    TRADES_FAILED_TOTAL, WS_ACTIVE_CONNECTIONS, WS_HEARTBEAT_MISSES_TOTAL, WS_MESSAGES_TOTAL,
-    WS_RECONNECTS_TOTAL,
+    PROTOCOL_FEE_TOKENS_TOTAL, RAYDIUM_PROTOCOL_FEE_SOL_MICRO_TOTAL, REFERRER_FEE_SOL_MICRO_TOTAL,
+    RPC_ERRORS_TOTAL, RPC_RETRY_ATTEMPTS_TOTAL, TRADES_EXECUTED_TOTAL, TRADES_FAILED_TOTAL,
+    WS_ACTIVE_CONNECTIONS, WS_HEARTBEAT_MISSES_TOTAL, WS_MESSAGES_TOTAL, WS_RECONNECTS_TOTAL,
 };
+use crate::tx_fee_parser;
 use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
 use chrono::Utc as ChronoUtc;
@@ -2341,9 +2343,52 @@ impl SniperEngine {
                             std::sync::atomic::Ordering::Relaxed,
                         );
                     }
+                    
+                    // Extended fee breakdown: parse transaction metadata for detailed attribution
+                    let mut dex_fee_breakdown_str = String::new();
+                    if let Ok(breakdown) = tx_fee_parser::parse_fee_breakdown(
+                        &tx_meta,
+                        &self.treasury.pubkey(),
+                    ) {
+                        // Update DEX-specific metrics
+                        if breakdown.raydium_protocol_fee_sol_micro > 0 {
+                            RAYDIUM_PROTOCOL_FEE_SOL_MICRO_TOTAL.fetch_add(
+                                breakdown.raydium_protocol_fee_sol_micro,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        if breakdown.orca_protocol_fee_sol_micro > 0 {
+                            ORCA_PROTOCOL_FEE_SOL_MICRO_TOTAL.fetch_add(
+                                breakdown.orca_protocol_fee_sol_micro,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        if breakdown.referrer_fee_sol_micro > 0 {
+                            REFERRER_FEE_SOL_MICRO_TOTAL.fetch_add(
+                                breakdown.referrer_fee_sol_micro,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        if breakdown.compute_overhead_sol_micro > 0 {
+                            COMPUTE_OVERHEAD_SOL_MICRO_TOTAL.fetch_add(
+                                breakdown.compute_overhead_sol_micro,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        
+                        // Format for CSV log
+                        dex_fee_breakdown_str = format!(
+                            "raydium_fee={:.9};orca_fee={:.9};referrer_fee={:.9};compute_overhead={:.9}",
+                            breakdown.raydium_protocol_fee_sol_micro as f64 / 1_000_000.0,
+                            breakdown.orca_protocol_fee_sol_micro as f64 / 1_000_000.0,
+                            breakdown.referrer_fee_sol_micro as f64 / 1_000_000.0,
+                            breakdown.compute_overhead_sol_micro as f64 / 1_000_000.0,
+                        );
+                    }
+                    
                     record_shortfall(shortfall, shortfall_sol);
                     let line = format!(
-                    "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9};protocol_fee_tokens={fee_tokens};network_fee_exact={network_fee_exact}",
+                    "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9};protocol_fee_tokens={fee_tokens};network_fee_exact={network_fee_exact};{dex_breakdown}",
                     ts=ChronoUtc::now().to_rfc3339(),
                     mint=mint,
                     dex=pend.dex,
@@ -2356,7 +2401,8 @@ impl SniperEngine {
                     shortfall_ui=shortfall_ui,
                     shortfall_sol=shortfall_sol,
                     fee_tokens=fee_tokens,
-                    network_fee_exact=exact_network_fee
+                    network_fee_exact=exact_network_fee,
+                    dex_breakdown=dex_fee_breakdown_str
                 );
                     self.append_trade_record(&line, true);
                 }

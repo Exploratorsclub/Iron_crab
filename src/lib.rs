@@ -6,5 +6,6 @@ pub mod engine;
 pub mod log_manager;
 pub mod metrics;
 pub mod solana;
+pub mod tx_fee_parser;
 pub mod types;
 pub mod wallet;
