@@ -31,11 +31,17 @@ jobs:
           toolchain: 1.89.0
           components: rustfmt, clippy
 
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
       - name: Versions
         run: |
           rustc -Vv
           cargo -V
           rustfmt -V || true
+          protoc --version || true
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -87,6 +93,11 @@ jobs:
           toolchain: 1.89.0
           components: rustfmt, clippy
 
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
       - name: Setup Python
         id: setup-py
         uses: actions/setup-python@v5
@@ -128,6 +139,11 @@ jobs:
         with:
           toolchain: 1.89.0
           components: rustfmt, clippy
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
 
   # Cache is optional here; remove to avoid flakiness causing job failure
 
