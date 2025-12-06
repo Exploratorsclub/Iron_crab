@@ -4,7 +4,7 @@
 # --- Application ---
 [app]
 name = "ironcrab-prod"
-log_level = "info"  # info = production, debug = troubleshooting, trace = deep diagnostics
+log_level = "debug"  # info = production, debug = troubleshooting, trace = deep diagnostics
 autosave_state_secs = 30
 
 # --- Solana RPC & Keypair (Linux paths) ---
@@ -82,8 +82,8 @@ stop_loss_cooldown_secs = 300
 # MULTI-LAYER RUG FILTERING (ordered by importance):
 
 ## 1. LP CONCENTRATION - MOST IMPORTANT RUG INDICATOR
-lp_top1_max_pct = 0.85  # Top holder max 85% (balanced)
-# Why 85%: Catches most rugs but allows legit presales
+lp_top1_max_pct = 0.95  # Top holder max 95% (TESTING - very permissive)
+# Why 95%: Catches most rugs but allows legit presales
 # - >90% = almost certain rug
 # - 70-85% = risky but some legit projects at launch
 # - <70% = more distributed (safer)
@@ -93,8 +93,8 @@ lp_top5_max_pct = 0.97  # Top 5 holders max 97%
 # If 5 wallets control 97%+ = coordinated rug team
 
 ## 2. LIQUIDITY AMOUNT - COMMITMENT SIGNAL
-min_pool_liquidity_sol = 2.0  # Minimum 2 SOL (~$280)
-# Why 2 SOL:
+min_pool_liquidity_sol = 0.5  # Minimum 0.5 SOL (~$70) - TESTING MODE
+# Why 0.5 SOL (TESTING):
 # - <1 SOL = zero-effort scam (filtered)
 # - 1-5 SOL = low commitment (risky but catches some gems)
 # - >5 SOL = serious project (fewer opportunities)
