@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
+    system_program,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -186,7 +187,7 @@ impl PumpFunDex {
                 AccountMeta::new(*associated_bonding_curve, false),
                 AccountMeta::new(*user_token_account, false),
                 AccountMeta::new(user, true), // Signer
-                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
                 AccountMeta::new_readonly(sysvar::rent::id(), false),
                 AccountMeta::new_readonly(self.event_authority, false),
@@ -226,7 +227,7 @@ impl PumpFunDex {
                 AccountMeta::new(*associated_bonding_curve, false),
                 AccountMeta::new(*user_token_account, false),
                 AccountMeta::new(user, true), // Signer
-                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()), false),
                 AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
                 AccountMeta::new_readonly(self.event_authority, false),
