@@ -1099,6 +1099,15 @@ impl SniperEngine {
                 continue;
             }
             debug!(line = %line, program=%program_label, "sniper: init-like log");
+            
+            // Debug: Show how many addresses we find in this line
+            let addr_count = BASE58_RE.find_iter(&line).count();
+            if addr_count == 0 {
+                debug!(line = %line, "sniper: no base58 addresses found in this log line");
+            } else {
+                debug!(line = %line, addr_count, "sniper: found addresses in log line");
+            }
+            
             let mut seen = std::collections::HashSet::new();
             let mut did_log_init = false;
             let mut candidates_to_check: Vec<Pubkey> = Vec::new();
