@@ -1815,14 +1815,8 @@ impl SniperEngine {
         let mint_sdk = SdkPubkey::new_from_array(mint.to_bytes());
         let owner_sdk = self.treasury.pubkey();
         
-        // Wrap SOL into WSOL ATA (Raydium expects token account)
-        let (wsol_ata_sdk, _wrap_sig) = match self.treasury.wrap_sol(&self.rpc, lamports_in).await {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(anyhow::anyhow!("wrap_sol failed with {} lamports: {:?}", lamports_in, e));
-            }
-        };
         // Build auto plan for min_out computation & pool selection (Raydium)
+        // DON'T wrap SOL yet - check if route exists first!
         let msb = self.adaptive_slippage_bps();
         let plan_opt = if let Some(r) = &ray {
             r.build_swap_plan_auto(&sol_mint.to_string(), &mint.to_string(), lamports_in, msb)?
@@ -1864,6 +1858,15 @@ impl SniperEngine {
                 }
             }
         }
+        
+        // NOW wrap SOL (only after confirming route exists!)
+        let (wsol_ata_sdk, _wrap_sig) = match self.treasury.wrap_sol(&self.rpc, lamports_in).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(anyhow::anyhow!("wrap_sol failed with {} lamports: {:?}", lamports_in, e));
+            }
+        };
+        
         // Source WSOL ATA (after wrap) & destination token ATA
         let _wsol_ata = wsol_ata_sdk; // already ensured via wrap
         let (_dest_ata, _token_prog) = self
