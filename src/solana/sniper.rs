@@ -1859,16 +1859,17 @@ impl SniperEngine {
             }
         }
         
-        // NOW wrap SOL (only after confirming route exists!)
-        let (wsol_ata_sdk, _wrap_sig) = match self.treasury.wrap_sol(&self.rpc, lamports_in).await {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(anyhow::anyhow!("wrap_sol failed with {} lamports: {:?}", lamports_in, e));
-            }
-        };
+        // DON'T wrap SOL yet - we need to verify swap instructions can be built first!
+        // Derive WSOL ATA address for instruction building (but don't create it yet)
+        let wsol_mint_prog = spl_token::native_mint::id();
+        let wsol_mint_sdk_key = SdkPubkey::new_from_array(wsol_mint_prog.to_bytes());
+        let (wsol_ata_sdk, _token_prog_wsol) = self
+            .treasury
+            .ata_address(&self.rpc, &owner_sdk, &wsol_mint_sdk_key)
+            .await?;
+        let _wsol_ata = wsol_ata_sdk; // use this for instruction building
         
-        // Source WSOL ATA (after wrap) & destination token ATA
-        let _wsol_ata = wsol_ata_sdk; // already ensured via wrap
+        // Derive destination token ATA address (but don't create it yet)
         let (_dest_ata, _token_prog) = self
             .treasury
             .ata_address(&self.rpc, &owner_sdk, &mint_sdk)
@@ -2161,6 +2162,14 @@ impl SniperEngine {
         if tx_ixs.is_empty() {
             return Err(anyhow::anyhow!("no swap instructions built - neither raydium nor orca route available"));
         }
+        
+        // NOW wrap SOL (only after confirming swap instructions exist!)
+        let (_wsol_ata_actual, _wrap_sig) = match self.treasury.wrap_sol(&self.rpc, lamports_in).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(anyhow::anyhow!("wrap_sol failed with {} lamports after route confirmed: {:?}", lamports_in, e));
+            }
+        };
         
         // NOW ensure dest ATA exists (only when swap is actually possible!)
         // This avoids wasting SOL creating ATAs for failed swaps
