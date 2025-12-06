@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    system_program,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15,6 +14,9 @@ use tracing::debug;
 
 use crate::solana::rpc::SolanaRpc;
 use super::{Dex, Quote};
+
+/// System Program ID
+const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 
 /// Pump.fun program ID
 pub const PUMPFUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
@@ -187,7 +189,7 @@ impl PumpFunDex {
                 AccountMeta::new(*associated_bonding_curve, false),
                 AccountMeta::new(*user_token_account, false),
                 AccountMeta::new(user, true), // Signer
-                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false),
                 AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
                 AccountMeta::new_readonly(sysvar::rent::id(), false),
                 AccountMeta::new_readonly(self.event_authority, false),
@@ -227,7 +229,7 @@ impl PumpFunDex {
                 AccountMeta::new(*associated_bonding_curve, false),
                 AccountMeta::new(*user_token_account, false),
                 AccountMeta::new(user, true), // Signer
-                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false),
                 AccountMeta::new_readonly(Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()), false),
                 AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
                 AccountMeta::new_readonly(self.event_authority, false),
