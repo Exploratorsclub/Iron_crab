@@ -6,23 +6,23 @@ use std::str::FromStr;
 // Known DEX fee vault addresses for protocol fee attribution
 pub mod fee_vaults {
     use super::*;
-    
+
     // Raydium protocol fee vaults (well-known addresses)
     // Main Raydium AMM fee destination
     pub fn raydium_fee_owner() -> Pubkey {
         Pubkey::from_str("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1").unwrap()
     }
-    
+
     // Orca protocol fee vaults
     // Orca fee collector (common destination)
     pub fn orca_fee_owner() -> Pubkey {
         Pubkey::from_str("3xxgYc3jXPdjqpMdrRyKtcddh4ZdtqpaN33fwaWJ2Wbh").unwrap()
     }
-    
+
     pub fn is_raydium_fee_vault(pubkey: &Pubkey) -> bool {
         *pubkey == raydium_fee_owner()
     }
-    
+
     pub fn is_orca_fee_vault(pubkey: &Pubkey) -> bool {
         *pubkey == orca_fee_owner()
     }

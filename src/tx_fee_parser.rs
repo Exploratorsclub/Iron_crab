@@ -27,13 +27,16 @@ pub fn parse_fee_breakdown(
             // Note: Priority fee is embedded in total fee, this is an approximation
             // Heuristic: ~5000 micro lamports per CU for typical priority
             let priority_fee_per_cu_micro = 5; // Conservative estimate
-            breakdown.compute_overhead_sol_micro = compute_units.saturating_mul(priority_fee_per_cu_micro);
+            breakdown.compute_overhead_sol_micro =
+                compute_units.saturating_mul(priority_fee_per_cu_micro);
         }
 
         // 3. Parse token balance changes for protocol fee attribution
-        let pre_balances_opt = Option::<Vec<UiTransactionTokenBalance>>::from(meta.pre_token_balances.clone());
-        let post_balances_opt = Option::<Vec<UiTransactionTokenBalance>>::from(meta.post_token_balances.clone());
-        
+        let pre_balances_opt =
+            Option::<Vec<UiTransactionTokenBalance>>::from(meta.pre_token_balances.clone());
+        let post_balances_opt =
+            Option::<Vec<UiTransactionTokenBalance>>::from(meta.post_token_balances.clone());
+
         if let (Some(pre_balances), Some(post_balances)) = (pre_balances_opt, post_balances_opt) {
             breakdown.protocol_fee_total_sol_micro += parse_protocol_fees_from_balances(
                 &pre_balances,
@@ -70,7 +73,7 @@ fn parse_protocol_fees_from_balances(
             // In Solana SDK 3.x, owner is OptionSerializer<String>, convert to Option
             let pre_owner_opt = Option::<String>::from(pre.owner.clone());
             let post_owner_opt = Option::<String>::from(post.owner.clone());
-            
+
             if let (Some(pre_owner_str), Some(post_owner_str)) = (pre_owner_opt, post_owner_opt) {
                 // Try to parse owner pubkeys
                 if let (Ok(pre_owner), Ok(post_owner)) = (
@@ -87,9 +90,10 @@ fn parse_protocol_fees_from_balances(
                     let is_orca = fee_vaults::is_orca_fee_vault(&post_owner);
 
                     // Calculate balance change (post - pre)
-                    if let (Some(pre_amt), Some(post_amt)) =
-                        (&pre.ui_token_amount.ui_amount, &post.ui_token_amount.ui_amount)
-                    {
+                    if let (Some(pre_amt), Some(post_amt)) = (
+                        &pre.ui_token_amount.ui_amount,
+                        &post.ui_token_amount.ui_amount,
+                    ) {
                         let delta = post_amt - pre_amt;
                         if delta > 0.0 {
                             // Positive delta = fee received by vault
@@ -98,13 +102,17 @@ fn parse_protocol_fees_from_balances(
                             let fee_micro = (delta * 1_000_000.0) as u64;
 
                             if is_raydium {
-                                breakdown.raydium_protocol_fee_sol_micro =
-                                    breakdown.raydium_protocol_fee_sol_micro.saturating_add(fee_micro);
-                                total_protocol_fee_micro = total_protocol_fee_micro.saturating_add(fee_micro);
+                                breakdown.raydium_protocol_fee_sol_micro = breakdown
+                                    .raydium_protocol_fee_sol_micro
+                                    .saturating_add(fee_micro);
+                                total_protocol_fee_micro =
+                                    total_protocol_fee_micro.saturating_add(fee_micro);
                             } else if is_orca {
-                                breakdown.orca_protocol_fee_sol_micro =
-                                    breakdown.orca_protocol_fee_sol_micro.saturating_add(fee_micro);
-                                total_protocol_fee_micro = total_protocol_fee_micro.saturating_add(fee_micro);
+                                breakdown.orca_protocol_fee_sol_micro = breakdown
+                                    .orca_protocol_fee_sol_micro
+                                    .saturating_add(fee_micro);
+                                total_protocol_fee_micro =
+                                    total_protocol_fee_micro.saturating_add(fee_micro);
                             } else {
                                 // Unknown destination = potential referrer fee
                                 breakdown.referrer_fee_sol_micro =

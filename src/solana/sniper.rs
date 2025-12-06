@@ -17,12 +17,11 @@ use crate::metrics; // keep metrics module in scope for qualified uses
 use crate::metrics::{
     record_fee_pct, record_network_fee, record_realized_gross_net, record_realized_pnl_sol,
     record_shortfall, record_shortfall_pct, record_swap_latency, record_trade_return,
-    DAILY_REALIZED_PNL_SOL_MICRO,
-    LIQUIDITY_ESTIMATE_SOL_MICRO, OPEN_POSITIONS_GAUGE,
+    DAILY_REALIZED_PNL_SOL_MICRO, LIQUIDITY_ESTIMATE_SOL_MICRO, OPEN_POSITIONS_GAUGE,
     PENDING_FAILED_TOTAL, PENDING_RECONCILIATIONS_TOTAL, PROTOCOL_FEE_SOL_MICRO_TOTAL,
-    PROTOCOL_FEE_TOKENS_TOTAL,
-    RPC_ERRORS_TOTAL, RPC_RETRY_ATTEMPTS_TOTAL, TRADES_EXECUTED_TOTAL, TRADES_FAILED_TOTAL,
-    WS_ACTIVE_CONNECTIONS, WS_HEARTBEAT_MISSES_TOTAL, WS_MESSAGES_TOTAL, WS_RECONNECTS_TOTAL,
+    PROTOCOL_FEE_TOKENS_TOTAL, RPC_ERRORS_TOTAL, RPC_RETRY_ATTEMPTS_TOTAL, TRADES_EXECUTED_TOTAL,
+    TRADES_FAILED_TOTAL, WS_ACTIVE_CONNECTIONS, WS_HEARTBEAT_MISSES_TOTAL, WS_MESSAGES_TOTAL,
+    WS_RECONNECTS_TOTAL,
 };
 use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
@@ -577,11 +576,17 @@ impl SniperEngine {
         };
         cur.clamp(min_b, max_b)
     }
-    
+
     /// Compute min_out using quantile-based slippage if enabled, otherwise use adaptive slippage
-    fn compute_min_out(&self, pool_id: &str, expected_out: u64, amount_in: u64, pool_liquidity: u128) -> u64 {
+    fn compute_min_out(
+        &self,
+        pool_id: &str,
+        expected_out: u64,
+        amount_in: u64,
+        pool_liquidity: u128,
+    ) -> u64 {
         let cfg = self.cfg.read();
-        
+
         // Check if quantile slippage is enabled
         if cfg.quantile_slippage_enabled.unwrap_or(false) {
             // Determine size category based on trade size vs pool liquidity
@@ -597,19 +602,22 @@ impl SniperEngine {
             } else {
                 crate::quantile_impact::SizeCategory::Small
             };
-            
+
             // Try quantile-based calculation
-            if let Ok(min_out) = self.quantile_calc.compute_min_out(pool_id, expected_out, size_category) {
+            if let Ok(min_out) =
+                self.quantile_calc
+                    .compute_min_out(pool_id, expected_out, size_category)
+            {
                 return min_out;
             }
         }
-        
+
         // Fallback to adaptive slippage
         let slip = self.adaptive_slippage_bps() as u128;
         let min_out = ((expected_out as u128) * (10_000 - slip) / 10_000) as u64;
         min_out.max(1)
     }
-    
+
     async fn rpc_retry_tx(
         &self,
         tx: &Transaction,
@@ -704,7 +712,7 @@ impl SniperEngine {
         treasury: Arc<Treasury>,
     ) -> Self {
         let (tx, rx) = tokio::sync::watch::channel(false);
-        
+
         // Initialize quantile calculator with config
         let quantile_config = crate::quantile_impact::QuantileConfig {
             confidence_level: cfg.quantile_confidence_level.unwrap_or(0.95),
@@ -713,7 +721,7 @@ impl SniperEngine {
             max_samples_per_pool: 500,
             fallback_slippage_bps: cfg.quantile_fallback_slippage_bps.unwrap_or(100),
         };
-        
+
         Self {
             rpc,
             cfg: parking_lot::RwLock::new(cfg),
@@ -724,7 +732,9 @@ impl SniperEngine {
             risk: parking_lot::RwLock::new(RiskState::default()),
             shutdown_tx: tx,
             shutdown_rx: rx,
-            quantile_calc: Arc::new(crate::quantile_impact::QuantileImpactCalculator::new(quantile_config)),
+            quantile_calc: Arc::new(crate::quantile_impact::QuantileImpactCalculator::new(
+                quantile_config,
+            )),
         }
     }
 
@@ -1092,7 +1102,7 @@ impl SniperEngine {
             let mut seen = std::collections::HashSet::new();
             let mut did_log_init = false;
             let mut candidates_to_check: Vec<Pubkey> = Vec::new();
-            
+
             for m in BASE58_RE.find_iter(&line) {
                 let s = m.as_str();
                 if !seen.insert(s) {
@@ -1106,7 +1116,11 @@ impl SniperEngine {
                             debug!(addr=%pk, data_len=acc.data.len(), "sniper: fetched account");
                             // Check if it's an Orca Whirlpool pool account
                             if acc.data.len() >= 261 && acc.data.len() <= 1024 {
-                                if let Some(parsed) = crate::solana::dex::orca_whirlpool_layout::parse_whirlpool(&acc.data) {
+                                if let Some(parsed) =
+                                    crate::solana::dex::orca_whirlpool_layout::parse_whirlpool(
+                                        &acc.data,
+                                    )
+                                {
                                     debug!(pool=%pk, mint_a=%parsed.token_mint_a, mint_b=%parsed.token_mint_b, "sniper: detected Orca pool init, extracting mints");
                                     // Check both mints from the pool
                                     candidates_to_check.push(parsed.token_mint_a);
@@ -1128,7 +1142,7 @@ impl SniperEngine {
                     candidates_to_check.push(pk);
                 }
             }
-            
+
             // Now check all candidate mints
             for pk in candidates_to_check {
                 if let Ok(pk) = Pubkey::from_str(&pk.to_string()) {
@@ -1762,7 +1776,8 @@ impl SniperEngine {
                     let pool_id = format!("orca_{}_{}", sol_mint, mint);
                     // Estimate pool liquidity from quote (if available) or use conservative default
                     let pool_liquidity = 100_000_000_000u128; // 100 SOL equivalent as default
-                    min_out_orca = self.compute_min_out(&pool_id, q.amount_out, lamports_in, pool_liquidity);
+                    min_out_orca =
+                        self.compute_min_out(&pool_id, q.amount_out, lamports_in, pool_liquidity);
                     if min_out_orca == 0 {
                         min_out_orca = 1;
                     }
@@ -1835,7 +1850,8 @@ impl SniperEngine {
                     // Use quantile-based min_out if enabled, otherwise adaptive slippage
                     let pool_id = format!("orca_{}_{}", sol_mint, mint);
                     let pool_liquidity = 100_000_000_000u128; // 100 SOL equivalent as default
-                    min_out_orca = self.compute_min_out(&pool_id, q.amount_out, lamports_in, pool_liquidity);
+                    min_out_orca =
+                        self.compute_min_out(&pool_id, q.amount_out, lamports_in, pool_liquidity);
                     if min_out_orca == 0 {
                         min_out_orca = 1;
                     }
@@ -2367,12 +2383,12 @@ impl SniperEngine {
                     let expected_safe = expected_raw.max(1) as f64;
                     let observed_slip = (shortfall as f64 / expected_safe).max(0.0);
                     record_shortfall_pct(observed_slip);
-                    
+
                     // Record fill observation for quantile calculator
                     if self.cfg.read().quantile_slippage_enabled.unwrap_or(false) {
                         // Determine pool ID (use DEX + mint pair as identifier)
                         let pool_id = format!("{}_{}", pend.dex, mint);
-                        
+
                         // Determine size category (approximate from invested lamports)
                         let size_category = if pend.lamports_in < 1_000_000_000 {
                             crate::quantile_impact::SizeCategory::Small
@@ -2381,7 +2397,7 @@ impl SniperEngine {
                         } else {
                             crate::quantile_impact::SizeCategory::Large
                         };
-                        
+
                         self.quantile_calc.record_fill(
                             pool_id,
                             expected_raw,
@@ -2390,7 +2406,7 @@ impl SniperEngine {
                         );
                     }
                     // Note: tx_meta not available here; fee breakdown handled separately
-                    
+
                     {
                         let mut rs = self.risk.write();
                         // Maintain rolling window
@@ -2468,11 +2484,11 @@ impl SniperEngine {
                             std::sync::atomic::Ordering::Relaxed,
                         );
                     }
-                    
+
                     // Note: Extended fee breakdown (DEX-specific vaults) would require transaction metadata
                     // which is not available at this point. Fee breakdown can be done via separate RPC call
                     // using tx_fee_parser::fetch_and_parse_fee_breakdown() if needed.
-                    
+
                     record_shortfall(shortfall, shortfall_sol);
                     let line = format!(
                     "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9};protocol_fee_tokens={fee_tokens};network_fee_exact={network_fee_exact}",
@@ -2860,7 +2876,8 @@ impl SniperEngine {
                     // Use quantile-based min_out if enabled, otherwise adaptive slippage
                     let pool_id = format!("orca_{}_{}", mint, sol_mint);
                     let pool_liquidity = 100_000_000_000u128; // 100 SOL equivalent as default
-                    min_out = self.compute_min_out(&pool_id, q.amount_out, sell_tokens, pool_liquidity);
+                    min_out =
+                        self.compute_min_out(&pool_id, q.amount_out, sell_tokens, pool_liquidity);
                     if min_out == 0 {
                         min_out = 1;
                     }

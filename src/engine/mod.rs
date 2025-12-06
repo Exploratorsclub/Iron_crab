@@ -615,7 +615,7 @@ impl Engine {
                 loop {
                     let batch_start = tokio::time::Instant::now();
                     let mut events_in_batch = 0usize;
-                    
+
                     // Collect events for batch_interval duration
                     loop {
                         let remaining = batch_interval.saturating_sub(batch_start.elapsed());
@@ -633,7 +633,9 @@ impl Engine {
                                 events_in_batch += 1;
                                 // Continue collecting events until batch interval elapsed
                             }
-                            Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                            Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                skipped,
+                            ))) => {
                                 tracing::debug!(
                                     skipped_events = skipped,
                                     "arbitrage_task: buffer lagged (normal during high activity)"
@@ -1529,6 +1531,7 @@ mod tests {
             ws_connect_timeout_ms: None,
             ws_max_backoff_ms: None,
             ws_headers: None,
+            geyser_grpc_url: None,
         };
         let cfg_all = crate::config::Config {
             app: app_cfg,

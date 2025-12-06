@@ -85,7 +85,7 @@ impl QuantileImpactCalculator {
     ) {
         let shortfall_pct = if expected_out > 0 {
             let shortfall = expected_out.saturating_sub(actual_out) as f64;
-            (shortfall / expected_out as f64).max(0.0).min(1.0)
+            (shortfall / expected_out as f64).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -105,7 +105,7 @@ impl QuantileImpactCalculator {
         };
 
         let mut obs = self.observations.write().unwrap();
-        let pool_obs = obs.entry(pool_id).or_insert_with(VecDeque::new);
+        let pool_obs = obs.entry(pool_id).or_default();
 
         // Add new observation
         pool_obs.push_back(observation);
@@ -144,8 +144,8 @@ impl QuantileImpactCalculator {
             .iter()
             .filter(|o| {
                 o.timestamp_ms >= cutoff_ms
-                    && (o.size_category == size_category
-                        || size_category == SizeCategory::Small) // Small trades can use all data
+                    && (o.size_category == size_category || size_category == SizeCategory::Small)
+                // Small trades can use all data
             })
             .map(|o| o.shortfall_pct)
             .collect();
@@ -213,8 +213,8 @@ impl QuantileImpactCalculator {
             return None;
         }
 
-        let mean_shortfall = recent_obs.iter().map(|o| o.shortfall_pct).sum::<f64>()
-            / recent_obs.len() as f64;
+        let mean_shortfall =
+            recent_obs.iter().map(|o| o.shortfall_pct).sum::<f64>() / recent_obs.len() as f64;
 
         let mut shortfalls: Vec<f64> = recent_obs.iter().map(|o| o.shortfall_pct).collect();
         let p50 = self.compute_percentile_at(&mut shortfalls, 0.50);
