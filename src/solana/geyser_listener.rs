@@ -39,7 +39,7 @@ impl GeyserListener {
         program_ids: Vec<Pubkey>,
     ) -> (Self, broadcast::Receiver<GeyserAccountUpdate>) {
         // Large buffer for high-frequency updates
-        let (tx, rx) = broadcast::channel(50000);
+        let (tx, rx) = broadcast::channel(200000);
 
         (
             Self {

@@ -541,7 +541,7 @@ impl Engine {
                     .expect("Invalid Whirlpool program ID");
 
                 // Create unified update channel (works for both Geyser and WebSocket)
-                let (update_tx, mut pool_updates) = tokio::sync::broadcast::channel(50000);
+                let (update_tx, mut pool_updates) = tokio::sync::broadcast::channel(200000);
 
                 // Use Geyser gRPC if configured, otherwise fall back to WebSocket
                 let geyser_url = ctx_arb.cfg.solana.geyser_grpc_url.clone();

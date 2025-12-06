@@ -141,8 +141,8 @@ program_ids = [
 
 # --- Arbitrage scanning with Auto-Discovery ---
 [arbitrage]
-interval_ms = 200  # Fast scanning: 200ms = 5 scans/sec (event-driven reacts even faster)
-# NOTE: If seeing "buffer overflowed" warnings, increase to 500ms (reduces CPU load)
+interval_ms = 500  # Balanced scanning: 500ms = 2 scans/sec (event-driven reacts to updates)
+# NOTE: 200ms = aggressive (5/sec), 500ms = balanced (2/sec), 1000ms = conservative (1/sec)
 
 min_profit_bps = 100  # 1.0% minimum profit
 # With liquidity filtering in place, 100bps is optimal
