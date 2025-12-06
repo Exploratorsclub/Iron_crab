@@ -1808,20 +1808,13 @@ impl SniperEngine {
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
         // Convert max_buy_sol (f64) to lamports safely
         let lamports_in = ((self.effective_max_buy_sol() * 1e9) as u64).max(10_000); // dynamic drawdown-adjusted size
-                                                                                     // Ensure destination ATA for target mint (may fail if mint malformed)
+        
+        // DON'T create dest ATA yet - wait until swap succeeds!
+        // We'll derive the address for planning, but not ensure it exists
         use solana_sdk::pubkey::Pubkey as SdkPubkey;
         let mint_sdk = SdkPubkey::new_from_array(mint.to_bytes());
         let owner_sdk = self.treasury.pubkey();
-        let _dest_ata = match self
-            .treasury
-            .ensure_ata(&self.rpc, &owner_sdk, &mint_sdk)
-            .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                return Err(anyhow::anyhow!("ensure dest ATA failed: {:?}", e));
-            }
-        };
+        
         // Wrap SOL into WSOL ATA (Raydium expects token account)
         let (wsol_ata_sdk, _wrap_sig) = match self.treasury.wrap_sol(&self.rpc, lamports_in).await {
             Ok(v) => v,
@@ -2165,6 +2158,15 @@ impl SniperEngine {
         if tx_ixs.is_empty() {
             return Err(anyhow::anyhow!("no swap instructions built - neither raydium nor orca route available"));
         }
+        
+        // NOW ensure dest ATA exists (only when swap is actually possible!)
+        // This avoids wasting SOL creating ATAs for failed swaps
+        let _dest_ata_result = self
+            .treasury
+            .ensure_ata(&self.rpc, &owner_sdk, &mint_sdk)
+            .await
+            .map_err(|e| anyhow::anyhow!("ensure dest ATA failed after route found: {:?}", e))?;
+        
         // Prepare message for fee estimate before signing
         let message = solana_sdk::message::Message::new(&tx_ixs, Some(&self.treasury.pubkey()));
         let fee_estimate = self
