@@ -1099,20 +1099,32 @@ impl SniperEngine {
                     continue;
                 }
                 if let Ok(pk) = Pubkey::from_str(s) {
+                    debug!(addr=%pk, "sniper: checking address from InitializePoolV2 log");
                     // First, try to fetch account and check if it's a Whirlpool pool
-                    if let Ok(acc) = self.rpc.get_account_retry(&pk).await {
-                        // Check if it's an Orca Whirlpool pool account
-                        if acc.data.len() >= 261 && acc.data.len() <= 1024 {
-                            if let Some(parsed) = crate::solana::dex::orca_whirlpool_layout::parse_whirlpool(&acc.data) {
-                                debug!(pool=%pk, mint_a=%parsed.token_mint_a, mint_b=%parsed.token_mint_b, "sniper: detected Orca pool init, extracting mints");
-                                // Check both mints from the pool
-                                candidates_to_check.push(parsed.token_mint_a);
-                                candidates_to_check.push(parsed.token_mint_b);
-                                continue; // Skip treating this as a direct mint
+                    match self.rpc.get_account_retry(&pk).await {
+                        Ok(acc) => {
+                            debug!(addr=%pk, data_len=acc.data.len(), "sniper: fetched account");
+                            // Check if it's an Orca Whirlpool pool account
+                            if acc.data.len() >= 261 && acc.data.len() <= 1024 {
+                                if let Some(parsed) = crate::solana::dex::orca_whirlpool_layout::parse_whirlpool(&acc.data) {
+                                    debug!(pool=%pk, mint_a=%parsed.token_mint_a, mint_b=%parsed.token_mint_b, "sniper: detected Orca pool init, extracting mints");
+                                    // Check both mints from the pool
+                                    candidates_to_check.push(parsed.token_mint_a);
+                                    candidates_to_check.push(parsed.token_mint_b);
+                                    continue; // Skip treating this as a direct mint
+                                } else {
+                                    debug!(addr=%pk, data_len=acc.data.len(), "sniper: account size matches but parse_whirlpool failed");
+                                }
+                            } else {
+                                debug!(addr=%pk, data_len=acc.data.len(), "sniper: account size outside whirlpool range (261-1024)");
                             }
+                        }
+                        Err(e) => {
+                            debug!(addr=%pk, error=?e, "sniper: failed to fetch account (might not exist yet)");
                         }
                     }
                     // If not a pool, treat as potential mint address
+                    debug!(addr=%pk, "sniper: treating as potential mint address");
                     candidates_to_check.push(pk);
                 }
             }
