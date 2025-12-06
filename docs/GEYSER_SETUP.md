@@ -26,23 +26,23 @@ netstat -tuln | grep 10000  # Check if gRPC port is open
 
 ```json
 {
-  "libpath": "/opt/solana/plugins/libyellowstone_grpc_geyser.so",
-  "bind_address": "127.0.0.1:10000",
+  "libpath": "/usr/local/lib/solana/libyellowstone_grpc_geyser.so",
   "log": {
     "level": "info"
   },
   "grpc": {
-    "max_decoding_message_size": "4_194_304",
-    "channel_capacity": "100_000",
-    "unary_concurrency_limit": 100,
-    "unary_disabled": false
-  },
-  "block_fail_action": "log"
+    "address": "127.0.0.1:10000",
+    "max_decoding_message_size": 4194304,
+    "channel_capacity": 200000
+  }
 }
 ```
 
-**Important:** Account filters are set in the **client code**, NOT in this config file!
-The bot's `GeyserListener` handles the subscription filters.
+**Important:** 
+- This is the **production-tested config** from root9051 server
+- Account filters (which DEX programs) are set in **client code**, not here
+- The bot's `GeyserListener` handles subscription filters
+- `channel_capacity: 200000` is tuned for high-frequency DEX updates
 
 ### Validator Startup Flag:
 

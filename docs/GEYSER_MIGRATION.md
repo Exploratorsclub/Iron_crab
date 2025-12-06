@@ -50,23 +50,22 @@ Create `/home/ironcrab/geyser-grpc-config.json`:
 
 ```json
 {
-  "libpath": "/opt/solana/plugins/libyellowstone_grpc_geyser.so",
-  "bind_address": "127.0.0.1:10000",
+  "libpath": "/usr/local/lib/solana/libyellowstone_grpc_geyser.so",
   "log": {
     "level": "info"
   },
   "grpc": {
-    "max_decoding_message_size": "4_194_304",
-    "channel_capacity": "100_000",
-    "unary_concurrency_limit": 100,
-    "unary_disabled": false
-  },
-  "block_fail_action": "log"
+    "address": "127.0.0.1:10000",
+    "max_decoding_message_size": 4194304,
+    "channel_capacity": 200000
+  }
 }
 ```
 
-**Note:** Yellowstone Geyser does NOT support account filters in the config file!
-Filters are applied in the **client subscription request** (the bot handles this).
+**Note:** 
+- Account filters are applied in the **client subscription** (bot code), NOT in config
+- Adjust `libpath` if your plugin is in a different location
+- Higher `channel_capacity` = better for high-frequency updates
 
 ### Step 3: Add Geyser Flag to Validator
 
