@@ -1266,8 +1266,8 @@ impl SniperEngine {
         pc_vault: &Pubkey,
     ) -> Result<f64> {
         // Fetch vault token account balances
-        let coin_balance = rpc.get_token_account_balance(coin_vault).await?;
-        let pc_balance = rpc.get_token_account_balance(pc_vault).await?;
+        let coin_balance = rpc.rpc.get_token_account_balance(coin_vault).await?;
+        let pc_balance = rpc.rpc.get_token_account_balance(pc_vault).await?;
 
         let coin_amount: u64 = coin_balance.amount.parse()
             .map_err(|e| anyhow::anyhow!("parse coin balance: {}", e))?;
