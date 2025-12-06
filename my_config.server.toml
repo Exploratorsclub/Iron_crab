@@ -141,8 +141,8 @@ program_ids = [
 
 # --- Arbitrage scanning with Auto-Discovery ---
 [arbitrage]
-interval_ms = 500  # Balanced scanning: 500ms = 2 scans/sec (event-driven reacts to updates)
-# NOTE: 200ms = aggressive (5/sec), 500ms = balanced (2/sec), 1000ms = conservative (1/sec)
+interval_ms = 300  # Faster batching: 300ms = 3.3 scans/sec (with batching, can be more aggressive)
+# NOTE: With batching, we can use lower intervals without CPU overload
 
 min_profit_bps = 100  # 1.0% minimum profit
 # With liquidity filtering in place, 100bps is optimal
@@ -153,11 +153,11 @@ pairs = []  # ignored when discovery.mode = "full-auto"
 event_driven = true  # EVENT-DRIVEN: React to WebSocket pool updates for <100ms latency
 
 [arbitrage.execution]
-max_slippage_bps = 150              # 1.5% Slippage-Toleranz im Mini-Mode
-min_profit_bps_to_execute = 50      # passt zu arbitrage.min_profit_bps
-max_position_lamports = 5000000     # 0.005 SOL Maximalgröße pro Trade
-dry_run = false                     # echte Ausführung statt nur Simulation
-priority_fee_micro_lamports = 1000  # kleine Priority Fee
+max_slippage_bps = 150              # 1.5% Slippage-Toleranz
+min_profit_bps_to_execute = 100     # MUST match min_profit_bps (avoid unprofitable trades)
+max_position_lamports = 20000000    # 0.02 SOL (~$2.80) - ensures profit > TX cost
+dry_run = false                     # echte Ausführung
+priority_fee_micro_lamports = 5000  # 0.005 SOL priority fee for competition
 
 [arbitrage.discovery]
 enable = true
@@ -170,8 +170,8 @@ base_tokens = [
 ]
 min_liquidity_sol = 2.0   # 2 SOL = ~$280 (gut für Test, findet mehr Pairs)
 min_liquidity_usd = 1000.0  # $1k (auch niedriger für mehr Test-Opportunities)
-default_ui_amount = 0.005  # 5k lamports per arbitrage cycle for small test
-top_n_per_base = 10
+default_ui_amount = 0.02   # 0.02 SOL scan size (matches max_position)
+top_n_per_base = 50        # 50 pairs per base = 150 total pairs (more opportunities)
 interval_secs = 120        # entlastet RPC (Raydium/Orca Scans seltener)
 enable_raydium = true
 enable_orca = true
