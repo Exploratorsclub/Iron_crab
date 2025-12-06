@@ -1187,8 +1187,8 @@ impl SniperEngine {
         );
 
         // Apply filters
-        let cfg = self.cfg.read();
-        if let Some(max_top1) = cfg.lp_top1_max_pct {
+        let max_top1 = self.cfg.read().lp_top1_max_pct;
+        if let Some(max_top1) = max_top1 {
             if lp_check.top1_pct > max_top1 {
                 info!(mint=%mint, top1=lp_check.top1_pct, max=max_top1, "sniper: top1 holder too concentrated");
                 self.append_pool_candidate_record(
@@ -1209,10 +1209,7 @@ impl SniperEngine {
 
         // Check burn requirement (note: config uses lp_top* fields, no separate burn field yet)
         // For now skip burn check or use a placeholder
-        // TODO: Add lp_burned_min_pct to SniperCfg if neededop* fields, no separate burn field yet)
-        // For now skip burn check or use a placeholder
         // TODO: Add lp_burned_min_pct to SniperCfg if needed
-        drop(cfg);
 
         // All checks passed - attempt buy
         info!(mint=%mint, "sniper: all filters passed, attempting buy");

@@ -60,7 +60,7 @@ impl GeyserPoolDiscovery {
     /// Process account update and determine if it's a new pool
     async fn process_account_update(
         update: GeyserAccountUpdate,
-        rpc: &Arc<SolanaRpc>,
+        _rpc: &Arc<SolanaRpc>,
     ) -> Option<PoolDiscoveryEvent> {
         // Identify DEX by owner
         let dex_type = match update.owner.to_string().as_str() {
