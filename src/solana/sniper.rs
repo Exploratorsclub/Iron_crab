@@ -1229,6 +1229,58 @@ impl SniperEngine {
         if let Err(e) = self.attempt_initial_buy(&mint, Some(liq_sol)).await {
             warn!(?e, mint=%mint, "sniper: initial buy failed");
         }
+
+        // Background task: Fetch actual liquidity from vaults (non-blocking)
+        // Only for Raydium pools that have vault addresses
+        if let (Some(coin_vault), Some(pc_vault)) = (event.coin_vault, event.pc_vault) {
+            let rpc = self.rpc.clone();
+            let pool_address = event.pool_address;
+            let mint_clone = mint;
+            
+            tokio::spawn(async move {
+                match Self::fetch_vault_liquidity(&rpc, &coin_vault, &pc_vault).await {
+                    Ok(actual_liq_sol) => {
+                        info!(
+                            pool=%pool_address,
+                            mint=%mint_clone,
+                            estimated_liq=liq_sol,
+                            actual_liq=actual_liq_sol,
+                            diff_pct=((actual_liq_sol - liq_sol) / liq_sol * 100.0),
+                            "sniper: actual vault liquidity fetched (background)"
+                        );
+                        // TODO: Store actual_liq_sol for position sizing in follow-up trades
+                        // Could update a HashMap<Pubkey, f64> of known pool liquidities
+                    }
+                    Err(e) => {
+                        debug!(?e, pool=%pool_address, "sniper: vault liquidity fetch failed (non-critical)");
+                    }
+                }
+            });
+        }
+    }
+
+    /// Fetch actual liquidity from Raydium pool vaults (for background validation)
+    async fn fetch_vault_liquidity(
+        rpc: &Arc<SolanaRpc>,
+        coin_vault: &Pubkey,
+        pc_vault: &Pubkey,
+    ) -> Result<f64> {
+        // Fetch vault token account balances
+        let coin_balance = rpc.get_token_account_balance(coin_vault).await?;
+        let pc_balance = rpc.get_token_account_balance(pc_vault).await?;
+
+        let coin_amount: u64 = coin_balance.amount.parse()
+            .map_err(|e| anyhow::anyhow!("parse coin balance: {}", e))?;
+        let pc_amount: u64 = pc_balance.amount.parse()
+            .map_err(|e| anyhow::anyhow!("parse pc balance: {}", e))?;
+
+        // Assuming quote token (pc) is SOL or SOL-equivalent
+        // Total liquidity = (pc_amount * 2) / 1e9 (convert lamports to SOL)
+        let pc_decimals = pc_balance.decimals;
+        let divisor = 10_u64.pow(pc_decimals as u32) as f64;
+        let actual_liq_sol = (pc_amount as f64 * 2.0) / divisor;
+
+        Ok(actual_liq_sol)
     }
 
     #[allow(dead_code)]
