@@ -45,7 +45,7 @@ strategy = "snipe-default"
 # --- Allocator ---
 [allocator]
 mode = "static_pct"
-rebalance_secs = 60
+rebalance_secs = 86400  # 24h = 86400s (daily rebalance)
 min_transfer_sol = 0.05
 
 # --- Strategies ---
