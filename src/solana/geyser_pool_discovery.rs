@@ -138,17 +138,16 @@ impl GeyserPoolDiscovery {
         // Offset 688: lp_amount (u64) - total LP tokens minted
         let lp_amount = u64::from_le_bytes(data[688..696].try_into().ok()?);
         
-        // Liquidity estimation from LP amount (rough heuristic)
-        // Real liquidity will be fetched from vaults in handle_pool_discovery
+        // Conservative liquidity estimation until vault fetch completes
+        // LP amount is NOT a reliable indicator of TVL due to varying decimals
+        // Use fixed reasonable estimates to avoid over-estimating
         let liquidity_lamports = if lp_amount == 0 {
-            10_000_000_000 // 10 SOL for brand new pools
-        } else if lp_amount < 1_000_000 {
-            50_000_000_000 // 50 SOL for small pools
-        } else if lp_amount < 10_000_000 {
-            500_000_000_000 // 500 SOL for medium pools
+            // Brand new pool with no LP minted yet
+            5_000_000_000 // 5 SOL default
         } else {
-            let lp_ratio = (lp_amount as f64) / 10_000_000.0;
-            (lp_ratio.sqrt() * 1000.0 * 1e9) as u64 // 1000+ SOL for large pools
+            // Any pool with LP minted: assume moderate liquidity
+            // Actual value will be fetched from vaults in background
+            50_000_000_000 // 50 SOL conservative estimate
         };
 
         Some(PoolData {
