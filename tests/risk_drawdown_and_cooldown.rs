@@ -24,7 +24,7 @@ async fn drawdown_sizing_scales_max_buy() {
         std::fs::write(&tmp, serde_json::to_vec(&kp.to_bytes().to_vec()).unwrap()).unwrap();
     }
     let treasury = Arc::new(Treasury::load(tmp.to_str().unwrap()).unwrap());
-    let engine = SniperEngine::new(rpc, cfg.clone(), None, None, treasury);
+    let engine = SniperEngine::new(rpc, cfg.clone(), None, None, treasury, None);
 
     // At 0% drawdown -> full size
     engine.test_set_realized_loss_today(0.0);
@@ -55,7 +55,7 @@ async fn cooldown_gating_blocks_and_expires() {
         std::fs::write(&tmp, serde_json::to_vec(&kp.to_bytes().to_vec()).unwrap()).unwrap();
     }
     let treasury = Arc::new(Treasury::load(tmp.to_str().unwrap()).unwrap());
-    let engine = SniperEngine::new(rpc, cfg.clone(), None, None, treasury);
+    let engine = SniperEngine::new(rpc, cfg.clone(), None, None, treasury, None);
 
     let mint = Pubkey::new_unique();
     // Mark cooldown now

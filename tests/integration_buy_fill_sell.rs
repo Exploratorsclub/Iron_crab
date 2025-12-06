@@ -22,7 +22,7 @@ async fn mock_buy_fill_sell_lifecycle() {
         std::fs::write(&tmp, serde_json::to_vec(&kp.to_bytes().to_vec()).unwrap()).unwrap();
     }
     let treasury = Arc::new(Treasury::load(tmp.to_str().unwrap()).unwrap());
-    let engine = SniperEngine::new(rpc, cfg, None, None, treasury);
+    let engine = SniperEngine::new(rpc, cfg, None, None, treasury, None);
 
     let mint = Pubkey::new_unique();
 

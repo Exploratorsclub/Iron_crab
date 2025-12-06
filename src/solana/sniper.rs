@@ -3,6 +3,7 @@
 // setzt kleine Erstkäufe mit harten Limits (Slippage/Blacklist/Owner/Freeze Auth usw.)
 #[allow(unused_imports)]
 use crate::config_reload::{diff_sniper_cfg, validate_sniper_cfg};
+use crate::solana::geyser_pool_discovery::PoolDiscoveryEvent;
 use crate::solana::dex::{orca::Orca, raydium::Raydium, Dex};
 use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
@@ -352,6 +353,7 @@ pub struct SniperEngine {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     quantile_calc: Arc<crate::quantile_impact::QuantileImpactCalculator>,
+    geyser_grpc_url: Option<String>,
 }
 
 // --- Test Helpers (feature-gated) -----------------------------------------------------------
@@ -710,6 +712,7 @@ impl SniperEngine {
         raydium: Option<Arc<Raydium>>,
         orca: Option<Arc<Orca>>,
         treasury: Arc<Treasury>,
+        geyser_grpc_url: Option<String>,
     ) -> Self {
         let (tx, rx) = tokio::sync::watch::channel(false);
 
@@ -735,6 +738,7 @@ impl SniperEngine {
             quantile_calc: Arc::new(crate::quantile_impact::QuantileImpactCalculator::new(
                 quantile_config,
             )),
+            geyser_grpc_url,
         }
     }
 
@@ -751,6 +755,7 @@ impl SniperEngine {
             shutdown_tx: tx,
             shutdown_rx: rx,
             quantile_calc: self.quantile_calc.clone(),
+            geyser_grpc_url: self.geyser_grpc_url.clone(),
         }
     }
 
@@ -1031,7 +1036,7 @@ impl SniperEngine {
 
     /// NEW: Geyser gRPC-based pool discovery (replaces WebSocket logsSubscribe)
     async fn run_with_geyser(&self, geyser_url: &str) -> Result<()> {
-        use crate::solana::geyser_pool_discovery::{GeyserPoolDiscovery, PoolDiscoveryEvent};
+        use crate::solana::geyser_pool_discovery::GeyserPoolDiscovery;
 
         // Build program list from config (default: Raydium, Orca, Pump.fun)
         let programs: Vec<Pubkey> = self
@@ -1061,7 +1066,7 @@ impl SniperEngine {
         );
 
         // Create Geyser pool discovery listener
-        let (discovery, mut event_rx) = GeyserPoolDiscovery::new(geyser_url, programs).await?;
+        let (discovery, mut event_rx) = GeyserPoolDiscovery::new(geyser_url.to_string(), programs, self.rpc.clone());
 
         // Start Geyser listener in background
         let mut shutdown_rx = self.shutdown_rx.clone();
@@ -1151,7 +1156,19 @@ impl SniperEngine {
 
         // Run LP concentration check
         let lp_check = match self.lp_lock_check(&mint).await {
-            Ok(c) => c,
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                info!(mint=%mint, "sniper: lp_lock_check returned None (no thresholds configured)");
+                self.append_pool_candidate_record(
+                    program_label,
+                    &mint,
+                    None, None, None, None, None,
+                    event.liquidity_sol,
+                    "SKIP",
+                    "lp_check_none",
+                );
+                return;
+            }
             Err(e) => {
                 warn!(?e, mint=%mint, "sniper: lp_lock_check failed");
                 self.append_pool_candidate_record(
@@ -1172,13 +1189,13 @@ impl SniperEngine {
             top3=lp_check.top3_pct,
             top5=lp_check.top5_pct,
             burned=lp_check.burned_pct,
-            program_locked=lp_check.program_locked_pct,
+            program_locked=lp_check.program_vault_pct,
             "sniper: LP concentration check complete"
         );
 
         // Apply filters
         let cfg = self.cfg.read();
-        if let Some(max_top1) = cfg.max_top1_pct {
+        if let Some(max_top1) = cfg.lp_top1_max_pct {
             if lp_check.top1_pct > max_top1 {
                 info!(mint=%mint, top1=lp_check.top1_pct, max=max_top1, "sniper: top1 holder too concentrated");
                 self.append_pool_candidate_record(
@@ -1188,7 +1205,7 @@ impl SniperEngine {
                     Some(lp_check.top3_pct),
                     Some(lp_check.top5_pct),
                     Some(lp_check.burned_pct),
-                    Some(lp_check.program_locked_pct),
+                    Some(lp_check.program_vault_pct),
                     event.liquidity_sol,
                     "SKIP",
                     &format!("top1 {:.2}% > {:.2}%", lp_check.top1_pct, max_top1),
@@ -1197,7 +1214,7 @@ impl SniperEngine {
             }
         }
 
-        if let Some(min_burned) = cfg.min_burned_pct {
+        if let Some(min_burned) = cfg.lp_burned_min_pct {
             if lp_check.burned_pct < min_burned {
                 info!(mint=%mint, burned=lp_check.burned_pct, min=min_burned, "sniper: insufficient burn");
                 self.append_pool_candidate_record(
@@ -1207,7 +1224,7 @@ impl SniperEngine {
                     Some(lp_check.top3_pct),
                     Some(lp_check.top5_pct),
                     Some(lp_check.burned_pct),
-                    Some(lp_check.program_locked_pct),
+                    Some(lp_check.program_vault_pct),
                     event.liquidity_sol,
                     "SKIP",
                     &format!("burned {:.2}% < {:.2}%", lp_check.burned_pct, min_burned),
@@ -1226,13 +1243,13 @@ impl SniperEngine {
             Some(lp_check.top3_pct),
             Some(lp_check.top5_pct),
             Some(lp_check.burned_pct),
-            Some(lp_check.program_locked_pct),
+            Some(lp_check.program_vault_pct),
             event.liquidity_sol,
             "BUY",
             "filters_passed",
         );
 
-        if let Err(e) = self.attempt_initial_buy(&mint).await {
+        if let Err(e) = self.attempt_initial_buy(&mint, event.liquidity_sol).await {
             warn!(?e, mint=%mint, "sniper: initial buy failed");
         }
     }
@@ -2221,7 +2238,7 @@ impl SniperEngine {
     pub async fn run(&self) -> Result<()> {
         self.try_load_risk_state();
         // NEW: Use Geyser gRPC if configured, otherwise fallback to WebSocket
-        if let Some(geyser_url) = &self.rpc.geyser_url {
+        if let Some(geyser_url) = &self.geyser_grpc_url {
             info!(url=%geyser_url, "sniper: using Geyser gRPC for pool discovery");
             return self.run_with_geyser(geyser_url).await;
         } else {
@@ -4116,8 +4133,9 @@ pub async fn run_sniper(
     raydium: Option<Arc<Raydium>>,
     orca: Option<Arc<Orca>>,
     treasury: Arc<Treasury>,
+    geyser_grpc_url: Option<String>,
 ) -> Result<()> {
-    let engine = SniperEngine::new(rpc, cfg, raydium, orca, treasury);
+    let engine = SniperEngine::new(rpc, cfg, raydium, orca, treasury, geyser_grpc_url);
     engine.run().await
 }
 

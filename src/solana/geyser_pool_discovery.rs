@@ -32,14 +32,18 @@ impl GeyserPoolDiscovery {
         // Create event channel for pool discoveries
         let (event_tx, event_rx) = broadcast::channel(10000);
 
-        let discovery = Self { listener, rpc };
+        let rpc_clone = rpc.clone();
+        let discovery = Self {
+            listener,
+            rpc: rpc_clone,
+        };
 
         // Spawn account processor
-        let rpc_clone = rpc.clone();
+        let rpc_clone2 = rpc.clone();
         tokio::spawn(async move {
             let mut rx = account_rx;
             while let Ok(update) = rx.recv().await {
-                if let Some(event) = Self::process_account_update(update, &rpc_clone).await {
+                if let Some(event) = Self::process_account_update(update, &rpc_clone2).await {
                     let _ = event_tx.send(event);
                 }
             }
@@ -124,7 +128,7 @@ impl GeyserPoolDiscovery {
         let quote_decimals = data[73];
 
         // Parse base/quote reserves to estimate liquidity
-        let base_reserve = u64::from_le_bytes(data[200..208].try_into().ok()?);
+        let _base_reserve = u64::from_le_bytes(data[200..208].try_into().ok()?);
         let quote_reserve = u64::from_le_bytes(data[208..216].try_into().ok()?);
 
         // Estimate total liquidity in lamports (assuming quote is SOL or USDC)

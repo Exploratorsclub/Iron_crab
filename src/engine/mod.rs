@@ -901,6 +901,8 @@ impl Engine {
                 .and_then(|a| a.discovery.as_ref())
                 .map(|d| d.log_all_inits)
                 .unwrap_or(false);
+            // Get geyser_grpc_url from config
+            let geyser_url = self.ctx.cfg.solana.geyser_grpc_url.clone();
             tokio::spawn(async move {
                 let mut cfg: SniperCfg = (&sn_cfg).into();
                 // propagate diagnostic flag from arbitrage.discovery to sniper config
@@ -911,6 +913,7 @@ impl Engine {
                     Some(raydium_ref),
                     Some(orca_ref),
                     treasury_arc,
+                    geyser_url,
                 )
                 .await
                 {
