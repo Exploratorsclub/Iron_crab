@@ -2440,7 +2440,7 @@ impl SniperEngine {
                     
                     record_shortfall(shortfall, shortfall_sol);
                     let line = format!(
-                    "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9};protocol_fee_tokens={fee_tokens};network_fee_exact={network_fee_exact};{dex_breakdown}",
+                    "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9};protocol_fee_tokens={fee_tokens};network_fee_exact={network_fee_exact}",
                     ts=ChronoUtc::now().to_rfc3339(),
                     mint=mint,
                     dex=pend.dex,
