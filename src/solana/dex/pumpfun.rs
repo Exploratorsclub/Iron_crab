@@ -7,11 +7,10 @@ use async_trait::async_trait;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    system_program,
 };
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::solana::rpc::SolanaRpc;
 use super::{Dex, Quote};
@@ -187,8 +186,8 @@ impl PumpFunDex {
                 AccountMeta::new(*associated_bonding_curve, false),
                 AccountMeta::new(*user_token_account, false),
                 AccountMeta::new(user, true), // Signer
-                AccountMeta::new_readonly(system_program::id(), false),
-                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
                 AccountMeta::new_readonly(sysvar::rent::id(), false),
                 AccountMeta::new_readonly(self.event_authority, false),
                 AccountMeta::new_readonly(self.program_id, false),
@@ -227,9 +226,9 @@ impl PumpFunDex {
                 AccountMeta::new(*associated_bonding_curve, false),
                 AccountMeta::new(*user_token_account, false),
                 AccountMeta::new(user, true), // Signer
-                AccountMeta::new_readonly(system_program::id(), false),
-                AccountMeta::new_readonly(spl_associated_token_account::id(), false),
-                AccountMeta::new_readonly(spl_token::id(), false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                AccountMeta::new_readonly(Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()), false),
+                AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
                 AccountMeta::new_readonly(self.event_authority, false),
                 AccountMeta::new_readonly(self.program_id, false),
             ],
@@ -341,10 +340,14 @@ impl Dex for PumpFunDex {
             .ok_or_else(|| anyhow!("user authority not set"))?;
 
         // Derive user token account (ATA)
-        let user_token_account = spl_associated_token_account::get_associated_token_address(
-            &user,
-            &token_mint,
+        // Convert to spl_token Pubkey for ATA derivation
+        let user_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(user.to_bytes());
+        let token_mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint.to_bytes());
+        let user_token_account_spl = spl_associated_token_account::get_associated_token_address(
+            &user_spl,
+            &token_mint_spl,
         );
+        let user_token_account = Pubkey::new_from_array(user_token_account_spl.to_bytes());
 
         let ix = if buy_token {
             // Buy: SOL → Token
