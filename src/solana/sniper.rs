@@ -1091,12 +1091,35 @@ impl SniperEngine {
             debug!(line = %line, program=%program_label, "sniper: init-like log");
             let mut seen = std::collections::HashSet::new();
             let mut did_log_init = false;
+            let mut candidates_to_check: Vec<Pubkey> = Vec::new();
+            
             for m in BASE58_RE.find_iter(&line) {
                 let s = m.as_str();
                 if !seen.insert(s) {
                     continue;
                 }
                 if let Ok(pk) = Pubkey::from_str(s) {
+                    // First, try to fetch account and check if it's a Whirlpool pool
+                    if let Ok(acc) = self.rpc.get_account_retry(&pk).await {
+                        // Check if it's an Orca Whirlpool pool account
+                        if acc.data.len() >= 261 && acc.data.len() <= 1024 {
+                            if let Some(parsed) = crate::solana::dex::orca_whirlpool_layout::parse_whirlpool(&acc.data) {
+                                debug!(pool=%pk, mint_a=%parsed.token_mint_a, mint_b=%parsed.token_mint_b, "sniper: detected Orca pool init, extracting mints");
+                                // Check both mints from the pool
+                                candidates_to_check.push(parsed.token_mint_a);
+                                candidates_to_check.push(parsed.token_mint_b);
+                                continue; // Skip treating this as a direct mint
+                            }
+                        }
+                    }
+                    // If not a pool, treat as potential mint address
+                    candidates_to_check.push(pk);
+                }
+            }
+            
+            // Now check all candidate mints
+            for pk in candidates_to_check {
+                if let Ok(pk) = Pubkey::from_str(&pk.to_string()) {
                     if allow_all_inits && !did_log_init {
                         // Diagnostic: log the first init-like occurrence even without classification
                         self.append_pool_candidate_record(
