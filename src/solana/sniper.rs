@@ -17,14 +17,13 @@ use crate::metrics; // keep metrics module in scope for qualified uses
 use crate::metrics::{
     record_fee_pct, record_network_fee, record_realized_gross_net, record_realized_pnl_sol,
     record_shortfall, record_shortfall_pct, record_swap_latency, record_trade_return,
-    COMPUTE_OVERHEAD_SOL_MICRO_TOTAL, DAILY_REALIZED_PNL_SOL_MICRO,
-    LIQUIDITY_ESTIMATE_SOL_MICRO, OPEN_POSITIONS_GAUGE, ORCA_PROTOCOL_FEE_SOL_MICRO_TOTAL,
+    DAILY_REALIZED_PNL_SOL_MICRO,
+    LIQUIDITY_ESTIMATE_SOL_MICRO, OPEN_POSITIONS_GAUGE,
     PENDING_FAILED_TOTAL, PENDING_RECONCILIATIONS_TOTAL, PROTOCOL_FEE_SOL_MICRO_TOTAL,
-    PROTOCOL_FEE_TOKENS_TOTAL, RAYDIUM_PROTOCOL_FEE_SOL_MICRO_TOTAL, REFERRER_FEE_SOL_MICRO_TOTAL,
+    PROTOCOL_FEE_TOKENS_TOTAL,
     RPC_ERRORS_TOTAL, RPC_RETRY_ATTEMPTS_TOTAL, TRADES_EXECUTED_TOTAL, TRADES_FAILED_TOTAL,
     WS_ACTIVE_CONNECTIONS, WS_HEARTBEAT_MISSES_TOTAL, WS_MESSAGES_TOTAL, WS_RECONNECTS_TOTAL,
 };
-use crate::tx_fee_parser;
 use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
 use chrono::Utc as ChronoUtc;
@@ -2454,8 +2453,7 @@ impl SniperEngine {
                     shortfall_ui=shortfall_ui,
                     shortfall_sol=shortfall_sol,
                     fee_tokens=fee_tokens,
-                    network_fee_exact=exact_network_fee,
-                    dex_breakdown=dex_fee_breakdown_str
+                    network_fee_exact=exact_network_fee
                 );
                     self.append_trade_record(&line, true);
                 }

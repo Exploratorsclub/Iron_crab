@@ -22,7 +22,7 @@ pub fn parse_fee_breakdown(
 
         // 2. Extract compute units consumed for overhead calculation
         // OptionSerializer in Solana SDK 3.x: convert to Option with .into()
-        if let Some(compute_units) = Option::<u64>::from(meta.compute_units_consumed) {
+        if let Some(compute_units) = Option::<u64>::from(meta.compute_units_consumed.clone()) {
             // Approximate compute overhead: compute_units * priority_fee_per_unit
             // Note: Priority fee is embedded in total fee, this is an approximation
             // Heuristic: ~5000 micro lamports per CU for typical priority
