@@ -544,8 +544,8 @@ impl Engine {
                 let (update_tx, mut pool_updates) = tokio::sync::broadcast::channel(50000);
 
                 // Use Geyser gRPC if configured, otherwise fall back to WebSocket
-                let geyser_url = cfg.solana.geyser_grpc_url.clone();
-                
+                let geyser_url = arb_cfg.solana.geyser_grpc_url.clone();
+
                 if let Some(geyser_endpoint) = geyser_url {
                     // Use Geyser gRPC for <10ms latency
                     tracing::info!(
@@ -553,11 +553,10 @@ impl Engine {
                         "arbitrage_task: using Geyser gRPC for account updates"
                     );
 
-                    let (listener, geyser_rx) =
-                        crate::solana::geyser_listener::GeyserListener::new(
-                            geyser_endpoint.clone(),
-                            vec![raydium_program, whirlpool_program],
-                        );
+                    let (listener, geyser_rx) = crate::solana::geyser_listener::GeyserListener::new(
+                        geyser_endpoint.clone(),
+                        vec![raydium_program, whirlpool_program],
+                    );
 
                     // Spawn Geyser listener task
                     tokio::spawn(async move {
@@ -581,11 +580,10 @@ impl Engine {
                         "arbitrage_task: using WebSocket for account updates (consider enabling Geyser for <10ms latency)"
                     );
 
-                    let (listener, ws_rx) =
-                        crate::solana::account_listener::AccountListener::new(
-                            ws_url.clone(),
-                            vec![raydium_program, whirlpool_program],
-                        );
+                    let (listener, ws_rx) = crate::solana::account_listener::AccountListener::new(
+                        ws_url.clone(),
+                        vec![raydium_program, whirlpool_program],
+                    );
                     let listener = Arc::new(listener);
 
                     // Spawn WebSocket listener task

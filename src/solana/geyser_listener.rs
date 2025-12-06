@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
-use yellowstone_grpc_proto::prelude::*;
+use yellowstone_grpc_proto::prelude::{
+    subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
+    SubscribeRequestFilterAccounts,
+};
 
 /// Event emitted when an account changes via Geyser
 #[derive(Debug, Clone)]
@@ -27,7 +30,7 @@ pub struct GeyserListener {
 
 impl GeyserListener {
     /// Create new Geyser listener
-    /// 
+    ///
     /// `endpoint`: Geyser gRPC endpoint (e.g., "http://127.0.0.1:10000")
     /// `program_ids`: DEX program IDs to monitor (Raydium, Orca)
     pub fn new(
@@ -56,19 +59,17 @@ impl GeyserListener {
         );
 
         // Connect to Geyser gRPC
-        let mut client = GeyserGrpcClient::connect(
-            self.endpoint.clone(),
-            None, // No auth token
-            None, // No custom headers
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to connect to Geyser: {}", e))?;
+        let mut client = GeyserGrpcClient::build_from_shared(self.endpoint.clone())
+            .map_err(|e| anyhow!("Failed to build Geyser client: {}", e))?
+            .connect()
+            .await
+            .map_err(|e| anyhow!("Failed to connect to Geyser: {}", e))?;
 
         info!("geyser_listener: connected successfully");
 
         // Build subscription request
         let mut accounts_filter = HashMap::new();
-        
+
         for (idx, program_id) in self.program_ids.iter().enumerate() {
             accounts_filter.insert(
                 format!("dex_{}", idx),
@@ -76,6 +77,7 @@ impl GeyserListener {
                     account: vec![],
                     owner: vec![program_id.to_string()],
                     filters: vec![],
+                    nonempty_txn_signature: None,
                 },
             );
         }
@@ -91,6 +93,7 @@ impl GeyserListener {
             commitment: Some(CommitmentLevel::Confirmed as i32),
             accounts_data_slice: vec![],
             ping: None,
+            from_slot: None,
         };
 
         // Subscribe and process stream
