@@ -101,45 +101,64 @@ impl GeyserPoolDiscovery {
             base_decimals: pool_data.base_decimals,
             quote_decimals: pool_data.quote_decimals,
             liquidity_estimate_lamports: pool_data.liquidity_lamports,
+            coin_vault: pool_data.coin_vault,
+            pc_vault: pool_data.pc_vault,
         })
     }
 
-    /// Parse Raydium AMM v4 pool account
+    /// Parse Raydium AMM v4 pool account (based on official program/src/state.rs)
     fn parse_raydium_pool(data: &[u8]) -> Option<PoolData> {
-        // Raydium AMM v4 layout (simplified - adjust offsets as needed)
+        // Raydium AMM v4 account layout: 752 bytes total
+        // Source: https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs
         if data.len() < 752 {
             return None;
         }
 
-        // Check discriminator (first 8 bytes should match pool account type)
-        // Adjust based on actual Raydium layout
-        let status = data[0];
+        // Offset 0: status (u64) - check if initialized
+        let status = u64::from_le_bytes(data[0..8].try_into().ok()?);
         if status == 0 {
-            // Not initialized
-            return None;
+            return None; // AmmStatus::Uninitialized
         }
 
-        // Parse base/quote mints (adjust offsets based on Raydium struct)
-        let base_mint = Pubkey::new_from_array(data[8..40].try_into().ok()?);
-        let quote_mint = Pubkey::new_from_array(data[40..72].try_into().ok()?);
+        // Offset 40: coin_decimals (u64)
+        let coin_decimals = u64::from_le_bytes(data[40..48].try_into().ok()?) as u8;
+        // Offset 48: pc_decimals (u64)
+        let pc_decimals = u64::from_le_bytes(data[48..56].try_into().ok()?) as u8;
 
-        // Parse decimals
-        let base_decimals = data[72];
-        let quote_decimals = data[73];
+        // Offset 400: coin_vault (Pubkey) - holds base token reserves
+        let coin_vault = Pubkey::new_from_array(data[400..432].try_into().ok()?);
+        // Offset 432: pc_vault (Pubkey) - holds quote token reserves
+        let pc_vault = Pubkey::new_from_array(data[432..464].try_into().ok()?);
 
-        // Parse base/quote reserves to estimate liquidity
-        let _base_reserve = u64::from_le_bytes(data[200..208].try_into().ok()?);
-        let quote_reserve = u64::from_le_bytes(data[208..216].try_into().ok()?);
+        // Offset 464: coin_vault_mint (Pubkey) - this is the BASE MINT!
+        let base_mint = Pubkey::new_from_array(data[464..496].try_into().ok()?);
+        // Offset 496: pc_vault_mint (Pubkey) - this is the QUOTE MINT!
+        let quote_mint = Pubkey::new_from_array(data[496..528].try_into().ok()?);
 
-        // Estimate total liquidity in lamports (assuming quote is SOL or USDC)
-        let liquidity_lamports = quote_reserve * 2; // rough estimate
+        // Offset 688: lp_amount (u64) - total LP tokens minted
+        let lp_amount = u64::from_le_bytes(data[688..696].try_into().ok()?);
+        
+        // Liquidity estimation from LP amount (rough heuristic)
+        // Real liquidity will be fetched from vaults in handle_pool_discovery
+        let liquidity_lamports = if lp_amount == 0 {
+            10_000_000_000 // 10 SOL for brand new pools
+        } else if lp_amount < 1_000_000 {
+            50_000_000_000 // 50 SOL for small pools
+        } else if lp_amount < 10_000_000 {
+            500_000_000_000 // 500 SOL for medium pools
+        } else {
+            let lp_ratio = (lp_amount as f64) / 10_000_000.0;
+            (lp_ratio.sqrt() * 1000.0 * 1e9) as u64 // 1000+ SOL for large pools
+        };
 
         Some(PoolData {
             base_mint,
             quote_mint,
-            base_decimals,
-            quote_decimals,
+            base_decimals: coin_decimals,
+            quote_decimals: pc_decimals,
             liquidity_lamports,
+            coin_vault: Some(coin_vault),
+            pc_vault: Some(pc_vault),
         })
     }
 
@@ -154,6 +173,8 @@ impl GeyserPoolDiscovery {
             base_decimals: 9, // Will need to fetch from mint account
             quote_decimals: 9,
             liquidity_lamports: 0, // Calculate from vault balances
+            coin_vault: None, // Orca uses different vault structure
+            pc_vault: None,
         })
     }
 
@@ -198,6 +219,8 @@ pub struct PoolDiscoveryEvent {
     pub base_decimals: u8,
     pub quote_decimals: u8,
     pub liquidity_estimate_lamports: u64,
+    pub coin_vault: Option<Pubkey>,
+    pub pc_vault: Option<Pubkey>,
 }
 
 struct PoolData {
@@ -206,4 +229,6 @@ struct PoolData {
     base_decimals: u8,
     quote_decimals: u8,
     liquidity_lamports: u64,
+    coin_vault: Option<Pubkey>,
+    pc_vault: Option<Pubkey>,
 }
