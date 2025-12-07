@@ -187,14 +187,19 @@ impl GeyserPoolDiscovery {
             }
         };
         
-        // Verify token mint exists on-chain
-        if !rpc.verify_token_mint(&token_mint).await {
-            debug!(
-                token_mint = %token_mint,
-                signature = %tx_update.signature,
-                "geyser_pool_discovery: token mint verification failed"
-            );
-            return None;
+        // Verify token mint exists on-chain via simple account fetch
+        match rpc.get_account_retry(&token_mint).await {
+            Ok(_) => {
+                // Mint exists, continue
+            }
+            Err(_) => {
+                debug!(
+                    token_mint = %token_mint,
+                    signature = %tx_update.signature,
+                    "geyser_pool_discovery: token mint does not exist or fetch failed"
+                );
+                return None;
+            }
         }
         
         // Extract pool address (bonding curve for Pump.fun is account[3])
