@@ -1146,8 +1146,7 @@ impl SniperEngine {
         if event.dex_type == crate::solana::geyser_pool_discovery::DexType::RaydiumAmmV4 {
             if let Some(ref ray) = self.raydium {
                 // Check if pool already exists in cache
-                let already_cached = ray.pools.contains_key(&event.pool_address);
-                if !already_cached {
+                if !ray.pool_exists(&event.pool_address) {
                     if let Err(e) = ray.load_pool_from_geyser(&event.pool_address).await {
                         warn!(pool=%event.pool_address, error=%e, "failed to load raydium pool into cache");
                     }

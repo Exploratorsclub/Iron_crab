@@ -205,6 +205,11 @@ impl Raydium {
         Ok(())
     }
 
+    /// Check if a pool is already cached
+    pub fn pool_exists(&self, pool_address: &Pubkey) -> bool {
+        self.pools.contains_key(pool_address)
+    }
+
     /// Export immutable pool snapshots (cheap clone of small fields) for backtest ingestion.
     pub fn snapshots(&self) -> Vec<PoolSnapshot> {
         self.pools
