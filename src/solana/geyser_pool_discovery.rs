@@ -13,7 +13,6 @@ use tracing::{debug, info};
 /// Pool discovery via Geyser account updates
 pub struct GeyserPoolDiscovery {
     listener: GeyserListener,
-    rpc: Arc<SolanaRpc>,
 }
 
 impl GeyserPoolDiscovery {
@@ -33,30 +32,26 @@ impl GeyserPoolDiscovery {
         // Create event channel for pool discoveries
         let (event_tx, event_rx) = broadcast::channel(10000);
 
-        let rpc_clone = rpc.clone();
-        let discovery = Self {
-            listener,
-            rpc: rpc_clone,
-        };
+        let discovery = Self { listener };
 
         // Spawn account processor
-        let rpc_clone2 = rpc.clone();
+        let rpc_clone = rpc.clone();
         let event_tx_clone = event_tx.clone();
         tokio::spawn(async move {
             let mut rx = account_rx;
             while let Ok(update) = rx.recv().await {
-                if let Some(event) = Self::process_account_update(update, &rpc_clone2).await {
+                if let Some(event) = Self::process_account_update(update, &rpc_clone).await {
                     let _ = event_tx_clone.send(event);
                 }
             }
         });
 
         // Spawn transaction processor
-        let rpc_clone3 = rpc.clone();
+        let rpc_clone2 = rpc.clone();
         tokio::spawn(async move {
             let mut rx = transaction_rx;
             while let Ok(tx_update) = rx.recv().await {
-                if let Some(event) = Self::process_transaction_update(tx_update, &rpc_clone3).await {
+                if let Some(event) = Self::process_transaction_update(tx_update, &rpc_clone2).await {
                     let _ = event_tx.send(event);
                 }
             }
@@ -328,6 +323,10 @@ impl GeyserPoolDiscovery {
     /// - Offset 32: real_sol_reserves (u64)
     /// - Offset 40: token_mint (Pubkey)
     /// - Offset 72: bonding_curve (Pubkey)
+    /// 
+    /// DEPRECATED: This method produces wrong token mints (12xtdJLo...)
+    /// Use transaction-based discovery instead (process_transaction_update)
+    #[allow(dead_code)]
     fn parse_pumpfun_bonding_curve(data: &[u8]) -> Option<PoolData> {
         if data.len() < 104 {
             tracing::info!(
