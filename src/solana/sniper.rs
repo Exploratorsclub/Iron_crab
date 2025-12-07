@@ -1096,8 +1096,20 @@ impl SniperEngine {
         // Process pool discovery events
         loop {
             tokio::select! {
-                Ok(event) = event_rx.recv() => {
-                    self.handle_pool_discovery(event).await;
+                result = event_rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            self.handle_pool_discovery(event).await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!(skipped, "sniper: Geyser event receiver lagged, skipped messages");
+                            // Continue processing - next recv() will get the latest event
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            error!("sniper: Geyser event channel closed unexpectedly");
+                            break;
+                        }
+                    }
                 }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
