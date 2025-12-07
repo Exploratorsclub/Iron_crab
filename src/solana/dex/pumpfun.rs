@@ -267,7 +267,7 @@ impl Dex for PumpFunDex {
         let token_mint = Pubkey::from_str(token_mint_str)?;
         let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
 
-        debug!(
+        info!(
             token_mint=%token_mint_str, 
             bonding_curve=%bonding_curve,
             buy_token,
@@ -278,21 +278,21 @@ impl Dex for PumpFunDex {
         let state = match self.fetch_bonding_curve(&bonding_curve).await {
             Ok(s) => s,
             Err(e) => {
-                debug!(token_mint=%token_mint_str, bonding_curve=%bonding_curve, error=?e, "pump.fun: failed to fetch bonding curve (account may not exist)");
+                info!(token_mint=%token_mint_str, bonding_curve=%bonding_curve, error=?e, "pump.fun: failed to fetch bonding curve (account may not exist)");
                 return Ok(None);
             }
         };
 
         // Check if bonding curve is complete (migrated to Raydium)
         if state.complete {
-            debug!(token_mint=%token_mint_str, bonding_curve=%bonding_curve, "pump.fun: bonding curve completed, migrated to raydium");
+            info!(token_mint=%token_mint_str, bonding_curve=%bonding_curve, "pump.fun: bonding curve completed, migrated to raydium");
             return Ok(None);
         }
 
         // Calculate output
         let amount_out = state.calculate_output(amount_in, buy_token);
 
-        debug!(
+        info!(
             token_mint=%token_mint_str,
             amount_in,
             amount_out,
@@ -302,7 +302,7 @@ impl Dex for PumpFunDex {
         );
 
         if amount_out == 0 {
-            debug!(token_mint=%token_mint_str, "pump.fun: amount_out is zero, no quote");
+            info!(token_mint=%token_mint_str, "pump.fun: amount_out is zero, no quote");
             return Ok(None);
         }
 
