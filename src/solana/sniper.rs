@@ -1938,7 +1938,7 @@ impl SniperEngine {
             }
         }
         
-        debug!(
+        info!(
             mint=%mint, 
             lamports_in, 
             pumpfun_out=pumpfun_quote_out, 
