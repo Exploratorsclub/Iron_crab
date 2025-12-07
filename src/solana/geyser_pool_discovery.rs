@@ -8,7 +8,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use std::str::FromStr;
 use tokio::sync::broadcast;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Pool discovery via Geyser account updates
 pub struct GeyserPoolDiscovery {
@@ -244,7 +244,8 @@ impl GeyserPoolDiscovery {
             virtual_sol=virtual_sol_reserves,
             real_token=real_token_reserves,
             real_sol=real_sol_reserves,
-            data_hex = %hex::encode(&data[0..104.min(data.len())]),
+            data_len=data.len(),
+            first_104_bytes=?&data[0..104.min(data.len())],
             "pump.fun bonding curve parsed"
         );
 
