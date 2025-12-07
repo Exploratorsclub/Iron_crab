@@ -142,8 +142,9 @@ impl Raydium {
     /// This allows the bot to trade on newly detected pools immediately.
     pub async fn load_pool_from_geyser(&self, pool_address: &Pubkey) -> Result<()> {
         // Fetch the full pool account data from RPC with retry for brand new pools
-        const MAX_RETRIES: usize = 5;
-        const RETRY_DELAY_MS: u64 = 30;
+        // Extended retry window: 20 attempts × 500ms = 10 seconds total
+        const MAX_RETRIES: usize = 20;
+        const RETRY_DELAY_MS: u64 = 500;
         
         let account = {
             let mut last_error = None;
