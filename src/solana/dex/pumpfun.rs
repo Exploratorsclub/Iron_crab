@@ -274,12 +274,56 @@ impl Dex for PumpFunDex {
             "pump.fun: attempting to fetch bonding curve"
         );
 
-        // Fetch bonding curve state
-        let state = match self.fetch_bonding_curve(&bonding_curve).await {
-            Ok(s) => s,
-            Err(e) => {
-                info!(token_mint=%token_mint_str, bonding_curve=%bonding_curve, error=?e, "pump.fun: failed to fetch bonding curve (account may not exist)");
-                return Ok(None);
+        // Fetch bonding curve state with retry logic for brand new tokens
+        // New tokens may not have bonding curve account created yet
+        let state = {
+            const MAX_RETRIES: usize = 5;
+            const RETRY_DELAY_MS: u64 = 30;
+            
+            let mut last_error = None;
+            let mut state_opt = None;
+            
+            for attempt in 0..MAX_RETRIES {
+                match self.fetch_bonding_curve(&bonding_curve).await {
+                    Ok(s) => {
+                        if attempt > 0 {
+                            info!(
+                                token_mint=%token_mint_str, 
+                                bonding_curve=%bonding_curve, 
+                                attempt, 
+                                "pump.fun: bonding curve fetch succeeded after retry"
+                            );
+                        }
+                        state_opt = Some(s);
+                        break;
+                    }
+                    Err(e) => {
+                        last_error = Some(e);
+                        if attempt < MAX_RETRIES - 1 {
+                            debug!(
+                                token_mint=%token_mint_str, 
+                                bonding_curve=%bonding_curve, 
+                                attempt, 
+                                "pump.fun: bonding curve not found, retrying..."
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                        }
+                    }
+                }
+            }
+            
+            match state_opt {
+                Some(s) => s,
+                None => {
+                    info!(
+                        token_mint=%token_mint_str, 
+                        bonding_curve=%bonding_curve, 
+                        error=?last_error, 
+                        "pump.fun: failed to fetch bonding curve after {} retries (account may not exist)", 
+                        MAX_RETRIES
+                    );
+                    return Ok(None);
+                }
             }
         };
 

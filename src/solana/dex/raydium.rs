@@ -140,9 +140,38 @@ impl Raydium {
     /// Load a pool from Geyser discovery event into the cache.
     /// This allows the bot to trade on newly detected pools immediately.
     pub async fn load_pool_from_geyser(&self, pool_address: &Pubkey) -> Result<()> {
-        // Fetch the full pool account data from RPC
-        let account = self.rpc.get_account_retry(pool_address).await
-            .map_err(|e| anyhow!("failed to fetch raydium pool account: {}", e))?;
+        // Fetch the full pool account data from RPC with retry for brand new pools
+        const MAX_RETRIES: usize = 5;
+        const RETRY_DELAY_MS: u64 = 30;
+        
+        let account = {
+            let mut last_error = None;
+            let mut account_opt = None;
+            
+            for attempt in 0..MAX_RETRIES {
+                match self.rpc.get_account_retry(pool_address).await {
+                    Ok(acc) => {
+                        if attempt > 0 {
+                            debug!(pool=%pool_address, attempt, "raydium: pool account fetch succeeded after retry");
+                        }
+                        account_opt = Some(acc);
+                        break;
+                    }
+                    Err(e) => {
+                        last_error = Some(e);
+                        if attempt < MAX_RETRIES - 1 {
+                            debug!(pool=%pool_address, attempt, "raydium: pool account not found, retrying...");
+                            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                        }
+                    }
+                }
+            }
+            
+            match account_opt {
+                Some(acc) => acc,
+                None => return Err(anyhow!("failed to fetch raydium pool account after {} retries: {:?}", MAX_RETRIES, last_error)),
+            }
+        };
 
         // Parse using the reader module
         let pool_state = reader::PoolV4::decode(*pool_address, &account.data)?;
