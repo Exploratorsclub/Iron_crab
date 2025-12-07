@@ -1241,7 +1241,7 @@ impl SniperEngine {
             "filters_passed",
         );
 
-        if let Err(e) = self.attempt_initial_buy(&mint, Some(liq_sol)).await {
+        if let Err(e) = self.attempt_initial_buy(&mint, Some(liq_sol), event.dex_type).await {
             warn!(?e, mint=%mint, "sniper: initial buy failed");
         }
 
@@ -1815,7 +1815,12 @@ impl SniperEngine {
     }
     /// Build (but not yet send) an initial Raydium buy swap plan. For now we only log the plan.
     /// Strategy: spend up to cfg.max_buy_sol SOL buying the candidate mint via best SOL pairing.
-    async fn attempt_initial_buy(&self, mint: &Pubkey, liq_sol: Option<f64>) -> Result<()> {
+    async fn attempt_initial_buy(
+        &self,
+        mint: &Pubkey,
+        liq_sol: Option<f64>,
+        pool_dex_type: crate::solana::geyser_pool_discovery::DexType,
+    ) -> Result<()> {
         // Choose Raydium first (faster listing) – require connector
         let ray = self.raydium.clone();
         let orca = self.orca.clone();
@@ -1834,14 +1839,16 @@ impl SniperEngine {
         // DON'T wrap SOL yet - check if route exists first!
         let msb = self.adaptive_slippage_bps();
         
-        // Try Pump.fun first (simplest, no Serum accounts needed)
+        // Try Pump.fun ONLY if the pool is actually on Pump.fun
         let mut pumpfun_quote_out: u64 = 0;
-        if let Some(ref pf) = pumpfun {
-            if let Ok(Some(q)) = pf
-                .quote_exact_in(&sol_mint.to_string(), &mint.to_string(), lamports_in)
-                .await
-            {
-                pumpfun_quote_out = q.amount_out;
+        if pool_dex_type == crate::solana::geyser_pool_discovery::DexType::PumpFun {
+            if let Some(ref pf) = pumpfun {
+                if let Ok(Some(q)) = pf
+                    .quote_exact_in(&sol_mint.to_string(), &mint.to_string(), lamports_in)
+                    .await
+                {
+                    pumpfun_quote_out = q.amount_out;
+                }
             }
         }
         
