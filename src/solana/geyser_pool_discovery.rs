@@ -84,7 +84,7 @@ impl GeyserPoolDiscovery {
             DexType::PumpFun => Self::parse_pumpfun_bonding_curve(&update.data),
         }?;
 
-        info!(
+        debug!(
             pool = %update.pubkey,
             dex = ?dex_type,
             slot = update.slot,
