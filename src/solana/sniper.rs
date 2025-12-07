@@ -1232,9 +1232,10 @@ impl SniperEngine {
 
         // Apply filters
         let max_top1 = self.cfg.read().lp_top1_max_pct;
+        info!(mint=%mint, top1=lp_check.top1_pct, max_top1=?max_top1, "sniper: checking top1 filter");
         if let Some(max_top1) = max_top1 {
             if lp_check.top1_pct > max_top1 {
-                info!(mint=%mint, top1=lp_check.top1_pct, max=max_top1, "sniper: top1 holder too concentrated");
+                info!(mint=%mint, top1=lp_check.top1_pct, max=max_top1, "sniper: top1 holder too concentrated, SKIPPING");
                 self.append_pool_candidate_record(
                     program_label,
                     &mint,
