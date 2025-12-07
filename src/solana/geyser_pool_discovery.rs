@@ -206,7 +206,7 @@ impl GeyserPoolDiscovery {
         // SOL mint for quote
         let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
         
-        info!(
+        debug!(
             signature = %tx_update.signature,
             slot = tx_update.slot,
             dex = ?dex_type,
