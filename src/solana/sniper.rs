@@ -1190,7 +1190,10 @@ impl SniperEngine {
 
         // Run LP concentration check
         let lp_check = match self.lp_lock_check(&mint).await {
-            Ok(Some(c)) => c,
+            Ok(Some(c)) => {
+                info!(mint=%mint, top1=c.top1_pct, top3=c.top3_pct, top5=c.top5_pct, "sniper: lp_lock_check returned Some(assessment)");
+                c
+            }
             Ok(None) => {
                 info!(mint=%mint, "sniper: lp_lock_check returned None (no thresholds configured)");
                 self.append_pool_candidate_record(
