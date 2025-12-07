@@ -1854,7 +1854,7 @@ impl SniperEngine {
         
         // Build Raydium plan
         let plan_opt = if let Some(r) = &ray {
-            r.build_swap_plan_auto(&sol_mint.to_string(), &mint.to_string(), lamports_in, msb)?
+            r.build_swap_plan_auto(&sol_mint.to_string(), &mint.to_string(), lamports_in, msb).await?
         } else {
             None
         };
@@ -3001,7 +3001,7 @@ impl SniperEngine {
         // Dynamic route selection for exit: compare Raydium vs Orca quotes
         let msb2 = self.adaptive_slippage_bps();
         let ray_plan = if let Some(r) = &self.raydium {
-            r.build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), sell_tokens, msb2)
+            r.build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), sell_tokens, msb2).await
                 .ok()
         } else {
             None

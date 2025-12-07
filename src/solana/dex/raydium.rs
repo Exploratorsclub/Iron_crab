@@ -380,13 +380,40 @@ impl Raydium {
     }
 
     /// Build a swap plan with heuristic compute budget estimation when caller does not want to specify limits manually.
-    pub fn build_swap_plan_auto(
+    pub async fn build_swap_plan_auto(
         &self,
         input_mint: &str,
         output_mint: &str,
         amount_in: u64,
         slippage_bps: u32,
     ) -> Result<Option<RaydiumSwapPlan>> {
+        use std::str::FromStr;
+        let in_pk = Pubkey::from_str(input_mint)?;
+        let out_pk = Pubkey::from_str(output_mint)?;
+        
+        // Find the pool
+        let (pool_addr, _forward) = self
+            .find_pool(&in_pk, &out_pk)
+            .ok_or_else(|| anyhow!("no raydium pool for pair"))?;
+
+        // Check if pool has Serum accounts populated, if not fetch them
+        let needs_serum = {
+            let pool = self.pools.get(&pool_addr)
+                .ok_or_else(|| anyhow!("pool snapshot missing"))?;
+            pool.serum_bids.is_none() || pool.serum_asks.is_none()
+        };
+
+        if needs_serum {
+            if let Err(e) = self.fetch_and_populate_serum_accounts(&pool_addr).await {
+                tracing::warn!(
+                    pool=%pool_addr,
+                    error=%e,
+                    "failed to fetch serum accounts, swap will likely fail"
+                );
+                // Don't return error, let the swap attempt continue (will fail later with better error)
+            }
+        }
+
         let base =
             self.build_swap_plan(input_mint, output_mint, amount_in, slippage_bps, None, None)?;
         let Some(_plan) = base else {
@@ -697,33 +724,63 @@ impl Dex for Raydium {
         use std::str::FromStr;
         let in_pk = Pubkey::from_str(input_mint)?;
         let out_pk = Pubkey::from_str(output_mint)?;
-        let (pool_addr, forward) = self
+        let (pool_addr, _forward) = self
             .find_pool(&in_pk, &out_pk)
             .ok_or_else(|| anyhow!("no raydium pool for pair"))?;
-        // Fetch pool snapshot for vaults & open_orders if present
-        let pool_opt = self.pools.get(&pool_addr);
-        if pool_opt.is_none() {
-            return Err(anyhow!("pool snapshot missing"));
+        
+        // Check if pool has Serum accounts populated
+        let pool = self.pools.get(&pool_addr)
+            .ok_or_else(|| anyhow!("pool snapshot missing"))?;
+        
+        // If Serum accounts are available, build full instruction
+        // Otherwise return error (caller should have fetched them already)
+        if pool.serum_bids.is_none() 
+            || pool.serum_asks.is_none() 
+            || pool.serum_event_queue.is_none()
+            || pool.serum_base_vault.is_none()
+            || pool.serum_quote_vault.is_none()
+        {
+            return Err(anyhow!(
+                "serum market accounts not populated for pool {} - fetch them first",
+                pool_addr
+            ));
         }
-        // Placeholder: open_orders & target_orders not stored; real implementation should extend SimplePool.
-        // Provide a helper requiring explicit RaydiumSwapAccounts if caller wants real swap.
-        let dir_flag = if forward { 0u8 } else { 1u8 };
-        // Use pseudo layout identical to Raydium base-in swap: tag (u8)=9 (commonly), amount_in u64 LE, min_out u64 LE, direction flag u8.
-        let mut data = Vec::with_capacity(1 + 8 + 8 + 1);
-        data.push(9u8); // tentative Raydium SwapBaseIn tag
-        data.extend_from_slice(&amount_in.to_le_bytes());
-        data.extend_from_slice(&min_out.to_le_bytes());
-        data.push(dir_flag);
-        let pseudo_ix = Instruction {
-            program_id: Self::program_id(),
-            accounts: vec![solana_sdk::instruction::AccountMeta {
-                pubkey: pool_addr,
-                is_signer: false,
-                is_writable: true,
-            }],
-            data,
+
+        // Build SerumMarketAccounts from pool data
+        let serum = SerumMarketAccounts {
+            bids: pool.serum_bids.unwrap(),
+            asks: pool.serum_asks.unwrap(),
+            event_queue: pool.serum_event_queue.unwrap(),
+            base_vault: pool.serum_base_vault.unwrap(),
+            quote_vault: pool.serum_quote_vault.unwrap(),
         };
-        Ok(vec![pseudo_ix])
+
+        // Use placeholder user accounts (will be replaced by actual caller)
+        let user_authority = Pubkey::default();
+        let user_source = Pubkey::default();
+        let user_destination = Pubkey::default();
+        let serum_program = Pubkey::from_str(OPENBOOK_V3)?;
+        let token_program = spl_token::id();
+        let rent_sysvar = solana_sdk::sysvar::rent::id();
+
+        // Build full instruction
+        let ix = self.build_swap_instruction(
+            pool_addr,
+            in_pk,
+            out_pk,
+            amount_in,
+            min_out,
+            user_authority,
+            user_source,
+            user_destination,
+            serum_program,
+            token_program,
+            rent_sysvar,
+            serum,
+            pool.target_orders,
+        )?;
+
+        Ok(vec![ix])
     }
 
     // (build_swap_instruction moved to inherent impl below)
@@ -833,6 +890,45 @@ impl Raydium {
             return Some((bids, asks, event_q, base_vault, quote_vault));
         }
         None
+    }
+
+    /// Fetch Serum market account data from RPC and populate pool's Serum fields.
+    /// This is called on-demand when a pool needs Serum accounts for swap execution.
+    pub async fn fetch_and_populate_serum_accounts(&self, pool_address: &Pubkey) -> Result<()> {
+        // Get pool from cache
+        let market_id = {
+            let pool = self.pools.get(pool_address)
+                .ok_or_else(|| anyhow!("pool not found in cache"))?;
+            pool.market_id
+                .ok_or_else(|| anyhow!("pool has no market_id"))?
+        };
+
+        // Fetch Serum market account
+        let account = self.rpc.get_account(&market_id).await
+            .map_err(|e| anyhow!("failed to fetch serum market account: {}", e))?;
+
+        // Parse Serum market accounts
+        let (bids, asks, event_queue, base_vault, quote_vault) = 
+            Self::parse_serum_market_accounts(&account.data)
+                .ok_or_else(|| anyhow!("failed to parse serum market account data"))?;
+
+        // Update pool with Serum accounts
+        if let Some(mut pool) = self.pools.get_mut(pool_address) {
+            pool.serum_bids = bids;
+            pool.serum_asks = asks;
+            pool.serum_event_queue = event_queue;
+            pool.serum_base_vault = base_vault;
+            pool.serum_quote_vault = quote_vault;
+            tracing::info!(
+                pool=%pool_address,
+                market=%market_id,
+                bids=%bids.unwrap_or_default(),
+                asks=%asks.unwrap_or_default(),
+                "fetched and populated serum market accounts"
+            );
+        }
+
+        Ok(())
     }
 }
 
