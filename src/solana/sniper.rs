@@ -12,7 +12,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::{hash::Hash, transaction::Transaction};
 use std::str::FromStr;
 use std::{collections::HashSet, sync::Arc};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 // (log subscription stub – real PubSub integration to be reintroduced with correct crate paths)
 use crate::metrics; // keep metrics module in scope for qualified uses
 use crate::metrics::{
