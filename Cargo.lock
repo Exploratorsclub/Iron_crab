@@ -2236,6 +2236,7 @@ dependencies = [
  "regex",
  "rusqlite",
  "rust_decimal",
+ "scopeguard",
  "serde",
  "serde_json",
  "serial_test",

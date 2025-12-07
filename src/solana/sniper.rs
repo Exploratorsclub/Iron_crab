@@ -348,7 +348,8 @@ pub struct SniperEngine {
     raydium: Option<Arc<Raydium>>,
     orca: Option<Arc<Orca>>,
     pumpfun: Option<Arc<PumpFunDex>>,
-    purchased: parking_lot::RwLock<HashSet<Pubkey>>, // track already bought mints (avoid double buy)
+    purchased: Arc<parking_lot::RwLock<HashSet<Pubkey>>>, // track already bought mints (avoid double buy)
+    processing: Arc<parking_lot::RwLock<HashSet<Pubkey>>>, // track mints currently being processed (deduplication)
     treasury: Arc<Treasury>,
     risk: parking_lot::RwLock<RiskState>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -744,7 +745,8 @@ impl SniperEngine {
             raydium,
             orca,
             pumpfun,
-            purchased: parking_lot::RwLock::new(HashSet::new()),
+            purchased: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            processing: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             treasury,
             risk: parking_lot::RwLock::new(RiskState::default()),
             shutdown_tx: tx,
@@ -764,7 +766,8 @@ impl SniperEngine {
             raydium: self.raydium.clone(),
             orca: self.orca.clone(),
             pumpfun: self.pumpfun.clone(),
-            purchased: parking_lot::RwLock::new(HashSet::new()),
+            purchased: self.purchased.clone(), // Share Arc-wrapped HashSets across spawned tasks
+            processing: self.processing.clone(),
             treasury: self.treasury.clone(),
             risk: parking_lot::RwLock::new(RiskState::default()),
             shutdown_tx: tx,
@@ -1131,6 +1134,33 @@ impl SniperEngine {
 
     /// Process a pool discovery event from Geyser
     async fn handle_pool_discovery(&self, event: PoolDiscoveryEvent) {
+        let mint = event.base_mint;
+        
+        // CRITICAL: Deduplication - prevent multiple parallel tasks processing same mint
+        // Same token can appear in multiple pool discovery events (different pools/bonding curves)
+        // Each spawned task would create ATAs and waste SOL on failed swaps
+        // Check if already processing or purchased
+        {
+            let processing = self.processing.read();
+            if processing.contains(&mint) {
+                debug!(mint=%mint, "mint already being processed by another task, skipping");
+                return;
+            }
+            let purchased = self.purchased.read();
+            if purchased.contains(&mint) {
+                debug!(mint=%mint, "mint already purchased, skipping");
+                return;
+            }
+        }
+        
+        // Mark as processing (will be removed when task completes)
+        self.processing.write().insert(mint);
+        
+        // Ensure cleanup happens even if task panics or returns early
+        let _cleanup_guard = scopeguard::guard((), |_| {
+            self.processing.write().remove(&mint);
+        });
+        
         let program_label = match event.dex_type {
             crate::solana::geyser_pool_discovery::DexType::RaydiumAmmV4 => "RAYDIUM",
             crate::solana::geyser_pool_discovery::DexType::OrcaWhirlpool => "ORCA",
