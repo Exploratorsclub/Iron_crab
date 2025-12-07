@@ -1200,7 +1200,27 @@ impl SniperEngine {
             }
         }
 
-        // Run LP concentration check
+        // For brand new tokens from transaction-based discovery, skip LP lock check
+        // These tokens are too new (< 1 second old) to have established holder distribution
+        // LP lock check will fail because mint account might not exist yet (data_len=0)
+        // This is intentional for ultra-fast sniping of Pump.fun tokens
+        let is_transaction_discovery = event.dex_type == crate::solana::geyser_pool_discovery::DexType::PumpFun;
+        
+        if is_transaction_discovery {
+            info!(
+                mint=%mint,
+                pool=%event.pool_address,
+                liq_sol=liq_sol,
+                "sniper: FAST TRACK - skipping LP lock check for transaction-discovered token"
+            );
+            // Proceed directly to buy attempt with liquidity info
+            if let Err(e) = self.attempt_initial_buy(&mint, liq_sol, event.dex_type).await {
+                warn!(?e, mint=%mint, "sniper: initial buy failed");
+            }
+            return;
+        }
+
+        // Run LP concentration check (only for account-based discoveries)
         let lp_check = match self.lp_lock_check(&mint).await {
             Ok(Some(c)) => {
                 info!(mint=%mint, top1=c.top1_pct, top3=c.top3_pct, top5=c.top5_pct, "sniper: lp_lock_check returned Some(assessment)");
