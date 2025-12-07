@@ -79,7 +79,16 @@ impl GeyserPoolDiscovery {
         let dex_type = match update.owner.to_string().as_str() {
             "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" => DexType::RaydiumAmmV4,
             "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" => DexType::OrcaWhirlpool,
-            "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" => DexType::PumpFun,
+            "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" => {
+                // Pump.fun: Skip account-based discovery, use transaction-based instead
+                // Account data parsing at offset 40-72 produces wrong mints (12xtdJLo...)
+                debug!(
+                    pool = %update.pubkey,
+                    slot = update.slot,
+                    "geyser_pool_discovery: Pump.fun account update ignored (using transaction-based discovery)"
+                );
+                return None;
+            }
             _ => {
                 debug!(
                     owner = %update.owner,
@@ -93,7 +102,10 @@ impl GeyserPoolDiscovery {
         let pool_data = match dex_type {
             DexType::RaydiumAmmV4 => Self::parse_raydium_pool(&update.data),
             DexType::OrcaWhirlpool => Self::parse_orca_pool(&update.data),
-            DexType::PumpFun => Self::parse_pumpfun_bonding_curve(&update.data),
+            DexType::PumpFun => {
+                // Should never reach here due to early return above
+                return None;
+            }
         }?;
 
         debug!(
@@ -124,11 +136,8 @@ impl GeyserPoolDiscovery {
     /// as instruction accounts, avoiding the need to parse account data layouts
     async fn process_transaction_update(
         tx_update: GeyserTransactionUpdate,
-        _rpc: &Arc<SolanaRpc>,
+        rpc: &Arc<SolanaRpc>,
     ) -> Option<PoolDiscoveryEvent> {
-        // For now, we'll use this to extract token mints from CreatePool instructions
-        // The token mint is typically in account_keys[1] for most DEX pool creation instructions
-        
         // Identify DEX by looking for known program IDs in account_keys
         let raydium_program = Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").ok()?;
         let orca_program = Pubkey::from_str("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc").ok()?;
@@ -144,30 +153,82 @@ impl GeyserPoolDiscovery {
             return None;
         };
         
-        // For Pump.fun CreatePool instructions, the layout is typically:
-        // account[0]: bonding curve (writable, PDA)
-        // account[1]: associated bonding curve (writable)
-        // account[2]: token mint (writable) - THIS IS WHAT WE NEED!
-        // account[3]: mint authority
-        // account[4]: system program
-        // account[5]: token program
-        // account[6]: associated token program
-        // account[7]: rent sysvar
+        // Filter: Only process pool creation transactions
+        // Buy/Sell transactions have 18 accounts, pool creations have 16 or 23
+        let account_count = tx_update.account_keys.len();
+        if dex_type == DexType::PumpFun && account_count == 18 {
+            // This is a Buy/Sell transaction, not a pool creation - ignore
+            return None;
+        }
         
-        // For now, log the transaction to help identify the correct account indices
+        // Extract token mint from instruction accounts
+        // For Pump.fun Create_v2 instruction:
+        // account[0]: Program ID
+        // account[1]: Token Mint (writable) ← THIS IS WHAT WE NEED!
+        // account[2]: Mint Authority
+        // account[3]: Bonding Curve (writable, PDA)
+        // account[4]: Associated Bonding Curve Vault (writable)
+        // ...
+        
+        let token_mint = match dex_type {
+            DexType::PumpFun => {
+                // For Pump.fun: account[1] is the token mint
+                tx_update.account_keys.get(1).copied()?
+            }
+            DexType::RaydiumAmmV4 => {
+                // For Raydium: need to analyze transaction structure
+                // For now, skip until we analyze Raydium pool creations
+                return None;
+            }
+            DexType::OrcaWhirlpool => {
+                // For Orca: need to analyze transaction structure
+                // For now, skip until we analyze Orca pool creations
+                return None;
+            }
+        };
+        
+        // Verify token mint exists on-chain
+        if !rpc.verify_token_mint(&token_mint).await {
+            debug!(
+                token_mint = %token_mint,
+                signature = %tx_update.signature,
+                "geyser_pool_discovery: token mint verification failed"
+            );
+            return None;
+        }
+        
+        // Extract pool address (bonding curve for Pump.fun is account[3])
+        let pool_address = match dex_type {
+            DexType::PumpFun => tx_update.account_keys.get(3).copied()?,
+            _ => tx_update.account_keys.get(0).copied()?,
+        };
+        
+        // SOL mint for quote
+        let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
+        
         info!(
             signature = %tx_update.signature,
             slot = tx_update.slot,
             dex = ?dex_type,
-            account_count = tx_update.account_keys.len(),
-            accounts = ?tx_update.account_keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
-            "geyser_pool_discovery: TRANSACTION DETECTED - analyzing for token mint"
+            pool = %pool_address,
+            token_mint = %token_mint,
+            account_count = account_count,
+            "geyser_pool_discovery: NEW POOL via TRANSACTION (professional method)"
         );
         
-        // TODO: Once we identify the correct account index from logs,
-        // we can extract the token mint and create a PoolDiscoveryEvent
-        // For now, return None to avoid creating false positives
-        None
+        // Create pool discovery event with transaction-based mint
+        Some(PoolDiscoveryEvent {
+            pool_address,
+            dex_type,
+            slot: tx_update.slot,
+            base_mint: token_mint,
+            quote_mint,
+            base_decimals: 9, // Standard for Pump.fun, fetch actual later if needed
+            quote_decimals: 9, // SOL decimals
+            liquidity_estimate_lamports: 30_000_000_000, // Default 30 SOL for new pools
+            coin_vault: None, // Will be fetched in background if needed
+            pc_vault: None,
+        })
     }
 
     /// Parse Raydium AMM v4 pool account (based on official program/src/state.rs)
