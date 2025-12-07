@@ -137,6 +137,74 @@ impl Raydium {
         }
     }
 
+    /// Load a pool from Geyser discovery event into the cache.
+    /// This allows the bot to trade on newly detected pools immediately.
+    pub async fn load_pool_from_geyser(&self, pool_address: &Pubkey) -> Result<()> {
+        // Fetch the full pool account data from RPC
+        let account = self.rpc.get_account_retry(pool_address).await
+            .map_err(|e| anyhow!("failed to fetch raydium pool account: {}", e))?;
+
+        // Parse using the reader module
+        let pool_state = reader::PoolV4::decode(*pool_address, &account.data)?;
+
+        // Validate the pool
+        Self::validate_pool_state(&pool_state)?;
+
+        // Derive PDAs
+        let (amm_auth, _) = Self::derive_amm_authority();
+        let serum_vault_signer = if pool_state.market_program_id.to_bytes() != [0u8; 32] {
+            let (v, _) = Self::derive_serum_vault_signer(&pool_state.market_id, &pool_state.market_program_id);
+            Some(v)
+        } else {
+            None
+        };
+
+        // Create SimplePool entry
+        let pool = SimplePool {
+            base_mint: pool_state.base_mint,
+            quote_mint: pool_state.quote_mint,
+            base_vault: pool_state.base_vault,
+            quote_vault: pool_state.quote_vault,
+            lp_reserve: pool_state.lp_reserve,
+            address: *pool_address,
+            open_orders: Some(pool_state.open_orders),
+            market_id: Some(pool_state.market_id),
+            market_program_id: Some(pool_state.market_program_id),
+            amm_authority: Some(amm_auth),
+            serum_vault_signer,
+            target_orders: pool_state.target_orders,
+            reserve_base: 0, // Will be updated by vault fetch
+            reserve_quote: 0,
+            fee_bps: 30, // Default Raydium fee
+            last_update: std::time::SystemTime::now(),
+            serum_bids: None,
+            serum_asks: None,
+            serum_event_queue: None,
+            serum_base_vault: None,
+            serum_quote_vault: None,
+        };
+
+        // Insert into pools cache
+        self.pools.insert(*pool_address, pool.clone());
+
+        // Update mint index
+        self.mint_index.entry(pool.base_mint)
+            .or_insert_with(Vec::new)
+            .push(*pool_address);
+        self.mint_index.entry(pool.quote_mint)
+            .or_insert_with(Vec::new)
+            .push(*pool_address);
+
+        tracing::info!(
+            pool=%pool_address,
+            base=%pool.base_mint,
+            quote=%pool.quote_mint,
+            "loaded raydium pool from geyser into cache"
+        );
+
+        Ok(())
+    }
+
     /// Export immutable pool snapshots (cheap clone of small fields) for backtest ingestion.
     pub fn snapshots(&self) -> Vec<PoolSnapshot> {
         self.pools

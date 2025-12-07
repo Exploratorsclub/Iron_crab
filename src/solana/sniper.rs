@@ -1130,6 +1130,15 @@ impl SniperEngine {
             "sniper: new pool discovered via Geyser"
         );
 
+        // Load Raydium pool into cache immediately
+        if event.dex_type == crate::solana::geyser_pool_discovery::DexType::RaydiumAmmV4 {
+            if let Some(ref ray) = self.raydium {
+                if let Err(e) = ray.load_pool_from_geyser(&event.pool_address).await {
+                    warn!(pool=%event.pool_address, error=%e, "failed to load raydium pool into cache");
+                }
+            }
+        }
+
         let mint = event.base_mint;
 
         // Check blacklist
