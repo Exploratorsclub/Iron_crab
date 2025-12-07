@@ -3912,13 +3912,13 @@ impl SniperEngine {
                 a
             }
             Err(e) => {
-                warn!(mint=%mint, error=?e, "sniper: mint account fetch failed");
+                info!(mint=%mint, error=?e, "sniper: mint account fetch failed, returning None");
                 return Ok(None);
             }
         };
         // SPL Mint length heuristic (approx range)
         if mint_acc.data.len() < 70 || mint_acc.data.len() > 90 {
-            debug!(mint=%mint, data_len=mint_acc.data.len(), "sniper: mint account size invalid (expected 70-90 bytes for SPL token)");
+            info!(mint=%mint, data_len=mint_acc.data.len(), "sniper: mint account size invalid, returning None");
             return Ok(None);
         }
         // Parse fields using helper and prefer RPC supply/decimals if available
@@ -3943,19 +3943,23 @@ impl SniperEngine {
             }
         }
         if supply == 0.0 {
+            info!(mint=%mint, "sniper: token supply is zero, returning None");
             return Ok(None);
         }
         // Owner blacklist gate
         let owners = self.cfg.read().blacklist_owners.clone();
         if owner_blacklisted(&owners, mint_auth_opt.as_ref(), freeze_auth_opt.as_ref()) {
+            info!(mint=%mint, "sniper: owner blacklisted, returning None");
             return Ok(None);
         }
         if self.cfg.read().require_freeze_auth_none.unwrap_or(false) && freeze_auth_opt.is_some() {
+            info!(mint=%mint, "sniper: freeze authority present, returning None");
             return Ok(None);
         }
         if let Some((lo, hi)) = self.cfg.read().require_mint_decimals_range {
             let d = decimals_eff;
             if d < lo || d > hi {
+                info!(mint=%mint, decimals=d, lo=lo, hi=hi, "sniper: decimals out of range, returning None");
                 return Ok(None);
             }
         }
@@ -3966,13 +3970,14 @@ impl SniperEngine {
             .iter()
             .any(|m| m == &mint.to_string())
         {
+            info!(mint=%mint, "sniper: mint blacklisted, returning None");
             return Ok(None);
         }
         // Largest accounts
         let list = match self.rpc.rpc.get_token_largest_accounts(mint).await {
             Ok(v) => v,
             Err(e) => {
-                warn!(?e, "largest accounts fetch failed");
+                info!(mint=%mint, error=?e, "sniper: largest accounts fetch failed, using fallback assessment");
                 // FALLBACK: Return placeholder assessment (95% concentration) when RPC unavailable
                 // This allows trades to proceed when account-index is disabled on RPC
                 // Config thresholds will still filter if configured stricter than 95%
@@ -3988,6 +3993,7 @@ impl SniperEngine {
             }
         };
         if list.is_empty() {
+            info!(mint=%mint, "sniper: largest accounts list empty, returning None");
             return Ok(None);
         }
         // Collect top5 addresses & amounts raw
