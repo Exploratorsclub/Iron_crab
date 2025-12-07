@@ -1142,11 +1142,17 @@ impl SniperEngine {
             "sniper: new pool discovered via Geyser"
         );
 
-        // Load Raydium pool into cache immediately
+        // Load Raydium pool into cache immediately (only if not already cached)
         if event.dex_type == crate::solana::geyser_pool_discovery::DexType::RaydiumAmmV4 {
             if let Some(ref ray) = self.raydium {
-                if let Err(e) = ray.load_pool_from_geyser(&event.pool_address).await {
-                    warn!(pool=%event.pool_address, error=%e, "failed to load raydium pool into cache");
+                // Check if pool already exists in cache
+                let already_cached = ray.pools.contains_key(&event.pool_address);
+                if !already_cached {
+                    if let Err(e) = ray.load_pool_from_geyser(&event.pool_address).await {
+                        warn!(pool=%event.pool_address, error=%e, "failed to load raydium pool into cache");
+                    }
+                } else {
+                    debug!(pool=%event.pool_address, "raydium pool already in cache, skipping reload");
                 }
             }
         }
