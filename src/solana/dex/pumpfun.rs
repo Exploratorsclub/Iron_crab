@@ -10,7 +10,7 @@ use solana_sdk::{
 };
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::solana::rpc::SolanaRpc;
 use super::{Dex, Quote};

@@ -4,6 +4,7 @@ use anyhow::{anyhow, ensure, Result};
 use async_trait::async_trait;
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::debug;
 
 use super::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
