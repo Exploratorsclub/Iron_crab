@@ -296,10 +296,10 @@ impl Dex for PumpFunDex {
 
         // Fetch bonding curve state with retry logic for brand new tokens
         // New tokens may not have bonding curve account created yet
-        // Extended retry window: 20 attempts × 500ms = 10 seconds total
+        // Fast retry window for sniping: 3 attempts × 200ms = 600ms total
         let state = {
-            const MAX_RETRIES: usize = 20;
-            const RETRY_DELAY_MS: u64 = 500;
+            const MAX_RETRIES: usize = 3;
+            const RETRY_DELAY_MS: u64 = 200;
             
             let mut last_error = None;
             let mut state_opt = None;
