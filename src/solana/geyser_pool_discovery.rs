@@ -1,14 +1,14 @@
 //! Professional Geyser-based Pool Discovery
 //! Replaces WebSocket log parsing with structured account updates
 
-use crate::solana::geyser_listener::{GeyserAccountUpdate, GeyserListener};
+use crate::solana::geyser_listener::{GeyserAccountUpdate, GeyserListener, GeyserTransactionUpdate};
 use crate::solana::rpc::SolanaRpc;
 use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use std::str::FromStr;
 use tokio::sync::broadcast;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Pool discovery via Geyser account updates
 pub struct GeyserPoolDiscovery {
@@ -28,7 +28,7 @@ impl GeyserPoolDiscovery {
         program_ids: Vec<Pubkey>,
         rpc: Arc<SolanaRpc>,
     ) -> (Self, broadcast::Receiver<PoolDiscoveryEvent>) {
-        let (listener, account_rx) = GeyserListener::new(geyser_endpoint, program_ids);
+        let (listener, account_rx, transaction_rx) = GeyserListener::new(geyser_endpoint, program_ids);
 
         // Create event channel for pool discoveries
         let (event_tx, event_rx) = broadcast::channel(10000);
@@ -41,10 +41,22 @@ impl GeyserPoolDiscovery {
 
         // Spawn account processor
         let rpc_clone2 = rpc.clone();
+        let event_tx_clone = event_tx.clone();
         tokio::spawn(async move {
             let mut rx = account_rx;
             while let Ok(update) = rx.recv().await {
                 if let Some(event) = Self::process_account_update(update, &rpc_clone2).await {
+                    let _ = event_tx_clone.send(event);
+                }
+            }
+        });
+
+        // Spawn transaction processor
+        let rpc_clone3 = rpc.clone();
+        tokio::spawn(async move {
+            let mut rx = transaction_rx;
+            while let Ok(tx_update) = rx.recv().await {
+                if let Some(event) = Self::process_transaction_update(tx_update, &rpc_clone3).await {
                     let _ = event_tx.send(event);
                 }
             }
@@ -105,6 +117,57 @@ impl GeyserPoolDiscovery {
             coin_vault: pool_data.coin_vault,
             pc_vault: pool_data.pc_vault,
         })
+    }
+
+    /// Process transaction update to extract token mints from instruction accounts
+    /// This is the professional approach - transaction instructions contain token mints
+    /// as instruction accounts, avoiding the need to parse account data layouts
+    async fn process_transaction_update(
+        tx_update: GeyserTransactionUpdate,
+        _rpc: &Arc<SolanaRpc>,
+    ) -> Option<PoolDiscoveryEvent> {
+        // For now, we'll use this to extract token mints from CreatePool instructions
+        // The token mint is typically in account_keys[1] for most DEX pool creation instructions
+        
+        // Identify DEX by looking for known program IDs in account_keys
+        let raydium_program = Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").ok()?;
+        let orca_program = Pubkey::from_str("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc").ok()?;
+        let pumpfun_program = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").ok()?;
+        
+        let dex_type = if tx_update.account_keys.contains(&pumpfun_program) {
+            DexType::PumpFun
+        } else if tx_update.account_keys.contains(&raydium_program) {
+            DexType::RaydiumAmmV4
+        } else if tx_update.account_keys.contains(&orca_program) {
+            DexType::OrcaWhirlpool
+        } else {
+            return None;
+        };
+        
+        // For Pump.fun CreatePool instructions, the layout is typically:
+        // account[0]: bonding curve (writable, PDA)
+        // account[1]: associated bonding curve (writable)
+        // account[2]: token mint (writable) - THIS IS WHAT WE NEED!
+        // account[3]: mint authority
+        // account[4]: system program
+        // account[5]: token program
+        // account[6]: associated token program
+        // account[7]: rent sysvar
+        
+        // For now, log the transaction to help identify the correct account indices
+        info!(
+            signature = %tx_update.signature,
+            slot = tx_update.slot,
+            dex = ?dex_type,
+            account_count = tx_update.account_keys.len(),
+            accounts = ?tx_update.account_keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+            "geyser_pool_discovery: TRANSACTION DETECTED - analyzing for token mint"
+        );
+        
+        // TODO: Once we identify the correct account index from logs,
+        // we can extract the token mint and create a PoolDiscoveryEvent
+        // For now, return None to avoid creating false positives
+        None
     }
 
     /// Parse Raydium AMM v4 pool account (based on official program/src/state.rs)
