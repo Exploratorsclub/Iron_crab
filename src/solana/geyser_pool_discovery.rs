@@ -201,7 +201,7 @@ impl GeyserPoolDiscovery {
     /// - Offset 72: bonding_curve (Pubkey)
     fn parse_pumpfun_bonding_curve(data: &[u8]) -> Option<PoolData> {
         if data.len() < 104 {
-            debug!(
+            tracing::info!(
                 data_len = data.len(),
                 "pump.fun bonding curve data too short"
             );
@@ -218,7 +218,7 @@ impl GeyserPoolDiscovery {
         let base_mint = Pubkey::new_from_array(data[40..72].try_into().ok()?);
         
         // DEBUG: Log raw bytes and parsed mint
-        debug!(
+        tracing::info!(
             data_len = data.len(),
             base_mint = %base_mint,
             mint_bytes = ?&data[40..72],
@@ -238,7 +238,7 @@ impl GeyserPoolDiscovery {
         // real_sol_reserves is in lamports, convert to SOL
         let liquidity_lamports = real_sol_reserves.max(virtual_sol_reserves);
 
-        debug!(
+        tracing::info!(
             base_mint=%base_mint,
             virtual_token=virtual_token_reserves,
             virtual_sol=virtual_sol_reserves,
