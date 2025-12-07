@@ -1214,7 +1214,7 @@ impl SniperEngine {
                 "sniper: FAST TRACK - skipping LP lock check for transaction-discovered token"
             );
             // Proceed directly to buy attempt with liquidity info
-            if let Err(e) = self.attempt_initial_buy(&mint, liq_sol, event.dex_type).await {
+            if let Err(e) = self.attempt_initial_buy(&mint, Some(liq_sol), event.dex_type).await {
                 warn!(?e, mint=%mint, "sniper: initial buy failed");
             }
             return;
