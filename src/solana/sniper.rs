@@ -3881,7 +3881,7 @@ impl SniperEngine {
         // Only run if any threshold configured
         {
             let r = self.cfg.read();
-            debug!(
+            info!(
                 mint=%mint,
                 top1=?r.lp_top1_max_pct,
                 top3=?r.lp_top3_max_pct,
@@ -3892,7 +3892,7 @@ impl SniperEngine {
                 && r.lp_top3_max_pct.is_none()
                 && r.lp_top5_max_pct.is_none()
             {
-                debug!(mint=%mint, "sniper: no lp thresholds configured or insufficient data");
+                info!(mint=%mint, "sniper: no lp thresholds configured or insufficient data");
                 return Ok(None);
             }
         }
