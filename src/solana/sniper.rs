@@ -1529,7 +1529,7 @@ impl SniperEngine {
                                     "BUY_ATTEMPT",
                                     "passes concentration+liquidity",
                                 );
-                                if let Err(e) = self.attempt_initial_buy(&pk, liq_sol).await
+                                if let Err(e) = self.attempt_initial_buy(&pk, liq_sol, crate::solana::geyser_pool_discovery::DexType::RaydiumAmmV4).await
                                 {
                                     warn!(mint = %pk, error = ?e, "sniper: initial buy failed");
                                 }
@@ -1644,7 +1644,7 @@ impl SniperEngine {
                                     }
                                     // Avoid duplicate buys
                                     if !self.purchased.read().contains(&pk) {
-                                        if let Err(e) = self.attempt_initial_buy(&pk, liq_sol).await
+                                        if let Err(e) = self.attempt_initial_buy(&pk, liq_sol, crate::solana::geyser_pool_discovery::DexType::RaydiumAmmV4).await
                                         {
                                             warn!(mint = %pk, error = ?e, "sniper: initial buy failed");
                                         }

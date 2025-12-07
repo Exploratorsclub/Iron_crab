@@ -760,7 +760,7 @@ impl Dex for Raydium {
         let user_source = Pubkey::default();
         let user_destination = Pubkey::default();
         let serum_program = Pubkey::from_str(OPENBOOK_V3)?;
-        let token_program = spl_token::id();
+        let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")?;
         let rent_sysvar = solana_sdk::sysvar::rent::id();
 
         // Build full instruction
@@ -904,7 +904,7 @@ impl Raydium {
         };
 
         // Fetch Serum market account
-        let account = self.rpc.get_account(&market_id).await
+        let account = self.rpc.get_account_retry(&market_id).await
             .map_err(|e| anyhow!("failed to fetch serum market account: {}", e))?;
 
         // Parse Serum market accounts
