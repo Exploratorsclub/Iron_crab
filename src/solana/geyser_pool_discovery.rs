@@ -201,6 +201,10 @@ impl GeyserPoolDiscovery {
     /// - Offset 72: bonding_curve (Pubkey)
     fn parse_pumpfun_bonding_curve(data: &[u8]) -> Option<PoolData> {
         if data.len() < 104 {
+            debug!(
+                data_len = data.len(),
+                "pump.fun bonding curve data too short"
+            );
             return None;
         }
 
@@ -212,6 +216,14 @@ impl GeyserPoolDiscovery {
 
         // Token mint (base)
         let base_mint = Pubkey::new_from_array(data[40..72].try_into().ok()?);
+        
+        // DEBUG: Log raw bytes and parsed mint
+        debug!(
+            data_len = data.len(),
+            base_mint = %base_mint,
+            mint_bytes = ?&data[40..72],
+            "pump.fun: parsed token mint from geyser data"
+        );
         
         // Quote mint is always SOL for Pump.fun
         let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
@@ -232,6 +244,7 @@ impl GeyserPoolDiscovery {
             virtual_sol=virtual_sol_reserves,
             real_token=real_token_reserves,
             real_sol=real_sol_reserves,
+            data_hex = %hex::encode(&data[0..104.min(data.len())]),
             "pump.fun bonding curve parsed"
         );
 
