@@ -3928,24 +3928,32 @@ impl SniperEngine {
         };
         // Fetch mint account
         debug!(mint=%mint, "sniper: fetching mint account for LP check");
-        let mint_acc = match self.rpc.get_account_retry(mint).await {
+        let mint_acc_opt = match self.rpc.get_account_retry(mint).await {
             Ok(a) => {
                 debug!(mint=%mint, data_len=a.data.len(), "sniper: mint account fetched successfully");
-                a
+                Some(a)
             }
             Err(e) => {
-                info!(mint=%mint, error=?e, "sniper: mint account fetch failed, returning None");
-                return Ok(None);
+                // For brand new Pump.fun tokens, the mint account might not exist yet
+                // Use fallback values and skip authority checks
+                info!(mint=%mint, error=?e, "sniper: mint account fetch failed, using fallback for brand new tokens");
+                None
             }
         };
-        // SPL Mint length heuristic (approx range)
-        if mint_acc.data.len() < 70 || mint_acc.data.len() > 90 {
-            info!(mint=%mint, data_len=mint_acc.data.len(), "sniper: mint account size invalid, returning None");
-            return Ok(None);
-        }
-        // Parse fields using helper and prefer RPC supply/decimals if available
-        let (mint_auth_opt, freeze_auth_opt, parsed_decimals, parsed_supply_raw) =
-            parse_spl_mint_fields(&mint_acc.data);
+        
+        // Parse mint account if available, otherwise use defaults
+        let (mint_auth_opt, freeze_auth_opt, parsed_decimals, parsed_supply_raw) = if let Some(ref acc) = mint_acc_opt {
+            // SPL Mint length heuristic (approx range)
+            if acc.data.len() < 70 || acc.data.len() > 90 {
+                info!(mint=%mint, data_len=acc.data.len(), "sniper: mint account size invalid, returning None");
+                return Ok(None);
+            }
+            parse_spl_mint_fields(&acc.data)
+        } else {
+            // Fallback for brand new tokens (Pump.fun defaults)
+            (None, None, 6u8, 1_000_000_000u64) // 1B supply with 6 decimals is common for Pump.fun
+        };
+        
         // Try authoritative RPC getTokenSupply for decimals and amount
         let mut decimals_eff = parsed_decimals;
         let mut supply = if parsed_decimals == 0 {
