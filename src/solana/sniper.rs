@@ -1882,9 +1882,15 @@ impl SniperEngine {
             }
         }
         
-        // Build Raydium plan
+        // Build Raydium plan (gracefully handle errors - don't fail if Raydium unavailable)
         let plan_opt = if let Some(r) = &ray {
-            r.build_swap_plan_auto(&sol_mint.to_string(), &mint.to_string(), lamports_in, msb).await?
+            match r.build_swap_plan_auto(&sol_mint.to_string(), &mint.to_string(), lamports_in, msb).await {
+                Ok(plan) => plan,
+                Err(e) => {
+                    debug!(mint=%mint, error=?e, "sniper: raydium swap plan failed, will try other DEXs");
+                    None
+                }
+            }
         } else {
             None
         };
