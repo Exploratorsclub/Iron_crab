@@ -1099,7 +1099,13 @@ impl SniperEngine {
                 result = event_rx.recv() => {
                     match result {
                         Ok(event) => {
-                            self.handle_pool_discovery(event).await;
+                            // CRITICAL: Spawn handling in background to avoid blocking the event loop
+                            // Each pool discovery (especially Pump.fun) can take 2-3 seconds due to RPC delays
+                            // Without spawning, we'd only process ~20 tokens/minute instead of 1000+
+                            let engine = self.clone_for_spawn();
+                            tokio::spawn(async move {
+                                engine.handle_pool_discovery(event).await;
+                            });
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             warn!(skipped, "sniper: Geyser event receiver lagged, skipped messages");
