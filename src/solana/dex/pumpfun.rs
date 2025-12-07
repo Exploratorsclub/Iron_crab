@@ -265,6 +265,26 @@ impl Dex for PumpFunDex {
         };
 
         let token_mint = Pubkey::from_str(token_mint_str)?;
+        
+        // CRITICAL: Verify token mint exists before wasting time on bonding curve
+        // Geyser can report accounts from failed/rolled-back transactions
+        match self.rpc.get_account_retry(&token_mint).await {
+            Ok(_) => {
+                debug!(
+                    token_mint=%token_mint_str,
+                    "pump.fun: token mint verified, proceeding to bonding curve"
+                );
+            }
+            Err(e) => {
+                info!(
+                    token_mint=%token_mint_str,
+                    error=%e,
+                    "pump.fun: token mint does not exist (likely failed transaction from Geyser)"
+                );
+                return Ok(None);
+            }
+        }
+        
         let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
 
         info!(
