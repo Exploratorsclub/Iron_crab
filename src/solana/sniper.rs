@@ -2151,13 +2151,16 @@ impl SniperEngine {
             }
         };
         
-        // NOW wrap SOL (only after confirming swap instructions exist!)
-        let (_wsol_ata_actual, _wrap_sig) = match self.treasury.wrap_sol(&self.rpc, lamports_in).await {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(anyhow::anyhow!("wrap_sol failed with {} lamports after route confirmed: {:?}", lamports_in, e));
-            }
-        };
+        // CRITICAL: Pump.fun uses native SOL from wallet, NOT wrapped SOL!
+        // Only wrap SOL for Raydium/Orca which require WSOL ATAs
+        if chosen_dex != ChosenDex::PumpFun {
+            let (_wsol_ata_actual, _wrap_sig) = match self.treasury.wrap_sol(&self.rpc, lamports_in).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(anyhow::anyhow!("wrap_sol failed with {} lamports after route confirmed: {:?}", lamports_in, e));
+                }
+            };
+        }
         
         // NOW ensure dest ATA exists (only when swap is actually possible!)
         // This avoids wasting SOL creating ATAs for failed swaps
