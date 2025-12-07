@@ -13,10 +13,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 async fn test_token(rpc: &Arc<SolanaRpc>, token_mint: &str, description: &str) -> Result<()> {
-    println!("\n{'='*60}");
+    println!("\n{}", "=".repeat(60));
     println!("Testing: {}", description);
     println!("Token: {}", token_mint);
-    println!("{'='*60}");
+    println!("{}", "=".repeat(60));
     
     let pumpfun = PumpFunDex::new(rpc.clone())?;
     let token_pubkey = Pubkey::from_str(token_mint)?;
@@ -83,8 +83,8 @@ async fn test_token(rpc: &Arc<SolanaRpc>, token_mint: &str, description: &str) -
             println!("✅ Quote successful!");
             println!("   Input: {} lamports (0.01 SOL)", amount_in);
             println!("   Output: {} tokens", quote.amount_out);
-            println!("   Price Impact: {:.2}%", quote.price_impact * 100.0);
-            println!("   Fee: {:.2}%", quote.fee * 100.0);
+            println!("   Price Impact: {:.2} bps", quote.price_impact_bps);
+            println!("   Fee: {:.2} bps", quote.fee_bps);
         }
         None => {
             println!("❌ Quote returned None (no route available)");
@@ -118,9 +118,9 @@ async fn test_pumpfun_with_real_tokens() -> Result<()> {
         "Token 2 - 52min old, 100% bonding curve"
     ).await?;
     
-    println!("\n{'='*60}");
+    println!("\n{}", "=".repeat(60));
     println!("✅ All tests complete!");
-    println!("{'='*60}\n");
+    println!("{}\n", "=".repeat(60));
     
     Ok(())
 }
