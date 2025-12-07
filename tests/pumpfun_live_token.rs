@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use ironcrab::solana::dex::pumpfun::PumpFunDex;
-use ironcrab::solana::dex::Dex;
+use ironcrab::solana::dex::Dex; // Trait needed for quote_exact_in method
 use ironcrab::solana::rpc::SolanaRpc;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
@@ -50,12 +50,13 @@ async fn test_pumpfun_live_token_quote() -> Result<()> {
             println!("\n=== Testing Quote ===");
             println!("Input: {} lamports (0.01 SOL)", amount_in);
             
-            match pumpfun.get_quote(sol_mint, token_mint, amount_in).await? {
+            match pumpfun.quote_exact_in(sol_mint, token_mint, amount_in).await? {
                 Some(quote) => {
                     println!("✅ Quote successful!");
                     println!("  Amount out: {}", quote.amount_out);
-                    println!("  Price impact: {:.2}%", quote.price_impact * 100.0);
-                    println!("  Expected slippage: {:.2}%", quote.expected_slippage * 100.0);
+                    println!("  Price impact: {:.2}%", quote.price_impact_bps as f64 / 100.0);
+                    println!("  Fee: {:.2}%", quote.fee_bps as f64 / 100.0);
+                    println!("  Route: {}", quote.route.join(" -> "));
                 }
                 None => {
                     println!("❌ Quote returned None");
