@@ -553,7 +553,7 @@ impl Engine {
                         "arbitrage_task: using Geyser gRPC for account updates"
                     );
 
-                    let (listener, geyser_rx) = crate::solana::geyser_listener::GeyserListener::new(
+                    let (listener, geyser_rx, _transaction_rx) = crate::solana::geyser_listener::GeyserListener::new(
                         geyser_endpoint.clone(),
                         vec![raydium_program, whirlpool_program],
                     );

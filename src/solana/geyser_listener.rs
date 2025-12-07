@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{bs58, pubkey::Pubkey};
 use std::collections::HashMap;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
@@ -194,12 +194,12 @@ impl GeyserListener {
                                 transaction_count += 1;
 
                                 if let Some(tx) = tx_update.transaction {
-                                    // Extract signature from first signature in transaction
-                                    let signature = tx
-                                        .signatures
-                                        .first()
-                                        .map(|s| bs58::encode(s).into_string())
-                                        .unwrap_or_else(|| "unknown".to_string());
+                                    // Extract signature from transaction
+                                    let signature = if !tx.signature.is_empty() {
+                                        bs58::encode(&tx.signature).into_string()
+                                    } else {
+                                        "unknown".to_string()
+                                    };
 
                                     // Extract account keys from transaction message
                                     let mut account_keys = Vec::new();
