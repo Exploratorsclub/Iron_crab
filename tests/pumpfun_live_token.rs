@@ -2,7 +2,7 @@
 //! Token: AA8Sb5tu2bvLWR2wJ8ueL1MnVAWeCDVQrPhJqog9pump
 
 use anyhow::Result;
-use ironcrab::solana::dex::pumpfun::PumpFun;
+use ironcrab::solana::dex::pumpfun::PumpFunDex;
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
 use solana_sdk::pubkey::Pubkey;
@@ -20,10 +20,10 @@ async fn test_pumpfun_live_token_quote() -> Result<()> {
         .unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
     
     println!("Connecting to RPC: {}", rpc_url);
-    let rpc = Arc::new(SolanaRpc::new(&rpc_url)?);
+    let rpc = Arc::new(SolanaRpc::new(&rpc_url));
     
     // Create PumpFun instance
-    let pumpfun = PumpFun::new(rpc.clone())?;
+    let pumpfun = PumpFunDex::new(rpc.clone())?;
     
     // Derive bonding curve address
     let token_pubkey = Pubkey::from_str(token_mint)?;
@@ -91,8 +91,8 @@ async fn test_pumpfun_pda_derivation() -> Result<()> {
     let rpc_url = std::env::var("SOLANA_RPC_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
     
-    let rpc = Arc::new(SolanaRpc::new(&rpc_url)?);
-    let pumpfun = PumpFun::new(rpc.clone())?;
+    let rpc = Arc::new(SolanaRpc::new(&rpc_url));
+    let pumpfun = PumpFunDex::new(rpc.clone())?;
     
     let token_pubkey = Pubkey::from_str(token_mint)?;
     let (bonding_curve, bump) = pumpfun.derive_bonding_curve(&token_pubkey);
