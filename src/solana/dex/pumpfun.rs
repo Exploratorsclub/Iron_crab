@@ -268,6 +268,11 @@ impl Dex for PumpFunDex {
         
         // CRITICAL: Verify token mint exists before wasting time on bonding curve
         // Geyser can report accounts from failed/rolled-back transactions
+        /* 
+           DISABLED for sniping speed:
+           RPC nodes are too slow to index the mint account immediately after creation.
+           We trust the Geyser instruction parser. If the mint is invalid, the bonding curve fetch will fail anyway.
+        
         match self.rpc.get_account_retry(&token_mint).await {
             Ok(_) => {
                 debug!(
@@ -284,6 +289,7 @@ impl Dex for PumpFunDex {
                 return Ok(None);
             }
         }
+        */
         
         let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
 
