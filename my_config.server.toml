@@ -135,11 +135,11 @@ oracle_sol_usd_override = 100.0
 log_retention_days = 30
 log_cleanup_interval_hours = 24
 
-# Explizit abonnierte DEX Programme (Raydium AMM v4, Orca Whirlpool, Pump.fun)
+# Explizit abonnierte DEX Programme für SNIPER (Pump.fun primär, Raydium sekundär)
+# ORCA REMOVED: Zu viele etablierte Tokens, kaum echte new token launches
 program_ids = [
-	"675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM v4
-	"whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  # Orca Whirlpool
-	"6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun
+	"6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun (PRIMARY - token birth)
+	"675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM v4 (SECONDARY - migrations)
 ]
 
 # --- Arbitrage scanning with Auto-Discovery ---
