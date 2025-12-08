@@ -93,12 +93,14 @@ lp_top5_max_pct = 0.97  # Top 5 holders max 97%
 # If 5 wallets control 97%+ = coordinated rug team
 
 ## 2. LIQUIDITY AMOUNT - COMMITMENT SIGNAL
-min_pool_liquidity_sol = 0.5  # Minimum 0.5 SOL (~$70) - TESTING MODE
-# Why 0.5 SOL (TESTING):
-# - <1 SOL = zero-effort scam (filtered)
-# - 1-5 SOL = low commitment (risky but catches some gems)
-# - >5 SOL = serious project (fewer opportunities)
-# Sweet spot: 2 SOL filters trash, keeps real launches
+min_pool_liquidity_sol = 0.01  # Minimum 0.01 SOL (~$1.40) - AGGRESSIVE TESTING MODE
+# Why 0.01 SOL (AGGRESSIVE TESTING):
+# - Catches more opportunities including micro-cap gems
+# - Relies heavily on LP concentration + stop loss for safety
+# - <0.01 SOL = absolute zero-effort scam (filtered)
+# - 0.01-0.5 SOL = very risky but real launches happen here
+# - >0.5 SOL = more serious (fewer false positives)
+# Sweet spot for testing: 0.01 SOL to see maximum activity
 
 ## 3. TOKEN AUTHORITY CHECKS - SECONDARY INDICATORS
 require_freeze_auth_none = false  # Don't require (filters too many good projects)

@@ -4036,18 +4036,24 @@ impl SniperEngine {
             (parsed_supply_raw as f64) / 10f64.powi(parsed_decimals as i32)
         };
         if let Ok(s) = self.rpc.rpc.get_token_supply(mint).await {
-            // Use RPC decimals and amount if parse succeeds
-            decimals_eff = s.decimals;
+            // Use RPC decimals and amount if parse succeeds AND supply is non-zero
             if let Ok(v) = s.amount.parse::<u128>() {
-                supply = if s.decimals == 0 {
+                let rpc_supply = if s.decimals == 0 {
                     v as f64
                 } else {
                     (v as f64) / 10f64.powi(s.decimals as i32)
                 };
+                // Only use RPC data if it's non-zero (otherwise keep fallback)
+                if rpc_supply > 0.0 {
+                    decimals_eff = s.decimals;
+                    supply = rpc_supply;
+                } else {
+                    info!(mint=%mint, "sniper: RPC returned zero supply, keeping fallback values");
+                }
             }
         }
         if supply == 0.0 {
-            info!(mint=%mint, "sniper: token supply is zero, returning None");
+            info!(mint=%mint, "sniper: token supply is zero after all checks, returning None");
             return Ok(None);
         }
         // Owner blacklist gate
