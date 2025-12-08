@@ -219,11 +219,19 @@ impl GeyserListener {
                                                 }
                                             }
                                             
-                                            // Extract first instruction's accounts (for Pump.fun Create)
-                                            if let Some(first_ix) = message.instructions.first() {
-                                                for &account_idx in &first_ix.accounts {
-                                                    if let Some(pubkey) = account_keys.get(account_idx as usize) {
-                                                        instruction_accounts.push(*pubkey);
+                                            // Find the Pump.fun/Raydium/Orca instruction (not first, could be 2nd or 3rd)
+                                            // Look for instruction that uses our monitored program
+                                            for ix in &message.instructions {
+                                                if let Some(program_pubkey) = account_keys.get(ix.program_id_index as usize) {
+                                                    // Check if this instruction is for one of our monitored programs
+                                                    if self.program_ids.contains(program_pubkey) {
+                                                        // Extract accounts for this instruction
+                                                        for &account_idx in &ix.accounts {
+                                                            if let Some(pubkey) = account_keys.get(account_idx as usize) {
+                                                                instruction_accounts.push(*pubkey);
+                                                            }
+                                                        }
+                                                        break; // Found our instruction, stop searching
                                                     }
                                                 }
                                             }
