@@ -50,7 +50,7 @@ impl Engine {
         let ctx = Arc::new(EngineContext {
             cfg: cfg.clone(),
             rpc: rpc.clone(),
-            treasury,
+            treasury: treasury.clone(),
         });
 
         // Initialize DEX connectors for router
