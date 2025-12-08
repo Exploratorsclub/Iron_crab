@@ -280,6 +280,35 @@ impl Treasury {
         Ok((ata, Some(ix)))
     }
 
+    /// Build ATA creation instruction for Pump.fun (skips RPC checks for speed).
+    /// Assumes standard SPL Token Program and always returns the idempotent create instruction.
+    pub fn build_ata_ix_pumpfun(
+        &self,
+        owner: &SdkPubkey,
+        mint: &SdkPubkey,
+    ) -> (SdkPubkey, solana_sdk::instruction::Instruction) {
+        let token_prog = spl_token::id();
+        
+        // Derive ATA address
+        let ata_prog = get_associated_token_address_with_program_id(
+            &sdk_to_spl(owner),
+            &sdk_to_spl(mint),
+            &token_prog,
+        );
+        let ata = spl_to_sdk(&ata_prog);
+
+        // Build create instruction (idempotent)
+        let ix_prog = create_associated_token_account_idempotent(
+            &sdk_to_spl(&self.pubkey()),
+            &sdk_to_spl(owner),
+            &sdk_to_spl(mint),
+            &token_prog,
+        );
+        let ix = prog_ix_to_sdk(ix_prog);
+        
+        (ata, ix)
+    }
+
     /// Ensure ATA exists (idempotent). Returns ATA **SDK** Pubkey.
     /// DEPRECATED: Use build_ata_ix to include ATA creation in swap TX instead of separate TX.
     pub async fn ensure_ata(

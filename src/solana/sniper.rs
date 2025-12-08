@@ -2260,11 +2260,16 @@ impl SniperEngine {
         }
         
         // Build ATA creation instruction for destination token
-        let (_dest_ata, maybe_ata_ix) = self
-            .treasury
-            .build_ata_ix(&self.rpc, &owner_sdk, &mint_sdk)
-            .await
-            .map_err(|e| anyhow::anyhow!("build_ata_ix failed: {:?}", e))?;
+        let (_dest_ata, maybe_ata_ix) = if chosen_dex == ChosenDex::PumpFun {
+            // Pump.fun optimization: Skip RPC lookup, assume standard SPL Token Program
+            let (ata, ix) = self.treasury.build_ata_ix_pumpfun(&owner_sdk, &mint_sdk);
+            (ata, Some(ix))
+        } else {
+            self.treasury
+                .build_ata_ix(&self.rpc, &owner_sdk, &mint_sdk)
+                .await
+                .map_err(|e| anyhow::anyhow!("build_ata_ix failed: {:?}", e))?
+        };
         
         if let Some(ata_ix) = maybe_ata_ix {
             pre_swap_ixs.push(ata_ix);
