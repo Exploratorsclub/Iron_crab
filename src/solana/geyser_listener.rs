@@ -2,11 +2,12 @@
 //! Uses Agave 3.0's native Geyser integration for <10ms latency
 
 use anyhow::{anyhow, Result};
+use tracing::debug;
 use futures::StreamExt;
 use solana_sdk::{bs58, pubkey::Pubkey};
 use std::collections::HashMap;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
