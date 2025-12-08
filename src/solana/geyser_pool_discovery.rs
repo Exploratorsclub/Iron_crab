@@ -193,6 +193,34 @@ impl GeyserPoolDiscovery {
                     return None; // Not a CREATE instruction
                 }
                 
+                // Filter by instruction discriminator to distinguish CREATE from BUY/SELL
+                // Pump.fun instruction discriminators (first 8 bytes of instruction data):
+                // - CREATE: 0x181ec828051c0777 (sighash of "global:create")
+                // - BUY: 0x66063d1201daebea (sighash of "global:buy")
+                // - SELL: 0x33e685a4017f83ad (sighash of "global:sell")
+                const PUMPFUN_CREATE_DISCRIMINATOR: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
+                
+                if tx_update.instruction_data.len() >= 8 {
+                    let discriminator = &tx_update.instruction_data[0..8];
+                    if discriminator != PUMPFUN_CREATE_DISCRIMINATOR {
+                        // Not a CREATE instruction (likely BUY or SELL)
+                        debug!(
+                            signature = %tx_update.signature,
+                            discriminator = ?discriminator,
+                            "geyser_pool_discovery: Pump.fun instruction is not CREATE (likely BUY/SELL) - ignoring"
+                        );
+                        return None;
+                    }
+                } else {
+                    // No instruction data or too short - can't verify
+                    debug!(
+                        signature = %tx_update.signature,
+                        data_len = tx_update.instruction_data.len(),
+                        "geyser_pool_discovery: Pump.fun instruction has no discriminator - ignoring"
+                    );
+                    return None;
+                }
+                
                 // Use INSTRUCTION accounts, not transaction account_keys!
                 // ix_account[0]: Mint (writable, newly created)
                 // ix_account[1]: Mint Authority (creator/signer)

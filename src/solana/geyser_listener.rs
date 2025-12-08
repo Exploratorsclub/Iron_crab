@@ -31,6 +31,8 @@ pub struct GeyserTransactionUpdate {
     pub account_keys: Vec<Pubkey>,
     /// First instruction's account indices (for Pump.fun Create)
     pub instruction_accounts: Vec<Pubkey>,
+    /// Instruction data (first 8 bytes = discriminator)
+    pub instruction_data: Vec<u8>,
 }
 
 pub struct GeyserListener {
@@ -206,6 +208,7 @@ impl GeyserListener {
                                     // Extract account keys from transaction message
                                     let mut account_keys = Vec::new();
                                     let mut instruction_accounts = Vec::new();
+                                    let mut instruction_data = Vec::new();
                                     
                                     if let Some(transaction) = &tx.transaction {
                                         if let Some(message) = &transaction.message {
@@ -231,6 +234,8 @@ impl GeyserListener {
                                                                 instruction_accounts.push(*pubkey);
                                                             }
                                                         }
+                                                        // Extract instruction data
+                                                        instruction_data = ix.data.clone();
                                                         break; // Found our instruction, stop searching
                                                     }
                                                 }
@@ -243,6 +248,7 @@ impl GeyserListener {
                                         slot: tx_update.slot,
                                         account_keys,
                                         instruction_accounts,
+                                        instruction_data,
                                     };
 
                                     // Broadcast to subscribers
