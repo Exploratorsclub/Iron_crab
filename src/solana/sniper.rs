@@ -1192,19 +1192,25 @@ impl SniperEngine {
             }
         }
 
-        let mint = event.base_mint;
-
-        // Skip non-SOL pairs (we only trade SOL/Token pairs for now)
+        // Determine which mint is the new token (not SOL/WSOL)
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        
+        // Skip non-SOL pairs (we only trade SOL/Token pairs for now)
         if event.base_mint != sol_mint && event.quote_mint != sol_mint {
             debug!(
-                mint=%mint, 
                 base=%event.base_mint, 
                 quote=%event.quote_mint, 
                 "sniper: skipping non-SOL pair (Token/Token or Token/Stablecoin)"
             );
             return;
         }
+        
+        // The new token mint is whichever side is NOT SOL
+        let mint = if event.base_mint == sol_mint {
+            event.quote_mint  // SOL is base, so new token is quote
+        } else {
+            event.base_mint   // New token is base, SOL is quote
+        };
 
         // Check blacklist
         if self.cfg.read().blacklist_mints.contains(&mint.to_string()) {
