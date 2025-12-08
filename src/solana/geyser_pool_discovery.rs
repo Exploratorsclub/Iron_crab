@@ -214,14 +214,14 @@ impl GeyserPoolDiscovery {
                 if tx_update.instruction_data.len() >= 8 {
                     let discriminator = &tx_update.instruction_data[0..8];
                     
-                    // DEBUG: Log discriminator for analysis
-                    debug!(
+                    // DEBUG: Log discriminator for analysis (INFO level to ensure visibility)
+                    tracing::info!(
                         signature = %tx_update.signature,
                         discriminator_hex = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
                             discriminator[0], discriminator[1], discriminator[2], discriminator[3],
                             discriminator[4], discriminator[5], discriminator[6], discriminator[7]),
                         instruction_count = tx_update.instruction_accounts.len(),
-                        "geyser_pool_discovery: Pump.fun instruction discriminator"
+                        "geyser_pool_discovery: Pump.fun instruction discriminator check"
                     );
                     
                     if discriminator != PUMPFUN_CREATE_DISCRIMINATOR {
@@ -230,7 +230,7 @@ impl GeyserPoolDiscovery {
                     }
                     
                     // Log successful CREATE detection
-                    debug!(
+                    tracing::info!(
                         signature = %tx_update.signature,
                         "geyser_pool_discovery: ✅ FOUND Pump.fun CREATE INSTRUCTION"
                     );
