@@ -222,10 +222,28 @@ impl GeyserListener {
                                                 }
                                             }
                                             
+                                            // DEBUG: Log instruction extraction attempt
+                                            debug!(
+                                                signature = %signature,
+                                                instruction_count = message.instructions.len(),
+                                                account_keys_len = account_keys.len(),
+                                                "geyser_listener: Processing transaction"
+                                            );
+                                            
                                             // Find the Pump.fun/Raydium/Orca instruction (not first, could be 2nd or 3rd)
                                             // Look for instruction that uses our monitored program
-                                            for ix in &message.instructions {
+                                            for (idx, ix) in message.instructions.iter().enumerate() {
                                                 if let Some(program_pubkey) = account_keys.get(ix.program_id_index as usize) {
+                                                    // DEBUG: Log each instruction
+                                                    debug!(
+                                                        signature = %signature,
+                                                        instruction_idx = idx,
+                                                        program_id = %program_pubkey,
+                                                        accounts_len = ix.accounts.len(),
+                                                        data_len = ix.data.len(),
+                                                        "geyser_listener: Found instruction"
+                                                    );
+                                                    
                                                     // Check if this instruction is for one of our monitored programs
                                                     if self.program_ids.contains(program_pubkey) {
                                                         // Extract accounts for this instruction
@@ -236,6 +254,15 @@ impl GeyserListener {
                                                         }
                                                         // Extract instruction data
                                                         instruction_data = ix.data.clone();
+                                                        
+                                                        debug!(
+                                                            signature = %signature,
+                                                            instruction_idx = idx,
+                                                            extracted_accounts = instruction_accounts.len(),
+                                                            extracted_data_len = instruction_data.len(),
+                                                            "geyser_listener: ✅ EXTRACTED Pump.fun/Raydium/Orca instruction"
+                                                        );
+                                                        
                                                         break; // Found our instruction, stop searching
                                                     }
                                                 }
