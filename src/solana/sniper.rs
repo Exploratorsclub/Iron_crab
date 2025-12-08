@@ -713,6 +713,7 @@ impl SniperEngine {
         cfg: SniperCfg,
         raydium: Option<Arc<Raydium>>,
         orca: Option<Arc<Orca>>,
+        pumpfun: Option<Arc<PumpFunDex>>,
         treasury: Arc<Treasury>,
         geyser_grpc_url: Option<String>,
     ) -> Self {
@@ -727,15 +728,19 @@ impl SniperEngine {
             fallback_slippage_bps: cfg.quantile_fallback_slippage_bps.unwrap_or(100),
         };
 
-        // Initialize Pump.fun connector
-        let pumpfun = match PumpFunDex::new(rpc.clone()) {
-            Ok(mut pf) => {
-                pf.set_user_authority(solana_sdk::pubkey::Pubkey::new_from_array(treasury.pubkey().to_bytes()));
-                Some(Arc::new(pf))
-            }
-            Err(e) => {
-                warn!(?e, "failed to initialize pump.fun connector");
-                None
+        // Use provided Pump.fun connector or initialize if missing (fallback)
+        let pumpfun_arc = if let Some(pf) = pumpfun {
+            Some(pf)
+        } else {
+            match PumpFunDex::new(rpc.clone()) {
+                Ok(mut pf) => {
+                    pf.set_user_authority(solana_sdk::pubkey::Pubkey::new_from_array(treasury.pubkey().to_bytes()));
+                    Some(Arc::new(pf))
+                }
+                Err(e) => {
+                    warn!(?e, "failed to initialize pump.fun connector");
+                    None
+                }
             }
         };
 
@@ -744,7 +749,7 @@ impl SniperEngine {
             cfg: parking_lot::RwLock::new(cfg),
             raydium,
             orca,
-            pumpfun,
+            pumpfun: pumpfun_arc,
             purchased: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             processing: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             treasury,
@@ -4334,10 +4339,11 @@ pub async fn run_sniper(
     cfg: SniperCfg,
     raydium: Option<Arc<Raydium>>,
     orca: Option<Arc<Orca>>,
+    pumpfun: Option<Arc<PumpFunDex>>,
     treasury: Arc<Treasury>,
     geyser_grpc_url: Option<String>,
 ) -> Result<()> {
-    let engine = SniperEngine::new(rpc, cfg, raydium, orca, treasury, geyser_grpc_url);
+    let engine = SniperEngine::new(rpc, cfg, raydium, orca, pumpfun, treasury, geyser_grpc_url);
     engine.run().await
 }
 

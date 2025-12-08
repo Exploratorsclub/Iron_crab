@@ -10,7 +10,7 @@ use crate::solana::arbitrage::ArbitrageEngine;
 use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
 use crate::solana::dex::router::Router;
-use crate::solana::dex::{orca::Orca, raydium::Raydium, Dex};
+use crate::solana::dex::{orca::Orca, pumpfun::PumpFunDex, raydium::Raydium, Dex};
 use crate::solana::execution::{ExecutionConfig, ExecutionEngine};
 use crate::solana::rpc::SolanaRpc;
 use crate::solana::sniper::{run_sniper, SniperCfg};
@@ -40,6 +40,8 @@ pub struct Engine {
     router: Router,                     // DEX router for best execution
     #[allow(dead_code)]
     orca: Arc<Orca>, // Direct reference for prefetching (used in background tasks)
+    #[allow(dead_code)]
+    pumpfun: Arc<PumpFunDex>,
 }
 
 impl Engine {
@@ -54,6 +56,20 @@ impl Engine {
         // Initialize DEX connectors for router
         let raydium = Arc::new(Raydium::new(rpc.clone()));
 
+        // Initialize Pump.fun connector
+        let pumpfun = match PumpFunDex::new(rpc.clone()) {
+            Ok(mut pf) => {
+                pf.set_user_authority(solana_sdk::pubkey::Pubkey::new_from_array(
+                    treasury.pubkey().to_bytes(),
+                ));
+                Arc::new(pf)
+            }
+            Err(e) => {
+                tracing::error!(?e, "failed to initialize pump.fun connector");
+                return Err(e);
+            }
+        };
+
         // Initialize Orca with optional persistent cache
         let orca_cache_path = if cfg.orca.enable_reserve_cache {
             cfg.orca
@@ -65,7 +81,12 @@ impl Engine {
         };
         let orca = Arc::new(Orca::new_with_cache(rpc.clone(), orca_cache_path));
 
-        let router = Router::new(vec![raydium, orca.clone()]);
+        let dexs: Vec<Arc<dyn Dex>> = vec![
+            raydium.clone(),
+            orca.clone(),
+            pumpfun.clone(),
+        ];
+        let router = Router::new(dexs);
 
         let engine = Self {
             ctx,
@@ -73,6 +94,7 @@ impl Engine {
             strategies: vec![],
             router,
             orca: orca.clone(),
+            pumpfun: pumpfun.clone(),
         };
 
         // Prefetch top pools if configured
@@ -903,6 +925,7 @@ impl Engine {
                 .unwrap_or(false);
             // Get geyser_grpc_url from config
             let geyser_url = self.ctx.cfg.solana.geyser_grpc_url.clone();
+            let pumpfun_ref = self.pumpfun.clone();
             tokio::spawn(async move {
                 let mut cfg: SniperCfg = (&sn_cfg).into();
                 // propagate diagnostic flag from arbitrage.discovery to sniper config
@@ -912,6 +935,7 @@ impl Engine {
                     cfg,
                     Some(raydium_ref),
                     Some(orca_ref),
+                    Some(pumpfun_ref),
                     treasury_arc,
                     geyser_url,
                 )
