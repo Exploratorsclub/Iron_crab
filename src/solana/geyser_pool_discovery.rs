@@ -172,10 +172,24 @@ impl GeyserPoolDiscovery {
         // account[11]: Event Authority
         // account[12]: Program
         
+        // DEBUG: Log complete account_keys array to analyze structure
+        if dex_type == DexType::PumpFun {
+            tracing::info!(
+                message = "DEBUG: Pump.fun CREATE transaction account_keys",
+                account_count = tx_update.account_keys.len(),
+                account_0 = %tx_update.account_keys.get(0).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
+                account_1 = %tx_update.account_keys.get(1).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
+                account_2 = %tx_update.account_keys.get(2).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
+                account_3 = %tx_update.account_keys.get(3).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
+                account_4 = %tx_update.account_keys.get(4).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
+                account_5 = %tx_update.account_keys.get(5).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
+            );
+        }
+        
         let token_mint = match dex_type {
             DexType::PumpFun => {
-                // CRITICAL FIX: account[0] is the token mint (newly created)
-                // account[1] is the creator/authority (often mistaken for mint)
+                // TEMPORARY: Using account[0] but need to verify with debug logs
+                // Will fix once we see actual account_keys structure
                 tx_update.account_keys.get(0).copied()?
             }
             DexType::RaydiumAmmV4 => {
