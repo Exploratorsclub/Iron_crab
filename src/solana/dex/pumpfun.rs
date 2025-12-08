@@ -359,7 +359,7 @@ impl Dex for PumpFunDex {
                     info!(
                         token_mint=%token_mint_str, 
                         bonding_curve=%bonding_curve, 
-                        error=?last_error, 
+                        error=%last_error.as_ref().map(|e| e.to_string()).unwrap_or_else(|| "None".to_string()), 
                         "pump.fun: failed to fetch bonding curve after {} retries. USING INITIAL STATE FALLBACK for sniping.", 
                         MAX_RETRIES
                     );

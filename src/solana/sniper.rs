@@ -2074,10 +2074,25 @@ impl SniperEngine {
         let _wsol_ata = wsol_ata_sdk; // use this for instruction building
         
         // Derive destination token ATA address (but don't create it yet)
-        let (_dest_ata, _token_prog) = self
-            .treasury
-            .ata_address(&self.rpc, &owner_sdk, &mint_sdk)
-            .await?;
+        let (_dest_ata, _token_prog) = if chosen_dex == ChosenDex::PumpFun {
+            // Pump.fun tokens are always standard SPL Token (not Token-2022)
+            // We skip RPC lookup because the mint account might not be indexed yet
+            let token_prog = spl_token::id();
+            let token_prog_sdk = SdkPubkey::new_from_array(token_prog.to_bytes());
+            
+            // Convert SDK Pubkey to SPL Pubkey for derivation
+            let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(owner_sdk.to_bytes());
+            let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(mint_sdk.to_bytes());
+            
+            let ata_spl = spl_associated_token_account::get_associated_token_address(&owner_spl, &mint_spl);
+            let ata_sdk = SdkPubkey::new_from_array(ata_spl.to_bytes());
+            
+            (ata_sdk, token_prog_sdk)
+        } else {
+            self.treasury
+                .ata_address(&self.rpc, &owner_sdk, &mint_sdk)
+                .await?
+        };
         
         // Build swap instructions based on chosen DEX
         let mut final_ixs: Vec<solana_sdk::instruction::Instruction> = Vec::new();
