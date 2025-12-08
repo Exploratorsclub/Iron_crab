@@ -253,21 +253,23 @@ impl Treasury {
         Ok((spl_to_sdk(&ata_prog), token_prog))
     }
 
-    /// Ensure ATA exists (idempotent). Returns ATA **SDK** Pubkey.
-    pub async fn ensure_ata(
+    /// Build ATA creation instruction (idempotent - safe to call even if ATA exists).
+    /// Returns (ata_address, optional_create_instruction).
+    /// If ATA already exists, instruction is None.
+    pub async fn build_ata_ix(
         &self,
         rpc: &SolanaRpc,
         owner: &SdkPubkey,
         mint: &SdkPubkey,
-    ) -> Result<SdkPubkey> {
+    ) -> Result<(SdkPubkey, Option<solana_sdk::instruction::Instruction>)> {
         let (ata, token_prog) = self.ata_address(rpc, owner, mint).await?;
 
         // Already present?
         if rpc.rpc.get_account(&ata).await.is_ok() {
-            return Ok(ata);
+            return Ok((ata, None)); // No instruction needed
         }
 
-        // Build program instruction then treat it as SDK Instruction (layouts identical)
+        // Build create instruction
         let ix_prog = create_associated_token_account_idempotent(
             &sdk_to_spl(&self.pubkey()),
             &sdk_to_spl(owner),
@@ -275,10 +277,27 @@ impl Treasury {
             &sdk_to_spl(&token_prog),
         );
         let ix = prog_ix_to_sdk(ix_prog);
-        let bh: Hash = rpc.rpc.get_latest_blockhash().await?;
-        let mut tx = Transaction::new_with_payer(&[ix], Some(&self.pubkey()));
-        tx.try_sign(&[self.signer.as_ref()], bh)?;
-        let _sig = rpc.rpc.send_and_confirm_transaction(&tx).await?;
+        Ok((ata, Some(ix)))
+    }
+
+    /// Ensure ATA exists (idempotent). Returns ATA **SDK** Pubkey.
+    /// DEPRECATED: Use build_ata_ix to include ATA creation in swap TX instead of separate TX.
+    pub async fn ensure_ata(
+        &self,
+        rpc: &SolanaRpc,
+        owner: &SdkPubkey,
+        mint: &SdkPubkey,
+    ) -> Result<SdkPubkey> {
+        let (ata, maybe_ix) = self.build_ata_ix(rpc, owner, mint).await?;
+        
+        // If instruction exists, send separate TX
+        if let Some(ix) = maybe_ix {
+            let bh: Hash = rpc.rpc.get_latest_blockhash().await?;
+            let mut tx = Transaction::new_with_payer(&[ix], Some(&self.pubkey()));
+            tx.try_sign(&[self.signer.as_ref()], bh)?;
+            let _sig = rpc.rpc.send_and_confirm_transaction(&tx).await?;
+        }
+        
         Ok(ata)
     }
 

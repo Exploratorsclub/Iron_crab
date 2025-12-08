@@ -2192,13 +2192,20 @@ impl SniperEngine {
             };
         }
         
-        // NOW ensure dest ATA exists (only when swap is actually possible!)
-        // This avoids wasting SOL creating ATAs for failed swaps
-        let _dest_ata_result = self
+        // CRITICAL FIX: Build ATA creation instruction to INCLUDE in swap TX
+        // This prevents wasted SOL on ATAs when swap fails (simulation error, etc.)
+        // Instead of separate TX (0.00207408 SOL lost), ATA creation + swap happen atomically
+        let (_dest_ata, maybe_ata_ix) = self
             .treasury
-            .ensure_ata(&self.rpc, &owner_sdk, &mint_sdk)
+            .build_ata_ix(&self.rpc, &owner_sdk, &mint_sdk)
             .await
-            .map_err(|e| anyhow::anyhow!("ensure dest ATA failed after route found: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("build_ata_ix failed: {:?}", e))?;
+        
+        // Prepend ATA creation instruction if needed
+        if let Some(ata_ix) = maybe_ata_ix {
+            final_ixs.insert(0, ata_ix);
+            info!(mint=%mint, "prepended ATA creation to swap TX (atomic execution)");
+        }
         
         // Prepare message for fee estimate before signing
         let message = solana_sdk::message::Message::new(&final_ixs, Some(&self.treasury.pubkey()));
