@@ -157,18 +157,26 @@ impl GeyserPoolDiscovery {
         }
         
         // Extract token mint from instruction accounts
-        // For Pump.fun Create_v2 instruction:
-        // account[0]: Program ID
-        // account[1]: Token Mint (writable) ← THIS IS WHAT WE NEED!
-        // account[2]: Mint Authority
-        // account[3]: Bonding Curve (writable, PDA)
-        // account[4]: Associated Bonding Curve Vault (writable)
-        // ...
+        // For Pump.fun Create instruction:
+        // account[0]: Token Mint (writable, to be created) ← THIS IS WHAT WE NEED!
+        // account[1]: Mint Authority / Creator (signer)
+        // account[2]: Bonding Curve (writable, PDA)
+        // account[3]: Associated Bonding Curve Vault (writable)
+        // account[4]: Global state
+        // account[5]: MPL Token Metadata
+        // account[6]: Metadata account
+        // account[7]: System Program
+        // account[8]: Token Program
+        // account[9]: Associated Token Program
+        // account[10]: Rent
+        // account[11]: Event Authority
+        // account[12]: Program
         
         let token_mint = match dex_type {
             DexType::PumpFun => {
-                // For Pump.fun: account[1] is the token mint
-                tx_update.account_keys.get(1).copied()?
+                // CRITICAL FIX: account[0] is the token mint (newly created)
+                // account[1] is the creator/authority (often mistaken for mint)
+                tx_update.account_keys.get(0).copied()?
             }
             DexType::RaydiumAmmV4 => {
                 // For Raydium: need to analyze transaction structure
@@ -197,9 +205,11 @@ impl GeyserPoolDiscovery {
             }
         }
         
-        // Extract pool address (bonding curve for Pump.fun is account[3])
+        // Extract pool address (bonding curve for Pump.fun)
+        // For Pump.fun: account[2] is the bonding curve PDA (the "pool")
+        // account[3] is the associated bonding curve vault
         let pool_address = match dex_type {
-            DexType::PumpFun => tx_update.account_keys.get(3).copied()?,
+            DexType::PumpFun => tx_update.account_keys.get(2).copied()?,
             _ => tx_update.account_keys.get(0).copied()?,
         };
         
