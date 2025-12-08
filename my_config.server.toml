@@ -4,7 +4,7 @@
 # --- Application ---
 [app]
 name = "ironcrab-prod"
-log_level = "debug"  # info = production, debug = troubleshooting, trace = deep diagnostics
+log_level = "trace,ironcrab::solana::dex::orca=info"  # trace globally, but silence orca spam
 autosave_state_secs = 30
 
 # --- Solana RPC & Keypair (Linux paths) ---
