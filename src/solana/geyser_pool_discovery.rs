@@ -187,6 +187,12 @@ impl GeyserPoolDiscovery {
         
         let token_mint = match dex_type {
             DexType::PumpFun => {
+                // Filter: Pump.fun Create needs at least 4 instruction accounts
+                // (mint, authority, bonding_curve, vault)
+                if tx_update.instruction_accounts.len() < 4 {
+                    return None; // Not a CREATE instruction
+                }
+                
                 // Use INSTRUCTION accounts, not transaction account_keys!
                 // ix_account[0]: Mint (writable, newly created)
                 // ix_account[1]: Mint Authority (creator/signer)
