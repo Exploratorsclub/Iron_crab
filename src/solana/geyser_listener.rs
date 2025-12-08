@@ -6,7 +6,7 @@ use futures::StreamExt;
 use solana_sdk::{bs58, pubkey::Pubkey};
 use std::collections::HashMap;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
