@@ -1248,16 +1248,12 @@ impl SniperEngine {
         let total_liq_across_dexes = {
             let mut total = 0.0f64;
             // Check Orca pools
-            if let Some(orca_pools) = self.orca_cache.read().pools.get(&mint) {
-                for pool in orca_pools {
-                    total += pool.liquidity_sol;
-                }
+            if let Some(orca) = &self.orca {
+                total += orca.get_liquidity_sol_for_mint(&mint);
             }
             // Check Raydium pools  
-            if let Some(raydium_pools) = self.raydium_cache.read().pools.get(&mint) {
-                for pool in raydium_pools {
-                    total += pool.liquidity_sol;
-                }
+            if let Some(raydium) = &self.raydium {
+                total += raydium.get_liquidity_sol_for_mint(&mint);
             }
             total
         };
@@ -4063,7 +4059,7 @@ impl SniperEngine {
         
         // Check token age: Only trade tokens created in the last 10 minutes (7200 slots at 400ms/slot)
         // This filters out established tokens like JLP that have new pools created for them
-        if let Some(ref acc) = mint_acc_opt {
+        if let Some(ref _acc) = mint_acc_opt {
             // Get current slot
             if let Ok(current_slot) = self.rpc.rpc.get_slot().await {
                 // Solana stores lamports in the account, but we need the slot when the account was created

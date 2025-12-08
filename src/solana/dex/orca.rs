@@ -143,6 +143,25 @@ impl Orca {
             .unwrap_or_default()
     }
 
+    /// Get total liquidity in SOL for a given mint across all tracked pools.
+    pub fn get_liquidity_sol_for_mint(&self, mint: &Pubkey) -> f64 {
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        let mut total_sol = 0.0;
+        
+        if let Some(pools) = self.mint_index.get(mint) {
+            for pool_pubkey in pools.iter() {
+                if let Some(pool) = self.pools.get(pool_pubkey) {
+                    if pool.base_mint == sol_mint {
+                        total_sol += pool.reserve_base as f64 / 1e9;
+                    } else if pool.quote_mint == sol_mint {
+                        total_sol += pool.reserve_quote as f64 / 1e9;
+                    }
+                }
+            }
+        }
+        total_sol
+    }
+
     /// Return a lightweight snapshot of current pools (for read-only aggregation like liquidity indexing).
     pub fn pools_snapshot(&self) -> Vec<OrcaPoolSnapshot> {
         self.pools
