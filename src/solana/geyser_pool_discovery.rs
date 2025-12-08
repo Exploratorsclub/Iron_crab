@@ -149,12 +149,9 @@ impl GeyserPoolDiscovery {
         };
         
         // Filter: Only process pool creation transactions
-        // Buy/Sell transactions have 18 accounts, pool creations have 16 or 23
+        // REMOVED: account_count == 18 check was too brittle and filtering valid transactions
+        // We now rely on the instruction discriminator check which is much more robust
         let account_count = tx_update.account_keys.len();
-        if dex_type == DexType::PumpFun && account_count == 18 {
-            // This is a Buy/Sell transaction, not a pool creation - ignore
-            return None;
-        }
         
         // Extract token mint from instruction accounts
         // For Pump.fun Create instruction:
