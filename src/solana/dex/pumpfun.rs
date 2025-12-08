@@ -159,6 +159,20 @@ impl PumpFunDex {
         BondingCurveState::parse(&account.data)
     }
 
+    /// Returns the initial state of a Pump.fun bonding curve
+    /// Used as fallback when RPC fails to index new pools fast enough
+    fn initial_bonding_curve_state(token_mint: Pubkey, bonding_curve: Pubkey) -> BondingCurveState {
+        BondingCurveState {
+            virtual_token_reserves: 1_073_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 793_100_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            token_mint,
+            bonding_curve,
+            complete: false,
+        }
+    }
+
     /// Build buy instruction (SOL → Token)
     /// Instruction discriminator: 0x66063d1201daebea (8 bytes)
     pub fn build_buy_ix(
@@ -346,10 +360,11 @@ impl Dex for PumpFunDex {
                         token_mint=%token_mint_str, 
                         bonding_curve=%bonding_curve, 
                         error=?last_error, 
-                        "pump.fun: failed to fetch bonding curve after {} retries (account may not exist)", 
+                        "pump.fun: failed to fetch bonding curve after {} retries. USING INITIAL STATE FALLBACK for sniping.", 
                         MAX_RETRIES
                     );
-                    return Ok(None);
+                    // Fallback to initial state for sniping speed
+                    Self::initial_bonding_curve_state(token_mint, bonding_curve)
                 }
             }
         };
@@ -442,13 +457,16 @@ impl Dex for PumpFunDex {
 
         let ix = if buy_token {
             // Buy: SOL → Token
+            // Pump.fun buy instruction takes (amount_tokens, max_sol_cost)
+            // We use min_out (calculated tokens) as the amount to buy
+            // We use amount_in (SOL) as the max cost
             self.build_buy_ix(
                 &token_mint,
                 &bonding_curve,
                 &associated_bonding_curve,
                 &user_token_account,
-                amount_in,
-                amount_in, // max_sol_cost = amount_in (no slippage limit here, use min_out instead)
+                min_out,   // amount (tokens)
+                amount_in, // max_sol_cost (SOL)
             )?
         } else {
             // Sell: Token → SOL
