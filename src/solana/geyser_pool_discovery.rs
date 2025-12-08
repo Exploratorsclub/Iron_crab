@@ -261,6 +261,9 @@ impl GeyserPoolDiscovery {
         };
         
         // Verify token mint exists on-chain via simple account fetch
+        // REMOVED: RPC check is too slow and prone to race conditions for new mints
+        // We trust the Geyser stream which just told us the mint is being created
+        /*
         match rpc.get_account_retry(&token_mint).await {
             Ok(_) => {
                 // Mint exists, continue
@@ -274,6 +277,7 @@ impl GeyserPoolDiscovery {
                 return None;
             }
         }
+        */
         
         // Extract pool address (bonding curve for Pump.fun)
         // For Pump.fun: instruction account[2] is the bonding curve PDA (the "pool")
@@ -286,7 +290,7 @@ impl GeyserPoolDiscovery {
         // SOL mint for quote
         let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
         
-        debug!(
+        tracing::info!(
             signature = %tx_update.signature,
             slot = tx_update.slot,
             dex = ?dex_type,
