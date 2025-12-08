@@ -8,7 +8,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use std::str::FromStr;
 use tokio::sync::broadcast;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Pool discovery via Geyser account updates
 pub struct GeyserPoolDiscovery {
@@ -187,6 +187,17 @@ impl GeyserPoolDiscovery {
         
         let token_mint = match dex_type {
             DexType::PumpFun => {
+                // DEBUG: Log instruction extraction status
+                if tx_update.instruction_accounts.is_empty() {
+                    debug!(
+                        signature = %tx_update.signature,
+                        account_keys_len = tx_update.account_keys.len(),
+                        instruction_data_len = tx_update.instruction_data.len(),
+                        "geyser_pool_discovery: No instruction accounts extracted - Pump.fun instruction not found"
+                    );
+                    return None;
+                }
+                
                 // Filter: Pump.fun Create needs at least 4 instruction accounts
                 // (mint, authority, bonding_curve, vault)
                 if tx_update.instruction_accounts.len() < 4 {
@@ -202,15 +213,27 @@ impl GeyserPoolDiscovery {
                 
                 if tx_update.instruction_data.len() >= 8 {
                     let discriminator = &tx_update.instruction_data[0..8];
+                    
+                    // DEBUG: Log discriminator for analysis
+                    debug!(
+                        signature = %tx_update.signature,
+                        discriminator_hex = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                            discriminator[0], discriminator[1], discriminator[2], discriminator[3],
+                            discriminator[4], discriminator[5], discriminator[6], discriminator[7]),
+                        instruction_count = tx_update.instruction_accounts.len(),
+                        "geyser_pool_discovery: Pump.fun instruction discriminator"
+                    );
+                    
                     if discriminator != PUMPFUN_CREATE_DISCRIMINATOR {
                         // Not a CREATE instruction (likely BUY or SELL)
-                        debug!(
-                            signature = %tx_update.signature,
-                            discriminator = ?discriminator,
-                            "geyser_pool_discovery: Pump.fun instruction is not CREATE (likely BUY/SELL) - ignoring"
-                        );
                         return None;
                     }
+                    
+                    // Log successful CREATE detection
+                    debug!(
+                        signature = %tx_update.signature,
+                        "geyser_pool_discovery: ✅ FOUND Pump.fun CREATE INSTRUCTION"
+                    );
                 } else {
                     // No instruction data or too short - can't verify
                     debug!(
