@@ -8,6 +8,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use std::str::FromStr;
 use tokio::sync::broadcast;
+use tracing::{debug, info};
 
 /// Pool discovery via Geyser account updates
 pub struct GeyserPoolDiscovery {
