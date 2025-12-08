@@ -29,6 +29,8 @@ pub struct GeyserTransactionUpdate {
     pub signature: String,
     pub slot: u64,
     pub account_keys: Vec<Pubkey>,
+    /// First instruction's account indices (for Pump.fun Create)
+    pub instruction_accounts: Vec<Pubkey>,
 }
 
 pub struct GeyserListener {
@@ -203,13 +205,25 @@ impl GeyserListener {
 
                                     // Extract account keys from transaction message
                                     let mut account_keys = Vec::new();
+                                    let mut instruction_accounts = Vec::new();
+                                    
                                     if let Some(transaction) = &tx.transaction {
                                         if let Some(message) = &transaction.message {
+                                            // Extract all account keys
                                             for key in &message.account_keys {
                                                 if key.len() == 32 {
                                                     if let Ok(bytes) = key.as_slice().try_into() {
                                                         account_keys
                                                             .push(Pubkey::new_from_array(bytes));
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // Extract first instruction's accounts (for Pump.fun Create)
+                                            if let Some(first_ix) = message.instructions.first() {
+                                                for &account_idx in &first_ix.accounts {
+                                                    if let Some(pubkey) = account_keys.get(account_idx as usize) {
+                                                        instruction_accounts.push(*pubkey);
                                                     }
                                                 }
                                             }
@@ -220,6 +234,7 @@ impl GeyserListener {
                                         signature,
                                         slot: tx_update.slot,
                                         account_keys,
+                                        instruction_accounts,
                                     };
 
                                     // Broadcast to subscribers

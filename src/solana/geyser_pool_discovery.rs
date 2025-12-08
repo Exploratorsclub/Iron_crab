@@ -175,22 +175,24 @@ impl GeyserPoolDiscovery {
         // DEBUG: Log complete account_keys array to analyze structure
         if dex_type == DexType::PumpFun {
             tracing::info!(
-                message = "DEBUG: Pump.fun CREATE transaction account_keys",
+                message = "DEBUG: Pump.fun CREATE - instruction accounts",
                 account_count = tx_update.account_keys.len(),
-                account_0 = %tx_update.account_keys.get(0).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
-                account_1 = %tx_update.account_keys.get(1).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
-                account_2 = %tx_update.account_keys.get(2).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
-                account_3 = %tx_update.account_keys.get(3).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
-                account_4 = %tx_update.account_keys.get(4).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
-                account_5 = %tx_update.account_keys.get(5).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
+                instruction_count = tx_update.instruction_accounts.len(),
+                ix_account_0 = %tx_update.instruction_accounts.get(0).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
+                ix_account_1 = %tx_update.instruction_accounts.get(1).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
+                ix_account_2 = %tx_update.instruction_accounts.get(2).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
+                ix_account_3 = %tx_update.instruction_accounts.get(3).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
             );
         }
         
         let token_mint = match dex_type {
             DexType::PumpFun => {
-                // TEMPORARY: Using account[0] but need to verify with debug logs
-                // Will fix once we see actual account_keys structure
-                tx_update.account_keys.get(0).copied()?
+                // Use INSTRUCTION accounts, not transaction account_keys!
+                // ix_account[0]: Mint (writable, newly created)
+                // ix_account[1]: Mint Authority (creator/signer)
+                // ix_account[2]: Bonding Curve PDA (writable)
+                // ix_account[3]: Associated Bonding Curve Vault (writable)
+                tx_update.instruction_accounts.get(0).copied()?
             }
             DexType::RaydiumAmmV4 => {
                 // For Raydium: need to analyze transaction structure
@@ -220,10 +222,10 @@ impl GeyserPoolDiscovery {
         }
         
         // Extract pool address (bonding curve for Pump.fun)
-        // For Pump.fun: account[2] is the bonding curve PDA (the "pool")
-        // account[3] is the associated bonding curve vault
+        // For Pump.fun: instruction account[2] is the bonding curve PDA (the "pool")
+        // instruction account[3] is the associated bonding curve vault
         let pool_address = match dex_type {
-            DexType::PumpFun => tx_update.account_keys.get(2).copied()?,
+            DexType::PumpFun => tx_update.instruction_accounts.get(2).copied()?,
             _ => tx_update.account_keys.get(0).copied()?,
         };
         
