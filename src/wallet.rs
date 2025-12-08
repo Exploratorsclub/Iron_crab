@@ -424,12 +424,28 @@ impl Treasury {
     }
 
     /// Wrap SOL → WSOL (classic token program)
-    pub async fn wrap_sol(&self, rpc: &SolanaRpc, lamports: u64) -> Result<(SdkPubkey, Signature)> {
+    /// Build WSOL wrap instructions (without sending TX).
+    /// Returns (wsol_ata, vec![optional_create_ata_ix, transfer_ix, sync_ix]).
+    /// Use this to include wrapping atomically in swap TX.
+    pub async fn build_wrap_sol_ixs(
+        &self,
+        rpc: &SolanaRpc,
+        lamports: u64,
+    ) -> Result<(SdkPubkey, Vec<solana_sdk::instruction::Instruction>)> {
         let wsol_mint_sdk = SdkPubkey::new_from_array(spl_token::native_mint::id().to_bytes());
         let owner = self.pubkey();
-        let ata = self.ensure_ata(rpc, &owner, &wsol_mint_sdk).await?;
-
-        // 1) send SOL to ATA
+        
+        // Build ATA creation if needed
+        let (ata, maybe_ata_ix) = self.build_ata_ix(rpc, &owner, &wsol_mint_sdk).await?;
+        
+        let mut ixs = Vec::new();
+        
+        // Add ATA creation if needed
+        if let Some(ix) = maybe_ata_ix {
+            ixs.push(ix);
+        }
+        
+        // Transfer SOL to WSOL ATA
         let ix_transfer = SdkInstruction {
             program_id: system_program_id(),
             accounts: vec![
@@ -445,19 +461,29 @@ impl Treasury {
                 },
             ],
             data: {
-                // System Program Transfer instruction: u32 discriminator (2) + u64 lamports
                 let mut d = Vec::with_capacity(4 + 8);
                 d.extend_from_slice(&2u32.to_le_bytes()); // Transfer discriminator
-                d.extend_from_slice(&lamports.to_le_bytes()); // Amount
+                d.extend_from_slice(&lamports.to_le_bytes());
                 d
             },
         };
-        // 2) sync native (needs program pubkey for ATA)
+        ixs.push(ix_transfer);
+        
+        // Sync native
         let ata_prog = sdk_to_spl(&ata);
         let ix_sync = prog_ix_to_sdk(spl_ix::sync_native(&spl_token_program_id(), &ata_prog)?);
+        ixs.push(ix_sync);
+        
+        Ok((ata, ixs))
+    }
 
+    /// Wrap SOL into WSOL ATA (separate TX).
+    /// DEPRECATED: Use build_wrap_sol_ixs to include wrapping in swap TX instead.
+    pub async fn wrap_sol(&self, rpc: &SolanaRpc, lamports: u64) -> Result<(SdkPubkey, Signature)> {
+        let (ata, ixs) = self.build_wrap_sol_ixs(rpc, lamports).await?;
+        
         let bh = rpc.rpc.get_latest_blockhash().await?;
-        let mut tx = Transaction::new_with_payer(&[ix_transfer, ix_sync], Some(&owner));
+        let mut tx = Transaction::new_with_payer(&ixs, Some(&self.pubkey()));
         tx.try_sign(&[self.signer.as_ref()], bh)?;
         let sig = rpc.rpc.send_and_confirm_transaction(&tx).await?;
         Ok((ata, sig))

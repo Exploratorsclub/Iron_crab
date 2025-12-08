@@ -2181,30 +2181,38 @@ impl SniperEngine {
             }
         };
         
-        // CRITICAL: Pump.fun uses native SOL from wallet, NOT wrapped SOL!
-        // Only wrap SOL for Raydium/Orca which require WSOL ATAs
+        // CRITICAL FIX: Build ALL pre-swap instructions WITHOUT sending separate TXs
+        // This prevents wasted SOL when swap fails (simulation error, etc.)
+        let mut pre_swap_ixs = Vec::new();
+        
+        // For Raydium/Orca: Build WSOL wrap instructions (Pump.fun uses native SOL)
         if chosen_dex != ChosenDex::PumpFun {
-            let (_wsol_ata_actual, _wrap_sig) = match self.treasury.wrap_sol(&self.rpc, lamports_in).await {
-                Ok(v) => v,
-                Err(e) => {
-                    return Err(anyhow::anyhow!("wrap_sol failed with {} lamports after route confirmed: {:?}", lamports_in, e));
-                }
-            };
+            let (_wsol_ata, wrap_ixs) = self
+                .treasury
+                .build_wrap_sol_ixs(&self.rpc, lamports_in)
+                .await
+                .map_err(|e| anyhow::anyhow!("build_wrap_sol_ixs failed: {:?}", e))?;
+            
+            pre_swap_ixs.extend(wrap_ixs);
+            info!(mint=%mint, lamports_in, "added WSOL wrap instructions to TX (atomic execution)");
         }
         
-        // CRITICAL FIX: Build ATA creation instruction to INCLUDE in swap TX
-        // This prevents wasted SOL on ATAs when swap fails (simulation error, etc.)
-        // Instead of separate TX (0.00207408 SOL lost), ATA creation + swap happen atomically
+        // Build ATA creation instruction for destination token
         let (_dest_ata, maybe_ata_ix) = self
             .treasury
             .build_ata_ix(&self.rpc, &owner_sdk, &mint_sdk)
             .await
             .map_err(|e| anyhow::anyhow!("build_ata_ix failed: {:?}", e))?;
         
-        // Prepend ATA creation instruction if needed
         if let Some(ata_ix) = maybe_ata_ix {
-            final_ixs.insert(0, ata_ix);
-            info!(mint=%mint, "prepended ATA creation to swap TX (atomic execution)");
+            pre_swap_ixs.push(ata_ix);
+            info!(mint=%mint, "added dest ATA creation to TX (atomic execution)");
+        }
+        
+        // Prepend all pre-swap instructions to swap instructions
+        // Order: [wrap_wsol (if needed), create_ata (if needed), ...swap_ixs]
+        for (i, ix) in pre_swap_ixs.into_iter().enumerate() {
+            final_ixs.insert(i, ix);
         }
         
         // Prepare message for fee estimate before signing
