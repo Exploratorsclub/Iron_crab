@@ -8,6 +8,7 @@ use crate::solana::dex::{orca::Orca, pumpfun::PumpFunDex, raydium::Raydium, Dex}
 use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
 use anyhow::Result;
+use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::{hash::Hash, transaction::Transaction};
 use std::str::FromStr;
@@ -626,16 +627,39 @@ impl SniperEngine {
         &self,
         tx: &Transaction,
         max_attempts: u32,
+        skip_preflight: bool,
     ) -> Result<solana_sdk::signature::Signature> {
         let mut attempt = 0;
         loop {
-            match self.rpc.rpc.send_and_confirm_transaction(tx).await {
+            let res = if skip_preflight {
+                let config = RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    preflight_commitment: None,
+                    encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+                    max_retries: None,
+                    min_context_slot: None,
+                };
+                match self.rpc.rpc.send_transaction_with_config(tx, config).await {
+                    Ok(sig) => {
+                        match self.rpc.rpc.confirm_transaction(&sig).await {
+                            Ok(true) => Ok(sig),
+                            Ok(false) => Err(anyhow::anyhow!("Confirmation timed out").into()),
+                            Err(e) => Err(e.into()),
+                        }
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            } else {
+                self.rpc.rpc.send_and_confirm_transaction(tx).await.map_err(|e| e.into())
+            };
+
+            match res {
                 Ok(sig) => return Ok(sig),
                 Err(e) => {
                     attempt += 1;
                     RPC_RETRY_ATTEMPTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if attempt >= max_attempts {
-                        return Err(e.into());
+                        return Err(e);
                     }
                     let delay_ms = (2u64.pow(attempt.min(5)) * 200).min(5_000);
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -2292,7 +2316,8 @@ impl SniperEngine {
         let mut tx = Transaction::new_with_payer(&final_ixs, Some(&self.treasury.pubkey()));
         tx.try_sign(&[self.treasury.signer_ref()], bh)?;
         let sent_at = Instant::now();
-        match self.rpc_retry_tx(&tx, 3).await {
+        let skip_preflight = chosen_dex == ChosenDex::PumpFun;
+        match self.rpc_retry_tx(&tx, 3, skip_preflight).await {
             Ok(sig) => {
                 let dur = sent_at.elapsed();
                 record_swap_latency(dur.as_nanos() as u64);
@@ -3387,7 +3412,7 @@ impl SniperEngine {
             0
         };
         let sent_at = Instant::now();
-        match self.rpc_retry_tx(&tx, 3).await {
+        match self.rpc_retry_tx(&tx, 3, false).await {
             Ok(sig) => {
                 let dur = sent_at.elapsed();
                 record_swap_latency(dur.as_nanos() as u64);
