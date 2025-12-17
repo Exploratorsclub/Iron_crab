@@ -440,7 +440,11 @@ impl GeyserPoolDiscovery {
     fn parse_raydium_pool(data: &[u8]) -> Option<PoolData> {
         // Raydium AMM v4 account layout: 752 bytes total
         // Source: https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs
-        if data.len() < 752 {
+        if data.len() != 752 {
+            // Log ignored account sizes to debug what we are picking up (e.g. 2208 bytes)
+            if data.len() == 2208 {
+                tracing::debug!(len = data.len(), "geyser_pool_discovery: ignoring Raydium account (likely OpenOrders/TargetOrders)");
+            }
             return None;
         }
 
