@@ -305,7 +305,7 @@ impl GeyserPoolDiscovery {
                     pubkey!("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf"), // Global
                 ];
 
-                for (i, acc) in tx_update.instruction_accounts.iter().enumerate() {
+                for acc in tx_update.instruction_accounts.iter() {
                     // Skip known accounts
                     if known_programs.contains(acc) {
                         continue;
