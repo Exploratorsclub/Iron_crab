@@ -969,21 +969,21 @@ impl Raydium {
             base_vault: usize,
             quote_vault: usize,
         }
-        // Primary (legacy serum v3) heuristic offsets (approx.)
+        // Standard OpenBook V3 (12 bytes padding: 5 "serum" + 7 pad)
         const T1: Offs = Offs {
-            bids: 384,
-            asks: 392,
-            event_q: 400,
-            base_vault: 448,
-            quote_vault: 456,
+            bids: 292,
+            asks: 324,
+            event_q: 260,
+            base_vault: 124,
+            quote_vault: 172,
         };
-        // Fallback template (some builds show shifted vault region by +8)
+        // Fallback (5 bytes padding: "serum")
         const T2: Offs = Offs {
-            bids: 384,
-            asks: 392,
-            event_q: 400,
-            base_vault: 456,
-            quote_vault: 464,
+            bids: 285,
+            asks: 317,
+            event_q: 253,
+            base_vault: 117,
+            quote_vault: 165,
         };
         let templates = [T1, T2];
         for t in templates.iter() {
