@@ -1320,99 +1320,112 @@ impl Raydium {
         Ok(Instruction {
             program_id: Self::program_id(),
             accounts: vec![
-                AM {
-                    pubkey: pool,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: amm_authority,
-                    is_signer: false,
-                    is_writable: false,
-                },
-                AM {
-                    pubkey: open_orders,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: target_orders,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: base_vault,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: quote_vault,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: market_id,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: serum.bids,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: serum.asks,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: serum.event_queue,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: serum.base_vault,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: serum.quote_vault,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: serum_vault_signer,
-                    is_signer: false,
-                    is_writable: false,
-                },
-                AM {
-                    pubkey: user_source,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: user_destination,
-                    is_signer: false,
-                    is_writable: true,
-                },
-                AM {
-                    pubkey: user_authority,
-                    is_signer: true,
-                    is_writable: false,
-                },
+                // 1. Token Program
                 AM {
                     pubkey: token_program,
                     is_signer: false,
                     is_writable: false,
                 },
+                // 2. AMM ID
                 AM {
-                    pubkey: rent_sysvar,
+                    pubkey: pool,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 3. AMM Authority
+                AM {
+                    pubkey: amm_authority,
                     is_signer: false,
                     is_writable: false,
                 },
+                // 4. AMM Open Orders
+                AM {
+                    pubkey: open_orders,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 5. AMM Target Orders
+                AM {
+                    pubkey: target_orders,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 6. Pool Base Vault
+                AM {
+                    pubkey: base_vault,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 7. Pool Quote Vault
+                AM {
+                    pubkey: quote_vault,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 8. Serum Program
                 AM {
                     pubkey: serum_program,
                     is_signer: false,
+                    is_writable: false,
+                },
+                // 9. Serum Market
+                AM {
+                    pubkey: market_id,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 10. Serum Bids
+                AM {
+                    pubkey: serum.bids,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 11. Serum Asks
+                AM {
+                    pubkey: serum.asks,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 12. Serum Event Queue
+                AM {
+                    pubkey: serum.event_queue,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 13. Serum Base Vault
+                AM {
+                    pubkey: serum.base_vault,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 14. Serum Quote Vault
+                AM {
+                    pubkey: serum.quote_vault,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 15. Serum Vault Signer
+                AM {
+                    pubkey: serum_vault_signer,
+                    is_signer: false,
+                    is_writable: false,
+                },
+                // 16. User Source Token Account
+                AM {
+                    pubkey: user_source,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 17. User Destination Token Account
+                AM {
+                    pubkey: user_destination,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                // 18. User Owner (Signer)
+                AM {
+                    pubkey: user_authority,
+                    is_signer: true,
                     is_writable: false,
                 },
             ],
