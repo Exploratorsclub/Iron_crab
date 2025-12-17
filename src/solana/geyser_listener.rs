@@ -2,11 +2,11 @@
 //! Uses Agave 3.0's native Geyser integration for <10ms latency
 
 use anyhow::{anyhow, Result};
-use tracing::debug;
 use futures::StreamExt;
 use solana_sdk::{bs58, pubkey::Pubkey};
 use std::collections::HashMap;
 use tokio::sync::broadcast;
+use tracing::debug;
 use tracing::{error, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
@@ -210,7 +210,7 @@ impl GeyserListener {
                                     let mut account_keys = Vec::new();
                                     let mut instruction_accounts = Vec::new();
                                     let mut instruction_data = Vec::new();
-                                    
+
                                     if let Some(transaction) = &tx.transaction {
                                         if let Some(message) = &transaction.message {
                                             // Extract all account keys
@@ -222,7 +222,7 @@ impl GeyserListener {
                                                     }
                                                 }
                                             }
-                                            
+
                                             // DEBUG: Log instruction extraction attempt
                                             debug!(
                                                 signature = %signature,
@@ -230,11 +230,14 @@ impl GeyserListener {
                                                 account_keys_len = account_keys.len(),
                                                 "geyser_listener: Processing transaction"
                                             );
-                                            
+
                                             // Find the Pump.fun/Raydium/Orca instruction (not first, could be 2nd or 3rd)
                                             // Look for instruction that uses our monitored program
-                                            for (idx, ix) in message.instructions.iter().enumerate() {
-                                                if let Some(program_pubkey) = account_keys.get(ix.program_id_index as usize) {
+                                            for (idx, ix) in message.instructions.iter().enumerate()
+                                            {
+                                                if let Some(program_pubkey) =
+                                                    account_keys.get(ix.program_id_index as usize)
+                                                {
                                                     // DEBUG: Log each instruction
                                                     debug!(
                                                         signature = %signature,
@@ -244,18 +247,20 @@ impl GeyserListener {
                                                         data_len = ix.data.len(),
                                                         "geyser_listener: Found instruction"
                                                     );
-                                                    
+
                                                     // Check if this instruction is for one of our monitored programs
                                                     if self.program_ids.contains(program_pubkey) {
                                                         // Extract accounts for this instruction
                                                         for &account_idx in &ix.accounts {
-                                                            if let Some(pubkey) = account_keys.get(account_idx as usize) {
+                                                            if let Some(pubkey) = account_keys
+                                                                .get(account_idx as usize)
+                                                            {
                                                                 instruction_accounts.push(*pubkey);
                                                             }
                                                         }
                                                         // Extract instruction data
                                                         instruction_data = ix.data.clone();
-                                                        
+
                                                         debug!(
                                                             signature = %signature,
                                                             instruction_idx = idx,
@@ -263,7 +268,7 @@ impl GeyserListener {
                                                             extracted_data_len = instruction_data.len(),
                                                             "geyser_listener: ✅ EXTRACTED Pump.fun/Raydium/Orca instruction"
                                                         );
-                                                        
+
                                                         break; // Found our instruction, stop searching
                                                     }
                                                 }

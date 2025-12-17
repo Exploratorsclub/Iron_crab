@@ -147,7 +147,7 @@ impl Orca {
     pub fn get_liquidity_sol_for_mint(&self, mint: &Pubkey) -> f64 {
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
         let mut total_sol = 0.0;
-        
+
         if let Some(pools) = self.mint_index.get(mint) {
             for pool_pubkey in pools.iter() {
                 if let Some(pool) = self.pools.get(pool_pubkey) {

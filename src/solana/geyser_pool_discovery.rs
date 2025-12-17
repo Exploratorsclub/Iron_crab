@@ -1,12 +1,14 @@
 //! Professional Geyser-based Pool Discovery
 //! Replaces WebSocket log parsing with structured account updates
 
-use crate::solana::geyser_listener::{GeyserAccountUpdate, GeyserListener, GeyserTransactionUpdate};
+use crate::solana::geyser_listener::{
+    GeyserAccountUpdate, GeyserListener, GeyserTransactionUpdate,
+};
 use crate::solana::rpc::SolanaRpc;
 use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
-use std::sync::Arc;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::debug;
 
@@ -27,7 +29,8 @@ impl GeyserPoolDiscovery {
         program_ids: Vec<Pubkey>,
         rpc: Arc<SolanaRpc>,
     ) -> (Self, broadcast::Receiver<PoolDiscoveryEvent>) {
-        let (listener, account_rx, transaction_rx) = GeyserListener::new(geyser_endpoint, program_ids);
+        let (listener, account_rx, transaction_rx) =
+            GeyserListener::new(geyser_endpoint, program_ids);
 
         // Create event channel for pool discoveries
         let (event_tx, event_rx) = broadcast::channel(10000);
@@ -51,7 +54,8 @@ impl GeyserPoolDiscovery {
         tokio::spawn(async move {
             let mut rx = transaction_rx;
             while let Ok(tx_update) = rx.recv().await {
-                if let Some(event) = Self::process_transaction_update(tx_update, &rpc_clone2).await {
+                if let Some(event) = Self::process_transaction_update(tx_update, &rpc_clone2).await
+                {
                     let _ = event_tx.send(event);
                 }
             }
@@ -134,10 +138,12 @@ impl GeyserPoolDiscovery {
         _rpc: &Arc<SolanaRpc>,
     ) -> Option<PoolDiscoveryEvent> {
         // Identify DEX by looking for known program IDs in account_keys
-        let raydium_program = Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").ok()?;
+        let raydium_program =
+            Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").ok()?;
         let orca_program = Pubkey::from_str("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc").ok()?;
-        let pumpfun_program = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").ok()?;
-        
+        let pumpfun_program =
+            Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").ok()?;
+
         let dex_type = if tx_update.account_keys.contains(&pumpfun_program) {
             DexType::PumpFun
         } else if tx_update.account_keys.contains(&raydium_program) {
@@ -147,12 +153,12 @@ impl GeyserPoolDiscovery {
         } else {
             return None;
         };
-        
+
         // Filter: Only process pool creation transactions
         // REMOVED: account_count == 18 check was too brittle and filtering valid transactions
         // We now rely on the instruction discriminator check which is much more robust
         let account_count = tx_update.account_keys.len();
-        
+
         // Extract token mint from instruction accounts
         // For Pump.fun Create instruction:
         // account[0]: Token Mint (writable, to be created) ← THIS IS WHAT WE NEED!
@@ -168,7 +174,7 @@ impl GeyserPoolDiscovery {
         // account[10]: Rent
         // account[11]: Event Authority
         // account[12]: Program
-        
+
         // DEBUG: Log complete account_keys array to analyze structure
         if dex_type == DexType::PumpFun {
             tracing::info!(
@@ -181,7 +187,7 @@ impl GeyserPoolDiscovery {
                 ix_account_3 = %tx_update.instruction_accounts.get(3).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
             );
         }
-        
+
         let token_mint = match dex_type {
             DexType::PumpFun => {
                 // DEBUG: Log instruction extraction status
@@ -194,23 +200,24 @@ impl GeyserPoolDiscovery {
                     );
                     return None;
                 }
-                
+
                 // Filter: Pump.fun Create needs at least 4 instruction accounts
                 // (mint, authority, bonding_curve, vault)
                 if tx_update.instruction_accounts.len() < 4 {
                     return None; // Not a CREATE instruction
                 }
-                
+
                 // Filter by instruction discriminator to distinguish CREATE from BUY/SELL
                 // Pump.fun instruction discriminators (first 8 bytes of instruction data):
                 // - CREATE: 0x181ec828051c0777 (sighash of "global:create")
                 // - BUY: 0x66063d1201daebea (sighash of "global:buy")
                 // - SELL: 0x33e685a4017f83ad (sighash of "global:sell")
-                const PUMPFUN_CREATE_DISCRIMINATOR: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
-                
+                const PUMPFUN_CREATE_DISCRIMINATOR: [u8; 8] =
+                    [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
+
                 if tx_update.instruction_data.len() >= 8 {
                     let discriminator = &tx_update.instruction_data[0..8];
-                    
+
                     // DEBUG: Log discriminator for analysis (INFO level to ensure visibility)
                     tracing::info!(
                         signature = %tx_update.signature,
@@ -220,12 +227,12 @@ impl GeyserPoolDiscovery {
                         instruction_count = tx_update.instruction_accounts.len(),
                         "geyser_pool_discovery: Pump.fun instruction discriminator check"
                     );
-                    
+
                     if discriminator != PUMPFUN_CREATE_DISCRIMINATOR {
                         // Not a CREATE instruction (likely BUY or SELL)
                         return None;
                     }
-                    
+
                     // Log successful CREATE detection
                     tracing::info!(
                         signature = %tx_update.signature,
@@ -240,7 +247,7 @@ impl GeyserPoolDiscovery {
                     );
                     return None;
                 }
-                
+
                 // Use INSTRUCTION accounts, not transaction account_keys!
                 // Based on observed logs:
                 // ix_account[0]: Global
@@ -260,7 +267,7 @@ impl GeyserPoolDiscovery {
                 return None;
             }
         };
-        
+
         // Verify token mint exists on-chain via simple account fetch
         // REMOVED: RPC check is too slow and prone to race conditions for new mints
         // We trust the Geyser stream which just told us the mint is being created
@@ -279,17 +286,17 @@ impl GeyserPoolDiscovery {
             }
         }
         */
-        
+
         // Extract pool address (bonding curve for Pump.fun)
         // For Pump.fun: instruction account[3] is the bonding curve PDA (the "pool")
         let pool_address = match dex_type {
             DexType::PumpFun => tx_update.instruction_accounts.get(3).copied()?,
             _ => tx_update.account_keys.first().copied()?,
         };
-        
+
         // SOL mint for quote
         let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
-        
+
         tracing::info!(
             signature = %tx_update.signature,
             slot = tx_update.slot,
@@ -299,7 +306,7 @@ impl GeyserPoolDiscovery {
             account_count = account_count,
             "geyser_pool_discovery: NEW POOL via TRANSACTION (professional method)"
         );
-        
+
         // Create pool discovery event with transaction-based mint
         Some(PoolDiscoveryEvent {
             pool_address,
@@ -307,10 +314,10 @@ impl GeyserPoolDiscovery {
             slot: tx_update.slot,
             base_mint: token_mint,
             quote_mint,
-            base_decimals: 9, // Standard for Pump.fun, fetch actual later if needed
+            base_decimals: 9,  // Standard for Pump.fun, fetch actual later if needed
             quote_decimals: 9, // SOL decimals
             liquidity_estimate_lamports: 30_000_000_000, // Default 30 SOL for new pools
-            coin_vault: None, // Will be fetched in background if needed
+            coin_vault: None,  // Will be fetched in background if needed
             pc_vault: None,
         })
     }
@@ -346,7 +353,7 @@ impl GeyserPoolDiscovery {
 
         // Offset 688: lp_amount (u64) - total LP tokens minted
         let lp_amount = u64::from_le_bytes(data[688..696].try_into().ok()?);
-        
+
         // Conservative liquidity estimation until vault fetch completes
         // LP amount is NOT a reliable indicator of TVL due to varying decimals
         // Use fixed reasonable estimates to avoid over-estimating
@@ -407,7 +414,7 @@ impl GeyserPoolDiscovery {
     /// - Offset 32: real_sol_reserves (u64)
     /// - Offset 40: token_mint (Pubkey)
     /// - Offset 72: bonding_curve (Pubkey)
-    /// 
+    ///
     /// DEPRECATED: This method produces wrong token mints (12xtdJLo...)
     /// Use transaction-based discovery instead (process_transaction_update)
     #[allow(dead_code)]
@@ -428,7 +435,7 @@ impl GeyserPoolDiscovery {
 
         // Token mint (base)
         let base_mint = Pubkey::new_from_array(data[40..72].try_into().ok()?);
-        
+
         // DEBUG: Log raw bytes and parsed mint
         tracing::info!(
             data_len = data.len(),
@@ -436,7 +443,7 @@ impl GeyserPoolDiscovery {
             mint_bytes = ?&data[40..72],
             "pump.fun: parsed token mint from geyser data"
         );
-        
+
         // Quote mint is always SOL for Pump.fun
         let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
             .unwrap_or_else(|_| Pubkey::new_from_array([0u8; 32]));
@@ -464,7 +471,7 @@ impl GeyserPoolDiscovery {
         Some(PoolData {
             base_mint,
             quote_mint,
-            base_decimals: 9, // Pump.fun tokens typically use 9 decimals
+            base_decimals: 9,  // Pump.fun tokens typically use 9 decimals
             quote_decimals: 9, // SOL decimals
             liquidity_lamports,
             coin_vault: None, // Pump.fun uses bonding curve, not traditional vaults

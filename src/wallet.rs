@@ -288,7 +288,7 @@ impl Treasury {
         mint: &SdkPubkey,
     ) -> (SdkPubkey, solana_sdk::instruction::Instruction) {
         let token_prog = spl_token::id();
-        
+
         // Derive ATA address
         let ata_prog = get_associated_token_address_with_program_id(
             &sdk_to_spl(owner),
@@ -305,7 +305,7 @@ impl Treasury {
             &token_prog,
         );
         let ix = prog_ix_to_sdk(ix_prog);
-        
+
         (ata, ix)
     }
 
@@ -318,7 +318,7 @@ impl Treasury {
         mint: &SdkPubkey,
     ) -> Result<SdkPubkey> {
         let (ata, maybe_ix) = self.build_ata_ix(rpc, owner, mint).await?;
-        
+
         // If instruction exists, send separate TX
         if let Some(ix) = maybe_ix {
             let bh: Hash = rpc.rpc.get_latest_blockhash().await?;
@@ -326,7 +326,7 @@ impl Treasury {
             tx.try_sign(&[self.signer.as_ref()], bh)?;
             let _sig = rpc.rpc.send_and_confirm_transaction(&tx).await?;
         }
-        
+
         Ok(ata)
     }
 
@@ -463,17 +463,17 @@ impl Treasury {
     ) -> Result<(SdkPubkey, Vec<solana_sdk::instruction::Instruction>)> {
         let wsol_mint_sdk = SdkPubkey::new_from_array(spl_token::native_mint::id().to_bytes());
         let owner = self.pubkey();
-        
+
         // Build ATA creation if needed
         let (ata, maybe_ata_ix) = self.build_ata_ix(rpc, &owner, &wsol_mint_sdk).await?;
-        
+
         let mut ixs = Vec::new();
-        
+
         // Add ATA creation if needed
         if let Some(ix) = maybe_ata_ix {
             ixs.push(ix);
         }
-        
+
         // Transfer SOL to WSOL ATA
         let ix_transfer = SdkInstruction {
             program_id: system_program_id(),
@@ -497,12 +497,12 @@ impl Treasury {
             },
         };
         ixs.push(ix_transfer);
-        
+
         // Sync native
         let ata_prog = sdk_to_spl(&ata);
         let ix_sync = prog_ix_to_sdk(spl_ix::sync_native(&spl_token_program_id(), &ata_prog)?);
         ixs.push(ix_sync);
-        
+
         Ok((ata, ixs))
     }
 
@@ -510,7 +510,7 @@ impl Treasury {
     /// DEPRECATED: Use build_wrap_sol_ixs to include wrapping in swap TX instead.
     pub async fn wrap_sol(&self, rpc: &SolanaRpc, lamports: u64) -> Result<(SdkPubkey, Signature)> {
         let (ata, ixs) = self.build_wrap_sol_ixs(rpc, lamports).await?;
-        
+
         let bh = rpc.rpc.get_latest_blockhash().await?;
         let mut tx = Transaction::new_with_payer(&ixs, Some(&self.pubkey()));
         tx.try_sign(&[self.signer.as_ref()], bh)?;

@@ -3,8 +3,8 @@
 // setzt kleine Erstkäufe mit harten Limits (Slippage/Blacklist/Owner/Freeze Auth usw.)
 #[allow(unused_imports)]
 use crate::config_reload::{diff_sniper_cfg, validate_sniper_cfg};
-use crate::solana::geyser_pool_discovery::PoolDiscoveryEvent;
 use crate::solana::dex::{orca::Orca, pumpfun::PumpFunDex, raydium::Raydium, Dex};
+use crate::solana::geyser_pool_discovery::PoolDiscoveryEvent;
 use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
 use anyhow::Result;
@@ -640,17 +640,19 @@ impl SniperEngine {
                     min_context_slot: None,
                 };
                 match self.rpc.rpc.send_transaction_with_config(tx, config).await {
-                    Ok(sig) => {
-                        match self.rpc.rpc.confirm_transaction(&sig).await {
-                            Ok(true) => Ok(sig),
-                            Ok(false) => Err(anyhow::anyhow!("Confirmation timed out").into()),
-                            Err(e) => Err(e.into()),
-                        }
-                    }
+                    Ok(sig) => match self.rpc.rpc.confirm_transaction(&sig).await {
+                        Ok(true) => Ok(sig),
+                        Ok(false) => Err(anyhow::anyhow!("Confirmation timed out").into()),
+                        Err(e) => Err(e.into()),
+                    },
                     Err(e) => Err(e.into()),
                 }
             } else {
-                self.rpc.rpc.send_and_confirm_transaction(tx).await.map_err(|e| e.into())
+                self.rpc
+                    .rpc
+                    .send_and_confirm_transaction(tx)
+                    .await
+                    .map_err(|e| e.into())
             };
 
             match res {
@@ -758,7 +760,9 @@ impl SniperEngine {
         } else {
             match PumpFunDex::new(rpc.clone()) {
                 Ok(mut pf) => {
-                    pf.set_user_authority(solana_sdk::pubkey::Pubkey::new_from_array(treasury.pubkey().to_bytes()));
+                    pf.set_user_authority(solana_sdk::pubkey::Pubkey::new_from_array(
+                        treasury.pubkey().to_bytes(),
+                    ));
                     Some(Arc::new(pf))
                 }
                 Err(e) => {
@@ -1004,17 +1008,17 @@ impl SniperEngine {
                                                         let sig = v.pointer("/params/result/value/signature")
                                                             .and_then(|s| s.as_str())
                                                             .map(|s| s.to_string());
-                                                        
+
                                                         if let Some(arr) = v.pointer("/params/result/value/logs").and_then(|x| x.as_array()) {
                                                             let payload: Vec<String> = arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect();
-                                                            
+
                                                             // Send (program_id, logs, signature) for processing
                                                             // For now, still use old format but we have sig available
                                                             // TODO: Refactor to use signature-based fetching
                                                             if let Some(signature) = sig {
                                                                 debug!(sig=%signature, program_id=%pid, "received tx with logs");
                                                             }
-                                                            
+
                                                             // Apply backpressure: try fast path; if full, await send with returned payload; if closed, break
                                                             match logs_tx.try_send((pid.clone(), payload)) {
                                                                 Ok(_) => {}
@@ -1119,7 +1123,8 @@ impl SniperEngine {
         );
 
         // Create Geyser pool discovery listener
-        let (discovery, mut event_rx) = GeyserPoolDiscovery::new(geyser_url.to_string(), programs, self.rpc.clone());
+        let (discovery, mut event_rx) =
+            GeyserPoolDiscovery::new(geyser_url.to_string(), programs, self.rpc.clone());
 
         // Start Geyser listener in background
         let mut shutdown_rx = self.shutdown_rx.clone();
@@ -1170,7 +1175,7 @@ impl SniperEngine {
     /// Process a pool discovery event from Geyser
     async fn handle_pool_discovery(&self, event: PoolDiscoveryEvent) {
         let mint = event.base_mint;
-        
+
         // CRITICAL: Deduplication - prevent multiple parallel tasks processing same mint
         // Same token can appear in multiple pool discovery events (different pools/bonding curves)
         // Each spawned task would create ATAs and waste SOL on failed swaps
@@ -1187,15 +1192,15 @@ impl SniperEngine {
                 return;
             }
         }
-        
+
         // Mark as processing (will be removed when task completes)
         self.processing.write().insert(mint);
-        
+
         // Ensure cleanup happens even if task panics or returns early
         let _cleanup_guard = scopeguard::guard((), |_| {
             self.processing.write().remove(&mint);
         });
-        
+
         let program_label = match event.dex_type {
             crate::solana::geyser_pool_discovery::DexType::RaydiumAmmV4 => "RAYDIUM",
             crate::solana::geyser_pool_discovery::DexType::OrcaWhirlpool => "ORCA",
@@ -1229,22 +1234,22 @@ impl SniperEngine {
 
         // Determine which mint is the new token (not SOL/WSOL)
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-        
+
         // Skip non-SOL pairs (we only trade SOL/Token pairs for now)
         if event.base_mint != sol_mint && event.quote_mint != sol_mint {
             debug!(
-                base=%event.base_mint, 
-                quote=%event.quote_mint, 
+                base=%event.base_mint,
+                quote=%event.quote_mint,
                 "sniper: skipping non-SOL pair (Token/Token or Token/Stablecoin)"
             );
             return;
         }
-        
+
         // The new token mint is whichever side is NOT SOL
         let mint = if event.base_mint == sol_mint {
-            event.quote_mint  // SOL is base, so new token is quote
+            event.quote_mint // SOL is base, so new token is quote
         } else {
-            event.base_mint   // New token is base, SOL is quote
+            event.base_mint // New token is base, SOL is quote
         };
 
         // Check blacklist
@@ -1253,7 +1258,11 @@ impl SniperEngine {
             self.append_pool_candidate_record(
                 program_label,
                 &mint,
-                None, None, None, None, None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 Some(liq_sol),
                 "SKIP",
                 "blacklisted",
@@ -1268,7 +1277,11 @@ impl SniperEngine {
                 self.append_pool_candidate_record(
                     program_label,
                     &mint,
-                    None, None, None, None, None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                     Some(liq_sol),
                     "SKIP",
                     &format!("liquidity {} < {}", liq_sol, min_liq),
@@ -1276,7 +1289,7 @@ impl SniperEngine {
                 return;
             }
         }
-        
+
         // CRITICAL FILTER: Check if this token already has established pools on other DEXes
         // This prevents trading established tokens (like JLP) that get new small pools
         // A truly NEW token should ONLY have tiny pools (< 100 SOL total liquidity)
@@ -1286,13 +1299,13 @@ impl SniperEngine {
             if let Some(orca) = &self.orca {
                 total += orca.get_liquidity_sol_for_mint(&mint);
             }
-            // Check Raydium pools  
+            // Check Raydium pools
             if let Some(raydium) = &self.raydium {
                 total += raydium.get_liquidity_sol_for_mint(&mint);
             }
             total
         };
-        
+
         // If token has > 100 SOL total liquidity across all DEXes, it's established - skip it
         const MAX_TOTAL_LIQ_FOR_NEW_TOKEN: f64 = 100.0; // 100 SOL = ~$14k (truly new tokens have < $1k)
         if total_liq_across_dexes > MAX_TOTAL_LIQ_FOR_NEW_TOKEN {
@@ -1305,10 +1318,17 @@ impl SniperEngine {
             self.append_pool_candidate_record(
                 program_label,
                 &mint,
-                None, None, None, None, None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 Some(liq_sol),
                 "SKIP",
-                &format!("established token: total_liq={:.2} SOL", total_liq_across_dexes),
+                &format!(
+                    "established token: total_liq={:.2} SOL",
+                    total_liq_across_dexes
+                ),
             );
             return;
         }
@@ -1317,8 +1337,9 @@ impl SniperEngine {
         // These tokens are too new (< 1 second old) to have established holder distribution
         // LP lock check will fail because mint account might not exist yet (data_len=0)
         // This is intentional for ultra-fast sniping of Pump.fun tokens
-        let is_transaction_discovery = event.dex_type == crate::solana::geyser_pool_discovery::DexType::PumpFun;
-        
+        let is_transaction_discovery =
+            event.dex_type == crate::solana::geyser_pool_discovery::DexType::PumpFun;
+
         if is_transaction_discovery {
             info!(
                 mint=%mint,
@@ -1327,7 +1348,10 @@ impl SniperEngine {
                 "sniper: FAST TRACK - skipping LP lock check for transaction-discovered token"
             );
             // Proceed directly to buy attempt with liquidity info
-            if let Err(e) = self.attempt_initial_buy(&mint, Some(liq_sol), event.dex_type).await {
+            if let Err(e) = self
+                .attempt_initial_buy(&mint, Some(liq_sol), event.dex_type)
+                .await
+            {
                 warn!(?e, mint=%mint, "sniper: initial buy failed");
             }
             return;
@@ -1344,7 +1368,11 @@ impl SniperEngine {
                 self.append_pool_candidate_record(
                     program_label,
                     &mint,
-                    None, None, None, None, None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                     Some(liq_sol),
                     "SKIP",
                     "lp_check_none",
@@ -1356,7 +1384,11 @@ impl SniperEngine {
                 self.append_pool_candidate_record(
                     program_label,
                     &mint,
-                    None, None, None, None, None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                     Some(liq_sol),
                     "ERROR",
                     "lp_check_failed",
@@ -1416,7 +1448,10 @@ impl SniperEngine {
             "filters_passed",
         );
 
-        if let Err(e) = self.attempt_initial_buy(&mint, Some(liq_sol), event.dex_type).await {
+        if let Err(e) = self
+            .attempt_initial_buy(&mint, Some(liq_sol), event.dex_type)
+            .await
+        {
             warn!(?e, mint=%mint, "sniper: initial buy failed");
         }
 
@@ -1426,7 +1461,7 @@ impl SniperEngine {
             let rpc = self.rpc.clone();
             let pool_address = event.pool_address;
             let mint_clone = mint;
-            
+
             tokio::spawn(async move {
                 match Self::fetch_vault_liquidity(&rpc, &coin_vault, &pc_vault).await {
                     Ok(actual_liq_sol) => {
@@ -1459,9 +1494,13 @@ impl SniperEngine {
         let coin_balance = rpc.rpc.get_token_account_balance(coin_vault).await?;
         let pc_balance = rpc.rpc.get_token_account_balance(pc_vault).await?;
 
-        let _coin_amount: u64 = coin_balance.amount.parse()
+        let _coin_amount: u64 = coin_balance
+            .amount
+            .parse()
             .map_err(|e| anyhow::anyhow!("parse coin balance: {}", e))?;
-        let pc_amount: u64 = pc_balance.amount.parse()
+        let pc_amount: u64 = pc_balance
+            .amount
+            .parse()
             .map_err(|e| anyhow::anyhow!("parse pc balance: {}", e))?;
 
         // Assuming quote token (pc) is SOL or SOL-equivalent
@@ -1545,50 +1584,54 @@ impl SniperEngine {
         let program_label = Self::program_label_for(program_id);
         static BASE58_RE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"[1-9A-HJ-NP-Za-km-z]{32,44}").unwrap());
-        
+
         // Check if ANY line contains POOL init (not just any init like InitializeAccount)
         let has_pool_init = logs.iter().any(|line| {
             let lower = line.to_ascii_lowercase();
             // Orca: InitializePoolV2, CreatePool, etc.
             // Raydium: initialize2, initialize (with "amm" context)
             // Pump.fun: create (token launch event)
-            if lower.contains("initializepool") 
+            if lower.contains("initializepool")
                 || lower.contains("initializepoolv2")
                 || lower.contains("createpool")
-                || lower.contains("create_pool") {
+                || lower.contains("create_pool")
+            {
                 return true;
             }
             // Raydium AMM initialize with context
-            if lower.contains("initialize2") || (lower.contains("initialize") && lower.contains("amm")) {
+            if lower.contains("initialize2")
+                || (lower.contains("initialize") && lower.contains("amm"))
+            {
                 return true;
             }
             // Pump.fun: "Program log: Instruction: Create" or "create" events
-            if (lower.contains("instruction:") && lower.contains("create")) 
-                || lower.contains("program invoke") && lower.contains("create") {
+            if (lower.contains("instruction:") && lower.contains("create"))
+                || lower.contains("program invoke") && lower.contains("create")
+            {
                 return true;
             }
             false
         });
-        
+
         if !has_pool_init {
             return;
         }
-        
+
         // Log the pool init event
         if let Some(init_line) = logs.iter().find(|line| {
             let lower = line.to_ascii_lowercase();
-            lower.contains("initializepool") 
+            lower.contains("initializepool")
                 || lower.contains("createpool")
                 || lower.contains("initialize2")
                 || (lower.contains("instruction:") && lower.contains("create"))
         }) {
             debug!(line = %init_line, program=%program_label, "sniper: POOL init detected in transaction");
         }
-        
+
         // Collect ALL addresses from ALL lines in this transaction logs
         let mut seen = std::collections::HashSet::new();
         let mut all_addresses: Vec<Pubkey> = Vec::new();
-        
+
         for line in &logs {
             for m in BASE58_RE.find_iter(line) {
                 let s = m.as_str();
@@ -1602,7 +1645,7 @@ impl SniperEngine {
                         let bytes = pk.to_bytes();
                         let all_zeros = bytes.iter().all(|&b| b == 0);
                         let mostly_zeros = bytes.iter().filter(|&&b| b == 0).count() > 28;
-                        
+
                         if !all_zeros && !mostly_zeros {
                             all_addresses.push(pk);
                         }
@@ -1610,11 +1653,11 @@ impl SniperEngine {
                 }
             }
         }
-        
+
         debug!(program=%program_label, address_count=all_addresses.len(), "sniper: found addresses in transaction logs");
-        
+
         let mut candidates_to_check: Vec<Pubkey> = Vec::new();
-        
+
         // Check each address - could be pool or mint
         for pk in all_addresses {
             debug!(addr=%pk, "sniper: checking address from transaction");
@@ -1642,9 +1685,9 @@ impl SniperEngine {
             // If not identified as pool, treat as potential mint address
             candidates_to_check.push(pk);
         }
-        
+
         debug!(program=%program_label, mint_candidate_count=candidates_to_check.len(), "sniper: checking mint candidates");
-        
+
         // Now check all candidate mints
         for pk in candidates_to_check {
             // Run LP concentration check (if thresholds configured)
@@ -1657,11 +1700,8 @@ impl SniperEngine {
                             match self.estimate_liquidity_index(&pk).await {
                                 Ok(v) => liq_sol = v,
                                 Err(_) => {
-                                    liq_sol = self
-                                        .estimate_liquidity_for_mint(&pk)
-                                        .await
-                                        .ok()
-                                        .flatten();
+                                    liq_sol =
+                                        self.estimate_liquidity_for_mint(&pk).await.ok().flatten();
                                 }
                             }
                         }
@@ -1704,7 +1744,13 @@ impl SniperEngine {
                                     "BUY_ATTEMPT",
                                     "passes concentration+liquidity",
                                 );
-                                if let Err(e) = self.attempt_initial_buy(&pk, liq_sol, crate::solana::geyser_pool_discovery::DexType::RaydiumAmmV4).await
+                                if let Err(e) = self
+                                    .attempt_initial_buy(
+                                        &pk,
+                                        liq_sol,
+                                        crate::solana::geyser_pool_discovery::DexType::RaydiumAmmV4,
+                                    )
+                                    .await
                                 {
                                     warn!(mint = %pk, error = ?e, "sniper: initial buy failed");
                                 }
@@ -2004,16 +2050,16 @@ impl SniperEngine {
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
         // Convert max_buy_sol (f64) to lamports safely
         let lamports_in = ((self.effective_max_buy_sol() * 1e9) as u64).max(10_000); // dynamic drawdown-adjusted size
-        
+
         // DON'T create dest ATA yet - wait until swap succeeds!
         // We'll derive the address for planning, but not ensure it exists
         use solana_sdk::pubkey::Pubkey as SdkPubkey;
         let mint_sdk = SdkPubkey::new_from_array(mint.to_bytes());
         let owner_sdk = self.treasury.pubkey();
-        
+
         // DON'T wrap SOL yet - check if route exists first!
         let msb = self.adaptive_slippage_bps();
-        
+
         // Try Pump.fun ONLY if the pool is actually on Pump.fun
         let mut pumpfun_quote_out: u64 = 0;
         if pool_dex_type == crate::solana::geyser_pool_discovery::DexType::PumpFun {
@@ -2026,10 +2072,13 @@ impl SniperEngine {
                 }
             }
         }
-        
+
         // Build Raydium plan (gracefully handle errors - don't fail if Raydium unavailable)
         let plan_opt = if let Some(r) = &ray {
-            match r.build_swap_plan_auto(&sol_mint.to_string(), &mint.to_string(), lamports_in, msb).await {
+            match r
+                .build_swap_plan_auto(&sol_mint.to_string(), &mint.to_string(), lamports_in, msb)
+                .await
+            {
                 Ok(plan) => plan,
                 Err(e) => {
                     debug!(mint=%mint, error=?e, "sniper: raydium swap plan failed, will try other DEXs");
@@ -2041,7 +2090,7 @@ impl SniperEngine {
         };
         let plan_meta = plan_opt;
         let ray_quote_out: u64 = plan_meta.as_ref().map(|pm| pm.expected_out).unwrap_or(0);
-        
+
         // Get Orca quote
         let mut orca_quote_out: u64 = 0;
         if let Some(o) = &orca {
@@ -2052,23 +2101,30 @@ impl SniperEngine {
                 orca_quote_out = q.amount_out;
             }
         }
-        
+
         // Check if ANY DEX is available
         if pumpfun_quote_out == 0 && ray_quote_out == 0 && orca_quote_out == 0 {
-            return Err(anyhow::anyhow!("no swap route available - tried pump.fun, raydium, and orca"));
+            return Err(anyhow::anyhow!(
+                "no swap route available - tried pump.fun, raydium, and orca"
+            ));
         }
-        
+
         // Dynamic route selection: pick DEX with best quote
         #[derive(Debug, PartialEq)]
-        enum ChosenDex { PumpFun, Raydium, Orca }
-        let chosen_dex = if pumpfun_quote_out >= ray_quote_out && pumpfun_quote_out >= orca_quote_out {
-            ChosenDex::PumpFun
-        } else if ray_quote_out >= orca_quote_out {
-            ChosenDex::Raydium
-        } else {
-            ChosenDex::Orca
-        };
-        
+        enum ChosenDex {
+            PumpFun,
+            Raydium,
+            Orca,
+        }
+        let chosen_dex =
+            if pumpfun_quote_out >= ray_quote_out && pumpfun_quote_out >= orca_quote_out {
+                ChosenDex::PumpFun
+            } else if ray_quote_out >= orca_quote_out {
+                ChosenDex::Raydium
+            } else {
+                ChosenDex::Orca
+            };
+
         match chosen_dex {
             ChosenDex::PumpFun => {
                 // Pump.fun metric tracking can be added here
@@ -2082,17 +2138,17 @@ impl SniperEngine {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        
+
         info!(
-            mint=%mint, 
-            lamports_in, 
-            pumpfun_out=pumpfun_quote_out, 
-            ray_out=ray_quote_out, 
-            orca_out=orca_quote_out, 
-            chosen=?chosen_dex, 
+            mint=%mint,
+            lamports_in,
+            pumpfun_out=pumpfun_quote_out,
+            ray_out=ray_quote_out,
+            orca_out=orca_quote_out,
+            chosen=?chosen_dex,
             "sniper: dynamic dex selection"
         );
-        
+
         // DON'T wrap SOL yet - we need to verify swap instructions can be built first!
         // Derive WSOL ATA address for instruction building (but don't create it yet)
         let wsol_mint_prog = spl_token::native_mint::id();
@@ -2102,31 +2158,34 @@ impl SniperEngine {
             .ata_address(&self.rpc, &owner_sdk, &wsol_mint_sdk_key)
             .await?;
         let _wsol_ata = wsol_ata_sdk; // use this for instruction building
-        
+
         // Derive destination token ATA address (but don't create it yet)
         let (_dest_ata, _token_prog) = if chosen_dex == ChosenDex::PumpFun {
             // Pump.fun tokens are always standard SPL Token (not Token-2022)
             // We skip RPC lookup because the mint account might not be indexed yet
             let token_prog = spl_token::id();
             let token_prog_sdk = SdkPubkey::new_from_array(token_prog.to_bytes());
-            
+
             // Convert SDK Pubkey to SPL Pubkey for derivation
-            let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(owner_sdk.to_bytes());
-            let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(mint_sdk.to_bytes());
-            
-            let ata_spl = spl_associated_token_account::get_associated_token_address(&owner_spl, &mint_spl);
+            let owner_spl =
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(owner_sdk.to_bytes());
+            let mint_spl =
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(mint_sdk.to_bytes());
+
+            let ata_spl =
+                spl_associated_token_account::get_associated_token_address(&owner_spl, &mint_spl);
             let ata_sdk = SdkPubkey::new_from_array(ata_spl.to_bytes());
-            
+
             (ata_sdk, token_prog_sdk)
         } else {
             self.treasury
                 .ata_address(&self.rpc, &owner_sdk, &mint_sdk)
                 .await?
         };
-        
+
         // Build swap instructions based on chosen DEX
         let mut final_ixs: Vec<solana_sdk::instruction::Instruction> = Vec::new();
-        
+
         if chosen_dex == ChosenDex::PumpFun {
             // Pump.fun swap (no Serum accounts needed!)
             if let Some(ref pf) = pumpfun {
@@ -2134,7 +2193,7 @@ impl SniperEngine {
                 let slip = msb as u128;
                 let min_out = ((pumpfun_quote_out as u128) * (10_000 - slip) / 10_000) as u64;
                 let min_out = min_out.max(1);
-                
+
                 match pf.build_swap_ix(
                     &sol_mint.to_string(),
                     &mint.to_string(),
@@ -2235,12 +2294,12 @@ impl SniperEngine {
                 {
                     o.set_user_token_account(mint_sdk, dst_ata);
                 }
-                
+
                 // Calculate min_out with slippage
                 let slip = msb as u128;
                 let min_out_orca = ((orca_quote_out as u128) * (10_000 - slip) / 10_000) as u64;
                 let min_out_orca = min_out_orca.max(1);
-                
+
                 match o.build_swap_ix(
                     &sol_mint.to_string(),
                     &mint.to_string(),
@@ -2258,12 +2317,15 @@ impl SniperEngine {
                 }
             }
         }
-        
+
         // Verify we have instructions before proceeding
         if final_ixs.is_empty() {
-            return Err(anyhow::anyhow!("no swap instructions built - chosen dex {:?} failed", chosen_dex));
+            return Err(anyhow::anyhow!(
+                "no swap instructions built - chosen dex {:?} failed",
+                chosen_dex
+            ));
         }
-        
+
         // Get blockhash and build transaction
         let bh: Hash = match self.rpc.get_latest_blockhash_retry().await {
             Ok(h) => h,
@@ -2272,11 +2334,11 @@ impl SniperEngine {
                 return Err(e.into());
             }
         };
-        
+
         // CRITICAL FIX: Build ALL pre-swap instructions WITHOUT sending separate TXs
         // This prevents wasted SOL when swap fails (simulation error, etc.)
         let mut pre_swap_ixs = Vec::new();
-        
+
         // For Raydium/Orca: Build WSOL wrap instructions (Pump.fun uses native SOL)
         if chosen_dex != ChosenDex::PumpFun {
             let (_wsol_ata, wrap_ixs) = self
@@ -2284,11 +2346,11 @@ impl SniperEngine {
                 .build_wrap_sol_ixs(&self.rpc, lamports_in)
                 .await
                 .map_err(|e| anyhow::anyhow!("build_wrap_sol_ixs failed: {:?}", e))?;
-            
+
             pre_swap_ixs.extend(wrap_ixs);
             info!(mint=%mint, lamports_in, "added WSOL wrap instructions to TX (atomic execution)");
         }
-        
+
         // Build ATA creation instruction for destination token
         let (_dest_ata, maybe_ata_ix) = if chosen_dex == ChosenDex::PumpFun {
             // Pump.fun optimization: Skip RPC lookup, assume standard SPL Token Program
@@ -2300,18 +2362,18 @@ impl SniperEngine {
                 .await
                 .map_err(|e| anyhow::anyhow!("build_ata_ix failed: {:?}", e))?
         };
-        
+
         if let Some(ata_ix) = maybe_ata_ix {
             pre_swap_ixs.push(ata_ix);
             info!(mint=%mint, "added dest ATA creation to TX (atomic execution)");
         }
-        
+
         // Prepend all pre-swap instructions to swap instructions
         // Order: [wrap_wsol (if needed), create_ata (if needed), ...swap_ixs]
         for (i, ix) in pre_swap_ixs.into_iter().enumerate() {
             final_ixs.insert(i, ix);
         }
-        
+
         // Prepare message for fee estimate before signing
         let message = solana_sdk::message::Message::new(&final_ixs, Some(&self.treasury.pubkey()));
         let fee_estimate = self
@@ -2328,7 +2390,7 @@ impl SniperEngine {
                 let dur = sent_at.elapsed();
                 record_swap_latency(dur.as_nanos() as u64);
                 TRADES_EXECUTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                
+
                 // Log based on which DEX was used
                 match chosen_dex {
                     ChosenDex::PumpFun => {
@@ -2336,7 +2398,7 @@ impl SniperEngine {
                         let sol_in = lamports_in as f64 / 1e9;
                         self.record_fill_placeholder(*mint, sol_in);
                         self.finalize_fill(*mint).await;
-                        
+
                         // Record pending trade for reconciliation
                         {
                             let mut rs = self.risk.write();
@@ -2373,7 +2435,7 @@ impl SniperEngine {
                                 self.record_fill_placeholder(*mint, sol_in);
                                 self.finalize_fill(*mint).await;
                             }
-                            
+
                             // Record pending trade
                             {
                                 let mut rs = self.risk.write();
@@ -2409,7 +2471,7 @@ impl SniperEngine {
                         let sol_in = lamports_in as f64 / 1e9;
                         self.record_fill_placeholder(*mint, sol_in);
                         self.finalize_fill(*mint).await;
-                        
+
                         record_network_fee(fee_estimate);
                         let line = format!(
                             "{ts},BUY,{mint},ORCA,{sig},{lamports_in},0,0,0,{exp_tokens},,0,,{fee},,",
@@ -2423,9 +2485,9 @@ impl SniperEngine {
                         self.append_trade_record(&line, true);
                     }
                 }
-                
+
                 self.purchased.write().insert(*mint);
-                
+
                 // Attempt WSOL unwrap to reclaim leftover lamports
                 match self.treasury.unwrap_wsol(&self.rpc, None).await {
                     Ok(unwrap_sig) => {
@@ -2450,7 +2512,9 @@ impl SniperEngine {
             info!(url=%geyser_url, "sniper: using Geyser gRPC for pool discovery");
             return self.run_with_geyser(geyser_url).await;
         } else {
-            warn!("sniper: using deprecated WebSocket logsSubscribe (high latency, false positives)");
+            warn!(
+                "sniper: using deprecated WebSocket logsSubscribe (high latency, false positives)"
+            );
             self.subscribe_logs().await?;
         }
         info!("sniper engine running (skeleton)");
@@ -3236,7 +3300,8 @@ impl SniperEngine {
         // Dynamic route selection for exit: compare Raydium vs Orca vs Pump.fun quotes
         let msb2 = self.adaptive_slippage_bps();
         let ray_plan = if let Some(r) = &self.raydium {
-            r.build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), sell_tokens, msb2).await
+            r.build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), sell_tokens, msb2)
+                .await
                 .ok()
         } else {
             None
@@ -3265,8 +3330,12 @@ impl SniperEngine {
         }
 
         #[derive(Debug, PartialEq)]
-        enum ChosenDex { PumpFun, Raydium, Orca }
-        
+        enum ChosenDex {
+            PumpFun,
+            Raydium,
+            Orca,
+        }
+
         let chosen_dex = if pumpfun_out >= ray_out && pumpfun_out >= orca_out && pumpfun_out > 0 {
             ChosenDex::PumpFun
         } else if ray_out >= orca_out && ray_out > 0 {
@@ -3275,7 +3344,11 @@ impl SniperEngine {
             ChosenDex::Orca
         } else {
             // Fallback logic
-            if ray_plan.is_some() { ChosenDex::Raydium } else { ChosenDex::Orca }
+            if ray_plan.is_some() {
+                ChosenDex::Raydium
+            } else {
+                ChosenDex::Orca
+            }
         };
 
         if chosen_dex == ChosenDex::Raydium {
@@ -3285,7 +3358,7 @@ impl SniperEngine {
             crate::metrics::DEX_SELECTION_EXIT_ORCA_TOTAL
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        
+
         debug!(mint=%mint, sell_tokens, ray_out, orca_out, pumpfun_out, chosen=?chosen_dex, "sniper: dynamic exit dex selection");
 
         // Build instructions based on chosen route; prefer full Raydium IX, fallback to Orca
@@ -3297,25 +3370,33 @@ impl SniperEngine {
             }
         };
         let mut tx_ixs: Vec<solana_sdk::instruction::Instruction> = Vec::new();
-        
+
         if chosen_dex == ChosenDex::PumpFun {
             if let Some(pf) = &self.pumpfun {
                 // Calculate min_out with slippage
                 let slip = msb2 as u128;
                 let min_out = ((pumpfun_out as u128) * (10_000 - slip) / 10_000) as u64;
                 let min_out = min_out.max(1);
-                
+
                 // We need to derive the bonding curve accounts manually here since build_sell_ix expects Pubkeys
                 // and we only have the mint Pubkey.
                 let mint_pk = solana_sdk::pubkey::Pubkey::new_from_array(mint.to_bytes());
                 let (bonding_curve, _) = pf.derive_bonding_curve(&mint_pk);
-                let (associated_bonding_curve, _) = pf.derive_associated_bonding_curve(&bonding_curve, &mint_pk);
-                
+                let (associated_bonding_curve, _) =
+                    pf.derive_associated_bonding_curve(&bonding_curve, &mint_pk);
+
                 // We also need the user's ATA for the token
                 let user_pk = self.treasury.pubkey();
-                let (user_token_account, _) = match self.treasury.ata_address(&self.rpc, &user_pk, &mint_pk).await {
+                let (user_token_account, _) = match self
+                    .treasury
+                    .ata_address(&self.rpc, &user_pk, &mint_pk)
+                    .await
+                {
                     Ok(v) => v,
-                    Err(_) => (solana_sdk::pubkey::Pubkey::default(), solana_sdk::pubkey::Pubkey::default()), // Should not happen if we have balance
+                    Err(_) => (
+                        solana_sdk::pubkey::Pubkey::default(),
+                        solana_sdk::pubkey::Pubkey::default(),
+                    ), // Should not happen if we have balance
                 };
 
                 match pf.build_sell_ix(
@@ -4178,7 +4259,7 @@ impl SniperEngine {
                 None
             }
         };
-        
+
         // Check token age: Only trade tokens created in the last 10 minutes (7200 slots at 400ms/slot)
         // This filters out established tokens like JLP that have new pools created for them
         if let Some(ref _acc) = mint_acc_opt {
@@ -4192,14 +4273,18 @@ impl SniperEngine {
                 // 1. Low liquidity (< 1 SOL typically)
                 // 2. No token account index (triggers fallback LP assessment)
                 // 3. Recent pool creation (from geyser timestamp)
-                
+
                 // TODO: Add explicit slot tracking from pool discovery event
                 debug!(mint=%mint, current_slot=current_slot, "sniper: token age check - using pool discovery timestamp");
             }
         }
-        
+
         // Parse mint account if available, otherwise use defaults
-        let (mint_auth_opt, freeze_auth_opt, parsed_decimals, parsed_supply_raw) = if let Some(ref acc) = mint_acc_opt {
+        let (mint_auth_opt, freeze_auth_opt, parsed_decimals, parsed_supply_raw) = if let Some(
+            ref acc,
+        ) =
+            mint_acc_opt
+        {
             // SPL Mint length heuristic (approx range)
             if acc.data.len() < 70 || acc.data.len() > 90 {
                 info!(mint=%mint, data_len=acc.data.len(), "sniper: mint account size invalid, returning None");
@@ -4210,7 +4295,7 @@ impl SniperEngine {
             // Fallback for brand new tokens (Pump.fun defaults)
             (None, None, 6u8, 1_000_000_000u64) // 1B supply with 6 decimals is common for Pump.fun
         };
-        
+
         // Try authoritative RPC getTokenSupply for decimals and amount
         let mut decimals_eff = parsed_decimals;
         let mut supply = if parsed_decimals == 0 {

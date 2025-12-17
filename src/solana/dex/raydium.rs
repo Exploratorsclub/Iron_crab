@@ -142,7 +142,7 @@ impl Raydium {
     pub fn get_liquidity_sol_for_mint(&self, mint: &Pubkey) -> f64 {
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
         let mut total_sol = 0.0;
-        
+
         if let Some(pools) = self.mint_index.get(mint) {
             for pool_pubkey in pools.iter() {
                 if let Some(pool) = self.pools.get(pool_pubkey) {
@@ -164,11 +164,11 @@ impl Raydium {
         // Extended retry window: 20 attempts × 500ms = 10 seconds total
         const MAX_RETRIES: usize = 20;
         const RETRY_DELAY_MS: u64 = 500;
-        
+
         let account = {
             let mut last_error = None;
             let mut account_opt = None;
-            
+
             for attempt in 0..MAX_RETRIES {
                 match self.rpc.get_account_retry(pool_address).await {
                     Ok(acc) => {
@@ -182,15 +182,22 @@ impl Raydium {
                         last_error = Some(e);
                         if attempt < MAX_RETRIES - 1 {
                             debug!(pool=%pool_address, attempt, "raydium: pool account not found, retrying...");
-                            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS))
+                                .await;
                         }
                     }
                 }
             }
-            
+
             match account_opt {
                 Some(acc) => acc,
-                None => return Err(anyhow!("failed to fetch raydium pool account after {} retries: {:?}", MAX_RETRIES, last_error)),
+                None => {
+                    return Err(anyhow!(
+                        "failed to fetch raydium pool account after {} retries: {:?}",
+                        MAX_RETRIES,
+                        last_error
+                    ))
+                }
             }
         };
 
@@ -203,7 +210,10 @@ impl Raydium {
         // Derive PDAs
         let (amm_auth, _) = Self::derive_amm_authority();
         let serum_vault_signer = if pool_state.market_program_id.to_bytes() != [0u8; 32] {
-            let (v, _) = Self::derive_serum_vault_signer(&pool_state.market_id, &pool_state.market_program_id);
+            let (v, _) = Self::derive_serum_vault_signer(
+                &pool_state.market_id,
+                &pool_state.market_program_id,
+            );
             Some(v)
         } else {
             None
@@ -238,11 +248,13 @@ impl Raydium {
         self.pools.insert(*pool_address, pool.clone());
 
         // Update mint index
-        self.mint_index.entry(pool.base_mint)
-            .or_insert_with(Vec::new)
+        self.mint_index
+            .entry(pool.base_mint)
+            .or_default()
             .push(*pool_address);
-        self.mint_index.entry(pool.quote_mint)
-            .or_insert_with(Vec::new)
+        self.mint_index
+            .entry(pool.quote_mint)
+            .or_default()
             .push(*pool_address);
 
         tracing::info!(
@@ -513,7 +525,7 @@ impl Raydium {
         use std::str::FromStr;
         let in_pk = Pubkey::from_str(input_mint)?;
         let out_pk = Pubkey::from_str(output_mint)?;
-        
+
         // Find the pool
         let (pool_addr, _forward) = self
             .find_pool(&in_pk, &out_pk)
@@ -521,7 +533,9 @@ impl Raydium {
 
         // Check if pool has Serum accounts populated, if not fetch them
         let needs_serum = {
-            let pool = self.pools.get(&pool_addr)
+            let pool = self
+                .pools
+                .get(&pool_addr)
                 .ok_or_else(|| anyhow!("pool snapshot missing"))?;
             pool.serum_bids.is_none() || pool.serum_asks.is_none()
         };
@@ -850,15 +864,17 @@ impl Dex for Raydium {
         let (pool_addr, _forward) = self
             .find_pool(&in_pk, &out_pk)
             .ok_or_else(|| anyhow!("no raydium pool for pair"))?;
-        
+
         // Check if pool has Serum accounts populated
-        let pool = self.pools.get(&pool_addr)
+        let pool = self
+            .pools
+            .get(&pool_addr)
             .ok_or_else(|| anyhow!("pool snapshot missing"))?;
-        
+
         // If Serum accounts are available, build full instruction
         // Otherwise return error (caller should have fetched them already)
-        if pool.serum_bids.is_none() 
-            || pool.serum_asks.is_none() 
+        if pool.serum_bids.is_none()
+            || pool.serum_asks.is_none()
             || pool.serum_event_queue.is_none()
             || pool.serum_base_vault.is_none()
             || pool.serum_quote_vault.is_none()
@@ -1020,18 +1036,23 @@ impl Raydium {
     pub async fn fetch_and_populate_serum_accounts(&self, pool_address: &Pubkey) -> Result<()> {
         // Get pool from cache
         let market_id = {
-            let pool = self.pools.get(pool_address)
+            let pool = self
+                .pools
+                .get(pool_address)
                 .ok_or_else(|| anyhow!("pool not found in cache"))?;
             pool.market_id
                 .ok_or_else(|| anyhow!("pool has no market_id"))?
         };
 
         // Fetch Serum market account
-        let account = self.rpc.get_account_retry(&market_id).await
+        let account = self
+            .rpc
+            .get_account_retry(&market_id)
+            .await
             .map_err(|e| anyhow!("failed to fetch serum market account: {}", e))?;
 
         // Parse Serum market accounts
-        let (bids, asks, event_queue, base_vault, quote_vault) = 
+        let (bids, asks, event_queue, base_vault, quote_vault) =
             Self::parse_serum_market_accounts(&account.data)
                 .ok_or_else(|| anyhow!("failed to parse serum market account data"))?;
 

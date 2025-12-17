@@ -81,11 +81,7 @@ impl Engine {
         };
         let orca = Arc::new(Orca::new_with_cache(rpc.clone(), orca_cache_path));
 
-        let dexs: Vec<Arc<dyn Dex>> = vec![
-            raydium.clone(),
-            orca.clone(),
-            pumpfun.clone(),
-        ];
+        let dexs: Vec<Arc<dyn Dex>> = vec![raydium.clone(), orca.clone(), pumpfun.clone()];
         let router = Router::new(dexs);
 
         let engine = Self {
@@ -575,10 +571,11 @@ impl Engine {
                         "arbitrage_task: using Geyser gRPC for account updates"
                     );
 
-                    let (listener, geyser_rx, _transaction_rx) = crate::solana::geyser_listener::GeyserListener::new(
-                        geyser_endpoint.clone(),
-                        vec![raydium_program, whirlpool_program],
-                    );
+                    let (listener, geyser_rx, _transaction_rx) =
+                        crate::solana::geyser_listener::GeyserListener::new(
+                            geyser_endpoint.clone(),
+                            vec![raydium_program, whirlpool_program],
+                        );
 
                     // Spawn Geyser listener task
                     tokio::spawn(async move {

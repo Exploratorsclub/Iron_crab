@@ -12,8 +12,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-use crate::solana::rpc::SolanaRpc;
 use super::{Dex, Quote};
+use crate::solana::rpc::SolanaRpc;
 
 /// System Program ID
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
@@ -55,7 +55,10 @@ impl BondingCurveState {
     /// - 104: complete (bool)
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < 105 {
-            return Err(anyhow!("bonding curve data too short: {} bytes", data.len()));
+            return Err(anyhow!(
+                "bonding curve data too short: {} bytes",
+                data.len()
+            ));
         }
 
         Ok(Self {
@@ -135,14 +138,15 @@ impl PumpFunDex {
 
     /// Derive bonding curve PDA for a token mint
     pub fn derive_bonding_curve(&self, token_mint: &Pubkey) -> (Pubkey, u8) {
-        Pubkey::find_program_address(
-            &[b"bonding-curve", token_mint.as_ref()],
-            &self.program_id,
-        )
+        Pubkey::find_program_address(&[b"bonding-curve", token_mint.as_ref()], &self.program_id)
     }
 
     /// Derive associated bonding curve token account (holds real token reserves)
-    pub fn derive_associated_bonding_curve(&self, bonding_curve: &Pubkey, token_mint: &Pubkey) -> (Pubkey, u8) {
+    pub fn derive_associated_bonding_curve(
+        &self,
+        bonding_curve: &Pubkey,
+        token_mint: &Pubkey,
+    ) -> (Pubkey, u8) {
         Pubkey::find_program_address(
             &[
                 b"associated-bonding-curve",
@@ -181,16 +185,17 @@ impl PumpFunDex {
         bonding_curve: &Pubkey,
         associated_bonding_curve: &Pubkey,
         user_token_account: &Pubkey,
-        amount_in: u64,  // SOL lamports
+        amount_in: u64,    // SOL lamports
         max_sol_cost: u64, // Slippage protection
     ) -> Result<Instruction> {
-        let user = self.user_authority
+        let user = self
+            .user_authority
             .ok_or_else(|| anyhow!("user authority not set"))?;
 
         // Instruction data: discriminator (8 bytes) + amount (8 bytes) + max_cost (8 bytes)
         let mut data = Vec::with_capacity(24);
         // Discriminator for "global:buy" = 66063d1201daebea
-        data.extend_from_slice(&[0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea]); 
+        data.extend_from_slice(&[0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea]);
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&max_sol_cost.to_le_bytes());
 
@@ -205,7 +210,10 @@ impl PumpFunDex {
                 AccountMeta::new(*user_token_account, false),
                 AccountMeta::new(user, true), // Signer
                 AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false),
-                AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
+                AccountMeta::new_readonly(
+                    Pubkey::new_from_array(spl_token::id().to_bytes()),
+                    false,
+                ),
                 AccountMeta::new_readonly(sysvar::rent::id(), false),
                 AccountMeta::new_readonly(self.event_authority, false),
                 AccountMeta::new_readonly(self.program_id, false),
@@ -222,16 +230,17 @@ impl PumpFunDex {
         bonding_curve: &Pubkey,
         associated_bonding_curve: &Pubkey,
         user_token_account: &Pubkey,
-        amount_in: u64,  // Token amount
+        amount_in: u64,      // Token amount
         min_sol_output: u64, // Slippage protection
     ) -> Result<Instruction> {
-        let user = self.user_authority
+        let user = self
+            .user_authority
             .ok_or_else(|| anyhow!("user authority not set"))?;
 
         // Instruction data: discriminator (8 bytes) + amount (8 bytes) + min_output (8 bytes)
         let mut data = Vec::with_capacity(24);
         // Discriminator for "global:sell" = 33e685a4017f83ad
-        data.extend_from_slice(&[0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad]); 
+        data.extend_from_slice(&[0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad]);
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_sol_output.to_le_bytes());
 
@@ -246,8 +255,14 @@ impl PumpFunDex {
                 AccountMeta::new(*user_token_account, false),
                 AccountMeta::new(user, true), // Signer
                 AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false),
-                AccountMeta::new_readonly(Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()), false),
-                AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
+                AccountMeta::new_readonly(
+                    Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
+                    false,
+                ),
+                AccountMeta::new_readonly(
+                    Pubkey::new_from_array(spl_token::id().to_bytes()),
+                    false,
+                ),
                 AccountMeta::new_readonly(self.event_authority, false),
                 AccountMeta::new_readonly(self.program_id, false),
             ],
@@ -270,7 +285,7 @@ impl Dex for PumpFunDex {
         amount_in: u64,
     ) -> Result<Option<Quote>> {
         let sol_mint = "So11111111111111111111111111111111111111112";
-        
+
         // Determine direction: SOL→Token or Token→SOL
         let (token_mint_str, buy_token) = if input_mint == sol_mint {
             (output_mint, true)
@@ -281,14 +296,14 @@ impl Dex for PumpFunDex {
         };
 
         let token_mint = Pubkey::from_str(token_mint_str)?;
-        
+
         // CRITICAL: Verify token mint exists before wasting time on bonding curve
         // Geyser can report accounts from failed/rolled-back transactions
-        /* 
+        /*
            DISABLED for sniping speed:
            RPC nodes are too slow to index the mint account immediately after creation.
            We trust the Geyser instruction parser. If the mint is invalid, the bonding curve fetch will fail anyway.
-        
+
         match self.rpc.get_account_retry(&token_mint).await {
             Ok(_) => {
                 debug!(
@@ -306,11 +321,11 @@ impl Dex for PumpFunDex {
             }
         }
         */
-        
+
         let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
 
         info!(
-            token_mint=%token_mint_str, 
+            token_mint=%token_mint_str,
             bonding_curve=%bonding_curve,
             buy_token,
             "pump.fun: attempting to fetch bonding curve"
@@ -322,18 +337,18 @@ impl Dex for PumpFunDex {
         let state = {
             const MAX_RETRIES: usize = 10;
             const RETRY_DELAY_MS: u64 = 250;
-            
+
             let mut last_error = None;
             let mut state_opt = None;
-            
+
             for attempt in 0..MAX_RETRIES {
                 match self.fetch_bonding_curve(&bonding_curve).await {
                     Ok(s) => {
                         if attempt > 0 {
                             info!(
-                                token_mint=%token_mint_str, 
-                                bonding_curve=%bonding_curve, 
-                                attempt, 
+                                token_mint=%token_mint_str,
+                                bonding_curve=%bonding_curve,
+                                attempt,
                                 "pump.fun: bonding curve fetch succeeded after retry"
                             );
                         }
@@ -344,25 +359,26 @@ impl Dex for PumpFunDex {
                         last_error = Some(e);
                         if attempt < MAX_RETRIES - 1 {
                             debug!(
-                                token_mint=%token_mint_str, 
-                                bonding_curve=%bonding_curve, 
-                                attempt, 
+                                token_mint=%token_mint_str,
+                                bonding_curve=%bonding_curve,
+                                attempt,
                                 "pump.fun: bonding curve not found, retrying..."
                             );
-                            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS))
+                                .await;
                         }
                     }
                 }
             }
-            
+
             match state_opt {
                 Some(s) => s,
                 None => {
                     info!(
-                        token_mint=%token_mint_str, 
-                        bonding_curve=%bonding_curve, 
-                        error=%last_error.as_ref().map(|e| e.to_string()).unwrap_or_else(|| "None".to_string()), 
-                        "pump.fun: failed to fetch bonding curve after {} retries. USING INITIAL STATE FALLBACK for sniping.", 
+                        token_mint=%token_mint_str,
+                        bonding_curve=%bonding_curve,
+                        error=%last_error.as_ref().map(|e| e.to_string()).unwrap_or_else(|| "None".to_string()),
+                        "pump.fun: failed to fetch bonding curve after {} retries. USING INITIAL STATE FALLBACK for sniping.",
                         MAX_RETRIES
                     );
                     // Fallback to initial state for sniping speed
@@ -396,9 +412,15 @@ impl Dex for PumpFunDex {
 
         // Calculate price impact
         let (in_reserve, out_reserve) = if buy_token {
-            (state.virtual_sol_reserves as u128, state.virtual_token_reserves as u128)
+            (
+                state.virtual_sol_reserves as u128,
+                state.virtual_token_reserves as u128,
+            )
         } else {
-            (state.virtual_token_reserves as u128, state.virtual_sol_reserves as u128)
+            (
+                state.virtual_token_reserves as u128,
+                state.virtual_sol_reserves as u128,
+            )
         };
 
         let price_impact_bps = if in_reserve > 0 {
@@ -429,7 +451,7 @@ impl Dex for PumpFunDex {
         min_out: u64,
     ) -> Result<Vec<Instruction>> {
         let sol_mint = "So11111111111111111111111111111111111111112";
-        
+
         // Determine direction
         let (token_mint_str, buy_token) = if input_mint == sol_mint {
             (output_mint, true)
@@ -441,20 +463,20 @@ impl Dex for PumpFunDex {
 
         let token_mint = Pubkey::from_str(token_mint_str)?;
         let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
-        let (associated_bonding_curve, _bump2) = 
+        let (associated_bonding_curve, _bump2) =
             self.derive_associated_bonding_curve(&bonding_curve, &token_mint);
 
-        let user = self.user_authority
+        let user = self
+            .user_authority
             .ok_or_else(|| anyhow!("user authority not set"))?;
 
         // Derive user token account (ATA)
         // Convert to spl_token Pubkey for ATA derivation
         let user_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(user.to_bytes());
-        let token_mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint.to_bytes());
-        let user_token_account_spl = spl_associated_token_account::get_associated_token_address(
-            &user_spl,
-            &token_mint_spl,
-        );
+        let token_mint_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint.to_bytes());
+        let user_token_account_spl =
+            spl_associated_token_account::get_associated_token_address(&user_spl, &token_mint_spl);
         let user_token_account = Pubkey::new_from_array(user_token_account_spl.to_bytes());
 
         let ix = if buy_token {
@@ -496,7 +518,7 @@ mod sysvar {
     pub mod rent {
         use solana_sdk::pubkey::Pubkey;
         use std::str::FromStr;
-        
+
         pub fn id() -> Pubkey {
             Pubkey::from_str("SysvarRent111111111111111111111111111111111")
                 .expect("valid rent sysvar")
