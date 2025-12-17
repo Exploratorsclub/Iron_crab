@@ -242,11 +242,12 @@ impl GeyserPoolDiscovery {
                 }
                 
                 // Use INSTRUCTION accounts, not transaction account_keys!
-                // ix_account[0]: Mint (writable, newly created)
-                // ix_account[1]: Mint Authority (creator/signer)
-                // ix_account[2]: Bonding Curve PDA (writable)
-                // ix_account[3]: Associated Bonding Curve Vault (writable)
-                tx_update.instruction_accounts.get(0).copied()?
+                // Based on observed logs:
+                // ix_account[0]: Global
+                // ix_account[1]: Fee Recipient
+                // ix_account[2]: Mint (writable, newly created)
+                // ix_account[3]: Bonding Curve PDA (writable)
+                tx_update.instruction_accounts.get(2).copied()?
             }
             DexType::RaydiumAmmV4 => {
                 // For Raydium: need to analyze transaction structure
@@ -280,10 +281,9 @@ impl GeyserPoolDiscovery {
         */
         
         // Extract pool address (bonding curve for Pump.fun)
-        // For Pump.fun: instruction account[2] is the bonding curve PDA (the "pool")
-        // instruction account[3] is the associated bonding curve vault
+        // For Pump.fun: instruction account[3] is the bonding curve PDA (the "pool")
         let pool_address = match dex_type {
-            DexType::PumpFun => tx_update.instruction_accounts.get(2).copied()?,
+            DexType::PumpFun => tx_update.instruction_accounts.get(3).copied()?,
             _ => tx_update.account_keys.get(0).copied()?,
         };
         
