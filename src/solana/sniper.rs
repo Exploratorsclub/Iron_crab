@@ -994,6 +994,12 @@ impl SniperEngine {
                                                 }
                                                 if txt.contains("logsNotification") {
                                                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                                        // Check for error first - skip failed transactions
+                                                        if !v.pointer("/params/result/value/err").unwrap_or(&serde_json::Value::Null).is_null() {
+                                                            // Transaction failed, ignore logs
+                                                            continue;
+                                                        }
+
                                                         // Extract signature first - we'll need it for fetching full tx
                                                         let sig = v.pointer("/params/result/value/signature")
                                                             .and_then(|s| s.as_str())
