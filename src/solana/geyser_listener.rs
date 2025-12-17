@@ -223,6 +223,25 @@ impl GeyserListener {
                                                 }
                                             }
 
+                                            // Append loaded addresses from meta (for V0 transactions)
+                                            // Order matters: Static -> Loaded Writable -> Loaded Readonly
+                                            if let Some(meta) = &tx.meta {
+                                                for key in &meta.loaded_writable_addresses {
+                                                    if key.len() == 32 {
+                                                        if let Ok(bytes) = key.as_slice().try_into() {
+                                                            account_keys.push(Pubkey::new_from_array(bytes));
+                                                        }
+                                                    }
+                                                }
+                                                for key in &meta.loaded_readonly_addresses {
+                                                    if key.len() == 32 {
+                                                        if let Ok(bytes) = key.as_slice().try_into() {
+                                                            account_keys.push(Pubkey::new_from_array(bytes));
+                                                        }
+                                                    }
+                                                }
+                                            }
+
                                             // DEBUG: Log instruction extraction attempt
                                             debug!(
                                                 signature = %signature,
