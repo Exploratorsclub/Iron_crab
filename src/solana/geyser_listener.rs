@@ -148,7 +148,16 @@ impl GeyserListener {
         let mut transaction_count = 0u64;
 
         // Process incoming updates
+        let mut last_log = std::time::Instant::now();
         while let Some(message) = stream.next().await {
+            if last_log.elapsed().as_secs() >= 60 {
+                info!(
+                    accounts = account_update_count,
+                    transactions = transaction_count,
+                    "geyser_listener: heartbeat - still receiving updates"
+                );
+                last_log = std::time::Instant::now();
+            }
             match message {
                 Ok(msg) => {
                     if let Some(update) = msg.update_oneof {
@@ -278,7 +287,7 @@ impl GeyserListener {
                                                         // Extract instruction data
                                                         instruction_data = ix.data.clone();
 
-                                                        debug!(
+                                                        info!(
                                                             signature = %signature,
                                                             instruction_idx = idx,
                                                             extracted_accounts = instruction_accounts.len(),
