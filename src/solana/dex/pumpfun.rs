@@ -189,7 +189,8 @@ impl PumpFunDex {
 
         // Instruction data: discriminator (8 bytes) + amount (8 bytes) + max_cost (8 bytes)
         let mut data = Vec::with_capacity(24);
-        data.extend_from_slice(&0x66063d1201daebea_u64.to_le_bytes()); // Buy discriminator
+        // Discriminator for "global:buy" = 66063d1201daebea
+        data.extend_from_slice(&[0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea]); 
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&max_sol_cost.to_le_bytes());
 
@@ -229,7 +230,8 @@ impl PumpFunDex {
 
         // Instruction data: discriminator (8 bytes) + amount (8 bytes) + min_output (8 bytes)
         let mut data = Vec::with_capacity(24);
-        data.extend_from_slice(&0x33e685a4017f83ad_u64.to_le_bytes()); // Sell discriminator
+        // Discriminator for "global:sell" = 33e685a4017f83ad
+        data.extend_from_slice(&[0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad]); 
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_sol_output.to_le_bytes());
 

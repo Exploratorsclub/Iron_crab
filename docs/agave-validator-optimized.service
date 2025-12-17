@@ -22,6 +22,7 @@ Environment=RUST_BACKTRACE=1
 ExecStart=/usr/local/bin/agave-validator \
   --identity /home/sol/validator-keypair.json \
   --ledger /var/solana/ledger \
+  --limit-ledger-size 50000000 \
   --accounts /var/solana/accounts \
   --no-voting \
   --rpc-port 8899 \
