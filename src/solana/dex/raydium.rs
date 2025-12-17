@@ -532,12 +532,15 @@ impl Raydium {
             .ok_or_else(|| anyhow!("no raydium pool for pair"))?;
 
         // Check if pool has Serum accounts populated, if not fetch them
-        let needs_serum = {
+        let (needs_serum, needs_reserves) = {
             let pool = self
                 .pools
                 .get(&pool_addr)
                 .ok_or_else(|| anyhow!("pool snapshot missing"))?;
-            pool.serum_bids.is_none() || pool.serum_asks.is_none()
+            (
+                pool.serum_bids.is_none() || pool.serum_asks.is_none(),
+                pool.reserve_base == 0 || pool.reserve_quote == 0
+            )
         };
 
         if needs_serum {
@@ -548,6 +551,16 @@ impl Raydium {
                     "failed to fetch serum accounts, swap will likely fail"
                 );
                 // Don't return error, let the swap attempt continue (will fail later with better error)
+            }
+        }
+
+        if needs_reserves {
+            if let Err(e) = self.fetch_and_update_reserves(&pool_addr).await {
+                tracing::warn!(
+                    pool=%pool_addr,
+                    error=%e,
+                    "failed to fetch pool reserves, swap calculation might fail"
+                );
             }
         }
 
@@ -1069,6 +1082,47 @@ impl Raydium {
                 bids=%bids.unwrap_or_default(),
                 asks=%asks.unwrap_or_default(),
                 "fetched and populated serum market accounts"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Fetch pool vault reserves from RPC and update cache.
+    /// This is called on-demand when a pool needs reserves for swap calculation.
+    pub async fn fetch_and_update_reserves(&self, pool_address: &Pubkey) -> Result<()> {
+        let (base_vault, quote_vault) = {
+            let pool = self
+                .pools
+                .get(pool_address)
+                .ok_or_else(|| anyhow!("pool not found in cache"))?;
+            (pool.base_vault, pool.quote_vault)
+        };
+
+        // Fetch both vault balances in parallel
+        let (base_bal, quote_bal) = tokio::try_join!(
+            self.rpc.rpc.get_token_account_balance(&base_vault),
+            self.rpc.rpc.get_token_account_balance(&quote_vault)
+        )
+        .map_err(|e| anyhow!("failed to fetch vault balances: {}", e))?;
+
+        let base_amt = base_bal
+            .amount
+            .parse::<u128>()
+            .map_err(|e| anyhow!("failed to parse base amount: {}", e))?;
+        let quote_amt = quote_bal
+            .amount
+            .parse::<u128>()
+            .map_err(|e| anyhow!("failed to parse quote amount: {}", e))?;
+
+        if let Some(mut pool) = self.pools.get_mut(pool_address) {
+            pool.reserve_base = base_amt;
+            pool.reserve_quote = quote_amt;
+            tracing::info!(
+                pool=%pool_address,
+                base=%base_amt,
+                quote=%quote_amt,
+                "fetched and updated pool reserves"
             );
         }
 
