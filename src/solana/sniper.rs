@@ -3060,6 +3060,21 @@ impl SniperEngine {
                     }
                 }
             }
+            // Check Pump.fun if others failed (likely for new bonding curve tokens)
+            if quote_out.is_none() {
+                if let Some(pf) = &self.pumpfun {
+                    if let Ok(Some(q)) = pf
+                        .quote_exact_in(
+                            &mint.to_string(),
+                            &sol_mint.to_string(),
+                            pos.amount_tokens as u64,
+                        )
+                        .await
+                    {
+                        quote_out = Some(q.amount_out);
+                    }
+                }
+            }
             let Some(out_lamports) = quote_out else {
                 continue;
             };
@@ -3218,7 +3233,7 @@ impl SniperEngine {
             }
         };
 
-        // Dynamic route selection for exit: compare Raydium vs Orca quotes
+        // Dynamic route selection for exit: compare Raydium vs Orca vs Pump.fun quotes
         let msb2 = self.adaptive_slippage_bps();
         let ray_plan = if let Some(r) = &self.raydium {
             r.build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), sell_tokens, msb2).await
@@ -3239,25 +3254,39 @@ impl SniperEngine {
                 orca_out = q.amount_out;
             }
         }
-        let mut used_raydium = false;
-        if ray_out > 0 || orca_out > 0 {
-            used_raydium = ray_out >= orca_out;
-            if used_raydium {
-                crate::metrics::DEX_SELECTION_EXIT_RAYDIUM_TOTAL
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                crate::metrics::DEX_SELECTION_EXIT_ORCA_TOTAL
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            debug!(mint=%mint, sell_tokens, ray_out, orca_out, chosen = if used_raydium { "RAYDIUM" } else { "ORCA" }, "sniper: dynamic exit dex selection");
-        } else {
-            // Fallback to Raydium if plan exists
-            if let Some(ref p) = ray_plan {
-                if p.as_ref().map(|rp| rp.pool.is_some()).unwrap_or(false) {
-                    used_raydium = true;
-                }
+        let mut pumpfun_out: u64 = 0;
+        if let Some(pf) = &self.pumpfun {
+            if let Ok(Some(q)) = pf
+                .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), sell_tokens)
+                .await
+            {
+                pumpfun_out = q.amount_out;
             }
         }
+
+        #[derive(Debug, PartialEq)]
+        enum ChosenDex { PumpFun, Raydium, Orca }
+        
+        let chosen_dex = if pumpfun_out >= ray_out && pumpfun_out >= orca_out && pumpfun_out > 0 {
+            ChosenDex::PumpFun
+        } else if ray_out >= orca_out && ray_out > 0 {
+            ChosenDex::Raydium
+        } else if orca_out > 0 {
+            ChosenDex::Orca
+        } else {
+            // Fallback logic
+            if ray_plan.is_some() { ChosenDex::Raydium } else { ChosenDex::Orca }
+        };
+
+        if chosen_dex == ChosenDex::Raydium {
+            crate::metrics::DEX_SELECTION_EXIT_RAYDIUM_TOTAL
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else if chosen_dex == ChosenDex::Orca {
+            crate::metrics::DEX_SELECTION_EXIT_ORCA_TOTAL
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        
+        debug!(mint=%mint, sell_tokens, ray_out, orca_out, pumpfun_out, chosen=?chosen_dex, "sniper: dynamic exit dex selection");
 
         // Build instructions based on chosen route; prefer full Raydium IX, fallback to Orca
         let bh: Hash = match self.rpc.get_latest_blockhash_retry().await {
@@ -3268,7 +3297,31 @@ impl SniperEngine {
             }
         };
         let mut tx_ixs: Vec<solana_sdk::instruction::Instruction> = Vec::new();
-        if used_raydium {
+        
+        if chosen_dex == ChosenDex::PumpFun {
+            if let Some(pf) = &self.pumpfun {
+                // Calculate min_out with slippage
+                let slip = msb2 as u128;
+                let min_out = ((pumpfun_out as u128) * (10_000 - slip) / 10_000) as u64;
+                let min_out = min_out.max(1);
+                
+                match pf.build_sell_ix(
+                    &mint.to_string(), // Token mint
+                    &sol_mint.to_string(), // Not used in build_sell_ix but consistent with interface
+                    sell_tokens,
+                    min_out,
+                ) {
+                    Ok(ixs) => {
+                        if !ixs.is_empty() {
+                            tx_ixs = ixs;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(?e, mint=%mint, "pump.fun build_sell_ix failed");
+                    }
+                }
+            }
+        } else if chosen_dex == ChosenDex::Raydium {
             // Try full Raydium instruction using Serum market accounts from snapshot
             if let (Some(r), Some(plan_meta)) = (
                 self.raydium.as_ref(),
@@ -3337,10 +3390,10 @@ impl SniperEngine {
             }
             if tx_ixs.is_empty() {
                 info!(mint=%mint, "raydium full exit instruction unavailable; falling back to orca");
-                used_raydium = false; // fallback
+                // used_raydium = false; // No longer needed with enum
             }
         }
-        if !used_raydium {
+        if chosen_dex == ChosenDex::Orca {
             if let Some(o) = &self.orca {
                 o.set_user_authority(Pubkey::new_from_array(self.treasury.pubkey().to_bytes()));
                 // Register token source and WSOL destination accounts
