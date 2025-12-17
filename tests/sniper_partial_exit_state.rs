@@ -24,7 +24,7 @@ async fn partial_exit_state_reduction() {
         path
     };
     let treasury = Arc::new(Treasury::load(tmp_path.to_str().unwrap()).unwrap());
-    let engine = SniperEngine::new(rpc, cfg, raydium, orca, treasury, None);
+    let engine = SniperEngine::new(rpc, cfg, raydium, orca, None, treasury, None);
 
     let mint = Pubkey::new_unique();
     let invested_sol = 8.0;

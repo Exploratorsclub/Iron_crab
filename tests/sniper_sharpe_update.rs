@@ -23,7 +23,7 @@ async fn sharpe_updates_after_partial_exits() {
         path
     };
     let treasury = Arc::new(Treasury::load(tmp_path.to_str().unwrap()).unwrap());
-    let engine = SniperEngine::new(rpc, cfg, None, None, treasury, None);
+    let engine = SniperEngine::new(rpc, cfg, None, None, None, treasury, None);
 
     let mint = Pubkey::new_unique();
     engine.test_insert_lot(mint, 10.0, 1_000_000.0, 0.00001, 6);
