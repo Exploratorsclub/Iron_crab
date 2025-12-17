@@ -1386,10 +1386,9 @@ pub mod reader {
         pub const QUOTE_MINT: usize = 432;
         pub const LP_MINT: usize = 464;
         pub const OPEN_ORDERS: usize = 496;
-        // Corrected ordering: after OPEN_ORDERS comes TARGET_ORDERS, then MARKET_ID, then MARKET_PROGRAM_ID (each 32 bytes)
-        pub const TARGET_ORDERS: usize = 528;
-        pub const MARKET_ID: usize = 560;
-        pub const MARKET_PROGRAM_ID: usize = 592;
+        pub const MARKET_ID: usize = 528;
+        pub const MARKET_PROGRAM_ID: usize = 560;
+        pub const TARGET_ORDERS: usize = 592;
         pub const LP_RESERVE: usize = 720; // u64 LE
         pub const STATUS: usize = 0; // u64 LE
     }
