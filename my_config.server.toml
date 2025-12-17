@@ -74,9 +74,20 @@ adaptive_slippage_window = 20
 adaptive_slippage_target_pct = 0.002
 adaptive_slippage_step_bps = 5
 
-# EXIT STRATEGY - YOUR BEST RUG PROTECTION:
-stop_loss_bps = 1500  # -15% stop loss (tighter than -20%, less loss on rugs)
-take_profit_bps = 2000  # +20% take profit (take money off table quickly)
+# EXIT STRATEGY - MOONBAG MODE
+stop_loss_bps = 1000       # -10% Initial Stop Loss (Sehr eng, siehe Erklärung)
+# take_profit_bps = 2000   # DEAKTIVIERT zugunsten von Tiers
+trailing_stop_bps = 1500   # 15% Trailing Stop (Sichert Gewinne ab)
+
+# MOONBAG STRATEGY:
+# 1. Bei +100% (2x): Verkaufe 50% -> Einsatz ist raus (Risk Free).
+# 2. Bei +300% (4x): Verkaufe 50% der verbleibenden Position -> Gewinn sichern.
+# 3. Der Rest (25% der Ursprungsgröße) läuft weiter bis zum Trailing Stop.
+take_profit_tiers = [
+    { bps = 10000, fraction = 0.5 },
+    { bps = 30000, fraction = 0.5 }
+]
+
 stop_loss_cooldown_secs = 300
 
 # MULTI-LAYER RUG FILTERING (ordered by importance):
