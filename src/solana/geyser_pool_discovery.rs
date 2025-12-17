@@ -131,7 +131,7 @@ impl GeyserPoolDiscovery {
     /// as instruction accounts, avoiding the need to parse account data layouts
     async fn process_transaction_update(
         tx_update: GeyserTransactionUpdate,
-        rpc: &Arc<SolanaRpc>,
+        _rpc: &Arc<SolanaRpc>,
     ) -> Option<PoolDiscoveryEvent> {
         // Identify DEX by looking for known program IDs in account_keys
         let raydium_program = Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").ok()?;
@@ -175,7 +175,7 @@ impl GeyserPoolDiscovery {
                 message = "DEBUG: Pump.fun CREATE - instruction accounts",
                 account_count = tx_update.account_keys.len(),
                 instruction_count = tx_update.instruction_accounts.len(),
-                ix_account_0 = %tx_update.instruction_accounts.get(0).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
+                ix_account_0 = %tx_update.instruction_accounts.first().map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
                 ix_account_1 = %tx_update.instruction_accounts.get(1).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
                 ix_account_2 = %tx_update.instruction_accounts.get(2).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
                 ix_account_3 = %tx_update.instruction_accounts.get(3).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
@@ -247,7 +247,7 @@ impl GeyserPoolDiscovery {
                 // ix_account[1]: Fee Recipient
                 // ix_account[2]: Mint (writable, newly created)
                 // ix_account[3]: Bonding Curve PDA (writable)
-                tx_update.instruction_accounts.get(2).copied()?
+                tx_update.instruction_accounts.first().copied()?
             }
             DexType::RaydiumAmmV4 => {
                 // For Raydium: need to analyze transaction structure
@@ -284,7 +284,7 @@ impl GeyserPoolDiscovery {
         // For Pump.fun: instruction account[3] is the bonding curve PDA (the "pool")
         let pool_address = match dex_type {
             DexType::PumpFun => tx_update.instruction_accounts.get(3).copied()?,
-            _ => tx_update.account_keys.get(0).copied()?,
+            _ => tx_update.account_keys.first().copied()?,
         };
         
         // SOL mint for quote

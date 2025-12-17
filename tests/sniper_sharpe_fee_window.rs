@@ -29,7 +29,14 @@ async fn sharpe_lower_with_fees() {
         temp_treasury("no-fee"),
         None,
     );
-    let eng_fee = SniperEngine::new(rpc.clone(), base_cfg, None, None, temp_treasury("fee1"), None);
+    let eng_fee = SniperEngine::new(
+        rpc.clone(),
+        base_cfg,
+        None,
+        None,
+        temp_treasury("fee1"),
+        None,
+    );
 
     let mint_a = Pubkey::new_unique();
     let mint_b = Pubkey::new_unique();
