@@ -43,9 +43,21 @@ impl GeyserPoolDiscovery {
         let event_tx_clone = event_tx.clone();
         tokio::spawn(async move {
             let mut rx = account_rx;
-            while let Ok(update) = rx.recv().await {
-                if let Some(event) = Self::process_account_update(update, &rpc_clone).await {
-                    let _ = event_tx_clone.send(event);
+            loop {
+                match rx.recv().await {
+                    Ok(update) => {
+                        if let Some(event) = Self::process_account_update(update, &rpc_clone).await
+                        {
+                            let _ = event_tx_clone.send(event);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "geyser_pool_discovery: account processor lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::warn!("geyser_pool_discovery: account stream closed");
+                        break;
+                    }
                 }
             }
         });
@@ -54,10 +66,25 @@ impl GeyserPoolDiscovery {
         let rpc_clone2 = rpc.clone();
         tokio::spawn(async move {
             let mut rx = transaction_rx;
-            while let Ok(tx_update) = rx.recv().await {
-                if let Some(event) = Self::process_transaction_update(tx_update, &rpc_clone2).await
-                {
-                    let _ = event_tx.send(event);
+            loop {
+                match rx.recv().await {
+                    Ok(tx_update) => {
+                        if let Some(event) =
+                            Self::process_transaction_update(tx_update, &rpc_clone2).await
+                        {
+                            let _ = event_tx.send(event);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            skipped,
+                            "geyser_pool_discovery: transaction processor lagged"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::warn!("geyser_pool_discovery: transaction stream closed");
+                        break;
+                    }
                 }
             }
         });
