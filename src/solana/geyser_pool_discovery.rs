@@ -254,7 +254,93 @@ impl GeyserPoolDiscovery {
                 // ix_account[1]: Fee Recipient
                 // ix_account[2]: Mint (writable, newly created)
                 // ix_account[3]: Bonding Curve PDA (writable)
-                tx_update.instruction_accounts.get(2).copied()?
+                
+                // ROBUST MINT DETECTION:
+                // Iterate through accounts to find the Mint.
+                // Criteria:
+                // 1. Writable (it's being initialized)
+                // 2. Signer (it must sign to be created)
+                // 3. On-Curve (not a PDA)
+                // 4. Not the Fee Payer (usually index 0 of transaction, but hard to know here. However, Mint is usually NOT the first account in instruction if Global is 0)
+                
+                let mut found_mint = None;
+                
+                // Log all accounts for debugging
+                for (i, acc) in tx_update.instruction_accounts.iter().enumerate() {
+                     tracing::info!(
+                        signature = %tx_update.signature,
+                        index = i,
+                        pubkey = %acc,
+                        // We don't have is_signer/is_writable in the Pubkey struct here, 
+                        // assuming tx_update.instruction_accounts is just Vec<Pubkey>.
+                        // Wait, if it's just Pubkey, we can't check signer status!
+                        // We need to look up the account in the transaction message if possible, 
+                        // or rely on position/curve check.
+                        is_on_curve = acc.is_on_curve(),
+                        "geyser_pool_discovery: Account Analysis"
+                    );
+                }
+
+                // Since we only have Pubkeys in instruction_accounts (based on usage), 
+                // we can't check signer/writable status directly unless we have the full message.
+                // However, we know:
+                // - Global (index 0) is on-curve but known.
+                // - Fee Recipient (index 1) is on-curve but known.
+                // - Bonding Curve (index 3?) is OFF-curve (PDA).
+                // - Associated Bonding Curve (index 4?) is OFF-curve (PDA).
+                // - Mint is ON-curve.
+                
+                // So, skip index 0 and 1. Find the first ON-curve account.
+                // Also skip System Program, Token Program, etc.
+                
+                let known_programs = [
+                    Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap(), // Token
+                    Pubkey::from_str("11111111111111111111111111111111").unwrap(), // System
+                    Pubkey::from_str("SysvarRent111111111111111111111111111111111").unwrap(), // Rent
+                    Pubkey::from_str("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s").unwrap(), // Metadata
+                    Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap(), // ATA
+                    Pubkey::from_str("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1").unwrap(), // Event Auth
+                    Pubkey::from_str("CebN5wgopZ17X43SymdI8Y434Bs7rfL3ffU28JeD7ctP").unwrap(), // Fee Recipient
+                    Pubkey::from_str("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf").unwrap(), // Global
+                ];
+
+                for (i, acc) in tx_update.instruction_accounts.iter().enumerate() {
+                    // Skip known accounts
+                    if known_programs.contains(acc) {
+                        continue;
+                    }
+                    
+                    // Skip PDAs (Bonding Curve is PDA)
+                    if !acc.is_on_curve() {
+                        continue;
+                    }
+                    
+                    // The first remaining on-curve account is likely the Mint or the Mint Authority (Payer).
+                    // In Create instruction, Mint comes before Mint Authority usually?
+                    // Or Mint Authority comes first?
+                    // In the log: ix_2 (4AJX...) was Mint? ix_3 (6ydT...) was Bonding Curve.
+                    // If 4AJX... is on curve, and 6ydT... is off curve.
+                    // Then 4AJX... is the candidate.
+                    
+                    // We assume the Mint is the first unknown on-curve account.
+                    found_mint = Some(*acc);
+                    break;
+                }
+                
+                if let Some(mint) = found_mint {
+                     tracing::info!(
+                        signature = %tx_update.signature,
+                        mint = %mint,
+                        "geyser_pool_discovery: ✅ DETECTED MINT via Heuristic"
+                    );
+                    mint
+                } else {
+                     tracing::warn!(
+                        signature = %tx_update.signature,
+                        "geyser_pool_discovery: ❌ FAILED TO DETECT MINT - Fallback to index 2"
+                    );
+                    tx_update.instruction_accounts.get(2).copied()?
+                }
             }
             DexType::RaydiumAmmV4 => {
                 // For Raydium: need to analyze transaction structure

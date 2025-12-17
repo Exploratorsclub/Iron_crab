@@ -10,6 +10,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 #[tokio::test]
+#[ignore]
 async fn test_pumpfun_live_token_quote() -> Result<()> {
     // Real token that just launched with 20% gain
     let token_mint = "AA8Sb5tu2bvLWR2wJ8ueL1MnVAWeCDVQrPhJqog9pump";
