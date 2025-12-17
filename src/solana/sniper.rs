@@ -4396,7 +4396,7 @@ impl SniperEngine {
             }
         };
         // Known constants
-        let incinerator = Pubkey::from_str("1nc1nerator11111111111111111111111111111111").unwrap();
+        let incinerator = pubkey!("1nc1nerator11111111111111111111111111111111");
         let raydium_prog = Pubkey::from_str(RAYDIUM_AMM_V4).unwrap_or(Pubkey::default());
         let orca_prog = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap_or(Pubkey::default());
         // Build a set of current known vault addresses from Raydium and Orca snapshots to classify program vault holdings precisely

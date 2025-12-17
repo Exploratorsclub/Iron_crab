@@ -296,7 +296,7 @@ impl GeyserPoolDiscovery {
 
                 let known_programs = [
                     pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), // Token
-                    pubkey!("11111111111111111111111111111111"), // System
+                    pubkey!("11111111111111111111111111111111"),            // System
                     pubkey!("SysvarRent111111111111111111111111111111111"), // Rent
                     pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"), // Metadata
                     pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"), // ATA
