@@ -3387,17 +3387,11 @@ impl SniperEngine {
 
                 // We also need the user's ATA for the token
                 let user_pk = self.treasury.pubkey();
-                let (user_token_account, _) = match self
+                let (user_token_account, _) = self
                     .treasury
                     .ata_address(&self.rpc, &user_pk, &mint_pk)
                     .await
-                {
-                    Ok(v) => v,
-                    Err(_) => (
-                        solana_sdk::pubkey::Pubkey::default(),
-                        solana_sdk::pubkey::Pubkey::default(),
-                    ), // Should not happen if we have balance
-                };
+                    .unwrap_or_default();
 
                 match pf.build_sell_ix(
                     &mint_pk,
