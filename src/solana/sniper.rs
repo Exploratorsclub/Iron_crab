@@ -9,6 +9,7 @@ use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
 use anyhow::Result;
 use solana_client::rpc_config::RpcSendTransactionConfig;
+use solana_sdk::pubkey;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::{hash::Hash, transaction::Transaction};
 use std::str::FromStr;
@@ -1110,10 +1111,10 @@ impl SniperEngine {
             })
             .unwrap_or_else(|| {
                 vec![
-                    Pubkey::from_str(RAYDIUM_AMM_V4).unwrap(),
-                    Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap(),
+                    Pubkey::from_str(RAYDIUM_AMM_V4).expect("valid raydium pubkey"),
+                    Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).expect("valid orca pubkey"),
                     // Pump.fun: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
-                    Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap(),
+                    pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
                 ]
             });
 
@@ -1233,7 +1234,7 @@ impl SniperEngine {
         }
 
         // Determine which mint is the new token (not SOL/WSOL)
-        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
 
         // Skip non-SOL pairs (we only trade SOL/Token pairs for now)
         if event.base_mint != sol_mint && event.quote_mint != sol_mint {
@@ -2047,7 +2048,7 @@ impl SniperEngine {
         let orca = self.orca.clone();
         let pumpfun = self.pumpfun.clone();
         // Determine input (SOL) and output (mint) ordering for swap (we buy the mint with SOL)
-        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
         // Convert max_buy_sol (f64) to lamports safely
         let lamports_in = ((self.effective_max_buy_sol() * 1e9) as u64).max(10_000); // dynamic drawdown-adjusted size
 
@@ -3076,7 +3077,7 @@ impl SniperEngine {
                 r.min_exit_notional_sol.unwrap_or(0.0),
             )
         };
-        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
         // Flatten lots for evaluation
         let positions: Vec<(Pubkey, PositionLot, usize)> = {
             let rs = self.risk.read();
@@ -3249,7 +3250,7 @@ impl SniperEngine {
         amount_tokens: u64,
         fraction: f64,
     ) -> Result<()> {
-        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
         // Determine actual token balance (ATA) to avoid over-selling
         let owner_sdk = self.treasury.pubkey();
         let mint_sdk = solana_sdk::pubkey::Pubkey::new_from_array(mint.to_bytes());
@@ -4065,9 +4066,9 @@ impl SniperEngine {
     /// Index-based (Raydium/Orca) liquidity estimation using current pool snapshots.
     /// Returns conservative SOL notionals (sum over pools: 2 * SOL_reserve for SOL pairs, stable converted to SOL via placeholder rate).
     async fn estimate_liquidity_index(&self, mint: &Pubkey) -> Result<Option<f64>> {
-        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-        let usdc = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
-        let usdt = Pubkey::from_str("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB").unwrap();
+        let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
+        let usdc = pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+        let usdt = pubkey!("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB");
         let mut total_sol = 0f64;
         let mut considered = 0u32;
         // Helper to process pools from a connector
@@ -4139,9 +4140,9 @@ impl SniperEngine {
     /// 4. Price conversion: if SOL paired -> direct; if USDC/USDT paired -> treat 1 token == 1 USD and convert using a static SOL/USD (placeholder) or skip until oracle integrated.
     async fn estimate_liquidity_for_mint(&self, mint: &Pubkey) -> Result<Option<f64>> {
         // Placeholder stable + SOL mints (should move to config/oracle):
-        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-        let usdc = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
-        let usdt = Pubkey::from_str("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB").unwrap();
+        let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
+        let usdc = pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+        let usdt = pubkey!("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB");
         // Quick exit if candidate itself is SOL/stable
         if *mint == sol_mint || *mint == usdc || *mint == usdt {
             return Ok(None);

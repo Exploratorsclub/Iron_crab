@@ -6,6 +6,7 @@ use crate::solana::geyser_listener::{
 };
 use crate::solana::rpc::SolanaRpc;
 use anyhow::Result;
+use solana_sdk::pubkey;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -294,14 +295,14 @@ impl GeyserPoolDiscovery {
                 // Also skip System Program, Token Program, etc.
 
                 let known_programs = [
-                    Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap(), // Token
-                    Pubkey::from_str("11111111111111111111111111111111").unwrap(), // System
-                    Pubkey::from_str("SysvarRent111111111111111111111111111111111").unwrap(), // Rent
-                    Pubkey::from_str("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s").unwrap(), // Metadata
-                    Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap(), // ATA
-                    Pubkey::from_str("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1").unwrap(), // Event Auth
-                    Pubkey::from_str("CebN5wgopZ17X43SymdI8Y434Bs7rfL3ffU28JeD7ctP").unwrap(), // Fee Recipient
-                    Pubkey::from_str("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf").unwrap(), // Global
+                    pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), // Token
+                    pubkey!("11111111111111111111111111111111"), // System
+                    pubkey!("SysvarRent111111111111111111111111111111111"), // Rent
+                    pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"), // Metadata
+                    pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"), // ATA
+                    pubkey!("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1"), // Event Auth
+                    pubkey!("CebN5wgopZ17X43SymdI8Y434Bs7rfL3ffU28JeD7ctP"), // Fee Recipient
+                    pubkey!("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf"), // Global
                 ];
 
                 for (i, acc) in tx_update.instruction_accounts.iter().enumerate() {
