@@ -642,7 +642,7 @@ impl SniperEngine {
                 match self.rpc.rpc.send_transaction_with_config(tx, config).await {
                     Ok(sig) => match self.rpc.rpc.confirm_transaction(&sig).await {
                         Ok(true) => Ok(sig),
-                        Ok(false) => Err(anyhow::anyhow!("Confirmation timed out").into()),
+                        Ok(false) => Err(anyhow::anyhow!("Confirmation timed out")),
                         Err(e) => Err(e.into()),
                     },
                     Err(e) => Err(e.into()),

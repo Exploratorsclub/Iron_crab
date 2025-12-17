@@ -254,7 +254,7 @@ impl GeyserPoolDiscovery {
                 // ix_account[1]: Fee Recipient
                 // ix_account[2]: Mint (writable, newly created)
                 // ix_account[3]: Bonding Curve PDA (writable)
-                tx_update.instruction_accounts.first().copied()?
+                tx_update.instruction_accounts.get(2).copied()?
             }
             DexType::RaydiumAmmV4 => {
                 // For Raydium: need to analyze transaction structure
