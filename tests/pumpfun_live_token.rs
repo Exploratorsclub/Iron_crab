@@ -111,7 +111,7 @@ async fn test_pumpfun_pda_derivation() -> Result<()> {
     println!("Bump: {}", bump);
 
     // Verify it's a valid PDA
-    assert!(bump < 255, "Bump should be valid");
+    // assert!(bump < 255, "Bump should be valid"); // 255 is a valid bump!
 
     // Try alternative derivation to verify
     let program_id = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")?;
