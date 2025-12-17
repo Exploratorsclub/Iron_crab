@@ -1184,12 +1184,12 @@ impl SniperEngine {
         {
             let processing = self.processing.read();
             if processing.contains(&mint) {
-                debug!(mint=%mint, "mint already being processed by another task, skipping");
+                info!(mint=%mint, "mint already being processed by another task, skipping");
                 return;
             }
             let purchased = self.purchased.read();
             if purchased.contains(&mint) {
-                debug!(mint=%mint, "mint already purchased, skipping");
+                info!(mint=%mint, "mint already purchased, skipping");
                 return;
             }
         }
@@ -1228,7 +1228,7 @@ impl SniperEngine {
                         warn!(pool=%event.pool_address, error=%e, "failed to load raydium pool into cache");
                     }
                 } else {
-                    debug!(pool=%event.pool_address, "raydium pool already in cache, skipping reload");
+                    info!(pool=%event.pool_address, "raydium pool already in cache, skipping reload");
                 }
             }
         }
@@ -1238,7 +1238,7 @@ impl SniperEngine {
 
         // Skip non-SOL pairs (we only trade SOL/Token pairs for now)
         if event.base_mint != sol_mint && event.quote_mint != sol_mint {
-            debug!(
+            info!(
                 base=%event.base_mint,
                 quote=%event.quote_mint,
                 "sniper: skipping non-SOL pair (Token/Token or Token/Stablecoin)"

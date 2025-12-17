@@ -4,7 +4,8 @@
 # --- Application ---
 [app]
 name = "ironcrab-prod"
-log_level = "trace,ironcrab::solana::dex::orca=info"  # trace globally, but silence orca spam
+# Optimized logging: Global INFO, Sniper DEBUG (to see decision logic), Silence Orca/Geyser spam
+log_level = "info,ironcrab::solana::sniper=debug,ironcrab::solana::dex::orca=warn,ironcrab::solana::geyser_listener=warn"
 autosave_state_secs = 30
 
 # --- Solana RPC & Keypair (Linux paths) ---
