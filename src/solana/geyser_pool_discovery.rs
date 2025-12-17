@@ -454,23 +454,23 @@ impl GeyserPoolDiscovery {
             return None; // AmmStatus::Uninitialized
         }
 
-        // Offset 40: coin_decimals (u64)
-        let coin_decimals = u64::from_le_bytes(data[40..48].try_into().ok()?) as u8;
-        // Offset 48: pc_decimals (u64)
-        let pc_decimals = u64::from_le_bytes(data[48..56].try_into().ok()?) as u8;
+        // Offset 32: coin_decimals (u64)
+        let coin_decimals = u64::from_le_bytes(data[32..40].try_into().ok()?) as u8;
+        // Offset 40: pc_decimals (u64)
+        let pc_decimals = u64::from_le_bytes(data[40..48].try_into().ok()?) as u8;
 
-        // Offset 400: coin_vault (Pubkey) - holds base token reserves
-        let coin_vault = Pubkey::new_from_array(data[400..432].try_into().ok()?);
-        // Offset 432: pc_vault (Pubkey) - holds quote token reserves
-        let pc_vault = Pubkey::new_from_array(data[432..464].try_into().ok()?);
+        // Offset 336: coin_vault (Pubkey) - holds base token reserves
+        let coin_vault = Pubkey::new_from_array(data[336..368].try_into().ok()?);
+        // Offset 368: pc_vault (Pubkey) - holds quote token reserves
+        let pc_vault = Pubkey::new_from_array(data[368..400].try_into().ok()?);
 
-        // Offset 464: coin_vault_mint (Pubkey) - this is the BASE MINT!
-        let base_mint = Pubkey::new_from_array(data[464..496].try_into().ok()?);
-        // Offset 496: pc_vault_mint (Pubkey) - this is the QUOTE MINT!
-        let quote_mint = Pubkey::new_from_array(data[496..528].try_into().ok()?);
+        // Offset 400: coin_vault_mint (Pubkey) - this is the BASE MINT!
+        let base_mint = Pubkey::new_from_array(data[400..432].try_into().ok()?);
+        // Offset 432: pc_vault_mint (Pubkey) - this is the QUOTE MINT!
+        let quote_mint = Pubkey::new_from_array(data[432..464].try_into().ok()?);
 
-        // Offset 688: lp_amount (u64) - total LP tokens minted
-        let lp_amount = u64::from_le_bytes(data[688..696].try_into().ok()?);
+        // Offset 720: lp_amount (u64) - total LP tokens minted
+        let lp_amount = u64::from_le_bytes(data[720..728].try_into().ok()?);
 
         // Conservative liquidity estimation until vault fetch completes
         // LP amount is NOT a reliable indicator of TVL due to varying decimals
