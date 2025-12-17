@@ -3305,16 +3305,29 @@ impl SniperEngine {
                 let min_out = ((pumpfun_out as u128) * (10_000 - slip) / 10_000) as u64;
                 let min_out = min_out.max(1);
                 
+                // We need to derive the bonding curve accounts manually here since build_sell_ix expects Pubkeys
+                // and we only have the mint Pubkey.
+                let mint_pk = solana_sdk::pubkey::Pubkey::new_from_array(mint.to_bytes());
+                let (bonding_curve, _) = pf.derive_bonding_curve(&mint_pk);
+                let (associated_bonding_curve, _) = pf.derive_associated_bonding_curve(&bonding_curve, &mint_pk);
+                
+                // We also need the user's ATA for the token
+                let user_pk = self.treasury.pubkey();
+                let (user_token_account, _) = match self.treasury.ata_address(&self.rpc, &user_pk, &mint_pk).await {
+                    Ok(v) => v,
+                    Err(_) => (solana_sdk::pubkey::Pubkey::default(), solana_sdk::pubkey::Pubkey::default()), // Should not happen if we have balance
+                };
+
                 match pf.build_sell_ix(
-                    &mint.to_string(), // Token mint
-                    &sol_mint.to_string(), // Not used in build_sell_ix but consistent with interface
+                    &mint_pk,
+                    &bonding_curve,
+                    &associated_bonding_curve,
+                    &user_token_account,
                     sell_tokens,
                     min_out,
                 ) {
-                    Ok(ixs) => {
-                        if !ixs.is_empty() {
-                            tx_ixs = ixs;
-                        }
+                    Ok(ix) => {
+                        tx_ixs = vec![ix];
                     }
                     Err(e) => {
                         warn!(?e, mint=%mint, "pump.fun build_sell_ix failed");
