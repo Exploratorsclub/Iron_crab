@@ -1219,6 +1219,24 @@ impl SniperEngine {
             "sniper: new pool discovered via Geyser"
         );
 
+        // Determine which mint is the new token (not SOL/WSOL)
+        let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
+
+        // The new token mint is whichever side is NOT SOL
+        // Note: We do this BEFORE loading the pool to check if it was ALREADY known
+        let mint = if event.base_mint == sol_mint {
+            event.quote_mint // SOL is base, so new token is quote
+        } else {
+            event.base_mint // New token is base, SOL is quote
+        };
+
+        // Check if mint is already known in Raydium cache BEFORE we load this new pool
+        let is_known_before_load = if let Some(ray) = &self.raydium {
+            ray.is_mint_known(&mint)
+        } else {
+            false
+        };
+
         // Load Raydium pool into cache immediately (only if not already cached)
         if event.dex_type == crate::solana::geyser_pool_discovery::DexType::RaydiumAmmV4 {
             if let Some(ref ray) = self.raydium {
@@ -1233,9 +1251,6 @@ impl SniperEngine {
             }
         }
 
-        // Determine which mint is the new token (not SOL/WSOL)
-        let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
-
         // Skip non-SOL pairs (we only trade SOL/Token pairs for now)
         if event.base_mint != sol_mint && event.quote_mint != sol_mint {
             info!(
@@ -1245,13 +1260,6 @@ impl SniperEngine {
             );
             return;
         }
-
-        // The new token mint is whichever side is NOT SOL
-        let mint = if event.base_mint == sol_mint {
-            event.quote_mint // SOL is base, so new token is quote
-        } else {
-            event.base_mint // New token is base, SOL is quote
-        };
 
         // Check blacklist
         if self.cfg.read().blacklist_mints.contains(&mint.to_string()) {
@@ -1335,23 +1343,21 @@ impl SniperEngine {
         }
 
         // Check if mint is already known in Raydium cache (implies old token with existing pools)
-        if let Some(ray) = &self.raydium {
-            if ray.is_mint_known(&mint) {
-                info!(mint=%mint, "sniper: skipping token already known in Raydium cache (old token)");
-                self.append_pool_candidate_record(
-                    program_label,
-                    &mint,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(liq_sol),
-                    "SKIP",
-                    "known_in_raydium",
-                );
-                return;
-            }
+        if is_known_before_load {
+            info!(mint=%mint, "sniper: skipping token already known in Raydium cache (old token)");
+            self.append_pool_candidate_record(
+                program_label,
+                &mint,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(liq_sol),
+                "SKIP",
+                "known_in_raydium",
+            );
+            return;
         }
 
         // For brand new tokens from transaction-based discovery, skip LP lock check
