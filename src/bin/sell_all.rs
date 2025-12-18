@@ -95,9 +95,7 @@ async fn main() -> anyhow::Result<()> {
         // Manual parse to avoid spl_token version mismatch
         // Layout is compatible for basic fields between Token and Token-2022
         if bytes.len() < 72 {
-            // Try parsing as Token-2022 with extensions (often larger) or just standard layout
-            // Standard layout is 165 bytes.
-            // If it's smaller than 72, it's definitely not a valid token account.
+            tracing::debug!("Skipping account with len < 72: {}", bytes.len());
             continue;
         }
         let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
@@ -105,11 +103,19 @@ async fn main() -> anyhow::Result<()> {
         let amount_bytes: [u8; 8] = bytes[64..72].try_into().unwrap();
         let amount = u64::from_le_bytes(amount_bytes);
 
+        tracing::debug!(
+            "Checking account: Mint={}, Amount={}, Len={}",
+            mint,
+            amount,
+            bytes.len()
+        );
+
         if mint == sol_mint {
+            tracing::debug!("Skipping SOL mint");
             continue;
         }
         if amount == 0 {
-            // info!("Skipping empty account for mint {}", mint);
+            tracing::debug!("Skipping empty account for mint {}", mint);
             continue;
         }
 
