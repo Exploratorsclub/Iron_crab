@@ -1,4 +1,5 @@
 use clap::Parser;
+use futures::stream::{self, StreamExt};
 use ironcrab::config::Config;
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::Dex;
@@ -25,6 +26,141 @@ struct Args {
     rpc_url: Option<String>,
 }
 
+struct SellTask {
+    mint: Pubkey,
+    amount: u64,
+    ta_pubkey: Pubkey,
+}
+
+async fn sell_token(
+    rpc: Arc<SolanaRpc>,
+    raydium: Arc<Raydium>,
+    treasury: Arc<Treasury>,
+    task: SellTask,
+    wsol_ata: Pubkey,
+) -> anyhow::Result<()> {
+    let mint = task.mint;
+    let amount = task.amount;
+    let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+
+    // Slippage 50% for panic sell
+    let slippage_bps = 5000;
+
+    // Try to fetch pool specifically for this pair if not in cache
+    // Use Raydium V3 API via curl to avoid RPC scanning issues
+    let url = format!(
+        "https://api-v3.raydium.io/pools/info/mint?mint1={}&mint2={}&poolType=standard&poolSortField=liquidity&sortType=desc&pageSize=1&page=1",
+        mint, sol_mint
+    );
+
+    info!("Fetching pool for {} from Raydium API...", mint);
+
+    let output = std::process::Command::new("curl")
+        .arg("-s")
+        .arg(&url)
+        .output();
+
+    let pool_id = match output {
+        Ok(out) if out.status.success() => {
+            let json_str = String::from_utf8(out.stdout).unwrap_or_default();
+            let v: serde_json::Value =
+                serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
+
+            if let Some(arr) = v["data"]["data"].as_array() {
+                if let Some(first) = arr.first() {
+                    if let Some(id_str) = first["id"].as_str() {
+                        Pubkey::from_str(id_str).ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(pid) = pool_id {
+        if pid != Pubkey::default() {
+            info!("Found pool {} via API. Loading...", pid);
+            if let Err(e) = raydium.load_pool_from_geyser(&pid).await {
+                warn!("Failed to load pool {}: {}", pid, e);
+            }
+        }
+    } else {
+        warn!("No pool found for {} via API", mint);
+    }
+
+    match raydium
+        .build_swap_plan_auto(
+            &mint.to_string(),
+            &sol_mint.to_string(),
+            amount,
+            slippage_bps,
+        )
+        .await
+    {
+        Ok(Some(plan)) => {
+            info!(
+                "Selling {} {} -> SOL (Expected: {})",
+                amount, mint, plan.expected_out
+            );
+
+            let mut ixs = plan.ixs;
+
+            // Patch Raydium instructions with actual user accounts
+            let raydium_prog =
+                Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").unwrap();
+            let source_pubkey = task.ta_pubkey;
+
+            for ix in ixs.iter_mut() {
+                if ix.program_id == raydium_prog {
+                    // Raydium V4 Swap Instruction has 18 accounts.
+                    // Index 15: User Source
+                    // Index 16: User Destination
+                    // Index 17: User Authority
+                    if ix.accounts.len() >= 18 {
+                        // Patch User Source
+                        if ix.accounts[15].pubkey == Pubkey::default() {
+                            ix.accounts[15].pubkey = source_pubkey;
+                        }
+                        // Patch User Destination
+                        if ix.accounts[16].pubkey == Pubkey::default() {
+                            ix.accounts[16].pubkey = wsol_ata;
+                        }
+                        // Patch User Authority
+                        if ix.accounts[17].pubkey == Pubkey::default() {
+                            ix.accounts[17].pubkey = treasury.pubkey();
+                        }
+                    }
+                }
+            }
+
+            let latest_blockhash = rpc.get_latest_blockhash_retry().await?;
+            let mut tx = Transaction::new_with_payer(&ixs, Some(&treasury.pubkey()));
+
+            if let Err(e) = tx.try_sign(&[treasury.signer_ref()], latest_blockhash) {
+                warn!("Failed to sign transaction for {}: {:?}", mint, e);
+                return Err(anyhow::anyhow!("Failed to sign"));
+            }
+
+            match rpc.rpc.send_and_confirm_transaction(&tx).await {
+                Ok(sig) => {
+                    info!("Sold {}! Sig: {}", mint, sig);
+                }
+                Err(e) => warn!("Failed to sell {}: {:?}", mint, e),
+            }
+        }
+        Ok(None) => warn!("No route for {}", mint),
+        Err(e) => warn!("Error planning swap for {}: {:?}", mint, e),
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -44,10 +180,6 @@ async fn main() -> anyhow::Result<()> {
     info!("Wallet: {}", treasury.pubkey());
 
     let raydium = Arc::new(Raydium::new(rpc.clone()));
-    // Skip full refresh to avoid hanging
-    // info!("Refreshing Raydium pools (this may take a moment)...");
-    // raydium.refresh_pools().await?;
-    // info!("Pools loaded.");
 
     // Fetch all token accounts (Token Program AND Token-2022)
     let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
@@ -77,21 +209,20 @@ async fn main() -> anyhow::Result<()> {
     info!("Found {} token accounts total.", token_accounts.len());
 
     let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-    let mut sold_count = 0;
+    let mut tasks = Vec::new();
 
     for ta in token_accounts {
         let data = ta.account.data;
+        let ta_pubkey = Pubkey::from_str(&ta.pubkey).unwrap();
 
         let result = match data {
             solana_account_decoder::UiAccountData::Binary(b, _) => {
                 let bytes = bs58::decode(b).into_vec().unwrap_or_default();
                 if bytes.len() < 72 {
-                    tracing::debug!("Skipping account with len < 72: {}", bytes.len());
                     None
                 } else {
                     // Check frozen
                     if bytes.len() >= 109 && bytes[108] == 2 {
-                        tracing::debug!("Skipping frozen account (binary)");
                         None
                     } else {
                         let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
@@ -105,12 +236,10 @@ async fn main() -> anyhow::Result<()> {
             solana_account_decoder::UiAccountData::LegacyBinary(b) => {
                 let bytes = bs58::decode(b).into_vec().unwrap_or_default();
                 if bytes.len() < 72 {
-                    tracing::debug!("Skipping account with len < 72: {}", bytes.len());
                     None
                 } else {
                     // Check frozen
                     if bytes.len() >= 109 && bytes[108] == 2 {
-                        tracing::debug!("Skipping frozen account (legacy binary)");
                         None
                     } else {
                         let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
@@ -133,7 +262,6 @@ async fn main() -> anyhow::Result<()> {
                             .unwrap_or(false);
 
                         if is_frozen {
-                            tracing::debug!("Skipping frozen account (json)");
                             None
                         } else {
                             let mint_str =
@@ -148,16 +276,13 @@ async fn main() -> anyhow::Result<()> {
                                 let amount = u64::from_str(amount_str).unwrap_or(0);
                                 Some((mint, amount))
                             } else {
-                                tracing::debug!("Failed to parse mint from JSON: {}", mint_str);
                                 None
                             }
                         }
                     } else {
-                        tracing::debug!("JSON account missing 'info' field");
                         None
                     }
                 } else {
-                    tracing::debug!("JSON account parsed field is not an object");
                     None
                 }
             }
@@ -168,177 +293,57 @@ async fn main() -> anyhow::Result<()> {
             None => continue,
         };
 
-        tracing::debug!("Checking account: Mint={}, Amount={}", mint, amount);
-
         if mint == sol_mint {
-            tracing::debug!("Skipping SOL mint");
             continue;
         }
         if amount == 0 {
-            tracing::debug!("Skipping empty account for mint {}", mint);
             continue;
         }
 
-        info!("Found {} of mint {}", amount, mint);
-        sold_count += 1;
-
-        // Slippage 50% for panic sell (was 5%)
-        let slippage_bps = 5000;
-
-        // Try to fetch pool specifically for this pair if not in cache
-        // We need to find a pool for Mint <-> SOL
-        // Since we skipped refresh_pools, we must discover it now.
-        // Raydium doesn't have a public "find_pool" method exposed easily without refresh.
-        // But we can try to use `refresh_pools` but maybe we can hack it?
-        // Actually, let's just try to refresh pools but ONLY for the mints we have?
-        // Raydium::refresh_pools fetches ALL.
-        // Let's try to use a targeted fetch if possible, or just accept the wait.
-        // Since the user said it hangs, we must avoid full refresh.
-        // Let's try to fetch the pool account directly if we can guess the address? No.
-        // We can use `get_program_accounts` with a filter for the mints.
-
-        // For now, let's try to just call build_swap_plan_auto.
-        // If it fails because of missing pool, we might need to implement a targeted fetch.
-        // But wait, build_swap_plan_auto calls `fetch_and_update_reserves` if pool is known.
-        // If pool is NOT known, it returns None.
-
-        // Try to fetch pool specifically for this pair if not in cache
-        // Use Raydium V3 API via curl to avoid RPC scanning issues (getProgramAccounts with memcmp is often blocked)
-        let url = format!(
-            "https://api-v3.raydium.io/pools/info/mint?mint1={}&mint2={}&poolType=standard&poolSortField=liquidity&sortType=desc&pageSize=1&page=1",
-            mint, sol_mint
-        );
-
-        info!("Fetching pool for {} from Raydium API...", mint);
-
-        let output = std::process::Command::new("curl")
-            .arg("-s")
-            .arg(&url)
-            .output();
-
-        let pool_id = match output {
-            Ok(out) if out.status.success() => {
-                let json_str = String::from_utf8(out.stdout).unwrap_or_default();
-                let v: serde_json::Value =
-                    serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
-
-                if let Some(arr) = v["data"]["data"].as_array() {
-                    if let Some(first) = arr.first() {
-                        if let Some(id_str) = first["id"].as_str() {
-                            Pubkey::from_str(id_str).ok()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-
-        if let Some(pid) = pool_id {
-            if pid != Pubkey::default() {
-                info!("Found pool {} via API. Loading...", pid);
-                if let Err(e) = raydium.load_pool_from_geyser(&pid).await {
-                    warn!("Failed to load pool {}: {}", pid, e);
-                    // Don't continue, maybe we can still swap if it was already cached?
-                }
-            }
-        } else {
-            warn!("No pool found for {} via API", mint);
-            // continue; // Don't continue, maybe it's already in cache?
-        }
-
-        match raydium
-            .build_swap_plan_auto(
-                &mint.to_string(),
-                &sol_mint.to_string(),
-                amount,
-                slippage_bps,
-            )
-            .await
-        {
-            Ok(Some(plan)) => {
-                info!(
-                    "Selling {} {} -> SOL (Expected: {})",
-                    amount, mint, plan.expected_out
-                );
-
-                let mut ixs = plan.ixs;
-
-                let wsol_mint_sdk =
-                    Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-                let (wsol_ata, create_ix) = treasury
-                    .build_ata_ix(&rpc, &treasury.pubkey(), &wsol_mint_sdk)
-                    .await?;
-                if let Some(ix) = create_ix {
-                    ixs.insert(0, ix);
-                }
-
-                // Patch Raydium instructions with actual user accounts
-                let raydium_prog =
-                    Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").unwrap();
-                let source_pubkey = Pubkey::from_str(&ta.pubkey).unwrap();
-
-                for ix in ixs.iter_mut() {
-                    if ix.program_id == raydium_prog {
-                        // Raydium V4 Swap Instruction has 18 accounts.
-                        // Index 15: User Source
-                        // Index 16: User Destination
-                        // Index 17: User Authority
-                        if ix.accounts.len() >= 18 {
-                            // Patch User Source
-                            if ix.accounts[15].pubkey == Pubkey::default() {
-                                ix.accounts[15].pubkey = source_pubkey;
-                            }
-                            // Patch User Destination
-                            if ix.accounts[16].pubkey == Pubkey::default() {
-                                ix.accounts[16].pubkey = wsol_ata;
-                            }
-                            // Patch User Authority
-                            if ix.accounts[17].pubkey == Pubkey::default() {
-                                ix.accounts[17].pubkey = treasury.pubkey();
-                            }
-                        }
-                    }
-                }
-
-                let latest_blockhash = rpc.get_latest_blockhash_retry().await?;
-                let mut tx = Transaction::new_with_payer(&ixs, Some(&treasury.pubkey()));
-
-                // We need to sign with the treasury keypair.
-                // The error "not enough signers" usually means we are missing a required signature.
-                // Raydium swaps might require the user to sign (which we do).
-                // If we are creating a WSOL account, we might need to sign for that too? No, ATA creation is payer signed.
-                // Wait, if the swap plan includes instructions that require other signers?
-                // Usually only the user wallet is needed.
-
-                // Let's check if we need to sign with anything else.
-                // For now, just sign with treasury.
-                if let Err(e) = tx.try_sign(&[treasury.signer_ref()], latest_blockhash) {
-                    warn!("Failed to sign transaction for {}: {:?}", mint, e);
-                    continue;
-                }
-
-                match rpc.rpc.send_and_confirm_transaction(&tx).await {
-                    Ok(sig) => {
-                        info!("Sold! Sig: {}", sig);
-                        let _ = treasury.unwrap_wsol(&rpc, None).await;
-                    }
-                    Err(e) => warn!("Failed to sell {}: {:?}", mint, e),
-                }
-            }
-            Ok(None) => warn!("No route for {}", mint),
-            Err(e) => warn!("Error planning swap for {}: {:?}", mint, e),
-        }
+        info!("Queuing sell for {} of mint {}", amount, mint);
+        tasks.push(SellTask {
+            mint,
+            amount,
+            ta_pubkey,
+        });
     }
 
-    if sold_count == 0 {
-        info!("No sellable tokens found (checked Token Program and Token-2022).");
+    if tasks.is_empty() {
+        info!("No sellable tokens found.");
+        return Ok(());
     }
+
+    // Ensure WSOL ATA exists
+    info!("Ensuring WSOL ATA exists...");
+    let (wsol_ata, create_ix) = treasury
+        .build_ata_ix(&rpc, &treasury.pubkey(), &sol_mint)
+        .await?;
+    if let Some(ix) = create_ix {
+        info!("Creating WSOL ATA...");
+        let recent_blockhash = rpc.get_latest_blockhash().await?;
+        let mut tx = Transaction::new_with_payer(&[ix], Some(&treasury.pubkey()));
+        tx.sign(&[treasury.signer_ref()], recent_blockhash);
+        rpc.send_and_confirm_transaction(&tx).await?;
+    }
+
+    info!("Starting parallel sell of {} tokens...", tasks.len());
+
+    let concurrency = 5;
+    let treasury = Arc::new(treasury); // Wrap in Arc for sharing
+
+    stream::iter(tasks)
+        .map(|task| {
+            let rpc = rpc.clone();
+            let raydium = raydium.clone();
+            let treasury = treasury.clone();
+            async move { sell_token(rpc, raydium, treasury, task, wsol_ata).await }
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+    info!("All sells completed. Unwrapping WSOL...");
+    let _ = treasury.unwrap_wsol(&rpc, None).await;
 
     Ok(())
 }
