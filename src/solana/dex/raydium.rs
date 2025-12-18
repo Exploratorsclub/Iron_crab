@@ -1284,7 +1284,7 @@ impl Raydium {
         user_destination: Pubkey,
         serum_program: Pubkey,
         token_program: Pubkey,
-        rent_sysvar: Pubkey,
+        _rent_sysvar: Pubkey,
         serum: SerumMarketAccounts,
         amm_target_orders: Option<Pubkey>,
     ) -> Result<Instruction> {
