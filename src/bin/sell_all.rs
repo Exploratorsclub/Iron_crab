@@ -82,35 +82,57 @@ async fn main() -> anyhow::Result<()> {
     for ta in token_accounts {
         let data = ta.account.data;
 
-        let (mint, amount) = match data {
+        let result = match data {
             solana_account_decoder::UiAccountData::Binary(b, _) => {
                 let bytes = bs58::decode(b).into_vec().unwrap_or_default();
                 if bytes.len() < 72 {
                     tracing::debug!("Skipping account with len < 72: {}", bytes.len());
-                    continue;
+                    None
+                } else {
+                    // Check frozen
+                    if bytes.len() >= 109 && bytes[108] == 2 {
+                        tracing::debug!("Skipping frozen account (binary)");
+                        None
+                    } else {
+                        let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
+                        let mint = Pubkey::new_from_array(mint_bytes);
+                        let amount_bytes: [u8; 8] = bytes[64..72].try_into().unwrap();
+                        let amount = u64::from_le_bytes(amount_bytes);
+                        Some((mint, amount))
+                    }
                 }
-                let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
-                let mint = Pubkey::new_from_array(mint_bytes);
-                let amount_bytes: [u8; 8] = bytes[64..72].try_into().unwrap();
-                let amount = u64::from_le_bytes(amount_bytes);
-                (mint, amount)
             }
             solana_account_decoder::UiAccountData::LegacyBinary(b) => {
                 let bytes = bs58::decode(b).into_vec().unwrap_or_default();
                 if bytes.len() < 72 {
                     tracing::debug!("Skipping account with len < 72: {}", bytes.len());
-                    continue;
+                    None
+                } else {
+                    // Check frozen
+                    if bytes.len() >= 109 && bytes[108] == 2 {
+                        tracing::debug!("Skipping frozen account (legacy binary)");
+                        None
+                    } else {
+                        let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
+                        let mint = Pubkey::new_from_array(mint_bytes);
+                        let amount_bytes: [u8; 8] = bytes[64..72].try_into().unwrap();
+                        let amount = u64::from_le_bytes(amount_bytes);
+                        Some((mint, amount))
+                    }
                 }
-                let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
-                let mint = Pubkey::new_from_array(mint_bytes);
-                let amount_bytes: [u8; 8] = bytes[64..72].try_into().unwrap();
-                let amount = u64::from_le_bytes(amount_bytes);
-                (mint, amount)
             }
             solana_account_decoder::UiAccountData::Json(parsed) => {
                 // Handle JSON parsed accounts
                 if let serde_json::Value::Object(info) = parsed.parsed {
                     if let Some(info_obj) = info.get("info") {
+                        // Check frozen state
+                        if let Some(state) = info_obj.get("state").and_then(|s| s.as_str()) {
+                            if state.eq_ignore_ascii_case("frozen") {
+                                tracing::debug!("Skipping frozen account (json)");
+                                return None; // Closure? No, this is inside match, so we need to return None to assign to result
+                            }
+                        }
+
                         let mint_str = info_obj.get("mint").and_then(|v| v.as_str()).unwrap_or("");
                         let amount_str = info_obj
                             .get("tokenAmount")
@@ -120,20 +142,25 @@ async fn main() -> anyhow::Result<()> {
 
                         if let Ok(mint) = Pubkey::from_str(mint_str) {
                             let amount = u64::from_str(amount_str).unwrap_or(0);
-                            (mint, amount)
+                            Some((mint, amount))
                         } else {
                             tracing::debug!("Failed to parse mint from JSON: {}", mint_str);
-                            continue;
+                            None
                         }
                     } else {
                         tracing::debug!("JSON account missing 'info' field");
-                        continue;
+                        None
                     }
                 } else {
                     tracing::debug!("JSON account parsed field is not an object");
-                    continue;
+                    None
                 }
             }
+        };
+
+        let (mint, amount) = match result {
+            Some(r) => r,
+            None => continue,
         };
 
         tracing::debug!("Checking account: Mint={}, Amount={}", mint, amount);
@@ -145,23 +172,6 @@ async fn main() -> anyhow::Result<()> {
         if amount == 0 {
             tracing::debug!("Skipping empty account for mint {}", mint);
             continue;
-        }
-
-        // Check if account is frozen or closed (state byte at offset 108 for standard token, but let's check offset 64+8+32+1 = 105? No.)
-        // SPL Token Layout:
-        // mint (32)
-        // owner (32)
-        // amount (8)
-        // delegate (36 option) -> 4 + 32
-        // state (1) -> offset 32+32+8+36 = 108.
-        // State: 0 = Uninitialized, 1 = Initialized, 2 = Frozen.
-        // If state is Frozen (2), we can't sell.
-        if bytes.len() >= 109 {
-            let state = bytes[108];
-            if state == 2 {
-                info!("Skipping frozen account for mint {}", mint);
-                continue;
-            }
         }
 
         info!("Found {} of mint {}", amount, mint);
