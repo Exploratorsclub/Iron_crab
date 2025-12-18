@@ -8,6 +8,8 @@ use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::Transaction;
+use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -351,5 +353,32 @@ async fn main() -> anyhow::Result<()> {
     info!("All sells completed. Unwrapping WSOL...");
     let _ = treasury.unwrap_wsol(&rpc, None).await;
 
+    // Update risk state
+    update_risk_state()?;
+
+    Ok(())
+}
+
+fn update_risk_state() -> anyhow::Result<()> {
+    let path = PathBuf::from("state/risk_state.json");
+    if !path.exists() {
+        info!("No risk state file found at state/risk_state.json, skipping update.");
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&path)?;
+    let mut json: serde_json::Value = serde_json::from_str(&content)?;
+
+    if let Some(obj) = json.as_object_mut() {
+        if let Some(open_pos) = obj.get_mut("open_positions") {
+            info!("Clearing open positions in risk state...");
+            *open_pos = serde_json::json!([]);
+        }
+    }
+
+    let new_content = serde_json::to_string_pretty(&json)?;
+    let mut file = fs::File::create(&path)?;
+    file.write_all(new_content.as_bytes())?;
+    info!("Risk state updated successfully.");
     Ok(())
 }
