@@ -1334,6 +1334,26 @@ impl SniperEngine {
             return;
         }
 
+        // Check if mint is already known in Raydium cache (implies old token with existing pools)
+        if let Some(ray) = &self.raydium {
+            if ray.is_mint_known(&mint) {
+                info!(mint=%mint, "sniper: skipping token already known in Raydium cache (old token)");
+                self.append_pool_candidate_record(
+                    program_label,
+                    &mint,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(liq_sol),
+                    "SKIP",
+                    "known_in_raydium",
+                );
+                return;
+            }
+        }
+
         // For brand new tokens from transaction-based discovery, skip LP lock check
         // These tokens are too new (< 1 second old) to have established holder distribution
         // LP lock check will fail because mint account might not exist yet (data_len=0)
@@ -2759,21 +2779,26 @@ impl SniperEngine {
         let cfg_r = self.cfg.read();
         if let Some(cap) = cfg_r.max_position_sol {
             if planned_sol > cap {
+                debug!(mint=%mint, planned=planned_sol, cap=cap, "sniper: position size exceeds max_position_sol");
                 return false;
             }
         }
         if let Some(daily) = cfg_r.daily_loss_limit_sol {
             if rs.realized_loss_today_sol >= daily {
+                debug!(mint=%mint, loss=rs.realized_loss_today_sol, limit=daily, "sniper: daily loss limit reached");
                 return false;
             }
         }
         if let Some(mop) = cfg_r.max_open_positions {
-            if rs.open.len() >= mop {
+            let current_count = rs.open.len();
+            if current_count >= mop {
+                info!(mint=%mint, current=current_count, max=mop, "sniper: max open positions reached, rejecting new buy");
                 return false;
             }
         }
         if let Some(until) = rs.cooldown_until.get(mint) {
             if *until > chrono::Utc::now().timestamp() {
+                debug!(mint=%mint, until=until, "sniper: mint in cooldown");
                 return false;
             }
         }
@@ -3842,11 +3867,22 @@ impl SniperEngine {
     fn persist_risk_state(&self) {
         let path = Self::risk_state_file_path();
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::error!(?e, path=?parent, "failed to create risk state directory");
+            }
         }
         let snapshot = self.build_risk_snapshot_json();
-        if let Ok(txt) = serde_json::to_string_pretty(&snapshot) {
-            let _ = std::fs::write(&path, txt);
+        match serde_json::to_string_pretty(&snapshot) {
+            Ok(txt) => {
+                if let Err(e) = std::fs::write(&path, txt) {
+                    tracing::error!(?e, path=?path, "failed to write risk state file");
+                } else {
+                    tracing::debug!(path=?path, "risk state saved");
+                }
+            }
+            Err(e) => {
+                tracing::error!(?e, "failed to serialize risk state");
+            }
         }
         // Update extended metrics from current RiskState on each persist
         {
