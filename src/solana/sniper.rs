@@ -4242,14 +4242,15 @@ impl SniperEngine {
     /// Check if a mint is "fresh" by inspecting its transaction history.
     /// Returns true if the mint appears to be new (few transactions or recent creation).
     async fn check_mint_freshness(&self, mint: &Pubkey) -> Result<bool> {
-        // Fetch last 50 signatures
+        // Fetch last 1000 signatures (max allowed by RPC)
+        // If a token has >1000 transactions, it's either old or extremely active (too late for sniping)
         let sigs = self
             .rpc
             .rpc
             .get_signatures_for_address_with_config(
                 mint,
                 solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
-                    limit: Some(50),
+                    limit: Some(1000),
                     ..Default::default()
                 },
             )
@@ -4260,24 +4261,17 @@ impl SniperEngine {
             return Ok(true);
         }
 
-        // If we have 50 transactions (limit reached), check the oldest one in the batch
-        if sigs.len() == 50 {
-            let oldest_in_batch = &sigs[49];
-            if let Some(block_time) = oldest_in_batch.block_time {
-                let now = ChronoUtc::now().timestamp();
-                let age_secs = now - block_time;
-                // If the 50th transaction is older than 24 hours, it's definitely an old token
-                if age_secs > 86400 {
-                    info!(mint=%mint, age_hours=age_secs/3600, "sniper: token has >50 txs and oldest in batch is >24h old -> OLD TOKEN");
-                    return Ok(false);
-                }
-            }
-            // If 50th tx is recent, it's very active. Could be new hype or old active.
-            // We rely on holder count check for this case.
-            return Ok(true);
+        // If we hit the limit (1000), it means there are likely MORE transactions.
+        // For a sniper, we want to be early. 1000 transactions is already a lot.
+        // If it's a new launch with >1000 txs in seconds, it's extremely risky/volatile.
+        // If it's an old token, it definitely has >1000 txs.
+        // Safest bet: Reject anything with >1000 transactions.
+        if sigs.len() == 1000 {
+            info!(mint=%mint, count=sigs.len(), "sniper: token has >=1000 txs -> TOO ACTIVE / OLD TOKEN");
+            return Ok(false);
         }
 
-        // If < 50 transactions, check the oldest one (which is likely the creation or close to it)
+        // If < 1000 transactions, check the oldest one (which is likely the creation or close to it)
         let oldest = sigs.last().unwrap();
         if let Some(block_time) = oldest.block_time {
             let now = ChronoUtc::now().timestamp();
