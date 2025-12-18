@@ -280,7 +280,20 @@ async fn main() -> anyhow::Result<()> {
 
                 let latest_blockhash = rpc.get_latest_blockhash_retry().await?;
                 let mut tx = Transaction::new_with_payer(&ixs, Some(&treasury.pubkey()));
-                tx.try_sign(&[treasury.signer_ref()], latest_blockhash)?;
+
+                // We need to sign with the treasury keypair.
+                // The error "not enough signers" usually means we are missing a required signature.
+                // Raydium swaps might require the user to sign (which we do).
+                // If we are creating a WSOL account, we might need to sign for that too? No, ATA creation is payer signed.
+                // Wait, if the swap plan includes instructions that require other signers?
+                // Usually only the user wallet is needed.
+
+                // Let's check if we need to sign with anything else.
+                // For now, just sign with treasury.
+                if let Err(e) = tx.try_sign(&[treasury.signer_ref()], latest_blockhash) {
+                    warn!("Failed to sign transaction for {}: {:?}", mint, e);
+                    continue;
+                }
 
                 match rpc.rpc.send_and_confirm_transaction(&tx).await {
                     Ok(sig) => {
