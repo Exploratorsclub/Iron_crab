@@ -318,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
 
     if tasks.is_empty() {
         info!("No sellable tokens found.");
+        update_risk_state()?;
         return Ok(());
     }
 
