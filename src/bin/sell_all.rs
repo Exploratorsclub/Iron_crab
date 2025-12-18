@@ -4,8 +4,6 @@ use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::wallet::Treasury;
-use solana_account_decoder::UiAccountEncoding;
-use solana_client::rpc_config::RpcAccountInfoConfig;
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
@@ -56,33 +54,24 @@ async fn main() -> anyhow::Result<()> {
     let token_2022_program_id =
         Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
 
-    let config = RpcAccountInfoConfig {
-        encoding: Some(UiAccountEncoding::Base64),
-        ..Default::default()
-    };
-
     let mut token_accounts = rpc
         .rpc
-        .get_token_accounts_by_owner_with_config(
+        .get_token_accounts_by_owner(
             &treasury.pubkey(),
             TokenAccountsFilter::ProgramId(token_program_id),
-            config.clone(),
         )
-        .await?
-        .value;
+        .await?;
 
     // Also fetch Token-2022 accounts
-    if let Ok(response) = rpc
+    if let Ok(mut accounts_2022) = rpc
         .rpc
-        .get_token_accounts_by_owner_with_config(
+        .get_token_accounts_by_owner(
             &treasury.pubkey(),
             TokenAccountsFilter::ProgramId(token_2022_program_id),
-            config,
         )
         .await
     {
-        let mut accounts = response.value;
-        token_accounts.append(&mut accounts);
+        token_accounts.append(&mut accounts_2022);
     }
 
     info!("Found {} token accounts total.", token_accounts.len());
@@ -93,36 +82,61 @@ async fn main() -> anyhow::Result<()> {
     for ta in token_accounts {
         let data = ta.account.data;
 
-        let bytes = match data {
+        let (mint, amount) = match data {
             solana_account_decoder::UiAccountData::Binary(b, _) => {
-                bs58::decode(b).into_vec().unwrap_or_default()
+                let bytes = bs58::decode(b).into_vec().unwrap_or_default();
+                if bytes.len() < 72 {
+                    tracing::debug!("Skipping account with len < 72: {}", bytes.len());
+                    continue;
+                }
+                let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
+                let mint = Pubkey::new_from_array(mint_bytes);
+                let amount_bytes: [u8; 8] = bytes[64..72].try_into().unwrap();
+                let amount = u64::from_le_bytes(amount_bytes);
+                (mint, amount)
             }
             solana_account_decoder::UiAccountData::LegacyBinary(b) => {
-                bs58::decode(b).into_vec().unwrap_or_default()
+                let bytes = bs58::decode(b).into_vec().unwrap_or_default();
+                if bytes.len() < 72 {
+                    tracing::debug!("Skipping account with len < 72: {}", bytes.len());
+                    continue;
+                }
+                let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
+                let mint = Pubkey::new_from_array(mint_bytes);
+                let amount_bytes: [u8; 8] = bytes[64..72].try_into().unwrap();
+                let amount = u64::from_le_bytes(amount_bytes);
+                (mint, amount)
             }
-            _ => {
-                tracing::debug!("Skipping account with non-binary data (likely JSON parsed)");
-                continue;
+            solana_account_decoder::UiAccountData::Json(parsed) => {
+                // Handle JSON parsed accounts
+                if let serde_json::Value::Object(info) = parsed.parsed {
+                    if let Some(info_obj) = info.get("info") {
+                        let mint_str = info_obj.get("mint").and_then(|v| v.as_str()).unwrap_or("");
+                        let amount_str = info_obj
+                            .get("tokenAmount")
+                            .and_then(|v| v.get("amount"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("0");
+
+                        if let Ok(mint) = Pubkey::from_str(mint_str) {
+                            let amount = u64::from_str(amount_str).unwrap_or(0);
+                            (mint, amount)
+                        } else {
+                            tracing::debug!("Failed to parse mint from JSON: {}", mint_str);
+                            continue;
+                        }
+                    } else {
+                        tracing::debug!("JSON account missing 'info' field");
+                        continue;
+                    }
+                } else {
+                    tracing::debug!("JSON account parsed field is not an object");
+                    continue;
+                }
             }
         };
 
-        // Manual parse to avoid spl_token version mismatch
-        // Layout is compatible for basic fields between Token and Token-2022
-        if bytes.len() < 72 {
-            tracing::debug!("Skipping account with len < 72: {}", bytes.len());
-            continue;
-        }
-        let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
-        let mint = Pubkey::new_from_array(mint_bytes);
-        let amount_bytes: [u8; 8] = bytes[64..72].try_into().unwrap();
-        let amount = u64::from_le_bytes(amount_bytes);
-
-        tracing::debug!(
-            "Checking account: Mint={}, Amount={}, Len={}",
-            mint,
-            amount,
-            bytes.len()
-        );
+        tracing::debug!("Checking account: Mint={}, Amount={}", mint, amount);
 
         if mint == sol_mint {
             tracing::debug!("Skipping SOL mint");
