@@ -1371,41 +1371,104 @@ impl SniperEngine {
             return;
         }
 
-        // For brand new tokens from transaction-based discovery, skip LP lock check
-        // These tokens are too new (< 1 second old) to have established holder distribution
-        // LP lock check will fail because mint account might not exist yet (data_len=0)
-        // This is intentional for ultra-fast sniping of Pump.fun tokens
-        let is_transaction_discovery =
+        // For Pump.fun tokens from transaction-based discovery, skip only LP lock check
+        // LP lock check is impossible because these tokens are too new (< 1 second old)
+        // and mint account might not exist yet (data_len=0)
+        // BUT we still run freshness check and position limits!
+        let is_pumpfun_discovery =
             event.dex_type == crate::solana::geyser_pool_discovery::DexType::PumpFun;
 
-        if is_transaction_discovery {
+        if is_pumpfun_discovery {
             info!(
                 mint=%mint,
                 pool=%event.pool_address,
                 liq_sol=liq_sol,
-                "sniper: FAST TRACK - skipping LP lock check for transaction-discovered token"
+                "sniper: Pump.fun token - skipping LP lock check only (freshness + position checks still apply)"
             );
 
-            // Risk Gate: Check max positions, daily loss, etc.
-            let base_buy = self.effective_max_buy_sol();
-            if !self.can_open_position_for(&mint, base_buy) {
-                info!(mint=%mint, "sniper: FAST TRACK risk gate blocked new position");
-                return;
+            // CRITICAL: Still check mint freshness even for Pump.fun tokens!
+            // This prevents buying old tokens that happen to get new activity
+            match self.check_mint_freshness(&mint).await {
+                Ok(true) => {
+                    info!(mint=%mint, "sniper: [Pump.fun] mint freshness check passed");
+                }
+                Ok(false) => {
+                    info!(mint=%mint, "sniper: [Pump.fun] mint freshness check FAILED (old token), SKIPPING");
+                    self.append_pool_candidate_record(
+                        program_label,
+                        &mint,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(liq_sol),
+                        "SKIP",
+                        "pumpfun_old_token_history",
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(?e, mint=%mint, "sniper: [Pump.fun] freshness check RPC error, SKIPPING for safety");
+                    self.append_pool_candidate_record(
+                        program_label,
+                        &mint,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(liq_sol),
+                        "SKIP",
+                        "pumpfun_freshness_check_error",
+                    );
+                    return;
+                }
             }
 
-            // Reserve slot immediately to prevent race conditions
-            self.reserve_buy_slot();
-            // Ensure slot is released when this scope exits (success or fail)
+            // Risk Gate: ATOMIC check + reserve to prevent race conditions
+            let base_buy = self.effective_max_buy_sol();
+            if !self.try_reserve_buy_slot_atomic(&mint, base_buy) {
+                info!(mint=%mint, base_buy, "sniper: [Pump.fun] RISK GATE BLOCKED - max positions or daily loss limit reached");
+                self.append_pool_candidate_record(
+                    program_label,
+                    &mint,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(liq_sol),
+                    "REJECT_RISK",
+                    "pumpfun_risk_gate_blocked",
+                );
+                return;
+            }
+            // Slot is now reserved atomically! Ensure it's released when scope exits
             let _guard = scopeguard::guard((), |_| {
                 self.release_buy_slot();
             });
+
+            info!(mint=%mint, "sniper: [Pump.fun] all checks passed, attempting buy");
+            self.append_pool_candidate_record(
+                program_label,
+                &mint,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(liq_sol),
+                "BUY",
+                "pumpfun_filters_passed",
+            );
 
             // Proceed directly to buy attempt with liquidity info
             if let Err(e) = self
                 .attempt_initial_buy(&mint, Some(liq_sol), event.dex_type)
                 .await
             {
-                warn!(?e, mint=%mint, "sniper: initial buy failed");
+                warn!(?e, mint=%mint, "sniper: [Pump.fun] initial buy failed");
             }
             return;
         }
@@ -1550,9 +1613,10 @@ impl SniperEngine {
         info!(mint=%mint, "sniper: all filters passed, attempting buy");
 
         // Risk Gate: Check max positions, daily loss, etc.
+        // Risk Gate: ATOMIC check + reserve to prevent race conditions
         let base_buy = self.effective_max_buy_sol();
-        if !self.can_open_position_for(&mint, base_buy) {
-            info!(mint=%mint, "sniper: risk gate blocked new position (notional/daily loss/max positions)");
+        if !self.try_reserve_buy_slot_atomic(&mint, base_buy) {
+            info!(mint=%mint, base_buy, "sniper: RISK GATE BLOCKED - max positions or daily loss limit reached");
             self.append_pool_candidate_record(
                 program_label,
                 &mint,
@@ -1563,10 +1627,14 @@ impl SniperEngine {
                 Some(lp_check.program_vault_pct),
                 Some(liq_sol),
                 "REJECT_RISK",
-                "risk gate blocked",
+                "risk_gate_blocked",
             );
             return;
         }
+        // Slot is now reserved atomically! Ensure it's released when scope exits
+        let _guard = scopeguard::guard((), |_| {
+            self.release_buy_slot();
+        });
 
         self.append_pool_candidate_record(
             program_label,
@@ -1580,13 +1648,6 @@ impl SniperEngine {
             "BUY",
             "filters_passed",
         );
-
-        // Reserve slot immediately to prevent race conditions
-        self.reserve_buy_slot();
-        // Ensure slot is released when this scope exits (success or fail)
-        let _guard = scopeguard::guard((), |_| {
-            self.release_buy_slot();
-        });
 
         if let Err(e) = self
             .attempt_initial_buy(&mint, Some(liq_sol), event.dex_type)
@@ -2901,6 +2962,66 @@ impl SniperEngine {
                 return false;
             }
         }
+        true
+    }
+
+    /// Atomically check if we can open a position AND reserve the slot if allowed.
+    /// This prevents race conditions where multiple tasks pass the check simultaneously.
+    /// Returns true if slot was reserved, false if blocked by risk limits.
+    fn try_reserve_buy_slot_atomic(&self, mint: &Pubkey, planned_sol: f64) -> bool {
+        self.risk_reset_if_needed();
+        let mut rs = self.risk.write(); // Write lock for atomicity
+        let cfg_r = self.cfg.read();
+
+        // Check position size cap
+        if let Some(cap) = cfg_r.max_position_sol {
+            if planned_sol > cap {
+                info!(mint=%mint, planned=planned_sol, cap=cap, "sniper: [ATOMIC] position size exceeds max_position_sol");
+                return false;
+            }
+        }
+
+        // Check daily loss limit
+        if let Some(daily) = cfg_r.daily_loss_limit_sol {
+            if rs.realized_loss_today_sol >= daily {
+                info!(mint=%mint, loss=rs.realized_loss_today_sol, limit=daily, "sniper: [ATOMIC] daily loss limit reached");
+                return false;
+            }
+        }
+
+        // Check max open positions (CRITICAL: includes pending_buys)
+        if let Some(mop) = cfg_r.max_open_positions {
+            let current_count = rs.open.len();
+            let total_exposure = current_count + rs.pending_buys;
+            if total_exposure >= mop {
+                info!(
+                    mint=%mint,
+                    current_positions=current_count,
+                    pending_buys=rs.pending_buys,
+                    total_exposure=total_exposure,
+                    max_allowed=mop,
+                    "sniper: [ATOMIC] MAX OPEN POSITIONS LIMIT REACHED - BLOCKING NEW BUY"
+                );
+                return false;
+            }
+        }
+
+        // Check cooldown
+        if let Some(until) = rs.cooldown_until.get(mint) {
+            if *until > chrono::Utc::now().timestamp() {
+                info!(mint=%mint, until=until, "sniper: [ATOMIC] mint in cooldown");
+                return false;
+            }
+        }
+
+        // All checks passed - atomically reserve the slot NOW
+        rs.pending_buys += 1;
+        info!(
+            mint=%mint,
+            new_pending_count=rs.pending_buys,
+            open_positions=rs.open.len(),
+            "sniper: [ATOMIC] slot reserved successfully"
+        );
         true
     }
 

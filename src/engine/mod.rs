@@ -930,7 +930,7 @@ impl Engine {
                 cfg.log_all_inits = log_all_inits_flag;
                 // propagate autosave setting from app config
                 cfg.autosave_state_secs = Some(autosave_secs);
-                
+
                 if let Err(e) = run_sniper(
                     rpc_clone,
                     cfg,
