@@ -272,6 +272,11 @@ impl Raydium {
         self.pools.contains_key(pool_address)
     }
 
+    /// Check if a mint is known in the cache
+    pub fn is_mint_known(&self, mint: &Pubkey) -> bool {
+        self.mint_index.contains_key(mint)
+    }
+
     /// Export immutable pool snapshots (cheap clone of small fields) for backtest ingestion.
     pub fn snapshots(&self) -> Vec<PoolSnapshot> {
         self.pools
@@ -306,6 +311,11 @@ impl Raydium {
             .get(mint)
             .map(|v| v.clone())
             .unwrap_or_default()
+    }
+
+    /// Check if we already have pools for this mint (implies established token).
+    pub fn is_mint_known(&self, mint: &Pubkey) -> bool {
+        self.mint_index.contains_key(mint)
     }
 
     #[allow(dead_code)]
@@ -539,7 +549,7 @@ impl Raydium {
                 .ok_or_else(|| anyhow!("pool snapshot missing"))?;
             (
                 pool.serum_bids.is_none() || pool.serum_asks.is_none(),
-                pool.reserve_base == 0 || pool.reserve_quote == 0
+                pool.reserve_base == 0 || pool.reserve_quote == 0,
             )
         };
 
