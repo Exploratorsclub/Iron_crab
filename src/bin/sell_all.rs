@@ -49,10 +49,12 @@ async fn main() -> anyhow::Result<()> {
     // raydium.refresh_pools().await?;
     // info!("Pools loaded.");
 
-    // Fetch all token accounts
-    // Use string for Token Program ID to avoid version mismatch types
+    // Fetch all token accounts (Token Program AND Token-2022)
     let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
-    let token_accounts = rpc
+    let token_2022_program_id =
+        Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+
+    let mut token_accounts = rpc
         .rpc
         .get_token_accounts_by_owner(
             &treasury.pubkey(),
@@ -60,7 +62,22 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
 
+    // Also fetch Token-2022 accounts
+    if let Ok(mut accounts_2022) = rpc
+        .rpc
+        .get_token_accounts_by_owner(
+            &treasury.pubkey(),
+            TokenAccountsFilter::ProgramId(token_2022_program_id),
+        )
+        .await
+    {
+        token_accounts.append(&mut accounts_2022);
+    }
+
+    info!("Found {} token accounts total.", token_accounts.len());
+
     let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+    let mut sold_count = 0;
 
     for ta in token_accounts {
         let data = ta.account.data;
@@ -76,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
         // Manual parse to avoid spl_token version mismatch
+        // Layout is compatible for basic fields between Token and Token-2022
         if bytes.len() < 72 {
             continue;
         }
@@ -92,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         info!("Found {} of mint {}", amount, mint);
+        sold_count += 1;
 
         // Slippage 5% for panic sell
         let slippage_bps = 500;
@@ -204,6 +223,10 @@ async fn main() -> anyhow::Result<()> {
             Ok(None) => warn!("No route for {}", mint),
             Err(e) => warn!("Error planning swap for {}: {:?}", mint, e),
         }
+    }
+
+    if sold_count == 0 {
+        info!("No sellable tokens found (checked Token Program and Token-2022).");
     }
 
     Ok(())
