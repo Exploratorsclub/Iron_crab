@@ -232,6 +232,8 @@ struct RiskState {
     recent_slippage: Vec<f64>,
     #[serde(default)]
     adaptive_slippage_bps: Option<u32>,
+    #[serde(skip)]
+    pending_buys: usize,
 }
 
 impl Default for RiskState {
@@ -247,6 +249,7 @@ impl Default for RiskState {
             last_sharpe: 0.0,
             recent_slippage: Vec::new(),
             adaptive_slippage_bps: None,
+            pending_buys: 0,
         }
     }
 }
@@ -1382,6 +1385,13 @@ impl SniperEngine {
                 return;
             }
 
+            // Reserve slot immediately to prevent race conditions
+            self.reserve_buy_slot();
+            // Ensure slot is released when this scope exits (success or fail)
+            let _guard = scopeguard::guard((), |_| {
+                self.release_buy_slot();
+            });
+
             // Proceed directly to buy attempt with liquidity info
             if let Err(e) = self
                 .attempt_initial_buy(&mint, Some(liq_sol), event.dex_type)
@@ -1502,6 +1512,13 @@ impl SniperEngine {
             "BUY",
             "filters_passed",
         );
+
+        // Reserve slot immediately to prevent race conditions
+        self.reserve_buy_slot();
+        // Ensure slot is released when this scope exits (success or fail)
+        let _guard = scopeguard::guard((), |_| {
+            self.release_buy_slot();
+        });
 
         if let Err(e) = self
             .attempt_initial_buy(&mint, Some(liq_sol), event.dex_type)
@@ -2797,8 +2814,9 @@ impl SniperEngine {
         }
         if let Some(mop) = cfg_r.max_open_positions {
             let current_count = rs.open.len();
-            if current_count >= mop {
-                info!(mint=%mint, current=current_count, max=mop, "sniper: max open positions reached, rejecting new buy");
+            let total_exposure = current_count + rs.pending_buys;
+            if total_exposure >= mop {
+                info!(mint=%mint, current=current_count, pending=rs.pending_buys, max=mop, "sniper: max open positions reached (incl. pending), rejecting new buy");
                 return false;
             }
         }
@@ -2809,6 +2827,18 @@ impl SniperEngine {
             }
         }
         true
+    }
+
+    pub fn reserve_buy_slot(&self) {
+        let mut rs = self.risk.write();
+        rs.pending_buys += 1;
+    }
+
+    pub fn release_buy_slot(&self) {
+        let mut rs = self.risk.write();
+        if rs.pending_buys > 0 {
+            rs.pending_buys -= 1;
+        }
     }
 
     fn record_fill_placeholder(&self, mint: Pubkey, invested_sol: f64) {

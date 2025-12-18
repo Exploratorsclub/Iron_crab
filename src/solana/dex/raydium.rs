@@ -916,7 +916,10 @@ impl Dex for Raydium {
         let user_authority = Pubkey::default();
         let user_source = Pubkey::default();
         let user_destination = Pubkey::default();
-        let serum_program = Pubkey::from_str(OPENBOOK_V3)?;
+        // Use the actual market program ID from the pool snapshot, not hardcoded OpenBook V3
+        let serum_program = pool
+            .market_program_id
+            .ok_or_else(|| anyhow!("market_program_id missing in pool snapshot"))?;
         let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")?;
         let rent_sysvar = solana_sdk::sysvar::rent::id();
 
