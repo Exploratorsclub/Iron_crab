@@ -1529,7 +1529,20 @@ impl SniperEngine {
                 return;
             }
             Err(e) => {
-                warn!(?e, mint=%mint, "sniper: mint freshness check failed (RPC error), proceeding with caution");
+                warn!(?e, mint=%mint, "sniper: mint freshness check failed (RPC error), SKIPPING for safety");
+                self.append_pool_candidate_record(
+                    program_label,
+                    &mint,
+                    Some(lp_check.top1_pct),
+                    Some(lp_check.top3_pct),
+                    Some(lp_check.top5_pct),
+                    Some(lp_check.burned_pct),
+                    Some(lp_check.program_vault_pct),
+                    Some(liq_sol),
+                    "SKIP",
+                    "freshness_check_error",
+                );
+                return;
             }
         }
 
