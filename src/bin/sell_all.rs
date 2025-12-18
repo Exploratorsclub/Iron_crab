@@ -19,13 +19,22 @@ use tracing::{info, warn};
 struct Args {
     #[arg(short, long, default_value = "my_config.server.toml")]
     config: PathBuf,
+
+    /// Override RPC URL (e.g. https://api.mainnet-beta.solana.com)
+    #[arg(long)]
+    rpc_url: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    let cfg = Config::load(&args.config)?;
+    let mut cfg = Config::load(&args.config)?;
+
+    if let Some(url) = args.rpc_url {
+        info!("Overriding RPC URL: {}", url);
+        cfg.solana.rpc_url = url;
+    }
 
     info!("Loading wallet and RPC...");
     let rpc = Arc::new(SolanaRpc::from_cfg(&cfg.solana));
