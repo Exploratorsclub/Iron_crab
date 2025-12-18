@@ -2,13 +2,11 @@ use clap::Parser;
 use futures::stream::{self, StreamExt};
 use ironcrab::config::Config;
 use ironcrab::solana::dex::raydium::Raydium;
-use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::wallet::Treasury;
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signer;
 use solana_sdk::transaction::Transaction;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -320,10 +318,10 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     if let Some(ix) = create_ix {
         info!("Creating WSOL ATA...");
-        let recent_blockhash = rpc.get_latest_blockhash().await?;
+        let recent_blockhash = rpc.get_latest_blockhash_retry().await?;
         let mut tx = Transaction::new_with_payer(&[ix], Some(&treasury.pubkey()));
         tx.sign(&[treasury.signer_ref()], recent_blockhash);
-        rpc.send_and_confirm_transaction(&tx).await?;
+        rpc.rpc.send_and_confirm_transaction(&tx).await?;
     }
 
     info!("Starting parallel sell of {} tokens...", tasks.len());
