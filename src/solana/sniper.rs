@@ -90,6 +90,8 @@ pub struct SniperCfg {
     pub quantile_fallback_slippage_bps: Option<u32>,
     // Freshness filters
     pub max_holders: Option<usize>,
+    // System
+    pub autosave_state_secs: Option<u64>,
 }
 
 impl Default for SniperCfg {
@@ -138,6 +140,7 @@ impl Default for SniperCfg {
             quantile_max_sample_age_secs: None,
             quantile_fallback_slippage_bps: None,
             max_holders: None,
+            autosave_state_secs: None,
         }
     }
 }
@@ -188,6 +191,7 @@ impl From<&crate::config::SniperSettings> for SniperCfg {
             quantile_max_sample_age_secs: c.quantile_max_sample_age_secs,
             quantile_fallback_slippage_bps: c.quantile_fallback_slippage_bps,
             max_holders: c.max_holders,
+            autosave_state_secs: None,
         }
     }
 }
@@ -4231,7 +4235,7 @@ impl SniperEngine {
             .rpc
             .get_signatures_for_address_with_config(
                 mint,
-                solana_client::rpc_config::RpcGetSignaturesForAddressConfig {
+                solana_client::rpc_config::RpcSignaturesForAddressConfig {
                     limit: Some(50),
                     ..Default::default()
                 },
