@@ -126,7 +126,12 @@ require_mint_decimals_range = [6, 9]  # Standard token decimals
 # Weird decimals (0-5 or >9) = red flag
 # Most legit tokens: 6-9 decimals (like USDC=6, SOL=9)
 
-## 4. OPTIONAL BURN CHECK - DISABLED FOR FLEXIBILITY
+## 4. FRESHNESS & DISTRIBUTION
+max_holders = 20  # Max holders for new token check (filters old/established tokens)
+# If a token has >20 holders, it's likely an old token or pre-distributed.
+# New mints usually have 1-5 holders (Mint Auth, LP, Team).
+
+## 5. OPTIONAL BURN CHECK - DISABLED FOR FLEXIBILITY
 # lp_burned_min_pct = 0.20  # Uncomment to require 20% burned
 # Trade-off: Filters some rugs BUT also filters legit new launches
 # Recommendation: Keep disabled initially, enable after seeing false positives

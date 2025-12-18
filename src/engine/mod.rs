@@ -922,11 +922,15 @@ impl Engine {
                 .unwrap_or(false);
             // Get geyser_grpc_url from config
             let geyser_url = self.ctx.cfg.solana.geyser_grpc_url.clone();
+            let autosave_secs = self.ctx.cfg.app.autosave_state_secs;
             let pumpfun_ref = self.pumpfun.clone();
             tokio::spawn(async move {
                 let mut cfg: SniperCfg = (&sn_cfg).into();
                 // propagate diagnostic flag from arbitrage.discovery to sniper config
                 cfg.log_all_inits = log_all_inits_flag;
+                // propagate autosave setting from app config
+                cfg.autosave_state_secs = Some(autosave_secs);
+                
                 if let Err(e) = run_sniper(
                     rpc_clone,
                     cfg,

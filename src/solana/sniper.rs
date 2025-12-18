@@ -88,6 +88,8 @@ pub struct SniperCfg {
     pub quantile_min_samples: Option<usize>,
     pub quantile_max_sample_age_secs: Option<u64>,
     pub quantile_fallback_slippage_bps: Option<u32>,
+    // Freshness filters
+    pub max_holders: Option<usize>,
 }
 
 impl Default for SniperCfg {
@@ -135,6 +137,7 @@ impl Default for SniperCfg {
             quantile_min_samples: None,
             quantile_max_sample_age_secs: None,
             quantile_fallback_slippage_bps: None,
+            max_holders: None,
         }
     }
 }
@@ -184,6 +187,7 @@ impl From<&crate::config::SniperSettings> for SniperCfg {
             quantile_min_samples: c.quantile_min_samples,
             quantile_max_sample_age_secs: c.quantile_max_sample_age_secs,
             quantile_fallback_slippage_bps: c.quantile_fallback_slippage_bps,
+            max_holders: c.max_holders,
         }
     }
 }
@@ -1478,6 +1482,53 @@ impl SniperEngine {
         // For now skip burn check or use a placeholder
         // TODO: Add lp_burned_min_pct to SniperCfg if needed
 
+        // Check holder count (filter old/established tokens)
+        // Default to 20 if not configured (standard RPC limit)
+        let max_holders = self.cfg.read().max_holders.unwrap_or(20);
+        if lp_check.holder_count >= max_holders {
+            info!(mint=%mint, holders=lp_check.holder_count, max=max_holders, "sniper: too many holders (likely old token), SKIPPING");
+            self.append_pool_candidate_record(
+                program_label,
+                &mint,
+                Some(lp_check.top1_pct),
+                Some(lp_check.top3_pct),
+                Some(lp_check.top5_pct),
+                Some(lp_check.burned_pct),
+                Some(lp_check.program_vault_pct),
+                Some(liq_sol),
+                "SKIP",
+                &format!("holders {} >= {}", lp_check.holder_count, max_holders),
+            );
+            return;
+        }
+
+        // Check mint freshness (transaction history age)
+        // This is an expensive check (extra RPC call), so we do it last
+        match self.check_mint_freshness(&mint).await {
+            Ok(true) => {
+                info!(mint=%mint, "sniper: mint freshness check passed");
+            }
+            Ok(false) => {
+                info!(mint=%mint, "sniper: mint freshness check failed (old token), SKIPPING");
+                self.append_pool_candidate_record(
+                    program_label,
+                    &mint,
+                    Some(lp_check.top1_pct),
+                    Some(lp_check.top3_pct),
+                    Some(lp_check.top5_pct),
+                    Some(lp_check.burned_pct),
+                    Some(lp_check.program_vault_pct),
+                    Some(liq_sol),
+                    "SKIP",
+                    "old_token_history",
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(?e, mint=%mint, "sniper: mint freshness check failed (RPC error), proceeding with caution");
+            }
+        }
+
         // All checks passed - attempt buy
         info!(mint=%mint, "sniper: all filters passed, attempting buy");
 
@@ -2605,10 +2656,17 @@ impl SniperEngine {
             }
         });
         // Autosave task
-        let autosave_secs: u64 = std::env::var("IRONCRAB_RISK_AUTOSAVE_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let autosave_secs: u64 = self
+            .cfg
+            .read()
+            .autosave_state_secs
+            .or_else(|| {
+                std::env::var("IRONCRAB_RISK_AUTOSAVE_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
             .unwrap_or(60);
+
         if autosave_secs > 0 {
             let engine_clone = self.clone_for_spawn();
             tokio::spawn(async move {
@@ -4103,6 +4161,7 @@ pub struct LpLockAssessment {
     pub largest_account: Option<String>,
     pub burned_pct: f64,
     pub program_vault_pct: f64,
+    pub holder_count: usize,
 }
 
 // Test-only utilities for verifying concentration math
@@ -4163,6 +4222,59 @@ pub fn test_compute_concentration(
 }
 
 impl SniperEngine {
+    /// Check if a mint is "fresh" by inspecting its transaction history.
+    /// Returns true if the mint appears to be new (few transactions or recent creation).
+    async fn check_mint_freshness(&self, mint: &Pubkey) -> Result<bool> {
+        // Fetch last 50 signatures
+        let sigs = self
+            .rpc
+            .rpc
+            .get_signatures_for_address_with_config(
+                mint,
+                solana_client::rpc_config::RpcGetSignaturesForAddressConfig {
+                    limit: Some(50),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if sigs.is_empty() {
+            // No transactions? Very fresh (or RPC lag). Assume fresh.
+            return Ok(true);
+        }
+
+        // If we have 50 transactions (limit reached), check the oldest one in the batch
+        if sigs.len() == 50 {
+            let oldest_in_batch = &sigs[49];
+            if let Some(block_time) = oldest_in_batch.block_time {
+                let now = ChronoUtc::now().timestamp();
+                let age_secs = now - block_time;
+                // If the 50th transaction is older than 24 hours, it's definitely an old token
+                if age_secs > 86400 {
+                    info!(mint=%mint, age_hours=age_secs/3600, "sniper: token has >50 txs and oldest in batch is >24h old -> OLD TOKEN");
+                    return Ok(false);
+                }
+            }
+            // If 50th tx is recent, it's very active. Could be new hype or old active.
+            // We rely on holder count check for this case.
+            return Ok(true);
+        }
+
+        // If < 50 transactions, check the oldest one (which is likely the creation or close to it)
+        let oldest = sigs.last().unwrap();
+        if let Some(block_time) = oldest.block_time {
+            let now = ChronoUtc::now().timestamp();
+            let age_secs = now - block_time;
+            // If the oldest transaction is > 24 hours, it's an old token
+            if age_secs > 86400 {
+                info!(mint=%mint, age_hours=age_secs/3600, count=sigs.len(), "sniper: token has few txs but oldest is >24h old -> OLD INACTIVE TOKEN");
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
     /// Index-based (Raydium/Orca) liquidity estimation using current pool snapshots.
     /// Returns conservative SOL notionals (sum over pools: 2 * SOL_reserve for SOL pairs, stable converted to SOL via placeholder rate).
     async fn estimate_liquidity_index(&self, mint: &Pubkey) -> Result<Option<f64>> {
@@ -4408,8 +4520,8 @@ impl SniperEngine {
                 };
                 // Only use RPC data if it's non-zero (otherwise keep fallback)
                 if rpc_supply > 0.0 {
-                    decimals_eff = s.decimals;
                     supply = rpc_supply;
+                    decimals_eff = s.decimals;
                 } else {
                     info!(mint=%mint, "sniper: RPC returned zero supply, keeping fallback values");
                 }
@@ -4462,9 +4574,11 @@ impl SniperEngine {
                     largest_account: None,
                     burned_pct: 0.0,
                     program_vault_pct: 0.0,
+                    holder_count: 0,
                 }));
             }
         };
+        let holder_count = list.len();
         if list.is_empty() {
             info!(mint=%mint, "sniper: largest accounts list empty, returning None");
             return Ok(None);
@@ -4623,6 +4737,7 @@ impl SniperEngine {
             top5_pct,
             concentration_ok,
             largest_account: largest_key,
+            holder_count,
             burned_pct,
             program_vault_pct,
         }))

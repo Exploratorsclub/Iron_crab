@@ -290,6 +290,8 @@ pub struct SniperSettings {
     pub quantile_max_sample_age_secs: Option<u64>, // Maximum age of samples in seconds
     #[serde(default)]
     pub quantile_fallback_slippage_bps: Option<u32>, // Fallback slippage when insufficient data
+    #[serde(default)]
+    pub max_holders: Option<usize>, // Max holders for new token check (default: 20)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
