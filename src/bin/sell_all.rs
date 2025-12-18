@@ -113,6 +113,23 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
 
+        // Check if account is frozen or closed (state byte at offset 108 for standard token, but let's check offset 64+8+32+1 = 105? No.)
+        // SPL Token Layout:
+        // mint (32)
+        // owner (32)
+        // amount (8)
+        // delegate (36 option) -> 4 + 32
+        // state (1) -> offset 32+32+8+36 = 108.
+        // State: 0 = Uninitialized, 1 = Initialized, 2 = Frozen.
+        // If state is Frozen (2), we can't sell.
+        if bytes.len() >= 109 {
+            let state = bytes[108];
+            if state == 2 {
+                info!("Skipping frozen account for mint {}", mint);
+                continue;
+            }
+        }
+
         info!("Found {} of mint {}", amount, mint);
         sold_count += 1;
 
