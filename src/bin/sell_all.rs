@@ -4,6 +4,8 @@ use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::wallet::Treasury;
+use solana_account_decoder::UiAccountEncoding;
+use solana_client::rpc_config::RpcAccountInfoConfig;
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
@@ -54,24 +56,33 @@ async fn main() -> anyhow::Result<()> {
     let token_2022_program_id =
         Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
 
+    let config = RpcAccountInfoConfig {
+        encoding: Some(UiAccountEncoding::Base64),
+        ..Default::default()
+    };
+
     let mut token_accounts = rpc
         .rpc
-        .get_token_accounts_by_owner(
+        .get_token_accounts_by_owner_with_config(
             &treasury.pubkey(),
             TokenAccountsFilter::ProgramId(token_program_id),
+            config.clone(),
         )
-        .await?;
+        .await?
+        .value;
 
     // Also fetch Token-2022 accounts
-    if let Ok(mut accounts_2022) = rpc
+    if let Ok(response) = rpc
         .rpc
-        .get_token_accounts_by_owner(
+        .get_token_accounts_by_owner_with_config(
             &treasury.pubkey(),
             TokenAccountsFilter::ProgramId(token_2022_program_id),
+            config,
         )
         .await
     {
-        token_accounts.append(&mut accounts_2022);
+        let mut accounts = response.value;
+        token_accounts.append(&mut accounts);
     }
 
     info!("Found {} token accounts total.", token_accounts.len());
@@ -89,7 +100,10 @@ async fn main() -> anyhow::Result<()> {
             solana_account_decoder::UiAccountData::LegacyBinary(b) => {
                 bs58::decode(b).into_vec().unwrap_or_default()
             }
-            _ => continue,
+            _ => {
+                tracing::debug!("Skipping account with non-binary data (likely JSON parsed)");
+                continue;
+            }
         };
 
         // Manual parse to avoid spl_token version mismatch
