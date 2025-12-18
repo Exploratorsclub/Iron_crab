@@ -1348,6 +1348,14 @@ impl SniperEngine {
                 liq_sol=liq_sol,
                 "sniper: FAST TRACK - skipping LP lock check for transaction-discovered token"
             );
+
+            // Risk Gate: Check max positions, daily loss, etc.
+            let base_buy = self.effective_max_buy_sol();
+            if !self.can_open_position_for(&mint, base_buy) {
+                info!(mint=%mint, "sniper: FAST TRACK risk gate blocked new position");
+                return;
+            }
+
             // Proceed directly to buy attempt with liquidity info
             if let Err(e) = self
                 .attempt_initial_buy(&mint, Some(liq_sol), event.dex_type)
@@ -1436,6 +1444,26 @@ impl SniperEngine {
 
         // All checks passed - attempt buy
         info!(mint=%mint, "sniper: all filters passed, attempting buy");
+
+        // Risk Gate: Check max positions, daily loss, etc.
+        let base_buy = self.effective_max_buy_sol();
+        if !self.can_open_position_for(&mint, base_buy) {
+            info!(mint=%mint, "sniper: risk gate blocked new position (notional/daily loss/max positions)");
+            self.append_pool_candidate_record(
+                program_label,
+                &mint,
+                Some(lp_check.top1_pct),
+                Some(lp_check.top3_pct),
+                Some(lp_check.top5_pct),
+                Some(lp_check.burned_pct),
+                Some(lp_check.program_vault_pct),
+                Some(liq_sol),
+                "REJECT_RISK",
+                "risk gate blocked",
+            );
+            return;
+        }
+
         self.append_pool_candidate_record(
             program_label,
             &mint,
