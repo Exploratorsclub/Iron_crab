@@ -4235,7 +4235,7 @@ impl SniperEngine {
             .rpc
             .get_signatures_for_address_with_config(
                 mint,
-                solana_client::rpc_config::RpcSignaturesForAddressConfig {
+                solana_client::rpc_config::GetConfirmedSignaturesForAddress2Config {
                     limit: Some(50),
                     ..Default::default()
                 },
