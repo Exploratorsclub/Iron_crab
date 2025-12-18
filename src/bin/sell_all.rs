@@ -104,131 +104,54 @@ async fn main() -> anyhow::Result<()> {
         // But wait, build_swap_plan_auto calls `fetch_and_update_reserves` if pool is known.
         // If pool is NOT known, it returns None.
 
-        // We need to populate the cache.
-        // Let's implement a targeted pool fetch here using RPC.
-        // Raydium V4 Program ID
-        let raydium_prog =
-            Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").unwrap();
+        // Try to fetch pool specifically for this pair if not in cache
+        // Use Raydium V3 API via curl to avoid RPC scanning issues (getProgramAccounts with memcmp is often blocked)
+        let url = format!(
+            "https://api-v3.raydium.io/pools/info/mint?mint1={}&mint2={}&poolType=standard&poolSortField=liquidity&sortType=desc&pageSize=1&page=1",
+            mint, sol_mint
+        );
 
-        // Find pool for Mint/SOL
-        // We can search for accounts owned by Raydium with size 752 (AMM) and offsets for mints.
-        // Base Mint offset: 400, Quote Mint offset: 432 (approx, need to verify layout)
-        // Actually, let's just use the `raydium.refresh_pools()` but maybe we can filter?
-        // No, the method doesn't take filters.
+        info!("Fetching pool for {} from Raydium API...", mint);
 
-        // Alternative: Use the `raydium` instance to fetch specific pools.
-        // We can add a helper to `Raydium` struct or just do it here.
-        // Let's do it here using raw RPC to avoid modifying `Raydium` struct too much if not needed.
+        let output = std::process::Command::new("curl")
+            .arg("-s")
+            .arg(&url)
+            .output();
 
-        // Layout:
-        // status: u64 (0)
-        // nonce: u64 (8)
-        // max_order: u64 (16)
-        // depth: u64 (24)
-        // base_decimal: u64 (32)
-        // quote_decimal: u64 (40)
-        // state: u64 (48)
-        // reset_flag: u64 (56)
-        // min_size: u64 (64)
-        // vol_max_cut_ratio: u64 (72)
-        // amount_wave: u64 (80)
-        // base_lot_size: u64 (88)
-        // quote_lot_size: u64 (96)
-        // min_price_multiplier: u64 (104)
-        // max_price_multiplier: u64 (112)
-        // system_decimal: u64 (120)
-        // min_separate_numerator: u64 (128)
-        // min_separate_denominator: u64 (136)
-        // trade_fee_numerator: u64 (144)
-        // trade_fee_denominator: u64 (152)
-        // pnl_numerator: u64 (160)
-        // pnl_denominator: u64 (168)
-        // swap_fee_numerator: u64 (176)
-        // swap_fee_denominator: u64 (184)
-        // base_need_take_pnl: u64 (192)
-        // quote_need_take_pnl: u64 (200)
-        // quote_total_pnl: u64 (208)
-        // base_total_pnl: u64 (216)
-        // pool_open_time: u64 (224)
-        // punish_pc_amount: u64 (232)
-        // punish_coin_amount: u64 (240)
-        // orderbook_to_init_time: u64 (248)
-        // swap_base_in_amount: u128 (256)
-        // swap_quote_out_amount: u128 (272)
-        // swap_base_2_quote_fee: u64 (288)
-        // swap_quote_in_amount: u128 (296)
-        // swap_base_out_amount: u128 (312)
-        // swap_quote_2_base_fee: u64 (328)
-        // base_vault: Pubkey (336)
-        // quote_vault: Pubkey (368)
-        // base_mint: Pubkey (400)
-        // quote_mint: Pubkey (432)
-        // lp_mint: Pubkey (464)
+        let pool_id = match output {
+            Ok(out) if out.status.success() => {
+                let json_str = String::from_utf8(out.stdout).unwrap_or_default();
+                let v: serde_json::Value =
+                    serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
 
-        // We search for accounts with size 752, owner Raydium, and (base_mint = mint AND quote_mint = SOL) OR (base_mint = SOL AND quote_mint = mint)
-
-        let filters_base = vec![
-            solana_client::rpc_filter::RpcFilterType::DataSize(752),
-            solana_client::rpc_filter::RpcFilterType::Memcmp(
-                solana_client::rpc_filter::Memcmp::new_base58_encoded(400, &mint.to_bytes()),
-            ),
-            solana_client::rpc_filter::RpcFilterType::Memcmp(
-                solana_client::rpc_filter::Memcmp::new_base58_encoded(432, &sol_mint.to_bytes()),
-            ),
-        ];
-
-        let filters_quote = vec![
-            solana_client::rpc_filter::RpcFilterType::DataSize(752),
-            solana_client::rpc_filter::RpcFilterType::Memcmp(
-                solana_client::rpc_filter::Memcmp::new_base58_encoded(400, &sol_mint.to_bytes()),
-            ),
-            solana_client::rpc_filter::RpcFilterType::Memcmp(
-                solana_client::rpc_filter::Memcmp::new_base58_encoded(432, &mint.to_bytes()),
-            ),
-        ];
-
-        let mut pools = rpc
-            .rpc
-            .get_program_accounts_with_config(
-                &raydium_prog,
-                solana_client::rpc_config::RpcProgramAccountsConfig {
-                    filters: Some(filters_base),
-                    account_config: solana_client::rpc_config::RpcAccountInfoConfig {
-                        encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
-                        ..Default::default()
-                    },
-                    with_context: None,
-                    sort_results: None,
-                },
-            )
-            .await
-            .unwrap_or_default();
-
-        if pools.is_empty() {
-            pools = rpc
-                .rpc
-                .get_program_accounts_with_config(
-                    &raydium_prog,
-                    solana_client::rpc_config::RpcProgramAccountsConfig {
-                        filters: Some(filters_quote),
-                        account_config: solana_client::rpc_config::RpcAccountInfoConfig {
-                            encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
-                            ..Default::default()
-                        },
-                        with_context: None,
-                        sort_results: None,
-                    },
-                )
-                .await
-                .unwrap_or_default();
-        }
-
-        if let Some((pubkey, _)) = pools.first() {
-            info!("Found pool for {}: {}", mint, pubkey);
-            // Use the public method to load the pool into cache
-            if let Err(e) = raydium.load_pool_from_geyser(pubkey).await {
-                warn!("Failed to load pool {}: {:?}", pubkey, e);
+                if let Some(arr) = v["data"]["data"].as_array() {
+                    if let Some(first) = arr.first() {
+                        if let Some(id_str) = first["id"].as_str() {
+                            Pubkey::from_str(id_str).ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             }
+            _ => None,
+        };
+
+        if let Some(pid) = pool_id {
+            if pid != Pubkey::default() {
+                info!("Found pool {} via API. Loading...", pid);
+                if let Err(e) = raydium.load_pool_from_geyser(&pid).await {
+                    warn!("Failed to load pool {}: {}", pid, e);
+                    // Don't continue, maybe we can still swap if it was already cached?
+                }
+            }
+        } else {
+            warn!("No pool found for {} via API", mint);
+            // continue; // Don't continue, maybe it's already in cache?
         }
 
         match raydium
