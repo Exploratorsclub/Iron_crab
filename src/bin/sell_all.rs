@@ -41,8 +41,8 @@ async fn sell_token(
     let amount = task.amount;
     let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
 
-    // Slippage 50% for panic sell
-    let slippage_bps = 5000;
+    // Slippage 99% for panic sell (force execution)
+    let slippage_bps = 9900;
 
     // Try to fetch pool specifically for this pair if not in cache
     // Use Raydium V3 API via curl to avoid RPC scanning issues
