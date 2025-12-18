@@ -46,8 +46,9 @@ async fn sell_token(
 
     // Try to fetch pool specifically for this pair if not in cache
     // Use Raydium V3 API via curl to avoid RPC scanning issues
+    // Fetch multiple pools (pageSize=10) and filter for V4 (AMM)
     let url = format!(
-        "https://api-v3.raydium.io/pools/info/mint?mint1={}&mint2={}&poolType=standard&poolSortField=liquidity&sortType=desc&pageSize=1&page=1",
+        "https://api-v3.raydium.io/pools/info/mint?mint1={}&mint2={}&poolType=all&poolSortField=liquidity&sortType=desc&pageSize=10&page=1",
         mint, sol_mint
     );
 
@@ -65,13 +66,20 @@ async fn sell_token(
                 serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
 
             if let Some(arr) = v["data"]["data"].as_array() {
-                if let Some(first) = arr.first() {
-                    if let Some(id_str) = first["id"].as_str() {
+                // Find first pool with Raydium V4 Program ID
+                let v4_prog = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+                let found = arr
+                    .iter()
+                    .find(|p| p["programId"].as_str().unwrap_or("") == v4_prog);
+
+                if let Some(pool) = found {
+                    if let Some(id_str) = pool["id"].as_str() {
                         Pubkey::from_str(id_str).ok()
                     } else {
                         None
                     }
                 } else {
+                    warn!("No Raydium V4 pool found in API response for {}", mint);
                     None
                 }
             } else {
