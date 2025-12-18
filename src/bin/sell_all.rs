@@ -126,26 +126,31 @@ async fn main() -> anyhow::Result<()> {
                 if let serde_json::Value::Object(info) = parsed.parsed {
                     if let Some(info_obj) = info.get("info") {
                         // Check frozen state
-                        if let Some(state) = info_obj.get("state").and_then(|s| s.as_str()) {
-                            if state.eq_ignore_ascii_case("frozen") {
-                                tracing::debug!("Skipping frozen account (json)");
-                                return None; // Closure? No, this is inside match, so we need to return None to assign to result
-                            }
-                        }
+                        let is_frozen = info_obj
+                            .get("state")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.eq_ignore_ascii_case("frozen"))
+                            .unwrap_or(false);
 
-                        let mint_str = info_obj.get("mint").and_then(|v| v.as_str()).unwrap_or("");
-                        let amount_str = info_obj
-                            .get("tokenAmount")
-                            .and_then(|v| v.get("amount"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("0");
-
-                        if let Ok(mint) = Pubkey::from_str(mint_str) {
-                            let amount = u64::from_str(amount_str).unwrap_or(0);
-                            Some((mint, amount))
-                        } else {
-                            tracing::debug!("Failed to parse mint from JSON: {}", mint_str);
+                        if is_frozen {
+                            tracing::debug!("Skipping frozen account (json)");
                             None
+                        } else {
+                            let mint_str =
+                                info_obj.get("mint").and_then(|v| v.as_str()).unwrap_or("");
+                            let amount_str = info_obj
+                                .get("tokenAmount")
+                                .and_then(|v| v.get("amount"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0");
+
+                            if let Ok(mint) = Pubkey::from_str(mint_str) {
+                                let amount = u64::from_str(amount_str).unwrap_or(0);
+                                Some((mint, amount))
+                            } else {
+                                tracing::debug!("Failed to parse mint from JSON: {}", mint_str);
+                                None
+                            }
                         }
                     } else {
                         tracing::debug!("JSON account missing 'info' field");
