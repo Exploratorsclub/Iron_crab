@@ -1,6 +1,7 @@
 use clap::Parser;
 use ironcrab::config::Config;
 use ironcrab::solana::dex::raydium::Raydium;
+use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::wallet::Treasury;
 use solana_sdk::pubkey::Pubkey;
@@ -11,7 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{info, warn};
 use solana_client::rpc_request::TokenAccountsFilter;
-use solana_program::program_pack::Pack;
+use solana_sdk::bs58;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -38,52 +39,34 @@ async fn main() -> anyhow::Result<()> {
     info!("Pools loaded.");
 
     // Fetch all token accounts
+    // Use string for Token Program ID to avoid version mismatch types
+    let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
     let token_accounts = rpc.rpc.get_token_accounts_by_owner(
         &treasury.pubkey(),
-        TokenAccountsFilter::ProgramId(spl_token::id()),
+        TokenAccountsFilter::ProgramId(token_program_id),
     ).await?;
     
     let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
 
     for ta in token_accounts {
-        // Decode account data
         let data = ta.account.data;
-        // Handle UiAccountData if needed, but usually get_token_accounts_by_owner returns parsed or base64.
-        // By default it might return base64 if configured in client, but here we use default client.
-        // Actually RpcClient default is usually base64 or binary.
-        // Let's assume it's binary compatible or we need to handle UiAccountData.
-        // Wait, RpcKeyedAccount.account.data is UiAccountData.
         
         let bytes = match data {
             solana_account_decoder::UiAccountData::Binary(b, _) => {
-                bs58::decode(b).into_vec().unwrap_or_default() // Wait, Binary is usually base58 or base64 string?
-                // UiAccountData::Binary(String, UiAccountEncoding)
+                bs58::decode(b).into_vec().unwrap_or_default()
             },
             solana_account_decoder::UiAccountData::LegacyBinary(b) => {
                 bs58::decode(b).into_vec().unwrap_or_default()
             },
-            _ => continue, // Skip parsed
+            _ => continue,
         };
         
-        // Actually, let's just use get_token_accounts_by_owner_with_commitment and specify encoding if needed.
-        // But simpler: use spl_token::state::Account::unpack on the bytes.
-        
-        // Re-fetch with explicit encoding to be safe?
-        // Or just try to parse.
-        
-        // Let's try to parse bytes.
-        let token_account = match spl_token::state::Account::unpack(&bytes) {
-            Ok(a) => a,
-            Err(_) => {
-                // Try base64 decode if it was base64 string in binary
-                // Actually, let's rely on the fact that we can just ask for parsed accounts?
-                // No, parsed accounts are easier.
-                continue;
-            }
-        };
-
-        let mint = token_account.mint;
-        let amount = token_account.amount;
+        // Manual parse to avoid spl_token version mismatch
+        if bytes.len() < 72 { continue; }
+        let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
+        let mint = Pubkey::new_from_array(mint_bytes);
+        let amount_bytes: [u8; 8] = bytes[64..72].try_into().unwrap();
+        let amount = u64::from_le_bytes(amount_bytes);
 
         if mint == sol_mint { continue; }
         if amount == 0 { continue; }
@@ -104,8 +87,7 @@ async fn main() -> anyhow::Result<()> {
                 
                 let mut ixs = plan.ixs;
                 
-                // Ensure WSOL ATA exists
-                let wsol_mint_sdk = solana_sdk::pubkey::Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+                let wsol_mint_sdk = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
                 let (_, create_ix) = treasury.build_ata_ix(&rpc, &treasury.pubkey(), &wsol_mint_sdk).await?;
                 if let Some(ix) = create_ix {
                     ixs.insert(0, ix);
@@ -115,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut tx = Transaction::new_with_payer(&ixs, Some(&treasury.pubkey()));
                 tx.try_sign(&[treasury.signer_ref()], latest_blockhash)?;
                 
-                match rpc.send_and_confirm_transaction(&tx).await {
+                match rpc.rpc.send_and_confirm_transaction(&tx).await {
                     Ok(sig) => {
                         info!("Sold! Sig: {}", sig);
                         let _ = treasury.unwrap_wsol(&rpc, None).await;
