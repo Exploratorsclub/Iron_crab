@@ -18,9 +18,13 @@ if [ ! -f "my_config.server.toml" ]; then
     exit 1
 fi
 
-# 3. Build release binary
-echo "🔨 Building release binary (this may take a few minutes)..."
-cargo build --release --no-default-features
+# 3. Build release binaries
+echo "🔨 Building release binaries (this may take a few minutes)..."
+# Build main bot
+cargo build --release --no-default-features --bin ironcrab
+# Build sell_all tool
+echo "🔨 Building sell_all tool..."
+cargo build --release --bin sell_all
 
 # 4. Stop service
 echo "⏸️  Stopping ironcrab service..."
