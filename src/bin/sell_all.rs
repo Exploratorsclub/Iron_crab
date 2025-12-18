@@ -95,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
         // Manual parse to avoid spl_token version mismatch
         // Layout is compatible for basic fields between Token and Token-2022
         if bytes.len() < 72 {
+            // Try parsing as Token-2022 with extensions (often larger) or just standard layout
+            // Standard layout is 165 bytes.
+            // If it's smaller than 72, it's definitely not a valid token account.
             continue;
         }
         let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
@@ -106,14 +109,15 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
         if amount == 0 {
+            // info!("Skipping empty account for mint {}", mint);
             continue;
         }
 
         info!("Found {} of mint {}", amount, mint);
         sold_count += 1;
 
-        // Slippage 5% for panic sell
-        let slippage_bps = 500;
+        // Slippage 50% for panic sell (was 5%)
+        let slippage_bps = 5000;
 
         // Try to fetch pool specifically for this pair if not in cache
         // We need to find a pool for Mint <-> SOL
