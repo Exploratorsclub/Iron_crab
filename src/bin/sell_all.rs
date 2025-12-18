@@ -271,11 +271,39 @@ async fn main() -> anyhow::Result<()> {
 
                 let wsol_mint_sdk =
                     Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-                let (_, create_ix) = treasury
+                let (wsol_ata, create_ix) = treasury
                     .build_ata_ix(&rpc, &treasury.pubkey(), &wsol_mint_sdk)
                     .await?;
                 if let Some(ix) = create_ix {
                     ixs.insert(0, ix);
+                }
+
+                // Patch Raydium instructions with actual user accounts
+                let raydium_prog =
+                    Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").unwrap();
+                let source_pubkey = Pubkey::from_str(&ta.pubkey).unwrap();
+
+                for ix in ixs.iter_mut() {
+                    if ix.program_id == raydium_prog {
+                        // Raydium V4 Swap Instruction has 18 accounts.
+                        // Index 15: User Source
+                        // Index 16: User Destination
+                        // Index 17: User Authority
+                        if ix.accounts.len() >= 18 {
+                            // Patch User Source
+                            if ix.accounts[15].pubkey == Pubkey::default() {
+                                ix.accounts[15].pubkey = source_pubkey;
+                            }
+                            // Patch User Destination
+                            if ix.accounts[16].pubkey == Pubkey::default() {
+                                ix.accounts[16].pubkey = wsol_ata;
+                            }
+                            // Patch User Authority
+                            if ix.accounts[17].pubkey == Pubkey::default() {
+                                ix.accounts[17].pubkey = treasury.pubkey();
+                            }
+                        }
+                    }
                 }
 
                 let latest_blockhash = rpc.get_latest_blockhash_retry().await?;
