@@ -313,11 +313,6 @@ impl Raydium {
             .unwrap_or_default()
     }
 
-    /// Check if we already have pools for this mint (implies established token).
-    pub fn is_mint_known(&self, mint: &Pubkey) -> bool {
-        self.mint_index.contains_key(mint)
-    }
-
     #[allow(dead_code)]
     fn parse_token_account_amount(data: &[u8]) -> Result<u64> {
         if data.len() < 72 {
