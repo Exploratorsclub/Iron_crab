@@ -533,6 +533,15 @@ impl Treasury {
             return Err(anyhow!("WSOL must use classic spl-token program"));
         }
 
+        // Check if account exists and is a valid token account to avoid "Invalid Account Data" errors
+        if let Ok(acc) = rpc.rpc.get_account(&ata).await {
+            if acc.owner != spl_token_sdk {
+                return Ok(Signature::default()); // Not a token account, nothing to close
+            }
+        } else {
+            return Ok(Signature::default()); // Account doesn't exist
+        }
+
         let dest = recipient.unwrap_or(owner);
         let ata_p = sdk_to_spl(&ata);
         let dest_p = sdk_to_spl(&dest);
