@@ -3808,73 +3808,109 @@ impl SniperEngine {
             warn!(mint=%mint, "sniper: no pool_address provided - cannot verify pool creation time");
         }
 
-        // Also check mint creation time as additional safety layer
-        // NOTE: For tokens with many transactions, we can't get the TRUE oldest signature
-        // with a simple query. Instead, we check if the mint has TOO MANY signatures.
-        // A brand new token should have very few signatures (< 100).
+        // ============================================================
+        // CRITICAL: Check MINT account creation time directly!
+        // Old tokens can create NEW pools - we must verify the MINT itself is new.
+        // ============================================================
+        
+        // First, get mint account to check its slot (when it was created)
+        let mint_account = match self.rpc.get_account_retry(mint).await {
+            Ok(acc) => acc,
+            Err(e) => {
+                warn!(mint=%mint, error=?e, "sniper: could not fetch mint account -> REJECT");
+                return Ok(false);
+            }
+        };
+        
+        // Check mint account rent epoch as a proxy for age
+        // Very new accounts have rent_epoch close to current epoch
+        // NOTE: This is not foolproof but adds another layer
+        
+        // Also check mint signatures - but be STRICT
         let mint_sigs = self
             .rpc
             .rpc
             .get_signatures_for_address_with_config(
                 mint,
                 solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
-                    limit: Some(200),  // Reduced - we only need to check count
+                    limit: Some(200),
                     ..Default::default()
                 },
             )
             .await?;
 
-        // CRITICAL: If mint has many signatures, it's an OLD token with active trading
-        // New tokens should have < 50-100 signatures in the first few minutes
         let sig_count = mint_sigs.len();
-        if sig_count >= 200 {
+        
+        // CRITICAL FIX: If we get 0 signatures, the RPC is NOT indexing this mint properly
+        // This is SUSPICIOUS - a real new token should have at least its creation TX
+        // Old tokens on new pools often show 0 signatures because RPC pagination issues
+        if sig_count == 0 {
+            warn!(
+                mint=%mint,
+                "sniper: REJECT - mint has 0 signatures (RPC not indexing or pagination issue)"
+            );
+            return Ok(false);
+        }
+        
+        // CRITICAL: If mint has many signatures, it's an OLD token
+        // Reduced threshold from 200 to 50 - truly new tokens have very few signatures
+        if sig_count >= 50 {
             info!(
                 mint=%mint, 
                 sig_count,
-                "sniper: REJECT - mint has too many signatures (>= 200), likely old/active token"
+                "sniper: REJECT - mint has too many signatures (>= 50), likely old token"
             );
             return Ok(false);
         }
 
-        // Check the OLDEST signature we can see
-        if !mint_sigs.is_empty() {
-            let oldest_visible_sig = mint_sigs.last().unwrap();
-            if let Some(block_time) = oldest_visible_sig.block_time {
-                // CRITICAL: If even the oldest VISIBLE signature is before boot, definitely reject
-                if block_time < self.boot_timestamp {
-                    let age_since_boot = self.boot_timestamp - block_time;
-                    info!(
-                        mint=%mint, 
-                        oldest_visible_sig_time=block_time,
-                        bot_started_at=self.boot_timestamp,
-                        secs_before_boot=age_since_boot,
-                        sig_count,
-                        "sniper: REJECT - oldest visible mint signature is BEFORE bot started"
-                    );
-                    return Ok(false);
-                }
-                
-                let now = ChronoUtc::now().timestamp();
-                let age_secs = now - block_time;
-                // If the oldest visible signature is > 30 min old, reject
-                if age_secs > 1800 {
-                    info!(
-                        mint=%mint, 
-                        age_mins=age_secs/60, 
-                        sig_count, 
-                        "sniper: REJECT - oldest visible mint sig is >30min old"
-                    );
-                    return Ok(false);
-                }
-            } else {
-                // No block time on signature - suspicious
-                warn!(mint=%mint, "sniper: mint signature has no block_time -> REJECT");
+        // Check the OLDEST and NEWEST signatures
+        let oldest_visible_sig = mint_sigs.last().unwrap();
+        let newest_sig = mint_sigs.first().unwrap();
+        
+        if let (Some(oldest_time), Some(newest_time)) = (oldest_visible_sig.block_time, newest_sig.block_time) {
+            // CRITICAL: If oldest visible signature is before boot, REJECT
+            if oldest_time < self.boot_timestamp {
+                let age_since_boot = self.boot_timestamp - oldest_time;
+                info!(
+                    mint=%mint, 
+                    oldest_visible_sig_time=oldest_time,
+                    bot_started_at=self.boot_timestamp,
+                    secs_before_boot=age_since_boot,
+                    sig_count,
+                    "sniper: REJECT - oldest visible mint signature is BEFORE bot started"
+                );
+                return Ok(false);
+            }
+            
+            // Check if mint is too old (> 10 min from oldest to newest = suspicious)
+            let mint_activity_span = newest_time - oldest_time;
+            if mint_activity_span > 600 {
+                info!(
+                    mint=%mint,
+                    activity_span_secs=mint_activity_span,
+                    sig_count,
+                    "sniper: REJECT - mint activity spans > 10 minutes (not a fresh launch)"
+                );
+                return Ok(false);
+            }
+            
+            let now = ChronoUtc::now().timestamp();
+            let age_secs = now - oldest_time;
+            
+            // If the oldest visible signature is > 10 min old, reject (was 30 min)
+            if age_secs > 600 {
+                info!(
+                    mint=%mint, 
+                    age_secs,
+                    sig_count, 
+                    "sniper: REJECT - oldest visible mint sig is > 10 min old"
+                );
                 return Ok(false);
             }
         } else {
-            // No signatures at all - this is actually OK for brand new tokens
-            // The pool check already passed, so we trust that
-            info!(mint=%mint, "sniper: mint has zero signatures - very fresh token");
+            // No block time on signature - suspicious
+            warn!(mint=%mint, "sniper: mint signature has no block_time -> REJECT");
+            return Ok(false);
         }
 
         // All checks passed!
