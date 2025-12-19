@@ -287,12 +287,10 @@ impl GeyserListener {
                                                         // Extract instruction data
                                                         instruction_data = ix.data.clone();
 
-                                                        info!(
+                                                        debug!(
                                                             signature = %signature,
                                                             instruction_idx = idx,
-                                                            extracted_accounts = instruction_accounts.len(),
-                                                            extracted_data_len = instruction_data.len(),
-                                                            "geyser_listener: ✅ EXTRACTED Pump.fun/Raydium/Orca instruction"
+                                                            "geyser: extracted DEX instruction"
                                                         );
 
                                                         break; // Found our instruction, stop searching

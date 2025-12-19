@@ -189,13 +189,7 @@ impl Orca {
         if let Some(ref db_cache) = self.reserve_cache {
             if let Ok(Some(entry)) = db_cache.get(pool_id) {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                tracing::trace!(
-                    pool = %pool_id,
-                    reserve_base = entry.reserve_base,
-                    reserve_quote = entry.reserve_quote,
-                    source = "persistent_cache",
-                    "orca reserves loaded"
-                );
+                // Log removed - too spammy
                 return (entry.reserve_base, entry.reserve_quote);
             }
         }
@@ -206,13 +200,7 @@ impl Orca {
                 if let Ok(elapsed) = fetch_time.elapsed() {
                     if elapsed.as_secs() < CACHE_TTL_SECS {
                         self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                        tracing::trace!(
-                            pool = %pool_id,
-                            cached_base,
-                            cached_quote,
-                            source = "memory_cache",
-                            "orca reserves loaded"
-                        );
+                        // Log removed - too spammy (hundreds per second)
                         return (cached_base, cached_quote);
                     }
                 }
@@ -249,12 +237,11 @@ impl Orca {
                     };
                     let _ = db_cache.set(&entry);
                 }
-                tracing::trace!(
+                tracing::debug!(
                     pool = %pool_id,
-                    vault_a_balance = reserves.0,
-                    vault_b_balance = reserves.1,
-                    source = "rpc_fetch",
-                    "orca reserves loaded"
+                    vault_a = reserves.0,
+                    vault_b = reserves.1,
+                    "orca: fresh reserves fetched via RPC"
                 );
                 reserves
             }

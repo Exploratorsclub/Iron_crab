@@ -1265,7 +1265,7 @@ impl SniperEngine {
                         warn!(pool=%event.pool_address, error=%e, "failed to load raydium pool into cache");
                     }
                 } else {
-                    info!(pool=%event.pool_address, "raydium pool already in cache, skipping reload");
+                    debug!(pool=%event.pool_address, "raydium pool already in cache");
                 }
             }
         }
@@ -1363,7 +1363,7 @@ impl SniperEngine {
 
         // Check if mint is already known in Raydium cache (implies old token with existing pools)
         if is_known_before_load {
-            info!(mint=%mint, "sniper: skipping token already known in Raydium cache (old token)");
+            debug!(mint=%mint, "sniper: skipping - already in Raydium cache (old token)");
             self.append_pool_candidate_record(
                 program_label,
                 &mint,
