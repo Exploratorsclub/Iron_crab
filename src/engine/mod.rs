@@ -1563,6 +1563,7 @@ mod tests {
             ws_max_backoff_ms: None,
             ws_headers: None,
             geyser_grpc_url: None,
+            helius_rpc_url: None,
         };
         let cfg_all = crate::config::Config {
             app: app_cfg,
