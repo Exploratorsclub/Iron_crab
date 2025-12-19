@@ -3809,55 +3809,72 @@ impl SniperEngine {
         }
 
         // Also check mint creation time as additional safety layer
+        // NOTE: For tokens with many transactions, we can't get the TRUE oldest signature
+        // with a simple query. Instead, we check if the mint has TOO MANY signatures.
+        // A brand new token should have very few signatures (< 100).
         let mint_sigs = self
             .rpc
             .rpc
             .get_signatures_for_address_with_config(
                 mint,
                 solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
-                    limit: Some(1000),
+                    limit: Some(200),  // Reduced - we only need to check count
                     ..Default::default()
                 },
             )
             .await?;
 
-        // Check the OLDEST signature on mint - this reveals token creation time
+        // CRITICAL: If mint has many signatures, it's an OLD token with active trading
+        // New tokens should have < 50-100 signatures in the first few minutes
+        let sig_count = mint_sigs.len();
+        if sig_count >= 200 {
+            info!(
+                mint=%mint, 
+                sig_count,
+                "sniper: REJECT - mint has too many signatures (>= 200), likely old/active token"
+            );
+            return Ok(false);
+        }
+
+        // Check the OLDEST signature we can see
         if !mint_sigs.is_empty() {
-            let oldest_mint_sig = mint_sigs.last().unwrap();
-            if let Some(block_time) = oldest_mint_sig.block_time {
-                // CRITICAL: If mint was created before bot started, REJECT
+            let oldest_visible_sig = mint_sigs.last().unwrap();
+            if let Some(block_time) = oldest_visible_sig.block_time {
+                // CRITICAL: If even the oldest VISIBLE signature is before boot, definitely reject
                 if block_time < self.boot_timestamp {
                     let age_since_boot = self.boot_timestamp - block_time;
                     info!(
                         mint=%mint, 
-                        mint_created_at=block_time,
+                        oldest_visible_sig_time=block_time,
                         bot_started_at=self.boot_timestamp,
                         secs_before_boot=age_since_boot,
-                        "sniper: REJECT - mint existed BEFORE bot started (old token)"
+                        sig_count,
+                        "sniper: REJECT - oldest visible mint signature is BEFORE bot started"
                     );
                     return Ok(false);
                 }
                 
                 let now = ChronoUtc::now().timestamp();
                 let age_secs = now - block_time;
-                // If the MINT was created more than 30 minutes ago, it's an OLD token
+                // If the oldest visible signature is > 30 min old, reject
                 if age_secs > 1800 {
                     info!(
                         mint=%mint, 
                         age_mins=age_secs/60, 
-                        count=mint_sigs.len(), 
-                        "sniper: REJECT - mint is >30min old"
+                        sig_count, 
+                        "sniper: REJECT - oldest visible mint sig is >30min old"
                     );
                     return Ok(false);
                 }
             } else {
-                // No block time on oldest signature - old transactions often don't have block_time indexed
-                warn!(mint=%mint, "sniper: oldest mint signature has no block_time -> REJECT (likely old token)");
+                // No block time on signature - suspicious
+                warn!(mint=%mint, "sniper: mint signature has no block_time -> REJECT");
                 return Ok(false);
             }
         } else {
-            warn!(mint=%mint, "sniper: no signatures found on mint -> REJECT for safety");
-            return Ok(false);
+            // No signatures at all - this is actually OK for brand new tokens
+            // The pool check already passed, so we trust that
+            info!(mint=%mint, "sniper: mint has zero signatures - very fresh token");
         }
 
         // All checks passed!
