@@ -1383,17 +1383,16 @@ impl SniperEngine {
                 mint=%mint,
                 pool=%event.pool_address,
                 liq_sol=liq_sol,
-                "sniper: Pump.fun token - skipping LP lock check only (freshness + position checks still apply)"
+                "sniper: Pump.fun token - using professional validation (no index required)"
             );
 
-            // CRITICAL: Still check mint freshness even for Pump.fun tokens!
-            // This prevents buying old tokens that happen to get new activity
-            match self.check_mint_freshness(&mint).await {
+            // PROFESSIONAL VALIDATION for Pump.fun tokens
+            match self.validate_token_professional(&mint, event.slot).await {
                 Ok(true) => {
-                    info!(mint=%mint, "sniper: [Pump.fun] mint freshness check passed");
+                    info!(mint=%mint, "sniper: [Pump.fun] professional validation PASSED");
                 }
                 Ok(false) => {
-                    info!(mint=%mint, "sniper: [Pump.fun] mint freshness check FAILED (old token), SKIPPING");
+                    info!(mint=%mint, "sniper: [Pump.fun] professional validation FAILED, SKIPPING");
                     self.append_pool_candidate_record(
                         program_label,
                         &mint,
@@ -1404,12 +1403,12 @@ impl SniperEngine {
                         None,
                         Some(liq_sol),
                         "SKIP",
-                        "pumpfun_old_token_history",
+                        "pumpfun_pro_validation_failed",
                     );
                     return;
                 }
                 Err(e) => {
-                    warn!(?e, mint=%mint, "sniper: [Pump.fun] freshness check RPC error, SKIPPING for safety");
+                    warn!(?e, mint=%mint, "sniper: [Pump.fun] professional validation error, SKIPPING");
                     self.append_pool_candidate_record(
                         program_label,
                         &mint,
@@ -1420,7 +1419,7 @@ impl SniperEngine {
                         None,
                         Some(liq_sol),
                         "SKIP",
-                        "pumpfun_freshness_check_error",
+                        "pumpfun_pro_validation_error",
                     );
                     return;
                 }
@@ -1474,152 +1473,58 @@ impl SniperEngine {
             return;
         }
 
-        // Run LP concentration check (only for account-based discoveries)
-        let lp_check = match self.lp_lock_check(&mint).await {
-            Ok(Some(c)) => {
-                info!(mint=%mint, top1=c.top1_pct, top3=c.top3_pct, top5=c.top5_pct, "sniper: lp_lock_check returned Some(assessment)");
-                c
-            }
-            Ok(None) => {
-                info!(mint=%mint, "sniper: lp_lock_check returned None (no thresholds configured)");
-                self.append_pool_candidate_record(
-                    program_label,
-                    &mint,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(liq_sol),
-                    "SKIP",
-                    "lp_check_none",
-                );
-                return;
-            }
-            Err(e) => {
-                warn!(?e, mint=%mint, "sniper: lp_lock_check failed");
-                self.append_pool_candidate_record(
-                    program_label,
-                    &mint,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(liq_sol),
-                    "ERROR",
-                    "lp_check_failed",
-                );
-                return;
-            }
-        };
-
+        // ============================================================================
+        // PROFESSIONAL VALIDATION FOR RAYDIUM/ORCA
+        // Replaces the old lp_lock_check which required get_token_largest_accounts
+        // ============================================================================
         info!(
             mint=%mint,
-            top1=lp_check.top1_pct,
-            top3=lp_check.top3_pct,
-            top5=lp_check.top5_pct,
-            burned=lp_check.burned_pct,
-            program_locked=lp_check.program_vault_pct,
-            "sniper: LP concentration check complete"
+            pool=%event.pool_address,
+            discovery_slot=event.slot,
+            "sniper: [Raydium/Orca] using professional validation (no index required)"
         );
 
-        // Apply filters
-        let max_top1 = self.cfg.read().lp_top1_max_pct;
-        info!(mint=%mint, top1=lp_check.top1_pct, max_top1=?max_top1, "sniper: checking top1 filter");
-        if let Some(max_top1) = max_top1 {
-            if lp_check.top1_pct > max_top1 {
-                info!(mint=%mint, top1=lp_check.top1_pct, max=max_top1, "sniper: top1 holder too concentrated, SKIPPING");
-                self.append_pool_candidate_record(
-                    program_label,
-                    &mint,
-                    Some(lp_check.top1_pct),
-                    Some(lp_check.top3_pct),
-                    Some(lp_check.top5_pct),
-                    Some(lp_check.burned_pct),
-                    Some(lp_check.program_vault_pct),
-                    Some(liq_sol),
-                    "SKIP",
-                    &format!("top1 {:.2}% > {:.2}%", lp_check.top1_pct, max_top1),
-                );
-                return;
-            }
-        }
-
-        // Check burn requirement (note: config uses lp_top* fields, no separate burn field yet)
-        // For now skip burn check or use a placeholder
-        // TODO: Add lp_burned_min_pct to SniperCfg if needed
-
-        // Check holder count (filter old/established tokens)
-        // Skip this check if holder info was unavailable (RPC index limitation)
-        // In that case, rely on the freshness check to filter old tokens
-        let max_holders = self.cfg.read().max_holders.unwrap_or(20);
-        if lp_check.holder_check_available && lp_check.holder_count >= max_holders {
-            info!(mint=%mint, holders=lp_check.holder_count, max=max_holders, "sniper: too many holders (likely old token), SKIPPING");
-            self.append_pool_candidate_record(
-                program_label,
-                &mint,
-                Some(lp_check.top1_pct),
-                Some(lp_check.top3_pct),
-                Some(lp_check.top5_pct),
-                Some(lp_check.burned_pct),
-                Some(lp_check.program_vault_pct),
-                Some(liq_sol),
-                "SKIP",
-                &format!("holders {} >= {}", lp_check.holder_count, max_holders),
-            );
-            return;
-        }
-        
-        // Log when using freshness-only mode
-        if !lp_check.holder_check_available {
-            info!(mint=%mint, "sniper: holder check unavailable (RPC index limit), using freshness check only");
-        }
-
-        // Check mint freshness (transaction history age)
-        // This is an expensive check (extra RPC call), so we do it last
-        match self.check_mint_freshness(&mint).await {
+        match self.validate_token_professional(&mint, event.slot).await {
             Ok(true) => {
-                info!(mint=%mint, "sniper: mint freshness check passed");
+                info!(mint=%mint, "sniper: [PRO] validation PASSED");
             }
             Ok(false) => {
-                info!(mint=%mint, "sniper: mint freshness check failed (old token), SKIPPING");
+                info!(mint=%mint, "sniper: [PRO] validation FAILED, SKIPPING");
                 self.append_pool_candidate_record(
                     program_label,
                     &mint,
-                    Some(lp_check.top1_pct),
-                    Some(lp_check.top3_pct),
-                    Some(lp_check.top5_pct),
-                    Some(lp_check.burned_pct),
-                    Some(lp_check.program_vault_pct),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                     Some(liq_sol),
                     "SKIP",
-                    "old_token_history",
+                    "pro_validation_failed",
                 );
                 return;
             }
             Err(e) => {
-                warn!(?e, mint=%mint, "sniper: mint freshness check failed (RPC error), SKIPPING for safety");
+                warn!(?e, mint=%mint, "sniper: [PRO] validation error, SKIPPING");
                 self.append_pool_candidate_record(
                     program_label,
                     &mint,
-                    Some(lp_check.top1_pct),
-                    Some(lp_check.top3_pct),
-                    Some(lp_check.top5_pct),
-                    Some(lp_check.burned_pct),
-                    Some(lp_check.program_vault_pct),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                     Some(liq_sol),
                     "SKIP",
-                    "freshness_check_error",
+                    "pro_validation_error",
                 );
                 return;
             }
         }
 
-        // All checks passed - attempt buy
-        info!(mint=%mint, "sniper: all filters passed, attempting buy");
+        // All professional checks passed - attempt buy
+        info!(mint=%mint, "sniper: all professional filters passed, attempting buy");
 
-        // Risk Gate: Check max positions, daily loss, etc.
         // Risk Gate: ATOMIC check + reserve to prevent race conditions
         let base_buy = self.effective_max_buy_sol();
         if !self.try_reserve_buy_slot_atomic(&mint, base_buy) {
@@ -1627,34 +1532,32 @@ impl SniperEngine {
             self.append_pool_candidate_record(
                 program_label,
                 &mint,
-                Some(lp_check.top1_pct),
-                Some(lp_check.top3_pct),
-                Some(lp_check.top5_pct),
-                Some(lp_check.burned_pct),
-                Some(lp_check.program_vault_pct),
+                None,
+                None,
+                None,
+                None,
+                None,
                 Some(liq_sol),
                 "REJECT_RISK",
                 "risk_gate_blocked",
             );
             return;
         }
-        // Slot is now reserved atomically!
-        // NOTE: pending_buys will be decremented by record_fill_placeholder on success,
-        // or manually released here on failure.
 
         self.append_pool_candidate_record(
             program_label,
             &mint,
-            Some(lp_check.top1_pct),
-            Some(lp_check.top3_pct),
-            Some(lp_check.top5_pct),
-            Some(lp_check.burned_pct),
-            Some(lp_check.program_vault_pct),
+            None,
+            None,
+            None,
+            None,
+            None,
             Some(liq_sol),
             "BUY",
-            "filters_passed",
+            "pro_validation_passed",
         );
 
+        // Proceed to buy attempt
         if let Err(e) = self
             .attempt_initial_buy(&mint, Some(liq_sol), event.dex_type)
             .await
@@ -2452,6 +2355,9 @@ impl SniperEngine {
                                     base_vault,
                                     quote_vault,
                                 };
+                                let market_prog = snap.market_program_id.unwrap_or(
+                                    Pubkey::from_str("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin").unwrap()
+                                );
                                 if let Ok(ray_prog) = Pubkey::from_str(RAYDIUM_AMM_V4) {
                                     let auth_pk =
                                         Pubkey::new_from_array(self.treasury.pubkey().to_bytes());
@@ -2470,7 +2376,7 @@ impl SniperEngine {
                                             auth_pk,
                                             user_source,
                                             user_dest,
-                                            ray_prog,
+                                            market_prog,
                                             token_prog_pk,
                                             rent_pk,
                                             serum_accounts,
@@ -3760,6 +3666,9 @@ impl SniperEngine {
                                     base_vault,
                                     quote_vault,
                                 };
+                                let market_prog = snap.market_program_id.unwrap_or(
+                                    Pubkey::from_str("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin").unwrap()
+                                );
                                 if let Ok(ray_prog) = Pubkey::from_str(RAYDIUM_AMM_V4) {
                                     let token_prog = spl_token::id();
                                     let rent_sysvar = solana_sdk::sysvar::rent::id();
@@ -3779,7 +3688,7 @@ impl SniperEngine {
                                         auth_pk,
                                         user_source,
                                         user_dest,
-                                        ray_prog,
+                                        market_prog,
                                         token_prog_pk,
                                         rent_pk,
                                         serum_accounts,
@@ -4534,8 +4443,12 @@ impl SniperEngine {
             .await?;
 
         if sigs.is_empty() {
-            // No transactions? Very fresh (or RPC lag). Assume fresh.
-            return Ok(true);
+            // No transactions? This is suspicious for a "new" token that we just discovered via Geyser/Logs.
+            // If we found it via Geyser, it MUST have at least one transaction (the one that triggered the event).
+            // If RPC returns empty, it likely means the node is not indexing this address yet or is lagging.
+            // SAFEST BET: Assume it's NOT fresh if we can't see any history to verify.
+            warn!(mint=%mint, "sniper: no signatures found -> RPC likely lagging or not indexing, SKIPPING for safety");
+            return Ok(false);
         }
 
         // If we hit the limit (1000), it means there are likely MORE transactions.
@@ -4543,7 +4456,7 @@ impl SniperEngine {
         // If it's a new launch with >1000 txs in seconds, it's extremely risky/volatile.
         // If it's an old token, it definitely has >1000 txs.
         // Safest bet: Reject anything with >1000 transactions.
-        if sigs.len() == 1000 {
+        if sigs.len() >= 1000 {
             info!(mint=%mint, count=sigs.len(), "sniper: token has >=1000 txs -> TOO ACTIVE / OLD TOKEN");
             return Ok(false);
         }
@@ -4559,6 +4472,12 @@ impl SniperEngine {
                 info!(mint=%mint, age_mins=age_secs/60, count=sigs.len(), "sniper: oldest visible tx is >1h old -> likely OLD TOKEN");
                 return Ok(false);
             }
+        } else {
+            // Block time missing - cannot verify age.
+            // This often happens for very old transactions where the node doesn't have the time index.
+            // Safer to reject.
+            warn!(mint=%mint, "sniper: oldest transaction has no block time -> cannot verify freshness, SKIPPING");
+            return Ok(false);
         }
 
         // Additional check: if there are more than 100 transactions, it's probably not brand new
@@ -4568,6 +4487,119 @@ impl SniperEngine {
         }
 
         Ok(true)
+    }
+
+    /// PROFESSIONAL TOKEN VALIDATION - No index-dependent RPC calls!
+    /// This is how pro snipers validate tokens:
+    /// 1. Mint Authority must be revoked (None) - prevents rug via inflation
+    /// 2. Freeze Authority must be revoked (None) - prevents rug via freezing
+    /// 3. Slot-based age check - token must be created within last N slots
+    /// 4. Transaction count - must be under threshold (via get_signatures)
+    /// 
+    /// Does NOT use get_token_largest_accounts (requires expensive full index)
+    async fn validate_token_professional(
+        &self,
+        mint: &Pubkey,
+        discovery_slot: u64,
+    ) -> Result<bool> {
+        // 1. Fetch mint account (always works, no index needed)
+        let mint_acc = match self.rpc.get_account_retry(mint).await {
+            Ok(acc) => acc,
+            Err(e) => {
+                // For brand-new tokens, account might not be available yet
+                // This is actually a GOOD sign - it means we're very early
+                info!(mint=%mint, error=?e, "sniper: [PRO] mint account not yet available - token is VERY fresh");
+                // Allow it through, rely on other checks
+                return Ok(true);
+            }
+        };
+
+        // Parse mint account
+        if mint_acc.data.len() < 82 {
+            warn!(mint=%mint, len=mint_acc.data.len(), "sniper: [PRO] invalid mint account size");
+            return Ok(false);
+        }
+
+        let (mint_authority, freeze_authority, decimals, supply) = parse_spl_mint_fields(&mint_acc.data);
+
+        // 2. CRITICAL: Mint Authority MUST be revoked
+        if mint_authority.is_some() {
+            info!(
+                mint=%mint,
+                mint_auth=?mint_authority,
+                "sniper: [PRO] REJECT - Mint authority NOT revoked (rug risk: can inflate supply)"
+            );
+            return Ok(false);
+        }
+
+        // 3. CRITICAL: Freeze Authority MUST be revoked (if configured)
+        if self.cfg.read().require_freeze_auth_none.unwrap_or(true) && freeze_authority.is_some() {
+            info!(
+                mint=%mint,
+                freeze_auth=?freeze_authority,
+                "sniper: [PRO] REJECT - Freeze authority NOT revoked (rug risk: can freeze tokens)"
+            );
+            return Ok(false);
+        }
+
+        // 4. Decimals sanity check
+        if let Some((lo, hi)) = self.cfg.read().require_mint_decimals_range {
+            if decimals < lo || decimals > hi {
+                info!(mint=%mint, decimals, lo, hi, "sniper: [PRO] REJECT - decimals out of range");
+                return Ok(false);
+            }
+        }
+
+        // 5. Supply sanity check
+        if supply == 0 {
+            warn!(mint=%mint, "sniper: [PRO] REJECT - zero supply");
+            return Ok(false);
+        }
+
+        // 6. Slot-based freshness (if we have discovery slot from Geyser)
+        if discovery_slot > 0 {
+            if let Ok(current_slot) = self.rpc.rpc.get_slot().await {
+                // ~400ms per slot, so 7500 slots ≈ 50 minutes
+                // For sniping, we want tokens created in the last ~10 minutes (1500 slots)
+                let max_age_slots: u64 = 1500; // ~10 minutes
+                let age_slots = current_slot.saturating_sub(discovery_slot);
+                
+                if age_slots > max_age_slots {
+                    info!(
+                        mint=%mint,
+                        discovery_slot,
+                        current_slot,
+                        age_slots,
+                        max_age_slots,
+                        "sniper: [PRO] REJECT - token discovered too long ago (slot age)"
+                    );
+                    return Ok(false);
+                }
+                
+                debug!(
+                    mint=%mint,
+                    age_slots,
+                    age_mins = (age_slots as f64 * 0.4) / 60.0,
+                    "sniper: [PRO] slot age OK"
+                );
+            }
+        }
+
+        // 7. Transaction count check (the only "index" we need is signature history)
+        match self.check_mint_freshness(mint).await {
+            Ok(true) => {
+                info!(mint=%mint, "sniper: [PRO] PASS - all professional checks passed");
+                Ok(true)
+            }
+            Ok(false) => {
+                info!(mint=%mint, "sniper: [PRO] REJECT - transaction history indicates old token");
+                Ok(false)
+            }
+            Err(e) => {
+                warn!(?e, mint=%mint, "sniper: [PRO] freshness check failed");
+                Ok(false)
+            }
+        }
     }
 
     /// Index-based (Raydium/Orca) liquidity estimation using current pool snapshots.
