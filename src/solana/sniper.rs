@@ -28,7 +28,6 @@ use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
 use chrono::Utc as ChronoUtc;
 use once_cell::sync::Lazy;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -579,6 +578,7 @@ impl SniperEngine {
     }
 }
 
+#[allow(dead_code)]
 impl SniperEngine {
     fn adaptive_slippage_bps(&self) -> u32 {
         let r = self.cfg.read();
@@ -1420,6 +1420,7 @@ impl SniperEngine {
     }
 }
 
+#[allow(dead_code)]
 impl SniperEngine {
     // auxiliary impl continuation (initial buy etc.)
     async fn sol_usd_price(&self) -> f64 {
@@ -1774,7 +1775,7 @@ impl SniperEngine {
                                 let market_prog = snap.market_program_id.unwrap_or(
                                     Pubkey::from_str("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin").unwrap()
                                 );
-                                if let Ok(ray_prog) = Pubkey::from_str(RAYDIUM_AMM_V4) {
+                                if let Ok(_ray_prog) = Pubkey::from_str(RAYDIUM_AMM_V4) {
                                     let auth_pk =
                                         Pubkey::new_from_array(self.treasury.pubkey().to_bytes());
                                     let user_source = Pubkey::new_from_array(_wsol_ata.to_bytes());
@@ -2959,7 +2960,7 @@ impl SniperEngine {
                                 let market_prog = snap.market_program_id.unwrap_or(
                                     Pubkey::from_str("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin").unwrap()
                                 );
-                                if let Ok(ray_prog) = Pubkey::from_str(RAYDIUM_AMM_V4) {
+                                if let Ok(_ray_prog) = Pubkey::from_str(RAYDIUM_AMM_V4) {
                                     let token_prog = spl_token::id();
                                     let rent_sysvar = solana_sdk::sysvar::rent::id();
                                     let auth_pk =
@@ -3714,6 +3715,7 @@ pub fn test_compute_concentration(
     (top1_pct, top3_pct, top5_pct, burned_pct, locked_pct)
 }
 
+#[allow(dead_code)]
 impl SniperEngine {
     /// Check if a mint is "fresh" by inspecting its transaction history.
     /// Returns true if the mint appears to be new (few transactions or recent creation).
