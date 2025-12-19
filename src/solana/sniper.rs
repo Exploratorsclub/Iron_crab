@@ -1444,10 +1444,9 @@ impl SniperEngine {
                 );
                 return;
             }
-            // Slot is now reserved atomically! Ensure it's released when scope exits
-            let _guard = scopeguard::guard((), |_| {
-                self.release_buy_slot();
-            });
+            // Slot is now reserved atomically!
+            // NOTE: pending_buys will be decremented by record_fill_placeholder on success,
+            // or manually released here on failure.
 
             info!(mint=%mint, "sniper: [Pump.fun] all checks passed, attempting buy");
             self.append_pool_candidate_record(
@@ -1469,6 +1468,8 @@ impl SniperEngine {
                 .await
             {
                 warn!(?e, mint=%mint, "sniper: [Pump.fun] initial buy failed");
+                // CRITICAL: Release slot on failure since record_fill_placeholder won't be called
+                self.release_buy_slot();
             }
             return;
         }
@@ -1631,10 +1632,9 @@ impl SniperEngine {
             );
             return;
         }
-        // Slot is now reserved atomically! Ensure it's released when scope exits
-        let _guard = scopeguard::guard((), |_| {
-            self.release_buy_slot();
-        });
+        // Slot is now reserved atomically!
+        // NOTE: pending_buys will be decremented by record_fill_placeholder on success,
+        // or manually released here on failure.
 
         self.append_pool_candidate_record(
             program_label,
@@ -1654,6 +1654,8 @@ impl SniperEngine {
             .await
         {
             warn!(?e, mint=%mint, "sniper: initial buy failed");
+            // CRITICAL: Release slot on failure since record_fill_placeholder won't be called
+            self.release_buy_slot();
         }
 
         // Background task: Fetch actual liquidity from vaults (non-blocking)
@@ -2701,6 +2703,8 @@ impl SniperEngine {
                 warn!(?e, mint=%mint, "sniper: buy tx failed (will not retry immediately)");
                 TRADES_FAILED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // CRITICAL: Return error so caller knows to release the buy slot!
+                return Err(anyhow::anyhow!("buy tx failed: {}", e));
             }
         }
         Ok(())
@@ -2708,6 +2712,13 @@ impl SniperEngine {
 
     pub async fn run(&self) -> Result<()> {
         self.try_load_risk_state();
+
+        // CRITICAL: Scan wallet for existing token balances and register as positions
+        // This ensures max_open_positions works correctly even after restart
+        if let Err(e) = self.scan_wallet_for_existing_positions().await {
+            warn!(?e, "sniper: failed to scan wallet for existing positions");
+        }
+
         // NEW: Use Geyser gRPC if configured, otherwise fallback to WebSocket
         if let Some(geyser_url) = &self.geyser_grpc_url {
             info!(url=%geyser_url, "sniper: using Geyser gRPC for pool discovery");
@@ -3044,6 +3055,7 @@ impl SniperEngine {
         if let Some(limit) = self.cfg.read().per_mint_position_limit {
             if let Some(v) = rs.open.get(&mint) {
                 if v.len() as u32 >= limit {
+                    info!(mint=%mint, current_lots=v.len(), limit=limit, "sniper: per-mint position limit reached, not recording new lot");
                     return;
                 }
             }
@@ -3061,6 +3073,19 @@ impl SniperEngine {
         rs.open.entry(mint).or_default().push(lot);
         let lots: usize = rs.open.values().map(|v| v.len()).sum();
         OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
+
+        // CRITICAL: Also decrement pending_buys since position is now recorded
+        if rs.pending_buys > 0 {
+            rs.pending_buys -= 1;
+        }
+
+        info!(
+            mint=%mint,
+            invested_sol=invested_sol,
+            total_open_positions=lots,
+            remaining_pending=rs.pending_buys,
+            "sniper: [POSITION RECORDED] new position registered"
+        );
     }
 
     async fn finalize_fill(&self, mint: Pubkey) {
@@ -4285,6 +4310,121 @@ impl SniperEngine {
         } else {
             debug!("risk state read failed");
         }
+    }
+
+    /// Scan wallet for existing token balances and register as positions.
+    /// This ensures max_open_positions works correctly even after restart.
+    async fn scan_wallet_for_existing_positions(&self) -> Result<()> {
+        use solana_sdk::program_pack::Pack;
+
+        let owner = self.treasury.pubkey();
+        info!(owner=%owner, "sniper: scanning wallet for existing token positions...");
+
+        // Get all token accounts owned by this wallet
+        let token_accounts = self
+            .rpc
+            .rpc
+            .get_token_accounts_by_owner(
+                &solana_sdk::pubkey::Pubkey::new_from_array(owner.to_bytes()),
+                solana_client::rpc_request::TokenAccountsFilter::ProgramId(spl_token::id()),
+            )
+            .await?;
+
+        let mut positions_found = 0;
+        let mut already_tracked = 0;
+
+        // Native SOL mint to skip
+        let sol_mint =
+            solana_sdk::pubkey::Pubkey::from_str("So11111111111111111111111111111111111111112")
+                .unwrap();
+
+        for account in token_accounts.value {
+            // Parse the token account data
+            let data = match base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &account.account.data[0],
+            ) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            if data.len() < spl_token::state::Account::LEN {
+                continue;
+            }
+
+            let token_account = match spl_token::state::Account::unpack(&data) {
+                Ok(acc) => acc,
+                Err(_) => continue,
+            };
+
+            // Skip zero balances and SOL
+            if token_account.amount == 0 {
+                continue;
+            }
+
+            let mint = Pubkey::new_from_array(token_account.mint.to_bytes());
+            if token_account.mint == sol_mint {
+                continue;
+            }
+
+            // Check if already tracked in risk state
+            {
+                let rs = self.risk.read();
+                if rs.open.contains_key(&mint) {
+                    already_tracked += 1;
+                    continue;
+                }
+            }
+
+            // Add to purchased set so we don't try to buy again
+            self.purchased.write().insert(mint);
+
+            // Register as an open position (unknown entry price)
+            {
+                let mut rs = self.risk.write();
+                let lot = PositionLot {
+                    entry_price_sol: 0.0, // Unknown - was bought before this run
+                    amount_tokens: token_account.amount as f64,
+                    invested_sol: 0.0, // Unknown
+                    token_decimals: 0, // Will be filled by finalize_fill
+                    last_unrealized_pnl_sol: 0.0,
+                    opened_ts: chrono::Utc::now().timestamp(),
+                    executed_tp_bps: Vec::new(),
+                    peak_pnl_bps: 0,
+                };
+                rs.open.entry(mint).or_default().push(lot);
+                positions_found += 1;
+
+                info!(
+                    mint=%mint,
+                    amount=token_account.amount,
+                    "sniper: [WALLET SCAN] found existing token position"
+                );
+            }
+        }
+
+        // Update gauge
+        let total_positions: usize = self.risk.read().open.values().map(|v| v.len()).sum();
+        OPEN_POSITIONS_GAUGE.store(total_positions as u64, std::sync::atomic::Ordering::Relaxed);
+
+        let max_pos = self.cfg.read().max_open_positions.unwrap_or(u32::MAX);
+        info!(
+            positions_found = positions_found,
+            already_tracked = already_tracked,
+            total_open = total_positions,
+            max_allowed = max_pos,
+            "sniper: [WALLET SCAN COMPLETE] existing positions loaded"
+        );
+
+        if total_positions >= max_pos as usize {
+            warn!(
+                total=total_positions,
+                max=max_pos,
+                "sniper: [WARNING] max_open_positions already reached! No new buys will be allowed."
+            );
+        }
+
+        Ok(())
     }
 }
 // end try_load_risk_state; keep impl open for helper structs/functions below
