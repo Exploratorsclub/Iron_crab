@@ -1551,9 +1551,10 @@ impl SniperEngine {
         // TODO: Add lp_burned_min_pct to SniperCfg if needed
 
         // Check holder count (filter old/established tokens)
-        // Default to 20 if not configured (standard RPC limit)
+        // Skip this check if holder info was unavailable (RPC index limitation)
+        // In that case, rely on the freshness check to filter old tokens
         let max_holders = self.cfg.read().max_holders.unwrap_or(20);
-        if lp_check.holder_count >= max_holders {
+        if lp_check.holder_check_available && lp_check.holder_count >= max_holders {
             info!(mint=%mint, holders=lp_check.holder_count, max=max_holders, "sniper: too many holders (likely old token), SKIPPING");
             self.append_pool_candidate_record(
                 program_label,
@@ -1568,6 +1569,11 @@ impl SniperEngine {
                 &format!("holders {} >= {}", lp_check.holder_count, max_holders),
             );
             return;
+        }
+        
+        // Log when using freshness-only mode
+        if !lp_check.holder_check_available {
+            info!(mint=%mint, "sniper: holder check unavailable (RPC index limit), using freshness check only");
         }
 
         // Check mint freshness (transaction history age)
@@ -4447,6 +4453,9 @@ pub struct LpLockAssessment {
     pub burned_pct: f64,
     pub program_vault_pct: f64,
     pub holder_count: usize,
+    /// Whether the holder count could be fetched from RPC.
+    /// If false, holder_count is 0 and holder-based checks should be skipped.
+    pub holder_check_available: bool,
 }
 
 // Test-only utilities for verifying concentration math
@@ -4845,17 +4854,35 @@ impl SniperEngine {
             return Ok(None);
         }
         // Largest accounts
-        let list = match self.rpc.rpc.get_token_largest_accounts(mint).await {
-            Ok(v) => v,
+        let (list, holder_check_available) = match self.rpc.rpc.get_token_largest_accounts(mint).await {
+            Ok(v) => (v, true),
             Err(e) => {
-                // SAFETY: If we can't get holder info, we CANNOT verify it's a new token.
-                // Old tokens with many holders would pass our filters without this check.
-                // REJECT the token to be safe - only buy tokens we can fully verify.
-                info!(mint=%mint, error=?e, "sniper: largest accounts fetch failed -> REJECTING (cannot verify holder count)");
-                return Ok(None);
+                // RPC doesn't have this mint in account-index (common for new tokens)
+                // FALLBACK: Allow the trade but mark that holder check was unavailable
+                // The freshness check will be the primary filter for new tokens
+                info!(mint=%mint, error=?e, "sniper: largest accounts fetch failed -> using freshness-only mode");
+                (Vec::new(), false)
             }
         };
         let holder_count = list.len();
+        
+        // If holder check unavailable (RPC index limitation), return a permissive assessment
+        // The freshness check will be the primary filter for these tokens
+        if !holder_check_available {
+            info!(mint=%mint, "sniper: holder check unavailable, using freshness-only mode");
+            return Ok(Some(LpLockAssessment {
+                top1_pct: 0.0,
+                top3_pct: 0.0,
+                top5_pct: 0.0,
+                concentration_ok: true,  // Allow - we can't verify, rely on freshness
+                largest_account: None,
+                holder_count: 0,
+                burned_pct: 0.0,
+                program_vault_pct: 0.0,
+                holder_check_available: false,
+            }));
+        }
+        
         if list.is_empty() {
             info!(mint=%mint, "sniper: largest accounts list empty, returning None");
             return Ok(None);
@@ -5017,6 +5044,7 @@ impl SniperEngine {
             holder_count,
             burned_pct,
             program_vault_pct,
+            holder_check_available: true,
         }))
     }
 }
