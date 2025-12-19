@@ -1810,6 +1810,35 @@ impl SniperEngine {
 
         // Now check all candidate mints
         for pk in candidates_to_check {
+            // CRITICAL: Run professional validation (boot_timestamp check) FIRST
+            // This prevents buying old tokens that existed before bot started
+            info!(mint=%pk, "[WS-logs] running professional validation for candidate mint");
+            match self.validate_token_professional(&pk, &pk, 0).await {
+                Ok(true) => {
+                    info!(mint=%pk, "[WS-logs] professional validation PASSED");
+                }
+                Ok(false) => {
+                    info!(mint=%pk, "[WS-logs] professional validation FAILED - skipping old token");
+                    self.append_pool_candidate_record(
+                        program_label,
+                        &pk,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "REJECT_OLD",
+                        "ws_logs_pro_validation_failed",
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(?e, mint=%pk, "[WS-logs] professional validation error - skipping for safety");
+                    continue;
+                }
+            }
+
             // Run LP concentration check (if thresholds configured)
             match self.lp_lock_check(&pk).await {
                 Ok(Some(assess)) => {
@@ -1950,6 +1979,22 @@ impl SniperEngine {
                     continue;
                 }
                 if let Ok(pk) = Pubkey::from_str(s) {
+                    // CRITICAL: Run professional validation (boot_timestamp check) FIRST
+                    info!(mint=%pk, "[extract_and_evaluate] running professional validation");
+                    match self.validate_token_professional(&pk, &pk, 0).await {
+                        Ok(true) => {
+                            info!(mint=%pk, "[extract_and_evaluate] professional validation PASSED");
+                        }
+                        Ok(false) => {
+                            info!(mint=%pk, "[extract_and_evaluate] professional validation FAILED - skipping old token");
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(?e, mint=%pk, "[extract_and_evaluate] professional validation error - skipping");
+                            continue;
+                        }
+                    }
+
                     // Run LP concentration check (if thresholds configured)
                     match self.lp_lock_check(&pk).await {
                         Ok(Some(assess)) => {
