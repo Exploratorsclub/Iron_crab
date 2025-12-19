@@ -369,6 +369,8 @@ pub struct SniperEngine {
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     quantile_calc: Arc<crate::quantile_impact::QuantileImpactCalculator>,
     geyser_grpc_url: Option<String>,
+    /// CRITICAL: Timestamp when the bot started - only buy pools created AFTER this!
+    boot_timestamp: i64,
 }
 
 // --- Test Helpers (feature-gated) -----------------------------------------------------------
@@ -784,6 +786,10 @@ impl SniperEngine {
             }
         };
 
+        // Record boot timestamp - CRITICAL for filtering old pools!
+        let boot_timestamp = ChronoUtc::now().timestamp();
+        info!(boot_timestamp, "sniper: engine starting - will ONLY buy pools created AFTER this timestamp");
+
         Self {
             rpc,
             cfg: parking_lot::RwLock::new(cfg),
@@ -800,6 +806,7 @@ impl SniperEngine {
                 quantile_config,
             )),
             geyser_grpc_url,
+            boot_timestamp,
         }
     }
 
@@ -819,6 +826,7 @@ impl SniperEngine {
             shutdown_rx: rx,
             quantile_calc: self.quantile_calc.clone(),
             geyser_grpc_url: self.geyser_grpc_url.clone(),
+            boot_timestamp: self.boot_timestamp, // CRITICAL: preserve boot time for all clones
         }
     }
 
@@ -4428,12 +4436,95 @@ impl SniperEngine {
     /// Check if a mint is "fresh" by inspecting its transaction history.
     /// Returns true if the mint appears to be new (few transactions or recent creation).
     async fn check_mint_freshness(&self, mint: &Pubkey, pool_address: Option<&Pubkey>) -> Result<bool> {
-        // CRITICAL FIX: Check BOTH the mint account AND the pool account signatures!
-        // The mint account itself often has very few transactions (just creation + authority changes).
-        // Old tokens that get new Raydium pools will have few signatures on the MINT
-        // but the POOL will reveal when it was actually created.
+        // ============================================================
+        // CRITICAL PRO-GRADE FILTER: Only buy pools created AFTER bot start!
+        // ============================================================
+        // This is how professional snipers work:
+        // 1. When bot starts, record the timestamp
+        // 2. REJECT all pools that existed before bot started
+        // 3. ONLY buy pools created AFTER we started watching
+        // 
+        // This eliminates ALL old tokens, regardless of whether they have
+        // new pools, migrations, relistings, etc.
         
-        // First, check mint account signatures
+        // If we have a pool address, verify it was created AFTER we started
+        if let Some(pool) = pool_address {
+            let pool_sigs = match self
+                .rpc
+                .rpc
+                .get_signatures_for_address_with_config(
+                    pool,
+                    solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
+                        limit: Some(100),
+                        ..Default::default()
+                    },
+                )
+                .await 
+            {
+                Ok(sigs) => sigs,
+                Err(e) => {
+                    warn!(pool=%pool, error=?e, "sniper: could not fetch pool signatures -> REJECT for safety");
+                    return Ok(false);
+                }
+            };
+            
+            if pool_sigs.is_empty() {
+                // No signatures = RPC not indexing or pool doesn't exist
+                warn!(pool=%pool, "sniper: no pool signatures found -> REJECT for safety");
+                return Ok(false);
+            }
+            
+            // Check oldest pool signature - this is when the pool was created
+            let oldest_pool_sig = pool_sigs.last().unwrap();
+            if let Some(block_time) = oldest_pool_sig.block_time {
+                // CRITICAL CHECK: Was pool created AFTER we started?
+                if block_time < self.boot_timestamp {
+                    let age_since_boot = self.boot_timestamp - block_time;
+                    info!(
+                        mint=%mint,
+                        pool=%pool,
+                        pool_created_at=block_time,
+                        bot_started_at=self.boot_timestamp,
+                        secs_before_boot=age_since_boot,
+                        "sniper: REJECT - pool existed BEFORE bot started (old pool, not a new launch)"
+                    );
+                    return Ok(false);
+                }
+                
+                // Pool was created after boot - now check it's within reasonable time
+                let now = ChronoUtc::now().timestamp();
+                let pool_age_secs = now - block_time;
+                
+                // Pool should be created within last 10 minutes for fresh launch
+                if pool_age_secs > 600 {
+                    info!(
+                        mint=%mint,
+                        pool=%pool,
+                        pool_age_mins=pool_age_secs/60,
+                        "sniper: REJECT - pool is >10min old (not fresh enough)"
+                    );
+                    return Ok(false);
+                }
+                
+                info!(
+                    mint=%mint,
+                    pool=%pool, 
+                    pool_age_secs,
+                    pool_created_at=block_time,
+                    bot_started_at=self.boot_timestamp,
+                    "sniper: PASSED - pool created AFTER bot start and is fresh"
+                );
+            } else {
+                // No block_time on pool signature - likely old transaction
+                warn!(pool=%pool, "sniper: pool signature has no block_time -> REJECT (likely old pool)");
+                return Ok(false);
+            }
+        } else {
+            // No pool address provided - must still check mint age
+            warn!(mint=%mint, "sniper: no pool_address provided - cannot verify pool creation time");
+        }
+
+        // Also check mint creation time as additional safety layer
         let mint_sigs = self
             .rpc
             .rpc
@@ -4450,80 +4541,46 @@ impl SniperEngine {
         if !mint_sigs.is_empty() {
             let oldest_mint_sig = mint_sigs.last().unwrap();
             if let Some(block_time) = oldest_mint_sig.block_time {
+                // CRITICAL: If mint was created before bot started, REJECT
+                if block_time < self.boot_timestamp {
+                    let age_since_boot = self.boot_timestamp - block_time;
+                    info!(
+                        mint=%mint, 
+                        mint_created_at=block_time,
+                        bot_started_at=self.boot_timestamp,
+                        secs_before_boot=age_since_boot,
+                        "sniper: REJECT - mint existed BEFORE bot started (old token)"
+                    );
+                    return Ok(false);
+                }
+                
                 let now = ChronoUtc::now().timestamp();
                 let age_secs = now - block_time;
                 // If the MINT was created more than 30 minutes ago, it's an OLD token
-                // Real new launches: mint creation should be within last ~10-30 minutes
                 if age_secs > 1800 {
                     info!(
                         mint=%mint, 
                         age_mins=age_secs/60, 
                         count=mint_sigs.len(), 
-                        "sniper: MINT ACCOUNT is >30min old -> OLD TOKEN (created {} mins ago)",
-                        age_secs/60
+                        "sniper: REJECT - mint is >30min old"
                     );
                     return Ok(false);
                 }
             } else {
-                // No block time on oldest signature - very suspicious for old tokens
-                // Old transactions often don't have block_time indexed
-                warn!(mint=%mint, "sniper: oldest mint signature has no block_time -> likely OLD TOKEN");
+                // No block time on oldest signature - old transactions often don't have block_time indexed
+                warn!(mint=%mint, "sniper: oldest mint signature has no block_time -> REJECT (likely old token)");
                 return Ok(false);
             }
-        }
-
-        // If we have a pool address, also check when the POOL was created
-        // This catches the case where old tokens get NEW pools (migration, new DEX listing)
-        if let Some(pool) = pool_address {
-            let pool_sigs = self
-                .rpc
-                .rpc
-                .get_signatures_for_address_with_config(
-                    pool,
-                    solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
-                        limit: Some(100),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-            
-            if !pool_sigs.is_empty() {
-                // Check oldest pool signature - this is when the pool was created
-                let oldest_pool_sig = pool_sigs.last().unwrap();
-                if let Some(block_time) = oldest_pool_sig.block_time {
-                    let now = ChronoUtc::now().timestamp();
-                    let pool_age_secs = now - block_time;
-                    // Pool should be created within last 10 minutes for fresh launch
-                    if pool_age_secs > 600 {
-                        info!(
-                            mint=%mint,
-                            pool=%pool,
-                            pool_age_mins=pool_age_secs/60,
-                            "sniper: POOL is >10min old -> not a fresh launch"
-                        );
-                        return Ok(false);
-                    }
-                    info!(
-                        mint=%mint,
-                        pool=%pool, 
-                        pool_age_secs,
-                        "sniper: pool age check PASSED"
-                    );
-                }
-            }
-        }
-
-        // If mint_sigs is empty, the RPC isn't indexing this address
-        if mint_sigs.is_empty() {
-            warn!(mint=%mint, "sniper: no signatures found on mint -> RPC likely lagging, SKIPPING for safety");
+        } else {
+            warn!(mint=%mint, "sniper: no signatures found on mint -> REJECT for safety");
             return Ok(false);
         }
 
-        // If we got here, basic checks passed
+        // All checks passed!
         info!(
             mint=%mint,
             mint_sig_count=mint_sigs.len(),
-            "sniper: freshness check PASSED"
+            "sniper: ALL FRESHNESS CHECKS PASSED - token is genuinely new"
         );
         Ok(true)
     }
