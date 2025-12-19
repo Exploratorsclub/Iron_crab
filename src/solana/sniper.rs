@@ -4544,11 +4544,18 @@ impl SniperEngine {
         if let Some(block_time) = oldest.block_time {
             let now = ChronoUtc::now().timestamp();
             let age_secs = now - block_time;
-            // If the oldest transaction is > 24 hours, it's an old token
-            if age_secs > 86400 {
-                info!(mint=%mint, age_hours=age_secs/3600, count=sigs.len(), "sniper: token has few txs but oldest is >24h old -> OLD INACTIVE TOKEN");
+            // If the oldest transaction is > 1 hour old (3600 secs), be very suspicious
+            // New tokens should be VERY fresh - within minutes of creation
+            if age_secs > 3600 {
+                info!(mint=%mint, age_mins=age_secs/60, count=sigs.len(), "sniper: oldest visible tx is >1h old -> likely OLD TOKEN");
                 return Ok(false);
             }
+        }
+
+        // Additional check: if there are more than 100 transactions, it's probably not brand new
+        if sigs.len() > 100 {
+            info!(mint=%mint, count=sigs.len(), "sniper: token has >100 txs -> not fresh enough for sniping");
+            return Ok(false);
         }
 
         Ok(true)
@@ -4841,20 +4848,11 @@ impl SniperEngine {
         let list = match self.rpc.rpc.get_token_largest_accounts(mint).await {
             Ok(v) => v,
             Err(e) => {
-                info!(mint=%mint, error=?e, "sniper: largest accounts fetch failed, using fallback assessment");
-                // FALLBACK: Return placeholder assessment (95% concentration) when RPC unavailable
-                // This allows trades to proceed when account-index is disabled on RPC
-                // Config thresholds will still filter if configured stricter than 95%
-                return Ok(Some(LpLockAssessment {
-                    top1_pct: 0.95,
-                    top3_pct: 0.95,
-                    top5_pct: 0.95,
-                    concentration_ok: 0.95 <= thr1 && 0.95 <= thr3 && 0.95 <= thr5,
-                    largest_account: None,
-                    burned_pct: 0.0,
-                    program_vault_pct: 0.0,
-                    holder_count: 0,
-                }));
+                // SAFETY: If we can't get holder info, we CANNOT verify it's a new token.
+                // Old tokens with many holders would pass our filters without this check.
+                // REJECT the token to be safe - only buy tokens we can fully verify.
+                info!(mint=%mint, error=?e, "sniper: largest accounts fetch failed -> REJECTING (cannot verify holder count)");
+                return Ok(None);
             }
         };
         let holder_count = list.len();
