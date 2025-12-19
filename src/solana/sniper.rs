@@ -98,7 +98,7 @@ impl Default for SniperCfg {
     fn default() -> Self {
         Self {
             max_buy_sol: 1.0,
-            max_slippage_bps: 100,
+            max_slippage_bps: 1500, // 15% default for sniping (new tokens are volatile!)
             log_all_inits: false,
             program_ids: None,
             blacklist_mints: Vec::new(),
@@ -2506,6 +2506,34 @@ impl SniperEngine {
             .unwrap_or(0);
         let mut tx = Transaction::new_with_payer(&final_ixs, Some(&self.treasury.pubkey()));
         tx.try_sign(&[self.treasury.signer_ref()], bh)?;
+        
+        // CRITICAL: Simulate transaction BEFORE sending to avoid wasted SOL on failed TXs!
+        // This catches slippage errors, invalid pool states, honeypots, etc.
+        if chosen_dex != ChosenDex::PumpFun {
+            match self.rpc.rpc.simulate_transaction(&tx).await {
+                Ok(sim_result) => {
+                    if let Some(err) = sim_result.value.err {
+                        warn!(
+                            mint=%mint,
+                            error=?err,
+                            logs=?sim_result.value.logs,
+                            "sniper: TX simulation FAILED - NOT sending to avoid wasted SOL"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "simulation failed: {:?}. Logs: {:?}",
+                            err,
+                            sim_result.value.logs
+                        ));
+                    }
+                    info!(mint=%mint, "sniper: TX simulation PASSED, proceeding with send");
+                }
+                Err(e) => {
+                    warn!(mint=%mint, error=?e, "sniper: simulation RPC error - proceeding anyway");
+                    // Don't block on simulation errors - they might be RPC issues
+                }
+            }
+        }
+        
         let sent_at = Instant::now();
         let skip_preflight = chosen_dex == ChosenDex::PumpFun;
         match self.rpc_retry_tx(&tx, 3, skip_preflight).await {
