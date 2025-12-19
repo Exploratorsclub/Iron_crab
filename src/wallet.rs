@@ -463,15 +463,55 @@ impl Treasury {
     ) -> Result<(SdkPubkey, Vec<solana_sdk::instruction::Instruction>)> {
         let wsol_mint_sdk = SdkPubkey::new_from_array(spl_token::native_mint::id().to_bytes());
         let owner = self.pubkey();
+        let spl_token_sdk = SdkPubkey::new_from_array(spl_token_program_id().to_bytes());
 
-        // Build ATA creation if needed
-        let (ata, maybe_ata_ix) = self.build_ata_ix(rpc, &owner, &wsol_mint_sdk).await?;
+        // WSOL MUST use classic SPL Token program - derive address explicitly
+        let ata = spl_to_sdk(&get_associated_token_address_with_program_id(
+            &sdk_to_spl(&owner),
+            &sdk_to_spl(&wsol_mint_sdk),
+            &spl_token_program_id(),
+        ));
 
         let mut ixs = Vec::new();
 
-        // Add ATA creation if needed
-        if let Some(ix) = maybe_ata_ix {
-            ixs.push(ix);
+        // Check if ATA exists and verify it's owned by classic SPL Token
+        let ata_exists = match rpc.rpc.get_account(&ata).await {
+            Ok(acc) => {
+                if acc.owner != spl_token_sdk {
+                    // WSOL ATA exists but has wrong owner (shouldn't happen, but handle it)
+                    // Close it first, then recreate
+                    tracing::warn!(
+                        ata=%ata,
+                        actual_owner=%acc.owner,
+                        expected_owner=%spl_token_sdk,
+                        "WSOL ATA has incorrect owner, closing and recreating"
+                    );
+                    // Add close instruction
+                    let close_ix = prog_ix_to_sdk(spl_ix::close_account(
+                        &spl_token_program_id(),
+                        &sdk_to_spl(&ata),
+                        &sdk_to_spl(&owner),
+                        &sdk_to_spl(&owner),
+                        &[],
+                    )?);
+                    ixs.push(close_ix);
+                    false // Treat as not existing so we recreate
+                } else {
+                    true // Valid ATA exists
+                }
+            }
+            Err(_) => false, // ATA doesn't exist
+        };
+
+        // Create ATA if needed (idempotent instruction is safe)
+        if !ata_exists {
+            let create_ix = prog_ix_to_sdk(create_associated_token_account_idempotent(
+                &sdk_to_spl(&self.pubkey()),
+                &sdk_to_spl(&owner),
+                &sdk_to_spl(&wsol_mint_sdk),
+                &spl_token_program_id(),
+            ));
+            ixs.push(create_ix);
         }
 
         // Transfer SOL to WSOL ATA
@@ -498,7 +538,7 @@ impl Treasury {
         };
         ixs.push(ix_transfer);
 
-        // Sync native
+        // Sync native - ALWAYS use classic SPL Token program for WSOL
         let ata_prog = sdk_to_spl(&ata);
         let ix_sync = prog_ix_to_sdk(spl_ix::sync_native(&spl_token_program_id(), &ata_prog)?);
         ixs.push(ix_sync);
