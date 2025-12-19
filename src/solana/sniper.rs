@@ -4315,18 +4315,18 @@ impl SniperEngine {
     /// Scan wallet for existing token balances and register as positions.
     /// This ensures max_open_positions works correctly even after restart.
     async fn scan_wallet_for_existing_positions(&self) -> Result<()> {
-        use solana_sdk::program_pack::Pack;
-
         let owner = self.treasury.pubkey();
         info!(owner=%owner, "sniper: scanning wallet for existing token positions...");
 
         // Get all token accounts owned by this wallet
+        // Convert spl_token::id() to solana_sdk::pubkey::Pubkey
+        let spl_token_prog = solana_sdk::pubkey::Pubkey::new_from_array(spl_token::id().to_bytes());
         let token_accounts = self
             .rpc
             .rpc
             .get_token_accounts_by_owner(
                 &solana_sdk::pubkey::Pubkey::new_from_array(owner.to_bytes()),
-                solana_client::rpc_request::TokenAccountsFilter::ProgramId(spl_token::id()),
+                solana_client::rpc_request::TokenAccountsFilter::ProgramId(spl_token_prog),
             )
             .await?;
 
@@ -4338,34 +4338,41 @@ impl SniperEngine {
             solana_sdk::pubkey::Pubkey::from_str("So11111111111111111111111111111111111111112")
                 .unwrap();
 
-        for account in token_accounts.value {
-            // Parse the token account data
-            let data = match base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                &account.account.data[0],
-            ) {
-                Ok(d) => d,
-                Err(_) => continue,
+        // Response is Vec<RpcKeyedAccount> directly (not wrapped in .value)
+        for account in token_accounts {
+            // Parse the token account data - handle different encoding formats
+            let data: Vec<u8> = if let solana_account_decoder::UiAccountData::Binary(b64_str, _encoding) = &account.account.data {
+                match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_str) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                }
+            } else {
+                continue;
             };
 
-            if data.len() < spl_token::state::Account::LEN {
+            // Token account is 165 bytes
+            if data.len() < 165 {
                 continue;
             }
 
-            let token_account = match spl_token::state::Account::unpack(&data) {
-                Ok(acc) => acc,
-                Err(_) => continue,
-            };
+            // Parse token account manually (avoid Pack trait version conflicts)
+            // Layout: mint (32) + owner (32) + amount (8) + ...
+            let mint_bytes: [u8; 32] = data[0..32].try_into().unwrap_or([0u8; 32]);
+            let amount = u64::from_le_bytes(data[64..72].try_into().unwrap_or([0u8; 8]));
 
-            // Skip zero balances and SOL
-            if token_account.amount == 0 {
+            // Skip zero balances
+            if amount == 0 {
                 continue;
             }
 
-            let mint = Pubkey::new_from_array(token_account.mint.to_bytes());
-            if token_account.mint == sol_mint {
+            let token_mint = solana_sdk::pubkey::Pubkey::new_from_array(mint_bytes);
+            
+            // Skip WSOL
+            if token_mint == sol_mint {
                 continue;
             }
+
+            let mint = Pubkey::new_from_array(mint_bytes);
 
             // Check if already tracked in risk state
             {
@@ -4384,7 +4391,7 @@ impl SniperEngine {
                 let mut rs = self.risk.write();
                 let lot = PositionLot {
                     entry_price_sol: 0.0, // Unknown - was bought before this run
-                    amount_tokens: token_account.amount as f64,
+                    amount_tokens: amount as f64,
                     invested_sol: 0.0, // Unknown
                     token_decimals: 0, // Will be filled by finalize_fill
                     last_unrealized_pnl_sol: 0.0,
@@ -4397,7 +4404,7 @@ impl SniperEngine {
 
                 info!(
                     mint=%mint,
-                    amount=token_account.amount,
+                    amount=amount,
                     "sniper: [WALLET SCAN] found existing token position"
                 );
             }
@@ -4407,7 +4414,7 @@ impl SniperEngine {
         let total_positions: usize = self.risk.read().open.values().map(|v| v.len()).sum();
         OPEN_POSITIONS_GAUGE.store(total_positions as u64, std::sync::atomic::Ordering::Relaxed);
 
-        let max_pos = self.cfg.read().max_open_positions.unwrap_or(u32::MAX);
+        let max_pos = self.cfg.read().max_open_positions.unwrap_or(usize::MAX);
         info!(
             positions_found = positions_found,
             already_tracked = already_tracked,
@@ -4416,7 +4423,7 @@ impl SniperEngine {
             "sniper: [WALLET SCAN COMPLETE] existing positions loaded"
         );
 
-        if total_positions >= max_pos as usize {
+        if total_positions >= max_pos {
             warn!(
                 total=total_positions,
                 max=max_pos,
