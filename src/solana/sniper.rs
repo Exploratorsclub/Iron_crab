@@ -14,7 +14,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::{hash::Hash, transaction::Transaction};
 use std::str::FromStr;
 use std::{collections::HashSet, sync::Arc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use crate::metrics; // keep metrics module in scope for qualified uses
 use crate::metrics::{
     record_fee_pct, record_network_fee, record_realized_gross_net, record_realized_pnl_sol,
@@ -922,7 +922,7 @@ impl SniperEngine {
         {
             let processing = self.processing.read();
             if processing.contains(&mint) {
-                info!(mint=%mint, "mint already being processed by another task, skipping");
+                trace!(mint=%mint, "mint already being processed by another task, skipping");
                 return;
             }
             let purchased = self.purchased.read();
@@ -948,7 +948,7 @@ impl SniperEngine {
 
         let liq_sol = (event.liquidity_estimate_lamports as f64) / 1e9;
 
-        info!(
+        debug!(
             pool=%event.pool_address,
             dex=program_label,
             base=%event.base_mint,
@@ -991,7 +991,7 @@ impl SniperEngine {
 
         // Skip non-SOL pairs (we only trade SOL/Token pairs for now)
         if event.base_mint != sol_mint && event.quote_mint != sol_mint {
-            info!(
+            debug!(
                 base=%event.base_mint,
                 quote=%event.quote_mint,
                 "sniper: skipping non-SOL pair (Token/Token or Token/Stablecoin)"

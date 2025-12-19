@@ -686,7 +686,7 @@ impl Dex for Raydium {
             if acc.data.len() == reader::LIQ_STATE_V4_SIZE {
                 if let Ok(p) = reader::PoolV4::decode(*addr, &acc.data) {
                     if let Err(e) = Self::validate_pool_state(&p) {
-                        tracing::warn!(pool = %p.address, error = %e, "skip invalid raydium pool");
+                        tracing::debug!(pool = %p.address, error = %e, "skip invalid raydium pool");
                         RAYDIUM_POOLS_SKIPPED_INVALID
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     } else {
