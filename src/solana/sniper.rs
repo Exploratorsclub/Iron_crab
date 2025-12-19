@@ -3881,14 +3881,31 @@ impl SniperEngine {
         pool_address: &Pubkey,
         discovery_slot: u64,
     ) -> Result<bool> {
+        // ============================================================
+        // CRITICAL FIX: ALWAYS check boot_timestamp FIRST!
+        // This prevents buying old tokens even if RPC calls fail.
+        // ============================================================
+        match self.check_mint_freshness(mint, Some(pool_address)).await {
+            Ok(true) => {
+                debug!(mint=%mint, "sniper: [PRO] boot_timestamp check PASSED");
+            }
+            Ok(false) => {
+                // Token/pool existed before bot started - REJECT immediately
+                return Ok(false);
+            }
+            Err(e) => {
+                warn!(?e, mint=%mint, "sniper: [PRO] freshness check failed - REJECT for safety");
+                return Ok(false);
+            }
+        }
+
         // 1. Fetch mint account (always works, no index needed)
         let mint_acc = match self.rpc.get_account_retry(mint).await {
             Ok(acc) => acc,
             Err(e) => {
-                // For brand-new tokens, account might not be available yet
-                // This is actually a GOOD sign - it means we're very early
-                info!(mint=%mint, error=?e, "sniper: [PRO] mint account not yet available - token is VERY fresh");
-                // Allow it through, rely on other checks
+                // Mint account not available - but we already passed boot_timestamp check
+                // This could be a very fresh token, allow it through
+                info!(mint=%mint, error=?e, "sniper: [PRO] mint account not yet available - token is VERY fresh (passed boot_timestamp)");
                 return Ok(true);
             }
         };
@@ -3964,22 +3981,9 @@ impl SniperEngine {
             }
         }
 
-        // 7. Transaction count check (the only "index" we need is signature history)
-        // CRITICAL: Pass pool_address to check BOTH mint age AND pool age
-        match self.check_mint_freshness(mint, Some(pool_address)).await {
-            Ok(true) => {
-                info!(mint=%mint, "sniper: [PRO] PASS - all professional checks passed");
-                Ok(true)
-            }
-            Ok(false) => {
-                info!(mint=%mint, "sniper: [PRO] REJECT - transaction history indicates old token");
-                Ok(false)
-            }
-            Err(e) => {
-                warn!(?e, mint=%mint, "sniper: [PRO] freshness check failed");
-                Ok(false)
-            }
-        }
+        // All checks passed! (boot_timestamp was already checked at the start)
+        info!(mint=%mint, "sniper: [PRO] PASS - all professional checks passed");
+        Ok(true)
     }
 
     /// Index-based (Raydium/Orca) liquidity estimation using current pool snapshots.
