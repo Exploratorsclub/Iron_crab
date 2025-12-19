@@ -18,6 +18,11 @@ pub struct SolanaCfg {
     /// Example: "http://127.0.0.1:10000"
     #[serde(default)]
     pub geyser_grpc_url: Option<String>,
+    /// Optional Helius RPC URL for mint validation (full transaction index)
+    /// Used to verify token age with complete history that local validators lack
+    /// Example: "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
+    #[serde(default)]
+    pub helius_rpc_url: Option<String>,
     pub keypair_path: String,
     #[serde(default)]
     pub rpc_min_concurrency: Option<usize>,

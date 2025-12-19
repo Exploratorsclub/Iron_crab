@@ -366,6 +366,9 @@ pub struct SniperEngine {
     geyser_grpc_url: Option<String>,
     /// CRITICAL: Timestamp when the bot started - only buy pools created AFTER this!
     boot_timestamp: i64,
+    /// Optional Helius RPC client for mint validation (full transaction index)
+    /// Wrapped in Arc for sharing across spawned tasks
+    helius_rpc: Option<Arc<solana_client::nonblocking::rpc_client::RpcClient>>,
 }
 
 // --- Test Helpers (feature-gated) -----------------------------------------------------------
@@ -752,6 +755,7 @@ impl SniperEngine {
         pumpfun: Option<Arc<PumpFunDex>>,
         treasury: Arc<Treasury>,
         geyser_grpc_url: Option<String>,
+        helius_rpc_url: Option<String>,
     ) -> Self {
         let (tx, rx) = tokio::sync::watch::channel(false);
 
@@ -786,6 +790,17 @@ impl SniperEngine {
         let boot_timestamp = ChronoUtc::now().timestamp();
         info!(boot_timestamp, "sniper: engine starting - will ONLY buy pools created AFTER this timestamp");
 
+        // Initialize Helius RPC client for mint validation (requires full transaction index)
+        // Local validators don't have full history, Helius provides accurate mint signature counts
+        let helius_rpc = helius_rpc_url.as_ref().map(|url| {
+            info!("sniper: Helius RPC configured for mint validation: {}", 
+                  url.split("api-key=").next().unwrap_or("***"));
+            Arc::new(solana_client::nonblocking::rpc_client::RpcClient::new(url.clone()))
+        });
+        if helius_rpc.is_none() {
+            warn!("sniper: NO Helius RPC configured - mint validation will use local RPC (may be inaccurate!)");
+        }
+
         Self {
             rpc,
             cfg: parking_lot::RwLock::new(cfg),
@@ -803,6 +818,7 @@ impl SniperEngine {
             )),
             geyser_grpc_url,
             boot_timestamp,
+            helius_rpc,
         }
     }
 
@@ -823,6 +839,7 @@ impl SniperEngine {
             quantile_calc: self.quantile_calc.clone(),
             geyser_grpc_url: self.geyser_grpc_url.clone(),
             boot_timestamp: self.boot_timestamp, // CRITICAL: preserve boot time for all clones
+            helius_rpc: self.helius_rpc.clone(), // Share Helius RPC client for mint validation
         }
     }
 
@@ -3826,18 +3843,64 @@ impl SniperEngine {
         // Very new accounts have rent_epoch close to current epoch
         // NOTE: This is not foolproof but adds another layer
         
-        // Also check mint signatures - but be STRICT
-        let mint_sigs = self
-            .rpc
-            .rpc
-            .get_signatures_for_address_with_config(
-                mint,
-                solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
-                    limit: Some(200),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        // ============================================================
+        // CRITICAL: Use Helius RPC for mint signatures if configured!
+        // Local validators do NOT have full transaction index and return
+        // incorrect (too few) signatures for old tokens. Helius has complete history.
+        // ============================================================
+        let mint_sigs = if let Some(ref helius) = self.helius_rpc {
+            // Use Helius for accurate mint signature count
+            match helius
+                .get_signatures_for_address_with_config(
+                    mint,
+                    solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
+                        limit: Some(200),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(sigs) => {
+                    info!(
+                        mint=%mint,
+                        sig_count=sigs.len(),
+                        "sniper: got mint signatures from Helius (full index)"
+                    );
+                    sigs
+                }
+                Err(e) => {
+                    warn!(mint=%mint, error=?e, "sniper: Helius mint signature query failed -> REJECT for safety");
+                    return Ok(false);
+                }
+            }
+        } else {
+            // Fallback to local RPC (WARNING: may be inaccurate for old tokens!)
+            match self
+                .rpc
+                .rpc
+                .get_signatures_for_address_with_config(
+                    mint,
+                    solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
+                        limit: Some(200),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(sigs) => {
+                    warn!(
+                        mint=%mint,
+                        sig_count=sigs.len(),
+                        "sniper: using LOCAL RPC for mint sigs (may be inaccurate - no full index!)"
+                    );
+                    sigs
+                }
+                Err(e) => {
+                    warn!(mint=%mint, error=?e, "sniper: local RPC mint signature query failed -> REJECT");
+                    return Ok(false);
+                }
+            }
+        };
 
         let sig_count = mint_sigs.len();
         
@@ -4530,8 +4593,9 @@ pub async fn run_sniper(
     pumpfun: Option<Arc<PumpFunDex>>,
     treasury: Arc<Treasury>,
     geyser_grpc_url: Option<String>,
+    helius_rpc_url: Option<String>,
 ) -> Result<()> {
-    let engine = SniperEngine::new(rpc, cfg, raydium, orca, pumpfun, treasury, geyser_grpc_url);
+    let engine = SniperEngine::new(rpc, cfg, raydium, orca, pumpfun, treasury, geyser_grpc_url, helius_rpc_url);
     engine.run().await
 }
 

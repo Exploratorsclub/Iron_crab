@@ -922,6 +922,8 @@ impl Engine {
                 .unwrap_or(false);
             // Get geyser_grpc_url from config
             let geyser_url = self.ctx.cfg.solana.geyser_grpc_url.clone();
+            // Get helius_rpc_url for mint validation (full transaction index)
+            let helius_url = self.ctx.cfg.solana.helius_rpc_url.clone();
             let autosave_secs = self.ctx.cfg.app.autosave_state_secs;
             let pumpfun_ref = self.pumpfun.clone();
             tokio::spawn(async move {
@@ -939,6 +941,7 @@ impl Engine {
                     Some(pumpfun_ref),
                     treasury_arc,
                     geyser_url,
+                    helius_url,
                 )
                 .await
                 {

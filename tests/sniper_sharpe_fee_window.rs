@@ -29,6 +29,7 @@ async fn sharpe_lower_with_fees() {
         None,
         temp_treasury("no-fee"),
         None,
+        None,
     );
     let eng_fee = SniperEngine::new(
         rpc.clone(),
@@ -37,6 +38,7 @@ async fn sharpe_lower_with_fees() {
         None,
         None,
         temp_treasury("fee1"),
+        None,
         None,
     );
 
@@ -92,7 +94,7 @@ async fn rolling_window_truncation() {
         rolling_pnl_window: Some(5),
         ..SniperCfg::default()
     };
-    let engine = SniperEngine::new(rpc, cfg, None, None, None, temp_treasury("window"), None);
+    let engine = SniperEngine::new(rpc, cfg, None, None, None, temp_treasury("window"), None, None);
     let mint = Pubkey::new_unique();
     engine.test_insert_lot(mint, 12.0, 2_000_000.0, 0.00002, 6);
 

@@ -21,6 +21,13 @@ ws_failover_urls = ["ws://109.230.239.43:8900"]
 # Requires: --geyser-plugin-config flag in validator service
 geyser_grpc_url = "http://127.0.0.1:10000"
 
+# CRITICAL: Helius RPC for mint validation (full transaction index)
+# Local validators do NOT have full transaction history - they return
+# incorrect (too few) signatures for old tokens, causing us to buy them.
+# Helius Free Tier provides accurate mint age via complete signature history.
+# Get your API key at: https://www.helius.dev/
+helius_rpc_url = "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY"
+
 keypair_path = "/home/ironcrab/.config/solana/id.json"  # adjust to your user/path
 # Tuned concurrency & timeout for high-end validator (500GB RAM, 64 CPUs)
 rpc_min_concurrency = 32        # can handle much more on local validator

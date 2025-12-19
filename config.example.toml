@@ -21,6 +21,11 @@ keypair_path = "~/.config/solana/id.json"  # Haupt-Wallet (Treasury)
 # ws_failover_urls = ["wss://api.mainnet-beta.solana.com:8900"]
 # ws_connect_timeout_ms = 8000
 # ws_max_backoff_ms = 20000
+## CRITICAL: Helius RPC for mint validation (full transaction index)
+## Local validators do NOT have full tx history - causes buying old tokens!
+## Helius Free Tier (100k credits/month) is sufficient for mint validation.
+## Get your API key at: https://www.helius.dev/
+# helius_rpc_url = "https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY"
 
 # Interne Wallets / Märkte (logische Buckets für Allokation)
 [[markets]]
