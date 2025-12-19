@@ -1387,7 +1387,7 @@ impl SniperEngine {
             );
 
             // PROFESSIONAL VALIDATION for Pump.fun tokens
-            match self.validate_token_professional(&mint, event.slot).await {
+            match self.validate_token_professional(&mint, &event.pool_address, event.slot).await {
                 Ok(true) => {
                     info!(mint=%mint, "sniper: [Pump.fun] professional validation PASSED");
                 }
@@ -1484,7 +1484,7 @@ impl SniperEngine {
             "sniper: [Raydium/Orca] using professional validation (no index required)"
         );
 
-        match self.validate_token_professional(&mint, event.slot).await {
+        match self.validate_token_professional(&mint, &event.pool_address, event.slot).await {
             Ok(true) => {
                 info!(mint=%mint, "sniper: [PRO] validation PASSED");
             }
@@ -4427,10 +4427,14 @@ pub fn test_compute_concentration(
 impl SniperEngine {
     /// Check if a mint is "fresh" by inspecting its transaction history.
     /// Returns true if the mint appears to be new (few transactions or recent creation).
-    async fn check_mint_freshness(&self, mint: &Pubkey) -> Result<bool> {
-        // Fetch last 1000 signatures (max allowed by RPC)
-        // If a token has >1000 transactions, it's either old or extremely active (too late for sniping)
-        let sigs = self
+    async fn check_mint_freshness(&self, mint: &Pubkey, pool_address: Option<&Pubkey>) -> Result<bool> {
+        // CRITICAL FIX: Check BOTH the mint account AND the pool account signatures!
+        // The mint account itself often has very few transactions (just creation + authority changes).
+        // Old tokens that get new Raydium pools will have few signatures on the MINT
+        // but the POOL will reveal when it was actually created.
+        
+        // First, check mint account signatures
+        let mint_sigs = self
             .rpc
             .rpc
             .get_signatures_for_address_with_config(
@@ -4442,50 +4446,85 @@ impl SniperEngine {
             )
             .await?;
 
-        if sigs.is_empty() {
-            // No transactions? This is suspicious for a "new" token that we just discovered via Geyser/Logs.
-            // If we found it via Geyser, it MUST have at least one transaction (the one that triggered the event).
-            // If RPC returns empty, it likely means the node is not indexing this address yet or is lagging.
-            // SAFEST BET: Assume it's NOT fresh if we can't see any history to verify.
-            warn!(mint=%mint, "sniper: no signatures found -> RPC likely lagging or not indexing, SKIPPING for safety");
-            return Ok(false);
-        }
-
-        // If we hit the limit (1000), it means there are likely MORE transactions.
-        // For a sniper, we want to be early. 1000 transactions is already a lot.
-        // If it's a new launch with >1000 txs in seconds, it's extremely risky/volatile.
-        // If it's an old token, it definitely has >1000 txs.
-        // Safest bet: Reject anything with >1000 transactions.
-        if sigs.len() >= 1000 {
-            info!(mint=%mint, count=sigs.len(), "sniper: token has >=1000 txs -> TOO ACTIVE / OLD TOKEN");
-            return Ok(false);
-        }
-
-        // If < 1000 transactions, check the oldest one (which is likely the creation or close to it)
-        let oldest = sigs.last().unwrap();
-        if let Some(block_time) = oldest.block_time {
-            let now = ChronoUtc::now().timestamp();
-            let age_secs = now - block_time;
-            // If the oldest transaction is > 1 hour old (3600 secs), be very suspicious
-            // New tokens should be VERY fresh - within minutes of creation
-            if age_secs > 3600 {
-                info!(mint=%mint, age_mins=age_secs/60, count=sigs.len(), "sniper: oldest visible tx is >1h old -> likely OLD TOKEN");
+        // Check the OLDEST signature on mint - this reveals token creation time
+        if !mint_sigs.is_empty() {
+            let oldest_mint_sig = mint_sigs.last().unwrap();
+            if let Some(block_time) = oldest_mint_sig.block_time {
+                let now = ChronoUtc::now().timestamp();
+                let age_secs = now - block_time;
+                // If the MINT was created more than 30 minutes ago, it's an OLD token
+                // Real new launches: mint creation should be within last ~10-30 minutes
+                if age_secs > 1800 {
+                    info!(
+                        mint=%mint, 
+                        age_mins=age_secs/60, 
+                        count=mint_sigs.len(), 
+                        "sniper: MINT ACCOUNT is >30min old -> OLD TOKEN (created {} mins ago)",
+                        age_secs/60
+                    );
+                    return Ok(false);
+                }
+            } else {
+                // No block time on oldest signature - very suspicious for old tokens
+                // Old transactions often don't have block_time indexed
+                warn!(mint=%mint, "sniper: oldest mint signature has no block_time -> likely OLD TOKEN");
                 return Ok(false);
             }
-        } else {
-            // Block time missing - cannot verify age.
-            // This often happens for very old transactions where the node doesn't have the time index.
-            // Safer to reject.
-            warn!(mint=%mint, "sniper: oldest transaction has no block time -> cannot verify freshness, SKIPPING");
+        }
+
+        // If we have a pool address, also check when the POOL was created
+        // This catches the case where old tokens get NEW pools (migration, new DEX listing)
+        if let Some(pool) = pool_address {
+            let pool_sigs = self
+                .rpc
+                .rpc
+                .get_signatures_for_address_with_config(
+                    pool,
+                    solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
+                        limit: Some(100),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            
+            if !pool_sigs.is_empty() {
+                // Check oldest pool signature - this is when the pool was created
+                let oldest_pool_sig = pool_sigs.last().unwrap();
+                if let Some(block_time) = oldest_pool_sig.block_time {
+                    let now = ChronoUtc::now().timestamp();
+                    let pool_age_secs = now - block_time;
+                    // Pool should be created within last 10 minutes for fresh launch
+                    if pool_age_secs > 600 {
+                        info!(
+                            mint=%mint,
+                            pool=%pool,
+                            pool_age_mins=pool_age_secs/60,
+                            "sniper: POOL is >10min old -> not a fresh launch"
+                        );
+                        return Ok(false);
+                    }
+                    info!(
+                        mint=%mint,
+                        pool=%pool, 
+                        pool_age_secs,
+                        "sniper: pool age check PASSED"
+                    );
+                }
+            }
+        }
+
+        // If mint_sigs is empty, the RPC isn't indexing this address
+        if mint_sigs.is_empty() {
+            warn!(mint=%mint, "sniper: no signatures found on mint -> RPC likely lagging, SKIPPING for safety");
             return Ok(false);
         }
 
-        // Additional check: if there are more than 100 transactions, it's probably not brand new
-        if sigs.len() > 100 {
-            info!(mint=%mint, count=sigs.len(), "sniper: token has >100 txs -> not fresh enough for sniping");
-            return Ok(false);
-        }
-
+        // If we got here, basic checks passed
+        info!(
+            mint=%mint,
+            mint_sig_count=mint_sigs.len(),
+            "sniper: freshness check PASSED"
+        );
         Ok(true)
     }
 
@@ -4500,6 +4539,7 @@ impl SniperEngine {
     async fn validate_token_professional(
         &self,
         mint: &Pubkey,
+        pool_address: &Pubkey,
         discovery_slot: u64,
     ) -> Result<bool> {
         // 1. Fetch mint account (always works, no index needed)
@@ -4586,7 +4626,8 @@ impl SniperEngine {
         }
 
         // 7. Transaction count check (the only "index" we need is signature history)
-        match self.check_mint_freshness(mint).await {
+        // CRITICAL: Pass pool_address to check BOTH mint age AND pool age
+        match self.check_mint_freshness(mint, Some(pool_address)).await {
             Ok(true) => {
                 info!(mint=%mint, "sniper: [PRO] PASS - all professional checks passed");
                 Ok(true)
