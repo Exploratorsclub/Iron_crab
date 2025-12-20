@@ -376,17 +376,15 @@ impl Dex for PumpFunDex {
                     }
                     state_opt = Some(s);
                     break;
-                } else {
-                    if attempt < MAX_RETRIES - 1 {
-                        debug!(
-                            token_mint=%token_mint_str,
-                            bonding_curve=%bonding_curve,
-                            attempt,
-                            "pump.fun: bonding curve not found, retrying..."
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS))
-                            .await;
-                    }
+                } else if attempt < MAX_RETRIES - 1 {
+                    debug!(
+                        token_mint=%token_mint_str,
+                        bonding_curve=%bonding_curve,
+                        attempt,
+                        "pump.fun: bonding curve not found, retrying..."
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS))
+                        .await;
                 }
             }
 
