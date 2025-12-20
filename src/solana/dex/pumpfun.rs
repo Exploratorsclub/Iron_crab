@@ -149,10 +149,7 @@ impl PumpFunDex {
         token_mint: &Pubkey,
     ) -> (Pubkey, u8) {
         // The associated bonding curve is just a standard ATA
-        // Seeds: [bonding_curve, TOKEN_PROGRAM, token_mint] with ATA_PROGRAM as the program
-        let ata_program = spl_token::solana_program::pubkey::Pubkey::new_from_array(
-            spl_associated_token_account::id().to_bytes(),
-        );
+        // Derived using SPL Associated Token Account program
         let bonding_curve_spl =
             spl_token::solana_program::pubkey::Pubkey::new_from_array(bonding_curve.to_bytes());
         let token_mint_spl =

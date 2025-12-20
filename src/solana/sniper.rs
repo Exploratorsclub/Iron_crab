@@ -1640,14 +1640,15 @@ impl SniperEngine {
         let mut pumpfun_quote_out: u64 = 0;
         if pool_dex_type == crate::solana::geyser_pool_discovery::DexType::PumpFun {
             if let Some(ref pf) = pumpfun {
-                // Do NOT use fallback - wait for the bonding curve to be indexed by RPC
-                // The retry logic inside quote_exact_in_with_fallback will handle the waiting
+                // RE-ENABLED fallback for fresh Pump.fun launches!
+                // The ATA derivation bug (Error 3012) has been FIXED - we now use standard SPL ATA
+                // Fallback enables instant sniping when RPC is slower than Geyser events
                 if let Ok(Some(q)) = pf
                     .quote_exact_in_with_fallback(
                         &sol_mint.to_string(),
                         &mint.to_string(),
                         lamports_in,
-                        false, // DISABLED fallback - causes Error 3012 when bonding curve doesn't exist
+                        true, // ENABLED fallback - safe now that ATA derivation is fixed
                     )
                     .await
                 {
@@ -1975,10 +1976,24 @@ impl SniperEngine {
 
         // CRITICAL: Simulate transaction BEFORE sending to avoid wasted SOL on failed TXs!
         // This catches slippage errors, invalid pool states, honeypots, etc.
-        if chosen_dex != ChosenDex::PumpFun {
-            match self.rpc.rpc.simulate_transaction(&tx).await {
-                Ok(sim_result) => {
-                    if let Some(err) = sim_result.value.err {
+        // NOTE: For Pump.fun, simulation may fail on fresh tokens (bonding curve not indexed yet)
+        // but we still try it to catch obvious errors. If simulation fails with "account not found",
+        // we proceed anyway for fresh launches.
+        match self.rpc.rpc.simulate_transaction(&tx).await {
+            Ok(sim_result) => {
+                if let Some(err) = sim_result.value.err {
+                    // For Pump.fun fresh launches, "account not found" is expected - proceed anyway
+                    let is_pumpfun_fresh_launch = chosen_dex == ChosenDex::PumpFun;
+                    let is_account_not_found = format!("{:?}", err).contains("AccountNotFound")
+                        || format!("{:?}", err).contains("InvalidAccountData");
+                    
+                    if is_pumpfun_fresh_launch && is_account_not_found {
+                        info!(
+                            mint=%mint,
+                            error=?err,
+                            "sniper: Pump.fun simulation failed (expected for fresh launch) - proceeding anyway"
+                        );
+                    } else {
                         warn!(
                             mint=%mint,
                             error=?err,
@@ -1991,12 +2006,13 @@ impl SniperEngine {
                             sim_result.value.logs
                         ));
                     }
-                    info!(mint=%mint, "sniper: TX simulation PASSED, proceeding with send");
+                } else {
+                    info!(mint=%mint, chosen_dex=?chosen_dex, "sniper: TX simulation PASSED, proceeding with send");
                 }
-                Err(e) => {
-                    warn!(mint=%mint, error=?e, "sniper: simulation RPC error - proceeding anyway");
-                    // Don't block on simulation errors - they might be RPC issues
-                }
+            }
+            Err(e) => {
+                warn!(mint=%mint, error=?e, "sniper: simulation RPC error - proceeding anyway");
+                // Don't block on simulation errors - they might be RPC issues
             }
         }
 
