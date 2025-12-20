@@ -180,6 +180,7 @@ impl PumpFunDex {
 
     /// Returns the initial state of a Pump.fun bonding curve
     /// Used as fallback when RPC fails to index new pools fast enough
+    #[allow(dead_code)]
     fn initial_bonding_curve_state(token_mint: Pubkey, bonding_curve: Pubkey) -> BondingCurveState {
         BondingCurveState {
             virtual_token_reserves: 1_073_000_000_000_000,
