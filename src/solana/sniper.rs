@@ -3770,55 +3770,57 @@ impl SniperEngine {
             };
             
             if pool_sigs.is_empty() {
-                // No signatures = RPC not indexing or pool doesn't exist
-                warn!(pool=%pool, "sniper: no pool signatures found -> REJECT for safety");
-                return Ok(false);
-            }
-            
-            // Check oldest pool signature - this is when the pool was created
-            let oldest_pool_sig = pool_sigs.last().unwrap();
-            if let Some(block_time) = oldest_pool_sig.block_time {
-                // CRITICAL CHECK: Was pool created AFTER we started?
-                if block_time < self.boot_timestamp {
-                    let age_since_boot = self.boot_timestamp - block_time;
+                // No signatures = Pool is SO NEW that RPC hasn't indexed it yet!
+                // This is actually a GOOD sign for a fresh launch.
+                // Fall through to Helius mint validation instead of rejecting.
+                info!(pool=%pool, "sniper: no pool signatures found (pool may be very new) -> checking mint via Helius");
+                // Don't return - continue to mint validation below
+            } else {
+                // Check oldest pool signature - this is when the pool was created
+                let oldest_pool_sig = pool_sigs.last().unwrap();
+                if let Some(block_time) = oldest_pool_sig.block_time {
+                    // CRITICAL CHECK: Was pool created AFTER we started?
+                    if block_time < self.boot_timestamp {
+                        let age_since_boot = self.boot_timestamp - block_time;
+                        info!(
+                            mint=%mint,
+                            pool=%pool,
+                            pool_created_at=block_time,
+                            bot_started_at=self.boot_timestamp,
+                            secs_before_boot=age_since_boot,
+                            "sniper: REJECT - pool existed BEFORE bot started (old pool, not a new launch)"
+                        );
+                        return Ok(false);
+                    }
+                    
+                    // Pool was created after boot - now check it's within reasonable time
+                    let now = ChronoUtc::now().timestamp();
+                    let pool_age_secs = now - block_time;
+                    
+                    // Pool should be created within last 10 minutes for fresh launch
+                    if pool_age_secs > 600 {
+                        info!(
+                            mint=%mint,
+                            pool=%pool,
+                            pool_age_mins=pool_age_secs/60,
+                            "sniper: REJECT - pool is >10min old (not fresh enough)"
+                        );
+                        return Ok(false);
+                    }
+                    
                     info!(
                         mint=%mint,
-                        pool=%pool,
+                        pool=%pool, 
+                        pool_age_secs,
                         pool_created_at=block_time,
                         bot_started_at=self.boot_timestamp,
-                        secs_before_boot=age_since_boot,
-                        "sniper: REJECT - pool existed BEFORE bot started (old pool, not a new launch)"
+                        "sniper: PASSED - pool created AFTER bot start and is fresh"
                     );
+                } else {
+                    // No block_time on pool signature - likely old transaction
+                    warn!(pool=%pool, "sniper: pool signature has no block_time -> REJECT (likely old pool)");
                     return Ok(false);
                 }
-                
-                // Pool was created after boot - now check it's within reasonable time
-                let now = ChronoUtc::now().timestamp();
-                let pool_age_secs = now - block_time;
-                
-                // Pool should be created within last 10 minutes for fresh launch
-                if pool_age_secs > 600 {
-                    info!(
-                        mint=%mint,
-                        pool=%pool,
-                        pool_age_mins=pool_age_secs/60,
-                        "sniper: REJECT - pool is >10min old (not fresh enough)"
-                    );
-                    return Ok(false);
-                }
-                
-                info!(
-                    mint=%mint,
-                    pool=%pool, 
-                    pool_age_secs,
-                    pool_created_at=block_time,
-                    bot_started_at=self.boot_timestamp,
-                    "sniper: PASSED - pool created AFTER bot start and is fresh"
-                );
-            } else {
-                // No block_time on pool signature - likely old transaction
-                warn!(pool=%pool, "sniper: pool signature has no block_time -> REJECT (likely old pool)");
-                return Ok(false);
             }
         } else {
             // No pool address provided - must still check mint age
