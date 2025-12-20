@@ -3,18 +3,6 @@
 // setzt kleine Erstkäufe mit harten Limits (Slippage/Blacklist/Owner/Freeze Auth usw.)
 #[allow(unused_imports)]
 use crate::config_reload::{diff_sniper_cfg, validate_sniper_cfg};
-use crate::solana::dex::{orca::Orca, pumpfun::PumpFunDex, raydium::Raydium, Dex};
-use crate::solana::geyser_pool_discovery::PoolDiscoveryEvent;
-use crate::solana::rpc::SolanaRpc;
-use crate::wallet::Treasury;
-use anyhow::Result;
-use solana_client::rpc_config::RpcSendTransactionConfig;
-use solana_sdk::pubkey;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::{hash::Hash, transaction::Transaction};
-use std::str::FromStr;
-use std::{collections::HashSet, sync::Arc};
-use tracing::{debug, error, info, trace, warn};
 use crate::metrics; // keep metrics module in scope for qualified uses
 use crate::metrics::{
     record_fee_pct, record_network_fee, record_realized_gross_net, record_realized_pnl_sol,
@@ -26,11 +14,23 @@ use crate::metrics::{
 };
 use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
+use crate::solana::dex::{orca::Orca, pumpfun::PumpFunDex, raydium::Raydium, Dex};
+use crate::solana::geyser_pool_discovery::PoolDiscoveryEvent;
+use crate::solana::rpc::SolanaRpc;
+use crate::wallet::Treasury;
+use anyhow::Result;
 use chrono::Utc as ChronoUtc;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use solana_client::rpc_config::RpcSendTransactionConfig;
+use solana_sdk::pubkey;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{hash::Hash, transaction::Transaction};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
+use std::{collections::HashSet, sync::Arc};
+use tracing::{debug, error, info, trace, warn};
 
 // Simple global blacklist (extendable via config later)
 #[allow(dead_code)]
@@ -788,14 +788,21 @@ impl SniperEngine {
 
         // Record boot timestamp - CRITICAL for filtering old pools!
         let boot_timestamp = ChronoUtc::now().timestamp();
-        info!(boot_timestamp, "sniper: engine starting - will ONLY buy pools created AFTER this timestamp");
+        info!(
+            boot_timestamp,
+            "sniper: engine starting - will ONLY buy pools created AFTER this timestamp"
+        );
 
         // Initialize Helius RPC client for mint validation (requires full transaction index)
         // Local validators don't have full history, Helius provides accurate mint signature counts
         let helius_rpc = helius_rpc_url.as_ref().map(|url| {
-            info!("sniper: Helius RPC configured for mint validation: {}", 
-                  url.split("api-key=").next().unwrap_or("***"));
-            Arc::new(solana_client::nonblocking::rpc_client::RpcClient::new(url.clone()))
+            info!(
+                "sniper: Helius RPC configured for mint validation: {}",
+                url.split("api-key=").next().unwrap_or("***")
+            );
+            Arc::new(solana_client::nonblocking::rpc_client::RpcClient::new(
+                url.clone(),
+            ))
         });
         if helius_rpc.is_none() {
             warn!("sniper: NO Helius RPC configured - mint validation will use local RPC (may be inaccurate!)");
@@ -1131,7 +1138,10 @@ impl SniperEngine {
             );
 
             // PROFESSIONAL VALIDATION for Pump.fun tokens
-            match self.validate_token_professional(&mint, &event.pool_address, event.slot).await {
+            match self
+                .validate_token_professional(&mint, &event.pool_address, event.slot)
+                .await
+            {
                 Ok(true) => {
                     info!(mint=%mint, "sniper: [Pump.fun] professional validation PASSED");
                 }
@@ -1228,7 +1238,10 @@ impl SniperEngine {
             "sniper: [Raydium/Orca] using professional validation (no index required)"
         );
 
-        match self.validate_token_professional(&mint, &event.pool_address, event.slot).await {
+        match self
+            .validate_token_professional(&mint, &event.pool_address, event.slot)
+            .await
+        {
             Ok(true) => {
                 info!(mint=%mint, "sniper: [PRO] validation PASSED");
             }
@@ -1790,7 +1803,10 @@ impl SniperEngine {
                                     quote_vault,
                                 };
                                 let market_prog = snap.market_program_id.unwrap_or(
-                                    Pubkey::from_str("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin").unwrap()
+                                    Pubkey::from_str(
+                                        "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                                    )
+                                    .unwrap(),
                                 );
                                 if let Ok(_ray_prog) = Pubkey::from_str(RAYDIUM_AMM_V4) {
                                     let auth_pk =
@@ -1932,7 +1948,7 @@ impl SniperEngine {
             .unwrap_or(0);
         let mut tx = Transaction::new_with_payer(&final_ixs, Some(&self.treasury.pubkey()));
         tx.try_sign(&[self.treasury.signer_ref()], bh)?;
-        
+
         // CRITICAL: Simulate transaction BEFORE sending to avoid wasted SOL on failed TXs!
         // This catches slippage errors, invalid pool states, honeypots, etc.
         if chosen_dex != ChosenDex::PumpFun {
@@ -1959,7 +1975,7 @@ impl SniperEngine {
                 }
             }
         }
-        
+
         let sent_at = Instant::now();
         let skip_preflight = chosen_dex == ChosenDex::PumpFun;
         match self.rpc_retry_tx(&tx, 3, skip_preflight).await {
@@ -2094,9 +2110,12 @@ impl SniperEngine {
         }
 
         // GEYSER IS REQUIRED - no fallback to deprecated WebSocket
-        let geyser_url = self.geyser_grpc_url.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("GEYSER_GRPC_URL is required! WebSocket logsSubscribe has been removed."))?;
-        
+        let geyser_url = self.geyser_grpc_url.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "GEYSER_GRPC_URL is required! WebSocket logsSubscribe has been removed."
+            )
+        })?;
+
         info!(url=%geyser_url, "sniper: using Geyser gRPC for pool discovery");
         self.run_with_geyser(geyser_url).await
     }
@@ -2975,7 +2994,10 @@ impl SniperEngine {
                                     quote_vault,
                                 };
                                 let market_prog = snap.market_program_id.unwrap_or(
-                                    Pubkey::from_str("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin").unwrap()
+                                    Pubkey::from_str(
+                                        "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                                    )
+                                    .unwrap(),
                                 );
                                 if let Ok(_ray_prog) = Pubkey::from_str(RAYDIUM_AMM_V4) {
                                     let token_prog = spl_token::id();
@@ -3564,14 +3586,20 @@ impl SniperEngine {
         // Response is Vec<RpcKeyedAccount> directly (not wrapped in .value)
         for account in token_accounts {
             // Parse the token account data - handle different encoding formats
-            let data: Vec<u8> = if let solana_account_decoder::UiAccountData::Binary(b64_str, _encoding) = &account.account.data {
-                match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_str) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                }
-            } else {
-                continue;
-            };
+            let data: Vec<u8> =
+                if let solana_account_decoder::UiAccountData::Binary(b64_str, _encoding) =
+                    &account.account.data
+                {
+                    match base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        b64_str,
+                    ) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    }
+                } else {
+                    continue;
+                };
 
             // Token account is 165 bytes
             if data.len() < 165 {
@@ -3589,7 +3617,7 @@ impl SniperEngine {
             }
 
             let token_mint = solana_sdk::pubkey::Pubkey::new_from_array(mint_bytes);
-            
+
             // Skip WSOL
             if token_mint == sol_mint {
                 continue;
@@ -3736,7 +3764,11 @@ pub fn test_compute_concentration(
 impl SniperEngine {
     /// Check if a mint is "fresh" by inspecting its transaction history.
     /// Returns true if the mint appears to be new (few transactions or recent creation).
-    async fn check_mint_freshness(&self, mint: &Pubkey, pool_address: Option<&Pubkey>) -> Result<bool> {
+    async fn check_mint_freshness(
+        &self,
+        mint: &Pubkey,
+        pool_address: Option<&Pubkey>,
+    ) -> Result<bool> {
         // ============================================================
         // CRITICAL PRO-GRADE FILTER: Only buy pools created AFTER bot start!
         // ============================================================
@@ -3744,10 +3776,10 @@ impl SniperEngine {
         // 1. When bot starts, record the timestamp
         // 2. REJECT all pools that existed before bot started
         // 3. ONLY buy pools created AFTER we started watching
-        // 
+        //
         // This eliminates ALL old tokens, regardless of whether they have
         // new pools, migrations, relistings, etc.
-        
+
         // If we have a pool address, verify it was created AFTER we started
         if let Some(pool) = pool_address {
             let pool_sigs = match self
@@ -3760,7 +3792,7 @@ impl SniperEngine {
                         ..Default::default()
                     },
                 )
-                .await 
+                .await
             {
                 Ok(sigs) => sigs,
                 Err(e) => {
@@ -3768,7 +3800,7 @@ impl SniperEngine {
                     return Ok(false);
                 }
             };
-            
+
             if pool_sigs.is_empty() {
                 // No signatures = Pool is SO NEW that RPC hasn't indexed it yet!
                 // This is actually a GOOD sign for a fresh launch.
@@ -3792,11 +3824,11 @@ impl SniperEngine {
                         );
                         return Ok(false);
                     }
-                    
+
                     // Pool was created after boot - now check it's within reasonable time
                     let now = ChronoUtc::now().timestamp();
                     let pool_age_secs = now - block_time;
-                    
+
                     // Pool should be created within last 10 minutes for fresh launch
                     if pool_age_secs > 600 {
                         info!(
@@ -3807,10 +3839,10 @@ impl SniperEngine {
                         );
                         return Ok(false);
                     }
-                    
+
                     info!(
                         mint=%mint,
-                        pool=%pool, 
+                        pool=%pool,
                         pool_age_secs,
                         pool_created_at=block_time,
                         bot_started_at=self.boot_timestamp,
@@ -3831,20 +3863,20 @@ impl SniperEngine {
         // CRITICAL: Check MINT account creation time directly!
         // Old tokens can create NEW pools - we must verify the MINT itself is new.
         // ============================================================
-        
-        // First, get mint account to check its slot (when it was created)
-        let mint_account = match self.rpc.get_account_retry(mint).await {
+
+        // First, get mint account to verify it exists (creation time checked via signatures)
+        let _mint_account = match self.rpc.get_account_retry(mint).await {
             Ok(acc) => acc,
             Err(e) => {
                 warn!(mint=%mint, error=?e, "sniper: could not fetch mint account -> REJECT");
                 return Ok(false);
             }
         };
-        
+
         // Check mint account rent epoch as a proxy for age
         // Very new accounts have rent_epoch close to current epoch
         // NOTE: This is not foolproof but adds another layer
-        
+
         // ============================================================
         // CRITICAL: Use Helius RPC for mint signatures if configured!
         // Local validators do NOT have full transaction index and return
@@ -3905,7 +3937,7 @@ impl SniperEngine {
         };
 
         let sig_count = mint_sigs.len();
-        
+
         // CRITICAL FIX: If we get 0 signatures, the RPC is NOT indexing this mint properly
         // This is SUSPICIOUS - a real new token should have at least its creation TX
         // Old tokens on new pools often show 0 signatures because RPC pagination issues
@@ -3916,12 +3948,12 @@ impl SniperEngine {
             );
             return Ok(false);
         }
-        
+
         // CRITICAL: If mint has many signatures, it's an OLD token
         // Reduced threshold from 200 to 50 - truly new tokens have very few signatures
         if sig_count >= 50 {
             info!(
-                mint=%mint, 
+                mint=%mint,
                 sig_count,
                 "sniper: REJECT - mint has too many signatures (>= 50), likely old token"
             );
@@ -3931,13 +3963,15 @@ impl SniperEngine {
         // Check the OLDEST and NEWEST signatures
         let oldest_visible_sig = mint_sigs.last().unwrap();
         let newest_sig = mint_sigs.first().unwrap();
-        
-        if let (Some(oldest_time), Some(newest_time)) = (oldest_visible_sig.block_time, newest_sig.block_time) {
+
+        if let (Some(oldest_time), Some(newest_time)) =
+            (oldest_visible_sig.block_time, newest_sig.block_time)
+        {
             // CRITICAL: If oldest visible signature is before boot, REJECT
             if oldest_time < self.boot_timestamp {
                 let age_since_boot = self.boot_timestamp - oldest_time;
                 info!(
-                    mint=%mint, 
+                    mint=%mint,
                     oldest_visible_sig_time=oldest_time,
                     bot_started_at=self.boot_timestamp,
                     secs_before_boot=age_since_boot,
@@ -3946,7 +3980,7 @@ impl SniperEngine {
                 );
                 return Ok(false);
             }
-            
+
             // Check if mint is too old (> 10 min from oldest to newest = suspicious)
             let mint_activity_span = newest_time - oldest_time;
             if mint_activity_span > 600 {
@@ -3958,16 +3992,16 @@ impl SniperEngine {
                 );
                 return Ok(false);
             }
-            
+
             let now = ChronoUtc::now().timestamp();
             let age_secs = now - oldest_time;
-            
+
             // If the oldest visible signature is > 10 min old, reject (was 30 min)
             if age_secs > 600 {
                 info!(
-                    mint=%mint, 
+                    mint=%mint,
                     age_secs,
-                    sig_count, 
+                    sig_count,
                     "sniper: REJECT - oldest visible mint sig is > 10 min old"
                 );
                 return Ok(false);
@@ -3993,7 +4027,7 @@ impl SniperEngine {
     /// 2. Freeze Authority must be revoked (None) - prevents rug via freezing
     /// 3. Slot-based age check - token must be created within last N slots
     /// 4. Transaction count - must be under threshold (via get_signatures)
-    /// 
+    ///
     /// Does NOT use get_token_largest_accounts (requires expensive full index)
     async fn validate_token_professional(
         &self,
@@ -4036,7 +4070,8 @@ impl SniperEngine {
             return Ok(false);
         }
 
-        let (mint_authority, freeze_authority, decimals, supply) = parse_spl_mint_fields(&mint_acc.data);
+        let (mint_authority, freeze_authority, decimals, supply) =
+            parse_spl_mint_fields(&mint_acc.data);
 
         // 2. CRITICAL: Mint Authority MUST be revoked
         if mint_authority.is_some() {
@@ -4079,7 +4114,7 @@ impl SniperEngine {
                 // For sniping, we want tokens created in the last ~10 minutes (1500 slots)
                 let max_age_slots: u64 = 1500; // ~10 minutes
                 let age_slots = current_slot.saturating_sub(discovery_slot);
-                
+
                 if age_slots > max_age_slots {
                     info!(
                         mint=%mint,
@@ -4091,7 +4126,7 @@ impl SniperEngine {
                     );
                     return Ok(false);
                 }
-                
+
                 debug!(
                     mint=%mint,
                     age_slots,
@@ -4390,7 +4425,12 @@ impl SniperEngine {
             return Ok(None);
         }
         // Largest accounts
-        let (list, holder_check_available) = match self.rpc.rpc.get_token_largest_accounts(mint).await {
+        let (list, holder_check_available) = match self
+            .rpc
+            .rpc
+            .get_token_largest_accounts(mint)
+            .await
+        {
             Ok(v) => (v, true),
             Err(e) => {
                 // RPC doesn't have this mint in account-index (common for new tokens)
@@ -4401,7 +4441,7 @@ impl SniperEngine {
             }
         };
         let holder_count = list.len();
-        
+
         // If holder check unavailable (RPC index limitation), return a permissive assessment
         // The freshness check will be the primary filter for these tokens
         if !holder_check_available {
@@ -4410,7 +4450,7 @@ impl SniperEngine {
                 top1_pct: 0.0,
                 top3_pct: 0.0,
                 top5_pct: 0.0,
-                concentration_ok: true,  // Allow - we can't verify, rely on freshness
+                concentration_ok: true, // Allow - we can't verify, rely on freshness
                 largest_account: None,
                 holder_count: 0,
                 burned_pct: 0.0,
@@ -4418,7 +4458,7 @@ impl SniperEngine {
                 holder_check_available: false,
             }));
         }
-        
+
         if list.is_empty() {
             info!(mint=%mint, "sniper: largest accounts list empty, returning None");
             return Ok(None);
@@ -4597,7 +4637,16 @@ pub async fn run_sniper(
     geyser_grpc_url: Option<String>,
     helius_rpc_url: Option<String>,
 ) -> Result<()> {
-    let engine = SniperEngine::new(rpc, cfg, raydium, orca, pumpfun, treasury, geyser_grpc_url, helius_rpc_url);
+    let engine = SniperEngine::new(
+        rpc,
+        cfg,
+        raydium,
+        orca,
+        pumpfun,
+        treasury,
+        geyser_grpc_url,
+        helius_rpc_url,
+    );
     engine.run().await
 }
 

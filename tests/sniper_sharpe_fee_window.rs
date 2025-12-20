@@ -94,7 +94,16 @@ async fn rolling_window_truncation() {
         rolling_pnl_window: Some(5),
         ..SniperCfg::default()
     };
-    let engine = SniperEngine::new(rpc, cfg, None, None, None, temp_treasury("window"), None, None);
+    let engine = SniperEngine::new(
+        rpc,
+        cfg,
+        None,
+        None,
+        None,
+        temp_treasury("window"),
+        None,
+        None,
+    );
     let mint = Pubkey::new_unique();
     engine.test_insert_lot(mint, 12.0, 2_000_000.0, 0.00002, 6);
 
