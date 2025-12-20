@@ -1635,11 +1635,15 @@ impl SniperEngine {
         let msb = self.adaptive_slippage_bps();
 
         // Try Pump.fun ONLY if the pool is actually on Pump.fun
+        // Use fallback mode for fresh launches - RPC may be too slow to index the bonding curve
         let mut pumpfun_quote_out: u64 = 0;
         if pool_dex_type == crate::solana::geyser_pool_discovery::DexType::PumpFun {
             if let Some(ref pf) = pumpfun {
+                // USE FALLBACK for fresh Pump.fun launches!
+                // The token was just discovered via Geyser CREATE, so the bonding curve is being created NOW.
+                // RPC nodes often lag behind Geyser events, so we use the deterministic initial state as fallback.
                 if let Ok(Some(q)) = pf
-                    .quote_exact_in(&sol_mint.to_string(), &mint.to_string(), lamports_in)
+                    .quote_exact_in_with_fallback(&sol_mint.to_string(), &mint.to_string(), lamports_in, true)
                     .await
                 {
                     pumpfun_quote_out = q.amount_out;

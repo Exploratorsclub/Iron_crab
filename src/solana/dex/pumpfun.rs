@@ -180,8 +180,8 @@ impl PumpFunDex {
 
     /// Returns the initial state of a Pump.fun bonding curve
     /// Used as fallback when RPC fails to index new pools fast enough
-    #[allow(dead_code)]
-    fn initial_bonding_curve_state(token_mint: Pubkey, bonding_curve: Pubkey) -> BondingCurveState {
+    /// This is the KNOWN initial state for ALL Pump.fun tokens at launch
+    pub fn initial_bonding_curve_state(token_mint: Pubkey, bonding_curve: Pubkey) -> BondingCurveState {
         BondingCurveState {
             virtual_token_reserves: 1_073_000_000_000_000,
             virtual_sol_reserves: 30_000_000_000,
@@ -284,6 +284,161 @@ impl PumpFunDex {
             ],
             data,
         })
+    }
+
+    /// Quote with fallback to initial bonding curve state for fresh token launches.
+    /// Use this when the token was just discovered via Geyser CREATE instruction.
+    /// 
+    /// The fallback is safe because:
+    /// 1. Geyser CREATE means the bonding curve is being created in this block
+    /// 2. The initial state of ALL Pump.fun bonding curves is deterministic
+    /// 3. By the time our tx lands, the bonding curve will exist on-chain
+    pub async fn quote_exact_in_with_fallback(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount_in: u64,
+        use_fallback: bool,
+    ) -> Result<Option<Quote>> {
+        let sol_mint = "So11111111111111111111111111111111111111112";
+
+        // Determine direction: SOL→Token or Token→SOL
+        let (token_mint_str, buy_token) = if input_mint == sol_mint {
+            (output_mint, true)
+        } else if output_mint == sol_mint {
+            (input_mint, false)
+        } else {
+            return Ok(None); // Pump.fun only does SOL pairs
+        };
+
+        let token_mint = Pubkey::from_str(token_mint_str)?;
+        let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
+
+        info!(
+            token_mint=%token_mint_str,
+            bonding_curve=%bonding_curve,
+            buy_token,
+            use_fallback,
+            "pump.fun: attempting to fetch bonding curve (with_fallback)"
+        );
+
+        // Try to fetch bonding curve state with FAST retry
+        const MAX_RETRIES: usize = 5;
+        const RETRY_DELAY_MS: u64 = 200;
+
+        let mut state_opt = None;
+
+        for attempt in 0..MAX_RETRIES {
+            if let Some(s) = self.fetch_bonding_curve_fast(&bonding_curve).await {
+                if attempt > 0 {
+                    info!(
+                        token_mint=%token_mint_str,
+                        bonding_curve=%bonding_curve,
+                        attempt,
+                        "pump.fun: bonding curve fetch succeeded after retry"
+                    );
+                } else {
+                    debug!(
+                        token_mint=%token_mint_str,
+                        bonding_curve=%bonding_curve,
+                        "pump.fun: bonding curve fetched on first try"
+                    );
+                }
+                state_opt = Some(s);
+                break;
+            } else if attempt < MAX_RETRIES - 1 {
+                debug!(
+                    token_mint=%token_mint_str,
+                    bonding_curve=%bonding_curve,
+                    attempt,
+                    "pump.fun: bonding curve not found, retrying..."
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+            }
+        }
+
+        // If RPC fetch failed, use fallback for fresh launches
+        let state = match state_opt {
+            Some(s) => s,
+            None => {
+                if use_fallback {
+                    // USE INITIAL STATE FALLBACK for fresh token launches!
+                    // This is safe because:
+                    // 1. The Geyser CREATE event proves the bonding curve is being created NOW
+                    // 2. All Pump.fun bonding curves start with the same deterministic state
+                    // 3. Our transaction will land AFTER the CREATE tx (same or later block)
+                    warn!(
+                        token_mint=%token_mint_str,
+                        bonding_curve=%bonding_curve,
+                        "pump.fun: ⚡ USING INITIAL STATE FALLBACK - RPC too slow, bonding curve being created"
+                    );
+                    Self::initial_bonding_curve_state(token_mint, bonding_curve)
+                } else {
+                    info!(
+                        token_mint=%token_mint_str,
+                        bonding_curve=%bonding_curve,
+                        "pump.fun: bonding curve not found after {} fast retries - SKIPPING (use_fallback=false)",
+                        MAX_RETRIES
+                    );
+                    return Ok(None);
+                }
+            }
+        };
+
+        // Check if bonding curve is complete (migrated to Raydium)
+        if state.complete {
+            info!(token_mint=%token_mint_str, bonding_curve=%bonding_curve, "pump.fun: bonding curve completed, migrated to raydium");
+            return Ok(None);
+        }
+
+        // Calculate output
+        let amount_out = state.calculate_output(amount_in, buy_token);
+
+        info!(
+            token_mint=%token_mint_str,
+            amount_in,
+            amount_out,
+            virtual_sol=state.virtual_sol_reserves,
+            virtual_token=state.virtual_token_reserves,
+            "pump.fun: calculated swap output (with_fallback)"
+        );
+
+        if amount_out == 0 {
+            info!(token_mint=%token_mint_str, "pump.fun: amount_out is zero, no quote");
+            return Ok(None);
+        }
+
+        // Calculate price impact
+        let (in_reserve, out_reserve) = if buy_token {
+            (
+                state.virtual_sol_reserves as u128,
+                state.virtual_token_reserves as u128,
+            )
+        } else {
+            (
+                state.virtual_token_reserves as u128,
+                state.virtual_sol_reserves as u128,
+            )
+        };
+
+        let price_impact_bps = if in_reserve > 0 {
+            let impact = (amount_in as u128 * 10000) / in_reserve;
+            impact.min(10000) as u32
+        } else {
+            0
+        };
+
+        Ok(Some(Quote {
+            amount_out,
+            price_impact_bps,
+            route: vec![bonding_curve.to_string()],
+            fee_bps: 100, // Pump.fun fee: 1%
+            in_reserve,
+            out_reserve,
+            input_mint: input_mint.to_string(),
+            output_mint: output_mint.to_string(),
+            tick_spacing: None,
+        }))
     }
 }
 
