@@ -48,6 +48,12 @@ impl GeyserPoolDiscovery {
                     Ok(update) => {
                         if let Some(event) = Self::process_account_update(update, &rpc_clone).await
                         {
+                            // Log before sending
+                            tracing::debug!(
+                                dex = ?event.dex_type,
+                                pool = %event.pool_address,
+                                "geyser_pool_discovery: sending account-based event"
+                            );
                             let _ = event_tx_clone.send(event);
                         }
                     }
@@ -72,7 +78,27 @@ impl GeyserPoolDiscovery {
                         if let Some(event) =
                             Self::process_transaction_update(tx_update, &rpc_clone2).await
                         {
-                            let _ = event_tx.send(event);
+                            // Log before sending to verify event is created
+                            tracing::info!(
+                                dex = ?event.dex_type,
+                                pool = %event.pool_address,
+                                base_mint = %event.base_mint,
+                                "geyser_pool_discovery: SENDING transaction-based event to sniper"
+                            );
+                            match event_tx.send(event) {
+                                Ok(receiver_count) => {
+                                    tracing::info!(
+                                        receiver_count,
+                                        "geyser_pool_discovery: event sent successfully"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        ?e,
+                                        "geyser_pool_discovery: FAILED to send event - no receivers!"
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {

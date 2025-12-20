@@ -30,7 +30,7 @@ use solana_sdk::{hash::Hash, transaction::Transaction};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use std::{collections::HashSet, sync::Arc};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 // Simple global blacklist (extendable via config later)
 #[allow(dead_code)]
