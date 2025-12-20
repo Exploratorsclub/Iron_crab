@@ -1159,14 +1159,15 @@ impl Raydium {
         accounts: RaydiumSwapAccounts,
         amount_in: u64,
         min_out: u64,
-        direction_forward: bool,
+        _direction_forward: bool,
     ) -> Instruction {
-        // Raydium swap base-in instruction tag (commonly 9). Layout: tag u8, amount_in u64, min_out u64.
-        let mut data = Vec::with_capacity(1 + 8 + 8 + 1);
+        // Raydium SwapBaseIn instruction: tag (1 byte) + amount_in (8 bytes) + min_out (8 bytes) = 17 bytes
+        // NOTE: Direction is determined by the order of user_source/user_destination accounts,
+        // NOT by an extra byte in the instruction data.
+        let mut data = Vec::with_capacity(1 + 8 + 8);
         data.push(9u8);
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_out.to_le_bytes());
-        data.push(if direction_forward { 0 } else { 1 });
         use solana_sdk::instruction::AccountMeta as AM;
         Instruction {
             program_id: accounts.amm_id, // Raydium program id expected
@@ -1301,7 +1302,7 @@ impl Raydium {
         if !forward && !reverse {
             return Err(anyhow!("pool does not match provided mints"));
         }
-        let direction_forward = forward;
+        let _direction_forward = forward; // Direction is encoded in user_source/user_destination order, not in data
         let amm_authority = snap
             .amm_authority
             .ok_or_else(|| anyhow!("amm_authority missing in snapshot"))?;
@@ -1317,14 +1318,21 @@ impl Raydium {
         let serum_vault_signer = snap
             .serum_vault_signer
             .ok_or_else(|| anyhow!("serum_vault_signer missing in snapshot"))?;
-        let target_orders = amm_target_orders.or(snap.target_orders).unwrap_or_default();
+        let target_orders = amm_target_orders
+            .or(snap.target_orders)
+            .ok_or_else(|| anyhow!("target_orders missing in snapshot - cannot build swap"))?;
         let base_vault = snap.base_vault; // already present
         let quote_vault = snap.quote_vault;
-        let mut data = Vec::with_capacity(1 + 8 + 8 + 1);
+        // Raydium SwapBaseIn instruction: tag (1 byte) + amount_in (8 bytes) + min_out (8 bytes) = 17 bytes
+        // NOTE: Direction is determined by the order of user_source/user_destination accounts,
+        // NOT by an extra byte in the instruction data.
+        let mut data = Vec::with_capacity(1 + 8 + 8);
         data.push(9u8);
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_out.to_le_bytes());
-        data.push(if direction_forward { 0 } else { 1 });
+        // User source/destination accounts must be ordered correctly for the swap direction:
+        // For forward (base->quote): user_source = base token ATA, user_destination = quote token ATA
+        // For reverse (quote->base): user_source = quote token ATA, user_destination = base token ATA
         Ok(Instruction {
             program_id: Self::program_id(),
             accounts: vec![
