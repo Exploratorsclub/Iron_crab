@@ -947,12 +947,12 @@ impl SniperEngine {
         {
             let processing = self.processing.read();
             if processing.contains(&mint) {
-                trace!(mint=%mint, "mint already being processed by another task, skipping");
+                info!(mint=%mint, "sniper: mint already being processed by another task, skipping");
                 return;
             }
             let purchased = self.purchased.read();
             if purchased.contains(&mint) {
-                info!(mint=%mint, "mint already purchased, skipping");
+                info!(mint=%mint, "sniper: mint already purchased, skipping");
                 return;
             }
         }
@@ -973,7 +973,8 @@ impl SniperEngine {
 
         let liq_sol = (event.liquidity_estimate_lamports as f64) / 1e9;
 
-        debug!(
+        // Changed from debug! to info! to ensure visibility
+        info!(
             pool=%event.pool_address,
             dex=program_label,
             base=%event.base_mint,
