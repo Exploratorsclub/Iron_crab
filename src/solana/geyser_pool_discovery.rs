@@ -429,9 +429,10 @@ impl GeyserPoolDiscovery {
         */
 
         // Extract pool address (bonding curve for Pump.fun)
-        // For Pump.fun: instruction account[3] is the bonding curve PDA (the "pool")
+        // For Pump.fun: instruction account[2] is the bonding curve PDA (the "pool")
+        // Index 3 is the associated bonding curve (token vault), NOT the bonding curve!
         let pool_address = match dex_type {
-            DexType::PumpFun => tx_update.instruction_accounts.get(3).copied()?,
+            DexType::PumpFun => tx_update.instruction_accounts.get(2).copied()?,
             _ => tx_update.account_keys.first().copied()?,
         };
 
