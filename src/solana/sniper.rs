@@ -4627,6 +4627,7 @@ impl SniperEngine {
 // end secondary impl SniperEngine helpers
 // (auxiliary impl closed above)
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_sniper(
     rpc: Arc<SolanaRpc>,
     cfg: SniperCfg,
