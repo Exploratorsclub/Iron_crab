@@ -747,6 +747,7 @@ impl SniperEngine {
         };
         Ok((native_lamports + wsol_amount) as f64 / 1e9)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rpc: Arc<SolanaRpc>,
         cfg: SniperCfg,
