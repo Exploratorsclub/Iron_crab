@@ -142,19 +142,30 @@ impl PumpFunDex {
     }
 
     /// Derive associated bonding curve token account (holds real token reserves)
+    /// This is simply the ATA (Associated Token Account) of the bonding curve for the token mint
     pub fn derive_associated_bonding_curve(
         &self,
         bonding_curve: &Pubkey,
         token_mint: &Pubkey,
     ) -> (Pubkey, u8) {
-        Pubkey::find_program_address(
-            &[
-                b"associated-bonding-curve",
-                bonding_curve.as_ref(),
-                token_mint.as_ref(),
-            ],
-            &self.program_id,
-        )
+        // The associated bonding curve is just a standard ATA
+        // Seeds: [bonding_curve, TOKEN_PROGRAM, token_mint] with ATA_PROGRAM as the program
+        let ata_program = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+            spl_associated_token_account::id().to_bytes(),
+        );
+        let bonding_curve_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(bonding_curve.to_bytes());
+        let token_mint_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint.to_bytes());
+
+        let ata_spl = spl_associated_token_account::get_associated_token_address(
+            &bonding_curve_spl,
+            &token_mint_spl,
+        );
+
+        // Convert back to solana_sdk::pubkey::Pubkey
+        // The bump is not relevant for ATAs (we use the address directly)
+        (Pubkey::new_from_array(ata_spl.to_bytes()), 0)
     }
 
     /// Fetch bonding curve state from chain
@@ -325,9 +336,11 @@ impl PumpFunDex {
             "pump.fun: attempting to fetch bonding curve (with_fallback)"
         );
 
-        // Try to fetch bonding curve state with FAST retry
-        const MAX_RETRIES: usize = 5;
-        const RETRY_DELAY_MS: u64 = 200;
+        // Try to fetch bonding curve state with aggressive retry for sniping
+        // More retries with exponential backoff: 50ms, 100ms, 200ms, 400ms, 800ms, 1000ms, 1000ms, 1000ms = ~4.5s total
+        const MAX_RETRIES: usize = 8;
+        const INITIAL_DELAY_MS: u64 = 50;
+        const MAX_DELAY_MS: u64 = 1000;
 
         let mut state_opt = None;
 
@@ -350,13 +363,16 @@ impl PumpFunDex {
                 state_opt = Some(s);
                 break;
             } else if attempt < MAX_RETRIES - 1 {
+                // Exponential backoff: 50, 100, 200, 400, 800, 1000, 1000ms
+                let delay = (INITIAL_DELAY_MS * (1 << attempt)).min(MAX_DELAY_MS);
                 debug!(
                     token_mint=%token_mint_str,
                     bonding_curve=%bonding_curve,
                     attempt,
-                    "pump.fun: bonding curve not found, retrying..."
+                    delay_ms=delay,
+                    "pump.fun: bonding curve not found, retrying with backoff..."
                 );
-                tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
             }
         }
 

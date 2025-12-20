@@ -1635,19 +1635,19 @@ impl SniperEngine {
         let msb = self.adaptive_slippage_bps();
 
         // Try Pump.fun ONLY if the pool is actually on Pump.fun
-        // Use fallback mode for fresh launches - RPC may be too slow to index the bonding curve
+        // IMPORTANT: Do NOT use fallback mode! The bonding curve MUST exist on-chain before we can buy.
+        // Error 3012 = "Account not initialized" means the bonding curve doesn't exist yet.
         let mut pumpfun_quote_out: u64 = 0;
         if pool_dex_type == crate::solana::geyser_pool_discovery::DexType::PumpFun {
             if let Some(ref pf) = pumpfun {
-                // USE FALLBACK for fresh Pump.fun launches!
-                // The token was just discovered via Geyser CREATE, so the bonding curve is being created NOW.
-                // RPC nodes often lag behind Geyser events, so we use the deterministic initial state as fallback.
+                // Do NOT use fallback - wait for the bonding curve to be indexed by RPC
+                // The retry logic inside quote_exact_in_with_fallback will handle the waiting
                 if let Ok(Some(q)) = pf
                     .quote_exact_in_with_fallback(
                         &sol_mint.to_string(),
                         &mint.to_string(),
                         lamports_in,
-                        true,
+                        false, // DISABLED fallback - causes Error 3012 when bonding curve doesn't exist
                     )
                     .await
                 {
