@@ -374,15 +374,17 @@ impl Dex for PumpFunDex {
             match state_opt {
                 Some(s) => s,
                 None => {
+                    // CRITICAL: Do NOT use fallback for sniping!
+                    // If bonding curve is not on-chain, the buy transaction WILL FAIL with error 3012.
+                    // Better to skip and let the next Geyser event trigger a retry.
                     info!(
                         token_mint=%token_mint_str,
                         bonding_curve=%bonding_curve,
                         error=%last_error.as_ref().map(|e| e.to_string()).unwrap_or_else(|| "None".to_string()),
-                        "pump.fun: failed to fetch bonding curve after {} retries. USING INITIAL STATE FALLBACK for sniping.",
+                        "pump.fun: bonding curve not found after {} retries - SKIPPING (account not yet on-chain)",
                         MAX_RETRIES
                     );
-                    // Fallback to initial state for sniping speed
-                    Self::initial_bonding_curve_state(token_mint, bonding_curve)
+                    return Ok(None);
                 }
             }
         };
