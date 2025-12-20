@@ -1156,7 +1156,7 @@ impl SniperEngine {
             if let Ok(current_slot) = self.rpc.rpc.get_slot().await {
                 let age_slots = current_slot.saturating_sub(event.slot);
                 let max_age_slots: u64 = 150; // ~60 seconds (400ms per slot) - must be VERY fresh
-                
+
                 if age_slots > max_age_slots {
                     info!(
                         mint=%mint,
@@ -1180,7 +1180,7 @@ impl SniperEngine {
                     );
                     return;
                 }
-                
+
                 info!(
                     mint=%mint,
                     event_slot=event.slot,

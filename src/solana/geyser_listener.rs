@@ -304,21 +304,35 @@ impl GeyserListener {
                                             if instruction_accounts.is_empty() {
                                                 if let Some(meta) = &tx.meta {
                                                     for inner_ix_group in &meta.inner_instructions {
-                                                        for inner_ix in &inner_ix_group.instructions {
+                                                        for inner_ix in &inner_ix_group.instructions
+                                                        {
                                                             if let Some(program_pubkey) =
-                                                                account_keys.get(inner_ix.program_id_index as usize)
+                                                                account_keys.get(
+                                                                    inner_ix.program_id_index
+                                                                        as usize,
+                                                                )
                                                             {
-                                                                if self.program_ids.contains(program_pubkey) {
+                                                                if self
+                                                                    .program_ids
+                                                                    .contains(program_pubkey)
+                                                                {
                                                                     // Extract accounts for this inner instruction
-                                                                    for &account_idx in &inner_ix.accounts {
-                                                                        if let Some(pubkey) = account_keys
-                                                                            .get(account_idx as usize)
+                                                                    for &account_idx in
+                                                                        &inner_ix.accounts
+                                                                    {
+                                                                        if let Some(pubkey) =
+                                                                            account_keys.get(
+                                                                                account_idx
+                                                                                    as usize,
+                                                                            )
                                                                         {
-                                                                            instruction_accounts.push(*pubkey);
+                                                                            instruction_accounts
+                                                                                .push(*pubkey);
                                                                         }
                                                                     }
                                                                     // Extract instruction data
-                                                                    instruction_data = inner_ix.data.clone();
+                                                                    instruction_data =
+                                                                        inner_ix.data.clone();
 
                                                                     debug!(
                                                                         signature = %signature,
