@@ -259,6 +259,7 @@ impl GeyserListener {
 
                                             // Find the Pump.fun/Raydium/Orca instruction (not first, could be 2nd or 3rd)
                                             // Look for instruction that uses our monitored program
+                                            // FIRST: Check top-level instructions
                                             for (idx, ix) in message.instructions.iter().enumerate()
                                             {
                                                 if let Some(program_pubkey) =
@@ -294,6 +295,45 @@ impl GeyserListener {
                                                         );
 
                                                         break; // Found our instruction, stop searching
+                                                    }
+                                                }
+                                            }
+
+                                            // SECOND: If not found in top-level, check inner instructions (CPIs)
+                                            // Pump.fun CREATE is often called via CPI from another program
+                                            if instruction_accounts.is_empty() {
+                                                if let Some(meta) = &tx.meta {
+                                                    for inner_ix_group in &meta.inner_instructions {
+                                                        for inner_ix in &inner_ix_group.instructions {
+                                                            if let Some(program_pubkey) =
+                                                                account_keys.get(inner_ix.program_id_index as usize)
+                                                            {
+                                                                if self.program_ids.contains(program_pubkey) {
+                                                                    // Extract accounts for this inner instruction
+                                                                    for &account_idx in &inner_ix.accounts {
+                                                                        if let Some(pubkey) = account_keys
+                                                                            .get(account_idx as usize)
+                                                                        {
+                                                                            instruction_accounts.push(*pubkey);
+                                                                        }
+                                                                    }
+                                                                    // Extract instruction data
+                                                                    instruction_data = inner_ix.data.clone();
+
+                                                                    debug!(
+                                                                        signature = %signature,
+                                                                        inner_ix_index = inner_ix_group.index,
+                                                                        program_id = %program_pubkey,
+                                                                        "geyser: extracted DEX instruction from INNER instruction (CPI)"
+                                                                    );
+
+                                                                    break; // Found our instruction
+                                                                }
+                                                            }
+                                                        }
+                                                        if !instruction_accounts.is_empty() {
+                                                            break; // Already found, exit outer loop
+                                                        }
                                                     }
                                                 }
                                             }
