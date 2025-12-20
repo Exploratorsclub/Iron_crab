@@ -173,10 +173,7 @@ impl PumpFunDex {
         let timeout = tokio::time::Duration::from_millis(2000);
 
         match tokio::time::timeout(timeout, self.rpc.get_account(bonding_curve)).await {
-            Ok(Ok(account)) => match BondingCurveState::parse(&account.data) {
-                Ok(state) => Some(state),
-                Err(_) => None,
-            },
+            Ok(Ok(account)) => BondingCurveState::parse(&account.data).ok(),
             _ => None,
         }
     }
