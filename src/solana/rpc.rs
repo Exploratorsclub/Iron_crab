@@ -399,6 +399,15 @@ impl SolanaRpc {
         }
     }
 
+    /// Get account without any retry logic - for time-sensitive operations like sniping
+    /// Returns the raw result from RPC without rate limiting or retries
+    pub async fn get_account(
+        &self,
+        key: &Pubkey,
+    ) -> Result<solana_sdk::account::Account, ClientError> {
+        self.rpc.get_account(key).await
+    }
+
     pub async fn get_account_retry(
         &self,
         key: &Pubkey,

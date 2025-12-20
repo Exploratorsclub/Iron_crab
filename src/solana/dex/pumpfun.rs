@@ -163,6 +163,24 @@ impl PumpFunDex {
         BondingCurveState::parse(&account.data)
     }
 
+    /// Fetch bonding curve with fast timeout for sniping (no RPC retries)
+    /// Returns None if account doesn't exist or timeout
+    pub async fn fetch_bonding_curve_fast(
+        &self,
+        bonding_curve: &Pubkey,
+    ) -> Option<BondingCurveState> {
+        // Fast 2 second timeout - if RPC can't answer quickly, skip this opportunity
+        let timeout = tokio::time::Duration::from_millis(2000);
+
+        match tokio::time::timeout(timeout, self.rpc.get_account(bonding_curve)).await {
+            Ok(Ok(account)) => match BondingCurveState::parse(&account.data) {
+                Ok(state) => Some(state),
+                Err(_) => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Returns the initial state of a Pump.fun bonding curve
     /// Used as fallback when RPC fails to index new pools fast enough
     fn initial_bonding_curve_state(token_mint: Pubkey, bonding_curve: Pubkey) -> BondingCurveState {
@@ -331,42 +349,43 @@ impl Dex for PumpFunDex {
             "pump.fun: attempting to fetch bonding curve"
         );
 
-        // Fetch bonding curve state with retry logic for brand new tokens
-        // New tokens may not have bonding curve account created yet
-        // Fast retry window for sniping: 10 attempts × 250ms = 2500ms total (plus network latency)
+        // Fetch bonding curve state with FAST retry for sniping
+        // Max 5 retries × 200ms = 1 second of retries (plus 2s timeout per attempt max)
+        // Total worst case: 5 × 2s = 10s, but typically much faster if RPC responds
         let state = {
-            const MAX_RETRIES: usize = 10;
-            const RETRY_DELAY_MS: u64 = 250;
+            const MAX_RETRIES: usize = 5;
+            const RETRY_DELAY_MS: u64 = 200;
 
-            let mut last_error = None;
             let mut state_opt = None;
 
             for attempt in 0..MAX_RETRIES {
-                match self.fetch_bonding_curve(&bonding_curve).await {
-                    Ok(s) => {
-                        if attempt > 0 {
-                            info!(
-                                token_mint=%token_mint_str,
-                                bonding_curve=%bonding_curve,
-                                attempt,
-                                "pump.fun: bonding curve fetch succeeded after retry"
-                            );
-                        }
-                        state_opt = Some(s);
-                        break;
+                if let Some(s) = self.fetch_bonding_curve_fast(&bonding_curve).await {
+                    if attempt > 0 {
+                        info!(
+                            token_mint=%token_mint_str,
+                            bonding_curve=%bonding_curve,
+                            attempt,
+                            "pump.fun: bonding curve fetch succeeded after retry"
+                        );
+                    } else {
+                        debug!(
+                            token_mint=%token_mint_str,
+                            bonding_curve=%bonding_curve,
+                            "pump.fun: bonding curve fetched on first try"
+                        );
                     }
-                    Err(e) => {
-                        last_error = Some(e);
-                        if attempt < MAX_RETRIES - 1 {
-                            debug!(
-                                token_mint=%token_mint_str,
-                                bonding_curve=%bonding_curve,
-                                attempt,
-                                "pump.fun: bonding curve not found, retrying..."
-                            );
-                            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS))
-                                .await;
-                        }
+                    state_opt = Some(s);
+                    break;
+                } else {
+                    if attempt < MAX_RETRIES - 1 {
+                        debug!(
+                            token_mint=%token_mint_str,
+                            bonding_curve=%bonding_curve,
+                            attempt,
+                            "pump.fun: bonding curve not found, retrying..."
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS))
+                            .await;
                     }
                 }
             }
@@ -380,8 +399,7 @@ impl Dex for PumpFunDex {
                     info!(
                         token_mint=%token_mint_str,
                         bonding_curve=%bonding_curve,
-                        error=%last_error.as_ref().map(|e| e.to_string()).unwrap_or_else(|| "None".to_string()),
-                        "pump.fun: bonding curve not found after {} retries - SKIPPING (account not yet on-chain)",
+                        "pump.fun: bonding curve not found after {} fast retries - SKIPPING (account not yet on-chain)",
                         MAX_RETRIES
                     );
                     return Ok(None);
