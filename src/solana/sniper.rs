@@ -1643,7 +1643,12 @@ impl SniperEngine {
                 // The token was just discovered via Geyser CREATE, so the bonding curve is being created NOW.
                 // RPC nodes often lag behind Geyser events, so we use the deterministic initial state as fallback.
                 if let Ok(Some(q)) = pf
-                    .quote_exact_in_with_fallback(&sol_mint.to_string(), &mint.to_string(), lamports_in, true)
+                    .quote_exact_in_with_fallback(
+                        &sol_mint.to_string(),
+                        &mint.to_string(),
+                        lamports_in,
+                        true,
+                    )
                     .await
                 {
                     pumpfun_quote_out = q.amount_out;

@@ -181,7 +181,10 @@ impl PumpFunDex {
     /// Returns the initial state of a Pump.fun bonding curve
     /// Used as fallback when RPC fails to index new pools fast enough
     /// This is the KNOWN initial state for ALL Pump.fun tokens at launch
-    pub fn initial_bonding_curve_state(token_mint: Pubkey, bonding_curve: Pubkey) -> BondingCurveState {
+    pub fn initial_bonding_curve_state(
+        token_mint: Pubkey,
+        bonding_curve: Pubkey,
+    ) -> BondingCurveState {
         BondingCurveState {
             virtual_token_reserves: 1_073_000_000_000_000,
             virtual_sol_reserves: 30_000_000_000,
@@ -288,7 +291,7 @@ impl PumpFunDex {
 
     /// Quote with fallback to initial bonding curve state for fresh token launches.
     /// Use this when the token was just discovered via Geyser CREATE instruction.
-    /// 
+    ///
     /// The fallback is safe because:
     /// 1. Geyser CREATE means the bonding curve is being created in this block
     /// 2. The initial state of ALL Pump.fun bonding curves is deterministic
