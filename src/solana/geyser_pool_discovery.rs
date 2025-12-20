@@ -328,8 +328,9 @@ impl GeyserPoolDiscovery {
                     pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"), // Metadata
                     pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"), // ATA
                     pubkey!("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1"), // Event Auth
-                    pubkey!("CebN5wgopZ17X43SymdI8Y434Bs7rfL3ffU28JeD7ctP"), // Fee Recipient
+                    pubkey!("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM"), // Fee Recipient (correct)
                     pubkey!("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf"), // Global
+                    pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),  // Pump.fun Program
                 ];
 
                 for acc in tx_update.instruction_accounts.iter() {
