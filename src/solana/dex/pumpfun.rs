@@ -383,8 +383,7 @@ impl Dex for PumpFunDex {
                         attempt,
                         "pump.fun: bonding curve not found, retrying..."
                     );
-                    tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS))
-                        .await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
                 }
             }
 
