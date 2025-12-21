@@ -902,6 +902,10 @@ impl SniperEngine {
 
         info!("sniper: Geyser pool discovery active, processing events...");
 
+        // Create interval for periodic position evaluation (stop-loss, take-profit)
+        let mut position_eval_interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        position_eval_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         // Process pool discovery events
         loop {
             tokio::select! {
@@ -924,6 +928,13 @@ impl SniperEngine {
                             error!("sniper: Geyser event channel closed unexpectedly");
                             break;
                         }
+                    }
+                }
+                _ = position_eval_interval.tick() => {
+                    // Periodic position evaluation for stop-loss and take-profit
+                    // Runs every 5 seconds to check if any open positions need to be closed
+                    if let Err(e) = self.evaluate_positions().await {
+                        warn!(error=?e, "sniper: position evaluation failed");
                     }
                 }
                 _ = shutdown_rx.changed() => {
