@@ -1,7 +1,7 @@
 use clap::Parser;
 use futures::stream::{self, StreamExt};
 use ironcrab::config::Config;
-use ironcrab::solana::dex::pumpfun::PumpFun;
+use ironcrab::solana::dex::pumpfun::PumpFunDex;
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::wallet::Treasury;
@@ -42,7 +42,7 @@ fn is_pumpfun_mint(mint: &Pubkey) -> bool {
 
 async fn sell_token_pumpfun(
     rpc: Arc<SolanaRpc>,
-    pumpfun: Arc<PumpFun>,
+    pumpfun: Arc<PumpFunDex>,
     treasury: Arc<Treasury>,
     task: SellTask,
 ) -> anyhow::Result<()> {
@@ -116,7 +116,7 @@ async fn sell_token_pumpfun(
 async fn sell_token(
     rpc: Arc<SolanaRpc>,
     raydium: Arc<Raydium>,
-    pumpfun: Arc<PumpFun>,
+    pumpfun: Arc<PumpFunDex>,
     treasury: Arc<Treasury>,
     task: SellTask,
     wsol_ata: Pubkey,
@@ -299,7 +299,7 @@ async fn main() -> anyhow::Result<()> {
     let raydium = Arc::new(Raydium::new(rpc.clone()));
     
     // Initialize Pump.fun with user authority for selling
-    let mut pumpfun = PumpFun::new(rpc.clone());
+    let mut pumpfun = PumpFunDex::new(rpc.clone());
     pumpfun.set_user_authority(treasury.pubkey());
     let pumpfun = Arc::new(pumpfun);
 
