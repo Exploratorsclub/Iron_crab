@@ -1801,13 +1801,15 @@ impl SniperEngine {
 
                 // Use async version with explicit slippage for proper max_sol_cost calculation
                 // For BUY: max_sol_cost = lamports_in + slippage (we're willing to pay more SOL if price rises)
+                // CRITICAL: Pump.fun tokens are extremely volatile - use at least 15% slippage
+                let pumpfun_slippage_bps = msb.max(1500); // At least 15% for Pump.fun
                 match pf.build_swap_ix_async_with_slippage(
                     &sol_mint.to_string(),
                     &mint.to_string(),
                     lamports_in,
                     min_out,
                     creator, // Pass creator from Geyser event for fresh launches
-                    msb, // Pass slippage in bps for max_sol_cost calculation
+                    pumpfun_slippage_bps, // Pass slippage in bps for max_sol_cost calculation (min 15%)
                 ).await {
                     Ok(ixs) => {
                         if !ixs.is_empty() {
@@ -2676,6 +2678,12 @@ impl SniperEngine {
             {
                 return Ok(());
             }
+        }
+        
+        // Count open positions for logging
+        let open_count = self.risk.read().open.len();
+        if open_count > 0 {
+            info!(open_positions=open_count, "evaluate_positions: checking positions for stop-loss/take-profit");
         }
         let (stop_bps, tp_bps, tiers, trailing, min_exit_notional) = {
             let r = self.cfg.read();
