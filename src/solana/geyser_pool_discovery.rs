@@ -446,9 +446,29 @@ impl GeyserPoolDiscovery {
             DexType::PumpFun => {
                 // User/Creator is typically at index 6 in the CREATE instruction
                 // But let's find the first signer that's on-curve and not a known program
+                // Known programs to skip (many are on-curve!):
+                let metaplex = pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+                let token_prog = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+                let ata_prog = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+                let system_prog = pubkey!("11111111111111111111111111111111");
+                let rent = pubkey!("SysvarRent111111111111111111111111111111111");
+                let event_auth = pubkey!("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1");
+                let pumpfun_global = pubkey!("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+                let pumpfun_prog = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+                let fee_prog = pubkey!("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
+                // Fee recipients (multiple possible)
+                let fee_recip_1 = pubkey!("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM");
+                let fee_recip_2 = pubkey!("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV");
+                
+                let known_to_skip = [
+                    metaplex, token_prog, ata_prog, system_prog, rent,
+                    event_auth, pumpfun_global, pumpfun_prog, fee_prog,
+                    fee_recip_1, fee_recip_2,
+                ];
+                
                 tx_update.instruction_accounts.iter()
                     .skip(5) // Skip known accounts: Global, Fee, Mint, Bonding, AssocBonding
-                    .find(|acc| acc.is_on_curve())
+                    .find(|acc| acc.is_on_curve() && !known_to_skip.contains(acc))
                     .copied()
             }
             _ => None,
