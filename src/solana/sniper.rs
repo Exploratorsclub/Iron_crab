@@ -1814,7 +1814,7 @@ impl SniperEngine {
                     Ok(ixs) => {
                         if !ixs.is_empty() {
                             final_ixs = ixs;
-                            info!(mint=%mint, lamports_in, expected_out=pumpfun_quote_out, min_out, slippage_bps=msb, "pump.fun swap instructions built");
+                            info!(mint=%mint, lamports_in, expected_out=pumpfun_quote_out, min_out, slippage_bps=pumpfun_slippage_bps, "pump.fun swap instructions built");
                         }
                     }
                     Err(e) => {
