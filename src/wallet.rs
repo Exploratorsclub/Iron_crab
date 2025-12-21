@@ -281,13 +281,14 @@ impl Treasury {
     }
 
     /// Build ATA creation instruction for Pump.fun (skips RPC checks for speed).
-    /// Assumes standard SPL Token Program and always returns the idempotent create instruction.
+    /// Uses Token-2022 Program as Pump.fun tokens are Token-2022 based.
     pub fn build_ata_ix_pumpfun(
         &self,
         owner: &SdkPubkey,
         mint: &SdkPubkey,
     ) -> (SdkPubkey, solana_sdk::instruction::Instruction) {
-        let token_prog = spl_token::id();
+        // Pump.fun tokens use Token-2022 (TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb)
+        let token_prog = spl_token_2022_program_id();
 
         // Derive ATA address
         let ata_prog = get_associated_token_address_with_program_id(

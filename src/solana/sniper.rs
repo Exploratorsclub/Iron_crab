@@ -18,6 +18,8 @@ use crate::solana::dex::{orca::Orca, pumpfun::PumpFunDex, raydium::Raydium, Dex}
 use crate::solana::geyser_pool_discovery::PoolDiscoveryEvent;
 use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
+// Token-2022 program for Pump.fun tokens
+use spl_token_2022;
 use anyhow::Result;
 use chrono::Utc as ChronoUtc;
 use once_cell::sync::Lazy;
@@ -1745,9 +1747,9 @@ impl SniperEngine {
 
         // Derive destination token ATA address (but don't create it yet)
         let (_dest_ata, _token_prog) = if chosen_dex == ChosenDex::PumpFun {
-            // Pump.fun tokens are always standard SPL Token (not Token-2022)
+            // Pump.fun tokens use Token-2022 (TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb)
             // We skip RPC lookup because the mint account might not be indexed yet
-            let token_prog = spl_token::id();
+            let token_prog = spl_token_2022::id();
             let token_prog_sdk = SdkPubkey::new_from_array(token_prog.to_bytes());
 
             // Convert SDK Pubkey to SPL Pubkey for derivation
@@ -1756,8 +1758,12 @@ impl SniperEngine {
             let mint_spl =
                 spl_token::solana_program::pubkey::Pubkey::new_from_array(mint_sdk.to_bytes());
 
-            let ata_spl =
-                spl_associated_token_account::get_associated_token_address(&owner_spl, &mint_spl);
+            // Use get_associated_token_address_with_program_id with Token-2022
+            let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+                &owner_spl,
+                &mint_spl,
+                &token_prog,
+            );
             let ata_sdk = SdkPubkey::new_from_array(ata_spl.to_bytes());
 
             (ata_sdk, token_prog_sdk)
