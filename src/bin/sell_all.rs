@@ -255,7 +255,15 @@ async fn sell_token(
                 Ok(sig) => {
                     info!("Sold {}! Sig: {}", mint, sig);
                 }
-                Err(e) => warn!("Failed to sell {}: {:?}", mint, e),
+                Err(e) => {
+                    warn!("Failed to sell {} via Raydium: {:?}, trying Pump.fun...", mint, e);
+                    // Fallback to Pump.fun when Raydium TX fails (e.g., slippage)
+                    let _ = sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), SellTask {
+                        mint,
+                        amount,
+                        ta_pubkey: task.ta_pubkey,
+                    }).await;
+                }
             }
         }
         Ok(None) => {
