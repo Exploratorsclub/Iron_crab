@@ -3,6 +3,7 @@ use futures::stream::{self, StreamExt};
 use ironcrab::config::Config;
 use ironcrab::solana::dex::pumpfun::PumpFunDex;
 use ironcrab::solana::dex::raydium::Raydium;
+use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::wallet::Treasury;
 use solana_client::rpc_request::TokenAccountsFilter;
@@ -299,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
     let raydium = Arc::new(Raydium::new(rpc.clone()));
     
     // Initialize Pump.fun with user authority for selling
-    let mut pumpfun = PumpFunDex::new(rpc.clone());
+    let mut pumpfun = PumpFunDex::new(rpc.clone()).expect("Failed to create PumpFunDex");
     pumpfun.set_user_authority(treasury.pubkey());
     let pumpfun = Arc::new(pumpfun);
 
