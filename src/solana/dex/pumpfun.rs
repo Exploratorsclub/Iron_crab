@@ -149,19 +149,19 @@ impl PumpFunDex {
         bonding_curve: &Pubkey,
         token_mint: &Pubkey,
     ) -> (Pubkey, u8) {
-        // The associated bonding curve is a Token-2022 ATA
-        // Derived using SPL Associated Token Account program with Token-2022
+        // The associated bonding curve is a standard SPL Token ATA
+        // Derived using SPL Associated Token Account program with standard Token Program
         let bonding_curve_spl =
             spl_token::solana_program::pubkey::Pubkey::new_from_array(bonding_curve.to_bytes());
         let token_mint_spl =
             spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint.to_bytes());
-        let token_2022_program =
-            spl_token::solana_program::pubkey::Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+        let token_program =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(spl_token::id().to_bytes());
 
         let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
             &bonding_curve_spl,
             &token_mint_spl,
-            &token_2022_program,
+            &token_program,
         );
 
         // Convert back to solana_sdk::pubkey::Pubkey
@@ -210,7 +210,7 @@ impl PumpFunDex {
 
     /// Build buy instruction (SOL → Token)
     /// Instruction discriminator: 0x66063d1201daebea (8 bytes)
-    /// Uses Token-2022 program as Pump.fun tokens are Token-2022 based
+    /// Uses standard SPL Token program (Pump.fun tokens are NOT Token-2022)
     pub fn build_buy_ix(
         &self,
         token_mint: &Pubkey,
@@ -243,7 +243,7 @@ impl PumpFunDex {
                 AccountMeta::new(user, true), // Signer
                 AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false),
                 AccountMeta::new_readonly(
-                    Pubkey::new_from_array(spl_token_2022::id().to_bytes()),
+                    Pubkey::new_from_array(spl_token::id().to_bytes()),
                     false,
                 ),
                 AccountMeta::new_readonly(sysvar::rent::id(), false),
@@ -256,7 +256,7 @@ impl PumpFunDex {
 
     /// Build sell instruction (Token → SOL)
     /// Instruction discriminator: 0x33e685a4017f83ad (8 bytes)
-    /// Uses Token-2022 program as Pump.fun tokens are Token-2022 based
+    /// Uses standard SPL Token program (Pump.fun tokens are NOT Token-2022)
     pub fn build_sell_ix(
         &self,
         token_mint: &Pubkey,
@@ -293,7 +293,7 @@ impl PumpFunDex {
                     false,
                 ),
                 AccountMeta::new_readonly(
-                    Pubkey::new_from_array(spl_token_2022::id().to_bytes()),
+                    Pubkey::new_from_array(spl_token::id().to_bytes()),
                     false,
                 ),
                 AccountMeta::new_readonly(self.event_authority, false),
@@ -662,18 +662,18 @@ impl Dex for PumpFunDex {
             .user_authority
             .ok_or_else(|| anyhow!("user authority not set"))?;
 
-        // Derive user token account (ATA) using Token-2022 program
-        // Pump.fun tokens are Token-2022 based
+        // Derive user token account (ATA) using standard SPL Token program
+        // Pump.fun tokens use standard Token Program (NOT Token-2022!)
         let user_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(user.to_bytes());
         let token_mint_spl =
             spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint.to_bytes());
-        let token_2022_program =
-            spl_token::solana_program::pubkey::Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+        let token_program =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(spl_token::id().to_bytes());
         let user_token_account_spl =
             spl_associated_token_account::get_associated_token_address_with_program_id(
                 &user_spl,
                 &token_mint_spl,
-                &token_2022_program,
+                &token_program,
             );
         let user_token_account = Pubkey::new_from_array(user_token_account_spl.to_bytes());
 

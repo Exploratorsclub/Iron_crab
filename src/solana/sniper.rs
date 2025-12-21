@@ -1747,9 +1747,9 @@ impl SniperEngine {
 
         // Derive destination token ATA address (but don't create it yet)
         let (_dest_ata, _token_prog) = if chosen_dex == ChosenDex::PumpFun {
-            // Pump.fun tokens use Token-2022 (TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb)
+            // Pump.fun tokens use standard SPL Token Program (NOT Token-2022!)
             // We skip RPC lookup because the mint account might not be indexed yet
-            let token_prog = spl_token_2022::id();
+            let token_prog = spl_token::id();
             let token_prog_sdk = SdkPubkey::new_from_array(token_prog.to_bytes());
 
             // Convert SDK Pubkey to SPL Pubkey for derivation
