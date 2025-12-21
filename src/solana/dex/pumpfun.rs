@@ -733,6 +733,16 @@ impl Dex for PumpFunDex {
 impl PumpFunDex {
     /// Async version of build_swap_ix that fetches bonding curve state to get creator
     /// This is the preferred method for building swap instructions
+    ///
+    /// For BUY (SOL → Token):
+    ///   - amount_in: SOL lamports you want to spend
+    ///   - min_out: minimum tokens you expect to receive (with slippage already applied)
+    ///   - expected_out: expected tokens without slippage (needed to calculate max_sol_cost)
+    ///   - slippage_bps: slippage tolerance in basis points (e.g., 1500 = 15%)
+    ///
+    /// For SELL (Token → SOL):
+    ///   - amount_in: tokens to sell
+    ///   - min_out: minimum SOL to receive
     pub async fn build_swap_ix_async(
         &self,
         input_mint: &str,
@@ -740,6 +750,20 @@ impl PumpFunDex {
         amount_in: u64,
         min_out: u64,
         fallback_creator: Option<Pubkey>, // Creator from Geyser event for fresh launches
+    ) -> Result<Vec<Instruction>> {
+        // Default slippage for backwards compatibility
+        self.build_swap_ix_async_with_slippage(input_mint, output_mint, amount_in, min_out, fallback_creator, 1500).await
+    }
+
+    /// Build swap instruction with explicit slippage for proper max_sol_cost calculation
+    pub async fn build_swap_ix_async_with_slippage(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount_in: u64,
+        min_out: u64,
+        fallback_creator: Option<Pubkey>,
+        slippage_bps: u32,
     ) -> Result<Vec<Instruction>> {
         let sol_mint = "So11111111111111111111111111111111111111112";
 
@@ -791,14 +815,33 @@ impl PumpFunDex {
         let user_token_account = Pubkey::new_from_array(user_token_account_spl.to_bytes());
 
         let ix = if buy_token {
+            // For BUY: We want to spend amount_in SOL to get tokens.
+            // Pump.fun BUY expects:
+            //   - amount: token amount we want to receive (min_out)
+            //   - max_sol_cost: maximum SOL we're willing to pay (with slippage buffer!)
+            //
+            // The slippage on BUY should be on max_sol_cost, not on token amount!
+            // If price goes up, we need MORE SOL for the same tokens.
+            // So max_sol_cost = amount_in + slippage
+            let max_sol_cost = ((amount_in as u128) * (10_000 + slippage_bps as u128) / 10_000) as u64;
+            
+            info!(
+                token_mint = %token_mint_str,
+                amount_in_sol = amount_in,
+                min_tokens_out = min_out,
+                max_sol_cost,
+                slippage_bps,
+                "pump.fun BUY: amount_in SOL with slippage protection on max_sol_cost"
+            );
+
             self.build_buy_ix(
                 &token_mint,
                 &bonding_curve,
                 &associated_bonding_curve,
                 &user_token_account,
                 &creator,
-                min_out,   // amount (tokens)
-                amount_in, // max_sol_cost (SOL)
+                min_out,       // amount (tokens we want)
+                max_sol_cost,  // max SOL we're willing to pay (amount_in + slippage!)
             )?
         } else {
             self.build_sell_ix(

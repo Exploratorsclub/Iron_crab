@@ -1788,18 +1788,20 @@ impl SniperEngine {
                 let min_out = ((pumpfun_quote_out as u128) * (10_000 - slip) / 10_000) as u64;
                 let min_out = min_out.max(1);
 
-                // Use async version that fetches creator from chain or uses fallback from Geyser
-                match pf.build_swap_ix_async(
+                // Use async version with explicit slippage for proper max_sol_cost calculation
+                // For BUY: max_sol_cost = lamports_in + slippage (we're willing to pay more SOL if price rises)
+                match pf.build_swap_ix_async_with_slippage(
                     &sol_mint.to_string(),
                     &mint.to_string(),
                     lamports_in,
                     min_out,
                     creator, // Pass creator from Geyser event for fresh launches
+                    msb, // Pass slippage in bps for max_sol_cost calculation
                 ).await {
                     Ok(ixs) => {
                         if !ixs.is_empty() {
                             final_ixs = ixs;
-                            info!(mint=%mint, lamports_in, expected_out=pumpfun_quote_out, min_out, "pump.fun swap instructions built");
+                            info!(mint=%mint, lamports_in, expected_out=pumpfun_quote_out, min_out, slippage_bps=msb, "pump.fun swap instructions built");
                         }
                     }
                     Err(e) => {
