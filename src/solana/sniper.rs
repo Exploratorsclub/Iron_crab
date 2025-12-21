@@ -1637,20 +1637,22 @@ impl SniperEngine {
         let msb = self.adaptive_slippage_bps();
 
         // Try Pump.fun ONLY if the pool is actually on Pump.fun
-        // IMPORTANT: Do NOT use fallback mode! The bonding curve MUST exist on-chain before we can buy.
-        // Error 3012 = "Account not initialized" means the bonding curve doesn't exist yet.
+        // CRITICAL: Do NOT use fallback mode! The token mint MUST be finalized on-chain
+        // before we can create an ATA. If RPC can't find the bonding curve, the mint
+        // likely doesn't exist yet (Geyser is faster than finalization).
+        // The ATA CreateIdempotent instruction will fail with "IncorrectProgramId" if
+        // the mint account doesn't exist or isn't owned by the Token Program yet.
         let mut pumpfun_quote_out: u64 = 0;
         if pool_dex_type == crate::solana::geyser_pool_discovery::DexType::PumpFun {
             if let Some(ref pf) = pumpfun {
-                // RE-ENABLED fallback for fresh Pump.fun launches!
-                // The ATA derivation bug (Error 3012) has been FIXED - we now use standard SPL ATA
-                // Fallback enables instant sniping when RPC is slower than Geyser events
+                // DISABLED fallback - we MUST wait for the mint to be on-chain!
+                // Using fallback causes "IncorrectProgramId" because the mint doesn't exist yet
                 if let Ok(Some(q)) = pf
                     .quote_exact_in_with_fallback(
                         &sol_mint.to_string(),
                         &mint.to_string(),
                         lamports_in,
-                        true, // ENABLED fallback - safe now that ATA derivation is fixed
+                        false, // DISABLED fallback - mint must exist before we can create ATA
                     )
                     .await
                 {
