@@ -724,6 +724,13 @@ impl Dex for PumpFunDex {
         ))
     }
 
+    fn list_pairs(&self) -> Vec<(String, String)> {
+        // Pump.fun pairs are dynamic, discovered via Geyser
+        Vec::new()
+    }
+}
+
+impl PumpFunDex {
     /// Async version of build_swap_ix that fetches bonding curve state to get creator
     /// This is the preferred method for building swap instructions
     pub async fn build_swap_ix_async(
@@ -806,11 +813,6 @@ impl Dex for PumpFunDex {
         };
 
         Ok(vec![ix])
-    }
-
-    fn list_pairs(&self) -> Vec<(String, String)> {
-        // Pump.fun pairs are dynamic, discovered via Geyser
-        Vec::new()
     }
 }
 
