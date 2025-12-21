@@ -1992,6 +1992,8 @@ impl SniperEngine {
                     // - AccountNotFound: bonding curve account not indexed yet
                     // - InvalidAccountData: account data not synced yet  
                     // - Invalid Mint (Custom(2)): Token mint not finalized yet when creating ATA
+                    // - IncorrectProgramId: Mint account not yet created/finalized, ATA creation fails
+                    //   because the AToken program can't read the mint's token program
                     let is_pumpfun_fresh_launch = chosen_dex == ChosenDex::PumpFun;
                     let err_str = format!("{:?}", err);
                     let logs_str = sim_result.value.logs.as_ref()
@@ -2000,7 +2002,8 @@ impl SniperEngine {
                     let is_expected_fresh_launch_error = 
                         err_str.contains("AccountNotFound")
                         || err_str.contains("InvalidAccountData")
-                        || (err_str.contains("Custom(2)") && logs_str.contains("Invalid Mint"));
+                        || (err_str.contains("Custom(2)") && logs_str.contains("Invalid Mint"))
+                        || (err_str.contains("IncorrectProgramId") && logs_str.contains("CreateIdempotent"));
                     
                     if is_pumpfun_fresh_launch && is_expected_fresh_launch_error {
                         info!(
