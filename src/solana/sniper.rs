@@ -1637,22 +1637,20 @@ impl SniperEngine {
         let msb = self.adaptive_slippage_bps();
 
         // Try Pump.fun ONLY if the pool is actually on Pump.fun
-        // CRITICAL: Do NOT use fallback mode! The token mint MUST be finalized on-chain
-        // before we can create an ATA. If RPC can't find the bonding curve, the mint
-        // likely doesn't exist yet (Geyser is faster than finalization).
-        // The ATA CreateIdempotent instruction will fail with "IncorrectProgramId" if
-        // the mint account doesn't exist or isn't owned by the Token Program yet.
+        // For Pump.fun fresh launches (from Geyser), use fallback mode for quoting.
+        // The fallback uses the deterministic initial bonding curve state.
+        // The ATA will be created by the TX itself (with skip_preflight), so we don't
+        // need the mint to exist for quoting - only for TX execution.
         let mut pumpfun_quote_out: u64 = 0;
         if pool_dex_type == crate::solana::geyser_pool_discovery::DexType::PumpFun {
             if let Some(ref pf) = pumpfun {
-                // DISABLED fallback - we MUST wait for the mint to be on-chain!
-                // Using fallback causes "IncorrectProgramId" because the mint doesn't exist yet
+                // Use fallback mode for fresh launches - the bonding curve state is deterministic
                 if let Ok(Some(q)) = pf
                     .quote_exact_in_with_fallback(
                         &sol_mint.to_string(),
                         &mint.to_string(),
                         lamports_in,
-                        false, // DISABLED fallback - mint must exist before we can create ATA
+                        true, // ENABLE fallback - use deterministic initial state for quote
                     )
                     .await
                 {
@@ -1982,38 +1980,16 @@ impl SniperEngine {
         let mut tx = Transaction::new_with_payer(&final_ixs, Some(&self.treasury.pubkey()));
         tx.try_sign(&[self.treasury.signer_ref()], bh)?;
 
-        // CRITICAL: Simulate transaction BEFORE sending to avoid wasted SOL on failed TXs!
-        // This catches slippage errors, invalid pool states, honeypots, etc.
-        // NOTE: For Pump.fun, simulation may fail on fresh tokens (bonding curve not indexed yet)
-        // but we still try it to catch obvious errors. If simulation fails with expected errors
-        // for fresh launches, we proceed anyway.
-        match self.rpc.rpc.simulate_transaction(&tx).await {
-            Ok(sim_result) => {
-                if let Some(err) = sim_result.value.err {
-                    // For Pump.fun fresh launches, these errors are expected - proceed anyway:
-                    // - AccountNotFound: bonding curve account not indexed yet
-                    // - InvalidAccountData: account data not synced yet  
-                    // - Invalid Mint (Custom(2)): Token mint not finalized yet when creating ATA
-                    // - IncorrectProgramId: Mint account not yet created/finalized, ATA creation fails
-                    //   because the AToken program can't read the mint's token program
-                    let is_pumpfun_fresh_launch = chosen_dex == ChosenDex::PumpFun;
-                    let err_str = format!("{:?}", err);
-                    let logs_str = sim_result.value.logs.as_ref()
-                        .map(|logs| logs.join(" "))
-                        .unwrap_or_default();
-                    let is_expected_fresh_launch_error = 
-                        err_str.contains("AccountNotFound")
-                        || err_str.contains("InvalidAccountData")
-                        || (err_str.contains("Custom(2)") && logs_str.contains("Invalid Mint"))
-                        || (err_str.contains("IncorrectProgramId") && logs_str.contains("CreateIdempotent"));
-                    
-                    if is_pumpfun_fresh_launch && is_expected_fresh_launch_error {
-                        info!(
-                            mint=%mint,
-                            error=?err,
-                            "sniper: Pump.fun simulation failed (expected for fresh launch - mint not finalized) - proceeding anyway"
-                        );
-                    } else {
+        // CRITICAL: For Pump.fun fresh launches, SKIP simulation entirely!
+        // The RPC is always behind Geyser, so simulation will fail because the mint
+        // doesn't exist yet from RPC's perspective. We send with skip_preflight anyway.
+        // For other DEXs, simulate to catch obvious errors.
+        let should_simulate = chosen_dex != ChosenDex::PumpFun;
+        
+        if should_simulate {
+            match self.rpc.rpc.simulate_transaction(&tx).await {
+                Ok(sim_result) => {
+                    if let Some(err) = sim_result.value.err {
                         warn!(
                             mint=%mint,
                             error=?err,
@@ -2025,15 +2001,21 @@ impl SniperEngine {
                             err,
                             sim_result.value.logs
                         ));
+                    } else {
+                        info!(mint=%mint, chosen_dex=?chosen_dex, "sniper: TX simulation PASSED, proceeding with send");
                     }
-                } else {
-                    info!(mint=%mint, chosen_dex=?chosen_dex, "sniper: TX simulation PASSED, proceeding with send");
+                }
+                Err(e) => {
+                    warn!(mint=%mint, error=?e, "sniper: simulation RPC error - proceeding anyway");
+                    // Don't block on simulation errors - they might be RPC issues
                 }
             }
-            Err(e) => {
-                warn!(mint=%mint, error=?e, "sniper: simulation RPC error - proceeding anyway");
-                // Don't block on simulation errors - they might be RPC issues
-            }
+        } else {
+            info!(
+                mint=%mint, 
+                chosen_dex=?chosen_dex, 
+                "sniper: SKIPPING simulation for Pump.fun fresh launch (RPC is behind Geyser)"
+            );
         }
 
         let sent_at = Instant::now();
