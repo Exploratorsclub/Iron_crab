@@ -1983,21 +1983,30 @@ impl SniperEngine {
         // CRITICAL: Simulate transaction BEFORE sending to avoid wasted SOL on failed TXs!
         // This catches slippage errors, invalid pool states, honeypots, etc.
         // NOTE: For Pump.fun, simulation may fail on fresh tokens (bonding curve not indexed yet)
-        // but we still try it to catch obvious errors. If simulation fails with "account not found",
-        // we proceed anyway for fresh launches.
+        // but we still try it to catch obvious errors. If simulation fails with expected errors
+        // for fresh launches, we proceed anyway.
         match self.rpc.rpc.simulate_transaction(&tx).await {
             Ok(sim_result) => {
                 if let Some(err) = sim_result.value.err {
-                    // For Pump.fun fresh launches, "account not found" is expected - proceed anyway
+                    // For Pump.fun fresh launches, these errors are expected - proceed anyway:
+                    // - AccountNotFound: bonding curve account not indexed yet
+                    // - InvalidAccountData: account data not synced yet  
+                    // - Invalid Mint (Custom(2)): Token mint not finalized yet when creating ATA
                     let is_pumpfun_fresh_launch = chosen_dex == ChosenDex::PumpFun;
-                    let is_account_not_found = format!("{:?}", err).contains("AccountNotFound")
-                        || format!("{:?}", err).contains("InvalidAccountData");
+                    let err_str = format!("{:?}", err);
+                    let logs_str = sim_result.value.logs.as_ref()
+                        .map(|logs| logs.join(" "))
+                        .unwrap_or_default();
+                    let is_expected_fresh_launch_error = 
+                        err_str.contains("AccountNotFound")
+                        || err_str.contains("InvalidAccountData")
+                        || (err_str.contains("Custom(2)") && logs_str.contains("Invalid Mint"));
                     
-                    if is_pumpfun_fresh_launch && is_account_not_found {
+                    if is_pumpfun_fresh_launch && is_expected_fresh_launch_error {
                         info!(
                             mint=%mint,
                             error=?err,
-                            "sniper: Pump.fun simulation failed (expected for fresh launch) - proceeding anyway"
+                            "sniper: Pump.fun simulation failed (expected for fresh launch - mint not finalized) - proceeding anyway"
                         );
                     } else {
                         warn!(
