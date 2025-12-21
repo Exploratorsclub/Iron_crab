@@ -181,6 +181,7 @@ impl GeyserPoolDiscovery {
             liquidity_estimate_lamports: pool_data.liquidity_lamports,
             coin_vault: pool_data.coin_vault,
             pc_vault: pool_data.pc_vault,
+            creator: None, // Account-based discovery doesn't have creator info
         })
     }
 
@@ -436,6 +437,23 @@ impl GeyserPoolDiscovery {
             _ => tx_update.account_keys.first().copied()?,
         };
 
+        // Extract creator (for Pump.fun - needed for new buy instruction accounts)
+        // Pump.fun CREATE instruction accounts:
+        // [0]: Global, [1]: Fee Recipient, [2]: Mint, [3]: Bonding Curve,
+        // [4]: Associated Bonding Curve, [5]: User/Creator (Signer)
+        // However, based on actual tx logs, user is usually at index 6
+        let creator = match dex_type {
+            DexType::PumpFun => {
+                // User/Creator is typically at index 6 in the CREATE instruction
+                // But let's find the first signer that's on-curve and not a known program
+                tx_update.instruction_accounts.iter()
+                    .skip(5) // Skip known accounts: Global, Fee, Mint, Bonding, AssocBonding
+                    .find(|acc| acc.is_on_curve())
+                    .copied()
+            }
+            _ => None,
+        };
+
         // SOL mint for quote
         let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
 
@@ -445,6 +463,7 @@ impl GeyserPoolDiscovery {
             dex = ?dex_type,
             pool = %pool_address,
             token_mint = %token_mint,
+            creator = ?creator,
             account_count = account_count,
             "geyser_pool_discovery: NEW POOL via TRANSACTION (professional method)"
         );
@@ -461,6 +480,7 @@ impl GeyserPoolDiscovery {
             liquidity_estimate_lamports: 30_000_000_000, // Default 30 SOL for new pools
             coin_vault: None,  // Will be fetched in background if needed
             pc_vault: None,
+            creator,
         })
     }
 
@@ -655,6 +675,8 @@ pub struct PoolDiscoveryEvent {
     pub liquidity_estimate_lamports: u64,
     pub coin_vault: Option<Pubkey>,
     pub pc_vault: Option<Pubkey>,
+    /// Creator address (for Pump.fun tokens - needed for buy instruction)
+    pub creator: Option<Pubkey>,
 }
 
 struct PoolData {

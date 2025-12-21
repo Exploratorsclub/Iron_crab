@@ -1233,8 +1233,9 @@ impl SniperEngine {
             );
 
             // Proceed directly to buy attempt with liquidity info
+            // Pass creator from Geyser event for new Pump.fun protocol (16-account format)
             if let Err(e) = self
-                .attempt_initial_buy(&mint, Some(liq_sol), event.dex_type)
+                .attempt_initial_buy(&mint, Some(liq_sol), event.dex_type, event.creator)
                 .await
             {
                 warn!(?e, mint=%mint, "sniper: [Pump.fun] initial buy failed");
@@ -1332,8 +1333,9 @@ impl SniperEngine {
         );
 
         // Proceed to buy attempt
+        // For Raydium/Orca pools, creator is None (only Pump.fun uses it)
         if let Err(e) = self
-            .attempt_initial_buy(&mint, Some(liq_sol), event.dex_type)
+            .attempt_initial_buy(&mint, Some(liq_sol), event.dex_type, None)
             .await
         {
             warn!(?e, mint=%mint, "sniper: initial buy failed");
@@ -1617,6 +1619,7 @@ impl SniperEngine {
         mint: &Pubkey,
         liq_sol: Option<f64>,
         pool_dex_type: crate::solana::geyser_pool_discovery::DexType,
+        creator: Option<Pubkey>, // Required for Pump.fun - creator from Geyser event
     ) -> Result<()> {
         // Choose Raydium first (faster listing) – require connector
         let ray = self.raydium.clone();
@@ -1651,6 +1654,7 @@ impl SniperEngine {
                         &mint.to_string(),
                         lamports_in,
                         true, // ENABLE fallback - use deterministic initial state for quote
+                        creator, // Pass creator from Geyser event for fallback mode
                     )
                     .await
                 {
@@ -1784,12 +1788,14 @@ impl SniperEngine {
                 let min_out = ((pumpfun_quote_out as u128) * (10_000 - slip) / 10_000) as u64;
                 let min_out = min_out.max(1);
 
-                match pf.build_swap_ix(
+                // Use async version that fetches creator from chain or uses fallback from Geyser
+                match pf.build_swap_ix_async(
                     &sol_mint.to_string(),
                     &mint.to_string(),
                     lamports_in,
                     min_out,
-                ) {
+                    creator, // Pass creator from Geyser event for fresh launches
+                ).await {
                     Ok(ixs) => {
                         if !ixs.is_empty() {
                             final_ixs = ixs;
@@ -1797,7 +1803,7 @@ impl SniperEngine {
                         }
                     }
                     Err(e) => {
-                        warn!(mint=%mint, error=?e, "pump.fun build_swap_ix failed");
+                        warn!(mint=%mint, error=?e, "pump.fun build_swap_ix_async failed");
                     }
                 }
             }
@@ -2985,20 +2991,26 @@ impl SniperEngine {
                     .await
                     .unwrap_or_default();
 
-                match pf.build_sell_ix(
-                    &mint_pk,
-                    &bonding_curve,
-                    &associated_bonding_curve,
-                    &user_token_account,
-                    sell_tokens,
-                    min_out,
-                ) {
-                    Ok(ix) => {
-                        tx_ixs = vec![ix];
+                // Fetch bonding curve state to get creator (required for new protocol)
+                if let Some(state) = pf.fetch_bonding_curve_fast(&bonding_curve).await {
+                    match pf.build_sell_ix(
+                        &mint_pk,
+                        &bonding_curve,
+                        &associated_bonding_curve,
+                        &user_token_account,
+                        &state.creator, // Pass creator from bonding curve state
+                        sell_tokens,
+                        min_out,
+                    ) {
+                        Ok(ix) => {
+                            tx_ixs = vec![ix];
+                        }
+                        Err(e) => {
+                            warn!(?e, mint=%mint, "pump.fun build_sell_ix failed");
+                        }
                     }
-                    Err(e) => {
-                        warn!(?e, mint=%mint, "pump.fun build_sell_ix failed");
-                    }
+                } else {
+                    warn!(mint=%mint, bonding_curve=%bonding_curve, "pump.fun: could not fetch bonding curve for sell");
                 }
             }
         } else if chosen_dex == ChosenDex::Raydium {

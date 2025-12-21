@@ -30,33 +30,52 @@ pub const PUMPFUN_FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4
 /// Pump.fun event authority
 pub const PUMPFUN_EVENT_AUTHORITY: &str = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1";
 
+/// Pump.fun fee program (new accounts added to protocol)
+pub const PUMPFUN_FEE_PROGRAM: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
+
+/// Fee config seed constant (32 bytes from IDL)
+pub const FEE_CONFIG_SEED: [u8; 32] = [
+    1, 86, 224, 246, 147, 102, 90, 207, 68, 219, 21, 104, 191, 23, 91, 170,
+    81, 137, 203, 151, 245, 210, 255, 59, 101, 93, 43, 182, 253, 109, 24, 176
+];
+
 /// Bonding curve account data layout
+/// Note: Layout has been updated in recent Pump.fun version
+/// Layout (updated):
+/// - 0-7: discriminator (8 bytes)
+/// - 8-15: virtual_token_reserves (u64)
+/// - 16-23: virtual_sol_reserves (u64)  
+/// - 24-31: real_token_reserves (u64)
+/// - 32-39: real_sol_reserves (u64)
+/// - 40-47: token_total_supply (u64)
+/// - 48: complete (bool)
+/// - 49-80: creator (Pubkey, 32 bytes)
 #[derive(Debug, Clone)]
 pub struct BondingCurveState {
     pub virtual_token_reserves: u64,
     pub virtual_sol_reserves: u64,
     pub real_token_reserves: u64,
     pub real_sol_reserves: u64,
-    pub token_mint: Pubkey,
-    pub bonding_curve: Pubkey,
+    pub token_total_supply: u64,
     pub complete: bool,
+    pub creator: Pubkey,
 }
 
 impl BondingCurveState {
-    /// Parse bonding curve account data
-    /// Layout (from reverse engineering):
-    /// - 0-8: discriminator/version
-    /// - 8-16: virtual_token_reserves (u64)
-    /// - 16-24: virtual_sol_reserves (u64)
-    /// - 24-32: real_token_reserves (u64)
-    /// - 32-40: real_sol_reserves (u64)
-    /// - 40-72: token_mint (Pubkey)
-    /// - 72-104: bonding_curve (Pubkey)
-    /// - 104: complete (bool)
+    /// Parse bonding curve account data (new layout)
+    /// Layout:
+    /// - 0-7: discriminator (8 bytes)
+    /// - 8-15: virtual_token_reserves (u64)
+    /// - 16-23: virtual_sol_reserves (u64)
+    /// - 24-31: real_token_reserves (u64)
+    /// - 32-39: real_sol_reserves (u64)
+    /// - 40-47: token_total_supply (u64)
+    /// - 48: complete (bool)
+    /// - 49-80: creator (Pubkey, 32 bytes)
     pub fn parse(data: &[u8]) -> Result<Self> {
-        if data.len() < 105 {
+        if data.len() < 81 {
             return Err(anyhow!(
-                "bonding curve data too short: {} bytes",
+                "bonding curve data too short: {} bytes (need 81)",
                 data.len()
             ));
         }
@@ -66,9 +85,9 @@ impl BondingCurveState {
             virtual_sol_reserves: u64::from_le_bytes(data[16..24].try_into()?),
             real_token_reserves: u64::from_le_bytes(data[24..32].try_into()?),
             real_sol_reserves: u64::from_le_bytes(data[32..40].try_into()?),
-            token_mint: Pubkey::new_from_array(data[40..72].try_into()?),
-            bonding_curve: Pubkey::new_from_array(data[72..104].try_into()?),
-            complete: data[104] != 0,
+            token_total_supply: u64::from_le_bytes(data[40..48].try_into()?),
+            complete: data[48] != 0,
+            creator: Pubkey::new_from_array(data[49..81].try_into()?),
         })
     }
 
@@ -169,6 +188,28 @@ impl PumpFunDex {
         (Pubkey::new_from_array(ata_spl.to_bytes()), 0)
     }
 
+    /// Derive creator vault PDA (NEW in Pump.fun protocol update)
+    /// Used for creator fee collection in buy/sell instructions
+    pub fn derive_creator_vault(&self, creator: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"creator-vault", creator.as_ref()], &self.program_id)
+    }
+
+    /// Derive global volume accumulator PDA (NEW in Pump.fun protocol update)
+    pub fn derive_global_volume_accumulator(&self) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"global_volume_accumulator"], &self.program_id)
+    }
+
+    /// Derive user volume accumulator PDA (NEW in Pump.fun protocol update)
+    pub fn derive_user_volume_accumulator(&self, user: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"user_volume_accumulator", user.as_ref()], &self.program_id)
+    }
+
+    /// Derive fee config PDA from fee program (NEW in Pump.fun protocol update)
+    pub fn derive_fee_config() -> (Pubkey, u8) {
+        let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM).unwrap();
+        Pubkey::find_program_address(&[b"fee_config", &FEE_CONFIG_SEED], &fee_program)
+    }
+
     /// Fetch bonding curve state from chain
     pub async fn fetch_bonding_curve(&self, bonding_curve: &Pubkey) -> Result<BondingCurveState> {
         let account = self.rpc.get_account_retry(bonding_curve).await?;
@@ -193,36 +234,46 @@ impl PumpFunDex {
     /// Returns the initial state of a Pump.fun bonding curve
     /// Used as fallback when RPC fails to index new pools fast enough
     /// This is the KNOWN initial state for ALL Pump.fun tokens at launch
+    /// Note: creator must be provided as it cannot be inferred from token creation
     pub fn initial_bonding_curve_state(
-        token_mint: Pubkey,
-        bonding_curve: Pubkey,
+        creator: Pubkey,
     ) -> BondingCurveState {
         BondingCurveState {
             virtual_token_reserves: 1_073_000_000_000_000,
             virtual_sol_reserves: 30_000_000_000,
             real_token_reserves: 793_100_000_000_000,
             real_sol_reserves: 30_000_000_000,
-            token_mint,
-            bonding_curve,
+            token_total_supply: 1_000_000_000_000_000, // 1 billion tokens (6 decimals)
             complete: false,
+            creator,
         }
     }
 
     /// Build buy instruction (SOL → Token)
     /// Instruction discriminator: 0x66063d1201daebea (8 bytes)
     /// Uses standard SPL Token program (Pump.fun tokens are NOT Token-2022)
+    /// 
+    /// UPDATED: Now requires 16 accounts (protocol update added fee-related accounts)
     pub fn build_buy_ix(
         &self,
         token_mint: &Pubkey,
         bonding_curve: &Pubkey,
         associated_bonding_curve: &Pubkey,
         user_token_account: &Pubkey,
+        creator: &Pubkey,  // NEW: Creator pubkey for creator_vault derivation
         amount_in: u64,    // SOL lamports
         max_sol_cost: u64, // Slippage protection
     ) -> Result<Instruction> {
         let user = self
             .user_authority
             .ok_or_else(|| anyhow!("user authority not set"))?;
+
+        // Derive new PDAs required by updated protocol
+        let (creator_vault, _) = self.derive_creator_vault(creator);
+        let (global_volume_accumulator, _) = self.derive_global_volume_accumulator();
+        let (user_volume_accumulator, _) = self.derive_user_volume_accumulator(&user);
+        let (fee_config, _) = Self::derive_fee_config();
+        let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM)?;
 
         // Instruction data: discriminator (8 bytes) + amount (8 bytes) + max_cost (8 bytes)
         let mut data = Vec::with_capacity(24);
@@ -234,21 +285,27 @@ impl PumpFunDex {
         Ok(Instruction {
             program_id: self.program_id,
             accounts: vec![
-                AccountMeta::new_readonly(self.global, false),
-                AccountMeta::new(self.fee_recipient, false),
-                AccountMeta::new_readonly(*token_mint, false),
-                AccountMeta::new(*bonding_curve, false),
-                AccountMeta::new(*associated_bonding_curve, false),
-                AccountMeta::new(*user_token_account, false),
-                AccountMeta::new(user, true), // Signer
-                AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false),
+                // Original accounts (indices 0-7)
+                AccountMeta::new_readonly(self.global, false),                              // 0: global
+                AccountMeta::new(self.fee_recipient, false),                                 // 1: fee_recipient
+                AccountMeta::new_readonly(*token_mint, false),                               // 2: mint
+                AccountMeta::new(*bonding_curve, false),                                     // 3: bonding_curve
+                AccountMeta::new(*associated_bonding_curve, false),                          // 4: associated_bonding_curve
+                AccountMeta::new(*user_token_account, false),                                // 5: associated_user (user's ATA)
+                AccountMeta::new(user, true),                                                // 6: user (signer, writable)
+                AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false), // 7: system_program
                 AccountMeta::new_readonly(
                     Pubkey::new_from_array(spl_token::id().to_bytes()),
                     false,
-                ),
-                AccountMeta::new_readonly(sysvar::rent::id(), false),
-                AccountMeta::new_readonly(self.event_authority, false),
-                AccountMeta::new_readonly(self.program_id, false),
+                ),                                                                           // 8: token_program
+                // NEW accounts (indices 9-15) - added in protocol update
+                AccountMeta::new(creator_vault, false),                                      // 9: creator_vault
+                AccountMeta::new_readonly(self.event_authority, false),                      // 10: event_authority
+                AccountMeta::new_readonly(self.program_id, false),                           // 11: program
+                AccountMeta::new_readonly(global_volume_accumulator, false),                 // 12: global_volume_accumulator
+                AccountMeta::new(user_volume_accumulator, false),                            // 13: user_volume_accumulator
+                AccountMeta::new_readonly(fee_config, false),                                // 14: fee_config
+                AccountMeta::new_readonly(fee_program, false),                               // 15: fee_program
             ],
             data,
         })
@@ -263,12 +320,18 @@ impl PumpFunDex {
         bonding_curve: &Pubkey,
         associated_bonding_curve: &Pubkey,
         user_token_account: &Pubkey,
+        creator: &Pubkey,    // NEW: Creator pubkey for creator_vault derivation
         amount_in: u64,      // Token amount
         min_sol_output: u64, // Slippage protection
     ) -> Result<Instruction> {
         let user = self
             .user_authority
             .ok_or_else(|| anyhow!("user authority not set"))?;
+
+        // Derive new PDAs required by updated protocol
+        let (creator_vault, _) = self.derive_creator_vault(creator);
+        let (fee_config, _) = Self::derive_fee_config();
+        let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM)?;
 
         // Instruction data: discriminator (8 bytes) + amount (8 bytes) + min_output (8 bytes)
         let mut data = Vec::with_capacity(24);
@@ -280,24 +343,25 @@ impl PumpFunDex {
         Ok(Instruction {
             program_id: self.program_id,
             accounts: vec![
-                AccountMeta::new_readonly(self.global, false),
-                AccountMeta::new(self.fee_recipient, false),
-                AccountMeta::new_readonly(*token_mint, false),
-                AccountMeta::new(*bonding_curve, false),
-                AccountMeta::new(*associated_bonding_curve, false),
-                AccountMeta::new(*user_token_account, false),
-                AccountMeta::new(user, true), // Signer
-                AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false),
-                AccountMeta::new_readonly(
-                    Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
-                    false,
-                ),
+                // Original accounts (indices 0-7)
+                AccountMeta::new_readonly(self.global, false),                              // 0: global
+                AccountMeta::new(self.fee_recipient, false),                                 // 1: fee_recipient
+                AccountMeta::new_readonly(*token_mint, false),                               // 2: mint
+                AccountMeta::new(*bonding_curve, false),                                     // 3: bonding_curve
+                AccountMeta::new(*associated_bonding_curve, false),                          // 4: associated_bonding_curve
+                AccountMeta::new(*user_token_account, false),                                // 5: associated_user (user's ATA)
+                AccountMeta::new(user, true),                                                // 6: user (signer, writable)
+                AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false), // 7: system_program
+                // NEW accounts (indices 8-13) - added in protocol update
+                AccountMeta::new(creator_vault, false),                                      // 8: creator_vault
                 AccountMeta::new_readonly(
                     Pubkey::new_from_array(spl_token::id().to_bytes()),
                     false,
-                ),
-                AccountMeta::new_readonly(self.event_authority, false),
-                AccountMeta::new_readonly(self.program_id, false),
+                ),                                                                           // 9: token_program
+                AccountMeta::new_readonly(self.event_authority, false),                      // 10: event_authority
+                AccountMeta::new_readonly(self.program_id, false),                           // 11: program
+                AccountMeta::new_readonly(fee_config, false),                                // 12: fee_config
+                AccountMeta::new_readonly(fee_program, false),                               // 13: fee_program
             ],
             data,
         })
@@ -310,12 +374,16 @@ impl PumpFunDex {
     /// 1. Geyser CREATE means the bonding curve is being created in this block
     /// 2. The initial state of ALL Pump.fun bonding curves is deterministic
     /// 3. By the time our tx lands, the bonding curve will exist on-chain
+    ///
+    /// # Arguments
+    /// * `fallback_creator` - Creator pubkey for fallback mode (from Geyser event)
     pub async fn quote_exact_in_with_fallback(
         &self,
         input_mint: &str,
         output_mint: &str,
         amount_in: u64,
         use_fallback: bool,
+        fallback_creator: Option<Pubkey>,
     ) -> Result<Option<Quote>> {
         let sol_mint = "So11111111111111111111111111111111111111112";
 
@@ -389,12 +457,19 @@ impl PumpFunDex {
                     // 1. The Geyser CREATE event proves the bonding curve is being created NOW
                     // 2. All Pump.fun bonding curves start with the same deterministic state
                     // 3. Our transaction will land AFTER the CREATE tx (same or later block)
+                    
+                    // Need creator for the new buy instruction account format
+                    let creator = fallback_creator.ok_or_else(|| {
+                        anyhow!("fallback mode requires creator pubkey from Geyser event")
+                    })?;
+                    
                     warn!(
                         token_mint=%token_mint_str,
                         bonding_curve=%bonding_curve,
+                        creator=%creator,
                         "pump.fun: ⚡ USING INITIAL STATE FALLBACK - RPC too slow, bonding curve being created"
                     );
-                    Self::initial_bonding_curve_state(token_mint, bonding_curve)
+                    Self::initial_bonding_curve_state(creator)
                 } else {
                     info!(
                         token_mint=%token_mint_str,
@@ -637,10 +712,27 @@ impl Dex for PumpFunDex {
 
     fn build_swap_ix(
         &self,
+        _input_mint: &str,
+        _output_mint: &str,
+        _amount_in: u64,
+        _min_out: u64,
+    ) -> Result<Vec<Instruction>> {
+        // DEPRECATED: This sync function cannot get the creator from bonding curve
+        // Use build_swap_ix_async instead which fetches creator from chain
+        Err(anyhow!(
+            "build_swap_ix is deprecated for Pump.fun - use build_swap_ix_async instead"
+        ))
+    }
+
+    /// Async version of build_swap_ix that fetches bonding curve state to get creator
+    /// This is the preferred method for building swap instructions
+    pub async fn build_swap_ix_async(
+        &self,
         input_mint: &str,
         output_mint: &str,
         amount_in: u64,
         min_out: u64,
+        fallback_creator: Option<Pubkey>, // Creator from Geyser event for fresh launches
     ) -> Result<Vec<Instruction>> {
         let sol_mint = "So11111111111111111111111111111111111111112";
 
@@ -658,12 +750,26 @@ impl Dex for PumpFunDex {
         let (associated_bonding_curve, _bump2) =
             self.derive_associated_bonding_curve(&bonding_curve, &token_mint);
 
+        // Try to fetch bonding curve to get creator
+        let creator = if let Some(state) = self.fetch_bonding_curve_fast(&bonding_curve).await {
+            state.creator
+        } else if let Some(fallback) = fallback_creator {
+            // Use fallback creator from Geyser event for fresh launches
+            warn!(
+                token_mint = %token_mint_str,
+                fallback_creator = %fallback,
+                "Using fallback creator for swap instruction (bonding curve not indexed yet)"
+            );
+            fallback
+        } else {
+            return Err(anyhow!("Cannot build swap: bonding curve not found and no fallback creator provided"));
+        };
+
         let user = self
             .user_authority
             .ok_or_else(|| anyhow!("user authority not set"))?;
 
         // Derive user token account (ATA) using standard SPL Token program
-        // Pump.fun tokens use standard Token Program (NOT Token-2022!)
         let user_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(user.to_bytes());
         let token_mint_spl =
             spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint.to_bytes());
@@ -678,25 +784,22 @@ impl Dex for PumpFunDex {
         let user_token_account = Pubkey::new_from_array(user_token_account_spl.to_bytes());
 
         let ix = if buy_token {
-            // Buy: SOL → Token
-            // Pump.fun buy instruction takes (amount_tokens, max_sol_cost)
-            // We use min_out (calculated tokens) as the amount to buy
-            // We use amount_in (SOL) as the max cost
             self.build_buy_ix(
                 &token_mint,
                 &bonding_curve,
                 &associated_bonding_curve,
                 &user_token_account,
+                &creator,
                 min_out,   // amount (tokens)
                 amount_in, // max_sol_cost (SOL)
             )?
         } else {
-            // Sell: Token → SOL
             self.build_sell_ix(
                 &token_mint,
                 &bonding_curve,
                 &associated_bonding_curve,
                 &user_token_account,
+                &creator,
                 amount_in,
                 min_out,
             )?
