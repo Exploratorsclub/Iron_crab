@@ -8,9 +8,9 @@ use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::wallet::Treasury;
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::bs58;
+use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::Transaction;
-use spl_token::instruction as token_instruction;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -55,24 +55,33 @@ async fn burn_and_close_account(
         task.mint, task.amount
     );
 
-    // Build burn instruction
-    let burn_ix = token_instruction::burn(
-        &token_program_id,
-        &task.ta_pubkey,
-        &task.mint,
-        &treasury.pubkey(),
-        &[],
-        task.amount,
-    )?;
+    // Build burn instruction manually (SPL Token instruction index 8 = Burn)
+    // Accounts: [token_account (writable), mint (writable), owner/delegate (signer)]
+    // Data: [8 (instruction index), amount (u64 LE)]
+    let mut burn_data = vec![8u8]; // Burn instruction index
+    burn_data.extend_from_slice(&task.amount.to_le_bytes());
+    
+    let burn_ix = Instruction {
+        program_id: token_program_id,
+        accounts: vec![
+            AccountMeta::new(task.ta_pubkey, false),      // token account (writable)
+            AccountMeta::new(task.mint, false),           // mint (writable)
+            AccountMeta::new_readonly(treasury.pubkey(), true), // owner (signer)
+        ],
+        data: burn_data,
+    };
 
-    // Build close account instruction
-    let close_ix = token_instruction::close_account(
-        &token_program_id,
-        &task.ta_pubkey,
-        &treasury.pubkey(), // destination for rent
-        &treasury.pubkey(), // owner
-        &[],
-    )?;
+    // Build close account instruction manually (SPL Token instruction index 9 = CloseAccount)
+    // Accounts: [account_to_close (writable), destination (writable), owner (signer)]
+    let close_ix = Instruction {
+        program_id: token_program_id,
+        accounts: vec![
+            AccountMeta::new(task.ta_pubkey, false),      // account to close (writable)
+            AccountMeta::new(treasury.pubkey(), false),   // destination for rent (writable)
+            AccountMeta::new_readonly(treasury.pubkey(), true), // owner (signer)
+        ],
+        data: vec![9u8], // CloseAccount instruction index
+    };
 
     let latest_blockhash = rpc.get_latest_blockhash_retry().await?;
     let mut tx = Transaction::new_with_payer(&[burn_ix, close_ix], Some(&treasury.pubkey()));
