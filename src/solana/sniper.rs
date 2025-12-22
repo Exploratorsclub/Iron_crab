@@ -3364,6 +3364,33 @@ impl SniperEngine {
             amount_tokens
         };
         if ata_tokens == 0 {
+            // No tokens in wallet - position is stale, clean it up
+            info!(
+                mint=%mint, 
+                lot_idx=lot_idx,
+                state_tokens=amount_tokens,
+                "attempt_exit: wallet has 0 tokens, removing ghost position from state"
+            );
+            // Remove this position from risk state
+            {
+                let mut rs = self.risk.write();
+                if let Some(lots) = rs.open.get_mut(mint) {
+                    if lot_idx < lots.len() {
+                        lots.remove(lot_idx);
+                        info!(mint=%mint, lot_idx=lot_idx, remaining_lots=lots.len(), "removed ghost lot from position");
+                    }
+                    // If no lots remain, remove the mint entry entirely
+                    if lots.is_empty() {
+                        rs.open.remove(mint);
+                        info!(mint=%mint, "removed empty position entry");
+                    }
+                }
+            }
+            self.persist_risk_state();
+            // Unregister from kill switch if active
+            if let Some(ks) = &self.kill_switch {
+                ks.unregister_position(mint);
+            }
             return Ok(());
         }
         // Cap sale to both requested amount_tokens and on-chain balance (safety)
