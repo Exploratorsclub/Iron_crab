@@ -17,13 +17,12 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
     pubkey::Pubkey,
-    signature::Signature,
     transaction::Transaction,
 };
+use solana_system_program::instruction::transfer;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Jito tip accounts - one of these must receive the tip
 const JITO_TIP_ACCOUNTS: &[&str] = &[
@@ -175,49 +174,21 @@ impl JitoClient {
     /// Build a tip instruction to pay Jito validators
     /// This should be the LAST instruction in the bundle
     pub fn build_tip_instruction(
+        &self,
         payer: &Pubkey,
         tip_lamports: u64,
-    ) -> solana_sdk::instruction::Instruction {
+    ) -> Result<solana_sdk::instruction::Instruction> {
         let tip_account = Self::random_tip_account();
-        solana_sdk::system_instruction::transfer(payer, &tip_account, tip_lamports)
+        Ok(transfer(payer, &tip_account, tip_lamports))
     }
     
-    /// Add tip instruction to existing transaction
-    /// Returns a new transaction with the tip added as the last instruction
-    pub fn add_tip_to_transaction(
+    /// Add tip instruction to existing transaction instructions
+    /// Note: Caller should rebuild transaction with the returned instructions
+    pub fn build_tip_ix_for_payer(
         &self,
-        tx: &Transaction,
         payer: &Pubkey,
-    ) -> Transaction {
-        let mut ixs: Vec<solana_sdk::instruction::Instruction> = tx.message.instructions
-            .iter()
-            .map(|ix| {
-                let program_id = tx.message.account_keys[ix.program_id_index as usize];
-                let accounts: Vec<solana_sdk::instruction::AccountMeta> = ix.accounts
-                    .iter()
-                    .map(|idx| {
-                        let pubkey = tx.message.account_keys[*idx as usize];
-                        let is_signer = tx.message.is_signer(*idx as usize);
-                        let is_writable = tx.message.is_writable(*idx as usize);
-                        if is_writable {
-                            solana_sdk::instruction::AccountMeta::new(pubkey, is_signer)
-                        } else {
-                            solana_sdk::instruction::AccountMeta::new_readonly(pubkey, is_signer)
-                        }
-                    })
-                    .collect();
-                solana_sdk::instruction::Instruction {
-                    program_id,
-                    accounts,
-                    data: ix.data.clone(),
-                }
-            })
-            .collect();
-        
-        // Add tip as last instruction
-        ixs.push(Self::build_tip_instruction(payer, self.tip_lamports));
-        
-        Transaction::new_with_payer(&ixs, Some(payer))
+    ) -> Result<solana_sdk::instruction::Instruction> {
+        self.build_tip_instruction(payer, self.tip_lamports)
     }
     
     /// Submit a bundle of transactions to Jito
@@ -409,22 +380,17 @@ impl BundleBuilder {
         self
     }
     
-    /// Build the bundle - adds tip to the last transaction
+    /// Build the bundle - note: tip should be added to last TX before calling this
     /// 
     /// Returns transactions ready for signing
-    pub fn build(mut self) -> Vec<Transaction> {
-        if self.transactions.is_empty() {
-            return vec![];
-        }
-        
-        // Add tip instruction to the last transaction
-        if let Some(last_tx) = self.transactions.pop() {
-            let jito = JitoClient::new(vec![], self.tip_lamports);
-            let tx_with_tip = jito.add_tip_to_transaction(&last_tx, &self.payer);
-            self.transactions.push(tx_with_tip);
-        }
-        
+    pub fn build(self) -> Vec<Transaction> {
         self.transactions
+    }
+    
+    /// Get tip instruction for the payer (add to last TX manually)
+    pub fn get_tip_instruction(&self) -> Result<solana_sdk::instruction::Instruction> {
+        let tip_account = JitoClient::random_tip_account();
+        Ok(transfer(&self.payer, &tip_account, self.tip_lamports))
     }
     
     /// Get current transaction count

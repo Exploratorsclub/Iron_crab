@@ -3767,36 +3767,45 @@ impl SniperEngine {
                     info!(bundle_id = %bundle_id, mint = %mint, tip_lamports = tip_lamports, "Jito bundle submitted");
                     // Wait for bundle confirmation (with timeout)
                     match jito_client.wait_for_bundle(&bundle_id, 30).await {
-                        Ok(true) => {
-                            info!(bundle_id = %bundle_id, "Jito bundle LANDED successfully");
+                        Ok(status) => {
+                            // Bundle landed successfully
+                            info!(
+                                bundle_id = %bundle_id,
+                                slot = status.slot,
+                                confirmation = %status.confirmation_status,
+                                "Jito bundle LANDED successfully"
+                            );
                             crate::metrics::JITO_BUNDLES_LANDED_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             // Return the first signature from the transaction
                             Ok(tx_with_tip.signatures[0])
                         }
-                        Ok(false) => {
-                            warn!(
-                                bundle_id = %bundle_id,
-                                tip_lamports = tip_lamports,
-                                "Jito bundle REJECTED/NOT LANDED - tip may be too low or slot competition high"
-                            );
-                            crate::metrics::JITO_BUNDLES_REJECTED_TOTAL
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Err(e) => {
+                            // Bundle failed or timed out
+                            let error_msg = format!("{:?}", e);
+                            let is_timeout = error_msg.contains("timeout") || error_msg.contains("Timeout");
+                            
+                            if is_timeout {
+                                warn!(
+                                    ?e,
+                                    bundle_id = %bundle_id,
+                                    "Jito bundle status check TIMEOUT - network issue?"
+                                );
+                                crate::metrics::JITO_BUNDLES_TIMEOUT_TOTAL
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                warn!(
+                                    ?e,
+                                    bundle_id = %bundle_id,
+                                    tip_lamports = tip_lamports,
+                                    "Jito bundle REJECTED/FAILED - tip may be too low or slot competition high"
+                                );
+                                crate::metrics::JITO_BUNDLES_REJECTED_TOTAL
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             crate::metrics::JITO_FALLBACK_RPC_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             // Fallback to normal RPC submission
-                            self.rpc_retry_tx(&tx, 3, false).await
-                        }
-                        Err(e) => {
-                            warn!(
-                                ?e,
-                                bundle_id = %bundle_id,
-                                "Jito bundle status check TIMEOUT - network issue?"
-                            );
-                            crate::metrics::JITO_BUNDLES_TIMEOUT_TOTAL
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            crate::metrics::JITO_FALLBACK_RPC_TOTAL
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             self.rpc_retry_tx(&tx, 3, false).await
                         }
                     }
