@@ -4470,6 +4470,17 @@ impl SniperEngine {
             if amount_raw == 0 {
                 continue;
             }
+            
+            // Skip dust amounts (less than 1000 raw tokens = 0.001 for 6 decimal tokens)
+            // These are worthless and cannot be sold for any SOL
+            if amount_raw < 1000 {
+                debug!(
+                    mint=%mint_str,
+                    amount_raw=amount_raw,
+                    "sniper: [WALLET SCAN] skipping dust position (< 1000 raw tokens)"
+                );
+                continue;
+            }
 
             let token_mint = match solana_sdk::pubkey::Pubkey::from_str(&mint_str) {
                 Ok(pk) => pk,

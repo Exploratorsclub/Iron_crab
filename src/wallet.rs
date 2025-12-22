@@ -515,34 +515,38 @@ impl Treasury {
             ixs.push(create_ix);
         }
 
-        // Transfer SOL to WSOL ATA
-        let ix_transfer = SdkInstruction {
-            program_id: system_program_id(),
-            accounts: vec![
-                SdkAccountMeta {
-                    pubkey: owner,
-                    is_signer: true,
-                    is_writable: true,
+        // Only add transfer and sync if lamports > 0
+        // When lamports=0, we just want to ensure the ATA exists
+        if lamports > 0 {
+            // Transfer SOL to WSOL ATA
+            let ix_transfer = SdkInstruction {
+                program_id: system_program_id(),
+                accounts: vec![
+                    SdkAccountMeta {
+                        pubkey: owner,
+                        is_signer: true,
+                        is_writable: true,
+                    },
+                    SdkAccountMeta {
+                        pubkey: ata,
+                        is_signer: false,
+                        is_writable: true,
+                    },
+                ],
+                data: {
+                    let mut d = Vec::with_capacity(4 + 8);
+                    d.extend_from_slice(&2u32.to_le_bytes()); // Transfer discriminator
+                    d.extend_from_slice(&lamports.to_le_bytes());
+                    d
                 },
-                SdkAccountMeta {
-                    pubkey: ata,
-                    is_signer: false,
-                    is_writable: true,
-                },
-            ],
-            data: {
-                let mut d = Vec::with_capacity(4 + 8);
-                d.extend_from_slice(&2u32.to_le_bytes()); // Transfer discriminator
-                d.extend_from_slice(&lamports.to_le_bytes());
-                d
-            },
-        };
-        ixs.push(ix_transfer);
+            };
+            ixs.push(ix_transfer);
 
-        // Sync native - ALWAYS use classic SPL Token program for WSOL
-        let ata_prog = sdk_to_spl(&ata);
-        let ix_sync = prog_ix_to_sdk(spl_ix::sync_native(&spl_token_program_id(), &ata_prog)?);
-        ixs.push(ix_sync);
+            // Sync native - ALWAYS use classic SPL Token program for WSOL
+            let ata_prog = sdk_to_spl(&ata);
+            let ix_sync = prog_ix_to_sdk(spl_ix::sync_native(&spl_token_program_id(), &ata_prog)?);
+            ixs.push(ix_sync);
+        }
 
         Ok((ata, ixs))
     }
@@ -551,6 +555,11 @@ impl Treasury {
     /// DEPRECATED: Use build_wrap_sol_ixs to include wrapping in swap TX instead.
     pub async fn wrap_sol(&self, rpc: &SolanaRpc, lamports: u64) -> Result<(SdkPubkey, Signature)> {
         let (ata, ixs) = self.build_wrap_sol_ixs(rpc, lamports).await?;
+
+        // If no instructions needed (ATA exists and lamports=0), return early
+        if ixs.is_empty() {
+            return Ok((ata, Signature::default()));
+        }
 
         let bh = rpc.rpc.get_latest_blockhash().await?;
         let mut tx = Transaction::new_with_payer(&ixs, Some(&self.pubkey()));
