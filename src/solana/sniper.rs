@@ -2888,8 +2888,9 @@ impl SniperEngine {
                 }
                 let sell_tokens = (pos.amount_tokens * fraction).floor() as u64;
                 if sell_tokens > 0 {
+                    // Pass stop_trigger flag so attempt_exit can use higher slippage for emergency exits
                     if let Err(e) = self
-                        .attempt_exit(&mint, lot_idx, sell_tokens, fraction)
+                        .attempt_exit(&mint, lot_idx, sell_tokens, fraction, stop_trigger || full_exit)
                         .await
                     {
                         warn!(?e, mint=%mint, "exit tx failed");
@@ -2917,6 +2918,7 @@ impl SniperEngine {
         lot_idx: usize,
         amount_tokens: u64,
         fraction: f64,
+        is_emergency_exit: bool, // Stop-loss or full exit - use higher slippage
     ) -> Result<()> {
         let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
         // Determine actual token balance (ATA) to avoid over-selling
@@ -2967,7 +2969,16 @@ impl SniperEngine {
         };
 
         // Dynamic route selection for exit: compare Raydium vs Orca vs Pump.fun quotes
-        let msb2 = self.adaptive_slippage_bps();
+        // For emergency exits (stop-loss), use much higher slippage (50%) to ensure execution
+        let msb2 = if is_emergency_exit {
+            5000 // 50% slippage for emergency exits - GET OUT at any cost
+        } else {
+            self.adaptive_slippage_bps()
+        };
+        
+        if is_emergency_exit {
+            info!(mint=%mint, slippage_bps=msb2, "attempt_exit: EMERGENCY EXIT - using high slippage");
+        }
         let ray_plan = if let Some(r) = &self.raydium {
             r.build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), sell_tokens, msb2)
                 .await
