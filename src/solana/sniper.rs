@@ -16,7 +16,7 @@ use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
 use crate::solana::dex::{orca::Orca, pumpfun::PumpFunDex, raydium::Raydium, Dex};
 use crate::solana::geyser_pool_discovery::PoolDiscoveryEvent;
-use crate::solana::kill_switch::{KillSwitchMonitor, KillSwitchReason, TokenTradeEvent};
+use crate::solana::kill_switch::KillSwitchMonitor;
 use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
 use anyhow::Result;
@@ -2554,14 +2554,15 @@ impl SniperEngine {
                 };
                 rs.open.entry(mint).or_default().push(lot);
                 
-                // Register with kill switch monitor if enabled
-                drop(rs); // Release lock before async call
+                // Count positions before dropping lock
+                let lots: usize = rs.open.values().map(|v| v.len()).sum();
+                drop(rs); // Release write lock
+                
+                // Register with kill switch monitor if enabled (no lock needed)
                 if let Some(ks) = &self.kill_switch {
                     ks.register_position(mint, None); // TODO: Pass creator pubkey
                 }
-                let rs = self.risk.read();
                 
-                let lots: usize = rs.open.values().map(|v| v.len()).sum();
                 OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
                 info!(
                     mint=%mint,
@@ -2574,10 +2575,13 @@ impl SniperEngine {
                 );
             }
             
-            // Decrement pending_buys since position is now recorded
-            if rs.pending_buys > 0 { rs.pending_buys -= 1; }
+            // Decrement pending_buys since position is now recorded (re-acquire write lock)
+            {
+                let mut rs = self.risk.write();
+                if rs.pending_buys > 0 { rs.pending_buys -= 1; }
+            }
             
-            let entry_price_last = rs
+            let entry_price_last = self.risk.read()
                 .open
                 .get(&mint)
                 .and_then(|v| v.last())
