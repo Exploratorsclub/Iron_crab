@@ -951,6 +951,22 @@ impl SniperEngine {
     async fn handle_pool_discovery(&self, event: PoolDiscoveryEvent) {
         let mint = event.base_mint;
 
+        // CRITICAL: Check max_open_positions FIRST - before ANY validation or Helius calls!
+        // This saves API quota and prevents unnecessary processing.
+        {
+            let rs = self.risk.read();
+            let cfg = self.cfg.read();
+            if let Some(mop) = cfg.max_open_positions {
+                let current_count: usize = rs.open.values().map(|v| v.len()).sum();
+                let total_exposure = current_count + rs.pending_buys;
+                if total_exposure >= mop {
+                    debug!(mint=%mint, current=current_count, pending=rs.pending_buys, max=mop, 
+                        "sniper: max_open_positions reached - skipping ALL validation (saving Helius quota)");
+                    return;
+                }
+            }
+        }
+
         // CRITICAL: Deduplication - prevent multiple parallel tasks processing same mint
         // Same token can appear in multiple pool discovery events (different pools/bonding curves)
         // Each spawned task would create ATAs and waste SOL on failed swaps
@@ -2719,6 +2735,31 @@ impl SniperEngine {
     }
 
     async fn evaluate_positions(&self) -> Result<()> {
+        // CRITICAL: Clean up ghost positions (amount_tokens = 0 after TX failure)
+        // These can accumulate when buy TXs fail after position was reserved.
+        // Only remove if position is older than 2 minutes (allow finalize_fill time to run)
+        {
+            let now = chrono::Utc::now().timestamp();
+            let mut rs = self.risk.write();
+            let mut cleaned = 0usize;
+            for lots in rs.open.values_mut() {
+                let before = lots.len();
+                lots.retain(|lot| {
+                    // Keep if has tokens OR is less than 2 minutes old
+                    let age_secs = now - lot.opened_ts;
+                    lot.amount_tokens > 0.0 || age_secs < 120
+                });
+                cleaned += before - lots.len();
+            }
+            // Remove empty mint entries
+            rs.open.retain(|_, lots| !lots.is_empty());
+            if cleaned > 0 {
+                info!(cleaned_ghost_positions=cleaned, "evaluate_positions: removed ghost positions (amount_tokens=0, age>2min)");
+                drop(rs);
+                self.persist_risk_state();
+            }
+        }
+        
         // Skip if no thresholds configured
         {
             let r = self.cfg.read();

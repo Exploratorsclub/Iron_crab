@@ -232,7 +232,7 @@ impl GeyserPoolDiscovery {
 
         // DEBUG: Log complete account_keys array to analyze structure
         if dex_type == DexType::PumpFun {
-            tracing::info!(
+            tracing::debug!(
                 message = "DEBUG: Pump.fun CREATE - instruction accounts",
                 account_count = tx_update.account_keys.len(),
                 instruction_count = tx_update.instruction_accounts.len(),
@@ -273,8 +273,8 @@ impl GeyserPoolDiscovery {
                 if tx_update.instruction_data.len() >= 8 {
                     let discriminator = &tx_update.instruction_data[0..8];
 
-                    // DEBUG: Log discriminator for analysis (INFO level to ensure visibility)
-                    tracing::info!(
+                    // DEBUG: Log discriminator for analysis
+                    tracing::debug!(
                         signature = %tx_update.signature,
                         discriminator_hex = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
                             discriminator[0], discriminator[1], discriminator[2], discriminator[3],
