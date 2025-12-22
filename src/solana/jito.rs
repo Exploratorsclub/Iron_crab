@@ -17,9 +17,9 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
     pubkey::Pubkey,
-    system_instruction,
     transaction::Transaction,
 };
+use solana_system_program::system_instruction;
 use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, info, warn};
