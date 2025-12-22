@@ -70,7 +70,7 @@ params = { }
 [sniper]
 max_buy_sol = 0.005  # 5 millis per buy (small test size)
 max_position_sol = 0.02  # 20 millis max per position
-max_open_positions = 2  # Only 2 positions max (you have 72 millis total)
+max_open_positions = 10  # 10 positions max
 per_mint_position_limit = 1
 
 daily_loss_limit_sol = 0.05  # 50 millis max loss per day (70% of capital)
