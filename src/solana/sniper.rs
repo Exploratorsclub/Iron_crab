@@ -2388,6 +2388,10 @@ impl SniperEngine {
             remaining_pending=rs.pending_buys,
             "sniper: [POSITION RECORDED] new position registered"
         );
+        
+        // Persist immediately so max_open_positions works correctly on restart
+        drop(rs); // Release lock before persisting
+        self.persist_risk_state();
     }
 
     async fn finalize_fill(&self, mint: Pubkey) {
@@ -2663,6 +2667,9 @@ impl SniperEngine {
                     network_fee_exact=exact_network_fee
                 );
                     self.append_trade_record(&line, true);
+                    
+                    // Persist state after fill is finalized with accurate token amounts
+                    self.persist_risk_state();
                 }
             }
         }
@@ -3639,16 +3646,41 @@ impl SniperEngine {
         info!(owner=%owner, "sniper: scanning wallet for existing token positions...");
 
         // Get all token accounts owned by this wallet
-        // Convert spl_token::id() to solana_sdk::pubkey::Pubkey
+        // Need to check both SPL Token and Token-2022 programs
         let spl_token_prog = solana_sdk::pubkey::Pubkey::new_from_array(spl_token::id().to_bytes());
-        let token_accounts = self
+        let owner_sdk = solana_sdk::pubkey::Pubkey::new_from_array(owner.to_bytes());
+        
+        // Token-2022 program ID
+        let spl_token_2022_prog = solana_sdk::pubkey::Pubkey::from_str(
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+        ).unwrap();
+        
+        // Fetch accounts from both programs
+        let token_accounts_spl = self
             .rpc
             .rpc
             .get_token_accounts_by_owner(
-                &solana_sdk::pubkey::Pubkey::new_from_array(owner.to_bytes()),
+                &owner_sdk,
                 solana_client::rpc_request::TokenAccountsFilter::ProgramId(spl_token_prog),
             )
-            .await?;
+            .await
+            .unwrap_or_default();
+            
+        let token_accounts_2022 = self
+            .rpc
+            .rpc
+            .get_token_accounts_by_owner(
+                &owner_sdk,
+                solana_client::rpc_request::TokenAccountsFilter::ProgramId(spl_token_2022_prog),
+            )
+            .await
+            .unwrap_or_default();
+        
+        info!(
+            spl_token_count = token_accounts_spl.len(),
+            token_2022_count = token_accounts_2022.len(),
+            "sniper: found token accounts in wallet"
+        );
 
         let mut positions_found = 0;
         let mut already_tracked = 0;
@@ -3658,8 +3690,11 @@ impl SniperEngine {
             solana_sdk::pubkey::Pubkey::from_str("So11111111111111111111111111111111111111112")
                 .unwrap();
 
+        // Combine both token account lists
+        let all_token_accounts = token_accounts_spl.into_iter().chain(token_accounts_2022.into_iter());
+
         // Response is Vec<RpcKeyedAccount> directly (not wrapped in .value)
-        for account in token_accounts {
+        for account in all_token_accounts {
             // Parse the token account data - handle different encoding formats
             let data: Vec<u8> =
                 if let solana_account_decoder::UiAccountData::Binary(b64_str, _encoding) =
@@ -3755,6 +3790,12 @@ impl SniperEngine {
                 max=max_pos,
                 "sniper: [WARNING] max_open_positions already reached! No new buys will be allowed."
             );
+        }
+        
+        // Persist state so wallet scan results survive restart
+        if positions_found > 0 {
+            self.persist_risk_state();
+            info!(positions_found=positions_found, "sniper: persisted wallet scan results to state file");
         }
 
         Ok(())

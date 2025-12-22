@@ -458,28 +458,41 @@ impl Engine {
                 }
 
                 // PROFESSIONAL: Setup real-time vault balance subscriptions (batched)
-                tracing::info!("arbitrage_task: starting background vault balance refresh task");
+                // Configurable via [orca].vault_refresh_interval_secs (0 = disabled)
+                let vault_refresh_secs = ctx_arb.cfg.orca.as_ref()
+                    .and_then(|o| o.vault_refresh_interval_secs)
+                    .unwrap_or(5); // Default 5 seconds for backwards compatibility
 
-                let orc_for_refresh = orc.clone();
-                tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-                    interval.tick().await; // Skip first tick (immediate)
+                if vault_refresh_secs > 0 {
+                    tracing::info!(
+                        interval_secs = vault_refresh_secs,
+                        "arbitrage_task: starting background vault balance refresh task"
+                    );
 
-                    loop {
-                        interval.tick().await;
+                    let orc_for_refresh = orc.clone();
+                    tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(vault_refresh_secs));
+                        interval.tick().await; // Skip first tick (immediate)
 
-                        match orc_for_refresh.batch_refresh_vault_balances().await {
-                            Ok(()) => {}
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Failed to batch refresh vault balances");
+                        loop {
+                            interval.tick().await;
+
+                            match orc_for_refresh.batch_refresh_vault_balances().await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Failed to batch refresh vault balances");
+                                }
                             }
                         }
-                    }
-                });
+                    });
 
-                tracing::info!(
-                    "arbitrage_task: background vault refresh task started (5s interval)"
-                );
+                    tracing::info!(
+                        interval_secs = vault_refresh_secs,
+                        "arbitrage_task: background vault refresh task started"
+                    );
+                } else {
+                    tracing::info!("arbitrage_task: vault refresh DISABLED (vault_refresh_interval_secs=0)");
+                }
 
                 let arb = Arc::new(
                     ArbitrageEngine::new(rpc.clone(), vec![ray.clone(), orc.clone()])

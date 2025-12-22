@@ -319,6 +319,11 @@ pub struct OrcaCfg {
     /// Higher values = more cache warming but slower startup. Default: 100
     #[serde(default)]
     pub prefetch_top_pools: Option<usize>,
+    /// Interval in seconds for background vault balance refresh.
+    /// Set to 0 to disable vault refresh completely (saves RPC load).
+    /// Default: 5 seconds. Recommended: 30-60 for low RPC load.
+    #[serde(default)]
+    pub vault_refresh_interval_secs: Option<u64>,
 }
 
 impl Config {

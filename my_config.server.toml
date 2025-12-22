@@ -218,3 +218,9 @@ cache_path = "orca_reserves.db"
 # Number of top pools to prefetch reserves for on startup
 # Higher values = better cache warmth but slower startup
 prefetch_top_pools = 100
+
+# CRITICAL: Vault refresh interval (seconds)
+# This was causing massive RPC load (8700 accounts every 5 seconds!)
+# Set to 0 to DISABLE completely, or use higher value (30-60 recommended)
+# Default: 5 (backwards compatible but heavy on RPC)
+vault_refresh_interval_secs = 60  # Refresh every 60s instead of 5s (12x less RPC load)
