@@ -575,12 +575,31 @@ impl Treasury {
         }
 
         // Check if account exists and is a valid token account to avoid "Invalid Account Data" errors
-        if let Ok(acc) = rpc.rpc.get_account(&ata).await {
-            if acc.owner != spl_token_sdk {
-                return Ok(Signature::default()); // Not a token account, nothing to close
+        let acc = match rpc.rpc.get_account(&ata).await {
+            Ok(a) => a,
+            Err(_) => {
+                tracing::debug!(ata=%ata, "unwrap_wsol: account doesn't exist, nothing to close");
+                return Ok(Signature::default()); // Account doesn't exist
             }
-        } else {
-            return Ok(Signature::default()); // Account doesn't exist
+        };
+        
+        if acc.owner != spl_token_sdk {
+            tracing::debug!(ata=%ata, owner=%acc.owner, "unwrap_wsol: not a SPL token account, skipping");
+            return Ok(Signature::default()); // Not a token account, nothing to close
+        }
+        
+        // CRITICAL: Verify this is actually a valid SPL token account with correct size
+        // SPL Token accounts are exactly 165 bytes (Account struct)
+        if acc.data.len() != 165 {
+            tracing::warn!(ata=%ata, data_len=acc.data.len(), "unwrap_wsol: account has invalid size, not closing");
+            return Ok(Signature::default());
+        }
+        
+        // Verify the mint matches WSOL (bytes 0-32 of token account = mint)
+        let account_mint = SdkPubkey::new_from_array(acc.data[0..32].try_into().unwrap_or([0u8; 32]));
+        if account_mint != wsol_mint_sdk {
+            tracing::warn!(ata=%ata, account_mint=%account_mint, expected=%wsol_mint_sdk, "unwrap_wsol: account mint mismatch, not closing");
+            return Ok(Signature::default());
         }
 
         let dest = recipient.unwrap_or(owner);

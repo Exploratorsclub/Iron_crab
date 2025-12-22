@@ -3397,11 +3397,27 @@ impl SniperEngine {
             }
             return Ok(());
         }
-        // Cap sale to both requested amount_tokens and on-chain balance (safety)
-        let sell_tokens = amount_tokens.min(ata_tokens);
+        // CRITICAL FIX: For full exits (fraction >= 0.99), sell ALL tokens from wallet
+        // This prevents dust from remaining after sells due to rounding differences
+        // between tracked amount_tokens and actual wallet balance
+        let sell_tokens = if fraction >= 0.99 {
+            // Full exit - sell everything in wallet, not just tracked amount
+            ata_tokens
+        } else {
+            // Partial exit - use the minimum of requested and available
+            amount_tokens.min(ata_tokens)
+        };
         if sell_tokens == 0 {
             return Ok(());
         }
+        info!(
+            mint=%mint,
+            fraction=fraction,
+            requested_tokens=amount_tokens,
+            wallet_tokens=ata_tokens,
+            sell_tokens=sell_tokens,
+            "attempt_exit: calculated sell amount"
+        );
         // Ensure WSOL ATA for proceeds (create if missing)
         let wsol_ata = match self.treasury.wrap_sol(&self.rpc, 0).await {
             Ok((ata, _sig)) => ata,
@@ -4013,6 +4029,33 @@ impl SniperEngine {
                 );
                 self.append_trade_record(&line, true);
                 self.persist_risk_state();
+                
+                // === DUST SWEEP: After full exit, check if any dust remains and sell it ===
+                if fraction >= 0.99 {
+                    // Re-check wallet balance after sell
+                    if let Ok(acc) = self.rpc.get_account_retry(&ata).await {
+                        if acc.data.len() >= 72 {
+                            let remaining = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+                            if remaining > 0 && remaining < 1_000_000 {
+                                // Dust detected (less than 1 token for 6 decimal mints)
+                                info!(
+                                    mint=%mint,
+                                    dust_tokens=remaining,
+                                    "attempt_exit: dust detected after full exit, sweeping"
+                                );
+                                // Try to sell the dust - ignore errors as it's best-effort
+                                // Signature: attempt_exit(mint, lot_idx, amount_tokens, fraction, is_emergency)
+                                let _ = Box::pin(self.attempt_exit(
+                                    mint,
+                                    lot_idx,
+                                    remaining,
+                                    1.0,
+                                    true, // is_emergency to use high slippage
+                                )).await;
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => warn!(?e, mint=%mint, "exit tx failed"),
         }
@@ -4480,13 +4523,18 @@ impl SniperEngine {
             
             {
                 let mut rs = self.risk.write();
+                // CRITICAL: For wallet-scan positions, set opened_ts to a time in the past
+                // so they get processed by time-based exits immediately.
+                // We don't know when they were actually bought, so assume they're old enough
+                // to be eligible for time-based exits (set to 1 hour ago).
+                let old_timestamp = chrono::Utc::now().timestamp() - 3600; // 1 hour ago
                 let lot = PositionLot {
                     entry_price_sol: estimated_entry_price, // Estimated from config
                     amount_tokens: amount_human,
                     invested_sol: estimated_invested, // Estimate based on config
                     token_decimals: actual_decimals,
                     last_unrealized_pnl_sol: 0.0,
-                    opened_ts: chrono::Utc::now().timestamp(),
+                    opened_ts: old_timestamp, // Set to past so time-based exits can trigger
                     executed_tp_bps: Vec::new(),
                     peak_pnl_bps: 0,
                     executed_timed_tiers: Vec::new(),
