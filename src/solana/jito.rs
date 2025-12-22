@@ -13,7 +13,6 @@
 // - Salt Lake City: https://slc.mainnet.block-engine.jito.wtf
 
 use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
@@ -110,7 +109,8 @@ pub struct BundleResponse {
     pub jsonrpc: String,
     pub result: Option<String>,
     pub error: Option<JitoError>,
-    pub id: u64,
+    #[serde(default)]
+    pub id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,7 +125,8 @@ pub struct BundleStatusResponse {
     pub jsonrpc: String,
     pub result: Option<BundleStatusResult>,
     pub error: Option<JitoError>,
-    pub id: u64,
+    #[serde(default)]
+    pub id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,10 +225,10 @@ impl JitoClient {
             return Err(anyhow!("Cannot submit empty bundle"));
         }
         
-        // Serialize transactions to base64
+        // Serialize transactions to base58 (Jito requires base58, not base64!)
         let serialized: Vec<String> = transactions
             .iter()
-            .map(|tx| BASE64.encode(bincode::serialize(tx).expect("Failed to serialize tx")))
+            .map(|tx| bs58::encode(bincode::serialize(tx).expect("Failed to serialize tx")).into_string())
             .collect();
         
         let request = JsonRpcRequest {
