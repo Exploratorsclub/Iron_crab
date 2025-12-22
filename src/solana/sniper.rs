@@ -2825,6 +2825,18 @@ impl SniperEngine {
                 0.0
             };
             let pnl_bps = (pnl_pct * 10_000.0) as i64;
+            
+            // Log PnL for debugging
+            info!(
+                mint=%mint,
+                entry_price=pos.entry_price_sol,
+                price_now=price_now,
+                pnl_bps=pnl_bps,
+                stop_loss_bps=stop_bps,
+                out_lamports=out_lamports,
+                "evaluate_positions: PnL check"
+            );
+            
             {
                 let mut rs = self.risk.write();
                 if let Some(v) = rs.open.get_mut(&mint) {
