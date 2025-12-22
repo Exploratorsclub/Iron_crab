@@ -1815,8 +1815,9 @@ impl SniperEngine {
 
                 // Use async version with explicit slippage for proper max_sol_cost calculation
                 // For BUY: max_sol_cost = lamports_in + slippage (we're willing to pay more SOL if price rises)
-                // CRITICAL: Pump.fun tokens are extremely volatile - use at least 25% slippage for fresh launches
-                let pumpfun_slippage_bps = msb.max(2500); // At least 25% for Pump.fun - fresh launches move FAST
+                // CRITICAL: Pump.fun tokens are extremely volatile - use high slippage for fresh launches
+                let pumpfun_min_slippage = self.cfg.pumpfun_buy_slippage_bps.unwrap_or(2500); // Config or 25% default
+                let pumpfun_slippage_bps = msb.max(pumpfun_min_slippage);
                 match pf.build_swap_ix_async_with_slippage(
                     &sol_mint.to_string(),
                     &mint.to_string(),
@@ -3033,9 +3034,10 @@ impl SniperEngine {
         };
 
         // Dynamic route selection for exit: compare Raydium vs Orca vs Pump.fun quotes
-        // For emergency exits (stop-loss), use much higher slippage (50%) to ensure execution
+        // For emergency exits (stop-loss), use configurable high slippage to ensure execution
+        let emergency_slippage = self.cfg.emergency_exit_slippage_bps.unwrap_or(5000); // Config or 50% default
         let msb2 = if is_emergency_exit {
-            5000 // 50% slippage for emergency exits - GET OUT at any cost
+            emergency_slippage
         } else {
             self.adaptive_slippage_bps()
         };

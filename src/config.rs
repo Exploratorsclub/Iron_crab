@@ -297,6 +297,11 @@ pub struct SniperSettings {
     pub quantile_fallback_slippage_bps: Option<u32>, // Fallback slippage when insufficient data
     #[serde(default)]
     pub max_holders: Option<usize>, // Max holders for new token check (default: 20)
+    // Configurable slippage for specific scenarios (avoiding hardcoded values)
+    #[serde(default)]
+    pub pumpfun_buy_slippage_bps: Option<u32>, // Minimum slippage for Pump.fun buys (default: 2500 = 25%)
+    #[serde(default)]
+    pub emergency_exit_slippage_bps: Option<u32>, // Slippage for stop-loss/emergency exits (default: 5000 = 50%)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
