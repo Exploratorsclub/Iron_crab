@@ -2151,6 +2151,19 @@ impl SniperEngine {
                 }
             }
             Err(e) => {
+                let err_str = e.to_string();
+                // CRITICAL FIX: If TX was sent but confirmation timed out, the TX may have succeeded!
+                // Register the position anyway to prevent over-buying. Wallet scan will verify later.
+                if err_str.contains("timed out") || err_str.contains("Timeout") {
+                    warn!(mint=%mint, "sniper: buy TX confirmation timeout - TX was SENT, registering position anyway");
+                    // Register placeholder position since TX was definitely sent
+                    let sol_in = lamports_in as f64 / 1e9;
+                    self.record_fill_placeholder(*mint, sol_in);
+                    self.purchased.write().insert(*mint);
+                    // Don't return error - we registered the position
+                    return Ok(());
+                }
+                
                 warn!(?e, mint=%mint, "sniper: buy tx failed (will not retry immediately)");
                 TRADES_FAILED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
