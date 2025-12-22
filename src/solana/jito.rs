@@ -17,9 +17,9 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
     pubkey::Pubkey,
+    system_instruction,
     transaction::Transaction,
 };
-use solana_system_program::instruction::transfer;
 use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -179,7 +179,7 @@ impl JitoClient {
         tip_lamports: u64,
     ) -> Result<solana_sdk::instruction::Instruction> {
         let tip_account = Self::random_tip_account();
-        Ok(transfer(payer, &tip_account, tip_lamports))
+        Ok(system_instruction::transfer(payer, &tip_account, tip_lamports))
     }
     
     /// Add tip instruction to existing transaction instructions
@@ -265,25 +265,6 @@ impl JitoClient {
         }
         
         Err(last_error.unwrap_or_else(|| anyhow!("All Jito regions failed")))
-    }
-    
-    /// Send a single transaction via Jito (automatically adds tip)
-    /// 
-    /// # Arguments
-    /// * `transaction` - Signed transaction (tip will be added)
-    /// * `payer` - Payer pubkey for tip instruction
-    /// * `signer` - Signer for the new transaction with tip
-    /// * `recent_blockhash` - Recent blockhash for the new transaction
-    pub async fn send_transaction_with_tip<S: solana_sdk::signer::Signer>(
-        &self,
-        transaction: &Transaction,
-        payer: &Pubkey,
-        signer: &S,
-        recent_blockhash: solana_sdk::hash::Hash,
-    ) -> Result<String> {
-        let mut tx_with_tip = self.add_tip_to_transaction(transaction, payer);
-        tx_with_tip.sign(&[signer], recent_blockhash);
-        self.send_bundle(&[tx_with_tip]).await
     }
     
     /// Check bundle status
@@ -390,7 +371,7 @@ impl BundleBuilder {
     /// Get tip instruction for the payer (add to last TX manually)
     pub fn get_tip_instruction(&self) -> Result<solana_sdk::instruction::Instruction> {
         let tip_account = JitoClient::random_tip_account();
-        Ok(transfer(&self.payer, &tip_account, self.tip_lamports))
+        Ok(system_instruction::transfer(&self.payer, &tip_account, self.tip_lamports))
     }
     
     /// Get current transaction count

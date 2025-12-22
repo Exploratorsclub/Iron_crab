@@ -3709,10 +3709,14 @@ impl SniperEngine {
         // Route through Jito or normal RPC based on decision
         let tx_result: Result<solana_sdk::signature::Signature, anyhow::Error> = if use_jito {
             // === JITO BUNDLE SUBMISSION ===
-            let cfg = self.cfg.read();
-            let base_tip = cfg.jito_tip_lamports.unwrap_or(10_000);
-            let region_str = cfg.jito_region.clone().unwrap_or_else(|| "frankfurt".to_string());
-            drop(cfg); // Release lock before async operations
+            // Read config values in a block to ensure lock is released before async
+            let (base_tip, region_str) = {
+                let cfg = self.cfg.read();
+                (
+                    cfg.jito_tip_lamports.unwrap_or(10_000),
+                    cfg.jito_region.clone().unwrap_or_else(|| "frankfurt".to_string()),
+                )
+            }; // cfg lock released here
             
             // === DYNAMIC TIP HEURISTIC ===
             // Adjust tip based on urgency and exit type:
