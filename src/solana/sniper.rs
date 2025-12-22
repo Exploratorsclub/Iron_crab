@@ -2420,271 +2420,301 @@ impl SniperEngine {
         };
         let decimals =
             crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &mint_sdk).await;
-        let acc_opt = self.rpc.get_account_retry(&ata).await.ok();
-        if let Some(acc) = acc_opt {
-            if acc.data.len() >= 72 {
-                let raw = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
-                let amt = if decimals == 0 {
-                    raw as f64
-                } else {
-                    raw as f64 / 10f64.powi(decimals as i32)
-                };
-                if amt <= 0.0 {
-                    return;
-                }
-                // Take snapshot of pending & position without holding lock across RPC
-                let (pend_opt, entry_price_existing) = {
-                    let mut rs = self.risk.write();
-                    let pend = rs.pending.remove(&mint);
-                    if let Some(v) = rs.open.get_mut(&mint) {
-                        if let Some(last) = v.last_mut() {
-                            if last.entry_price_sol == 0.0 {
-                                last.amount_tokens = amt;
-                                last.token_decimals = decimals;
-                                last.entry_price_sol = last.invested_sol / amt.max(1e-9);
-                            }
-                        }
-                    }
-                    let entry_price_last = rs
-                        .open
-                        .get(&mint)
-                        .and_then(|v| v.last())
-                        .map(|l| l.entry_price_sol)
-                        .unwrap_or(0.0);
-                    (pend, entry_price_last)
-                };
-                if let Some(pend) = pend_opt {
-                    // Fetch meta outside lock
-                    let mut exact_network_fee = pend.network_fee_lamports;
-                    if let Ok(sig_obj) = solana_sdk::signature::Signature::from_str(&pend.sig) {
-                        use solana_client::rpc_config::RpcTransactionConfig;
-                        use solana_transaction_status::UiTransactionEncoding;
-                        let cfg = RpcTransactionConfig {
-                            encoding: Some(UiTransactionEncoding::JsonParsed),
-                            commitment: None,
-                            max_supported_transaction_version: None,
-                        };
-                        if let Ok(tx_opt) = self
-                            .rpc
-                            .get_transaction_with_config_retry(&sig_obj, cfg)
-                            .await
-                        {
-                            if let Some(meta) = tx_opt.transaction.meta {
-                                exact_network_fee = meta.fee;
-                                // Note: Further meta parsing follows below where we can update actual_raw if needed
-                            }
-                        }
-                    }
-                    // Meta-based token delta extraction for accuracy
-                    let scale = 10f64.powi(decimals as i32);
-                    let mut actual_raw = (amt * scale).round() as u64; // fallback
-                                                                       // Try recomputing actual_raw from meta pre/post if available (owner+mint delta)
-                                                                       // Since we can't pass from the inner scope easily, recompute quickly here by fetching the tx again (cheap in local scope)
-                    if let Ok(sig_obj) = solana_sdk::signature::Signature::from_str(&pend.sig) {
-                        use solana_client::rpc_config::RpcTransactionConfig;
-                        use solana_transaction_status::option_serializer::OptionSerializer;
-                        use solana_transaction_status::UiTransactionEncoding;
-                        let cfg = RpcTransactionConfig {
-                            encoding: Some(UiTransactionEncoding::JsonParsed),
-                            commitment: None,
-                            max_supported_transaction_version: None,
-                        };
-                        if let Ok(tx_opt) = self
-                            .rpc
-                            .get_transaction_with_config_retry(&sig_obj, cfg)
-                            .await
-                        {
-                            if let Some(meta) = tx_opt.transaction.meta {
-                                let owner_str = owner.to_string();
-                                let mint_str = mint.to_string();
-                                let mut pre_raw_opt: Option<u128> = None;
-                                let mut post_raw_opt: Option<u128> = None;
-                                if let OptionSerializer::Some(pre) =
-                                    meta.pre_token_balances.as_ref()
-                                {
-                                    for b in pre {
-                                        let owner_ok = match b.owner.as_ref() {
-                                            OptionSerializer::Some(o) => o == &owner_str,
-                                            _ => false,
-                                        };
-                                        if owner_ok && b.mint == mint_str {
-                                            if let Ok(v) = b.ui_token_amount.amount.parse::<u128>()
-                                            {
-                                                pre_raw_opt = Some(v);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                if let OptionSerializer::Some(post) =
-                                    meta.post_token_balances.as_ref()
-                                {
-                                    for b in post {
-                                        let owner_ok = match b.owner.as_ref() {
-                                            OptionSerializer::Some(o) => o == &owner_str,
-                                            _ => false,
-                                        };
-                                        if owner_ok && b.mint == mint_str {
-                                            if let Ok(v) = b.ui_token_amount.amount.parse::<u128>()
-                                            {
-                                                post_raw_opt = Some(v);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                if let (Some(pre_raw), Some(post_raw)) = (pre_raw_opt, post_raw_opt)
-                                {
-                                    if post_raw >= pre_raw {
-                                        let delta = (post_raw - pre_raw) as u64;
-                                        if delta > 0 {
-                                            actual_raw = delta;
-                                        }
-                                    }
-                                }
-                                // Protocol/referral fee attribution from meta is protocol-specific; pending detailed parsing of pool fee accounts.
-                            }
-                        }
-                    }
-                    // NOTE: OptionSerializer wrapper complicates direct access; keep fallback for now.
-                    let expected_raw = pend.expected_out_tokens;
-                    let shortfall = expected_raw.saturating_sub(actual_raw);
-                    let shortfall_ui = shortfall as f64 / scale;
-                    let shortfall_sol = shortfall_ui * entry_price_existing;
-                    // Adaptive slippage controller update (BUY fills only)
-                    // Observed slippage fraction relative to expected_out: s = shortfall / max(expected,1)
-                    let expected_safe = expected_raw.max(1) as f64;
-                    let observed_slip = (shortfall as f64 / expected_safe).max(0.0);
-                    record_shortfall_pct(observed_slip);
-
-                    // Record fill observation for quantile calculator
-                    if self.cfg.read().quantile_slippage_enabled.unwrap_or(false) {
-                        // Determine pool ID (use DEX + mint pair as identifier)
-                        let pool_id = format!("{}_{}", pend.dex, mint);
-
-                        // Determine size category (approximate from invested lamports)
-                        let size_category = if pend.lamports_in < 1_000_000_000 {
-                            crate::quantile_impact::SizeCategory::Small
-                        } else if pend.lamports_in < 5_000_000_000 {
-                            crate::quantile_impact::SizeCategory::Medium
-                        } else {
-                            crate::quantile_impact::SizeCategory::Large
-                        };
-
-                        self.quantile_calc.record_fill(
-                            pool_id,
-                            expected_raw,
-                            actual_raw,
-                            size_category,
-                        );
-                    }
-                    // Note: tx_meta not available here; fee breakdown handled separately
-
-                    {
-                        let mut rs = self.risk.write();
-                        // Maintain rolling window
-                        rs.recent_slippage.push(observed_slip);
-                        let win = self.cfg.read().adaptive_slippage_window.unwrap_or(20);
-                        if rs.recent_slippage.len() > win {
-                            let excess = rs.recent_slippage.len() - win;
-                            rs.recent_slippage.drain(0..excess);
-                        }
-                        // Compute mean and adjust toward target
-                        let mean = if rs.recent_slippage.is_empty() {
-                            0.0
-                        } else {
-                            rs.recent_slippage.iter().copied().sum::<f64>()
-                                / (rs.recent_slippage.len() as f64)
-                        };
-                        let target = self
-                            .cfg
-                            .read()
-                            .adaptive_slippage_target_pct
-                            .unwrap_or(0.002)
-                            .clamp(0.0, 0.2); // default 0.2%
-                        let step = self
-                            .cfg
-                            .read()
-                            .adaptive_slippage_step_bps
-                            .unwrap_or(5)
-                            .max(1) as i64;
-                        let min_b = self
-                            .cfg
-                            .read()
-                            .adaptive_slippage_min_bps
-                            .unwrap_or(self.cfg.read().max_slippage_bps)
-                            as i64;
-                        let max_b = self
-                            .cfg
-                            .read()
-                            .adaptive_slippage_max_bps
-                            .unwrap_or(self.cfg.read().max_slippage_bps)
-                            as i64;
-                        let mut cur = rs
-                            .adaptive_slippage_bps
-                            .unwrap_or(self.cfg.read().max_slippage_bps)
-                            as i64;
-                        if mean > target {
-                            cur = (cur + step).min(max_b);
-                        } else if mean < target {
-                            cur = (cur - step).max(min_b);
-                        }
-                        rs.adaptive_slippage_bps = Some(cur as u32);
-                    }
-                    // Record fee percent based on network fee vs notional invested
-                    let invested_ui = pend.lamports_in as f64 / 1e9;
-                    if invested_ui > 0.0 {
-                        let fee_pct = (exact_network_fee as f64 / 1e9) / invested_ui; // network fee percent of notional
-                        record_fee_pct(fee_pct.max(0.0));
-                    }
-                    // Compute protocol fee tokens heuristic from quote fee_bps if meta didn't yield fee transfers
-                    let fee_tokens = if pend.fee_bps > 0 && pend.fee_bps < 5000 {
-                        // expected_out = no_fee_out * (1 - fee_bps/10_000) approximately; invert
-                        let no_fee_out = ((expected_raw as u128) * 10_000u128
-                            / (10_000u128 - pend.fee_bps as u128))
-                            as u64;
-                        no_fee_out.saturating_sub(expected_raw)
+        
+        // CRITICAL FIX: Retry with delay to wait for TX confirmation
+        // The TX may not be confirmed yet when this is called immediately after send
+        let mut amt = 0.0f64;
+        let mut raw = 0u64;
+        for attempt in 0..10 {
+            if attempt > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+            let acc_opt = self.rpc.get_account_retry(&ata).await.ok();
+            if let Some(acc) = acc_opt {
+                if acc.data.len() >= 72 {
+                    raw = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+                    amt = if decimals == 0 {
+                        raw as f64
                     } else {
-                        0
+                        raw as f64 / 10f64.powi(decimals as i32)
                     };
-                    if fee_tokens > 0 {
-                        PROTOCOL_FEE_TOKENS_TOTAL
-                            .fetch_add(fee_tokens, std::sync::atomic::Ordering::Relaxed);
-                        let fee_ui = fee_tokens as f64 / scale;
-                        let fee_sol = fee_ui * entry_price_existing;
-                        PROTOCOL_FEE_SOL_MICRO_TOTAL.fetch_add(
-                            (fee_sol * 1_000_000.0) as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                    if amt > 0.0 {
+                        info!(mint=%mint, amount=amt, decimals=decimals, attempt=attempt, "finalize_fill: found token balance");
+                        break;
                     }
-
-                    // Note: Extended fee breakdown (DEX-specific vaults) would require transaction metadata
-                    // which is not available at this point. Fee breakdown can be done via separate RPC call
-                    // using tx_fee_parser::fetch_and_parse_fee_breakdown() if needed.
-
-                    record_shortfall(shortfall, shortfall_sol);
-                    let line = format!(
-                    "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9};protocol_fee_tokens={fee_tokens};network_fee_exact={network_fee_exact}",
-                    ts=ChronoUtc::now().to_rfc3339(),
-                    mint=mint,
-                    dex=pend.dex,
-                    sig=pend.sig,
-                    lamports_in=pend.lamports_in,
-                    actual_tokens=actual_raw,
-                    expected_tokens=expected_raw,
-                    shortfall_tokens=shortfall,
-                    fee=exact_network_fee,
-                    shortfall_ui=shortfall_ui,
-                    shortfall_sol=shortfall_sol,
-                    fee_tokens=fee_tokens,
-                    network_fee_exact=exact_network_fee
-                );
-                    self.append_trade_record(&line, true);
-                    
-                    // Persist state after fill is finalized with accurate token amounts
-                    self.persist_risk_state();
                 }
             }
+            if attempt < 9 {
+                debug!(mint=%mint, attempt=attempt, "finalize_fill: token balance is 0, retrying...");
+            }
+        }
+        
+        if amt <= 0.0 {
+            warn!(mint=%mint, "finalize_fill: no token balance found after 10 attempts, position will have incomplete data");
+            return;
+        }
+        
+        // Take snapshot of pending & position without holding lock across RPC
+        let (pend_opt, entry_price_existing) = {
+            let mut rs = self.risk.write();
+            let pend = rs.pending.remove(&mint);
+            if let Some(v) = rs.open.get_mut(&mint) {
+                if let Some(last) = v.last_mut() {
+                    if last.entry_price_sol == 0.0 {
+                        last.amount_tokens = amt;
+                        last.token_decimals = decimals;
+                        last.entry_price_sol = last.invested_sol / amt.max(1e-9);
+                        info!(
+                            mint=%mint,
+                            amount_tokens=amt,
+                            entry_price_sol=last.entry_price_sol,
+                            invested_sol=last.invested_sol,
+                            decimals=decimals,
+                            "finalize_fill: position data updated successfully"
+                        );
+                    }
+                }
+            }
+            let entry_price_last = rs
+                .open
+                .get(&mint)
+                .and_then(|v| v.last())
+                .map(|l| l.entry_price_sol)
+                .unwrap_or(0.0);
+            (pend, entry_price_last)
+        };
+        
+        // Persist immediately after updating position data
+        self.persist_risk_state();
+        
+        if let Some(pend) = pend_opt {
+            // Fetch meta outside lock
+            let mut exact_network_fee = pend.network_fee_lamports;
+            if let Ok(sig_obj) = solana_sdk::signature::Signature::from_str(&pend.sig) {
+                use solana_client::rpc_config::RpcTransactionConfig;
+                use solana_transaction_status::UiTransactionEncoding;
+                let cfg = RpcTransactionConfig {
+                    encoding: Some(UiTransactionEncoding::JsonParsed),
+                    commitment: None,
+                    max_supported_transaction_version: None,
+                };
+                if let Ok(tx_opt) = self
+                    .rpc
+                    .get_transaction_with_config_retry(&sig_obj, cfg)
+                    .await
+                {
+                    if let Some(meta) = tx_opt.transaction.meta {
+                        exact_network_fee = meta.fee;
+                        // Note: Further meta parsing follows below where we can update actual_raw if needed
+                    }
+                }
+            }
+            // Meta-based token delta extraction for accuracy
+            let scale = 10f64.powi(decimals as i32);
+            let mut actual_raw = raw; // Use the raw value we already fetched
+            // Try recomputing actual_raw from meta pre/post if available (owner+mint delta)
+            if let Ok(sig_obj) = solana_sdk::signature::Signature::from_str(&pend.sig) {
+                use solana_client::rpc_config::RpcTransactionConfig;
+                use solana_transaction_status::option_serializer::OptionSerializer;
+                use solana_transaction_status::UiTransactionEncoding;
+                let cfg = RpcTransactionConfig {
+                    encoding: Some(UiTransactionEncoding::JsonParsed),
+                    commitment: None,
+                    max_supported_transaction_version: None,
+                };
+                if let Ok(tx_opt) = self
+                    .rpc
+                    .get_transaction_with_config_retry(&sig_obj, cfg)
+                    .await
+                {
+                    if let Some(meta) = tx_opt.transaction.meta {
+                        let owner_str = owner.to_string();
+                        let mint_str = mint.to_string();
+                        let mut pre_raw_opt: Option<u128> = None;
+                        let mut post_raw_opt: Option<u128> = None;
+                        if let OptionSerializer::Some(pre) =
+                            meta.pre_token_balances.as_ref()
+                        {
+                            for b in pre {
+                                let owner_ok = match b.owner.as_ref() {
+                                    OptionSerializer::Some(o) => o == &owner_str,
+                                    _ => false,
+                                };
+                                if owner_ok && b.mint == mint_str {
+                                    if let Ok(v) = b.ui_token_amount.amount.parse::<u128>()
+                                    {
+                                        pre_raw_opt = Some(v);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if let OptionSerializer::Some(post) =
+                            meta.post_token_balances.as_ref()
+                        {
+                            for b in post {
+                                let owner_ok = match b.owner.as_ref() {
+                                    OptionSerializer::Some(o) => o == &owner_str,
+                                    _ => false,
+                                };
+                                if owner_ok && b.mint == mint_str {
+                                    if let Ok(v) = b.ui_token_amount.amount.parse::<u128>()
+                                    {
+                                        post_raw_opt = Some(v);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if let (Some(pre_raw), Some(post_raw)) = (pre_raw_opt, post_raw_opt)
+                        {
+                            if post_raw >= pre_raw {
+                                let delta = (post_raw - pre_raw) as u64;
+                                if delta > 0 {
+                                    actual_raw = delta;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // NOTE: OptionSerializer wrapper complicates direct access; keep fallback for now.
+            let expected_raw = pend.expected_out_tokens;
+            let shortfall = expected_raw.saturating_sub(actual_raw);
+            let shortfall_ui = shortfall as f64 / scale;
+            let shortfall_sol = shortfall_ui * entry_price_existing;
+            // Adaptive slippage controller update (BUY fills only)
+            // Observed slippage fraction relative to expected_out: s = shortfall / max(expected,1)
+            let expected_safe = expected_raw.max(1) as f64;
+            let observed_slip = (shortfall as f64 / expected_safe).max(0.0);
+            record_shortfall_pct(observed_slip);
+
+            // Record fill observation for quantile calculator
+            if self.cfg.read().quantile_slippage_enabled.unwrap_or(false) {
+                // Determine pool ID (use DEX + mint pair as identifier)
+                let pool_id = format!("{}_{}", pend.dex, mint);
+
+                // Determine size category (approximate from invested lamports)
+                let size_category = if pend.lamports_in < 1_000_000_000 {
+                    crate::quantile_impact::SizeCategory::Small
+                } else if pend.lamports_in < 5_000_000_000 {
+                    crate::quantile_impact::SizeCategory::Medium
+                } else {
+                    crate::quantile_impact::SizeCategory::Large
+                };
+
+                self.quantile_calc.record_fill(
+                    pool_id,
+                    expected_raw,
+                    actual_raw,
+                    size_category,
+                );
+            }
+            // Note: tx_meta not available here; fee breakdown handled separately
+
+            {
+                let mut rs = self.risk.write();
+                // Maintain rolling window
+                rs.recent_slippage.push(observed_slip);
+                let win = self.cfg.read().adaptive_slippage_window.unwrap_or(20);
+                if rs.recent_slippage.len() > win {
+                    let excess = rs.recent_slippage.len() - win;
+                    rs.recent_slippage.drain(0..excess);
+                }
+                // Compute mean and adjust toward target
+                let mean = if rs.recent_slippage.is_empty() {
+                    0.0
+                } else {
+                    rs.recent_slippage.iter().copied().sum::<f64>()
+                        / (rs.recent_slippage.len() as f64)
+                };
+                let target = self
+                    .cfg
+                    .read()
+                    .adaptive_slippage_target_pct
+                    .unwrap_or(0.002)
+                    .clamp(0.0, 0.2); // default 0.2%
+                let step = self
+                    .cfg
+                    .read()
+                    .adaptive_slippage_step_bps
+                    .unwrap_or(5)
+                    .max(1) as i64;
+                let min_b = self
+                    .cfg
+                    .read()
+                    .adaptive_slippage_min_bps
+                    .unwrap_or(self.cfg.read().max_slippage_bps)
+                    as i64;
+                let max_b = self
+                    .cfg
+                    .read()
+                    .adaptive_slippage_max_bps
+                    .unwrap_or(self.cfg.read().max_slippage_bps)
+                    as i64;
+                let mut cur = rs
+                    .adaptive_slippage_bps
+                    .unwrap_or(self.cfg.read().max_slippage_bps)
+                    as i64;
+                if mean > target {
+                    cur = (cur + step).min(max_b);
+                } else if mean < target {
+                    cur = (cur - step).max(min_b);
+                }
+                rs.adaptive_slippage_bps = Some(cur as u32);
+            }
+            // Record fee percent based on network fee vs notional invested
+            let invested_ui = pend.lamports_in as f64 / 1e9;
+            if invested_ui > 0.0 {
+                let fee_pct = (exact_network_fee as f64 / 1e9) / invested_ui; // network fee percent of notional
+                record_fee_pct(fee_pct.max(0.0));
+            }
+            // Compute protocol fee tokens heuristic from quote fee_bps if meta didn't yield fee transfers
+            let fee_tokens = if pend.fee_bps > 0 && pend.fee_bps < 5000 {
+                // expected_out = no_fee_out * (1 - fee_bps/10_000) approximately; invert
+                let no_fee_out = ((expected_raw as u128) * 10_000u128
+                    / (10_000u128 - pend.fee_bps as u128))
+                    as u64;
+                no_fee_out.saturating_sub(expected_raw)
+            } else {
+                0
+            };
+            if fee_tokens > 0 {
+                PROTOCOL_FEE_TOKENS_TOTAL
+                    .fetch_add(fee_tokens, std::sync::atomic::Ordering::Relaxed);
+                let fee_ui = fee_tokens as f64 / scale;
+                let fee_sol = fee_ui * entry_price_existing;
+                PROTOCOL_FEE_SOL_MICRO_TOTAL.fetch_add(
+                    (fee_sol * 1_000_000.0) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+
+            // Note: Extended fee breakdown (DEX-specific vaults) would require transaction metadata
+            // which is not available at this point. Fee breakdown can be done via separate RPC call
+            // using tx_fee_parser::fetch_and_parse_fee_breakdown() if needed.
+
+            record_shortfall(shortfall, shortfall_sol);
+            let line = format!(
+                "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9};protocol_fee_tokens={fee_tokens};network_fee_exact={network_fee_exact}",
+                ts=ChronoUtc::now().to_rfc3339(),
+                mint=mint,
+                dex=pend.dex,
+                sig=pend.sig,
+                lamports_in=pend.lamports_in,
+                actual_tokens=actual_raw,
+                expected_tokens=expected_raw,
+                shortfall_tokens=shortfall,
+                fee=exact_network_fee,
+                shortfall_ui=shortfall_ui,
+                shortfall_sol=shortfall_sol,
+                fee_tokens=fee_tokens,
+                network_fee_exact=exact_network_fee
+            );
+            self.append_trade_record(&line, true);
+            
+            // Persist state after fill is finalized with accurate token amounts
+            self.persist_risk_state();
         }
     }
 
