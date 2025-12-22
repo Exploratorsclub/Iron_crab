@@ -459,9 +459,7 @@ impl Engine {
 
                 // PROFESSIONAL: Setup real-time vault balance subscriptions (batched)
                 // Configurable via [orca].vault_refresh_interval_secs (0 = disabled)
-                let vault_refresh_secs = ctx_arb.cfg.orca.as_ref()
-                    .and_then(|o| o.vault_refresh_interval_secs)
-                    .unwrap_or(5); // Default 5 seconds for backwards compatibility
+                let vault_refresh_secs = ctx_arb.cfg.orca.vault_refresh_interval_secs.unwrap_or(5); // Default 5 seconds
 
                 if vault_refresh_secs > 0 {
                     tracing::info!(

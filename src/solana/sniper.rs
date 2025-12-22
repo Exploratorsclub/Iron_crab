@@ -18,8 +18,6 @@ use crate::solana::dex::{orca::Orca, pumpfun::PumpFunDex, raydium::Raydium, Dex}
 use crate::solana::geyser_pool_discovery::PoolDiscoveryEvent;
 use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
-// Token-2022 program for Pump.fun tokens
-use spl_token_2022;
 use anyhow::Result;
 use chrono::Utc as ChronoUtc;
 use once_cell::sync::Lazy;
