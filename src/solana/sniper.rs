@@ -359,7 +359,7 @@ pub struct SniperEngine {
     purchased: Arc<parking_lot::RwLock<HashSet<Pubkey>>>, // track already bought mints (avoid double buy)
     processing: Arc<parking_lot::RwLock<HashSet<Pubkey>>>, // track mints currently being processed (deduplication)
     treasury: Arc<Treasury>,
-    risk: parking_lot::RwLock<RiskState>,
+    risk: Arc<parking_lot::RwLock<RiskState>>, // CRITICAL: Must be Arc to share across spawned tasks!
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     quantile_calc: Arc<crate::quantile_impact::QuantileImpactCalculator>,
@@ -818,7 +818,7 @@ impl SniperEngine {
             purchased: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             processing: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             treasury,
-            risk: parking_lot::RwLock::new(RiskState::default()),
+            risk: Arc::new(parking_lot::RwLock::new(RiskState::default())), // Arc for sharing across tasks
             shutdown_tx: tx,
             shutdown_rx: rx,
             quantile_calc: Arc::new(crate::quantile_impact::QuantileImpactCalculator::new(
@@ -841,7 +841,7 @@ impl SniperEngine {
             purchased: self.purchased.clone(), // Share Arc-wrapped HashSets across spawned tasks
             processing: self.processing.clone(),
             treasury: self.treasury.clone(),
-            risk: parking_lot::RwLock::new(RiskState::default()),
+            risk: self.risk.clone(), // CRITICAL FIX: Share RiskState across all tasks!
             shutdown_tx: tx,
             shutdown_rx: rx,
             quantile_calc: self.quantile_calc.clone(),
