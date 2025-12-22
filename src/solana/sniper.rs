@@ -2160,6 +2160,8 @@ impl SniperEngine {
                     let sol_in = lamports_in as f64 / 1e9;
                     self.record_fill_placeholder(*mint, sol_in);
                     self.purchased.write().insert(*mint);
+                    // Try to finalize the fill to get actual token amount (may have arrived)
+                    self.finalize_fill(*mint).await;
                     // Don't return error - we registered the position
                     return Ok(());
                 }
@@ -3772,12 +3774,14 @@ impl SniperEngine {
             self.purchased.write().insert(mint);
 
             // Register as an open position (unknown entry price)
+            // Use sol_per_trade as estimated invested amount since we don't know the actual
+            let estimated_invested = self.cfg.read().sol_per_trade.unwrap_or(0.005);
             {
                 let mut rs = self.risk.write();
                 let lot = PositionLot {
                     entry_price_sol: 0.0, // Unknown - was bought before this run
                     amount_tokens: amount as f64,
-                    invested_sol: 0.0, // Unknown
+                    invested_sol: estimated_invested, // Estimate based on config
                     token_decimals: 0, // Will be filled by finalize_fill
                     last_unrealized_pnl_sol: 0.0,
                     opened_ts: chrono::Utc::now().timestamp(),
@@ -3790,6 +3794,7 @@ impl SniperEngine {
                 info!(
                     mint=%mint,
                     amount=amount,
+                    estimated_invested_sol=estimated_invested,
                     "sniper: [WALLET SCAN] found existing token position"
                 );
             }
