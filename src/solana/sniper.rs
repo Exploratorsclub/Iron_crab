@@ -3486,6 +3486,35 @@ impl SniperEngine {
             Orca,
         }
 
+        // If ALL quotes are 0, this position is worthless (dust) - remove it from state
+        if ray_out == 0 && orca_out == 0 && pumpfun_out == 0 {
+            info!(
+                mint=%mint,
+                lot_idx=lot_idx,
+                sell_tokens=sell_tokens,
+                "attempt_exit: ALL quotes returned 0 - position is worthless dust, removing from state"
+            );
+            // Remove this position from risk state
+            {
+                let mut rs = self.risk.write();
+                if let Some(lots) = rs.open.get_mut(mint) {
+                    if lot_idx < lots.len() {
+                        lots.remove(lot_idx);
+                        info!(mint=%mint, lot_idx=lot_idx, remaining_lots=lots.len(), "removed worthless dust lot from position");
+                    }
+                    if lots.is_empty() {
+                        rs.open.remove(mint);
+                        info!(mint=%mint, "removed empty position entry (all lots were dust)");
+                    }
+                }
+            }
+            self.persist_risk_state();
+            if let Some(ks) = &self.kill_switch {
+                ks.unregister_position(mint);
+            }
+            return Ok(());
+        }
+
         let chosen_dex = if pumpfun_out >= ray_out && pumpfun_out >= orca_out && pumpfun_out > 0 {
             ChosenDex::PumpFun
         } else if ray_out >= orca_out && ray_out > 0 {
@@ -3493,7 +3522,7 @@ impl SniperEngine {
         } else if orca_out > 0 {
             ChosenDex::Orca
         } else {
-            // Fallback logic
+            // Fallback logic - shouldn't reach here due to check above
             if ray_plan.is_some() {
                 ChosenDex::Raydium
             } else {
