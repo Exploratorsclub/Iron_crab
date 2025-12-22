@@ -106,6 +106,11 @@ pub struct SniperCfg {
     pub jito_enabled: Option<bool>,
     pub jito_tip_lamports: Option<u64>,
     pub jito_region: Option<String>,
+    // Jito thresholds: only use Jito for large/emergency exits (small exits: tip eats EV)
+    pub jito_min_exit_fraction: Option<f64>,  // Min fraction to use Jito (default 0.25 = 25%)
+    pub jito_min_exit_sol: Option<f64>,       // Min SOL value to use Jito (default 0.5 SOL)
+    pub jito_for_emergency: Option<bool>,     // Always use Jito for emergency/panic exits (default true)
+    pub jito_for_final_exit: Option<bool>,    // Always use Jito for full exits (default true)
     // Parallel exit execution
     pub parallel_exits: Option<bool>,
     pub max_parallel_exits: Option<usize>,
@@ -175,6 +180,10 @@ impl Default for SniperCfg {
             jito_enabled: None,
             jito_tip_lamports: None,
             jito_region: None,
+            jito_min_exit_fraction: Some(0.25),  // Default: use Jito for exits >= 25%
+            jito_min_exit_sol: Some(0.5),        // Default: use Jito for exits >= 0.5 SOL
+            jito_for_emergency: Some(true),      // Default: always Jito for panic exits
+            jito_for_final_exit: Some(true),     // Default: always Jito for 100% exits
             parallel_exits: None,
             max_parallel_exits: None,
             bundle_exits: None,
@@ -244,6 +253,10 @@ impl From<&crate::config::SniperSettings> for SniperCfg {
             jito_enabled: c.jito_enabled,
             jito_tip_lamports: c.jito_tip_lamports,
             jito_region: c.jito_region.clone(),
+            jito_min_exit_fraction: c.jito_min_exit_fraction,
+            jito_min_exit_sol: c.jito_min_exit_sol,
+            jito_for_emergency: c.jito_for_emergency,
+            jito_for_final_exit: c.jito_for_final_exit,
             parallel_exits: c.parallel_exits,
             max_parallel_exits: c.max_parallel_exits,
             bundle_exits: c.bundle_exits,
@@ -3660,8 +3673,103 @@ impl SniperEngine {
         } else {
             0
         };
+        
+        // === JITO DECISION LOGIC ===
+        // Determine if this exit qualifies for Jito bundle submission:
+        // 1. Emergency/panic exits (kill switch triggers) - always Jito if enabled
+        // 2. Final full exits (fraction >= 0.99) - always Jito if enabled
+        // 3. Large exits (fraction >= threshold AND value >= min SOL) - Jito for MEV protection
+        // Small exits (<25% or <0.5 SOL) use normal RPC - tip would eat EV
+        let use_jito = {
+            let cfg = self.cfg.read();
+            let jito_enabled = cfg.jito_enabled.unwrap_or(false);
+            if !jito_enabled {
+                false
+            } else {
+                let jito_for_emergency = cfg.jito_for_emergency.unwrap_or(true);
+                let jito_for_final = cfg.jito_for_final_exit.unwrap_or(true);
+                let min_fraction = cfg.jito_min_exit_fraction.unwrap_or(0.25);
+                let min_sol = cfg.jito_min_exit_sol.unwrap_or(0.5);
+                
+                // Estimate exit value in SOL (using invested_sol as proxy)
+                let exit_sol_value = invested_sol_lot * fraction;
+                
+                let is_final_exit = fraction >= 0.99;
+                let is_large_exit = fraction >= min_fraction && exit_sol_value >= min_sol;
+                
+                // Use Jito for: emergency OR final OR large exits
+                (is_emergency_exit && jito_for_emergency) || 
+                (is_final_exit && jito_for_final) || 
+                is_large_exit
+            }
+        };
+        
         let sent_at = Instant::now();
-        match self.rpc_retry_tx(&tx, 3, false).await {
+        
+        // Route through Jito or normal RPC based on decision
+        let tx_result: Result<solana_sdk::signature::Signature, anyhow::Error> = if use_jito {
+            // === JITO BUNDLE SUBMISSION ===
+            let cfg = self.cfg.read();
+            let tip_lamports = cfg.jito_tip_lamports.unwrap_or(10_000);
+            let region_str = cfg.jito_region.clone().unwrap_or_else(|| "frankfurt".to_string());
+            drop(cfg); // Release lock before async operations
+            
+            let region = JitoRegion::from_str(&region_str).unwrap_or(JitoRegion::Frankfurt);
+            let jito_client = JitoClient::new(region);
+            
+            info!(
+                mint = %mint,
+                fraction = fraction,
+                is_emergency = is_emergency_exit,
+                tip_lamports = tip_lamports,
+                region = %region_str,
+                "using JITO for exit (MEV protection)"
+            );
+            
+            // Add tip instruction to transaction
+            let mut tx_with_tip = tx.clone();
+            if let Ok(tip_ix) = jito_client.build_tip_instruction(&self.treasury.pubkey(), tip_lamports) {
+                // Create new transaction with tip instruction added
+                let mut all_ixs = tx_ixs.clone();
+                all_ixs.push(tip_ix);
+                tx_with_tip = Transaction::new_with_payer(&all_ixs, Some(&self.treasury.pubkey()));
+                tx_with_tip.try_sign(&[self.treasury.signer_ref()], bh)?;
+            }
+            
+            // Submit as single-TX bundle to Jito
+            match jito_client.send_bundle(&[tx_with_tip.clone()]).await {
+                Ok(bundle_id) => {
+                    info!(bundle_id = %bundle_id, mint = %mint, "Jito bundle submitted");
+                    // Wait for bundle confirmation (with timeout)
+                    match jito_client.wait_for_bundle(&bundle_id, 30).await {
+                        Ok(true) => {
+                            info!(bundle_id = %bundle_id, "Jito bundle LANDED");
+                            // Return the first signature from the transaction
+                            Ok(tx_with_tip.signatures[0])
+                        }
+                        Ok(false) => {
+                            warn!(bundle_id = %bundle_id, "Jito bundle did not land, falling back to RPC");
+                            // Fallback to normal RPC submission
+                            self.rpc_retry_tx(&tx, 3, false).await
+                        }
+                        Err(e) => {
+                            warn!(?e, bundle_id = %bundle_id, "Jito bundle status check failed, falling back to RPC");
+                            self.rpc_retry_tx(&tx, 3, false).await
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(?e, mint = %mint, "Jito bundle submission failed, falling back to RPC");
+                    // Fallback to normal RPC submission
+                    self.rpc_retry_tx(&tx, 3, false).await
+                }
+            }
+        } else {
+            // === NORMAL RPC SUBMISSION (small exits) ===
+            self.rpc_retry_tx(&tx, 3, false).await
+        };
+        
+        match tx_result {
             Ok(sig) => {
                 let dur = sent_at.elapsed();
                 record_swap_latency(dur.as_nanos() as u64);

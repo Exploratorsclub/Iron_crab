@@ -334,6 +334,14 @@ pub struct SniperSettings {
     pub jito_tip_lamports: Option<u64>, // Tip amount in lamports (default: 10000 = 0.00001 SOL)
     #[serde(default)]
     pub jito_region: Option<String>, // Block engine region: frankfurt, amsterdam, ny, tokyo, slc
+    #[serde(default)]
+    pub jito_min_exit_fraction: Option<f64>, // Min exit fraction to use Jito (default: 0.25 = 25%)
+    #[serde(default)]
+    pub jito_min_exit_sol: Option<f64>, // Min SOL value to use Jito (default: 0.5 SOL)
+    #[serde(default)]
+    pub jito_for_emergency: Option<bool>, // Always use Jito for emergency/panic exits (default: true)
+    #[serde(default)]
+    pub jito_for_final_exit: Option<bool>, // Always use Jito for 100% full exits (default: true)
     
     // === PARALLEL EXIT EXECUTION ===
     #[serde(default)]

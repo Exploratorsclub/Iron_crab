@@ -122,14 +122,27 @@ kill_switch_negative_flow_slots = 3  # 3 Slots in Folge negativer Netflow = EXIT
 # ============================================================================
 # JITO BUNDLE INTEGRATION (MEV-Schutz für schnellere Exits)
 # ============================================================================
-jito_enabled = false                 # Aktiviere Jito für Bundle-Submission
+jito_enabled = true                  # Aktiviere Jito für qualifizierte Exits
 jito_tip_lamports = 10000           # Tip: 0.00001 SOL (kann höher für Priorität)
 jito_region = "frankfurt"            # Block Engine: frankfurt, amsterdam, ny, tokyo, slc
+
+# JITO SCHWELLENWERTE: Nur für große/wichtige Exits (kleine Exits: Tip frisst EV)
+jito_min_exit_fraction = 0.25        # Mindestens 25% der Position
+jito_min_exit_sol = 0.5              # Mindestens 0.5 SOL Wert
+jito_for_emergency = true            # IMMER Jito für Panic-Exits (Kill Switch)
+jito_for_final_exit = true           # IMMER Jito für 100% Ausstieg
+
+# Beispiel: Bei 1 SOL Position:
+# - 10% Exit (0.1 SOL) = Normal RPC (zu klein, Tip frisst Gewinn)
+# - 30% Exit (0.3 SOL) = Normal RPC (unter 0.5 SOL minimum)
+# - 50% Exit (0.5 SOL) = JITO (>= 25% UND >= 0.5 SOL)
+# - 100% Exit = JITO (Final Exit)
+# - Stop-Loss/Kill-Switch = JITO (Emergency)
 
 # PARALLEL EXIT EXECUTION (mehrere Tokens gleichzeitig verkaufen)
 parallel_exits = true               # Aktiviere parallele Exits
 max_parallel_exits = 5              # Max 5 Exits gleichzeitig
-bundle_exits = false                # Bundle Exits über Jito (experimentell)
+bundle_exits = false                # Bundle Exits über Jito (legacy, nicht verwendet)
 
 # ============================================================================
 # LEGACY EXIT STRATEGY - PRICE-BASED (disabled when time_based_exits = true)
