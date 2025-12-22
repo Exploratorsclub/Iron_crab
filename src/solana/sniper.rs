@@ -3739,9 +3739,10 @@ impl SniperEngine {
         // Response is Vec<RpcKeyedAccount> directly (not wrapped in .value)
         for account in all_token_accounts {
             // Parse the token account data - handle JsonParsed format (default from RPC)
-            let (mint_str, amount): (String, u64) = 
+            // Now also extract decimals for correct amount display
+            let (mint_str, amount_raw, decimals): (String, u64, u8) = 
                 if let solana_account_decoder::UiAccountData::Json(parsed) = &account.account.data {
-                    // JsonParsed format: {"parsed": {"info": {"mint": "...", "tokenAmount": {"amount": "..."}}}}
+                    // JsonParsed format: {"parsed": {"info": {"mint": "...", "tokenAmount": {"amount": "...", "decimals": N}}}}
                     let info = parsed.parsed.get("info");
                     if let Some(info) = info {
                         let mint = info.get("mint").and_then(|v| v.as_str()).unwrap_or("");
@@ -3749,13 +3750,17 @@ impl SniperEngine {
                             .and_then(|v| v.get("amount"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("0");
+                        let decimals = info.get("tokenAmount")
+                            .and_then(|v| v.get("decimals"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(6) as u8; // Default to 6 decimals (common for SPL tokens)
                         let amount = amount_str.parse::<u64>().unwrap_or(0);
-                        (mint.to_string(), amount)
+                        (mint.to_string(), amount, decimals)
                     } else {
                         continue;
                     }
                 } else if let solana_account_decoder::UiAccountData::Binary(b64_str, _encoding) = &account.account.data {
-                    // Binary format fallback
+                    // Binary format fallback - need to fetch decimals from mint account
                     let data = match base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
                         b64_str,
@@ -3769,13 +3774,14 @@ impl SniperEngine {
                     let mint_bytes: [u8; 32] = data[0..32].try_into().unwrap_or([0u8; 32]);
                     let amount = u64::from_le_bytes(data[64..72].try_into().unwrap_or([0u8; 8]));
                     let mint_pk = solana_sdk::pubkey::Pubkey::new_from_array(mint_bytes);
-                    (mint_pk.to_string(), amount)
+                    // For binary format, we'll fetch decimals later or use default
+                    (mint_pk.to_string(), amount, 6) // Default 6, will be corrected below
                 } else {
                     continue;
                 };
 
             // Skip zero balances
-            if amount == 0 {
+            if amount_raw == 0 {
                 continue;
             }
 
@@ -3800,19 +3806,42 @@ impl SniperEngine {
                 }
             }
 
+            // For binary format, fetch actual decimals from mint account
+            let actual_decimals = if decimals == 6 {
+                // Try to get actual decimals from mint account
+                crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &token_mint).await
+            } else {
+                decimals
+            };
+
+            // Calculate human-readable amount
+            let amount_human = if actual_decimals == 0 {
+                amount_raw as f64
+            } else {
+                amount_raw as f64 / 10f64.powi(actual_decimals as i32)
+            };
+
             // Add to purchased set so we don't try to buy again
             self.purchased.write().insert(mint);
 
             // Register as an open position (unknown entry price)
             // Use max_buy_sol as estimated invested amount since we don't know the actual
             let estimated_invested = self.cfg.read().max_buy_sol;
+            
+            // Estimate entry price from invested / amount
+            let estimated_entry_price = if amount_human > 0.0 {
+                estimated_invested / amount_human
+            } else {
+                0.0
+            };
+            
             {
                 let mut rs = self.risk.write();
                 let lot = PositionLot {
-                    entry_price_sol: 0.0, // Unknown - was bought before this run
-                    amount_tokens: amount as f64,
+                    entry_price_sol: estimated_entry_price, // Estimated from config
+                    amount_tokens: amount_human,
                     invested_sol: estimated_invested, // Estimate based on config
-                    token_decimals: 0, // Will be filled by finalize_fill
+                    token_decimals: actual_decimals,
                     last_unrealized_pnl_sol: 0.0,
                     opened_ts: chrono::Utc::now().timestamp(),
                     executed_tp_bps: Vec::new(),
@@ -3823,8 +3852,11 @@ impl SniperEngine {
 
                 info!(
                     mint=%mint,
-                    amount=amount,
+                    amount_raw=amount_raw,
+                    amount_human=amount_human,
+                    decimals=actual_decimals,
                     estimated_invested_sol=estimated_invested,
+                    estimated_entry_price=estimated_entry_price,
                     "sniper: [WALLET SCAN] found existing token position"
                 );
             }
