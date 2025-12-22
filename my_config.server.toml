@@ -75,12 +75,12 @@ per_mint_position_limit = 1
 
 daily_loss_limit_sol = 0.05  # 50 millis max loss per day (70% of capital)
 
-max_slippage_bps = 150
-adaptive_slippage_min_bps = 75
-adaptive_slippage_max_bps = 300
+max_slippage_bps = 500              # 5% base (overridden by code for Pump.fun)
+adaptive_slippage_min_bps = 100     # 1% minimum
+adaptive_slippage_max_bps = 1500    # 15% max for normal exits (meme coins are illiquid!)
 adaptive_slippage_window = 20
 adaptive_slippage_target_pct = 0.002
-adaptive_slippage_step_bps = 5
+adaptive_slippage_step_bps = 25     # Faster adaptation
 
 # EXIT STRATEGY - MOONBAG MODE
 stop_loss_bps = 1000       # -10% Initial Stop Loss (Sehr eng, siehe Erklärung)
