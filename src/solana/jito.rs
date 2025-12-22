@@ -16,11 +16,32 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
+    instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     transaction::Transaction,
 };
-use solana_system_program::system_instruction;
 use std::str::FromStr;
+
+/// System program ID
+const SYSTEM_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("11111111111111111111111111111111");
+
+/// Build system transfer instruction manually (Solana 3.x compatible)
+fn build_system_transfer(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction {
+    Instruction {
+        program_id: SYSTEM_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta { pubkey: *from, is_signer: true, is_writable: true },
+            AccountMeta { pubkey: *to, is_signer: false, is_writable: true },
+        ],
+        data: {
+            // System transfer: instruction index 2 + u64 lamports (little-endian)
+            let mut d = Vec::with_capacity(12);
+            d.extend_from_slice(&2u32.to_le_bytes());
+            d.extend_from_slice(&lamports.to_le_bytes());
+            d
+        },
+    }
+}
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -177,9 +198,9 @@ impl JitoClient {
         &self,
         payer: &Pubkey,
         tip_lamports: u64,
-    ) -> Result<solana_sdk::instruction::Instruction> {
+    ) -> Result<Instruction> {
         let tip_account = Self::random_tip_account();
-        Ok(system_instruction::transfer(payer, &tip_account, tip_lamports))
+        Ok(build_system_transfer(payer, &tip_account, tip_lamports))
     }
     
     /// Add tip instruction to existing transaction instructions
@@ -369,9 +390,9 @@ impl BundleBuilder {
     }
     
     /// Get tip instruction for the payer (add to last TX manually)
-    pub fn get_tip_instruction(&self) -> Result<solana_sdk::instruction::Instruction> {
+    pub fn get_tip_instruction(&self) -> Result<Instruction> {
         let tip_account = JitoClient::random_tip_account();
-        Ok(system_instruction::transfer(&self.payer, &tip_account, self.tip_lamports))
+        Ok(build_system_transfer(&self.payer, &tip_account, self.tip_lamports))
     }
     
     /// Get current transaction count
