@@ -85,6 +85,9 @@ pub struct SniperCfg {
     pub quantile_fallback_slippage_bps: Option<u32>,
     // Freshness filters
     pub max_holders: Option<usize>,
+    // Scenario-specific slippage (configurable instead of hardcoded)
+    pub pumpfun_buy_slippage_bps: Option<u32>,
+    pub emergency_exit_slippage_bps: Option<u32>,
     // System
     pub autosave_state_secs: Option<u64>,
 }
@@ -186,6 +189,8 @@ impl From<&crate::config::SniperSettings> for SniperCfg {
             quantile_max_sample_age_secs: c.quantile_max_sample_age_secs,
             quantile_fallback_slippage_bps: c.quantile_fallback_slippage_bps,
             max_holders: c.max_holders,
+            pumpfun_buy_slippage_bps: c.pumpfun_buy_slippage_bps,
+            emergency_exit_slippage_bps: c.emergency_exit_slippage_bps,
             autosave_state_secs: None,
         }
     }
@@ -1816,7 +1821,7 @@ impl SniperEngine {
                 // Use async version with explicit slippage for proper max_sol_cost calculation
                 // For BUY: max_sol_cost = lamports_in + slippage (we're willing to pay more SOL if price rises)
                 // CRITICAL: Pump.fun tokens are extremely volatile - use high slippage for fresh launches
-                let pumpfun_min_slippage = self.cfg.pumpfun_buy_slippage_bps.unwrap_or(2500); // Config or 25% default
+                let pumpfun_min_slippage = self.cfg.read().pumpfun_buy_slippage_bps.unwrap_or(2500); // Config or 25% default
                 let pumpfun_slippage_bps = msb.max(pumpfun_min_slippage);
                 match pf.build_swap_ix_async_with_slippage(
                     &sol_mint.to_string(),
@@ -3035,7 +3040,7 @@ impl SniperEngine {
 
         // Dynamic route selection for exit: compare Raydium vs Orca vs Pump.fun quotes
         // For emergency exits (stop-loss), use configurable high slippage to ensure execution
-        let emergency_slippage = self.cfg.emergency_exit_slippage_bps.unwrap_or(5000); // Config or 50% default
+        let emergency_slippage = self.cfg.read().emergency_exit_slippage_bps.unwrap_or(5000); // Config or 50% default
         let msb2 = if is_emergency_exit {
             emergency_slippage
         } else {
