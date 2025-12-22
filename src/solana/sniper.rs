@@ -3710,12 +3710,30 @@ impl SniperEngine {
         let tx_result: Result<solana_sdk::signature::Signature, anyhow::Error> = if use_jito {
             // === JITO BUNDLE SUBMISSION ===
             let cfg = self.cfg.read();
-            let tip_lamports = cfg.jito_tip_lamports.unwrap_or(10_000);
+            let base_tip = cfg.jito_tip_lamports.unwrap_or(10_000);
             let region_str = cfg.jito_region.clone().unwrap_or_else(|| "frankfurt".to_string());
             drop(cfg); // Release lock before async operations
             
+            // === DYNAMIC TIP HEURISTIC ===
+            // Adjust tip based on urgency and exit type:
+            // - Emergency exits (kill switch, panic): 3x tip for maximum priority
+            // - Final exits (100%): 2x tip for high priority
+            // - Large exits (>50%): 1.5x tip
+            // - Normal qualifying exits: base tip
+            let tip_multiplier = if is_emergency_exit {
+                3.0  // PANIC: Max priority, get out NOW
+            } else if fraction >= 0.99 {
+                2.0  // Full exit: High priority
+            } else if fraction >= 0.5 {
+                1.5  // Large exit: Medium-high priority
+            } else {
+                1.0  // Normal qualifying exit
+            };
+            
+            let tip_lamports = ((base_tip as f64) * tip_multiplier) as u64;
+            
             let region = JitoRegion::from_str(&region_str).unwrap_or(JitoRegion::Frankfurt);
-            let jito_client = JitoClient::new(region);
+            let jito_client = JitoClient::new(vec![region], tip_lamports);
             
             info!(
                 mint = %mint,
@@ -3736,30 +3754,79 @@ impl SniperEngine {
                 tx_with_tip.try_sign(&[self.treasury.signer_ref()], bh)?;
             }
             
+            // Track tip amount
+            crate::metrics::JITO_TIP_LAMPORTS_TOTAL
+                .fetch_add(tip_lamports, std::sync::atomic::Ordering::Relaxed);
+            
             // Submit as single-TX bundle to Jito
+            crate::metrics::JITO_BUNDLES_SUBMITTED_TOTAL
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                
             match jito_client.send_bundle(&[tx_with_tip.clone()]).await {
                 Ok(bundle_id) => {
-                    info!(bundle_id = %bundle_id, mint = %mint, "Jito bundle submitted");
+                    info!(bundle_id = %bundle_id, mint = %mint, tip_lamports = tip_lamports, "Jito bundle submitted");
                     // Wait for bundle confirmation (with timeout)
                     match jito_client.wait_for_bundle(&bundle_id, 30).await {
                         Ok(true) => {
-                            info!(bundle_id = %bundle_id, "Jito bundle LANDED");
+                            info!(bundle_id = %bundle_id, "Jito bundle LANDED successfully");
+                            crate::metrics::JITO_BUNDLES_LANDED_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             // Return the first signature from the transaction
                             Ok(tx_with_tip.signatures[0])
                         }
                         Ok(false) => {
-                            warn!(bundle_id = %bundle_id, "Jito bundle did not land, falling back to RPC");
+                            warn!(
+                                bundle_id = %bundle_id,
+                                tip_lamports = tip_lamports,
+                                "Jito bundle REJECTED/NOT LANDED - tip may be too low or slot competition high"
+                            );
+                            crate::metrics::JITO_BUNDLES_REJECTED_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::metrics::JITO_FALLBACK_RPC_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             // Fallback to normal RPC submission
                             self.rpc_retry_tx(&tx, 3, false).await
                         }
                         Err(e) => {
-                            warn!(?e, bundle_id = %bundle_id, "Jito bundle status check failed, falling back to RPC");
+                            warn!(
+                                ?e,
+                                bundle_id = %bundle_id,
+                                "Jito bundle status check TIMEOUT - network issue?"
+                            );
+                            crate::metrics::JITO_BUNDLES_TIMEOUT_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::metrics::JITO_FALLBACK_RPC_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             self.rpc_retry_tx(&tx, 3, false).await
                         }
                     }
                 }
                 Err(e) => {
-                    warn!(?e, mint = %mint, "Jito bundle submission failed, falling back to RPC");
+                    // Detailed error diagnosis
+                    let error_msg = format!("{:?}", e);
+                    let reject_reason = if error_msg.contains("tip") || error_msg.contains("Tip") {
+                        "TIP_TOO_LOW"
+                    } else if error_msg.contains("simulation") || error_msg.contains("Simulation") {
+                        "SIMULATION_FAILED"
+                    } else if error_msg.contains("timeout") || error_msg.contains("Timeout") {
+                        "NETWORK_TIMEOUT"
+                    } else if error_msg.contains("rate") || error_msg.contains("Rate") {
+                        "RATE_LIMITED"
+                    } else {
+                        "UNKNOWN"
+                    };
+                    
+                    warn!(
+                        ?e,
+                        mint = %mint,
+                        tip_lamports = tip_lamports,
+                        reject_reason = reject_reason,
+                        "Jito bundle submission FAILED"
+                    );
+                    crate::metrics::JITO_BUNDLES_REJECTED_TOTAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::metrics::JITO_FALLBACK_RPC_TOTAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // Fallback to normal RPC submission
                     self.rpc_retry_tx(&tx, 3, false).await
                 }

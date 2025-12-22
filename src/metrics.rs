@@ -108,6 +108,13 @@ pub static PENDING_FAILED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0
 // Partial exit metrics
 pub static PARTIAL_EXIT_EVENTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static PARTIAL_EXIT_FRACTION_MICRO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Jito bundle metrics
+pub static JITO_BUNDLES_SUBMITTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static JITO_BUNDLES_LANDED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static JITO_BUNDLES_REJECTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static JITO_BUNDLES_TIMEOUT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static JITO_TIP_LAMPORTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static JITO_FALLBACK_RPC_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Re-quote metrics
 pub static REQUOTE_EVENTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static REQUOTE_IMPROVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -616,6 +623,31 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "partial_exit_fraction_sum",
         PARTIAL_EXIT_FRACTION_MICRO_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    );
+    // Jito bundle metrics
+    line!(
+        "jito_bundles_submitted_total",
+        JITO_BUNDLES_SUBMITTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "jito_bundles_landed_total",
+        JITO_BUNDLES_LANDED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "jito_bundles_rejected_total",
+        JITO_BUNDLES_REJECTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "jito_bundles_timeout_total",
+        JITO_BUNDLES_TIMEOUT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "jito_tip_lamports_total",
+        JITO_TIP_LAMPORTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "jito_fallback_rpc_total",
+        JITO_FALLBACK_RPC_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "requote_events_total",
