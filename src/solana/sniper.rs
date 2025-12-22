@@ -3221,40 +3221,104 @@ impl SniperEngine {
         Ok(())
     }
     
-    /// Execute multiple exit tasks in parallel with concurrency limit
-    async fn execute_exits_parallel(&self, tasks: Vec<ExitTask>, _max_concurrent: usize) {
-        // Note: True parallelism requires SniperWorker to be Arc-wrapped or using channels
-        // For now, execute all exits in rapid succession without waiting for confirmation
-        // This is effectively "fire and forget" parallelism
+    /// Execute multiple exit tasks in TRUE parallel using tokio::spawn
+    /// Each exit runs in its own task for maximum throughput - no waiting on bundles!
+    async fn execute_exits_parallel(&self, tasks: Vec<ExitTask>, max_concurrent: usize) {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        
+        let task_count = tasks.len();
+        info!(
+            task_count = task_count,
+            max_concurrent = max_concurrent,
+            "starting TRUE parallel exit execution"
+        );
+        
+        // Use FuturesUnordered for concurrent execution with limit
+        let mut futures = FuturesUnordered::new();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
         
         for task in tasks {
-            let start = Instant::now();
-            let result = self
-                .attempt_exit(&task.mint, task.lot_idx, task.sell_tokens, task.fraction, task.is_emergency)
-                .await;
-            let elapsed_ms = start.elapsed().as_millis();
+            // Clone engine for spawned task (shares Arc-wrapped state)
+            let engine_clone = self.clone_for_spawn();
+            let sem = semaphore.clone();
+            let task_clone = task.clone();
             
-            match result {
-                Ok(()) => {
-                    if task.is_emergency || task.fraction >= 0.99 {
-                        self.mark_cooldown(task.mint);
-                        if let Some(ks) = &self.kill_switch {
-                            ks.unregister_position(&task.mint);
+            let handle = tokio::spawn(async move {
+                // Acquire semaphore permit to limit concurrency
+                let _permit = sem.acquire().await.ok();
+                
+                let start = Instant::now();
+                let result = engine_clone
+                    .attempt_exit(
+                        &task_clone.mint,
+                        task_clone.lot_idx,
+                        task_clone.sell_tokens,
+                        task_clone.fraction,
+                        task_clone.is_emergency,
+                    )
+                    .await;
+                let elapsed_ms = start.elapsed().as_millis();
+                
+                (task_clone, result, elapsed_ms)
+            });
+            
+            futures.push(handle);
+        }
+        
+        // Collect results as they complete (don't wait for all - process immediately!)
+        let mut success_count = 0u32;
+        let mut fail_count = 0u32;
+        
+        while let Some(join_result) = futures.next().await {
+            match join_result {
+                Ok((task, result, elapsed_ms)) => {
+                    match result {
+                        Ok(()) => {
+                            success_count += 1;
+                            if task.is_emergency || task.fraction >= 0.99 {
+                                self.mark_cooldown(task.mint);
+                                if let Some(ks) = &self.kill_switch {
+                                    ks.unregister_position(&task.mint);
+                                }
+                            }
+                            metrics::PARTIAL_EXIT_EVENTS_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            metrics::PARTIAL_EXIT_FRACTION_MICRO_TOTAL.fetch_add(
+                                (task.fraction * 1_000_000.0) as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            info!(
+                                mint = %task.mint,
+                                reason = %task.reason,
+                                elapsed_ms = elapsed_ms,
+                                "parallel exit completed"
+                            );
+                        }
+                        Err(e) => {
+                            fail_count += 1;
+                            warn!(
+                                ?e,
+                                mint = %task.mint,
+                                reason = %task.reason,
+                                elapsed_ms = elapsed_ms,
+                                "parallel exit failed"
+                            );
                         }
                     }
-                    metrics::PARTIAL_EXIT_EVENTS_TOTAL
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    metrics::PARTIAL_EXIT_FRACTION_MICRO_TOTAL.fetch_add(
-                        (task.fraction * 1_000_000.0) as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    info!(mint=%task.mint, reason=%task.reason, elapsed_ms=elapsed_ms, "exit completed");
                 }
                 Err(e) => {
-                    warn!(?e, mint=%task.mint, reason=%task.reason, elapsed_ms=elapsed_ms, "exit failed");
+                    fail_count += 1;
+                    error!(?e, "exit task panicked");
                 }
             }
         }
+        
+        info!(
+            success_count = success_count,
+            fail_count = fail_count,
+            total = task_count,
+            "parallel exit execution completed"
+        );
     }
 
     async fn attempt_exit(
