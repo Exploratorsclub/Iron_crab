@@ -3693,45 +3693,58 @@ impl SniperEngine {
 
         // Response is Vec<RpcKeyedAccount> directly (not wrapped in .value)
         for account in all_token_accounts {
-            // Parse the token account data - handle different encoding formats
-            let data: Vec<u8> =
-                if let solana_account_decoder::UiAccountData::Binary(b64_str, _encoding) =
-                    &account.account.data
-                {
-                    match base64::Engine::decode(
+            // Parse the token account data - handle JsonParsed format (default from RPC)
+            let (mint_str, amount): (String, u64) = 
+                if let solana_account_decoder::UiAccountData::Json(parsed) = &account.account.data {
+                    // JsonParsed format: {"parsed": {"info": {"mint": "...", "tokenAmount": {"amount": "..."}}}}
+                    let info = parsed.parsed.get("info");
+                    if let Some(info) = info {
+                        let mint = info.get("mint").and_then(|v| v.as_str()).unwrap_or("");
+                        let amount_str = info.get("tokenAmount")
+                            .and_then(|v| v.get("amount"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("0");
+                        let amount = amount_str.parse::<u64>().unwrap_or(0);
+                        (mint.to_string(), amount)
+                    } else {
+                        continue;
+                    }
+                } else if let solana_account_decoder::UiAccountData::Binary(b64_str, _encoding) = &account.account.data {
+                    // Binary format fallback
+                    let data = match base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
                         b64_str,
                     ) {
                         Ok(d) => d,
                         Err(_) => continue,
+                    };
+                    if data.len() < 165 {
+                        continue;
                     }
+                    let mint_bytes: [u8; 32] = data[0..32].try_into().unwrap_or([0u8; 32]);
+                    let amount = u64::from_le_bytes(data[64..72].try_into().unwrap_or([0u8; 8]));
+                    let mint_pk = solana_sdk::pubkey::Pubkey::new_from_array(mint_bytes);
+                    (mint_pk.to_string(), amount)
                 } else {
                     continue;
                 };
-
-            // Token account is 165 bytes
-            if data.len() < 165 {
-                continue;
-            }
-
-            // Parse token account manually (avoid Pack trait version conflicts)
-            // Layout: mint (32) + owner (32) + amount (8) + ...
-            let mint_bytes: [u8; 32] = data[0..32].try_into().unwrap_or([0u8; 32]);
-            let amount = u64::from_le_bytes(data[64..72].try_into().unwrap_or([0u8; 8]));
 
             // Skip zero balances
             if amount == 0 {
                 continue;
             }
 
-            let token_mint = solana_sdk::pubkey::Pubkey::new_from_array(mint_bytes);
+            let token_mint = match solana_sdk::pubkey::Pubkey::from_str(&mint_str) {
+                Ok(pk) => pk,
+                Err(_) => continue,
+            };
 
             // Skip WSOL
             if token_mint == sol_mint {
                 continue;
             }
 
-            let mint = Pubkey::new_from_array(mint_bytes);
+            let mint = Pubkey::new_from_array(token_mint.to_bytes());
 
             // Check if already tracked in risk state
             {
