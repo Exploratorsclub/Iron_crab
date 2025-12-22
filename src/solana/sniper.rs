@@ -3774,8 +3774,8 @@ impl SniperEngine {
             self.purchased.write().insert(mint);
 
             // Register as an open position (unknown entry price)
-            // Use sol_per_trade as estimated invested amount since we don't know the actual
-            let estimated_invested = self.cfg.read().sol_per_trade.unwrap_or(0.005);
+            // Use max_buy_sol as estimated invested amount since we don't know the actual
+            let estimated_invested = self.cfg.read().max_buy_sol;
             {
                 let mut rs = self.risk.write();
                 let lot = PositionLot {
