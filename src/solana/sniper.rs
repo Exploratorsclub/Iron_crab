@@ -3522,7 +3522,8 @@ impl SniperEngine {
                             // Try finalize now (will remove pending & log fill if balance updated)
                             PENDING_RECONCILIATIONS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            self.finalize_fill(*mint).await;
+                            let invested_sol = p.lamports_in as f64 / 1e9;
+                            self.finalize_fill(*mint, invested_sol).await;
                             // If still present and older than half cutoff without realized fill treat as failed
                             let mut rs = self.risk.write();
                             if let Some(persist) = rs.pending.get(mint) {
