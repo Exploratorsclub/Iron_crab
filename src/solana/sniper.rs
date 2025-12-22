@@ -1240,7 +1240,7 @@ impl SniperEngine {
                 return;
             }
             // Slot is now reserved atomically!
-            // NOTE: pending_buys will be decremented by record_fill_placeholder on success,
+            // NOTE: pending_buys will be decremented by finalize_fill on success,
             // or manually released here on failure.
 
             info!(mint=%mint, "sniper: [Pump.fun] all checks passed, attempting buy");
@@ -1264,7 +1264,7 @@ impl SniperEngine {
                 .await
             {
                 warn!(?e, mint=%mint, "sniper: [Pump.fun] initial buy failed");
-                // CRITICAL: Release slot on failure since record_fill_placeholder won't be called
+                // CRITICAL: Release slot on failure since finalize_fill won't be called
                 self.release_buy_slot();
             }
             return;
@@ -1364,7 +1364,7 @@ impl SniperEngine {
             .await
         {
             warn!(?e, mint=%mint, "sniper: initial buy failed");
-            // CRITICAL: Release slot on failure since record_fill_placeholder won't be called
+            // CRITICAL: Release slot on failure since finalize_fill won't be called
             self.release_buy_slot();
         }
 
@@ -2066,8 +2066,8 @@ impl SniperEngine {
                     ChosenDex::PumpFun => {
                         info!(mint=%mint, sig=%sig, lamports_in, expected_out=pumpfun_quote_out, liq_sol, "sniper: initial buy submitted (pump.fun)");
                         let sol_in = lamports_in as f64 / 1e9;
-                        self.record_fill_placeholder(*mint, sol_in);
-                        self.finalize_fill(*mint).await;
+                        // NOTE: Position is only created in finalize_fill if tokens actually arrive
+                        self.finalize_fill(*mint, sol_in).await;
 
                         // Record pending trade for reconciliation
                         {
@@ -2102,8 +2102,8 @@ impl SniperEngine {
                             info!(mint=%mint, sig=%sig, lamports_in, expected_out=pm.expected_out, min_out=pm.min_out, pool=?pm.pool, liq_sol, "sniper: initial buy submitted (raydium)");
                             if pm.expected_out > 0 {
                                 let sol_in = lamports_in as f64 / 1e9;
-                                self.record_fill_placeholder(*mint, sol_in);
-                                self.finalize_fill(*mint).await;
+                                // NOTE: Position is only created in finalize_fill if tokens actually arrive
+                                self.finalize_fill(*mint, sol_in).await;
                             }
 
                             // Record pending trade
@@ -2139,8 +2139,8 @@ impl SniperEngine {
                     ChosenDex::Orca => {
                         info!(mint=%mint, sig=%sig, lamports_in, expected_out=orca_quote_out, liq_sol, "sniper: initial buy submitted (orca)");
                         let sol_in = lamports_in as f64 / 1e9;
-                        self.record_fill_placeholder(*mint, sol_in);
-                        self.finalize_fill(*mint).await;
+                        // NOTE: Position is only created in finalize_fill if tokens actually arrive
+                        self.finalize_fill(*mint, sol_in).await;
 
                         record_network_fee(fee_estimate);
                         let line = format!(
@@ -2171,14 +2171,12 @@ impl SniperEngine {
                 // CRITICAL FIX: If TX was sent but confirmation timed out, the TX may have succeeded!
                 // Register the position anyway to prevent over-buying. Wallet scan will verify later.
                 if err_str.contains("timed out") || err_str.contains("Timeout") {
-                    warn!(mint=%mint, "sniper: buy TX confirmation timeout - TX was SENT, registering position anyway");
-                    // Register placeholder position since TX was definitely sent
+                    warn!(mint=%mint, "sniper: buy TX confirmation timeout - TX was SENT, checking if tokens arrived");
+                    // Try to finalize the fill - position will only be created if tokens actually arrived
                     let sol_in = lamports_in as f64 / 1e9;
-                    self.record_fill_placeholder(*mint, sol_in);
+                    self.finalize_fill(*mint, sol_in).await;
                     self.purchased.write().insert(*mint);
-                    // Try to finalize the fill to get actual token amount (may have arrived)
-                    self.finalize_fill(*mint).await;
-                    // Don't return error - we registered the position
+                    // Don't return error - we attempted to register the position
                     return Ok(());
                 }
                 
@@ -2379,51 +2377,15 @@ impl SniperEngine {
         }
     }
 
-    fn record_fill_placeholder(&self, mint: Pubkey, invested_sol: f64) {
-        self.risk_reset_if_needed();
-        let mut rs = self.risk.write();
-        // Respect per-mint lot limit if configured
-        if let Some(limit) = self.cfg.read().per_mint_position_limit {
-            if let Some(v) = rs.open.get(&mint) {
-                if v.len() as u32 >= limit {
-                    info!(mint=%mint, current_lots=v.len(), limit=limit, "sniper: per-mint position limit reached, not recording new lot");
-                    return;
-                }
-            }
-        }
-        let lot = PositionLot {
-            entry_price_sol: 0.0,
-            amount_tokens: 0.0,
-            invested_sol,
-            token_decimals: 0,
-            last_unrealized_pnl_sol: 0.0,
-            opened_ts: chrono::Utc::now().timestamp(),
-            executed_tp_bps: Vec::new(),
-            peak_pnl_bps: 0,
-        };
-        rs.open.entry(mint).or_default().push(lot);
-        let lots: usize = rs.open.values().map(|v| v.len()).sum();
-        OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
+    // NOTE: record_fill_placeholder has been REMOVED!
+    // Position creation now only happens in finalize_fill() after confirming tokens arrived.
+    // This eliminates ghost positions from failed transactions.
 
-        // CRITICAL: Also decrement pending_buys since position is now recorded
-        if rs.pending_buys > 0 {
-            rs.pending_buys -= 1;
-        }
-
-        info!(
-            mint=%mint,
-            invested_sol=invested_sol,
-            total_open_positions=lots,
-            remaining_pending=rs.pending_buys,
-            "sniper: [POSITION RECORDED] new position registered"
-        );
-        
-        // Persist immediately so max_open_positions works correctly on restart
-        drop(rs); // Release lock before persisting
-        self.persist_risk_state();
-    }
-
-    async fn finalize_fill(&self, mint: Pubkey) {
+    /// Finalize a fill by checking token balance and creating/updating position.
+    /// Only creates position if tokens actually arrived (no more ghost positions).
+    /// invested_sol: The SOL amount that was spent on this buy
+    async fn finalize_fill(&self, mint: Pubkey, invested_sol: f64) {
+        self.risk_reset_if_needed(); // Reset daily counters if new day
         let owner = self.treasury.pubkey();
         let mint_sdk = solana_sdk::pubkey::Pubkey::new_from_array(mint.to_bytes());
         let ata = match self
@@ -2432,7 +2394,12 @@ impl SniperEngine {
             .await
         {
             Ok(v) => v.0,
-            Err(_) => return,
+            Err(_) => {
+                // Decrement pending_buys on failure
+                let mut rs = self.risk.write();
+                if rs.pending_buys > 0 { rs.pending_buys -= 1; }
+                return;
+            }
         };
         let decimals =
             crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &mint_sdk).await;
@@ -2466,31 +2433,71 @@ impl SniperEngine {
         }
         
         if amt <= 0.0 {
-            warn!(mint=%mint, "finalize_fill: no token balance found after 10 attempts, position will have incomplete data");
+            // TX failed - no tokens arrived. DO NOT create position!
+            warn!(mint=%mint, "finalize_fill: no token balance found after 10 attempts - TX likely failed, NOT creating position");
+            // Decrement pending_buys since we're done with this attempt
+            let mut rs = self.risk.write();
+            if rs.pending_buys > 0 { rs.pending_buys -= 1; }
             return;
         }
         
-        // Take snapshot of pending & position without holding lock across RPC
+        // SUCCESS: Tokens arrived! Now create the position
+        let entry_price = invested_sol / amt.max(1e-9);
         let (pend_opt, entry_price_existing) = {
             let mut rs = self.risk.write();
             let pend = rs.pending.remove(&mint);
-            if let Some(v) = rs.open.get_mut(&mint) {
-                if let Some(last) = v.last_mut() {
-                    if last.entry_price_sol == 0.0 {
-                        last.amount_tokens = amt;
-                        last.token_decimals = decimals;
-                        last.entry_price_sol = last.invested_sol / amt.max(1e-9);
-                        info!(
-                            mint=%mint,
-                            amount_tokens=amt,
-                            entry_price_sol=last.entry_price_sol,
-                            invested_sol=last.invested_sol,
-                            decimals=decimals,
-                            "finalize_fill: position data updated successfully"
-                        );
+            
+            // Check if position already exists (from wallet scan or previous buy)
+            let already_exists = rs.open.get(&mint).map(|v| !v.is_empty()).unwrap_or(false);
+            
+            if already_exists {
+                // Update existing position
+                if let Some(v) = rs.open.get_mut(&mint) {
+                    if let Some(last) = v.last_mut() {
+                        if last.entry_price_sol == 0.0 {
+                            last.amount_tokens = amt;
+                            last.token_decimals = decimals;
+                            last.entry_price_sol = entry_price;
+                            info!(
+                                mint=%mint,
+                                amount_tokens=amt,
+                                entry_price_sol=entry_price,
+                                invested_sol=invested_sol,
+                                decimals=decimals,
+                                "finalize_fill: position data updated successfully"
+                            );
+                        }
                     }
                 }
+            } else {
+                // Create NEW position - only if tokens actually arrived!
+                let lot = PositionLot {
+                    entry_price_sol: entry_price,
+                    amount_tokens: amt,
+                    invested_sol,
+                    token_decimals: decimals,
+                    last_unrealized_pnl_sol: 0.0,
+                    opened_ts: chrono::Utc::now().timestamp(),
+                    executed_tp_bps: Vec::new(),
+                    peak_pnl_bps: 0,
+                };
+                rs.open.entry(mint).or_default().push(lot);
+                let lots: usize = rs.open.values().map(|v| v.len()).sum();
+                OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
+                info!(
+                    mint=%mint,
+                    amount_tokens=amt,
+                    entry_price_sol=entry_price,
+                    invested_sol=invested_sol,
+                    decimals=decimals,
+                    total_open_positions=lots,
+                    "finalize_fill: NEW POSITION CREATED (tokens confirmed)"
+                );
             }
+            
+            // Decrement pending_buys since position is now recorded
+            if rs.pending_buys > 0 { rs.pending_buys -= 1; }
+            
             let entry_price_last = rs
                 .open
                 .get(&mint)
@@ -2735,9 +2742,9 @@ impl SniperEngine {
     }
 
     async fn evaluate_positions(&self) -> Result<()> {
-        // CRITICAL: Clean up ghost positions (amount_tokens = 0 after TX failure)
-        // These can accumulate when buy TXs fail after position was reserved.
-        // Only remove if position is older than 2 minutes (allow finalize_fill time to run)
+        // LEGACY: Clean up any remaining ghost positions (amount_tokens = 0)
+        // NOTE: With the new finalize_fill approach, ghost positions should no longer be created
+        // since positions are only created AFTER tokens are confirmed. This is just a safety net.
         {
             let now = chrono::Utc::now().timestamp();
             let mut rs = self.risk.write();
@@ -2754,7 +2761,7 @@ impl SniperEngine {
             // Remove empty mint entries
             rs.open.retain(|_, lots| !lots.is_empty());
             if cleaned > 0 {
-                info!(cleaned_ghost_positions=cleaned, "evaluate_positions: removed ghost positions (amount_tokens=0, age>2min)");
+                info!(cleaned_ghost_positions=cleaned, "evaluate_positions: removed legacy ghost positions (amount_tokens=0, age>2min)");
                 drop(rs);
                 self.persist_risk_state();
             }
