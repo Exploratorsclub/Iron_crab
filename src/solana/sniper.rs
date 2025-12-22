@@ -138,6 +138,8 @@ impl Default for SniperCfg {
             quantile_max_sample_age_secs: None,
             quantile_fallback_slippage_bps: None,
             max_holders: None,
+            pumpfun_buy_slippage_bps: None,
+            emergency_exit_slippage_bps: None,
             autosave_state_secs: None,
         }
     }
