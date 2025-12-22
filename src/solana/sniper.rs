@@ -1929,7 +1929,8 @@ impl SniperEngine {
                 // Use async version with explicit slippage for proper max_sol_cost calculation
                 // For BUY: max_sol_cost = lamports_in + slippage (we're willing to pay more SOL if price rises)
                 // CRITICAL: Pump.fun tokens are extremely volatile - use high slippage for fresh launches
-                let pumpfun_min_slippage = self.cfg.read().pumpfun_buy_slippage_bps.unwrap_or(2500); // Config or 25% default
+                // New tokens can pump 50-100% in the first seconds, so we need at least 50% slippage
+                let pumpfun_min_slippage = self.cfg.read().pumpfun_buy_slippage_bps.unwrap_or(5000); // Config or 50% default (was 25%)
                 let pumpfun_slippage_bps = msb.max(pumpfun_min_slippage);
                 match pf.build_swap_ix_async_with_slippage(
                     &sol_mint.to_string(),
@@ -2499,6 +2500,7 @@ impl SniperEngine {
     /// Only creates position if tokens actually arrived (no more ghost positions).
     /// invested_sol: The SOL amount that was spent on this buy
     async fn finalize_fill(&self, mint: Pubkey, invested_sol: f64) {
+        info!(mint=%mint, invested_sol=invested_sol, "finalize_fill: STARTING position finalization");
         self.risk_reset_if_needed(); // Reset daily counters if new day
         let owner = self.treasury.pubkey();
         let mint_sdk = solana_sdk::pubkey::Pubkey::new_from_array(mint.to_bytes());
@@ -2508,13 +2510,15 @@ impl SniperEngine {
             .await
         {
             Ok(v) => v.0,
-            Err(_) => {
+            Err(e) => {
+                warn!(mint=%mint, ?e, "finalize_fill: failed to get ATA address, aborting position creation");
                 // Decrement pending_buys on failure
                 let mut rs = self.risk.write();
                 if rs.pending_buys > 0 { rs.pending_buys -= 1; }
                 return;
             }
         };
+        info!(mint=%mint, ata=%ata, "finalize_fill: checking token balance");
         let decimals =
             crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &mint_sdk).await;
         
