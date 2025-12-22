@@ -2761,6 +2761,9 @@ impl SniperEngine {
             return Ok(());
         }
         for (mint, pos, lot_idx) in positions {
+            // Convert UI tokens to raw token amount (with decimals)
+            let raw_token_amount = (pos.amount_tokens * 10f64.powi(pos.token_decimals as i32)).floor() as u64;
+            
             // Quote exit value (prefer Raydium then Orca)
             let mut quote_out: Option<u64> = None;
             if let Some(r) = &self.raydium {
@@ -2768,7 +2771,7 @@ impl SniperEngine {
                     .quote_exact_in(
                         &mint.to_string(),
                         &sol_mint.to_string(),
-                        pos.amount_tokens as u64,
+                        raw_token_amount,
                     )
                     .await
                 {
@@ -2783,7 +2786,7 @@ impl SniperEngine {
                         .quote_exact_in(
                             &mint.to_string(),
                             &sol_mint.to_string(),
-                            pos.amount_tokens as u64,
+                            raw_token_amount,
                         )
                         .await
                     {
@@ -2800,7 +2803,7 @@ impl SniperEngine {
                         .quote_exact_in(
                             &mint.to_string(),
                             &sol_mint.to_string(),
-                            pos.amount_tokens as u64,
+                            raw_token_amount,
                         )
                         .await
                     {
@@ -2886,7 +2889,8 @@ impl SniperEngine {
                 if notional_now_sol < min_exit_notional {
                     continue;
                 }
-                let sell_tokens = (pos.amount_tokens * fraction).floor() as u64;
+                // Convert UI tokens to raw token amount (with decimals) for the sell
+                let sell_tokens = ((pos.amount_tokens * fraction) * 10f64.powi(pos.token_decimals as i32)).floor() as u64;
                 if sell_tokens > 0 {
                     // Pass stop_trigger flag so attempt_exit can use higher slippage for emergency exits
                     if let Err(e) = self
