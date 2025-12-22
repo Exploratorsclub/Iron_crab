@@ -326,6 +326,22 @@ pub struct SniperSettings {
     pub kill_switch_flow_ratio_min: Option<f64>, // Min buy/sell ratio before exit (e.g., 0.6)
     #[serde(default)]
     pub kill_switch_negative_flow_slots: Option<u64>, // Consecutive negative flow slots to exit (e.g., 3)
+    
+    // === JITO BUNDLE INTEGRATION ===
+    #[serde(default)]
+    pub jito_enabled: Option<bool>, // Enable Jito bundle submission for exits
+    #[serde(default)]
+    pub jito_tip_lamports: Option<u64>, // Tip amount in lamports (default: 10000 = 0.00001 SOL)
+    #[serde(default)]
+    pub jito_region: Option<String>, // Block engine region: frankfurt, amsterdam, ny, tokyo, slc
+    
+    // === PARALLEL EXIT EXECUTION ===
+    #[serde(default)]
+    pub parallel_exits: Option<bool>, // Execute multiple exits concurrently (default: true)
+    #[serde(default)]
+    pub max_parallel_exits: Option<usize>, // Max concurrent exit tasks (default: 5)
+    #[serde(default)]
+    pub bundle_exits: Option<bool>, // Bundle multiple exit TXs via Jito (default: false)
 }
 
 /// Timed exit tier - sell fraction after N seconds

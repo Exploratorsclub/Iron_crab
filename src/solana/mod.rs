@@ -3,6 +3,7 @@ pub mod arbitrage;
 pub mod execution;
 pub mod geyser_listener;
 pub mod geyser_pool_discovery;
+pub mod jito;
 pub mod kill_switch;
 pub mod rpc;
 pub mod sniper;

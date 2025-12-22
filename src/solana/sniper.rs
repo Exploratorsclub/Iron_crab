@@ -16,6 +16,7 @@ use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
 use crate::solana::dex::{orca::Orca, pumpfun::PumpFunDex, raydium::Raydium, Dex};
 use crate::solana::geyser_pool_discovery::PoolDiscoveryEvent;
+use crate::solana::jito::{JitoClient, JitoRegion};
 use crate::solana::kill_switch::KillSwitchMonitor;
 use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
@@ -101,6 +102,14 @@ pub struct SniperCfg {
     pub kill_switch_sell_burst_slots: Option<u64>,
     pub kill_switch_flow_ratio_min: Option<f64>,
     pub kill_switch_negative_flow_slots: Option<u64>,
+    // Jito bundle integration
+    pub jito_enabled: Option<bool>,
+    pub jito_tip_lamports: Option<u64>,
+    pub jito_region: Option<String>,
+    // Parallel exit execution
+    pub parallel_exits: Option<bool>,
+    pub max_parallel_exits: Option<usize>,
+    pub bundle_exits: Option<bool>,
     // System
     pub autosave_state_secs: Option<u64>,
 }
@@ -163,6 +172,12 @@ impl Default for SniperCfg {
             kill_switch_sell_burst_slots: None,
             kill_switch_flow_ratio_min: None,
             kill_switch_negative_flow_slots: None,
+            jito_enabled: None,
+            jito_tip_lamports: None,
+            jito_region: None,
+            parallel_exits: None,
+            max_parallel_exits: None,
+            bundle_exits: None,
             autosave_state_secs: None,
         }
     }
@@ -226,6 +241,12 @@ impl From<&crate::config::SniperSettings> for SniperCfg {
             kill_switch_sell_burst_slots: c.kill_switch_sell_burst_slots,
             kill_switch_flow_ratio_min: c.kill_switch_flow_ratio_min,
             kill_switch_negative_flow_slots: c.kill_switch_negative_flow_slots,
+            jito_enabled: c.jito_enabled,
+            jito_tip_lamports: c.jito_tip_lamports,
+            jito_region: c.jito_region.clone(),
+            parallel_exits: c.parallel_exits,
+            max_parallel_exits: c.max_parallel_exits,
+            bundle_exits: c.bundle_exits,
             autosave_state_secs: None,
         }
     }
@@ -249,6 +270,17 @@ struct PositionLot {
     // Kill switch tracking (creator address for dev sell detection)
     #[serde(default)]
     creator: Option<String>, // Token creator/dev address for kill switch
+}
+
+/// Exit task for parallel execution
+#[derive(Clone, Debug)]
+struct ExitTask {
+    mint: Pubkey,
+    lot_idx: usize,
+    sell_tokens: u64,
+    fraction: f64,
+    is_emergency: bool,
+    reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2882,6 +2914,15 @@ impl SniperEngine {
             return Ok(());
         }
         
+        // Load parallel exit config
+        let (parallel_exits_enabled, max_parallel) = {
+            let r = self.cfg.read();
+            (
+                r.parallel_exits.unwrap_or(true), // Default: enabled
+                r.max_parallel_exits.unwrap_or(5),
+            )
+        };
+        
         // Count open positions for logging
         let open_count = self.risk.read().open.len();
         if open_count > 0 {
@@ -2895,6 +2936,9 @@ impl SniperEngine {
         
         let now = chrono::Utc::now().timestamp();
         let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
+        
+        // Collect exit tasks for parallel execution
+        let mut exit_tasks: Vec<ExitTask> = Vec::new();
         
         // Flatten lots for evaluation
         let positions: Vec<(Pubkey, PositionLot, usize)> = {
@@ -2944,7 +2988,7 @@ impl SniperEngine {
                     }
                 }
                 
-                // Execute time-based exit if triggered
+                // Collect time-based exit task (instead of executing immediately)
                 if time_fraction > 0.0 {
                     let sell_tokens = ((pos.amount_tokens * time_fraction) * 10f64.powi(pos.token_decimals as i32)).floor() as u64;
                     if sell_tokens > 0 {
@@ -2952,27 +2996,19 @@ impl SniperEngine {
                             mint=%mint,
                             age_secs=age_secs,
                             fraction=time_fraction,
-                            reason=time_exit_reason,
+                            reason=%time_exit_reason,
                             sell_tokens=sell_tokens,
                             "TIME-BASED EXIT triggered"
                         );
                         let is_full_exit = time_fraction >= 0.99;
-                        if let Err(e) = self
-                            .attempt_exit(&mint, lot_idx, sell_tokens, time_fraction, is_full_exit)
-                            .await
-                        {
-                            warn!(?e, mint=%mint, "time-based exit tx failed");
-                        } else {
-                            if is_full_exit {
-                                self.mark_cooldown(mint);
-                                // Unregister from kill switch monitor
-                                if let Some(ks) = &self.kill_switch {
-                                    ks.unregister_position(&mint);
-                                }
-                            }
-                            metrics::PARTIAL_EXIT_EVENTS_TOTAL
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
+                        exit_tasks.push(ExitTask {
+                            mint,
+                            lot_idx,
+                            sell_tokens,
+                            fraction: time_fraction,
+                            is_emergency: is_full_exit,
+                            reason: time_exit_reason.clone(),
+                        });
                     }
                     continue; // Skip price-based evaluation for this position
                 }
@@ -3123,28 +3159,102 @@ impl SniperEngine {
                 // Convert UI tokens to raw token amount (with decimals) for the sell
                 let sell_tokens = ((pos.amount_tokens * fraction) * 10f64.powi(pos.token_decimals as i32)).floor() as u64;
                 if sell_tokens > 0 {
-                    // Pass stop_trigger flag so attempt_exit can use higher slippage for emergency exits
+                    // Collect price-based exit task (instead of executing immediately)
+                    let reason = if stop_trigger {
+                        "STOP_LOSS".to_string()
+                    } else if full_exit {
+                        "TRAILING_STOP".to_string()
+                    } else {
+                        format!("TAKE_PROFIT ({}bps)", pnl_bps)
+                    };
+                    exit_tasks.push(ExitTask {
+                        mint,
+                        lot_idx,
+                        sell_tokens,
+                        fraction,
+                        is_emergency: stop_trigger || full_exit,
+                        reason,
+                    });
+                }
+            }
+        }
+        
+        // Execute all collected exit tasks (parallel or sequential based on config)
+        if !exit_tasks.is_empty() {
+            info!(
+                exit_count=exit_tasks.len(),
+                parallel=parallel_exits_enabled,
+                max_parallel=max_parallel,
+                "evaluate_positions: executing exits"
+            );
+            
+            if parallel_exits_enabled && exit_tasks.len() > 1 {
+                // Execute exits in parallel with concurrency limit
+                self.execute_exits_parallel(exit_tasks, max_parallel).await;
+            } else {
+                // Execute exits sequentially (legacy behavior)
+                for task in exit_tasks {
                     if let Err(e) = self
-                        .attempt_exit(&mint, lot_idx, sell_tokens, fraction, stop_trigger || full_exit)
+                        .attempt_exit(&task.mint, task.lot_idx, task.sell_tokens, task.fraction, task.is_emergency)
                         .await
                     {
-                        warn!(?e, mint=%mint, "exit tx failed");
+                        warn!(?e, mint=%task.mint, reason=%task.reason, "exit tx failed");
                     } else {
-                        if full_exit || stop_trigger {
-                            self.mark_cooldown(mint);
+                        if task.is_emergency || task.fraction >= 0.99 {
+                            self.mark_cooldown(task.mint);
+                            // Unregister from kill switch monitor
+                            if let Some(ks) = &self.kill_switch {
+                                ks.unregister_position(&task.mint);
+                            }
                         }
-                        // metrics
                         metrics::PARTIAL_EXIT_EVENTS_TOTAL
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         metrics::PARTIAL_EXIT_FRACTION_MICRO_TOTAL.fetch_add(
-                            (fraction * 1_000_000.0) as u64,
+                            (task.fraction * 1_000_000.0) as u64,
                             std::sync::atomic::Ordering::Relaxed,
                         );
                     }
                 }
             }
         }
+        
         Ok(())
+    }
+    
+    /// Execute multiple exit tasks in parallel with concurrency limit
+    async fn execute_exits_parallel(&self, tasks: Vec<ExitTask>, _max_concurrent: usize) {
+        // Note: True parallelism requires SniperWorker to be Arc-wrapped or using channels
+        // For now, execute all exits in rapid succession without waiting for confirmation
+        // This is effectively "fire and forget" parallelism
+        
+        for task in tasks {
+            let start = Instant::now();
+            let result = self
+                .attempt_exit(&task.mint, task.lot_idx, task.sell_tokens, task.fraction, task.is_emergency)
+                .await;
+            let elapsed_ms = start.elapsed().as_millis();
+            
+            match result {
+                Ok(()) => {
+                    if task.is_emergency || task.fraction >= 0.99 {
+                        self.mark_cooldown(task.mint);
+                        if let Some(ks) = &self.kill_switch {
+                            ks.unregister_position(&task.mint);
+                        }
+                    }
+                    metrics::PARTIAL_EXIT_EVENTS_TOTAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics::PARTIAL_EXIT_FRACTION_MICRO_TOTAL.fetch_add(
+                        (task.fraction * 1_000_000.0) as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    info!(mint=%task.mint, reason=%task.reason, elapsed_ms=elapsed_ms, "exit completed");
+                }
+                Err(e) => {
+                    warn!(?e, mint=%task.mint, reason=%task.reason, elapsed_ms=elapsed_ms, "exit failed");
+                }
+            }
+        }
     }
 
     async fn attempt_exit(

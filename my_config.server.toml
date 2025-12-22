@@ -120,6 +120,18 @@ kill_switch_flow_ratio_min = 0.6     # Buy/Sell Ratio unter 0.6 = EXIT
 kill_switch_negative_flow_slots = 3  # 3 Slots in Folge negativer Netflow = EXIT
 
 # ============================================================================
+# JITO BUNDLE INTEGRATION (MEV-Schutz für schnellere Exits)
+# ============================================================================
+jito_enabled = false                 # Aktiviere Jito für Bundle-Submission
+jito_tip_lamports = 10000           # Tip: 0.00001 SOL (kann höher für Priorität)
+jito_region = "frankfurt"            # Block Engine: frankfurt, amsterdam, ny, tokyo, slc
+
+# PARALLEL EXIT EXECUTION (mehrere Tokens gleichzeitig verkaufen)
+parallel_exits = true               # Aktiviere parallele Exits
+max_parallel_exits = 5              # Max 5 Exits gleichzeitig
+bundle_exits = false                # Bundle Exits über Jito (experimentell)
+
+# ============================================================================
 # LEGACY EXIT STRATEGY - PRICE-BASED (disabled when time_based_exits = true)
 # ============================================================================
 stop_loss_bps = 1000       # -10% Stop Loss (backup wenn Zeit-Exits deaktiviert)
