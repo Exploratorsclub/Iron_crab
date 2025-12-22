@@ -302,6 +302,37 @@ pub struct SniperSettings {
     pub pumpfun_buy_slippage_bps: Option<u32>, // Minimum slippage for Pump.fun buys (default: 2500 = 25%)
     #[serde(default)]
     pub emergency_exit_slippage_bps: Option<u32>, // Slippage for stop-loss/emergency exits (default: 5000 = 50%)
+    
+    // === TIME-BASED EXIT STRATEGY ===
+    #[serde(default)]
+    pub enable_time_based_exits: Option<bool>, // Enable time-based exits instead of price-based
+    #[serde(default)]
+    pub max_hold_secs: Option<u64>, // Maximum hold time before forced exit (default: 90)
+    #[serde(default)]
+    pub timed_exit_tiers: Option<Vec<TimedExitTier>>, // Timed exit tiers [{secs, fraction}]
+    
+    // === KILL SWITCHES (Geyser-based, override all other logic) ===
+    #[serde(default)]
+    pub kill_switch_enabled: Option<bool>, // Enable kill switch monitoring
+    #[serde(default)]
+    pub kill_switch_dev_sell: Option<bool>, // Exit immediately if dev/creator sells
+    #[serde(default)]
+    pub kill_switch_sell_burst_count: Option<u32>, // Number of sells to trigger burst exit (e.g., 3)
+    #[serde(default)]
+    pub kill_switch_sell_burst_sol: Option<f64>, // Total SOL sold in burst to trigger (e.g., 0.5)
+    #[serde(default)]
+    pub kill_switch_sell_burst_slots: Option<u64>, // Time window in slots for burst (e.g., 5)
+    #[serde(default)]
+    pub kill_switch_flow_ratio_min: Option<f64>, // Min buy/sell ratio before exit (e.g., 0.6)
+    #[serde(default)]
+    pub kill_switch_negative_flow_slots: Option<u64>, // Consecutive negative flow slots to exit (e.g., 3)
+}
+
+/// Timed exit tier - sell fraction after N seconds
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TimedExitTier {
+    pub secs: u64,     // Seconds after entry to trigger this tier
+    pub fraction: f64, // Fraction of REMAINING position to sell (0.0-1.0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

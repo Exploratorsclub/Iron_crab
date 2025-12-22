@@ -16,6 +16,7 @@ use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
 use crate::solana::dex::{orca::Orca, pumpfun::PumpFunDex, raydium::Raydium, Dex};
 use crate::solana::geyser_pool_discovery::PoolDiscoveryEvent;
+use crate::solana::kill_switch::{KillSwitchMonitor, KillSwitchReason, TokenTradeEvent};
 use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
 use anyhow::Result;
@@ -88,6 +89,18 @@ pub struct SniperCfg {
     // Scenario-specific slippage (configurable instead of hardcoded)
     pub pumpfun_buy_slippage_bps: Option<u32>,
     pub emergency_exit_slippage_bps: Option<u32>,
+    // Time-based exit strategy
+    pub enable_time_based_exits: Option<bool>,
+    pub max_hold_secs: Option<u64>,
+    pub timed_exit_tiers: Option<Vec<crate::config::TimedExitTier>>,
+    // Kill switches (Geyser-based)
+    pub kill_switch_enabled: Option<bool>,
+    pub kill_switch_dev_sell: Option<bool>,
+    pub kill_switch_sell_burst_count: Option<u32>,
+    pub kill_switch_sell_burst_sol: Option<f64>,
+    pub kill_switch_sell_burst_slots: Option<u64>,
+    pub kill_switch_flow_ratio_min: Option<f64>,
+    pub kill_switch_negative_flow_slots: Option<u64>,
     // System
     pub autosave_state_secs: Option<u64>,
 }
@@ -140,6 +153,16 @@ impl Default for SniperCfg {
             max_holders: None,
             pumpfun_buy_slippage_bps: None,
             emergency_exit_slippage_bps: None,
+            enable_time_based_exits: None,
+            max_hold_secs: None,
+            timed_exit_tiers: None,
+            kill_switch_enabled: None,
+            kill_switch_dev_sell: None,
+            kill_switch_sell_burst_count: None,
+            kill_switch_sell_burst_sol: None,
+            kill_switch_sell_burst_slots: None,
+            kill_switch_flow_ratio_min: None,
+            kill_switch_negative_flow_slots: None,
             autosave_state_secs: None,
         }
     }
@@ -193,6 +216,16 @@ impl From<&crate::config::SniperSettings> for SniperCfg {
             max_holders: c.max_holders,
             pumpfun_buy_slippage_bps: c.pumpfun_buy_slippage_bps,
             emergency_exit_slippage_bps: c.emergency_exit_slippage_bps,
+            enable_time_based_exits: c.enable_time_based_exits,
+            max_hold_secs: c.max_hold_secs,
+            timed_exit_tiers: c.timed_exit_tiers.clone(),
+            kill_switch_enabled: c.kill_switch_enabled,
+            kill_switch_dev_sell: c.kill_switch_dev_sell,
+            kill_switch_sell_burst_count: c.kill_switch_sell_burst_count,
+            kill_switch_sell_burst_sol: c.kill_switch_sell_burst_sol,
+            kill_switch_sell_burst_slots: c.kill_switch_sell_burst_slots,
+            kill_switch_flow_ratio_min: c.kill_switch_flow_ratio_min,
+            kill_switch_negative_flow_slots: c.kill_switch_negative_flow_slots,
             autosave_state_secs: None,
         }
     }
@@ -210,6 +243,12 @@ struct PositionLot {
     executed_tp_bps: Vec<u32>, // welche TP Stufen bereits ausgeführt wurden
     #[serde(default)]
     peak_pnl_bps: i64, // Hochwasser-Marke für Trailing Stop
+    // Time-based exit tracking
+    #[serde(default)]
+    executed_timed_tiers: Vec<u64>, // which timed tiers (by secs) have been executed
+    // Kill switch tracking (creator address for dev sell detection)
+    #[serde(default)]
+    creator: Option<String>, // Token creator/dev address for kill switch
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -376,6 +415,8 @@ pub struct SniperEngine {
     /// Optional Helius RPC client for mint validation (full transaction index)
     /// Wrapped in Arc for sharing across spawned tasks
     helius_rpc: Option<Arc<solana_client::nonblocking::rpc_client::RpcClient>>,
+    /// Kill switch monitor for emergency exits
+    kill_switch: Option<Arc<KillSwitchMonitor>>,
 }
 
 // --- Test Helpers (feature-gated) -----------------------------------------------------------
@@ -399,6 +440,8 @@ impl SniperEngine {
             opened_ts: chrono::Utc::now().timestamp(),
             executed_tp_bps: Vec::new(),
             peak_pnl_bps: 0,
+            executed_timed_tiers: Vec::new(),
+            creator: None,
         };
         let mut rs = self.risk.write();
         rs.open.entry(mint).or_default().push(lot);
@@ -816,6 +859,22 @@ impl SniperEngine {
             warn!("sniper: NO Helius RPC configured - mint validation will use local RPC (may be inaccurate!)");
         }
 
+        // Initialize Kill Switch Monitor if enabled
+        let kill_switch = if cfg.kill_switch_enabled.unwrap_or(false) {
+            info!("sniper: Kill Switch Monitor ENABLED");
+            Some(Arc::new(KillSwitchMonitor::new(
+                cfg.kill_switch_dev_sell.unwrap_or(true),
+                cfg.kill_switch_sell_burst_count,
+                cfg.kill_switch_sell_burst_sol,
+                cfg.kill_switch_sell_burst_slots,
+                cfg.kill_switch_flow_ratio_min,
+                cfg.kill_switch_negative_flow_slots,
+            )))
+        } else {
+            info!("sniper: Kill Switch Monitor disabled");
+            None
+        };
+
         Self {
             rpc,
             cfg: parking_lot::RwLock::new(cfg),
@@ -834,6 +893,7 @@ impl SniperEngine {
             geyser_grpc_url,
             boot_timestamp,
             helius_rpc,
+            kill_switch,
         }
     }
 
@@ -855,6 +915,7 @@ impl SniperEngine {
             geyser_grpc_url: self.geyser_grpc_url.clone(),
             boot_timestamp: self.boot_timestamp, // CRITICAL: preserve boot time for all clones
             helius_rpc: self.helius_rpc.clone(), // Share Helius RPC client for mint validation
+            kill_switch: self.kill_switch.clone(), // Share kill switch monitor
         }
     }
 
@@ -2488,8 +2549,18 @@ impl SniperEngine {
                     opened_ts: chrono::Utc::now().timestamp(),
                     executed_tp_bps: Vec::new(),
                     peak_pnl_bps: 0,
+                    executed_timed_tiers: Vec::new(),
+                    creator: None, // TODO: Get creator from buy event
                 };
                 rs.open.entry(mint).or_default().push(lot);
+                
+                // Register with kill switch monitor if enabled
+                drop(rs); // Release lock before async call
+                if let Some(ks) = &self.kill_switch {
+                    ks.register_position(mint, None); // TODO: Pass creator pubkey
+                }
+                let rs = self.risk.read();
+                
                 let lots: usize = rs.open.values().map(|v| v.len()).sum();
                 OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
                 info!(
@@ -2775,23 +2846,17 @@ impl SniperEngine {
             }
         }
         
-        // Skip if no thresholds configured
-        {
-            let r = self.cfg.read();
-            if r.stop_loss_bps.is_none()
-                && r.take_profit_bps.is_none()
-                && r.take_profit_tiers.is_none()
-            {
-                return Ok(());
-            }
-        }
-        
-        // Count open positions for logging
-        let open_count = self.risk.read().open.len();
-        if open_count > 0 {
-            info!(open_positions=open_count, "evaluate_positions: checking positions for stop-loss/take-profit");
-        }
-        let (stop_bps, tp_bps, tiers, trailing, min_exit_notional) = {
+        // Load config
+        let (
+            stop_bps,
+            tp_bps,
+            tiers,
+            trailing,
+            min_exit_notional,
+            time_exits_enabled,
+            max_hold_secs,
+            timed_tiers,
+        ) = {
             let r = self.cfg.read();
             (
                 r.stop_loss_bps.unwrap_or(u32::MAX),
@@ -2799,9 +2864,34 @@ impl SniperEngine {
                 r.take_profit_tiers.clone(),
                 r.trailing_stop_bps,
                 r.min_exit_notional_sol.unwrap_or(0.0),
+                r.enable_time_based_exits.unwrap_or(false),
+                r.max_hold_secs.unwrap_or(90),
+                r.timed_exit_tiers.clone(),
             )
         };
+        
+        // Skip if no exit strategy configured
+        let has_price_exits = stop_bps != u32::MAX || tp_bps != u32::MAX || tiers.is_some();
+        let has_time_exits = time_exits_enabled;
+        
+        if !has_price_exits && !has_time_exits {
+            return Ok(());
+        }
+        
+        // Count open positions for logging
+        let open_count = self.risk.read().open.len();
+        if open_count > 0 {
+            info!(
+                open_positions=open_count,
+                time_exits_enabled=time_exits_enabled,
+                max_hold_secs=max_hold_secs,
+                "evaluate_positions: checking positions"
+            );
+        }
+        
+        let now = chrono::Utc::now().timestamp();
         let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
+        
         // Flatten lots for evaluation
         let positions: Vec<(Pubkey, PositionLot, usize)> = {
             let rs = self.risk.read();
@@ -2817,8 +2907,77 @@ impl SniperEngine {
             return Ok(());
         }
         for (mint, pos, lot_idx) in positions {
+            // Calculate position age in seconds
+            let age_secs = (now - pos.opened_ts) as u64;
+            
             // Convert UI tokens to raw token amount (with decimals)
             let raw_token_amount = (pos.amount_tokens * 10f64.powi(pos.token_decimals as i32)).floor() as u64;
+            
+            // === TIME-BASED EXIT LOGIC ===
+            if time_exits_enabled {
+                let mut time_fraction: f64 = 0.0;
+                let mut time_exit_reason = String::new();
+                
+                // Check max hold time - forced full exit
+                if age_secs >= max_hold_secs {
+                    time_fraction = 1.0;
+                    time_exit_reason = format!("MAX_HOLD_TIME ({}s >= {}s)", age_secs, max_hold_secs);
+                }
+                // Check timed exit tiers
+                else if let Some(ref timed) = timed_tiers {
+                    let mut rs = self.risk.write();
+                    if let Some(v) = rs.open.get_mut(&mint) {
+                        if let Some(l) = v.get_mut(lot_idx) {
+                            for tier in timed.iter() {
+                                if age_secs >= tier.secs && !l.executed_timed_tiers.contains(&tier.secs) {
+                                    time_fraction = tier.fraction.clamp(0.0, 1.0);
+                                    l.executed_timed_tiers.push(tier.secs);
+                                    time_exit_reason = format!("TIMED_TIER ({}s, {}%)", tier.secs, (tier.fraction * 100.0) as u32);
+                                    break; // Execute one tier at a time
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Execute time-based exit if triggered
+                if time_fraction > 0.0 {
+                    let sell_tokens = ((pos.amount_tokens * time_fraction) * 10f64.powi(pos.token_decimals as i32)).floor() as u64;
+                    if sell_tokens > 0 {
+                        info!(
+                            mint=%mint,
+                            age_secs=age_secs,
+                            fraction=time_fraction,
+                            reason=time_exit_reason,
+                            sell_tokens=sell_tokens,
+                            "TIME-BASED EXIT triggered"
+                        );
+                        let is_full_exit = time_fraction >= 0.99;
+                        if let Err(e) = self
+                            .attempt_exit(&mint, lot_idx, sell_tokens, time_fraction, is_full_exit)
+                            .await
+                        {
+                            warn!(?e, mint=%mint, "time-based exit tx failed");
+                        } else {
+                            if is_full_exit {
+                                self.mark_cooldown(mint);
+                                // Unregister from kill switch monitor
+                                if let Some(ks) = &self.kill_switch {
+                                    ks.unregister_position(&mint);
+                                }
+                            }
+                            metrics::PARTIAL_EXIT_EVENTS_TOTAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    continue; // Skip price-based evaluation for this position
+                }
+            }
+            
+            // === PRICE-BASED EXIT LOGIC (original) ===
+            if !has_price_exits {
+                continue;
+            }
             
             // Quote exit value (prefer Raydium then Orca)
             let mut quote_out: Option<u64> = None;
@@ -3716,6 +3875,8 @@ impl SniperEngine {
                                     opened_ts,
                                     executed_tp_bps: Vec::new(),
                                     peak_pnl_bps: 0,
+                                    executed_timed_tiers: Vec::new(),
+                                    creator: None,
                                 });
                             }
                         }
@@ -3931,6 +4092,8 @@ impl SniperEngine {
                     opened_ts: chrono::Utc::now().timestamp(),
                     executed_tp_bps: Vec::new(),
                     peak_pnl_bps: 0,
+                    executed_timed_tiers: Vec::new(),
+                    creator: None,
                 };
                 rs.open.entry(mint).or_default().push(lot);
                 positions_found += 1;

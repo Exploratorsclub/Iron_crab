@@ -86,15 +86,47 @@ adaptive_slippage_step_bps = 25     # Faster adaptation
 pumpfun_buy_slippage_bps = 2500     # 25% min for Pump.fun buys (fresh launches move FAST)
 emergency_exit_slippage_bps = 5000  # 50% for stop-loss exits (GET OUT at any cost)
 
-# EXIT STRATEGY - MOONBAG MODE
-stop_loss_bps = 1000       # -10% Initial Stop Loss (Sehr eng, siehe Erklärung)
-# take_profit_bps = 2000   # DEAKTIVIERT zugunsten von Tiers
+# ============================================================================
+# EXIT STRATEGY - TIME-BASED (meme coins move fast, don't hold forever!)
+# ============================================================================
+# ENABLE THIS for time-based exits (RECOMMENDED for meme coins)
+enable_time_based_exits = true
+max_hold_secs = 90                  # Maximum hold time: 90 seconds then FULL EXIT
+
+# TIMED EXIT TIERS (gestaffelt nach Zeit):
+# - Nach 25s: Verkaufe 30% (sichere erste Gewinne)
+# - Nach 60s: Verkaufe 40% der verbleibenden Position (42% total)
+# - Nach 90s: Verkaufe ALLES (max_hold_secs erzwingt 100% Exit)
+timed_exit_tiers = [
+    { secs = 25, fraction = 0.3 },   # 30% nach 25 Sekunden
+    { secs = 60, fraction = 0.4 }    # 40% nach 60 Sekunden
+]
+
+# ============================================================================
+# KILL SWITCHES - Geyser-basierte Notfall-Exits (überschreiben Zeitlogik!)
+# ============================================================================
+kill_switch_enabled = true           # Aktiviere Kill-Switch Monitoring
+
+# DEV SELL DETECTION: Wenn Creator/Dev verkauft -> SOFORT 100% raus!
+kill_switch_dev_sell = true
+
+# SELL BURST: Viele Verkäufe in kurzer Zeit = Panic Selling
+kill_switch_sell_burst_count = 3     # 3+ Verkäufe...
+kill_switch_sell_burst_sol = 0.3     # ...von insgesamt 0.3+ SOL...
+kill_switch_sell_burst_slots = 5     # ...innerhalb von 5 Slots (~2.5s) = EXIT!
+
+# FLOW RATIO: Wenn Verkäufe > Käufe dominieren
+kill_switch_flow_ratio_min = 0.6     # Buy/Sell Ratio unter 0.6 = EXIT
+kill_switch_negative_flow_slots = 3  # 3 Slots in Folge negativer Netflow = EXIT
+
+# ============================================================================
+# LEGACY EXIT STRATEGY - PRICE-BASED (disabled when time_based_exits = true)
+# ============================================================================
+stop_loss_bps = 1000       # -10% Stop Loss (backup wenn Zeit-Exits deaktiviert)
+# take_profit_bps = 2000   # DEAKTIVIERT zugunsten von Zeit-Exits
 trailing_stop_bps = 1500   # 15% Trailing Stop (Sichert Gewinne ab)
 
-# MOONBAG STRATEGY:
-# 1. Bei +100% (2x): Verkaufe 50% -> Einsatz ist raus (Risk Free).
-# 2. Bei +300% (4x): Verkaufe 50% der verbleibenden Position -> Gewinn sichern.
-# 3. Der Rest (25% der Ursprungsgröße) läuft weiter bis zum Trailing Stop.
+# MOONBAG STRATEGY (nur wenn enable_time_based_exits = false):
 take_profit_tiers = [
     { bps = 10000, fraction = 0.5 },
     { bps = 30000, fraction = 0.5 }
