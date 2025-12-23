@@ -37,3 +37,7 @@ node_modules/
 # Misc
 *.old
 *.bak
+state/
+trade_logs/
+orca_reserves.db
+*.db
