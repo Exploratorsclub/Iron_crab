@@ -2504,20 +2504,16 @@ impl SniperEngine {
         self.risk_reset_if_needed(); // Reset daily counters if new day
         let owner = self.treasury.pubkey();
         let mint_sdk = solana_sdk::pubkey::Pubkey::new_from_array(mint.to_bytes());
-        let ata = match self
-            .treasury
-            .ata_address(&self.rpc, &owner, &mint_sdk)
-            .await
-        {
-            Ok(v) => v.0,
-            Err(e) => {
-                warn!(mint=%mint, ?e, "finalize_fill: failed to get ATA address, aborting position creation");
-                // Decrement pending_buys on failure
-                let mut rs = self.risk.write();
-                if rs.pending_buys > 0 { rs.pending_buys -= 1; }
-                return;
-            }
-        };
+        // CRITICAL FIX: Compute ATA address WITHOUT RPC call.
+        // The RPC call fails when mint is not yet on-chain (buy TX still confirming).
+        // Pump.fun tokens use standard SPL Token Program.
+        let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(owner.to_bytes());
+        let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(mint_sdk.to_bytes());
+        let ata_spl = spl_associated_token_account::get_associated_token_address(
+            &owner_spl,
+            &mint_spl,
+        );
+        let ata = solana_sdk::pubkey::Pubkey::new_from_array(ata_spl.to_bytes());
         info!(mint=%mint, ata=%ata, "finalize_fill: checking token balance");
         let decimals =
             crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &mint_sdk).await;
@@ -2526,9 +2522,9 @@ impl SniperEngine {
         // The TX may not be confirmed yet when this is called immediately after send
         let mut amt = 0.0f64;
         let mut raw = 0u64;
-        for attempt in 0..10 {
+        for attempt in 0..30 {
             if attempt > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
             }
             let acc_opt = self.rpc.get_account_retry(&ata).await.ok();
             if let Some(acc) = acc_opt {
@@ -2545,14 +2541,14 @@ impl SniperEngine {
                     }
                 }
             }
-            if attempt < 9 {
+            if attempt < 29 {
                 debug!(mint=%mint, attempt=attempt, "finalize_fill: token balance is 0, retrying...");
             }
         }
         
         if amt <= 0.0 {
             // TX failed - no tokens arrived. DO NOT create position!
-            warn!(mint=%mint, "finalize_fill: no token balance found after 10 attempts - TX likely failed, NOT creating position");
+            warn!(mint=%mint, "finalize_fill: no token balance found after 30 attempts - TX likely failed, NOT creating position");
             // Decrement pending_buys since we're done with this attempt
             let mut rs = self.risk.write();
             if rs.pending_buys > 0 { rs.pending_buys -= 1; }

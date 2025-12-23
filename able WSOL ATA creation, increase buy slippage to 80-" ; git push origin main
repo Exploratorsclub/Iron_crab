@@ -1,0 +1,31 @@
+[1mdiff --git a/my_config.server.toml b/my_config.server.toml[m
+[1mindex 3e3a518..0419da1 100644[m
+[1m--- a/my_config.server.toml[m
+[1m+++ b/my_config.server.toml[m
+[36m@@ -26,7 +26,7 @@[m [mgeyser_grpc_url = "http://127.0.0.1:10000"[m
+ # incorrect (too few) signatures for old tokens, causing us to buy them.[m
+ # Helius Free Tier provides accurate mint age via complete signature history.[m
+ # Get your API key at: https://www.helius.dev/[m
+[31m-helius_rpc_url = "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY"[m
+[32m+[m[32mhelius_rpc_url = "https://mainnet.helius-rpc.com/?api-key=96755862-7b83-484a-9f7a-2c0620253cc1"[m
+ [m
+ keypair_path = "/home/ironcrab/.config/solana/id.json"  # adjust to your user/path[m
+ # Tuned concurrency & timeout for high-end validator (500GB RAM, 64 CPUs)[m
+[36m@@ -73,7 +73,7 @@[m [mmax_position_sol = 0.02  # 20 millis max per position[m
+ max_open_positions = 10  # 10 positions max[m
+ per_mint_position_limit = 1[m
+ [m
+[31m-daily_loss_limit_sol = 0.05  # 50 millis max loss per day (70% of capital)[m
+[32m+[m[32mdaily_loss_limit_sol = 0.3  # 50 millis max loss per day (70% of capital)[m
+ [m
+ max_slippage_bps = 500              # 5% base slippage[m
+ adaptive_slippage_min_bps = 100     # 1% minimum[m
+[36m@@ -83,7 +83,7 @@[m [madaptive_slippage_target_pct = 0.002[m
+ adaptive_slippage_step_bps = 25     # Faster adaptation[m
+ [m
+ # SCENARIO-SPECIFIC SLIPPAGE (no more hardcoded values!)[m
+[31m-pumpfun_buy_slippage_bps = 2500     # 25% min for Pump.fun buys (fresh launches move FAST)[m
+[32m+[m[32mpumpfun_buy_slippage_bps = 8000     # 25% min for Pump.fun buys (fresh launches move FAST)[m
+ emergency_exit_slippage_bps = 5000  # 50% for stop-loss exits (GET OUT at any cost)[m
+ [m
+ # ============================================================================[m

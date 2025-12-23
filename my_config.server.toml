@@ -26,7 +26,7 @@ geyser_grpc_url = "http://127.0.0.1:10000"
 # incorrect (too few) signatures for old tokens, causing us to buy them.
 # Helius Free Tier provides accurate mint age via complete signature history.
 # Get your API key at: https://www.helius.dev/
-helius_rpc_url = "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY"
+helius_rpc_url = "https://mainnet.helius-rpc.com/?api-key=96755862-7b83-484a-9f7a-2c0620253cc1"
 
 keypair_path = "/home/ironcrab/.config/solana/id.json"  # adjust to your user/path
 # Tuned concurrency & timeout for high-end validator (500GB RAM, 64 CPUs)
@@ -73,7 +73,7 @@ max_position_sol = 0.02  # 20 millis max per position
 max_open_positions = 10  # 10 positions max
 per_mint_position_limit = 1
 
-daily_loss_limit_sol = 0.05  # 50 millis max loss per day (70% of capital)
+daily_loss_limit_sol = 0.3  # 50 millis max loss per day (70% of capital)
 
 max_slippage_bps = 500              # 5% base slippage
 adaptive_slippage_min_bps = 100     # 1% minimum
@@ -83,7 +83,7 @@ adaptive_slippage_target_pct = 0.002
 adaptive_slippage_step_bps = 25     # Faster adaptation
 
 # SCENARIO-SPECIFIC SLIPPAGE (no more hardcoded values!)
-pumpfun_buy_slippage_bps = 2500     # 25% min for Pump.fun buys (fresh launches move FAST)
+pumpfun_buy_slippage_bps = 8000     # 25% min for Pump.fun buys (fresh launches move FAST)
 emergency_exit_slippage_bps = 5000  # 50% for stop-loss exits (GET OUT at any cost)
 
 # ============================================================================

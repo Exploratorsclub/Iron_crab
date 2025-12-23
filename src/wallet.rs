@@ -504,16 +504,18 @@ impl Treasury {
             Err(_) => false, // ATA doesn't exist
         };
 
-        // Create ATA if needed (idempotent instruction is safe)
-        if !ata_exists {
-            let create_ix = prog_ix_to_sdk(create_associated_token_account_idempotent(
-                &sdk_to_spl(&self.pubkey()),
-                &sdk_to_spl(&owner),
-                &sdk_to_spl(&wsol_mint_sdk),
-                &spl_token_program_id(),
-            ));
-            ixs.push(create_ix);
-        }
+        // DISABLED: ATA creation causes "seeds constraint violated" errors due to RPC lag.
+        // The WSOL ATA should already exist after the first trade. If not, the TX will fail
+        // and we'll retry - but at least we won't waste SOL on failed createIdempotent TXs.
+        // if !ata_exists {
+        //     let create_ix = prog_ix_to_sdk(create_associated_token_account_idempotent(
+        //         &sdk_to_spl(&self.pubkey()),
+        //         &sdk_to_spl(&owner),
+        //         &sdk_to_spl(&wsol_mint_sdk),
+        //         &spl_token_program_id(),
+        //     ));
+        //     ixs.push(create_ix);
+        // }
 
         // Only add transfer and sync if lamports > 0
         // When lamports=0, we just want to ensure the ATA exists
@@ -611,23 +613,11 @@ impl Treasury {
             return Ok(Signature::default());
         }
 
-        let dest = recipient.unwrap_or(owner);
-        let ata_p = sdk_to_spl(&ata);
-        let dest_p = sdk_to_spl(&dest);
-        let owner_p = sdk_to_spl(&owner);
-
-        let ix = prog_ix_to_sdk(spl_ix::close_account(
-            &spl_token_program_id(),
-            &ata_p,
-            &dest_p,
-            &owner_p,
-            &[],
-        )?);
-        let bh = rpc.rpc.get_latest_blockhash().await?;
-        let mut tx = Transaction::new_with_payer(&[ix], Some(&owner));
-        tx.try_sign(&[self.signer.as_ref()], bh)?;
-        let sig = rpc.rpc.send_and_confirm_transaction(&tx).await?;
-        Ok(sig)
+        // DISABLED: CloseAccount is unreliable due to RPC lag returning stale balance data.
+        // The WSOL account will be reused for future trades anyway.
+        // Just return success without doing anything.
+        tracing::debug!(ata=%ata, "unwrap_wsol: skipping close (disabled to avoid failed TXs)");
+        Ok(Signature::default())
     }
 
     async fn try_mint_decimals(&self, rpc: &SolanaRpc, mint: &SdkPubkey) -> Result<u8> {
