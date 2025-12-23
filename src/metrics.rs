@@ -1,9 +1,44 @@
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
 use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Recent trade record for dashboard display
+#[derive(Clone, serde::Serialize)]
+pub struct RecentTrade {
+    pub timestamp_ms: u64,
+    pub mint: String,
+    pub action: String,         // "BUY" or "SELL"
+    pub tx_hash: String,
+    pub amount_tokens: f64,
+    pub price_sol: f64,
+    pub pnl_sol: Option<f64>,    // Only for SELL
+    pub pnl_pct: Option<f64>,    // Only for SELL
+    pub latency_ms: Option<u64>, // Discovery to TX landed
+}
+
+/// Ring buffer for last N trades
+const MAX_RECENT_TRADES: usize = 20;
+pub static RECENT_TRADES: Lazy<RwLock<VecDeque<RecentTrade>>> = Lazy::new(|| RwLock::new(VecDeque::with_capacity(MAX_RECENT_TRADES)));
+
+/// Record a new trade (BUY or SELL)
+pub fn record_recent_trade(trade: RecentTrade) {
+    let mut trades = RECENT_TRADES.write();
+    if trades.len() >= MAX_RECENT_TRADES {
+        trades.pop_front();
+    }
+    trades.push_back(trade);
+}
+
+/// Get recent trades as JSON
+pub fn get_recent_trades_json() -> String {
+    let trades = RECENT_TRADES.read();
+    serde_json::to_string(&*trades).unwrap_or_else(|_| "[]".to_string())
+}
 
 // Global counters (simple, lock-free). For production consider Prometheus exporter.
 pub static QUOTE_REQUESTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -883,6 +918,18 @@ pub async fn serve_metrics(addr: SocketAddr) -> anyhow::Result<()> {
             let path = req.uri().path();
             if path == "/metrics" {
                 return Ok::<_, hyper::Error>(metrics_response().await);
+            }
+            if path == "/trades" {
+                // Return recent trades as JSON for Grafana
+                let json = get_recent_trades_json();
+                return Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .status(200)
+                        .header("Content-Type", "application/json")
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from(json))
+                        .unwrap(),
+                );
             }
             if path == "/live" {
                 return Ok::<_, hyper::Error>(Response::new(Body::from("ok")));

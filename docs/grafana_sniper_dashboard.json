@@ -1,0 +1,292 @@
+{
+  "title": "IronCrab Meme Sniper",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "5s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Open Positions",
+      "targets": [{ "expr": "open_positions_gauge", "refId": "A" }],
+      "gridPos": {"h":4,"w":4,"x":0,"y":0},
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 5 },
+              { "color": "red", "value": 8 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Trades Executed",
+      "targets": [{ "expr": "trades_executed_total", "refId": "A" }],
+      "gridPos": {"h":4,"w":4,"x":4,"y":0}
+    },
+    {
+      "type": "stat",
+      "title": "Trades Failed",
+      "targets": [{ "expr": "trades_failed_total", "refId": "A" }],
+      "gridPos": {"h":4,"w":4,"x":8,"y":0},
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 5 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Daily PnL (SOL)",
+      "targets": [{ "expr": "daily_realized_pnl_sol_micro / 1000000", "refId": "A" }],
+      "gridPos": {"h":4,"w":4,"x":12,"y":0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 4,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0 },
+              { "color": "green", "value": 0.01 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Sharpe Ratio",
+      "targets": [{ "expr": "sharpe_ratio_micro / 1000000", "refId": "A" }],
+      "gridPos": {"h":4,"w":4,"x":16,"y":0},
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0 },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Drawdown %",
+      "targets": [{ "expr": "drawdown_pct_micro / 10000", "refId": "A" }],
+      "gridPos": {"h":4,"w":4,"x":20,"y":0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 25 },
+              { "color": "red", "value": 50 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "table",
+      "title": "📋 Recent Trades (Last 20)",
+      "gridPos": {"h":12,"w":24,"x":0,"y":4},
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "infinity"
+      },
+      "targets": [{
+        "refId": "A",
+        "type": "json",
+        "source": "url",
+        "url": "http://localhost:9091/trades",
+        "root_selector": "",
+        "columns": [
+          { "selector": "timestamp_ms", "text": "Time", "type": "timestamp_epoch_s" },
+          { "selector": "action", "text": "Action", "type": "string" },
+          { "selector": "mint", "text": "Token (Mint)", "type": "string" },
+          { "selector": "tx_hash", "text": "TX Hash", "type": "string" },
+          { "selector": "amount_tokens", "text": "Amount", "type": "number" },
+          { "selector": "price_sol", "text": "Price (SOL)", "type": "number" },
+          { "selector": "pnl_sol", "text": "PnL (SOL)", "type": "number" },
+          { "selector": "pnl_pct", "text": "PnL %", "type": "number" }
+        ]
+      }],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Time" },
+            "properties": [{ "id": "unit", "value": "dateTimeFromNow" }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Action" },
+            "properties": [{
+              "id": "custom.cellOptions",
+              "value": {
+                "type": "color-text"
+              }
+            }, {
+              "id": "mappings",
+              "value": [
+                { "type": "value", "options": { "BUY": { "color": "green", "text": "🟢 BUY" } } },
+                { "type": "value", "options": { "SELL": { "color": "orange", "text": "🟠 SELL" } } }
+              ]
+            }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Token (Mint)" },
+            "properties": [{
+              "id": "custom.width",
+              "value": 120
+            }, {
+              "id": "links",
+              "value": [{
+                "title": "View on Solscan",
+                "url": "https://solscan.io/token/${__value.text}",
+                "targetBlank": true
+              }]
+            }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "TX Hash" },
+            "properties": [{
+              "id": "custom.width",
+              "value": 100
+            }, {
+              "id": "links",
+              "value": [{
+                "title": "View TX on Solscan",
+                "url": "https://solscan.io/tx/${__value.text}",
+                "targetBlank": true
+              }]
+            }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Price (SOL)" },
+            "properties": [{ "id": "decimals", "value": 12 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "PnL (SOL)" },
+            "properties": [
+              { "id": "decimals", "value": 6 },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "green", "value": 0 }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-text" }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "PnL %" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "decimals", "value": 2 },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "green", "value": 0 }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-text" }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "Time", "desc": true }]
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Realized PnL Over Time",
+      "targets": [
+        { "expr": "realized_pnl_sol_sum", "legendFormat": "Cumulative PnL (SOL)", "refId": "A" }
+      ],
+      "gridPos": {"h":8,"w":12,"x":0,"y":16},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 4,
+          "color": { "mode": "palette-classic" }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Trade Activity",
+      "targets": [
+        { "expr": "rate(trades_executed_total[5m]) * 60", "legendFormat": "Trades/min", "refId": "A" },
+        { "expr": "rate(trades_failed_total[5m]) * 60", "legendFormat": "Failed/min", "refId": "B" }
+      ],
+      "gridPos": {"h":8,"w":12,"x":12,"y":16}
+    },
+    {
+      "type": "timeseries",
+      "title": "RPC Health",
+      "targets": [
+        { "expr": "rpc_errors_total", "legendFormat": "RPC Errors", "refId": "A" },
+        { "expr": "rpc_timeouts_total", "legendFormat": "Timeouts", "refId": "B" },
+        { "expr": "rpc_inflight_gauge", "legendFormat": "In-Flight", "refId": "C" }
+      ],
+      "gridPos": {"h":8,"w":12,"x":0,"y":24}
+    },
+    {
+      "type": "timeseries",
+      "title": "Swap Latency",
+      "targets": [
+        { "expr": "rate(swap_latency_seconds_sum[5m]) / rate(swap_latency_seconds_count[5m])", "legendFormat": "Avg Latency (s)", "refId": "A" }
+      ],
+      "gridPos": {"h":8,"w":12,"x":12,"y":24},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3
+        }
+      }
+    }
+  ],
+  "templating": { "list": [] },
+  "annotations": { "list": [] }
+}

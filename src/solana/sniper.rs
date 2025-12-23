@@ -7,6 +7,7 @@ use crate::metrics; // keep metrics module in scope for qualified uses
 use crate::metrics::{
     record_fee_pct, record_network_fee, record_realized_gross_net, record_realized_pnl_sol,
     record_shortfall, record_shortfall_pct, record_swap_latency, record_trade_return,
+    record_recent_trade, RecentTrade,
     DAILY_REALIZED_PNL_SOL_MICRO, LIQUIDITY_ESTIMATE_SOL_MICRO, OPEN_POSITIONS_GAUGE,
     PENDING_FAILED_TOTAL, PENDING_RECONCILIATIONS_TOTAL, PROTOCOL_FEE_SOL_MICRO_TOTAL,
     PROTOCOL_FEE_TOKENS_TOTAL, RPC_ERRORS_TOTAL, RPC_RETRY_ATTEMPTS_TOTAL, TRADES_EXECUTED_TOTAL,
@@ -1126,6 +1127,13 @@ impl SniperEngine {
         };
 
         let liq_sol = (event.liquidity_estimate_lamports as f64) / 1e9;
+        
+        // Calculate latency from Geyser discovery to sniper processing
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let discovery_latency_ms = now_ms.saturating_sub(event.discovered_at_ms);
 
         // Changed from debug! to info! to ensure visibility
         info!(
@@ -1134,6 +1142,7 @@ impl SniperEngine {
             base=%event.base_mint,
             quote=%event.quote_mint,
             liq_sol=liq_sol,
+            discovery_latency_ms=discovery_latency_ms,
             "sniper: new pool discovered via Geyser"
         );
 
@@ -2647,6 +2656,24 @@ impl SniperEngine {
                 }
                 
                 OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
+                
+                // Record BUY trade for dashboard
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                record_recent_trade(RecentTrade {
+                    timestamp_ms: now_ms,
+                    mint: mint.to_string(),
+                    action: "BUY".to_string(),
+                    tx_hash: String::new(), // Will be filled from pending if available
+                    amount_tokens: amt,
+                    price_sol: entry_price,
+                    pnl_sol: None,
+                    pnl_pct: None,
+                    latency_ms: None,
+                });
+                
                 info!(
                     mint=%mint,
                     amount_tokens=amt,
@@ -4078,6 +4105,25 @@ impl SniperEngine {
                 record_realized_gross_net(gross, net);
                 // Also record absolute realized PnL (SOL) histogram using net
                 record_realized_pnl_sol(net);
+                
+                // Record SELL trade for dashboard
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let pnl_pct = if notional > 0.0 { Some((net / notional) * 100.0) } else { None };
+                record_recent_trade(RecentTrade {
+                    timestamp_ms: now_ms,
+                    mint: mint.to_string(),
+                    action: "SELL".to_string(),
+                    tx_hash: sig.to_string(),
+                    amount_tokens: sell_tokens as f64,
+                    price_sol: if sell_tokens > 0 { delta_wsol / (sell_tokens as f64) } else { 0.0 },
+                    pnl_sol: Some(net),
+                    pnl_pct,
+                    latency_ms: None,
+                });
+                
                 let line = format!(
                     "{ts},SELL,{mint},*,{sig},0,{lamports_out},{tok_in},{tok_out},,,0,,{fee},{realized},exit_fraction={fraction}",
                     ts=ChronoUtc::now().to_rfc3339(),
