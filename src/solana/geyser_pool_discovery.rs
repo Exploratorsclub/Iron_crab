@@ -161,6 +161,11 @@ impl GeyserPoolDiscovery {
             }
         }?;
 
+        let discovered_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        
         debug!(
             pool = %update.pubkey,
             dex = ?dex_type,
@@ -182,6 +187,7 @@ impl GeyserPoolDiscovery {
             coin_vault: pool_data.coin_vault,
             pc_vault: pool_data.pc_vault,
             creator: None, // Account-based discovery doesn't have creator info
+            discovered_at_ms,
         })
     }
 
@@ -489,6 +495,11 @@ impl GeyserPoolDiscovery {
         );
 
         // Create pool discovery event with transaction-based mint
+        let discovered_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        
         Some(PoolDiscoveryEvent {
             pool_address,
             dex_type,
@@ -501,6 +512,7 @@ impl GeyserPoolDiscovery {
             coin_vault: None,  // Will be fetched in background if needed
             pc_vault: None,
             creator,
+            discovered_at_ms,
         })
     }
 
@@ -697,6 +709,8 @@ pub struct PoolDiscoveryEvent {
     pub pc_vault: Option<Pubkey>,
     /// Creator address (for Pump.fun tokens - needed for buy instruction)
     pub creator: Option<Pubkey>,
+    /// Timestamp when this event was created (for latency tracking)
+    pub discovered_at_ms: u64,
 }
 
 struct PoolData {

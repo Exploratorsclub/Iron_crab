@@ -1063,8 +1063,22 @@ impl SniperEngine {
     /// Process a pool discovery event from Geyser
     async fn handle_pool_discovery(&self, event: PoolDiscoveryEvent) {
         let mint = event.base_mint;
+        
+        // LATENCY TRACKING: Calculate time since event was created
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let latency_to_handler_ms = now_ms.saturating_sub(event.discovered_at_ms);
+        
+        info!(
+            mint=%mint,
+            latency_ms=latency_to_handler_ms,
+            "⏱️ LATENCY: Geyser discovery -> handler start"
+        );
 
         // CRITICAL: Check max_open_positions FIRST - before ANY validation or Helius calls!
+        // This saves API quota and prevents unnecessary processing.
         // This saves API quota and prevents unnecessary processing.
         {
             let rs = self.risk.read();
@@ -1356,7 +1370,19 @@ impl SniperEngine {
             // NOTE: pending_buys will be decremented by finalize_fill on success,
             // or manually released here on failure.
 
-            info!(mint=%mint, "sniper: [Pump.fun] all checks passed, attempting buy");
+            // LATENCY TRACKING: Time from Geyser discovery to buy attempt
+            let pre_buy_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let latency_to_buy_ms = pre_buy_ms.saturating_sub(event.discovered_at_ms);
+            
+            info!(
+                mint=%mint, 
+                latency_ms=latency_to_buy_ms,
+                "⏱️ LATENCY: Geyser discovery -> pre-buy (all checks passed)"
+            );
+
             self.append_pool_candidate_record(
                 program_label,
                 &mint,
@@ -1379,6 +1405,18 @@ impl SniperEngine {
                 warn!(?e, mint=%mint, "sniper: [Pump.fun] initial buy failed");
                 // CRITICAL: Release slot on failure since finalize_fill won't be called
                 self.release_buy_slot();
+            } else {
+                // LATENCY TRACKING: Total time from Geyser discovery to buy TX sent
+                let post_buy_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let total_latency_ms = post_buy_ms.saturating_sub(event.discovered_at_ms);
+                info!(
+                    mint=%mint,
+                    total_latency_ms=total_latency_ms,
+                    "⏱️ LATENCY: Geyser discovery -> buy TX sent (TOTAL)"
+                );
             }
             return;
         }
