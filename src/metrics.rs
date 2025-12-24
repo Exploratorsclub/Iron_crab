@@ -12,7 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub struct RecentTrade {
     pub timestamp_ms: u64,
     pub mint: String,
-    pub action: String,         // "BUY" or "SELL"
+    pub action: String, // "BUY" or "SELL"
     pub tx_hash: String,
     pub amount_tokens: f64,
     pub price_sol: f64,
@@ -23,7 +23,8 @@ pub struct RecentTrade {
 
 /// Ring buffer for last N trades
 const MAX_RECENT_TRADES: usize = 20;
-pub static RECENT_TRADES: Lazy<RwLock<VecDeque<RecentTrade>>> = Lazy::new(|| RwLock::new(VecDeque::with_capacity(MAX_RECENT_TRADES)));
+pub static RECENT_TRADES: Lazy<RwLock<VecDeque<RecentTrade>>> =
+    Lazy::new(|| RwLock::new(VecDeque::with_capacity(MAX_RECENT_TRADES)));
 
 /// Record a new trade (BUY or SELL)
 pub fn record_recent_trade(trade: RecentTrade) {

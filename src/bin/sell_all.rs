@@ -49,7 +49,7 @@ async fn burn_and_close_account(
     task: &SellTask,
 ) -> anyhow::Result<()> {
     let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
-    
+
     info!(
         "No liquidity for {} - burning {} tokens and closing account to recover rent...",
         task.mint, task.amount
@@ -60,12 +60,12 @@ async fn burn_and_close_account(
     // Data: [8 (instruction index), amount (u64 LE)]
     let mut burn_data = vec![8u8]; // Burn instruction index
     burn_data.extend_from_slice(&task.amount.to_le_bytes());
-    
+
     let burn_ix = Instruction {
         program_id: token_program_id,
         accounts: vec![
-            AccountMeta::new(task.ta_pubkey, false),      // token account (writable)
-            AccountMeta::new(task.mint, false),           // mint (writable)
+            AccountMeta::new(task.ta_pubkey, false), // token account (writable)
+            AccountMeta::new(task.mint, false),      // mint (writable)
             AccountMeta::new_readonly(treasury.pubkey(), true), // owner (signer)
         ],
         data: burn_data,
@@ -76,8 +76,8 @@ async fn burn_and_close_account(
     let close_ix = Instruction {
         program_id: token_program_id,
         accounts: vec![
-            AccountMeta::new(task.ta_pubkey, false),      // account to close (writable)
-            AccountMeta::new(treasury.pubkey(), false),   // destination for rent (writable)
+            AccountMeta::new(task.ta_pubkey, false), // account to close (writable)
+            AccountMeta::new(treasury.pubkey(), false), // destination for rent (writable)
             AccountMeta::new_readonly(treasury.pubkey(), true), // owner (signer)
         ],
         data: vec![9u8], // CloseAccount instruction index
@@ -85,7 +85,7 @@ async fn burn_and_close_account(
 
     let latest_blockhash = rpc.get_latest_blockhash_retry().await?;
     let mut tx = Transaction::new_with_payer(&[burn_ix, close_ix], Some(&treasury.pubkey()));
-    
+
     if let Err(e) = tx.try_sign(&[treasury.signer_ref()], latest_blockhash) {
         warn!("Failed to sign burn+close for {}: {:?}", task.mint, e);
         return Err(anyhow::anyhow!("Failed to sign"));
@@ -119,7 +119,10 @@ async fn sell_token_pumpfun(
     info!("Selling {} {} via Pump.fun...", amount, mint);
 
     // Get quote first
-    let quote = match pumpfun.quote_exact_in(&mint.to_string(), sol_mint_str, amount).await {
+    let quote = match pumpfun
+        .quote_exact_in(&mint.to_string(), sol_mint_str, amount)
+        .await
+    {
         Ok(Some(q)) => q,
         Ok(None) => {
             warn!("No Pump.fun quote available for {}", mint);
@@ -133,24 +136,21 @@ async fn sell_token_pumpfun(
 
     // Very low min_out for panic sell (1% of expected)
     let min_out = quote.amount_out / 100;
-    
+
     info!(
         "Pump.fun quote: {} tokens -> {} lamports (min_out={})",
         amount, quote.amount_out, min_out
     );
 
     // Build sell instruction
-    match pumpfun.build_swap_ix_async(
-        &mint.to_string(),
-        sol_mint_str,
-        amount,
-        min_out,
-        None,
-    ).await {
+    match pumpfun
+        .build_swap_ix_async(&mint.to_string(), sol_mint_str, amount, min_out, None)
+        .await
+    {
         Ok(ixs) if !ixs.is_empty() => {
             let latest_blockhash = rpc.get_latest_blockhash_retry().await?;
             let mut tx = Transaction::new_with_payer(&ixs, Some(&treasury.pubkey()));
-            
+
             if let Err(e) = tx.try_sign(&[treasury.signer_ref()], latest_blockhash) {
                 warn!("Failed to sign Pump.fun sell for {}: {:?}", mint, e);
                 return Err(anyhow::anyhow!("Failed to sign"));
@@ -193,8 +193,14 @@ async fn sell_token(
 
     // Check if this is a Pump.fun token first
     if is_pumpfun_mint(&mint) {
-        info!("{} appears to be a Pump.fun token, trying Pump.fun first...", mint);
-        if sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task).await.is_ok() {
+        info!(
+            "{} appears to be a Pump.fun token, trying Pump.fun first...",
+            mint
+        );
+        if sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task)
+            .await
+            .is_ok()
+        {
             return Ok(());
         }
         info!("Pump.fun sell failed, falling back to Raydium...");
@@ -317,9 +323,15 @@ async fn sell_token(
                     info!("Sold {}! Sig: {}", mint, sig);
                 }
                 Err(e) => {
-                    warn!("Failed to sell {} via Raydium: {:?}, trying Pump.fun...", mint, e);
+                    warn!(
+                        "Failed to sell {} via Raydium: {:?}, trying Pump.fun...",
+                        mint, e
+                    );
                     // Fallback to Pump.fun when Raydium TX fails (e.g., slippage)
-                    if sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task).await.is_err() {
+                    if sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task)
+                        .await
+                        .is_err()
+                    {
                         // Last resort: burn and close account to recover rent
                         let _ = burn_and_close_account(rpc.clone(), treasury.clone(), &task).await;
                     }
@@ -328,14 +340,23 @@ async fn sell_token(
         }
         Ok(None) => {
             warn!("No Raydium route for {}, trying Pump.fun...", mint);
-            if sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task).await.is_err() {
+            if sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task)
+                .await
+                .is_err()
+            {
                 // Last resort: burn and close account to recover rent
                 let _ = burn_and_close_account(rpc.clone(), treasury.clone(), &task).await;
             }
         }
         Err(e) => {
-            warn!("Error planning Raydium swap for {}: {:?}, trying Pump.fun...", mint, e);
-            if sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task).await.is_err() {
+            warn!(
+                "Error planning Raydium swap for {}: {:?}, trying Pump.fun...",
+                mint, e
+            );
+            if sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task)
+                .await
+                .is_err()
+            {
                 // Last resort: burn and close account to recover rent
                 let _ = burn_and_close_account(rpc.clone(), treasury.clone(), &task).await;
             }
@@ -364,7 +385,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Wallet: {}", treasury.pubkey());
 
     let raydium = Arc::new(Raydium::new(rpc.clone()));
-    
+
     // Initialize Pump.fun with user authority for selling
     let mut pumpfun = PumpFunDex::new(rpc.clone()).expect("Failed to create PumpFunDex");
     pumpfun.set_user_authority(treasury.pubkey());

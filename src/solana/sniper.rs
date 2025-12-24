@@ -6,12 +6,11 @@ use crate::config_reload::{diff_sniper_cfg, validate_sniper_cfg};
 use crate::metrics; // keep metrics module in scope for qualified uses
 use crate::metrics::{
     record_fee_pct, record_network_fee, record_realized_gross_net, record_realized_pnl_sol,
-    record_shortfall, record_shortfall_pct, record_swap_latency, record_trade_return,
-    record_recent_trade, RecentTrade,
-    DAILY_REALIZED_PNL_SOL_MICRO, LIQUIDITY_ESTIMATE_SOL_MICRO, OPEN_POSITIONS_GAUGE,
-    PENDING_FAILED_TOTAL, PENDING_RECONCILIATIONS_TOTAL, PROTOCOL_FEE_SOL_MICRO_TOTAL,
-    PROTOCOL_FEE_TOKENS_TOTAL, RPC_ERRORS_TOTAL, RPC_RETRY_ATTEMPTS_TOTAL, TRADES_EXECUTED_TOTAL,
-    TRADES_FAILED_TOTAL,
+    record_recent_trade, record_shortfall, record_shortfall_pct, record_swap_latency,
+    record_trade_return, RecentTrade, DAILY_REALIZED_PNL_SOL_MICRO, LIQUIDITY_ESTIMATE_SOL_MICRO,
+    OPEN_POSITIONS_GAUGE, PENDING_FAILED_TOTAL, PENDING_RECONCILIATIONS_TOTAL,
+    PROTOCOL_FEE_SOL_MICRO_TOTAL, PROTOCOL_FEE_TOKENS_TOTAL, RPC_ERRORS_TOTAL,
+    RPC_RETRY_ATTEMPTS_TOTAL, TRADES_EXECUTED_TOTAL, TRADES_FAILED_TOTAL,
 };
 use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex::raydium::RAYDIUM_AMM_V4;
@@ -108,10 +107,10 @@ pub struct SniperCfg {
     pub jito_tip_lamports: Option<u64>,
     pub jito_region: Option<String>,
     // Jito thresholds: only use Jito for large/emergency exits (small exits: tip eats EV)
-    pub jito_min_exit_fraction: Option<f64>,  // Min fraction to use Jito (default 0.25 = 25%)
-    pub jito_min_exit_sol: Option<f64>,       // Min SOL value to use Jito (default 0.5 SOL)
-    pub jito_for_emergency: Option<bool>,     // Always use Jito for emergency/panic exits (default true)
-    pub jito_for_final_exit: Option<bool>,    // Always use Jito for full exits (default true)
+    pub jito_min_exit_fraction: Option<f64>, // Min fraction to use Jito (default 0.25 = 25%)
+    pub jito_min_exit_sol: Option<f64>,      // Min SOL value to use Jito (default 0.5 SOL)
+    pub jito_for_emergency: Option<bool>, // Always use Jito for emergency/panic exits (default true)
+    pub jito_for_final_exit: Option<bool>, // Always use Jito for full exits (default true)
     // Parallel exit execution
     pub parallel_exits: Option<bool>,
     pub max_parallel_exits: Option<usize>,
@@ -181,10 +180,10 @@ impl Default for SniperCfg {
             jito_enabled: None,
             jito_tip_lamports: None,
             jito_region: None,
-            jito_min_exit_fraction: Some(0.25),  // Default: use Jito for exits >= 25%
-            jito_min_exit_sol: Some(0.5),        // Default: use Jito for exits >= 0.5 SOL
-            jito_for_emergency: Some(true),      // Default: always Jito for panic exits
-            jito_for_final_exit: Some(true),     // Default: always Jito for 100% exits
+            jito_min_exit_fraction: Some(0.25), // Default: use Jito for exits >= 25%
+            jito_min_exit_sol: Some(0.5),       // Default: use Jito for exits >= 0.5 SOL
+            jito_for_emergency: Some(true),     // Default: always Jito for panic exits
+            jito_for_final_exit: Some(true),    // Default: always Jito for 100% exits
             parallel_exits: None,
             max_parallel_exits: None,
             bundle_exits: None,
@@ -1065,14 +1064,14 @@ impl SniperEngine {
     /// Process a pool discovery event from Geyser
     async fn handle_pool_discovery(&self, event: PoolDiscoveryEvent) {
         let mint = event.base_mint;
-        
+
         // LATENCY TRACKING: Calculate time since event was created
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         let latency_to_handler_ms = now_ms.saturating_sub(event.discovered_at_ms);
-        
+
         info!(
             mint=%mint,
             latency_ms=latency_to_handler_ms,
@@ -1089,7 +1088,7 @@ impl SniperEngine {
                 let current_count: usize = rs.open.values().map(|v| v.len()).sum();
                 let total_exposure = current_count + rs.pending_buys;
                 if total_exposure >= mop {
-                    debug!(mint=%mint, current=current_count, pending=rs.pending_buys, max=mop, 
+                    debug!(mint=%mint, current=current_count, pending=rs.pending_buys, max=mop,
                         "sniper: max_open_positions reached - skipping ALL validation (saving Helius quota)");
                     return;
                 }
@@ -1128,7 +1127,7 @@ impl SniperEngine {
         };
 
         let liq_sol = (event.liquidity_estimate_lamports as f64) / 1e9;
-        
+
         // Calculate latency from Geyser discovery to sniper processing
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1386,9 +1385,9 @@ impl SniperEngine {
                 .unwrap_or_default()
                 .as_millis() as u64;
             let latency_to_buy_ms = pre_buy_ms.saturating_sub(event.discovered_at_ms);
-            
+
             info!(
-                mint=%mint, 
+                mint=%mint,
                 latency_ms=latency_to_buy_ms,
                 "⏱️ LATENCY: Geyser discovery -> pre-buy (all checks passed)"
             );
@@ -1839,7 +1838,7 @@ impl SniperEngine {
                         &sol_mint.to_string(),
                         &mint.to_string(),
                         lamports_in,
-                        true, // ENABLE fallback - use deterministic initial state for quote
+                        true,    // ENABLE fallback - use deterministic initial state for quote
                         creator, // Pass creator from Geyser event for fallback mode
                     )
                     .await
@@ -1949,11 +1948,12 @@ impl SniperEngine {
                 spl_token::solana_program::pubkey::Pubkey::new_from_array(mint_sdk.to_bytes());
 
             // Use get_associated_token_address_with_program_id with Token-2022
-            let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-                &owner_spl,
-                &mint_spl,
-                &token_prog,
-            );
+            let ata_spl =
+                spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &owner_spl,
+                    &mint_spl,
+                    &token_prog,
+                );
             let ata_sdk = SdkPubkey::new_from_array(ata_spl.to_bytes());
 
             (ata_sdk, token_prog_sdk)
@@ -1980,14 +1980,17 @@ impl SniperEngine {
                 // New tokens can pump 50-100% in the first seconds, so we need at least 50% slippage
                 let pumpfun_min_slippage = self.cfg.read().pumpfun_buy_slippage_bps.unwrap_or(5000); // Config or 50% default (was 25%)
                 let pumpfun_slippage_bps = msb.max(pumpfun_min_slippage);
-                match pf.build_swap_ix_async_with_slippage(
-                    &sol_mint.to_string(),
-                    &mint.to_string(),
-                    lamports_in,
-                    min_out,
-                    creator, // Pass creator from Geyser event for fresh launches
-                    pumpfun_slippage_bps, // Pass slippage in bps for max_sol_cost calculation (min 25%)
-                ).await {
+                match pf
+                    .build_swap_ix_async_with_slippage(
+                        &sol_mint.to_string(),
+                        &mint.to_string(),
+                        lamports_in,
+                        min_out,
+                        creator, // Pass creator from Geyser event for fresh launches
+                        pumpfun_slippage_bps, // Pass slippage in bps for max_sol_cost calculation (min 25%)
+                    )
+                    .await
+                {
                     Ok(ixs) => {
                         if !ixs.is_empty() {
                             final_ixs = ixs;
@@ -2183,7 +2186,7 @@ impl SniperEngine {
         // doesn't exist yet from RPC's perspective. We send with skip_preflight anyway.
         // For other DEXs, simulate to catch obvious errors.
         let should_simulate = chosen_dex != ChosenDex::PumpFun;
-        
+
         if should_simulate {
             match self.rpc.rpc.simulate_transaction(&tx).await {
                 Ok(sim_result) => {
@@ -2210,8 +2213,8 @@ impl SniperEngine {
             }
         } else {
             info!(
-                mint=%mint, 
-                chosen_dex=?chosen_dex, 
+                mint=%mint,
+                chosen_dex=?chosen_dex,
                 "sniper: SKIPPING simulation for Pump.fun fresh launch (RPC is behind Geyser)"
             );
         }
@@ -2342,7 +2345,7 @@ impl SniperEngine {
                     // Don't return error - we attempted to register the position
                     return Ok(());
                 }
-                
+
                 warn!(?e, mint=%mint, "sniper: buy tx failed (will not retry immediately)");
                 TRADES_FAILED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2557,16 +2560,15 @@ impl SniperEngine {
         // The RPC call fails when mint is not yet on-chain (buy TX still confirming).
         // Pump.fun tokens use standard SPL Token Program.
         let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(owner.to_bytes());
-        let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(mint_sdk.to_bytes());
-        let ata_spl = spl_associated_token_account::get_associated_token_address(
-            &owner_spl,
-            &mint_spl,
-        );
+        let mint_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(mint_sdk.to_bytes());
+        let ata_spl =
+            spl_associated_token_account::get_associated_token_address(&owner_spl, &mint_spl);
         let ata = solana_sdk::pubkey::Pubkey::new_from_array(ata_spl.to_bytes());
         info!(mint=%mint, ata=%ata, "finalize_fill: checking token balance");
         let decimals =
             crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &mint_sdk).await;
-        
+
         // CRITICAL FIX: Retry with delay to wait for TX confirmation
         // The TX may not be confirmed yet when this is called immediately after send
         let mut amt = 0.0f64;
@@ -2594,25 +2596,27 @@ impl SniperEngine {
                 debug!(mint=%mint, attempt=attempt, "finalize_fill: token balance is 0, retrying...");
             }
         }
-        
+
         if amt <= 0.0 {
             // TX failed - no tokens arrived. DO NOT create position!
             warn!(mint=%mint, "finalize_fill: no token balance found after 30 attempts - TX likely failed, NOT creating position");
             // Decrement pending_buys since we're done with this attempt
             let mut rs = self.risk.write();
-            if rs.pending_buys > 0 { rs.pending_buys -= 1; }
+            if rs.pending_buys > 0 {
+                rs.pending_buys -= 1;
+            }
             return;
         }
-        
+
         // SUCCESS: Tokens arrived! Now create the position
         let entry_price = invested_sol / amt.max(1e-9);
         let (pend_opt, entry_price_existing) = {
             let mut rs = self.risk.write();
             let pend = rs.pending.remove(&mint);
-            
+
             // Check if position already exists (from wallet scan or previous buy)
             let already_exists = rs.open.get(&mint).map(|v| !v.is_empty()).unwrap_or(false);
-            
+
             if already_exists {
                 // Update existing position
                 if let Some(v) = rs.open.get_mut(&mint) {
@@ -2647,18 +2651,18 @@ impl SniperEngine {
                     creator: creator.map(|c| c.to_string()), // Store creator for exit path (Pump.fun)
                 };
                 rs.open.entry(mint).or_default().push(lot);
-                
+
                 // Count positions before dropping lock
                 let lots: usize = rs.open.values().map(|v| v.len()).sum();
                 drop(rs); // Release write lock
-                
+
                 // Register with kill switch monitor if enabled (no lock needed)
                 if let Some(ks) = &self.kill_switch {
                     ks.register_position(mint, creator); // Pass creator for dev-sell detection
                 }
-                
+
                 OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
-                
+
                 // Record BUY trade for dashboard
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2675,7 +2679,7 @@ impl SniperEngine {
                     pnl_pct: None,
                     latency_ms: None,
                 });
-                
+
                 info!(
                     mint=%mint,
                     amount_tokens=amt,
@@ -2686,14 +2690,18 @@ impl SniperEngine {
                     "finalize_fill: NEW POSITION CREATED (tokens confirmed)"
                 );
             }
-            
+
             // Decrement pending_buys since position is now recorded (re-acquire write lock)
             {
                 let mut rs = self.risk.write();
-                if rs.pending_buys > 0 { rs.pending_buys -= 1; }
+                if rs.pending_buys > 0 {
+                    rs.pending_buys -= 1;
+                }
             }
-            
-            let entry_price_last = self.risk.read()
+
+            let entry_price_last = self
+                .risk
+                .read()
                 .open
                 .get(&mint)
                 .and_then(|v| v.last())
@@ -2701,10 +2709,10 @@ impl SniperEngine {
                 .unwrap_or(0.0);
             (pend, entry_price_last)
         };
-        
+
         // Persist immediately after updating position data
         self.persist_risk_state();
-        
+
         if let Some(pend) = pend_opt {
             // Fetch meta outside lock
             let mut exact_network_fee = pend.network_fee_lamports;
@@ -2730,7 +2738,7 @@ impl SniperEngine {
             // Meta-based token delta extraction for accuracy
             let scale = 10f64.powi(decimals as i32);
             let mut actual_raw = raw; // Use the raw value we already fetched
-            // Try recomputing actual_raw from meta pre/post if available (owner+mint delta)
+                                      // Try recomputing actual_raw from meta pre/post if available (owner+mint delta)
             if let Ok(sig_obj) = solana_sdk::signature::Signature::from_str(&pend.sig) {
                 use solana_client::rpc_config::RpcTransactionConfig;
                 use solana_transaction_status::option_serializer::OptionSerializer;
@@ -2750,42 +2758,35 @@ impl SniperEngine {
                         let mint_str = mint.to_string();
                         let mut pre_raw_opt: Option<u128> = None;
                         let mut post_raw_opt: Option<u128> = None;
-                        if let OptionSerializer::Some(pre) =
-                            meta.pre_token_balances.as_ref()
-                        {
+                        if let OptionSerializer::Some(pre) = meta.pre_token_balances.as_ref() {
                             for b in pre {
                                 let owner_ok = match b.owner.as_ref() {
                                     OptionSerializer::Some(o) => o == &owner_str,
                                     _ => false,
                                 };
                                 if owner_ok && b.mint == mint_str {
-                                    if let Ok(v) = b.ui_token_amount.amount.parse::<u128>()
-                                    {
+                                    if let Ok(v) = b.ui_token_amount.amount.parse::<u128>() {
                                         pre_raw_opt = Some(v);
                                         break;
                                     }
                                 }
                             }
                         }
-                        if let OptionSerializer::Some(post) =
-                            meta.post_token_balances.as_ref()
-                        {
+                        if let OptionSerializer::Some(post) = meta.post_token_balances.as_ref() {
                             for b in post {
                                 let owner_ok = match b.owner.as_ref() {
                                     OptionSerializer::Some(o) => o == &owner_str,
                                     _ => false,
                                 };
                                 if owner_ok && b.mint == mint_str {
-                                    if let Ok(v) = b.ui_token_amount.amount.parse::<u128>()
-                                    {
+                                    if let Ok(v) = b.ui_token_amount.amount.parse::<u128>() {
                                         post_raw_opt = Some(v);
                                         break;
                                     }
                                 }
                             }
                         }
-                        if let (Some(pre_raw), Some(post_raw)) = (pre_raw_opt, post_raw_opt)
-                        {
+                        if let (Some(pre_raw), Some(post_raw)) = (pre_raw_opt, post_raw_opt) {
                             if post_raw >= pre_raw {
                                 let delta = (post_raw - pre_raw) as u64;
                                 if delta > 0 {
@@ -2821,12 +2822,8 @@ impl SniperEngine {
                     crate::quantile_impact::SizeCategory::Large
                 };
 
-                self.quantile_calc.record_fill(
-                    pool_id,
-                    expected_raw,
-                    actual_raw,
-                    size_category,
-                );
+                self.quantile_calc
+                    .record_fill(pool_id, expected_raw, actual_raw, size_category);
             }
             // Note: tx_meta not available here; fee breakdown handled separately
 
@@ -2862,18 +2859,15 @@ impl SniperEngine {
                     .cfg
                     .read()
                     .adaptive_slippage_min_bps
-                    .unwrap_or(self.cfg.read().max_slippage_bps)
-                    as i64;
+                    .unwrap_or(self.cfg.read().max_slippage_bps) as i64;
                 let max_b = self
                     .cfg
                     .read()
                     .adaptive_slippage_max_bps
-                    .unwrap_or(self.cfg.read().max_slippage_bps)
-                    as i64;
-                let mut cur = rs
-                    .adaptive_slippage_bps
-                    .unwrap_or(self.cfg.read().max_slippage_bps)
-                    as i64;
+                    .unwrap_or(self.cfg.read().max_slippage_bps) as i64;
+                let mut cur =
+                    rs.adaptive_slippage_bps
+                        .unwrap_or(self.cfg.read().max_slippage_bps) as i64;
                 if mean > target {
                     cur = (cur + step).min(max_b);
                 } else if mean < target {
@@ -2891,8 +2885,7 @@ impl SniperEngine {
             let fee_tokens = if pend.fee_bps > 0 && pend.fee_bps < 5000 {
                 // expected_out = no_fee_out * (1 - fee_bps/10_000) approximately; invert
                 let no_fee_out = ((expected_raw as u128) * 10_000u128
-                    / (10_000u128 - pend.fee_bps as u128))
-                    as u64;
+                    / (10_000u128 - pend.fee_bps as u128)) as u64;
                 no_fee_out.saturating_sub(expected_raw)
             } else {
                 0
@@ -2930,7 +2923,7 @@ impl SniperEngine {
                 network_fee_exact=exact_network_fee
             );
             self.append_trade_record(&line, true);
-            
+
             // Persist state after fill is finalized with accurate token amounts
             self.persist_risk_state();
         }
@@ -2961,7 +2954,7 @@ impl SniperEngine {
                 self.persist_risk_state();
             }
         }
-        
+
         // Load config
         let (
             stop_bps,
@@ -2985,15 +2978,15 @@ impl SniperEngine {
                 r.timed_exit_tiers.clone(),
             )
         };
-        
+
         // Skip if no exit strategy configured
         let has_price_exits = stop_bps != u32::MAX || tp_bps != u32::MAX || tiers.is_some();
         let has_time_exits = time_exits_enabled;
-        
+
         if !has_price_exits && !has_time_exits {
             return Ok(());
         }
-        
+
         // Load parallel exit config
         let (parallel_exits_enabled, max_parallel) = {
             let r = self.cfg.read();
@@ -3002,24 +2995,24 @@ impl SniperEngine {
                 r.max_parallel_exits.unwrap_or(5),
             )
         };
-        
+
         // Count open positions for logging
         let open_count = self.risk.read().open.len();
         if open_count > 0 {
             info!(
-                open_positions=open_count,
-                time_exits_enabled=time_exits_enabled,
-                max_hold_secs=max_hold_secs,
+                open_positions = open_count,
+                time_exits_enabled = time_exits_enabled,
+                max_hold_secs = max_hold_secs,
                 "evaluate_positions: checking positions"
             );
         }
-        
+
         let now = chrono::Utc::now().timestamp();
         let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
-        
+
         // Collect exit tasks for parallel execution
         let mut exit_tasks: Vec<ExitTask> = Vec::new();
-        
+
         // Flatten lots for evaluation
         let positions: Vec<(Pubkey, PositionLot, usize)> = {
             let rs = self.risk.read();
@@ -3037,19 +3030,21 @@ impl SniperEngine {
         for (mint, pos, lot_idx) in positions {
             // Calculate position age in seconds
             let age_secs = (now - pos.opened_ts) as u64;
-            
+
             // Convert UI tokens to raw token amount (with decimals)
-            let raw_token_amount = (pos.amount_tokens * 10f64.powi(pos.token_decimals as i32)).floor() as u64;
-            
+            let raw_token_amount =
+                (pos.amount_tokens * 10f64.powi(pos.token_decimals as i32)).floor() as u64;
+
             // === TIME-BASED EXIT LOGIC ===
             if time_exits_enabled {
                 let mut time_fraction: f64 = 0.0;
                 let mut time_exit_reason = String::new();
-                
+
                 // Check max hold time - forced full exit
                 if age_secs >= max_hold_secs {
                     time_fraction = 1.0;
-                    time_exit_reason = format!("MAX_HOLD_TIME ({}s >= {}s)", age_secs, max_hold_secs);
+                    time_exit_reason =
+                        format!("MAX_HOLD_TIME ({}s >= {}s)", age_secs, max_hold_secs);
                 }
                 // Check timed exit tiers
                 else if let Some(ref timed) = timed_tiers {
@@ -3057,20 +3052,28 @@ impl SniperEngine {
                     if let Some(v) = rs.open.get_mut(&mint) {
                         if let Some(l) = v.get_mut(lot_idx) {
                             for tier in timed.iter() {
-                                if age_secs >= tier.secs && !l.executed_timed_tiers.contains(&tier.secs) {
+                                if age_secs >= tier.secs
+                                    && !l.executed_timed_tiers.contains(&tier.secs)
+                                {
                                     time_fraction = tier.fraction.clamp(0.0, 1.0);
                                     l.executed_timed_tiers.push(tier.secs);
-                                    time_exit_reason = format!("TIMED_TIER ({}s, {}%)", tier.secs, (tier.fraction * 100.0) as u32);
+                                    time_exit_reason = format!(
+                                        "TIMED_TIER ({}s, {}%)",
+                                        tier.secs,
+                                        (tier.fraction * 100.0) as u32
+                                    );
                                     break; // Execute one tier at a time
                                 }
                             }
                         }
                     }
                 }
-                
+
                 // Collect time-based exit task (instead of executing immediately)
                 if time_fraction > 0.0 {
-                    let sell_tokens = ((pos.amount_tokens * time_fraction) * 10f64.powi(pos.token_decimals as i32)).floor() as u64;
+                    let sell_tokens = ((pos.amount_tokens * time_fraction)
+                        * 10f64.powi(pos.token_decimals as i32))
+                    .floor() as u64;
                     if sell_tokens > 0 {
                         info!(
                             mint=%mint,
@@ -3082,7 +3085,8 @@ impl SniperEngine {
                         );
                         let is_full_exit = time_fraction >= 0.99;
                         // Get creator from position for Pump.fun exit path
-                        let creator_pk = pos.creator.as_ref().and_then(|s| Pubkey::from_str(s).ok());
+                        let creator_pk =
+                            pos.creator.as_ref().and_then(|s| Pubkey::from_str(s).ok());
                         exit_tasks.push(ExitTask {
                             mint,
                             lot_idx,
@@ -3096,21 +3100,17 @@ impl SniperEngine {
                     continue; // Skip price-based evaluation for this position
                 }
             }
-            
+
             // === PRICE-BASED EXIT LOGIC (original) ===
             if !has_price_exits {
                 continue;
             }
-            
+
             // Quote exit value (prefer Raydium then Orca)
             let mut quote_out: Option<u64> = None;
             if let Some(r) = &self.raydium {
                 if let Ok(Some(q)) = r
-                    .quote_exact_in(
-                        &mint.to_string(),
-                        &sol_mint.to_string(),
-                        raw_token_amount,
-                    )
+                    .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), raw_token_amount)
                     .await
                 {
                     quote_out = Some(q.amount_out);
@@ -3121,11 +3121,7 @@ impl SniperEngine {
             if quote_out.is_none() {
                 if let Some(o) = &self.orca {
                     if let Ok(Some(q)) = o
-                        .quote_exact_in(
-                            &mint.to_string(),
-                            &sol_mint.to_string(),
-                            raw_token_amount,
-                        )
+                        .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), raw_token_amount)
                         .await
                     {
                         quote_out = Some(q.amount_out);
@@ -3138,11 +3134,7 @@ impl SniperEngine {
             if quote_out.is_none() {
                 if let Some(pf) = &self.pumpfun {
                     if let Ok(Some(q)) = pf
-                        .quote_exact_in(
-                            &mint.to_string(),
-                            &sol_mint.to_string(),
-                            raw_token_amount,
-                        )
+                        .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), raw_token_amount)
                         .await
                     {
                         quote_out = Some(q.amount_out);
@@ -3163,7 +3155,7 @@ impl SniperEngine {
                 0.0
             };
             let pnl_bps = (pnl_pct * 10_000.0) as i64;
-            
+
             // Log PnL for debugging
             info!(
                 mint=%mint,
@@ -3174,7 +3166,7 @@ impl SniperEngine {
                 out_lamports=out_lamports,
                 "evaluate_positions: PnL check"
             );
-            
+
             {
                 let mut rs = self.risk.write();
                 if let Some(v) = rs.open.get_mut(&mint) {
@@ -3240,7 +3232,9 @@ impl SniperEngine {
                     continue;
                 }
                 // Convert UI tokens to raw token amount (with decimals) for the sell
-                let sell_tokens = ((pos.amount_tokens * fraction) * 10f64.powi(pos.token_decimals as i32)).floor() as u64;
+                let sell_tokens = ((pos.amount_tokens * fraction)
+                    * 10f64.powi(pos.token_decimals as i32))
+                .floor() as u64;
                 if sell_tokens > 0 {
                     // Collect price-based exit task (instead of executing immediately)
                     let reason = if stop_trigger {
@@ -3264,16 +3258,16 @@ impl SniperEngine {
                 }
             }
         }
-        
+
         // Execute all collected exit tasks (parallel or sequential based on config)
         if !exit_tasks.is_empty() {
             info!(
-                exit_count=exit_tasks.len(),
-                parallel=parallel_exits_enabled,
-                max_parallel=max_parallel,
+                exit_count = exit_tasks.len(),
+                parallel = parallel_exits_enabled,
+                max_parallel = max_parallel,
                 "evaluate_positions: executing exits"
             );
-            
+
             if parallel_exits_enabled && exit_tasks.len() > 1 {
                 // Execute exits in parallel with concurrency limit
                 self.execute_exits_parallel(exit_tasks, max_parallel).await;
@@ -3281,7 +3275,14 @@ impl SniperEngine {
                 // Execute exits sequentially (legacy behavior)
                 for task in exit_tasks {
                     if let Err(e) = self
-                        .attempt_exit(&task.mint, task.lot_idx, task.sell_tokens, task.fraction, task.is_emergency, task.creator)
+                        .attempt_exit(
+                            &task.mint,
+                            task.lot_idx,
+                            task.sell_tokens,
+                            task.fraction,
+                            task.is_emergency,
+                            task.creator,
+                        )
                         .await
                     {
                         warn!(?e, mint=%task.mint, reason=%task.reason, "exit tx failed");
@@ -3303,36 +3304,36 @@ impl SniperEngine {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Execute multiple exit tasks in TRUE parallel using tokio::spawn
     /// Each exit runs in its own task for maximum throughput - no waiting on bundles!
     async fn execute_exits_parallel(&self, tasks: Vec<ExitTask>, max_concurrent: usize) {
         use futures::stream::{FuturesUnordered, StreamExt};
-        
+
         let task_count = tasks.len();
         info!(
             task_count = task_count,
             max_concurrent = max_concurrent,
             "starting TRUE parallel exit execution"
         );
-        
+
         // Use FuturesUnordered for concurrent execution with limit
         let mut futures = FuturesUnordered::new();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-        
+
         for task in tasks {
             // Clone engine for spawned task (shares Arc-wrapped state)
             let engine_clone = self.clone_for_spawn();
             let sem = semaphore.clone();
             let task_clone = task.clone();
-            
+
             let handle = tokio::spawn(async move {
                 // Acquire semaphore permit to limit concurrency
                 let _permit = sem.acquire().await.ok();
-                
+
                 let start = Instant::now();
                 let result = engine_clone
                     .attempt_exit(
@@ -3345,61 +3346,59 @@ impl SniperEngine {
                     )
                     .await;
                 let elapsed_ms = start.elapsed().as_millis();
-                
+
                 (task_clone, result, elapsed_ms)
             });
-            
+
             futures.push(handle);
         }
-        
+
         // Collect results as they complete (don't wait for all - process immediately!)
         let mut success_count = 0u32;
         let mut fail_count = 0u32;
-        
+
         while let Some(join_result) = futures.next().await {
             match join_result {
-                Ok((task, result, elapsed_ms)) => {
-                    match result {
-                        Ok(()) => {
-                            success_count += 1;
-                            if task.is_emergency || task.fraction >= 0.99 {
-                                self.mark_cooldown(task.mint);
-                                if let Some(ks) = &self.kill_switch {
-                                    ks.unregister_position(&task.mint);
-                                }
+                Ok((task, result, elapsed_ms)) => match result {
+                    Ok(()) => {
+                        success_count += 1;
+                        if task.is_emergency || task.fraction >= 0.99 {
+                            self.mark_cooldown(task.mint);
+                            if let Some(ks) = &self.kill_switch {
+                                ks.unregister_position(&task.mint);
                             }
-                            metrics::PARTIAL_EXIT_EVENTS_TOTAL
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            metrics::PARTIAL_EXIT_FRACTION_MICRO_TOTAL.fetch_add(
-                                (task.fraction * 1_000_000.0) as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            info!(
-                                mint = %task.mint,
-                                reason = %task.reason,
-                                elapsed_ms = elapsed_ms,
-                                "parallel exit completed"
-                            );
                         }
-                        Err(e) => {
-                            fail_count += 1;
-                            warn!(
-                                ?e,
-                                mint = %task.mint,
-                                reason = %task.reason,
-                                elapsed_ms = elapsed_ms,
-                                "parallel exit failed"
-                            );
-                        }
+                        metrics::PARTIAL_EXIT_EVENTS_TOTAL
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics::PARTIAL_EXIT_FRACTION_MICRO_TOTAL.fetch_add(
+                            (task.fraction * 1_000_000.0) as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        info!(
+                            mint = %task.mint,
+                            reason = %task.reason,
+                            elapsed_ms = elapsed_ms,
+                            "parallel exit completed"
+                        );
                     }
-                }
+                    Err(e) => {
+                        fail_count += 1;
+                        warn!(
+                            ?e,
+                            mint = %task.mint,
+                            reason = %task.reason,
+                            elapsed_ms = elapsed_ms,
+                            "parallel exit failed"
+                        );
+                    }
+                },
                 Err(e) => {
                     fail_count += 1;
                     error!(?e, "exit task panicked");
                 }
             }
         }
-        
+
         info!(
             success_count = success_count,
             fail_count = fail_count,
@@ -3441,7 +3440,7 @@ impl SniperEngine {
         if ata_tokens == 0 {
             // No tokens in wallet - position is stale, clean it up
             info!(
-                mint=%mint, 
+                mint=%mint,
                 lot_idx=lot_idx,
                 state_tokens=amount_tokens,
                 "attempt_exit: wallet has 0 tokens, removing ghost position from state"
@@ -3516,7 +3515,7 @@ impl SniperEngine {
         } else {
             self.adaptive_slippage_bps()
         };
-        
+
         if is_emergency_exit {
             info!(mint=%mint, slippage_bps=msb2, "attempt_exit: EMERGENCY EXIT - using high slippage");
         }
@@ -3837,7 +3836,7 @@ impl SniperEngine {
         } else {
             0
         };
-        
+
         // === JITO DECISION LOGIC ===
         // Determine if this exit qualifies for Jito bundle submission:
         // 1. Emergency/panic exits (kill switch triggers) - always Jito if enabled
@@ -3854,22 +3853,22 @@ impl SniperEngine {
                 let jito_for_final = cfg.jito_for_final_exit.unwrap_or(true);
                 let min_fraction = cfg.jito_min_exit_fraction.unwrap_or(0.25);
                 let min_sol = cfg.jito_min_exit_sol.unwrap_or(0.5);
-                
+
                 // Estimate exit value in SOL (using invested_sol as proxy)
                 let exit_sol_value = invested_sol_lot * fraction;
-                
+
                 let is_final_exit = fraction >= 0.99;
                 let is_large_exit = fraction >= min_fraction && exit_sol_value >= min_sol;
-                
+
                 // Use Jito for: emergency OR final OR large exits
-                (is_emergency_exit && jito_for_emergency) || 
-                (is_final_exit && jito_for_final) || 
-                is_large_exit
+                (is_emergency_exit && jito_for_emergency)
+                    || (is_final_exit && jito_for_final)
+                    || is_large_exit
             }
         };
-        
+
         let sent_at = Instant::now();
-        
+
         // Route through Jito or normal RPC based on decision
         let tx_result: Result<solana_sdk::signature::Signature, anyhow::Error> = if use_jito {
             // === JITO BUNDLE SUBMISSION ===
@@ -3878,10 +3877,12 @@ impl SniperEngine {
                 let cfg = self.cfg.read();
                 (
                     cfg.jito_tip_lamports.unwrap_or(10_000),
-                    cfg.jito_region.clone().unwrap_or_else(|| "frankfurt".to_string()),
+                    cfg.jito_region
+                        .clone()
+                        .unwrap_or_else(|| "frankfurt".to_string()),
                 )
             }; // cfg lock released here
-            
+
             // === DYNAMIC TIP HEURISTIC ===
             // Adjust tip based on urgency and exit type:
             // - Emergency exits (kill switch, panic): 3x tip for maximum priority
@@ -3889,20 +3890,20 @@ impl SniperEngine {
             // - Large exits (>50%): 1.5x tip
             // - Normal qualifying exits: base tip
             let tip_multiplier = if is_emergency_exit {
-                3.0  // PANIC: Max priority, get out NOW
+                3.0 // PANIC: Max priority, get out NOW
             } else if fraction >= 0.99 {
-                2.0  // Full exit: High priority
+                2.0 // Full exit: High priority
             } else if fraction >= 0.5 {
-                1.5  // Large exit: Medium-high priority
+                1.5 // Large exit: Medium-high priority
             } else {
-                1.0  // Normal qualifying exit
+                1.0 // Normal qualifying exit
             };
-            
+
             let tip_lamports = ((base_tip as f64) * tip_multiplier) as u64;
-            
+
             let region = JitoRegion::from_str(&region_str).unwrap_or(JitoRegion::Frankfurt);
             let jito_client = JitoClient::new(vec![region], tip_lamports);
-            
+
             info!(
                 mint = %mint,
                 fraction = fraction,
@@ -3911,25 +3912,27 @@ impl SniperEngine {
                 region = %region_str,
                 "using JITO for exit (MEV protection)"
             );
-            
+
             // Add tip instruction to transaction
             let mut tx_with_tip = tx.clone();
-            if let Ok(tip_ix) = jito_client.build_tip_instruction(&self.treasury.pubkey(), tip_lamports) {
+            if let Ok(tip_ix) =
+                jito_client.build_tip_instruction(&self.treasury.pubkey(), tip_lamports)
+            {
                 // Create new transaction with tip instruction added
                 let mut all_ixs = tx_ixs.clone();
                 all_ixs.push(tip_ix);
                 tx_with_tip = Transaction::new_with_payer(&all_ixs, Some(&self.treasury.pubkey()));
                 tx_with_tip.try_sign(&[self.treasury.signer_ref()], bh)?;
             }
-            
+
             // Track tip amount
             crate::metrics::JITO_TIP_LAMPORTS_TOTAL
                 .fetch_add(tip_lamports, std::sync::atomic::Ordering::Relaxed);
-            
+
             // Submit as single-TX bundle to Jito
             crate::metrics::JITO_BUNDLES_SUBMITTED_TOTAL
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                
+
             match jito_client.send_bundle(&[tx_with_tip.clone()]).await {
                 Ok(bundle_id) => {
                     info!(bundle_id = %bundle_id, mint = %mint, tip_lamports = tip_lamports, "Jito bundle submitted");
@@ -3951,8 +3954,9 @@ impl SniperEngine {
                         Err(e) => {
                             // Bundle failed or timed out
                             let error_msg = format!("{:?}", e);
-                            let is_timeout = error_msg.contains("timeout") || error_msg.contains("Timeout");
-                            
+                            let is_timeout =
+                                error_msg.contains("timeout") || error_msg.contains("Timeout");
+
                             if is_timeout {
                                 warn!(
                                     ?e,
@@ -3992,7 +3996,7 @@ impl SniperEngine {
                     } else {
                         "UNKNOWN"
                     };
-                    
+
                     warn!(
                         ?e,
                         mint = %mint,
@@ -4012,7 +4016,7 @@ impl SniperEngine {
             // === NORMAL RPC SUBMISSION (small exits) ===
             self.rpc_retry_tx(&tx, 3, false).await
         };
-        
+
         match tx_result {
             Ok(sig) => {
                 let dur = sent_at.elapsed();
@@ -4132,25 +4136,33 @@ impl SniperEngine {
                 record_realized_gross_net(gross, net);
                 // Also record absolute realized PnL (SOL) histogram using net
                 record_realized_pnl_sol(net);
-                
+
                 // Record SELL trade for dashboard
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-                let pnl_pct = if notional > 0.0 { Some((net / notional) * 100.0) } else { None };
+                let pnl_pct = if notional > 0.0 {
+                    Some((net / notional) * 100.0)
+                } else {
+                    None
+                };
                 record_recent_trade(RecentTrade {
                     timestamp_ms: now_ms,
                     mint: mint.to_string(),
                     action: "SELL".to_string(),
                     tx_hash: sig.to_string(),
                     amount_tokens: sell_tokens as f64,
-                    price_sol: if sell_tokens > 0 { delta_wsol / (sell_tokens as f64) } else { 0.0 },
+                    price_sol: if sell_tokens > 0 {
+                        delta_wsol / (sell_tokens as f64)
+                    } else {
+                        0.0
+                    },
                     pnl_sol: Some(net),
                     pnl_pct,
                     latency_ms: None,
                 });
-                
+
                 let line = format!(
                     "{ts},SELL,{mint},*,{sig},0,{lamports_out},{tok_in},{tok_out},,,0,,{fee},{realized},exit_fraction={fraction}",
                     ts=ChronoUtc::now().to_rfc3339(),
@@ -4165,13 +4177,14 @@ impl SniperEngine {
                 );
                 self.append_trade_record(&line, true);
                 self.persist_risk_state();
-                
+
                 // === DUST SWEEP: After full exit, check if any dust remains and sell it ===
                 if fraction >= 0.99 {
                     // Re-check wallet balance after sell
                     if let Ok(acc) = self.rpc.get_account_retry(&ata).await {
                         if acc.data.len() >= 72 {
-                            let remaining = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+                            let remaining =
+                                u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
                             if remaining > 0 && remaining < 1_000_000 {
                                 // Dust detected (less than 1 token for 6 decimal mints)
                                 info!(
@@ -4182,13 +4195,11 @@ impl SniperEngine {
                                 // Try to sell the dust - ignore errors as it's best-effort
                                 // Signature: attempt_exit(mint, lot_idx, amount_tokens, fraction, is_emergency, creator)
                                 let _ = Box::pin(self.attempt_exit(
-                                    mint,
-                                    lot_idx,
-                                    remaining,
-                                    1.0,
-                                    true, // is_emergency to use high slippage
+                                    mint, lot_idx, remaining, 1.0,
+                                    true,    // is_emergency to use high slippage
                                     creator, // pass through creator for dust sweep
-                                )).await;
+                                ))
+                                .await;
                             }
                         }
                     }
@@ -4516,12 +4527,12 @@ impl SniperEngine {
         // Need to check both SPL Token and Token-2022 programs
         let spl_token_prog = solana_sdk::pubkey::Pubkey::new_from_array(spl_token::id().to_bytes());
         let owner_sdk = solana_sdk::pubkey::Pubkey::new_from_array(owner.to_bytes());
-        
+
         // Token-2022 program ID
-        let spl_token_2022_prog = solana_sdk::pubkey::Pubkey::from_str(
-            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
-        ).unwrap();
-        
+        let spl_token_2022_prog =
+            solana_sdk::pubkey::Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+                .unwrap();
+
         // Fetch accounts from both programs
         let token_accounts_spl = self
             .rpc
@@ -4532,7 +4543,7 @@ impl SniperEngine {
             )
             .await
             .unwrap_or_default();
-            
+
         let token_accounts_2022 = self
             .rpc
             .rpc
@@ -4542,7 +4553,7 @@ impl SniperEngine {
             )
             .await
             .unwrap_or_default();
-        
+
         info!(
             spl_token_count = token_accounts_spl.len(),
             token_2022_count = token_accounts_2022.len(),
@@ -4558,23 +4569,27 @@ impl SniperEngine {
                 .unwrap();
 
         // Combine both token account lists
-        let all_token_accounts = token_accounts_spl.into_iter().chain(token_accounts_2022.into_iter());
+        let all_token_accounts = token_accounts_spl
+            .into_iter()
+            .chain(token_accounts_2022.into_iter());
 
         // Response is Vec<RpcKeyedAccount> directly (not wrapped in .value)
         for account in all_token_accounts {
             // Parse the token account data - handle JsonParsed format (default from RPC)
             // Now also extract decimals for correct amount display
-            let (mint_str, amount_raw, decimals): (String, u64, u8) = 
+            let (mint_str, amount_raw, decimals): (String, u64, u8) =
                 if let solana_account_decoder::UiAccountData::Json(parsed) = &account.account.data {
                     // JsonParsed format: {"parsed": {"info": {"mint": "...", "tokenAmount": {"amount": "...", "decimals": N}}}}
                     let info = parsed.parsed.get("info");
                     if let Some(info) = info {
                         let mint = info.get("mint").and_then(|v| v.as_str()).unwrap_or("");
-                        let amount_str = info.get("tokenAmount")
+                        let amount_str = info
+                            .get("tokenAmount")
                             .and_then(|v| v.get("amount"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("0");
-                        let decimals = info.get("tokenAmount")
+                        let decimals = info
+                            .get("tokenAmount")
                             .and_then(|v| v.get("decimals"))
                             .and_then(|v| v.as_u64())
                             .unwrap_or(6) as u8; // Default to 6 decimals (common for SPL tokens)
@@ -4583,7 +4598,9 @@ impl SniperEngine {
                     } else {
                         continue;
                     }
-                } else if let solana_account_decoder::UiAccountData::Binary(b64_str, _encoding) = &account.account.data {
+                } else if let solana_account_decoder::UiAccountData::Binary(b64_str, _encoding) =
+                    &account.account.data
+                {
                     // Binary format fallback - need to fetch decimals from mint account
                     let data = match base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
@@ -4608,7 +4625,7 @@ impl SniperEngine {
             if amount_raw == 0 {
                 continue;
             }
-            
+
             // Skip dust amounts (less than 1000 raw tokens = 0.001 for 6 decimal tokens)
             // These are worthless and cannot be sold for any SOL
             if amount_raw < 1000 {
@@ -4644,7 +4661,8 @@ impl SniperEngine {
             // For binary format, fetch actual decimals from mint account
             let actual_decimals = if decimals == 6 {
                 // Try to get actual decimals from mint account
-                crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &token_mint).await
+                crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &token_mint)
+                    .await
             } else {
                 decimals
             };
@@ -4662,14 +4680,14 @@ impl SniperEngine {
             // Register as an open position (unknown entry price)
             // Use max_buy_sol as estimated invested amount since we don't know the actual
             let estimated_invested = self.cfg.read().max_buy_sol;
-            
+
             // Estimate entry price from invested / amount
             let estimated_entry_price = if amount_human > 0.0 {
                 estimated_invested / amount_human
             } else {
                 0.0
             };
-            
+
             {
                 let mut rs = self.risk.write();
                 // CRITICAL: For wallet-scan positions, set opened_ts to a time in the past
@@ -4724,11 +4742,14 @@ impl SniperEngine {
                 "sniper: [WARNING] max_open_positions already reached! No new buys will be allowed."
             );
         }
-        
+
         // Persist state so wallet scan results survive restart
         if positions_found > 0 {
             self.persist_risk_state();
-            info!(positions_found=positions_found, "sniper: persisted wallet scan results to state file");
+            info!(
+                positions_found = positions_found,
+                "sniper: persisted wallet scan results to state file"
+            );
         }
 
         Ok(())

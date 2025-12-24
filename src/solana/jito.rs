@@ -29,8 +29,16 @@ fn build_system_transfer(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instructi
     Instruction {
         program_id: SYSTEM_PROGRAM_ID,
         accounts: vec![
-            AccountMeta { pubkey: *from, is_signer: true, is_writable: true },
-            AccountMeta { pubkey: *to, is_signer: false, is_writable: true },
+            AccountMeta {
+                pubkey: *from,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: *to,
+                is_signer: false,
+                is_writable: true,
+            },
         ],
         data: {
             // System transfer: instruction index 2 + u64 lamports (little-endian)
@@ -76,7 +84,7 @@ impl JitoRegion {
             JitoRegion::SaltLakeCity => "https://slc.mainnet.block-engine.jito.wtf",
         }
     }
-    
+
     pub fn all() -> Vec<JitoRegion> {
         vec![
             JitoRegion::Frankfurt,
@@ -90,7 +98,7 @@ impl JitoRegion {
 
 impl FromStr for JitoRegion {
     type Err = anyhow::Error;
-    
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "amsterdam" => Ok(JitoRegion::Amsterdam),
@@ -167,7 +175,7 @@ pub struct JitoClient {
 
 impl JitoClient {
     /// Create a new Jito client
-    /// 
+    ///
     /// # Arguments
     /// * `regions` - Block engine regions to use (will try in order)
     /// * `tip_lamports` - Tip amount in lamports (minimum 1000, recommended 10000+)
@@ -177,33 +185,33 @@ impl JitoClient {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("Failed to create HTTP client"),
-            regions: if regions.is_empty() { vec![JitoRegion::Frankfurt] } else { regions },
+            regions: if regions.is_empty() {
+                vec![JitoRegion::Frankfurt]
+            } else {
+                regions
+            },
             tip_lamports: tip_lamports.max(1000), // Minimum tip
         }
     }
-    
+
     /// Create with default settings (Frankfurt, 10k lamports tip)
     pub fn default() -> Self {
         Self::new(vec![JitoRegion::Frankfurt], 10_000)
     }
-    
+
     /// Get a random tip account
     pub fn random_tip_account() -> Pubkey {
         let idx = rand::random::<usize>() % JITO_TIP_ACCOUNTS.len();
         Pubkey::from_str(JITO_TIP_ACCOUNTS[idx]).expect("Invalid tip account")
     }
-    
+
     /// Build a tip instruction to pay Jito validators
     /// This should be the LAST instruction in the bundle
-    pub fn build_tip_instruction(
-        &self,
-        payer: &Pubkey,
-        tip_lamports: u64,
-    ) -> Result<Instruction> {
+    pub fn build_tip_instruction(&self, payer: &Pubkey, tip_lamports: u64) -> Result<Instruction> {
         let tip_account = Self::random_tip_account();
         Ok(build_system_transfer(payer, &tip_account, tip_lamports))
     }
-    
+
     /// Add tip instruction to existing transaction instructions
     /// Note: Caller should rebuild transaction with the returned instructions
     pub fn build_tip_ix_for_payer(
@@ -212,83 +220,88 @@ impl JitoClient {
     ) -> Result<solana_sdk::instruction::Instruction> {
         self.build_tip_instruction(payer, self.tip_lamports)
     }
-    
+
     /// Submit a bundle of transactions to Jito
-    /// 
+    ///
     /// # Arguments
     /// * `transactions` - Signed transactions to submit as a bundle
-    /// 
+    ///
     /// # Returns
     /// Bundle ID if successful
     pub async fn send_bundle(&self, transactions: &[Transaction]) -> Result<String> {
         if transactions.is_empty() {
             return Err(anyhow!("Cannot submit empty bundle"));
         }
-        
+
         // Serialize transactions to base58 (Jito requires base58, not base64!)
         let serialized: Vec<String> = transactions
             .iter()
-            .map(|tx| bs58::encode(bincode::serialize(tx).expect("Failed to serialize tx")).into_string())
+            .map(|tx| {
+                bs58::encode(bincode::serialize(tx).expect("Failed to serialize tx")).into_string()
+            })
             .collect();
-        
+
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: 1,
             method: "sendBundle".to_string(),
             params: vec![serialized],
         };
-        
+
         // Try each region in order
         let mut last_error = None;
         for region in &self.regions {
             let url = format!("{}/api/v1/bundles", region.url());
-            debug!("Submitting bundle to Jito {} ({} txs)", region.url(), transactions.len());
-            
-            match self.http_client
+            debug!(
+                "Submitting bundle to Jito {} ({} txs)",
+                region.url(),
+                transactions.len()
+            );
+
+            match self
+                .http_client
                 .post(&url)
                 .header("Content-Type", "application/json")
                 .json(&request)
                 .send()
                 .await
             {
-                Ok(response) => {
-                    match response.json::<BundleResponse>().await {
-                        Ok(bundle_resp) => {
-                            if let Some(bundle_id) = bundle_resp.result {
-                                info!(
-                                    bundle_id = %bundle_id,
-                                    region = ?region,
-                                    tx_count = transactions.len(),
-                                    "Jito bundle submitted successfully"
-                                );
-                                return Ok(bundle_id);
-                            }
-                            if let Some(err) = bundle_resp.error {
-                                warn!(
-                                    code = err.code,
-                                    message = %err.message,
-                                    region = ?region,
-                                    "Jito bundle error"
-                                );
-                                last_error = Some(anyhow!("Jito error {}: {}", err.code, err.message));
-                            }
+                Ok(response) => match response.json::<BundleResponse>().await {
+                    Ok(bundle_resp) => {
+                        if let Some(bundle_id) = bundle_resp.result {
+                            info!(
+                                bundle_id = %bundle_id,
+                                region = ?region,
+                                tx_count = transactions.len(),
+                                "Jito bundle submitted successfully"
+                            );
+                            return Ok(bundle_id);
                         }
-                        Err(e) => {
-                            warn!(?e, region = ?region, "Failed to parse Jito response");
-                            last_error = Some(e.into());
+                        if let Some(err) = bundle_resp.error {
+                            warn!(
+                                code = err.code,
+                                message = %err.message,
+                                region = ?region,
+                                "Jito bundle error"
+                            );
+                            last_error = Some(anyhow!("Jito error {}: {}", err.code, err.message));
                         }
                     }
-                }
+                    Err(e) => {
+                        warn!(?e, region = ?region, "Failed to parse Jito response");
+                        last_error = Some(e.into());
+                    }
+                },
                 Err(e) => {
                     warn!(?e, region = ?region, "Failed to connect to Jito block engine");
                     last_error = Some(e.into());
                 }
             }
         }
-        
+
         Err(last_error.unwrap_or_else(|| anyhow!("All Jito regions failed")))
     }
-    
+
     /// Check bundle status
     pub async fn get_bundle_status(&self, bundle_ids: &[String]) -> Result<Vec<BundleStatusValue>> {
         let request = JsonRpcRequest {
@@ -297,11 +310,12 @@ impl JitoClient {
             method: "getBundleStatuses".to_string(),
             params: vec![bundle_ids.to_vec()],
         };
-        
+
         for region in &self.regions {
             let url = format!("{}/api/v1/bundles", region.url());
-            
-            match self.http_client
+
+            match self
+                .http_client
                 .post(&url)
                 .header("Content-Type", "application/json")
                 .json(&request)
@@ -320,10 +334,10 @@ impl JitoClient {
                 }
             }
         }
-        
+
         Ok(vec![])
     }
-    
+
     /// Wait for bundle confirmation (with timeout)
     pub async fn wait_for_bundle(
         &self,
@@ -332,26 +346,28 @@ impl JitoClient {
     ) -> Result<BundleStatusValue> {
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
-        
+
         while start.elapsed() < timeout {
             let statuses = self.get_bundle_status(&[bundle_id.to_string()]).await?;
-            
+
             if let Some(status) = statuses.into_iter().find(|s| s.bundle_id == bundle_id) {
-                if status.confirmation_status == "confirmed" || 
-                   status.confirmation_status == "finalized" {
+                if status.confirmation_status == "confirmed"
+                    || status.confirmation_status == "finalized"
+                {
                     return Ok(status);
                 }
                 if status.err.is_some() {
-                    return Err(anyhow!(
-                        "Bundle failed: {:?}", status.err
-                    ));
+                    return Err(anyhow!("Bundle failed: {:?}", status.err));
                 }
             }
-            
+
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        
-        Err(anyhow!("Bundle confirmation timeout after {}s", timeout_secs))
+
+        Err(anyhow!(
+            "Bundle confirmation timeout after {}s",
+            timeout_secs
+        ))
     }
 }
 
@@ -370,37 +386,41 @@ impl BundleBuilder {
             payer,
         }
     }
-    
+
     /// Add a transaction to the bundle
     pub fn add_transaction(mut self, tx: Transaction) -> Self {
         self.transactions.push(tx);
         self
     }
-    
+
     /// Add multiple transactions to the bundle
     pub fn add_transactions(mut self, txs: Vec<Transaction>) -> Self {
         self.transactions.extend(txs);
         self
     }
-    
+
     /// Build the bundle - note: tip should be added to last TX before calling this
-    /// 
+    ///
     /// Returns transactions ready for signing
     pub fn build(self) -> Vec<Transaction> {
         self.transactions
     }
-    
+
     /// Get tip instruction for the payer (add to last TX manually)
     pub fn get_tip_instruction(&self) -> Result<Instruction> {
         let tip_account = JitoClient::random_tip_account();
-        Ok(build_system_transfer(&self.payer, &tip_account, self.tip_lamports))
+        Ok(build_system_transfer(
+            &self.payer,
+            &tip_account,
+            self.tip_lamports,
+        ))
     }
-    
+
     /// Get current transaction count
     pub fn len(&self) -> usize {
         self.transactions.len()
     }
-    
+
     pub fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
@@ -409,18 +429,26 @@ impl BundleBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_jito_region_parsing() {
-        assert_eq!(JitoRegion::from_str("frankfurt").unwrap(), JitoRegion::Frankfurt);
-        assert_eq!(JitoRegion::from_str("amsterdam").unwrap(), JitoRegion::Amsterdam);
+        assert_eq!(
+            JitoRegion::from_str("frankfurt").unwrap(),
+            JitoRegion::Frankfurt
+        );
+        assert_eq!(
+            JitoRegion::from_str("amsterdam").unwrap(),
+            JitoRegion::Amsterdam
+        );
         assert_eq!(JitoRegion::from_str("ny").unwrap(), JitoRegion::NewYork);
         assert_eq!(JitoRegion::from_str("tokyo").unwrap(), JitoRegion::Tokyo);
     }
-    
+
     #[test]
     fn test_tip_account_valid() {
         let tip_account = JitoClient::random_tip_account();
-        assert!(JITO_TIP_ACCOUNTS.iter().any(|&acc| Pubkey::from_str(acc).unwrap() == tip_account));
+        assert!(JITO_TIP_ACCOUNTS
+            .iter()
+            .any(|&acc| Pubkey::from_str(acc).unwrap() == tip_account));
     }
 }

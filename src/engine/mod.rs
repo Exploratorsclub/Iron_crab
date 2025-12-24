@@ -469,7 +469,9 @@ impl Engine {
 
                     let orc_for_refresh = orc.clone();
                     tokio::spawn(async move {
-                        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(vault_refresh_secs));
+                        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+                            vault_refresh_secs,
+                        ));
                         interval.tick().await; // Skip first tick (immediate)
 
                         loop {
@@ -489,7 +491,9 @@ impl Engine {
                         "arbitrage_task: background vault refresh task started"
                     );
                 } else {
-                    tracing::info!("arbitrage_task: vault refresh DISABLED (vault_refresh_interval_secs=0)");
+                    tracing::info!(
+                        "arbitrage_task: vault refresh DISABLED (vault_refresh_interval_secs=0)"
+                    );
                 }
 
                 let arb = Arc::new(

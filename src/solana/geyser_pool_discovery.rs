@@ -165,7 +165,7 @@ impl GeyserPoolDiscovery {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        
+
         debug!(
             pool = %update.pubkey,
             dex = ?dex_type,
@@ -465,14 +465,24 @@ impl GeyserPoolDiscovery {
                 // Fee recipients (multiple possible)
                 let fee_recip_1 = pubkey!("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM");
                 let fee_recip_2 = pubkey!("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV");
-                
+
                 let known_to_skip = [
-                    metaplex, token_prog, ata_prog, system_prog, rent,
-                    event_auth, pumpfun_global, pumpfun_prog, fee_prog,
-                    fee_recip_1, fee_recip_2,
+                    metaplex,
+                    token_prog,
+                    ata_prog,
+                    system_prog,
+                    rent,
+                    event_auth,
+                    pumpfun_global,
+                    pumpfun_prog,
+                    fee_prog,
+                    fee_recip_1,
+                    fee_recip_2,
                 ];
-                
-                tx_update.instruction_accounts.iter()
+
+                tx_update
+                    .instruction_accounts
+                    .iter()
                     .skip(5) // Skip known accounts: Global, Fee, Mint, Bonding, AssocBonding
                     .find(|acc| acc.is_on_curve() && !known_to_skip.contains(acc))
                     .copied()
@@ -499,7 +509,7 @@ impl GeyserPoolDiscovery {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        
+
         Some(PoolDiscoveryEvent {
             pool_address,
             dex_type,

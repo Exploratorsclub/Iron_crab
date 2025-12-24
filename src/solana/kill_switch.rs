@@ -1,14 +1,14 @@
 //! Kill Switch Monitor - Geyser-based emergency exit triggers
-//! 
+//!
 //! Monitors token transactions for positions and triggers emergency exits on:
 //! 1. Dev/Creator Sell - immediate 100% exit
 //! 2. Sell Burst - >N sells of >X SOL within Y slots
 //! 3. Flow Kippunkt - buy/sell ratio drops below threshold or N consecutive negative flow slots
 
+use parking_lot::RwLock;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
 /// Trade event from Geyser
@@ -25,10 +25,22 @@ pub struct TokenTradeEvent {
 /// Kill switch trigger reason
 #[derive(Debug, Clone, PartialEq)]
 pub enum KillSwitchReason {
-    DevSell { dev_address: String, sol_amount: f64 },
-    SellBurst { sell_count: u32, total_sol: f64, slots: u64 },
-    FlowRatio { ratio: f64, threshold: f64 },
-    NegativeFlow { consecutive_slots: u64 },
+    DevSell {
+        dev_address: String,
+        sol_amount: f64,
+    },
+    SellBurst {
+        sell_count: u32,
+        total_sol: f64,
+        slots: u64,
+    },
+    FlowRatio {
+        ratio: f64,
+        threshold: f64,
+    },
+    NegativeFlow {
+        consecutive_slots: u64,
+    },
 }
 
 /// Per-token flow tracking
@@ -53,20 +65,21 @@ impl TokenFlowState {
             last_slot: 0,
         }
     }
-    
+
     /// Add a trade and update flow state
     fn add_trade(&mut self, slot: u64, is_buy: bool, sol_amount: f64, trader: Pubkey) {
         // Add to recent trades
-        self.recent_trades.push_back((slot, is_buy, sol_amount, trader));
-        
+        self.recent_trades
+            .push_back((slot, is_buy, sol_amount, trader));
+
         // Keep only last 100 trades
         while self.recent_trades.len() > 100 {
             self.recent_trades.pop_front();
         }
-        
+
         // Update slot flow
         let flow = if is_buy { sol_amount } else { -sol_amount };
-        
+
         if let Some((last_slot, last_flow)) = self.slot_flows.back_mut() {
             if *last_slot == slot {
                 *last_flow += flow;
@@ -76,12 +89,12 @@ impl TokenFlowState {
         } else {
             self.slot_flows.push_back((slot, flow));
         }
-        
+
         // Keep only last 20 slots
         while self.slot_flows.len() > 20 {
             self.slot_flows.pop_front();
         }
-        
+
         self.last_slot = slot;
     }
 }
@@ -90,7 +103,7 @@ impl TokenFlowState {
 pub struct KillSwitchMonitor {
     /// Per-token flow state
     token_states: Arc<RwLock<HashMap<Pubkey, TokenFlowState>>>,
-    
+
     // Configuration
     dev_sell_enabled: bool,
     sell_burst_count: u32,
@@ -119,7 +132,7 @@ impl KillSwitchMonitor {
             negative_flow_slots: negative_flow_slots.unwrap_or(3),
         }
     }
-    
+
     /// Register a new position to monitor
     pub fn register_position(&self, mint: Pubkey, creator: Option<Pubkey>) {
         let mut states = self.token_states.write();
@@ -128,7 +141,7 @@ impl KillSwitchMonitor {
             states.insert(mint, TokenFlowState::new(creator));
         }
     }
-    
+
     /// Unregister a position (after exit)
     pub fn unregister_position(&self, mint: &Pubkey) {
         let mut states = self.token_states.write();
@@ -136,21 +149,21 @@ impl KillSwitchMonitor {
             debug!(mint=%mint, "kill_switch: unregistered position");
         }
     }
-    
+
     /// Process a trade event and check for kill switch triggers
     pub fn process_trade(&self, event: TokenTradeEvent) -> Option<KillSwitchReason> {
         let mut states = self.token_states.write();
-        
+
         let state = match states.get_mut(&event.mint) {
             Some(s) => s,
             None => return None, // Not monitoring this token
         };
-        
+
         // Add trade to state
         state.add_trade(event.slot, event.is_buy, event.sol_amount, event.trader);
-        
+
         // Check kill switch conditions
-        
+
         // 1. Dev/Creator Sell
         if self.dev_sell_enabled && !event.is_buy {
             if let Some(creator) = &state.creator {
@@ -168,16 +181,20 @@ impl KillSwitchMonitor {
                 }
             }
         }
-        
+
         // 2. Sell Burst
         if !event.is_buy {
             let current_slot = event.slot;
             let min_slot = current_slot.saturating_sub(self.sell_burst_slots);
-            
-            let (sell_count, total_sol): (u32, f64) = state.recent_trades.iter()
+
+            let (sell_count, total_sol): (u32, f64) = state
+                .recent_trades
+                .iter()
                 .filter(|(slot, is_buy, _, _)| *slot >= min_slot && !is_buy)
-                .fold((0, 0.0), |(count, sol), (_, _, amount, _)| (count + 1, sol + amount));
-            
+                .fold((0, 0.0), |(count, sol), (_, _, amount, _)| {
+                    (count + 1, sol + amount)
+                });
+
             if sell_count >= self.sell_burst_count && total_sol >= self.sell_burst_sol {
                 warn!(
                     mint=%event.mint,
@@ -193,17 +210,20 @@ impl KillSwitchMonitor {
                 });
             }
         }
-        
+
         // 3. Flow Ratio (buy/sell ratio)
-        let (total_buys, total_sells): (f64, f64) = state.recent_trades.iter()
-            .fold((0.0, 0.0), |(buys, sells), (_, is_buy, sol, _)| {
-                if *is_buy {
-                    (buys + sol, sells)
-                } else {
-                    (buys, sells + sol)
-                }
-            });
-        
+        let (total_buys, total_sells): (f64, f64) =
+            state
+                .recent_trades
+                .iter()
+                .fold((0.0, 0.0), |(buys, sells), (_, is_buy, sol, _)| {
+                    if *is_buy {
+                        (buys + sol, sells)
+                    } else {
+                        (buys, sells + sol)
+                    }
+                });
+
         if total_sells > 0.0 {
             let ratio = total_buys / total_sells;
             if ratio < self.flow_ratio_min && total_sells > 0.1 {
@@ -222,19 +242,19 @@ impl KillSwitchMonitor {
                 });
             }
         }
-        
+
         // 4. Consecutive Negative Flow Slots
         if state.slot_flows.len() >= self.negative_flow_slots as usize {
-            let recent_slots: Vec<_> = state.slot_flows.iter()
+            let recent_slots: Vec<_> = state
+                .slot_flows
+                .iter()
                 .rev()
                 .take(self.negative_flow_slots as usize)
                 .collect();
-            
+
             let all_negative = recent_slots.iter().all(|(_, flow)| *flow < 0.0);
-            let total_negative: f64 = recent_slots.iter()
-                .map(|(_, flow)| flow.abs())
-                .sum();
-            
+            let total_negative: f64 = recent_slots.iter().map(|(_, flow)| flow.abs()).sum();
+
             if all_negative && total_negative > 0.1 {
                 // Only trigger if significant volume
                 warn!(
@@ -248,15 +268,15 @@ impl KillSwitchMonitor {
                 });
             }
         }
-        
+
         None
     }
-    
+
     /// Get all monitored mints
     pub fn get_monitored_mints(&self) -> Vec<Pubkey> {
         self.token_states.read().keys().cloned().collect()
     }
-    
+
     /// Check if a mint is being monitored
     pub fn is_monitoring(&self, mint: &Pubkey) -> bool {
         self.token_states.read().contains_key(mint)
@@ -267,17 +287,17 @@ impl KillSwitchMonitor {
 mod tests {
     use super::*;
     use solana_sdk::pubkey;
-    
+
     #[test]
     fn test_dev_sell_detection() {
         let monitor = KillSwitchMonitor::new(true, Some(3), Some(0.5), Some(5), Some(0.6), Some(3));
-        
+
         let mint = pubkey!("TokenMint1111111111111111111111111111111111");
         let dev = pubkey!("DevWallet111111111111111111111111111111111");
         let random_trader = pubkey!("RandomTrader11111111111111111111111111111");
-        
+
         monitor.register_position(mint, Some(dev));
-        
+
         // Random trader sell - no trigger
         let event = TokenTradeEvent {
             mint,
@@ -288,7 +308,7 @@ mod tests {
             timestamp: 0,
         };
         assert!(monitor.process_trade(event).is_none());
-        
+
         // Dev sell - should trigger
         let event = TokenTradeEvent {
             mint,
@@ -301,16 +321,17 @@ mod tests {
         let result = monitor.process_trade(event);
         assert!(matches!(result, Some(KillSwitchReason::DevSell { .. })));
     }
-    
+
     #[test]
     fn test_sell_burst_detection() {
-        let monitor = KillSwitchMonitor::new(false, Some(3), Some(0.5), Some(5), Some(0.6), Some(3));
-        
+        let monitor =
+            KillSwitchMonitor::new(false, Some(3), Some(0.5), Some(5), Some(0.6), Some(3));
+
         let mint = pubkey!("TokenMint1111111111111111111111111111111111");
         let trader = pubkey!("RandomTrader11111111111111111111111111111");
-        
+
         monitor.register_position(mint, None);
-        
+
         // 3 sells of 0.2 SOL each within 5 slots = 0.6 SOL > 0.5 threshold
         for i in 0..3 {
             let event = TokenTradeEvent {

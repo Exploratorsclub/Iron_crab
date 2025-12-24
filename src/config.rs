@@ -302,7 +302,7 @@ pub struct SniperSettings {
     pub pumpfun_buy_slippage_bps: Option<u32>, // Minimum slippage for Pump.fun buys (default: 2500 = 25%)
     #[serde(default)]
     pub emergency_exit_slippage_bps: Option<u32>, // Slippage for stop-loss/emergency exits (default: 5000 = 50%)
-    
+
     // === TIME-BASED EXIT STRATEGY ===
     #[serde(default)]
     pub enable_time_based_exits: Option<bool>, // Enable time-based exits instead of price-based
@@ -310,7 +310,7 @@ pub struct SniperSettings {
     pub max_hold_secs: Option<u64>, // Maximum hold time before forced exit (default: 90)
     #[serde(default)]
     pub timed_exit_tiers: Option<Vec<TimedExitTier>>, // Timed exit tiers [{secs, fraction}]
-    
+
     // === KILL SWITCHES (Geyser-based, override all other logic) ===
     #[serde(default)]
     pub kill_switch_enabled: Option<bool>, // Enable kill switch monitoring
@@ -326,7 +326,7 @@ pub struct SniperSettings {
     pub kill_switch_flow_ratio_min: Option<f64>, // Min buy/sell ratio before exit (e.g., 0.6)
     #[serde(default)]
     pub kill_switch_negative_flow_slots: Option<u64>, // Consecutive negative flow slots to exit (e.g., 3)
-    
+
     // === JITO BUNDLE INTEGRATION ===
     #[serde(default)]
     pub jito_enabled: Option<bool>, // Enable Jito bundle submission for exits
@@ -342,7 +342,7 @@ pub struct SniperSettings {
     pub jito_for_emergency: Option<bool>, // Always use Jito for emergency/panic exits (default: true)
     #[serde(default)]
     pub jito_for_final_exit: Option<bool>, // Always use Jito for 100% full exits (default: true)
-    
+
     // === PARALLEL EXIT EXECUTION ===
     #[serde(default)]
     pub parallel_exits: Option<bool>, // Execute multiple exits concurrently (default: true)
