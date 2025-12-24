@@ -781,19 +781,24 @@ impl PumpFunDex {
         let (associated_bonding_curve, _bump2) =
             self.derive_associated_bonding_curve(&bonding_curve, &token_mint);
 
-        // Try to fetch bonding curve to get creator
-        let creator = if let Some(state) = self.fetch_bonding_curve_fast(&bonding_curve).await {
-            state.creator
-        } else if let Some(fallback) = fallback_creator {
-            // Use fallback creator from Geyser event for fresh launches
-            warn!(
-                token_mint = %token_mint_str,
-                fallback_creator = %fallback,
-                "Using fallback creator for swap instruction (bonding curve not indexed yet)"
-            );
-            fallback
-        } else {
-            return Err(anyhow!("Cannot build swap: bonding curve not found and no fallback creator provided"));
+        // CRITICAL: Creator MUST come from Geyser event (trusted source).
+        // The bonding curve layout changed (81 -> 154 bytes) and creator field is at wrong offset.
+        // DO NOT attempt to parse creator from bonding curve - it will fail!
+        let creator = match fallback_creator {
+            Some(c) => {
+                info!(
+                    token_mint = %token_mint_str,
+                    creator = %c,
+                    "pump.fun: using creator from Geyser event"
+                );
+                c
+            }
+            None => {
+                return Err(anyhow!(
+                    "Cannot build Pump.fun swap: creator not provided. \
+                    Bonding curve parsing is disabled due to layout change."
+                ));
+            }
         };
 
         let user = self

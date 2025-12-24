@@ -295,6 +295,7 @@ struct ExitTask {
     fraction: f64,
     is_emergency: bool,
     reason: String,
+    creator: Option<Pubkey>, // Token creator for Pump.fun exits
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2229,7 +2230,7 @@ impl SniperEngine {
                         info!(mint=%mint, sig=%sig, lamports_in, expected_out=pumpfun_quote_out, liq_sol, "sniper: initial buy submitted (pump.fun)");
                         let sol_in = lamports_in as f64 / 1e9;
                         // NOTE: Position is only created in finalize_fill if tokens actually arrive
-                        self.finalize_fill(*mint, sol_in).await;
+                        self.finalize_fill(*mint, sol_in, creator).await;
 
                         // Record pending trade for reconciliation
                         {
@@ -2265,7 +2266,7 @@ impl SniperEngine {
                             if pm.expected_out > 0 {
                                 let sol_in = lamports_in as f64 / 1e9;
                                 // NOTE: Position is only created in finalize_fill if tokens actually arrive
-                                self.finalize_fill(*mint, sol_in).await;
+                                self.finalize_fill(*mint, sol_in, None).await; // Raydium: no creator needed
                             }
 
                             // Record pending trade
@@ -2302,7 +2303,7 @@ impl SniperEngine {
                         info!(mint=%mint, sig=%sig, lamports_in, expected_out=orca_quote_out, liq_sol, "sniper: initial buy submitted (orca)");
                         let sol_in = lamports_in as f64 / 1e9;
                         // NOTE: Position is only created in finalize_fill if tokens actually arrive
-                        self.finalize_fill(*mint, sol_in).await;
+                        self.finalize_fill(*mint, sol_in, None).await; // Orca: no creator needed
 
                         record_network_fee(fee_estimate);
                         let line = format!(
@@ -2336,7 +2337,7 @@ impl SniperEngine {
                     warn!(mint=%mint, "sniper: buy TX confirmation timeout - TX was SENT, checking if tokens arrived");
                     // Try to finalize the fill - position will only be created if tokens actually arrived
                     let sol_in = lamports_in as f64 / 1e9;
-                    self.finalize_fill(*mint, sol_in).await;
+                    self.finalize_fill(*mint, sol_in, creator).await; // Pass creator in case it's Pump.fun
                     self.purchased.write().insert(*mint);
                     // Don't return error - we attempted to register the position
                     return Ok(());
@@ -2546,7 +2547,8 @@ impl SniperEngine {
     /// Finalize a fill by checking token balance and creating/updating position.
     /// Only creates position if tokens actually arrived (no more ghost positions).
     /// invested_sol: The SOL amount that was spent on this buy
-    async fn finalize_fill(&self, mint: Pubkey, invested_sol: f64) {
+    /// creator: Optional creator pubkey (for Pump.fun tokens, used in exit path)
+    async fn finalize_fill(&self, mint: Pubkey, invested_sol: f64, creator: Option<Pubkey>) {
         info!(mint=%mint, invested_sol=invested_sol, "finalize_fill: STARTING position finalization");
         self.risk_reset_if_needed(); // Reset daily counters if new day
         let owner = self.treasury.pubkey();
@@ -2642,7 +2644,7 @@ impl SniperEngine {
                     executed_tp_bps: Vec::new(),
                     peak_pnl_bps: 0,
                     executed_timed_tiers: Vec::new(),
-                    creator: None, // TODO: Get creator from buy event
+                    creator: creator.map(|c| c.to_string()), // Store creator for exit path (Pump.fun)
                 };
                 rs.open.entry(mint).or_default().push(lot);
                 
@@ -2652,7 +2654,7 @@ impl SniperEngine {
                 
                 // Register with kill switch monitor if enabled (no lock needed)
                 if let Some(ks) = &self.kill_switch {
-                    ks.register_position(mint, None); // TODO: Pass creator pubkey
+                    ks.register_position(mint, creator); // Pass creator for dev-sell detection
                 }
                 
                 OPEN_POSITIONS_GAUGE.store(lots as u64, std::sync::atomic::Ordering::Relaxed);
@@ -3079,6 +3081,8 @@ impl SniperEngine {
                             "TIME-BASED EXIT triggered"
                         );
                         let is_full_exit = time_fraction >= 0.99;
+                        // Get creator from position for Pump.fun exit path
+                        let creator_pk = pos.creator.as_ref().and_then(|s| Pubkey::from_str(s).ok());
                         exit_tasks.push(ExitTask {
                             mint,
                             lot_idx,
@@ -3086,6 +3090,7 @@ impl SniperEngine {
                             fraction: time_fraction,
                             is_emergency: is_full_exit,
                             reason: time_exit_reason.clone(),
+                            creator: creator_pk,
                         });
                     }
                     continue; // Skip price-based evaluation for this position
@@ -3245,6 +3250,8 @@ impl SniperEngine {
                     } else {
                         format!("TAKE_PROFIT ({}bps)", pnl_bps)
                     };
+                    // Get creator from position for Pump.fun exit path
+                    let creator_pk = pos.creator.as_ref().and_then(|s| Pubkey::from_str(s).ok());
                     exit_tasks.push(ExitTask {
                         mint,
                         lot_idx,
@@ -3252,6 +3259,7 @@ impl SniperEngine {
                         fraction,
                         is_emergency: stop_trigger || full_exit,
                         reason,
+                        creator: creator_pk,
                     });
                 }
             }
@@ -3273,7 +3281,7 @@ impl SniperEngine {
                 // Execute exits sequentially (legacy behavior)
                 for task in exit_tasks {
                     if let Err(e) = self
-                        .attempt_exit(&task.mint, task.lot_idx, task.sell_tokens, task.fraction, task.is_emergency)
+                        .attempt_exit(&task.mint, task.lot_idx, task.sell_tokens, task.fraction, task.is_emergency, task.creator)
                         .await
                     {
                         warn!(?e, mint=%task.mint, reason=%task.reason, "exit tx failed");
@@ -3333,6 +3341,7 @@ impl SniperEngine {
                         task_clone.sell_tokens,
                         task_clone.fraction,
                         task_clone.is_emergency,
+                        task_clone.creator,
                     )
                     .await;
                 let elapsed_ms = start.elapsed().as_millis();
@@ -3406,6 +3415,7 @@ impl SniperEngine {
         amount_tokens: u64,
         fraction: f64,
         is_emergency_exit: bool, // Stop-loss or full exit - use higher slippage
+        creator: Option<Pubkey>, // Token creator for Pump.fun exits (avoids bonding curve parsing issues)
     ) -> Result<()> {
         let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
         // Determine actual token balance (ATA) to avoid over-selling
@@ -3633,26 +3643,43 @@ impl SniperEngine {
                     .await
                     .unwrap_or_default();
 
-                // Fetch bonding curve state to get creator (required for new protocol)
-                if let Some(state) = pf.fetch_bonding_curve_fast(&bonding_curve).await {
-                    match pf.build_sell_ix(
-                        &mint_pk,
-                        &bonding_curve,
-                        &associated_bonding_curve,
-                        &user_token_account,
-                        &state.creator, // Pass creator from bonding curve state
-                        sell_tokens,
-                        min_out,
-                    ) {
-                        Ok(ix) => {
-                            tx_ixs = vec![ix];
-                        }
-                        Err(e) => {
-                            warn!(?e, mint=%mint, "pump.fun build_sell_ix failed");
-                        }
+                // CRITICAL: Creator MUST come from stored position data.
+                // Bonding curve parsing is DISABLED - layout changed and creator field is wrong.
+                let sell_creator = match creator {
+                    Some(c) => {
+                        info!(mint=%mint, creator=%c, "pump.fun exit: using stored creator from position");
+                        c
                     }
-                } else {
-                    warn!(mint=%mint, bonding_curve=%bonding_curve, "pump.fun: could not fetch bonding curve for sell");
+                    None => {
+                        // This should not happen for positions created after the fix.
+                        // For old positions without creator, we cannot sell via Pump.fun.
+                        error!(
+                            mint=%mint,
+                            "pump.fun exit FAILED: no creator stored in position. \
+                            Position was created before creator tracking was implemented. \
+                            Use manual sell or wait for Raydium migration."
+                        );
+                        return Err(anyhow::anyhow!(
+                            "pump.fun sell failed: no creator stored. Position predates creator tracking."
+                        ));
+                    }
+                };
+
+                match pf.build_sell_ix(
+                    &mint_pk,
+                    &bonding_curve,
+                    &associated_bonding_curve,
+                    &user_token_account,
+                    &sell_creator,
+                    sell_tokens,
+                    min_out,
+                ) {
+                    Ok(ix) => {
+                        tx_ixs = vec![ix];
+                    }
+                    Err(e) => {
+                        warn!(?e, mint=%mint, "pump.fun build_sell_ix failed");
+                    }
                 }
             }
         } else if chosen_dex == ChosenDex::Raydium {
@@ -4153,13 +4180,14 @@ impl SniperEngine {
                                     "attempt_exit: dust detected after full exit, sweeping"
                                 );
                                 // Try to sell the dust - ignore errors as it's best-effort
-                                // Signature: attempt_exit(mint, lot_idx, amount_tokens, fraction, is_emergency)
+                                // Signature: attempt_exit(mint, lot_idx, amount_tokens, fraction, is_emergency, creator)
                                 let _ = Box::pin(self.attempt_exit(
                                     mint,
                                     lot_idx,
                                     remaining,
                                     1.0,
                                     true, // is_emergency to use high slippage
+                                    creator, // pass through creator for dust sweep
                                 )).await;
                             }
                         }
@@ -4240,7 +4268,8 @@ impl SniperEngine {
                             PENDING_RECONCILIATIONS_TOTAL
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let invested_sol = p.lamports_in as f64 / 1e9;
-                            self.finalize_fill(*mint, invested_sol).await;
+                            // Note: creator not available in reconciliation path (position already created)
+                            self.finalize_fill(*mint, invested_sol, None).await;
                             // If still present and older than half cutoff without realized fill treat as failed
                             let mut rs = self.risk.write();
                             if let Some(persist) = rs.pending.get(mint) {

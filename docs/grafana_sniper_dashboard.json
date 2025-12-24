@@ -123,7 +123,7 @@
         "refId": "A",
         "type": "json",
         "source": "url",
-        "url": "http://localhost:9091/trades",
+        "url": "http://localhost:9898/trades",
         "root_selector": "",
         "columns": [
           { "selector": "timestamp_ms", "text": "Time", "type": "timestamp_epoch_s" },
