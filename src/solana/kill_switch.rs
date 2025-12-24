@@ -136,10 +136,10 @@ impl KillSwitchMonitor {
     /// Register a new position to monitor
     pub fn register_position(&self, mint: Pubkey, creator: Option<Pubkey>) {
         let mut states = self.token_states.write();
-        if !states.contains_key(&mint) {
+        states.entry(mint).or_insert_with(|| {
             info!(mint=%mint, creator=?creator, "kill_switch: registered new position for monitoring");
-            states.insert(mint, TokenFlowState::new(creator));
-        }
+            TokenFlowState::new(creator)
+        });
     }
 
     /// Unregister a position (after exit)
@@ -154,10 +154,7 @@ impl KillSwitchMonitor {
     pub fn process_trade(&self, event: TokenTradeEvent) -> Option<KillSwitchReason> {
         let mut states = self.token_states.write();
 
-        let state = match states.get_mut(&event.mint) {
-            Some(s) => s,
-            None => return None, // Not monitoring this token
-        };
+        let state = states.get_mut(&event.mint)?;
 
         // Add trade to state
         state.add_trade(event.slot, event.is_buy, event.sol_amount, event.trader);

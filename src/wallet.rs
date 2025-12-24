@@ -476,7 +476,7 @@ impl Treasury {
         let mut ixs = Vec::new();
 
         // Check if ATA exists and verify it's owned by classic SPL Token
-        let ata_exists = match rpc.rpc.get_account(&ata).await {
+        let _ata_exists = match rpc.rpc.get_account(&ata).await {
             Ok(acc) => {
                 if acc.owner != spl_token_sdk {
                     // WSOL ATA exists but has wrong owner (shouldn't happen, but handle it)
@@ -574,7 +574,7 @@ impl Treasury {
     pub async fn unwrap_wsol(
         &self,
         rpc: &SolanaRpc,
-        recipient: Option<SdkPubkey>,
+        _recipient: Option<SdkPubkey>,
     ) -> Result<Signature> {
         let wsol_mint_sdk = SdkPubkey::new_from_array(spl_token::native_mint::id().to_bytes());
         let owner = self.pubkey();

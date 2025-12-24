@@ -41,3 +41,9 @@ state/
 trade_logs/
 orca_reserves.db
 *.db
+
+# Debug/analysis scripts (not part of project)
+analyze_tx.py
+verify_vault.py
+verify_pda.py
+tests/verify_creator_vault.rs

@@ -195,7 +195,7 @@ impl JitoClient {
     }
 
     /// Create with default settings (Frankfurt, 10k lamports tip)
-    pub fn default() -> Self {
+    pub fn with_defaults() -> Self {
         Self::new(vec![JitoRegion::Frankfurt], 10_000)
     }
 

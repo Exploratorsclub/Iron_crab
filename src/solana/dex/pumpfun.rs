@@ -875,16 +875,3 @@ impl PumpFunDex {
         Ok(vec![ix])
     }
 }
-
-// Missing sysvar module, add this
-mod sysvar {
-    pub mod rent {
-        use solana_sdk::pubkey::Pubkey;
-        use std::str::FromStr;
-
-        pub fn id() -> Pubkey {
-            Pubkey::from_str("SysvarRent111111111111111111111111111111111")
-                .expect("valid rent sysvar")
-        }
-    }
-}
