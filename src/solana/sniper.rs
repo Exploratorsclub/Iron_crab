@@ -4378,7 +4378,8 @@ impl SniperEngine {
                         "invested_sol": lot.invested_sol,
                         "token_decimals": lot.token_decimals,
                         "last_unrealized_pnl_sol": lot.last_unrealized_pnl_sol,
-                        "opened_ts": lot.opened_ts
+                        "opened_ts": lot.opened_ts,
+                        "creator": lot.creator.as_ref().map(|c| c.to_string())
                     })
                 })
             })
@@ -4453,6 +4454,12 @@ impl SniperEngine {
                                     .unwrap_or(0.0);
                                 let opened_ts =
                                     ent.get("opened_ts").and_then(|f| f.as_i64()).unwrap_or(0);
+                                // Load creator from persisted state
+                                let creator_opt = ent
+                                    .get("creator")
+                                    .and_then(|c| c.as_str())
+                                    .and_then(|s| s.parse::<Pubkey>().ok())
+                                    .map(|p| p.to_string());
                                 rs.open.entry(pk).or_default().push(PositionLot {
                                     entry_price_sol: entry_price,
                                     amount_tokens,
@@ -4463,7 +4470,7 @@ impl SniperEngine {
                                     executed_tp_bps: Vec::new(),
                                     peak_pnl_bps: 0,
                                     executed_timed_tiers: Vec::new(),
-                                    creator: None,
+                                    creator: creator_opt,
                                 });
                             }
                         }
