@@ -8,7 +8,7 @@
     {
       "type": "stat",
       "title": "Open Positions",
-      "targets": [{ "expr": "open_positions_gauge", "refId": "A" }],
+      "targets": [{ "expr": "open_positions", "refId": "A" }],
       "gridPos": {"h":4,"w":4,"x":0,"y":0},
       "fieldConfig": {
         "defaults": {
@@ -52,7 +52,7 @@
     {
       "type": "stat",
       "title": "Daily PnL (SOL)",
-      "targets": [{ "expr": "daily_realized_pnl_sol_micro / 1000000", "refId": "A" }],
+      "targets": [{ "expr": "daily_realized_pnl_sol", "refId": "A" }],
       "gridPos": {"h":4,"w":4,"x":12,"y":0},
       "fieldConfig": {
         "defaults": {
@@ -73,7 +73,7 @@
     {
       "type": "stat",
       "title": "Sharpe Ratio",
-      "targets": [{ "expr": "sharpe_ratio_micro / 1000000", "refId": "A" }],
+      "targets": [{ "expr": "ironcrab_sharpe_ratio", "refId": "A" }],
       "gridPos": {"h":4,"w":4,"x":16,"y":0},
       "fieldConfig": {
         "defaults": {
@@ -93,7 +93,7 @@
     {
       "type": "stat",
       "title": "Drawdown %",
-      "targets": [{ "expr": "drawdown_pct_micro / 10000", "refId": "A" }],
+      "targets": [{ "expr": "ironcrab_drawdown_pct", "refId": "A" }],
       "gridPos": {"h":4,"w":4,"x":20,"y":0},
       "fieldConfig": {
         "defaults": {
@@ -268,7 +268,7 @@
       "targets": [
         { "expr": "rpc_errors_total", "legendFormat": "RPC Errors", "refId": "A" },
         { "expr": "rpc_timeouts_total", "legendFormat": "Timeouts", "refId": "B" },
-        { "expr": "rpc_inflight_gauge", "legendFormat": "In-Flight", "refId": "C" }
+        { "expr": "rpc_inflight", "legendFormat": "In-Flight", "refId": "C" }
       ],
       "gridPos": {"h":8,"w":12,"x":0,"y":24}
     },
