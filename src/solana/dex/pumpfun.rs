@@ -410,8 +410,43 @@ impl PumpFunDex {
             "pump.fun: attempting to fetch bonding curve (with_fallback)"
         );
 
-        // Try to fetch bonding curve state with aggressive retry for sniping
-        // More retries with exponential backoff: 50ms, 100ms, 200ms, 400ms, 800ms, 1000ms, 1000ms, 1000ms = ~4.5s total
+        // OPTIMIZATION: For fresh Pump.fun launches via Geyser (use_fallback=true, buy_token=true),
+        // skip RPC entirely and use initial state directly. This saves ~4.5s of latency!
+        // The RPC is always behind Geyser for fresh launches anyway.
+        if use_fallback && buy_token && fallback_creator.is_some() {
+            let creator = fallback_creator.unwrap();
+            info!(
+                token_mint=%token_mint_str,
+                bonding_curve=%bonding_curve,
+                creator=%creator,
+                "pump.fun: ⚡ INSTANT INITIAL STATE - skipping RPC for fresh Geyser launch"
+            );
+            let state = Self::initial_bonding_curve_state(creator);
+            let amount_out = state.calculate_output(amount_in, buy_token);
+
+            info!(
+                token_mint=%token_mint_str,
+                amount_in,
+                amount_out,
+                virtual_sol=state.virtual_sol_reserves,
+                virtual_token=state.virtual_token_reserves,
+                "pump.fun: calculated swap output (instant initial state)"
+            );
+
+            return Ok(Some(Quote {
+                input_mint: input_mint.to_string(),
+                output_mint: output_mint.to_string(),
+                amount_out,
+                price_impact_bps: 0,
+                route: vec![bonding_curve.to_string()],
+                fee_bps: 100, // 1% Pump.fun fee
+                in_reserve: state.virtual_sol_reserves as u128,
+                out_reserve: state.virtual_token_reserves as u128,
+                tick_spacing: None,
+            }));
+        }
+
+        // For sells or non-fallback mode, try to fetch bonding curve state with retry
         const MAX_RETRIES: usize = 8;
         const INITIAL_DELAY_MS: u64 = 50;
         const MAX_DELAY_MS: u64 = 1000;

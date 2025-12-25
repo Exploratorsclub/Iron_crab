@@ -3114,9 +3114,8 @@ impl SniperEngine {
                     .await
                 {
                     quote_out = Some(q.amount_out);
-                } else {
-                    RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Note: Not counting as RPC error - token may simply not be on Raydium
             }
             if quote_out.is_none() {
                 if let Some(o) = &self.orca {
@@ -3125,9 +3124,8 @@ impl SniperEngine {
                         .await
                     {
                         quote_out = Some(q.amount_out);
-                    } else {
-                        RPC_ERRORS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
+                    // Note: Not counting as RPC error - token may simply not be on Orca
                 }
             }
             // Check Pump.fun if others failed (likely for new bonding curve tokens)
