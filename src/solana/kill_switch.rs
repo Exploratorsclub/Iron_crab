@@ -284,16 +284,15 @@ impl KillSwitchMonitor {
 mod tests {
     use super::*;
     use solana_sdk::pubkey::Pubkey;
-    use std::str::FromStr;
 
     #[test]
     fn test_dev_sell_detection() {
         let monitor = KillSwitchMonitor::new(true, Some(3), Some(0.5), Some(5), Some(0.6), Some(3));
 
-        // Use valid base58 pubkeys (32 bytes = 44 chars in base58)
-        let mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-        let dev = Pubkey::from_str("11111111111111111111111111111111").unwrap();
-        let random_trader = Pubkey::from_str("22222222222222222222222222222222").unwrap();
+        // Use valid pubkeys from byte arrays (32 bytes each)
+        let mint = Pubkey::new_from_array([1u8; 32]);
+        let dev = Pubkey::new_from_array([2u8; 32]);
+        let random_trader = Pubkey::new_from_array([3u8; 32]);
 
         monitor.register_position(mint, Some(dev));
 
@@ -326,9 +325,9 @@ mod tests {
         let monitor =
             KillSwitchMonitor::new(false, Some(3), Some(0.5), Some(5), Some(0.6), Some(3));
 
-        // Use valid base58 pubkeys
-        let mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-        let trader = Pubkey::from_str("33333333333333333333333333333333").unwrap();
+        // Use valid pubkeys from byte arrays
+        let mint = Pubkey::new_from_array([4u8; 32]);
+        let trader = Pubkey::new_from_array([5u8; 32]);
 
         monitor.register_position(mint, None);
 
