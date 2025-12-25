@@ -1,3 +1,0 @@
-# Cargo audit configuration
-[advisories]
-ignore = []
