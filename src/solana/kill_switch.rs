@@ -288,7 +288,8 @@ mod tests {
     #[test]
     fn test_dev_sell_detection() {
         // Disable flow ratio (set to 0.0) so we only test dev sell detection
-        let monitor = KillSwitchMonitor::new(true, Some(100), Some(100.0), Some(5), Some(0.0), Some(100));
+        let monitor =
+            KillSwitchMonitor::new(true, Some(100), Some(100.0), Some(5), Some(0.0), Some(100));
 
         // Use valid pubkeys from byte arrays (32 bytes each)
         let mint = Pubkey::new_from_array([1u8; 32]);
