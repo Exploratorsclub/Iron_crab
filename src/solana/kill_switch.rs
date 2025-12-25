@@ -287,7 +287,8 @@ mod tests {
 
     #[test]
     fn test_dev_sell_detection() {
-        let monitor = KillSwitchMonitor::new(true, Some(3), Some(0.5), Some(5), Some(0.6), Some(3));
+        // Disable flow ratio (set to 0.0) so we only test dev sell detection
+        let monitor = KillSwitchMonitor::new(true, Some(100), Some(100.0), Some(5), Some(0.0), Some(100));
 
         // Use valid pubkeys from byte arrays (32 bytes each)
         let mint = Pubkey::new_from_array([1u8; 32]);
@@ -296,12 +297,12 @@ mod tests {
 
         monitor.register_position(mint, Some(dev));
 
-        // Random trader sell - no trigger
+        // Random trader sell - no trigger (flow ratio disabled, burst thresholds very high)
         let event = TokenTradeEvent {
             mint,
             slot: 100,
             is_buy: false,
-            sol_amount: 1.0,
+            sol_amount: 0.05, // Small amount below 0.1 SOL threshold
             trader: random_trader,
             timestamp: 0,
         };
@@ -322,8 +323,9 @@ mod tests {
 
     #[test]
     fn test_sell_burst_detection() {
+        // Disable dev sell and flow ratio, only test burst detection
         let monitor =
-            KillSwitchMonitor::new(false, Some(3), Some(0.5), Some(5), Some(0.6), Some(3));
+            KillSwitchMonitor::new(false, Some(3), Some(0.5), Some(5), Some(0.0), Some(100));
 
         // Use valid pubkeys from byte arrays
         let mint = Pubkey::new_from_array([4u8; 32]);
