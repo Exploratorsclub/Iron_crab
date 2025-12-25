@@ -413,8 +413,7 @@ impl PumpFunDex {
         // OPTIMIZATION: For fresh Pump.fun launches via Geyser (use_fallback=true, buy_token=true),
         // skip RPC entirely and use initial state directly. This saves ~4.5s of latency!
         // The RPC is always behind Geyser for fresh launches anyway.
-        if use_fallback && buy_token && fallback_creator.is_some() {
-            let creator = fallback_creator.unwrap();
+        if let Some(creator) = fallback_creator.filter(|_| use_fallback && buy_token) {
             info!(
                 token_mint=%token_mint_str,
                 bonding_curve=%bonding_curve,
