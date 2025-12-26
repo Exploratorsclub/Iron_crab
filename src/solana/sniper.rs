@@ -748,21 +748,14 @@ impl SniperEngine {
                     max_retries: None,
                     min_context_slot: None,
                 };
+                // OPTIMIZATION: For sniper speed, just send TX and return signature immediately
+                // Don't wait for confirmation - finalize_fill will verify tokens arrived
+                // This reduces latency from ~20s (Finalized) to ~100ms
                 match self.rpc.rpc.send_transaction_with_config(tx, config).await {
-                    Ok(sig) => match self.rpc.rpc.confirm_transaction(&sig).await {
-                        Ok(true) => Ok(sig),
-                        Ok(false) => {
-                            // TX was SENT successfully - return sig even if confirmation timed out
-                            // The TX is likely on-chain, just confirmation was slow
-                            warn!(sig=%sig, "TX sent but confirmation timed out - returning sig anyway");
-                            Ok(sig)
-                        }
-                        Err(e) => {
-                            // Confirmation RPC error, but TX was sent - return sig
-                            warn!(sig=%sig, error=?e, "TX sent but confirmation RPC error - returning sig anyway");
-                            Ok(sig)
-                        }
-                    },
+                    Ok(sig) => {
+                        info!(sig=%sig, "TX sent successfully (skip confirmation for speed)");
+                        Ok(sig)
+                    }
                     Err(e) => Err(e.into()),
                 }
             } else {
