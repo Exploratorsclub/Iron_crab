@@ -4045,7 +4045,16 @@ impl SniperEngine {
                 let dur = sent_at.elapsed();
                 record_swap_latency(dur.as_nanos() as u64);
                 info!(mint=%mint, sig=%sig, amount_tokens=sell_tokens, "exit trade submitted");
-                // Read WSOL ATA after swap before unwrap
+
+                // Wait a moment for balance to update
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                // Measure native SOL balance change (Pump.fun returns native SOL, not WSOL!)
+                let post_native_lamports =
+                    self.rpc.get_balance_retry(&owner_sdk).await.unwrap_or(0);
+                let pre_native_lamports = (pre_balance * 1e9) as u64;
+
+                // Also check WSOL in case DEX returns WSOL (Raydium/Orca)
                 let post_wsol_amount: u64 =
                     if let Ok(acc) = self.rpc.get_account_retry(&wsol_ata).await {
                         if acc.data.len() >= 72 {
@@ -4056,20 +4065,25 @@ impl SniperEngine {
                     } else {
                         0
                     };
-                let delta_wsol = post_wsol_amount.saturating_sub(pre_wsol_amount) as f64 / 1e9;
-                // Fetch recent block fee estimation via meta fallback (if any) else approximate by difference in native balance delta
-                let post_native =
-                    self.rpc.get_balance_retry(&owner_sdk).await.unwrap_or(0) as f64 / 1e9;
-                let native_delta =
-                    (post_native - (pre_balance - (pre_wsol_amount as f64 / 1e9))).max(0.0); // approximate, excludes wsol tokens
-                                                                                             // Assume fee ~ native_delta decrease unrelated to proceeds (if negative) ignore
-                let fee_est_native = fee_estimate as f64 / 1e9;
-                let fee_est = if native_delta < 0.0 {
-                    -native_delta.max(fee_est_native)
+                let delta_wsol_lamports = post_wsol_amount.saturating_sub(pre_wsol_amount);
+
+                // Native SOL delta (subtract fee estimate to get actual proceeds)
+                let native_change = post_native_lamports as i64 - pre_native_lamports as i64;
+                // If native increased, that's our proceeds (Pump.fun case)
+                // Fee was already deducted from native balance
+                let delta_native_lamports = if native_change > 0 {
+                    native_change as u64
                 } else {
-                    fee_est_native
-                }; // prefer RPC reported fee_estimate
-                let realized = delta_wsol - invested_sol_lot * fraction - fee_est; // proportional share of invested capital sold
+                    0
+                };
+
+                // Use whichever is greater: native SOL increase or WSOL increase
+                let proceeds_lamports = delta_native_lamports.max(delta_wsol_lamports);
+                let delta_sol = proceeds_lamports as f64 / 1e9;
+
+                // Fee estimation
+                let fee_est = fee_estimate as f64 / 1e9;
+                let realized = delta_sol - invested_sol_lot * fraction - fee_est; // proportional share of invested capital sold
                 let trade_ret = if invested_sol_lot > 0.0 {
                     realized / (invested_sol_lot * fraction.max(1e-9))
                 } else {
@@ -4146,7 +4160,7 @@ impl SniperEngine {
                 // Unwrap afterwards outside lock
                 let _ = self.treasury.unwrap_wsol(&self.rpc, None).await;
                 // Trade CSV log (SELL)
-                let lamports_out = (delta_wsol * 1e9) as u64; // proceeds
+                let lamports_out = proceeds_lamports; // proceeds in lamports
                 record_network_fee(fee_estimate);
                 // Record fee percent vs notional and gross/net realized PnL
                 let notional = invested_sol_lot * fraction;
@@ -4154,7 +4168,7 @@ impl SniperEngine {
                     let fee_pct = (fee_estimate as f64 / 1e9) / notional;
                     record_fee_pct(fee_pct.max(0.0));
                 }
-                let gross = delta_wsol - notional; // proceeds minus cost basis slice
+                let gross = delta_sol - notional; // proceeds minus cost basis slice
                 let net = gross - (fee_estimate as f64 / 1e9);
                 record_realized_gross_net(gross, net);
                 // Also record absolute realized PnL (SOL) histogram using net
@@ -4177,7 +4191,7 @@ impl SniperEngine {
                     tx_hash: sig.to_string(),
                     amount_tokens: sell_tokens as f64,
                     price_sol: if sell_tokens > 0 {
-                        delta_wsol / (sell_tokens as f64)
+                        delta_sol / (sell_tokens as f64)
                     } else {
                         0.0
                     },
