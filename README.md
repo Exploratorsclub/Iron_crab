@@ -53,11 +53,20 @@ Core
 DEX & Routing
 - Raydium: Pool Scan, Quotes, Swap Plan (Compute Budget), Full Swap IX
 - Orca Whirlpool: Strukturierter Parser, Fee Tier Accounts, Swap IX Builder (Tick Arrays + Oracle PDAs)
+- Pump.fun: Bonding Curve Detection, Buy/Sell via Transaction Subscription
 - Routing: Single-Hop + Depth‑2/3 Multi-Hop (finales globales min_out)
- - Arbitrage Auto‑Discovery: Optionaler Discovery‑Loop (Raydium + Orca) filtert liquide Paare und füttert den Scanner (Modus: CSV‑only oder Full‑Auto)
+- Arbitrage Engine: Triangular Cycle Detection (A→B→C→A), Net Profit Filter, Atomic TX Plans
+- Arbitrage Auto‑Discovery: Optionaler Discovery‑Loop (Raydium + Orca) filtert liquide Paare und füttert den Scanner (Modus: CSV‑only oder Full‑Auto)
+- Jito Bundle Integration: Atomare Arbitrage TXs zur Vermeidung von Frontrunning (Feature: `jito`)
+
+Geyser gRPC (Low-Latency Data)
+- Pool Discovery: Geyser-basierte Pool-Erkennung für Raydium, Orca, Pump.fun (<10ms vs ~400ms RPC)
+- Transaction Subscription: Pump.fun CREATE Instruction Detection via Discriminator Check
+- ATA Confirmation: Dynamische Subscription für spezifische ATAs (nicht gesamtes Token Program)
+- Kill Switch: Echtzeit Dev-Sell Detection, Sell-Burst Monitoring, Negative Flow Detection
 
 Sniper & Risk
-- WS Log Subscription (Pool Create Events)
+- Geyser Pool Discovery (ersetzt WS Log Subscription)
 - WS Resilience: Subscribe-ACK Gating, Bounded Backpressure, Heartbeat/Staleness, Multi-Endpoint Failover, optionale Auth-Header
 - Heuristiken (Blacklist, Liquidity, FreezeAuth, Decimals Range)
 - SL/TP Evaluation (Stop-Loss / Take-Profit Trigger BPS)
@@ -74,6 +83,9 @@ Sniper & Risk
 	 - Watcher Feature (`--features notify_watch`) ersetzt 30s Polling
 	 - Unix: SIGHUP (`kill -HUP <pid>`) triggert sofortigen Reload
 - Multi-Lot Positions & Partielle Exits (TP Teilverkauf, SL Vollausstieg)
+- Zeitbasierte Exits: `max_hold_secs` für Zwangsverkauf, `timed_exit_tiers` für gestaffelte Teilverkäufe
+- Kill Switch: Automatischer Exit bei Dev-Sell, Sell-Burst oder negativem Flow (Geyser-basiert)
+- Jito Bundle Exits: Atomare Emergency-Exits mit konfigurierbaren Thresholds
 - Persistente Risk-State Snapshot (JSON) + Autosave
 - Graceful Shutdown (Snapshot Flush)
 
@@ -355,6 +367,9 @@ Die Sniper‑Konfiguration wurde um optionale Felder für gestaffelte Teilverkä
 - min_exit_notional_sol: Mindest‑Notional in SOL für einen Exit; kleine Restbeträge werden übersprungen.
 - pending_trade_ttl_secs: TTL in Sekunden; Pending Trades werden nach Ablauf bereinigt und per Reconciliation verifiziert.
 - exit_eval_interval_secs: Intervall (Sekunden) für die separate Exit‑Evaluation Task.
+- enable_time_based_exits: Aktiviert zeitbasierte Exits (Zwangsverkauf nach Haltezeit).
+- max_hold_secs: Maximale Haltezeit in Sekunden, danach 100% Exit.
+- timed_exit_tiers: Array gestaffelter Zeitaustritte `[{secs, fraction}]`.
 
 Beispiel (TOML):
 ```toml
@@ -368,6 +383,27 @@ take_profit_tiers = [
 trailing_stop_bps = 300
 min_exit_notional_sol = 0.02
 pending_trade_ttl_secs = 120
+
+# Zeitbasierte Exits
+enable_time_based_exits = true
+max_hold_secs = 90                # Zwangsverkauf nach 90 Sekunden
+timed_exit_tiers = [
+	{ secs = 30, fraction = 0.25 },  # Nach 30s: 25% verkaufen
+	{ secs = 60, fraction = 0.50 },  # Nach 60s: 50% verkaufen
+]
+
+# Kill Switch (Geyser-basiert)
+kill_switch_enabled = true
+kill_switch_dev_sell = true       # Exit bei Dev-Sell Detection
+kill_switch_sell_burst_count = 5  # Exit bei 5+ Sells
+kill_switch_sell_burst_sol = 10.0 # Exit bei >10 SOL Sell-Volumen
+kill_switch_flow_ratio_min = 0.3  # Exit wenn Buy/Sell Ratio < 0.3
+
+# Jito Bundle Exits
+jito_enabled = true
+jito_tip_lamports = 10000         # 0.00001 SOL Tip
+jito_for_emergency = true         # Immer Jito für Emergency Exits
+jito_min_exit_sol = 0.5           # Jito nur für Exits > 0.5 SOL
 ```
 
 Hinweise:
@@ -418,7 +454,9 @@ cargo run --bin raydium_pools -- --mint So11111111111111111111111111111111111111
 ## Hinweise / Roadmap Auszug
 - Siehe `docs/TASKS.md` für detaillierte Meilensteine
 - Nächste Schritte: Exakte Fee Aufschlüsselung (Protocol/Referral), zusätzliche Histograms (Absolute Realized PnL, Shortfall %), finalisiertes Grafana Dashboard
-- MEV/Jito Bundles & Adaptive Slippage geplant
+- ✅ Jito Bundle Integration implementiert (Feature `jito`)
+- ✅ Geyser gRPC Pool Discovery & Kill Switch implementiert
+- ✅ Zeitbasierte Exits implementiert
 
 ## Test Helpers
 Feature `test_helpers` stellt gezielte Methoden bereit (`test_insert_lot`, `test_simulate_partial_exit_with_fee`, Sharpe Abfragen) für deterministische Unit-/Integrationstests ohne Netzwerk‑Side‑Effects. Standardmäßig nicht im Release aktiv.
