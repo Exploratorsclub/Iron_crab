@@ -3839,26 +3839,7 @@ impl SniperEngine {
             }
         };
         let pre_balance = self.total_sol_balance().await.unwrap_or(0.0);
-        // Pre WSOL ATA amount (destination of swap proceeds)
-        let wsol_mint_prog = spl_token::native_mint::id();
-        let wsol_mint_sdk = solana_sdk::pubkey::Pubkey::new_from_array(wsol_mint_prog.to_bytes());
-        let (wsol_ata, _prog_wsol) = match self
-            .treasury
-            .ata_address(&self.rpc, &owner_sdk, &wsol_mint_sdk)
-            .await
-        {
-            Ok(v) => v,
-            Err(_) => (self.treasury.pubkey(), self.treasury.pubkey()),
-        };
-        let pre_wsol_amount: u64 = if let Ok(acc) = self.rpc.get_account_retry(&wsol_ata).await {
-            if acc.data.len() >= 72 {
-                u64::from_le_bytes(acc.data[64..72].try_into().unwrap())
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        // NOTE: We no longer need pre_wsol_amount - we use TX metadata for balance changes
 
         // === JITO DECISION LOGIC ===
         // Determine if this exit qualifies for Jito bundle submission:
@@ -4046,40 +4027,109 @@ impl SniperEngine {
                 record_swap_latency(dur.as_nanos() as u64);
                 info!(mint=%mint, sig=%sig, amount_tokens=sell_tokens, "exit trade submitted");
 
-                // Wait a moment for balance to update
+                // === TRANSACTION METADATA APPROACH ===
+                // Fetch transaction metadata to get EXACT balance changes
+                // This is more accurate than polling balances (1 RPC call, no race conditions)
+                let mut proceeds_lamports: u64 = 0;
+                let mut actual_fee: u64 = fee_estimate;
+
+                // Wait a moment for TX to be confirmed and indexed
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-                // Measure native SOL balance change (Pump.fun returns native SOL, not WSOL!)
-                let post_native_lamports =
-                    self.rpc.get_balance_retry(&owner_sdk).await.unwrap_or(0);
-                let pre_native_lamports = (pre_balance * 1e9) as u64;
+                // Fetch transaction metadata with retries
+                use solana_client::rpc_config::RpcTransactionConfig;
+                use solana_transaction_status::UiTransactionEncoding;
+                let tx_cfg = RpcTransactionConfig {
+                    encoding: Some(UiTransactionEncoding::JsonParsed),
+                    commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
+                    max_supported_transaction_version: Some(0),
+                };
 
-                // Also check WSOL in case DEX returns WSOL (Raydium/Orca)
-                let post_wsol_amount: u64 =
-                    if let Ok(acc) = self.rpc.get_account_retry(&wsol_ata).await {
-                        if acc.data.len() >= 72 {
-                            u64::from_le_bytes(acc.data[64..72].try_into().unwrap())
-                        } else {
-                            0
+                let mut tx_meta_fetched = false;
+                for attempt in 0..5 {
+                    if attempt > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    }
+
+                    match self
+                        .rpc
+                        .get_transaction_with_config_retry(&sig, tx_cfg.clone())
+                        .await
+                    {
+                        Ok(tx_data) => {
+                            if let Some(meta) = tx_data.transaction.meta {
+                                // Get actual fee from metadata
+                                actual_fee = meta.fee;
+
+                                // Calculate SOL balance change from pre/post balances
+                                // Account 0 is always the fee payer (our wallet)
+                                let pre_balances = &meta.pre_balances;
+                                let post_balances = &meta.post_balances;
+
+                                if !pre_balances.is_empty() && !post_balances.is_empty() {
+                                    let pre_sol = pre_balances[0];
+                                    let post_sol = post_balances[0];
+
+                                    // For SELL: post_sol should be > pre_sol (we received SOL)
+                                    // But fee was deducted, so: proceeds = (post - pre) + fee
+                                    // If post > pre: we gained SOL (SELL worked)
+                                    // If post < pre: we lost SOL (shouldn't happen for SELL)
+                                    let sol_change = post_sol as i64 - pre_sol as i64;
+
+                                    // Proceeds = SOL gained + fee paid (fee is already deducted from balance)
+                                    // For a successful SELL:
+                                    //   pre_sol = 10.0 SOL
+                                    //   post_sol = 10.5 SOL (after receiving 0.6 SOL proceeds, minus 0.1 SOL fee)
+                                    //   sol_change = +0.5 SOL
+                                    //   actual_proceeds = sol_change + fee = 0.5 + 0.1 = 0.6 SOL
+                                    proceeds_lamports = if sol_change > 0 {
+                                        (sol_change as u64).saturating_add(actual_fee)
+                                    } else {
+                                        // Negative change is unexpected for SELL, use 0
+                                        0
+                                    };
+
+                                    tx_meta_fetched = true;
+                                    info!(
+                                        mint=%mint,
+                                        sig=%sig,
+                                        pre_sol_lamports=pre_sol,
+                                        post_sol_lamports=post_sol,
+                                        sol_change_lamports=sol_change,
+                                        fee_lamports=actual_fee,
+                                        proceeds_lamports=proceeds_lamports,
+                                        "SELL: extracted proceeds from TX metadata"
+                                    );
+                                    break;
+                                }
+                            }
                         }
+                        Err(e) => {
+                            debug!(mint=%mint, sig=%sig, attempt=attempt, error=?e, "failed to fetch TX metadata, retrying...");
+                        }
+                    }
+                }
+
+                // Fallback: If TX metadata fetch failed, use balance polling as backup
+                if !tx_meta_fetched {
+                    warn!(mint=%mint, sig=%sig, "TX metadata fetch failed, falling back to balance polling");
+
+                    // Old balance-based approach as fallback
+                    let post_native_lamports =
+                        self.rpc.get_balance_retry(&owner_sdk).await.unwrap_or(0);
+                    let pre_native_lamports = (pre_balance * 1e9) as u64;
+
+                    let native_change = post_native_lamports as i64 - pre_native_lamports as i64;
+                    proceeds_lamports = if native_change > 0 {
+                        native_change as u64
                     } else {
                         0
                     };
-                let delta_wsol_lamports = post_wsol_amount.saturating_sub(pre_wsol_amount);
+                }
 
-                // Native SOL delta (subtract fee estimate to get actual proceeds)
-                let native_change = post_native_lamports as i64 - pre_native_lamports as i64;
-                // If native increased, that's our proceeds (Pump.fun case)
-                // Fee was already deducted from native balance
-                let delta_native_lamports = if native_change > 0 {
-                    native_change as u64
-                } else {
-                    0
-                };
-
-                // Use whichever is greater: native SOL increase or WSOL increase
-                let proceeds_lamports = delta_native_lamports.max(delta_wsol_lamports);
                 let delta_sol = proceeds_lamports as f64 / 1e9;
+                // Use actual fee from metadata if available
+                let fee_estimate = actual_fee;
 
                 // Fee estimation
                 let fee_est = fee_estimate as f64 / 1e9;
