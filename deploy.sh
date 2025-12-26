@@ -8,7 +8,7 @@ echo "🚀 Starting deployment..."
 
 # 1. Pull latest changes
 echo "📥 Pulling latest code from GitHub..."
-git pull origin solana3x_clean
+git pull origin main
 
 # 2. Copy config if needed
 if [ ! -f "my_config.server.toml" ]; then
