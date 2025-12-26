@@ -326,8 +326,9 @@ fn test_fallback_behavior() {
    - Future: Integrate with pool snapshot data
 3. **Cross-Pool Learning**: Each pool learns independently
    - Future: Pool clustering for similar behaviors
-4. **Primary DEXes**: Sniper focuses on Pump.fun and Raydium (new pool launches)
-   - Orca Whirlpool rarely has new meme token pools
+4. **Active DEXes**: Sniper monitors **Pump.fun** (primary) and **Raydium** (secondary)
+   - Orca is **disabled** in production config (only established pools, no new launches)
+   - See `program_ids` in `my_config.server.toml`
 5. **Memory Growth**: Unbounded pool count (mitigated by cleanup)
    - Future: LRU eviction for inactive pools
 
