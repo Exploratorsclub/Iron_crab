@@ -344,9 +344,8 @@ fn test_fallback_behavior() {
 ## References
 
 - **Implementation**: `src/quantile_impact.rs`
-- **Integration**: `src/solana/sniper.rs` (lines 581-603, 2350-2370)
-- **Config**: `config.example.toml` (lines 104-113)
-- **Tasks**: `docs/TASKS.md` (line 93)
+- **Integration**: `src/solana/sniper.rs` (`compute_min_out()`, `quantile_calc`)
+- **Config**: `config.example.toml` (siehe `quantile_*` Optionen)
 - **Tests**: `src/quantile_impact.rs` (#[cfg(test)])
 
 ## Support
@@ -359,6 +358,5 @@ For questions or issues:
 
 ---
 
-**Status**: ✅ Fully Implemented (2025-01-XX)
-**Author**: GitHub Copilot (Claude Sonnet 4.5)
+**Status**: ✅ Fully Implemented
 **Version**: 1.0.0
