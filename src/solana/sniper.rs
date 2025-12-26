@@ -2253,7 +2253,7 @@ impl SniperEngine {
                         }
                         record_network_fee(fee_estimate);
                         let line = format!(
-                            "{ts},BUY,{mint},PUMPFUN,{sig},{lamports_in},0,0,0,{exp_tokens},,0,,{fee},,",
+                            "{ts},BUY,{mint},PUMPFUN,{sig},{lamports_in},0,0,{exp_tokens},{exp_tokens},,0,,{fee},,",
                             ts=ChronoUtc::now().to_rfc3339(),
                             mint=mint,
                             sig=sig,
@@ -2290,7 +2290,7 @@ impl SniperEngine {
                             }
                             record_network_fee(fee_estimate);
                             let line = format!(
-                                "{ts},BUY,{mint},RAYDIUM,{sig},{lamports_in},0,0,0,{exp_tokens},,0,,{fee},,expected_min_out={min_out}",
+                                "{ts},BUY,{mint},RAYDIUM,{sig},{lamports_in},0,0,{exp_tokens},{exp_tokens},,0,,{fee},,expected_min_out={min_out}",
                                 ts=ChronoUtc::now().to_rfc3339(),
                                 mint=mint,
                                 sig=sig,
@@ -2310,7 +2310,7 @@ impl SniperEngine {
 
                         record_network_fee(fee_estimate);
                         let line = format!(
-                            "{ts},BUY,{mint},ORCA,{sig},{lamports_in},0,0,0,{exp_tokens},,0,,{fee},,",
+                            "{ts},BUY,{mint},ORCA,{sig},{lamports_in},0,0,{exp_tokens},{exp_tokens},,0,,{fee},,",
                             ts=ChronoUtc::now().to_rfc3339(),
                             mint=mint,
                             sig=sig,
@@ -2355,7 +2355,7 @@ impl SniperEngine {
                         ChosenDex::Orca => orca_quote_out,
                     };
                     let line = format!(
-                        "{ts},BUY,{mint},{dex},TIMEOUT,{lamports_in},0,0,0,{exp_tokens},,0,,{fee},,confirmation_timeout",
+                        "{ts},BUY,{mint},{dex},TIMEOUT,{lamports_in},0,0,{exp_tokens},{exp_tokens},,0,,{fee},,confirmation_timeout",
                         ts=ChronoUtc::now().to_rfc3339(),
                         mint=mint,
                         dex=dex_name,
