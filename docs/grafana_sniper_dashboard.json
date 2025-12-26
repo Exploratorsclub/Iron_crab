@@ -117,16 +117,16 @@
       "gridPos": {"h":12,"w":24,"x":0,"y":4},
       "datasource": {
         "type": "yesoreyeram-infinity-datasource",
-        "uid": "infinity"
+        "uid": "bf7ze18vokflsf"
       },
       "targets": [{
         "refId": "A",
         "type": "json",
         "source": "url",
-        "url": "http://localhost:9898/trades",
+        "url": "/trades",
         "root_selector": "",
         "columns": [
-          { "selector": "timestamp_ms", "text": "Time", "type": "timestamp_epoch_s" },
+          { "selector": "timestamp_ms", "text": "Time", "type": "timestamp_epoch" },
           { "selector": "action", "text": "Action", "type": "string" },
           { "selector": "mint", "text": "Token (Mint)", "type": "string" },
           { "selector": "tx_hash", "text": "TX Hash", "type": "string" },
