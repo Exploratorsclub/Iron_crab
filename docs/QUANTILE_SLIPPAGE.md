@@ -1,5 +1,11 @@
 # Quantile-Based Slippage Protection
 
+> **⚠️ Status: Optional Feature – Currently DISABLED**
+> 
+> This is an **advanced optional feature** that is not enabled by default.
+> Production config uses **Adaptive Slippage** (`adaptive_slippage_*` settings).
+> To enable quantile-based slippage, set `quantile_slippage_enabled = true` in your config.
+
 ## Overview
 
 The quantile-based slippage system replaces fixed slippage percentages with statistical learning from historical trade fills. Instead of applying a constant percentage (e.g., 1% slippage), the system:
@@ -358,5 +364,5 @@ For questions or issues:
 
 ---
 
-**Status**: ✅ Fully Implemented
+**Status**: ✅ Implemented, ⚠️ **Disabled by default** (use Adaptive Slippage first)
 **Version**: 1.0.0
