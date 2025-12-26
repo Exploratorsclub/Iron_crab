@@ -90,9 +90,24 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         
         # Get PnL for sells (already in CSV)
         pnl_sol = None
+        pnl_pct = None
         if action == 'SELL':
             try:
                 pnl_sol = float(row.get('realized_pnl_sol', '') or 0)
+                # Calculate PnL % based on exit fraction and original buy amount
+                # For partial exits: lamports_in from original buy was 5000000 (0.005 SOL)
+                # Approximate: pnl_pct = (pnl_sol / cost_basis) * 100
+                # Since we don't have exact cost basis, estimate from exit fraction
+                exit_fraction_str = row.get('notes', '')
+                if 'exit_fraction=' in exit_fraction_str:
+                    try:
+                        frac = float(exit_fraction_str.split('exit_fraction=')[1].split(',')[0])
+                        # Assume original buy was 0.005 SOL
+                        cost_basis = 0.005 * frac
+                        if cost_basis > 0:
+                            pnl_pct = (pnl_sol / cost_basis) * 100
+                    except:
+                        pass
             except:
                 pass
         
@@ -104,7 +119,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             'amount_tokens': amount_tokens_raw,  # Raw token amount (for reference)
             'price_sol': sol_amount,  # Actually: SOL amount of this trade!
             'pnl_sol': pnl_sol,
-            'pnl_pct': None,
+            'pnl_pct': pnl_pct,
             'latency_ms': None
         }
     
