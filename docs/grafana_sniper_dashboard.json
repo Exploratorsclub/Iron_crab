@@ -123,7 +123,12 @@
         "refId": "A",
         "type": "json",
         "source": "url",
+        "format": "table",
         "url": "/trades",
+        "url_options": {
+          "method": "GET",
+          "data": ""
+        },
         "root_selector": "",
         "columns": [
           { "selector": "timestamp_ms", "text": "Time", "type": "timestamp_epoch" },
