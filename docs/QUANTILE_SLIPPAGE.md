@@ -326,20 +326,19 @@ fn test_fallback_behavior() {
    - Future: Integrate with pool snapshot data
 3. **Cross-Pool Learning**: Each pool learns independently
    - Future: Pool clustering for similar behaviors
-4. **Raydium Integration**: Currently Orca-only in sniper
-   - Raydium uses static helpers, needs refactor for quantile access
+4. **Primary DEXes**: Sniper focuses on Pump.fun and Raydium (new pool launches)
+   - Orca Whirlpool rarely has new meme token pools
 5. **Memory Growth**: Unbounded pool count (mitigated by cleanup)
    - Future: LRU eviction for inactive pools
 
 ## Future Enhancements
 
 1. **Pool Liquidity Integration**: Use actual pool reserves from snapshots
-2. **Raydium Support**: Refactor to pass quantile calculator to Raydium helpers
-3. **Cluster-Based Learning**: Group similar pools (e.g., all small-cap meme tokens)
-4. **Dynamic Confidence Levels**: Adjust P95 → P99 during high volatility
-5. **Multi-Hop Quotes**: Apply quantile to each hop in multi-leg routes
-6. **MEV Protection**: Integrate with Jito bundles for front-run resistant fills
-7. **Real-Time Stats API**: Expose pool statistics via HTTP endpoint
+2. **Cluster-Based Learning**: Group similar pools (e.g., all small-cap meme tokens)
+3. **Dynamic Confidence Levels**: Adjust P95 → P99 during high volatility
+4. **Multi-Hop Quotes**: Apply quantile to each hop in multi-leg routes
+5. **MEV Protection**: Integrate with Jito bundles for front-run resistant fills
+6. **Real-Time Stats API**: Expose pool statistics via HTTP endpoint
 
 ## References
 
