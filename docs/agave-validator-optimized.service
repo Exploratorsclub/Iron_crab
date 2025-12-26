@@ -1,5 +1,4 @@
-/etc/systemd/system/agave-validator.service
-
+  GNU nano 8.4                                             /etc/systemd/system/agave-validator.service *
 [Unit]
 Description=Agave Validator (Non-Voting RPC) - Optimized for Arbitrage
 After=network-online.target
@@ -19,6 +18,7 @@ RestartSec=5
 Environment=RUST_BACKTRACE=1
 
 
+
 ExecStart=/usr/local/bin/agave-validator \
   --identity /home/sol/validator-keypair.json \
   --ledger /var/solana/ledger \
@@ -30,17 +30,23 @@ ExecStart=/usr/local/bin/agave-validator \
   --full-rpc-api \
   --rpc-threads 32 \
   --account-index program-id \
+  --account-index spl-token-owner \
+  --account-index spl-token-mint \
   --account-index-include-key 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 \
   --account-index-include-key whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc \
+  --account-index-include-key Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM \
   --accounts-db-cache-limit-mb 262144 \
   --accounts-index-scan-results-limit-mb 8192 \
+  --enable-rpc-transaction-history \
   --dynamic-port-range 8000-8025 \
   --tpu-connection-pool-size 1024 \
+  --geyser-plugin-config /home/sol/geyser-config.json \
   --no-port-check \
   --entrypoint entrypoint.mainnet-beta.solana.com:8001 \
   --entrypoint entrypoint2.mainnet-beta.solana.com:8001 \
   --entrypoint entrypoint3.mainnet-beta.solana.com:8001 \
   --log /var/solana/validator.log
+
 
 StandardOutput=journal
 StandardError=journal
@@ -48,4 +54,5 @@ SyslogIdentifier=agave-validator
 
 [Install]
 WantedBy=multi-user.target
+
 
