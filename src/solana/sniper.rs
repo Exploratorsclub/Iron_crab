@@ -1063,7 +1063,14 @@ impl SniperEngine {
 
     /// Process a pool discovery event from Geyser
     async fn handle_pool_discovery(&self, event: PoolDiscoveryEvent) {
-        let mint = event.base_mint;
+        // CRITICAL: Calculate the correct token mint FIRST before any logging/deduplication
+        // The new token is whichever side is NOT SOL/WSOL
+        let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
+        let mint = if event.base_mint == sol_mint {
+            event.quote_mint // SOL is base, so new token is quote
+        } else {
+            event.base_mint // New token is base (or non-SOL pair)
+        };
 
         // LATENCY TRACKING: Calculate time since event was created
         let now_ms = std::time::SystemTime::now()
@@ -1146,16 +1153,8 @@ impl SniperEngine {
             "sniper: new pool discovered via Geyser"
         );
 
-        // Determine which mint is the new token (not SOL/WSOL)
-        let sol_mint = pubkey!("So11111111111111111111111111111111111111112");
-
-        // The new token mint is whichever side is NOT SOL
-        // Note: We do this BEFORE loading the pool to check if it was ALREADY known
-        let mint = if event.base_mint == sol_mint {
-            event.quote_mint // SOL is base, so new token is quote
-        } else {
-            event.base_mint // New token is base, SOL is quote
-        };
+        // NOTE: mint was already calculated at function start (correct token, not SOL)
+        // sol_mint is also already defined at function start
 
         // Check if mint is already known in Raydium cache BEFORE we load this new pool
         let is_known_before_load = if let Some(ray) = &self.raydium {
