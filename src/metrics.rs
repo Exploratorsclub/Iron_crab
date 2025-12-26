@@ -51,23 +51,24 @@ pub fn get_recent_trades_json() -> String {
 fn read_trades_from_csv(limit: usize) -> Vec<RecentTrade> {
     use chrono::Utc;
     use std::io::BufRead;
-    
-    let dir_name = std::env::var("IRONCRAB_TRADE_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string());
+
+    let dir_name =
+        std::env::var("IRONCRAB_TRADE_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string());
     let date = Utc::now().format("%Y%m%d");
     let file_path = std::path::Path::new(&dir_name).join(format!("trades-{}.csv", date));
-    
+
     let file = match std::fs::File::open(&file_path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
-    
+
     let reader = std::io::BufReader::new(file);
     let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
-    
+
     // Skip header, take last N lines, reverse to show newest first
     let data_lines: Vec<&String> = lines.iter().skip(1).collect();
     let start = data_lines.len().saturating_sub(limit);
-    
+
     data_lines[start..]
         .iter()
         .rev()
@@ -82,12 +83,12 @@ fn parse_csv_line(line: &str) -> Option<RecentTrade> {
     if parts.len() < 10 {
         return None;
     }
-    
+
     let timestamp_str = parts.first()?;
     let timestamp_ms = chrono::DateTime::parse_from_rfc3339(timestamp_str)
         .ok()?
         .timestamp_millis() as u64;
-    
+
     let action = parts.get(1)?.to_string();
     let mint = parts.get(2)?.to_string();
     let tx_hash = parts.get(4).unwrap_or(&"").to_string();
@@ -95,7 +96,7 @@ fn parse_csv_line(line: &str) -> Option<RecentTrade> {
     let lamports_out: u64 = parts.get(6).and_then(|s| s.parse().ok()).unwrap_or(0);
     let tokens_in: f64 = parts.get(7).and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let tokens_out: f64 = parts.get(8).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    
+
     // For BUY: lamports_in is spent, tokens_out received
     // For SELL: tokens_in sold, lamports_out received
     let (amount_tokens, price_sol) = if action == "BUY" {
@@ -109,14 +110,14 @@ fn parse_csv_line(line: &str) -> Option<RecentTrade> {
         let price = if tokens > 0.0 { sol / tokens } else { 0.0 };
         (tokens, price)
     };
-    
+
     // PnL from realized_pnl_sol column (index 14)
     let pnl_sol = if action == "SELL" {
         parts.get(14).and_then(|s| s.parse::<f64>().ok())
     } else {
         None
     };
-    
+
     Some(RecentTrade {
         timestamp_ms,
         mint,

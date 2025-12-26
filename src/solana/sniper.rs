@@ -2342,7 +2342,7 @@ impl SniperEngine {
                     let sol_in = lamports_in as f64 / 1e9;
                     self.finalize_fill(*mint, sol_in, creator).await; // Pass creator in case it's Pump.fun
                     self.purchased.write().insert(*mint);
-                    
+
                     // Record BUY trade for dashboard (even on timeout - TX was sent)
                     let dex_name = match chosen_dex {
                         ChosenDex::PumpFun => "PUMPFUN",
@@ -2351,7 +2351,9 @@ impl SniperEngine {
                     };
                     let expected_out = match chosen_dex {
                         ChosenDex::PumpFun => pumpfun_quote_out,
-                        ChosenDex::Raydium => plan_meta.as_ref().map(|p| p.expected_out).unwrap_or(0),
+                        ChosenDex::Raydium => {
+                            plan_meta.as_ref().map(|p| p.expected_out).unwrap_or(0)
+                        }
                         ChosenDex::Orca => orca_quote_out,
                     };
                     let line = format!(
@@ -2364,7 +2366,7 @@ impl SniperEngine {
                         fee=fee_estimate
                     );
                     self.append_trade_record(&line, true);
-                    
+
                     // Don't return error - we attempted to register the position
                     return Ok(());
                 }
