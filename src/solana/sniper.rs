@@ -463,6 +463,8 @@ pub struct SniperEngine {
     helius_rpc: Option<Arc<solana_client::nonblocking::rpc_client::RpcClient>>,
     /// Kill switch monitor for emergency exits
     kill_switch: Option<Arc<KillSwitchMonitor>>,
+    /// Geyser-based TX/ATA confirmation for efficient position finalization
+    geyser_confirm: Arc<crate::solana::geyser_tx_confirm::GeyserTxConfirm>,
 }
 
 // --- Test Helpers (feature-gated) -----------------------------------------------------------
@@ -923,6 +925,21 @@ impl SniperEngine {
             None
         };
 
+        // Initialize Geyser-based TX/ATA confirmation
+        // Uses a separate lightweight Geyser stream for dynamic ATA watching
+        let geyser_confirm = if let Some(geyser_url) = &geyser_grpc_url {
+            info!("sniper: Geyser-based ATA confirmation ENABLED");
+            Arc::new(
+                crate::solana::geyser_tx_confirm::GeyserTxConfirm::with_geyser(
+                    30,
+                    geyser_url.clone(),
+                ),
+            )
+        } else {
+            info!("sniper: Geyser-based ATA confirmation disabled (will use RPC polling)");
+            Arc::new(crate::solana::geyser_tx_confirm::GeyserTxConfirm::new(30))
+        };
+
         Self {
             rpc,
             cfg: parking_lot::RwLock::new(cfg),
@@ -942,6 +959,7 @@ impl SniperEngine {
             boot_timestamp,
             helius_rpc,
             kill_switch,
+            geyser_confirm,
         }
     }
 
@@ -964,6 +982,7 @@ impl SniperEngine {
             boot_timestamp: self.boot_timestamp, // CRITICAL: preserve boot time for all clones
             helius_rpc: self.helius_rpc.clone(), // Share Helius RPC client for mint validation
             kill_switch: self.kill_switch.clone(), // Share kill switch monitor
+            geyser_confirm: self.geyser_confirm.clone(), // Share Geyser confirmation tracker
         }
     }
 
@@ -2591,43 +2610,103 @@ impl SniperEngine {
         let ata_spl =
             spl_associated_token_account::get_associated_token_address(&owner_spl, &mint_spl);
         let ata = solana_sdk::pubkey::Pubkey::new_from_array(ata_spl.to_bytes());
-        info!(mint=%mint, ata=%ata, "finalize_fill: checking token balance");
         let decimals =
             crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &mint_sdk).await;
 
-        // OPTIMIZATION: Reduced RPC polling (was 30 attempts, now max 10 with 500ms intervals)
-        // Total max wait: 5 seconds instead of 30 seconds
-        // TX is usually confirmed within 400ms-2s on a good validator
+        // EFFICIENT: Use Geyser-based ATA watching if available, otherwise RPC polling
         let mut amt = 0.0f64;
         let mut raw = 0u64;
 
-        for attempt in 0..10 {
-            if attempt > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            }
-            let acc_opt = self.rpc.get_account_retry(&ata).await.ok();
-            if let Some(acc) = acc_opt {
-                if acc.data.len() >= 72 {
-                    raw = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+        if self.geyser_confirm.is_geyser_enabled() {
+            // FAST PATH: Geyser-based watching (no RPC polling!)
+            info!(mint=%mint, ata=%ata, "finalize_fill: waiting for tokens via Geyser");
+
+            let ata_rx = self.geyser_confirm.register_ata(ata);
+
+            // Wait for Geyser notification (30s timeout)
+            match tokio::time::timeout(tokio::time::Duration::from_secs(30), ata_rx).await {
+                Ok(Ok(crate::solana::geyser_tx_confirm::AtaBalanceResult::Received(balance))) => {
+                    raw = balance;
                     amt = if decimals == 0 {
                         raw as f64
                     } else {
                         raw as f64 / 10f64.powi(decimals as i32)
                     };
-                    if amt > 0.0 {
-                        info!(mint=%mint, amount=amt, decimals=decimals, attempt=attempt, "finalize_fill: found token balance");
-                        break;
+                    info!(mint=%mint, amount=amt, raw=raw, "finalize_fill: Geyser confirmed token balance!");
+                }
+                Ok(Ok(crate::solana::geyser_tx_confirm::AtaBalanceResult::Timeout)) => {
+                    warn!(mint=%mint, "finalize_fill: Geyser timeout, doing single RPC check");
+                    // Single RPC fallback
+                    if let Ok(acc) = self.rpc.get_account_retry(&ata).await {
+                        if acc.data.len() >= 72 {
+                            raw = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+                            amt = if decimals == 0 {
+                                raw as f64
+                            } else {
+                                raw as f64 / 10f64.powi(decimals as i32)
+                            };
+                        }
+                    }
+                }
+                Ok(Ok(crate::solana::geyser_tx_confirm::AtaBalanceResult::Error(e))) => {
+                    warn!(mint=%mint, error=%e, "finalize_fill: Geyser error, doing single RPC check");
+                    if let Ok(acc) = self.rpc.get_account_retry(&ata).await {
+                        if acc.data.len() >= 72 {
+                            raw = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+                            amt = if decimals == 0 {
+                                raw as f64
+                            } else {
+                                raw as f64 / 10f64.powi(decimals as i32)
+                            };
+                        }
+                    }
+                }
+                Ok(Err(_)) | Err(_) => {
+                    warn!(mint=%mint, "finalize_fill: Geyser channel error, doing single RPC check");
+                    if let Ok(acc) = self.rpc.get_account_retry(&ata).await {
+                        if acc.data.len() >= 72 {
+                            raw = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+                            amt = if decimals == 0 {
+                                raw as f64
+                            } else {
+                                raw as f64 / 10f64.powi(decimals as i32)
+                            };
+                        }
                     }
                 }
             }
-            if attempt < 9 {
-                debug!(mint=%mint, attempt=attempt, "finalize_fill: token balance is 0, retrying...");
+        } else {
+            // FALLBACK: RPC polling (max 10 attempts, 500ms each = 5s total)
+            info!(mint=%mint, ata=%ata, "finalize_fill: checking token balance via RPC polling");
+
+            for attempt in 0..10 {
+                if attempt > 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+                let acc_opt = self.rpc.get_account_retry(&ata).await.ok();
+                if let Some(acc) = acc_opt {
+                    if acc.data.len() >= 72 {
+                        raw = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+                        amt = if decimals == 0 {
+                            raw as f64
+                        } else {
+                            raw as f64 / 10f64.powi(decimals as i32)
+                        };
+                        if amt > 0.0 {
+                            info!(mint=%mint, amount=amt, decimals=decimals, attempt=attempt, "finalize_fill: found token balance");
+                            break;
+                        }
+                    }
+                }
+                if attempt < 9 {
+                    debug!(mint=%mint, attempt=attempt, "finalize_fill: token balance is 0, retrying...");
+                }
             }
         }
 
         if amt <= 0.0 {
             // TX failed - no tokens arrived. DO NOT create position!
-            warn!(mint=%mint, "finalize_fill: no token balance found after 10 attempts (5s) - TX likely failed, NOT creating position");
+            warn!(mint=%mint, "finalize_fill: no token balance found - TX likely failed, NOT creating position");
             // Decrement pending_buys since we're done with this attempt
             let mut rs = self.risk.write();
             if rs.pending_buys > 0 {
