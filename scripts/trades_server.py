@@ -79,14 +79,23 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         tokens_in_raw = float(row.get('tokens_in', 0) or 0)
         tokens_out_raw = float(row.get('tokens_out', 0) or 0)
         expected_tokens_out_raw = float(row.get('expected_tokens_out', 0) or 0)
+        dex = row.get('dex', '').upper()
         
         # What matters: SOL amount of the trade (not price per token!)
         if action == 'BUY':
             amount_tokens_raw = tokens_out_raw if tokens_out_raw > 0 else expected_tokens_out_raw
-            sol_amount = lamports_in / 1e9  # SOL spent
+            sol_sent = lamports_in / 1e9  # SOL sent to DEX
+            
+            # Calculate ACTUAL swap amount after DEX fees (without RPC calls)
+            # Pump.fun: ~1% fee (0.3% + 0.7% = 1%)
+            # This matches what Solscan shows as the actual swap amount
+            if dex == 'PUMPFUN':
+                sol_amount = sol_sent * 0.99  # After 1% fee
+            else:
+                sol_amount = sol_sent  # Raydium/Orca: fee comes from output, not input
         else:  # SELL
             amount_tokens_raw = tokens_in_raw
-            sol_amount = lamports_out / 1e9  # SOL received
+            sol_amount = lamports_out / 1e9  # SOL received (already after fees)
         
         # Get PnL for sells (already in CSV)
         pnl_sol = None
