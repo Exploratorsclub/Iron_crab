@@ -751,8 +751,17 @@ impl SniperEngine {
                 match self.rpc.rpc.send_transaction_with_config(tx, config).await {
                     Ok(sig) => match self.rpc.rpc.confirm_transaction(&sig).await {
                         Ok(true) => Ok(sig),
-                        Ok(false) => Err(anyhow::anyhow!("Confirmation timed out")),
-                        Err(e) => Err(e.into()),
+                        Ok(false) => {
+                            // TX was SENT successfully - return sig even if confirmation timed out
+                            // The TX is likely on-chain, just confirmation was slow
+                            warn!(sig=%sig, "TX sent but confirmation timed out - returning sig anyway");
+                            Ok(sig)
+                        }
+                        Err(e) => {
+                            // Confirmation RPC error, but TX was sent - return sig
+                            warn!(sig=%sig, error=?e, "TX sent but confirmation RPC error - returning sig anyway");
+                            Ok(sig)
+                        }
                     },
                     Err(e) => Err(e.into()),
                 }
