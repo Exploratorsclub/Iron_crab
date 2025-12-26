@@ -78,10 +78,13 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         lamports_out = int(row.get('lamports_out', 0) or 0)
         tokens_in = float(row.get('tokens_in', 0) or 0)
         tokens_out = float(row.get('tokens_out', 0) or 0)
+        # Fallback to expected_tokens_out for old CSV format
+        expected_tokens_out = float(row.get('expected_tokens_out', 0) or 0)
         
         # Calculate price
         if action == 'BUY':
-            amount_tokens = tokens_out
+            # Use tokens_out, fallback to expected_tokens_out for old entries
+            amount_tokens = tokens_out if tokens_out > 0 else expected_tokens_out
             sol = lamports_in / 1e9
             price_sol = sol / amount_tokens if amount_tokens > 0 else 0
         else:  # SELL
