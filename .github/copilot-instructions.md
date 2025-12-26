@@ -220,6 +220,62 @@ struct PendingTrade { ... }    // In-flight TX tracking
 4. **Time-Based Exits** → Partial/full exits after time thresholds
 5. **Trailing Stop** → Dynamic SL that follows price up
 
+## Arbitrage Module (`src/solana/arbitrage.rs`)
+
+The `ArbitrageEngine` scans for triangular arbitrage opportunities across DEX pools.
+
+### How It Works
+1. **Pool Discovery**: Syncs Raydium (700k+ pools) and Orca (4k+ pools) snapshots
+2. **Cycle Enumeration**: For each base token, DFS searches for 3-hop paths (A→B→C→A)
+3. **Quote Evaluation**: Gets best quotes per hop via Router
+4. **Profitability Filter**: Net profit after DEX fees + TX costs + slippage
+5. **Execution**: Atomic Jito bundles (prevents frontrunning)
+
+### Configuration
+```toml
+[arbitrage]
+interval_ms = 2000                    # Scan every 2 seconds
+min_profit_bps = 10                   # Minimum 10 bps profit
+est_tx_cost_lamports = 5000000        # 0.05 SOL estimated cost
+
+[arbitrage.discovery]
+enable = true
+mode = "full-auto"
+base_tokens = [
+    "So11111111111111111111111111111111111111112",    # SOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+]
+min_liquidity_sol = 20.0
+```
+
+### Key Methods
+```rust
+impl ArbitrageEngine {
+    // Enumerate all profitable triangles
+    pub async fn enumerate_triangular_cycles(&self, base_tokens: &[String], amount_in: u64) -> Result<Vec<CycleOpportunity>>;
+    
+    // Build atomic TX plan for a triangle
+    pub async fn assemble_triangle_plan(&self, a, b, c, amount, slippage_bps) -> Result<Option<TransactionPlan>>;
+    
+    // Simulate before sending
+    pub async fn simulate_transaction_plan(&self, plan, fee_payer) -> Result<SimulationOutcome>;
+}
+```
+
+### Metrics
+| Metric | Description |
+|--------|-------------|
+| `arb_triangle_attempts_total` | Triangles evaluated |
+| `arb_triangle_profitable_total` | Profitable cycles found |
+| `arb_triangle_opportunities_total` | Opportunities per scan |
+
+### Decimal Normalization
+All amounts normalized to 9 decimals (SOL standard) for profit comparison:
+```rust
+fn normalize_amount(amount: u64, from_decimals: u8, to_decimals: u8) -> u64;
+fn get_mint_decimals_fast(&self, mint: &str) -> u8;  // Hardcoded for common tokens
+```
+
 ## Config Hot-Reload
 
 **Feature-gated**: `cargo build --features notify_watch`
@@ -284,6 +340,7 @@ pub fn validate_sniper_cfg(cfg: &SniperCfg) -> Result<(), String>;
 | Path | Purpose |
 |------|---------|
 | `src/solana/sniper.rs` | Main trading engine (6000+ LOC) |
+| `src/solana/arbitrage.rs` | Triangular arbitrage cycle detection |
 | `src/solana/dex/*.rs` | DEX connectors (Raydium, Orca, Pump.fun) |
 | `src/solana/geyser_*.rs` | Real-time Geyser streams |
 | `src/config.rs` | TOML config parsing |
