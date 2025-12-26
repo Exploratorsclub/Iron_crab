@@ -2595,13 +2595,15 @@ impl SniperEngine {
         let decimals =
             crate::solana::token_utils::get_token_decimals_or_default(&self.rpc, &mint_sdk).await;
 
-        // CRITICAL FIX: Retry with delay to wait for TX confirmation
-        // The TX may not be confirmed yet when this is called immediately after send
+        // OPTIMIZATION: Reduced RPC polling (was 30 attempts, now max 10 with 500ms intervals)
+        // Total max wait: 5 seconds instead of 30 seconds
+        // TX is usually confirmed within 400ms-2s on a good validator
         let mut amt = 0.0f64;
         let mut raw = 0u64;
-        for attempt in 0..30 {
+
+        for attempt in 0..10 {
             if attempt > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
             let acc_opt = self.rpc.get_account_retry(&ata).await.ok();
             if let Some(acc) = acc_opt {
@@ -2618,14 +2620,14 @@ impl SniperEngine {
                     }
                 }
             }
-            if attempt < 29 {
+            if attempt < 9 {
                 debug!(mint=%mint, attempt=attempt, "finalize_fill: token balance is 0, retrying...");
             }
         }
 
         if amt <= 0.0 {
             // TX failed - no tokens arrived. DO NOT create position!
-            warn!(mint=%mint, "finalize_fill: no token balance found after 30 attempts - TX likely failed, NOT creating position");
+            warn!(mint=%mint, "finalize_fill: no token balance found after 10 attempts (5s) - TX likely failed, NOT creating position");
             // Decrement pending_buys since we're done with this attempt
             let mut rs = self.risk.write();
             if rs.pending_buys > 0 {
