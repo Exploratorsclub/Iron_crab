@@ -4041,7 +4041,7 @@ impl SniperEngine {
                 use solana_transaction_status::UiTransactionEncoding;
                 let tx_cfg = RpcTransactionConfig {
                     encoding: Some(UiTransactionEncoding::JsonParsed),
-                    commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
+                    commitment: None, // Use default (confirmed)
                     max_supported_transaction_version: Some(0),
                 };
 
