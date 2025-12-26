@@ -1,79 +1,100 @@
-# IronCrab — Minimal Go‑Live Runbook
+# IronCrab — Production Runbook (Debian/Linux)
 
-This short runbook helps you go live safely with conservative defaults. Read everything before running.
+Go-Live Anleitung für den Betrieb auf dem Validator-Server. Der Bot läuft auf dem gleichen Server wie der Agave Validator für minimale Latenz.
 
-## Prerequisites
-- Windows with PowerShell
-- Rust toolchain installed
-- A reliable Solana RPC/WS provider (paid is recommended). Update URLs in `my_config.toml` accordingly.
-- A funded keypair file. On Windows, use an absolute path in `my_config.toml` like:
-  `C:\Users\<you>\.config\solana\id.json`
-- Sufficient SOL for rent and fees (recommend at least 0.5–1.0 SOL to start).
+## Voraussetzungen
+- Debian 13 (oder kompatible Linux-Distribution)
+- Rust Toolchain installiert (`rustup`)
+- Agave Validator läuft auf dem gleichen Server (siehe `docs/VALIDATOR_SETUP.md`)
+- Funded Keypair unter `/home/ironcrab/.config/solana/id.json`
+- Mindestens 0.5–1.0 SOL für Rent und Fees
 
-## Files
-- `my_config.toml` — minimal production config with conservative limits.
-- `run.ps1` — start the bot with a given config.
-- `docs/grafana_dashboard_example.json` — ready-to-import Grafana dashboard.
+## Dateien
+- `my_config.server.toml` — Produktions-Config mit konservativen Limits
+- `run.sh` — Startet den Bot mit gegebener Config
+- `docs/systemd/ironcrab.service` — Systemd Service Template
+- `docs/grafana_*.json` — Grafana Dashboards
 
-## One‑time checks
-1) Update `my_config.toml`:
-   - `solana.rpc_url` and `solana.ws_url`
-   - `solana.keypair_path` (absolute Windows path)
-   - `sniper.oracle_sol_usd_override` (set to current price if using `override`)
-2) Confirm your keypair has enough SOL.
-3) Optional: import Grafana dashboard and set Prometheus datasource.
+## Einmalige Konfiguration
+1) Config anpassen (`my_config.server.toml`):
+   ```toml
+   [solana]
+   rpc_url = "http://127.0.0.1:8899"      # Lokaler Validator
+   ws_url = "ws://127.0.0.1:8900"         # Lokaler Validator WS
+   keypair_path = "/home/ironcrab/.config/solana/id.json"
+   
+   [geyser]
+   endpoint = "http://127.0.0.1:10000"    # Lokaler Geyser gRPC
+   ```
+2) Keypair Balance prüfen: `solana balance`
+3) Optional: Grafana Dashboard importieren
 
 ## Build
-- Debug build (faster):
-  - From repo root run PowerShell: `./build.ps1`
-- Release build (recommended for live):
-  - `./build.ps1 -Release`
+```bash
+# Release Build (empfohlen für Produktion)
+./build.sh --release
 
-## Run (Windows)
-- Debug binary with custom config:
-  - `./run.ps1 -Config "my_config.toml"`
-- Release binary:
-  - `./run.ps1 -Release -Config "my_config.toml"`
-
-The bot serves Prometheus metrics at http://localhost:9898/metrics
-
-## Run (Linux server) & systemd service
-- Debug/Release Build:
-  - `./build.sh` oder `./build.sh --release`
-- Manuell starten:
-  - `./run.sh --release --config my_config.server.toml`
-
-### Als systemd Service betreiben
-1) Datei anpassen und installieren:
-   - Vorlage: `docs/systemd/ironcrab.service`
-   - Passe `User`, `Group`, `WorkingDirectory`, `ExecStart` an deine Pfade an
-   - Kopiere sie nach `/etc/systemd/system/ironcrab.service`
-2) Aktivieren und starten:
+# Debug Build (für Entwicklung)
+./build.sh
 ```
+
+## Manuell starten (zum Testen)
+```bash
+./run.sh --release --config my_config.server.toml
+```
+
+Prometheus Metrics: `http://localhost:9898/metrics`
+
+## Systemd Service (Produktion)
+
+### Installation
+```bash
+# Service-Datei anpassen und kopieren
+sudo cp docs/systemd/ironcrab.service /etc/systemd/system/
+sudo nano /etc/systemd/system/ironcrab.service
+# Pfade anpassen: User, Group, WorkingDirectory, ExecStart
+
+# Aktivieren und starten
 sudo systemctl daemon-reload
 sudo systemctl enable --now ironcrab
 sudo systemctl status ironcrab --no-pager
 ```
-3) Logs ansehen:
-```
+
+### Logs
+```bash
+# Live Logs
 journalctl -u ironcrab -f
+
+# Letzte 100 Zeilen
+journalctl -u ironcrab -n 100
 ```
 
-Der Metrics‑Exporter läuft standardmäßig auf `0.0.0.0:9898` mit Pfad `/metrics`.
+### Neustart nach Config-Änderung
+```bash
+sudo systemctl restart ironcrab
+```
 
-## Safety checklist
-- Start with very small limits: `sniper.max_buy_sol = 0.02`, strict filters enabled.
-- Keep `require_freeze_auth_none = true` and reasonable LP concentration caps.
-- Watch logs for rate limiting and errors; adjust RPC concurrency if needed.
-- Verify fills and PnL via CSV logs. Ensure adaptive slippage settles near target shortfall.
-- Consider raising limits gradually only after several successful sessions.
+## Safety Checklist
+- Starte mit kleinen Limits: `max_buy_sol = 0.02`, strikte Filter aktiv
+- `require_freeze_auth_none = true` und LP Konzentrations-Caps beibehalten
+- Logs auf Rate Limiting und Errors überwachen
+- Fills und PnL via CSV Logs verifizieren (`trade_logs/`)
+- Limits erst nach mehreren erfolgreichen Sessions erhöhen
 
 ## Troubleshooting
-- Config validation error: the process prints aggregated validation messages. Fix fields or paths.
-- RPC/WS connectivity: test with `solana config get` or try alternate providers.
-- Keypair permissions: ensure the file is readable by your user and the path is correct.
-- High rejections due to pool filters: temporarily lower `min_pool_liquidity_sol` or widen decimals range cautiously.
+| Problem | Lösung |
+|---------|--------|
+| Config Validation Error | Fehlermeldung lesen, Felder/Pfade korrigieren |
+| Validator nicht erreichbar | `curl http://127.0.0.1:8899/health` prüfen |
+| Geyser Verbindung fehlgeschlagen | Validator Geyser Plugin Config prüfen |
+| Keypair Permissions | `chmod 600 ~/.config/solana/id.json` |
+| Hohe Pool-Ablehnungen | `min_pool_liquidity_sol` senken oder Decimals-Range erweitern |
 
-## Notes
-- The sample Rust strategy remains defined but unused. Production flow is controlled via the `[sniper]` section and the `snipe-default` strategy referenced by `markets`.
-- To test strategy wiring without live trading, use the backtesting tools and `docs/BACKTESTING.md`.
+## CPU Pinning
+Der Bot ist auf CPUs 48-63 gepinnt (oberes Viertel), um den Validator nicht zu stören.
+Siehe `docs/systemd/ironcrab.service` → `CPUAffinity=48-63`
+
+## Siehe auch
+- [VALIDATOR_SETUP.md](VALIDATOR_SETUP.md) — Validator + Geyser Konfiguration
+- [GEYSER_SETUP.md](GEYSER_SETUP.md) — Geyser gRPC Plugin Details
+- [BACKTESTING.md](BACKTESTING.md) — Strategie-Testing ohne Live-Trading
