@@ -76,23 +76,19 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         action = row.get('side', '')
         lamports_in = int(row.get('lamports_in', 0) or 0)
         lamports_out = int(row.get('lamports_out', 0) or 0)
-        tokens_in = float(row.get('tokens_in', 0) or 0)
-        tokens_out = float(row.get('tokens_out', 0) or 0)
-        # Fallback to expected_tokens_out for old CSV format
-        expected_tokens_out = float(row.get('expected_tokens_out', 0) or 0)
+        tokens_in_raw = float(row.get('tokens_in', 0) or 0)
+        tokens_out_raw = float(row.get('tokens_out', 0) or 0)
+        expected_tokens_out_raw = float(row.get('expected_tokens_out', 0) or 0)
         
-        # Calculate price
+        # What matters: SOL amount of the trade (not price per token!)
         if action == 'BUY':
-            # Use tokens_out, fallback to expected_tokens_out for old entries
-            amount_tokens = tokens_out if tokens_out > 0 else expected_tokens_out
-            sol = lamports_in / 1e9
-            price_sol = sol / amount_tokens if amount_tokens > 0 else 0
+            amount_tokens_raw = tokens_out_raw if tokens_out_raw > 0 else expected_tokens_out_raw
+            sol_amount = lamports_in / 1e9  # SOL spent
         else:  # SELL
-            amount_tokens = tokens_in
-            sol = lamports_out / 1e9
-            price_sol = sol / amount_tokens if amount_tokens > 0 else 0
+            amount_tokens_raw = tokens_in_raw
+            sol_amount = lamports_out / 1e9  # SOL received
         
-        # Get PnL for sells
+        # Get PnL for sells (already in CSV)
         pnl_sol = None
         if action == 'SELL':
             try:
@@ -105,8 +101,8 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             'mint': row.get('mint', ''),
             'action': action,
             'tx_hash': row.get('signature', ''),
-            'amount_tokens': amount_tokens,
-            'price_sol': price_sol,
+            'amount_tokens': amount_tokens_raw,  # Raw token amount (for reference)
+            'price_sol': sol_amount,  # Actually: SOL amount of this trade!
             'pnl_sol': pnl_sol,
             'pnl_pct': None,
             'latency_ms': None
