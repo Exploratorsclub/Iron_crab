@@ -1,9 +1,8 @@
 # IronCrab – Solana‑First Tradingbot (Rust)
 
-Version: **0.3.1-dev** (Agave / Solana 3.x line)  
-Legacy (Solana 1.18 baseline): tag `v0.2.1-solana1_18`.
+Version: **0.3.1-dev** (Agave / Solana 3.x)
 
-> Migration in progress. See `MIGRATION.md` for details on the upgrade from the legacy 1.18 toolchain to Agave / 3.x crates. The active development branch is `solana3x_clean` (may be renamed / merged soon).
+High-frequency Solana trading bot with meme token sniper and arbitrage modules. Runs alongside a self-hosted Agave 3.0.11 validator for minimal latency.
 
 ## Validator Entry Point Latency Testing
 To select the fastest Solana mainnet-beta entrypoints (Gossip port 8001) from your Frankfurt host you can use the helper script:
