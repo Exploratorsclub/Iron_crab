@@ -991,10 +991,11 @@ mod tests {
             "Creator vault should not be default pubkey"
         );
 
-        // The derived vault should be off-curve (it's a PDA)
+        // PDAs are OFF-curve by design (no private key exists)
+        // is_on_curve() returns false for valid PDAs
         assert!(
-            vault.is_on_curve(),
-            "Creator vault PDA should have a valid structure"
+            !vault.is_on_curve(),
+            "Creator vault PDA should be off-curve (no private key)"
         );
     }
 }
