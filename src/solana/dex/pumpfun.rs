@@ -516,7 +516,7 @@ impl PumpFunDex {
         }
 
         // If RPC fetch failed, use fallback with initial bonding curve state
-        // VERIFIED: The creator from instruction_accounts[7] (User/Fee Payer) 
+        // VERIFIED: The creator from instruction_accounts[7] (User/Fee Payer)
         // IS the same as the creator stored in the bonding curve at bytes [49..81]
         let state = match state_opt {
             Some(s) => s,
