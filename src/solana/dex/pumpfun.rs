@@ -982,8 +982,9 @@ mod tests {
         let (vault, bump) =
             Pubkey::find_program_address(&[b"creator-vault", test_creator.as_ref()], &program_id);
 
-        // Verify it's a valid PDA (bump should be 0-255)
-        assert!(bump <= 255, "Invalid PDA bump");
+        // bump is u8 (0-255) by definition from find_program_address
+        // Just verify we got a valid PDA by checking vault is not default
+        let _ = bump; // Acknowledge bump exists
         assert_ne!(
             vault,
             Pubkey::default(),
