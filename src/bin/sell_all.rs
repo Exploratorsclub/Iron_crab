@@ -33,6 +33,7 @@ struct Args {
     force_burn: bool,
 }
 
+#[derive(Debug)]
 struct SellTask {
     mint: Pubkey,
     amount: u64,
