@@ -4135,7 +4135,7 @@ impl SniperEngine {
 
                     match self
                         .rpc
-                        .get_transaction_with_config_retry(&sig, tx_cfg.clone())
+                        .get_transaction_with_config_retry(&sig, tx_cfg)
                         .await
                     {
                         Ok(tx_data) => {

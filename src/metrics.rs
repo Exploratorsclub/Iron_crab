@@ -63,7 +63,7 @@ fn read_trades_from_csv(limit: usize) -> Vec<RecentTrade> {
     };
 
     let reader = std::io::BufReader::new(file);
-    let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
 
     // Skip header, take last N lines, reverse to show newest first
     let data_lines: Vec<&String> = lines.iter().skip(1).collect();
