@@ -1,23 +1,17 @@
 //! Professional Geyser-based Pool Discovery
-//! Replaces WebSocket log parsing with structured account updates
+//! Simplified approach: TX-based for Pump.fun, Account-based for Raydium/Orca
 
 use crate::solana::geyser_listener::{
     GeyserAccountUpdate, GeyserListener, GeyserTransactionUpdate,
 };
 use crate::solana::rpc::SolanaRpc;
 use anyhow::Result;
-use parking_lot::RwLock;
 use solana_sdk::pubkey;
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::debug;
-
-/// Cache for bonding curve -> creator mappings from account updates
-/// This is needed because the mint is in the TX but the creator is in the account data
-type CreatorCache = Arc<RwLock<HashMap<Pubkey, Pubkey>>>;
 
 /// Pool discovery via Geyser account updates
 pub struct GeyserPoolDiscovery {
@@ -42,27 +36,19 @@ impl GeyserPoolDiscovery {
         // Create event channel for pool discoveries
         let (event_tx, event_rx) = broadcast::channel(10000);
 
-        // Creator cache: bonding_curve -> creator (from account data)
-        // Pump.fun bonding curve doesn't store the mint, only the creator
-        // We need to get mint from TX and creator from account update
-        let creator_cache: CreatorCache = Arc::new(RwLock::new(HashMap::new()));
-
         let discovery = Self { listener };
 
-        // Spawn account processor
+        // Spawn account processor (for Raydium/Orca)
         let rpc_clone = rpc.clone();
         let event_tx_clone = event_tx.clone();
-        let creator_cache_clone = creator_cache.clone();
         tokio::spawn(async move {
             let mut rx = account_rx;
             loop {
                 match rx.recv().await {
                     Ok(update) => {
                         if let Some(event) =
-                            Self::process_account_update(update, &rpc_clone, &creator_cache_clone)
-                                .await
+                            Self::process_account_update(update, &rpc_clone).await
                         {
-                            // Log before sending
                             tracing::debug!(
                                 dex = ?event.dex_type,
                                 pool = %event.pool_address,
@@ -82,20 +68,15 @@ impl GeyserPoolDiscovery {
             }
         });
 
-        // Spawn transaction processor
-        let rpc_clone2 = rpc.clone();
-        let creator_cache_clone2 = creator_cache.clone();
+        // Spawn transaction processor (for Pump.fun - simplified approach)
+        let rpc_clone2 = rpc;
         tokio::spawn(async move {
             let mut rx = transaction_rx;
             loop {
                 match rx.recv().await {
                     Ok(tx_update) => {
-                        if let Some(event) = Self::process_transaction_update(
-                            tx_update,
-                            &rpc_clone2,
-                            &creator_cache_clone2,
-                        )
-                        .await
+                        if let Some(event) =
+                            Self::process_transaction_update(tx_update, &rpc_clone2).await
                         {
                             // Log before sending to verify event is created
                             tracing::info!(
@@ -143,39 +124,18 @@ impl GeyserPoolDiscovery {
     }
 
     /// Process account update and determine if it's a new pool
-    /// For Pump.fun: caches the creator (doesn't emit event - TX-based does that)
+    /// Used for Raydium/Orca (Pump.fun uses TX-based discovery)
     async fn process_account_update(
         update: GeyserAccountUpdate,
         _rpc: &Arc<SolanaRpc>,
-        creator_cache: &CreatorCache,
     ) -> Option<PoolDiscoveryEvent> {
         // Identify DEX by owner
         let dex_type = match update.owner.to_string().as_str() {
             "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" => DexType::RaydiumAmmV4,
             "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" => DexType::OrcaWhirlpool,
             "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" => {
-                // Pump.fun: Cache the creator from bonding curve account data
-                // The bonding curve doesn't contain the mint, only the creator
-                // We cache (bonding_curve -> creator) and the TX processor uses it
-                if let Some(creator) = Self::extract_pumpfun_creator(&update.data) {
-                    let mut cache = creator_cache.write();
-                    cache.insert(update.pubkey, creator);
-                    // Limit cache size to prevent unbounded growth
-                    if cache.len() > 100_000 {
-                        // Remove oldest entries (HashMap doesn't track order, so just clear half)
-                        let keys: Vec<_> = cache.keys().take(50_000).copied().collect();
-                        for k in keys {
-                            cache.remove(&k);
-                        }
-                    }
-                    debug!(
-                        bonding_curve = %update.pubkey,
-                        creator = %creator,
-                        cache_size = cache.len(),
-                        "geyser_pool_discovery: cached Pump.fun creator"
-                    );
-                }
-                // Don't emit event - TX-based discovery will do that with the mint
+                // Pump.fun: TX-based discovery is faster and simpler
+                // We don't need account updates for Pump.fun anymore
                 return None;
             }
             _ => {
@@ -228,11 +188,10 @@ impl GeyserPoolDiscovery {
     }
 
     /// Process transaction update to extract token mints from instruction accounts
-    /// For Pump.fun: gets mint from TX, creator from cache (set by account processor)
+    /// For Pump.fun: SIMPLIFIED - mint from TX, bonding curve PDA calculated, creator = signer
     async fn process_transaction_update(
         tx_update: GeyserTransactionUpdate,
         _rpc: &Arc<SolanaRpc>,
-        creator_cache: &CreatorCache,
     ) -> Option<PoolDiscoveryEvent> {
         // Identify DEX by looking for known program IDs in account_keys
         let raydium_program =
@@ -251,13 +210,17 @@ impl GeyserPoolDiscovery {
             return None;
         };
 
-        let _account_count = tx_update.account_keys.len();
-
         // Process based on DEX type
         match dex_type {
             DexType::PumpFun => {
-                // Need at least 4 instruction accounts for CREATE
-                if tx_update.instruction_accounts.len() < 4 {
+                // SIMPLIFIED APPROACH (per Sniper Playbook):
+                // 1. Get Mint from TX (instruction account)
+                // 2. CALCULATE Bonding Curve PDA (don't read from TX!)
+                // 3. Creator = TX signer (fee payer, account_keys[0])
+                // NO Creator Cache needed!
+
+                // Need at least 3 instruction accounts for CREATE
+                if tx_update.instruction_accounts.len() < 3 {
                     return None;
                 }
 
@@ -277,18 +240,20 @@ impl GeyserPoolDiscovery {
                 // [0]: Global
                 // [1]: Fee Recipient
                 // [2]: Mint (the token being created!)
-                // [3]: Bonding Curve PDA
-                // [4]: Associated Bonding Curve (token vault)
-                // [5+]: User, programs, etc.
+                // [3+]: Other accounts...
 
                 // Get the mint (account index 2)
                 let token_mint = *tx_update.instruction_accounts.get(2)?;
 
-                // Get the bonding curve (account index 3)
-                let bonding_curve = *tx_update.instruction_accounts.get(3)?;
+                // CALCULATE Bonding Curve PDA deterministically (don't read from TX!)
+                // Seeds: ["bonding-curve", mint_pubkey]
+                let (bonding_curve, _bump) = Pubkey::find_program_address(
+                    &[b"bonding-curve", token_mint.as_ref()],
+                    &pumpfun_program,
+                );
 
-                // Try to get creator from cache (set by account processor)
-                let creator = creator_cache.read().get(&bonding_curve).copied();
+                // Creator = TX signer (fee payer is always account_keys[0])
+                let creator = tx_update.account_keys.first().copied();
 
                 let quote_mint = pubkey!("So11111111111111111111111111111111111111112");
 
@@ -303,8 +268,7 @@ impl GeyserPoolDiscovery {
                     mint = %token_mint,
                     bonding_curve = %bonding_curve,
                     creator = ?creator,
-                    creator_from_cache = creator.is_some(),
-                    "geyser_pool_discovery: PUMPFUN CREATE via TX (with cached creator)"
+                    "geyser_pool_discovery: PUMPFUN CREATE (simplified: PDA calculated, creator from signer)"
                 );
 
                 Some(PoolDiscoveryEvent {
@@ -498,30 +462,6 @@ impl GeyserPoolDiscovery {
     /// - Offset 8: virtual_token_reserves (u64)
     /// - Offset 16: virtual_sol_reserves (u64)  
     /// - Offset 24: real_token_reserves (u64)
-    /// - Offset 32: real_sol_reserves (u64)
-    /// - Offset 40: token_total_supply (u64)
-    /// - Offset 48: complete (u8, bool)
-    /// - Offset 49: creator (Pubkey, 32 bytes) <-- THE REAL CREATOR!
-    /// - Offset 81-151: padding/other data (NO MINT!)
-    ///
-    /// NOTE: The mint is NOT stored in the bonding curve!
-    /// It must be extracted from the CREATE transaction.
-    fn extract_pumpfun_creator(data: &[u8]) -> Option<Pubkey> {
-        // Minimum size: discriminator(8) + reserves(40) + complete(1) + creator(32) = 81 bytes
-        if data.len() < 81 {
-            return None;
-        }
-
-        // Creator is at bytes [49..81]
-        let creator = Pubkey::new_from_array(data[49..81].try_into().ok()?);
-
-        // Sanity check - creator shouldn't be zero
-        if creator.to_bytes() == [0u8; 32] {
-            return None;
-        }
-
-        Some(creator)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
