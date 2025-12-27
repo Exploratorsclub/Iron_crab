@@ -213,13 +213,12 @@ impl GeyserPoolDiscovery {
         match dex_type {
             DexType::PumpFun => {
                 // SIMPLIFIED APPROACH (per Sniper Playbook):
-                // 1. Get Mint from TX (instruction account)
-                // 2. CALCULATE Bonding Curve PDA (don't read from TX!)
-                // 3. Creator = TX signer (fee payer, account_keys[0])
-                // NO Creator Cache needed!
+                // 1. Get Mint from TX (instruction account[0])
+                // 2. CALCULATE Bonding Curve PDA from mint
+                // 3. Creator = instruction account[7] (User)
 
-                // Need at least 3 instruction accounts for CREATE
-                if tx_update.instruction_accounts.len() < 3 {
+                // Need at least 8 instruction accounts for CREATE
+                if tx_update.instruction_accounts.len() < 8 {
                     return None;
                 }
 
@@ -235,24 +234,28 @@ impl GeyserPoolDiscovery {
                     return None; // Not CREATE, likely BUY or SELL
                 }
 
-                // Pump.fun CREATE instruction accounts:
-                // [0]: Global
-                // [1]: Fee Recipient
-                // [2]: Mint (the token being created!)
-                // [3+]: Other accounts...
+                // Pump.fun CREATE instruction accounts (from Solscan):
+                // [0]: Mint (the token being created!) ← THIS IS THE MINT
+                // [1]: Mint Authority
+                // [2]: Bonding Curve
+                // [3]: Associated Bonding Curve (vault)
+                // [4]: Global
+                // [5]: Metaplex Token Metadata Program
+                // [6]: Metadata account
+                // [7]: User (creator, fee payer) ← THIS IS THE CREATOR
 
-                // Get the mint (account index 2)
-                let token_mint = *tx_update.instruction_accounts.get(2)?;
+                // Get the mint (account index 0)
+                let token_mint = *tx_update.instruction_accounts.get(0)?;
 
-                // CALCULATE Bonding Curve PDA deterministically (don't read from TX!)
+                // CALCULATE Bonding Curve PDA deterministically
                 // Seeds: ["bonding-curve", mint_pubkey]
                 let (bonding_curve, _bump) = Pubkey::find_program_address(
                     &[b"bonding-curve", token_mint.as_ref()],
                     &pumpfun_program,
                 );
 
-                // Creator = TX signer (fee payer is always account_keys[0])
-                let creator = tx_update.account_keys.first().copied();
+                // Creator = User at instruction account[7]
+                let creator = tx_update.instruction_accounts.get(7).copied();
 
                 let quote_mint = pubkey!("So11111111111111111111111111111111111111112");
 
