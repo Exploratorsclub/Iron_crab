@@ -1,70 +1,109 @@
-# Local Development Setup Guide
+# Local Development Setup Guide (Windows)
 
 To run tests and build the project locally on Windows, you need to ensure your environment is correctly configured.
 
+> **Note**: Production runs on Debian Linux (same server as the validator). 
+> This guide is for local development/testing only.
+
 ## 1. Install Prerequisites
+
+### Rust Toolchain
+```powershell
+# Install rustup if not already installed
+winget install Rustlang.Rustup
+
+# Project uses Rust 1.89.0 (see rust-toolchain.toml)
+rustup show
+```
 
 ### Visual Studio Build Tools
 Ensure you have **Visual Studio Build Tools** installed with the **"Desktop development with C++"** workload.
 - Download: [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
 - During installation, select "Desktop development with C++".
 
-### Python 3.x (Required for `pyo3`)
-The project uses `pyo3` which requires a Python interpreter.
-1. Download Python 3.10 or newer from [python.org](https://www.python.org/downloads/windows/).
-2. **Important:** During installation, check the box **"Add Python to PATH"**.
-3. Verify installation in PowerShell:
-   ```powershell
-   python --version
-   ```
+### Protobuf Compiler (REQUIRED for Geyser gRPC)
+The `yellowstone-grpc-proto` dependency requires `protoc`:
 
-### Git Bash (Required for `protobuf-src`)
-The `protobuf-src` dependency requires a shell (`sh`) to build.
-1. Download Git for Windows from [git-scm.com](https://git-scm.com/download/win).
-2. During installation, you can use default settings.
-3. You need to add the `bin` folder to your PATH so `sh.exe` is found.
+**Option A: Via Chocolatey (recommended)**
+```powershell
+# Install Chocolatey if not installed: https://chocolatey.org/install
+choco install protoc -y
+
+# Verify
+protoc --version
+```
+
+**Option B: Manual Installation**
+1. Download latest release from [protobuf releases](https://github.com/protocolbuffers/protobuf/releases)
+2. Download `protoc-XX.X-win64.zip`
+3. Extract to `C:\protoc`
+4. Add `C:\protoc\bin` to your PATH
+
+### Python 3.x (Required for `pyo3` feature)
+Only needed if building with `--features python`:
+1. Download Python 3.10+ from [python.org](https://www.python.org/downloads/windows/)
+2. **Important:** Check **"Add Python to PATH"** during installation
+3. Verify: `python --version`
+
+### Git Bash (Required for some build scripts)
+1. Download Git for Windows from [git-scm.com](https://git-scm.com/download/win)
+2. Add `C:\Program Files\Git\bin` to your PATH
 
 ## 2. Configure Environment Variables (PowerShell)
 
-You need to add Git Bash to your PATH so the build script can find `sh`.
-
-Run this in PowerShell to add it temporarily (for the current session):
+Add required tools to PATH (for current session):
 ```powershell
 $env:PATH += ";C:\Program Files\Git\bin"
+$env:PATH += ";C:\protoc\bin"  # If manual protoc install
 ```
 
-To make it permanent:
-1. Search for "Edit the system environment variables" in Windows Search.
-2. Click "Environment Variables".
-3. Under "System variables", find `Path` and click "Edit".
-4. Click "New" and add `C:\Program Files\Git\bin`.
-5. Click OK.
+To make permanent: System Properties → Environment Variables → Edit `Path`
 
-## 3. Running Tests and Checks
+## 3. Building & Testing
 
-Once the environment is set up, you can run the following commands in PowerShell:
-
-### Run Tests
 ```powershell
-# Add Git bin to path if not permanent
-$env:PATH += ";C:\Program Files\Git\bin"
+# Build (debug)
+cargo build
 
-# Run all tests
+# Build (release)
+cargo build --release
+
+# Run tests
 cargo test
-```
 
-### Run Linter (Clippy)
-```powershell
-cargo clippy --all-targets --all-features -- -D warnings
-```
+# Run tests with test helpers
+cargo test --features test_helpers
 
-### Check Formatting
-```powershell
+# Clippy (linter)
+cargo clippy --all-targets -- -D warnings
+
+# Format check
 cargo fmt -- --check
 ```
 
-## Troubleshooting
+## 4. Common Build Errors
 
-- **"sh is required to run configure"**: This means `sh.exe` is not in your PATH. Add `C:\Program Files\Git\bin` to your PATH.
-- **"no Python 3.x interpreter found"**: Install Python and add it to your PATH.
-- **"linker link.exe not found"**: Install Visual Studio Build Tools with C++ workload.
+| Error | Solution |
+|-------|----------|
+| `protoc: command not found` | Install protobuf compiler (see above) |
+| `cannot find -lprotobuf` | Install protobuf via Chocolatey or manual |
+| `sh is required to run configure` | Add `C:\Program Files\Git\bin` to PATH |
+| `no Python 3.x interpreter found` | Install Python with PATH option |
+| `linker link.exe not found` | Install VS Build Tools with C++ workload |
+| `LINK : fatal error LNK1181` | Missing C++ libs, reinstall VS Build Tools |
+
+## 5. Alternative: Build on Linux/WSL
+
+If Windows build issues persist, use WSL2:
+
+```bash
+# In WSL2 (Ubuntu)
+sudo apt-get update
+sudo apt-get install -y build-essential protobuf-compiler libprotobuf-dev
+
+# Clone and build
+cd /mnt/c/Users/rober/Iron_crab
+cargo build --release
+```
+
+This matches the CI environment exactly.
