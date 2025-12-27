@@ -2707,6 +2707,8 @@ impl SniperEngine {
         if amt <= 0.0 {
             // TX failed - no tokens arrived. DO NOT create position!
             warn!(mint=%mint, "finalize_fill: no token balance found - TX likely failed, NOT creating position");
+            // Increment TRADES_FAILED counter since the on-chain TX failed
+            TRADES_FAILED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Decrement pending_buys since we're done with this attempt
             let mut rs = self.risk.write();
             if rs.pending_buys > 0 {
