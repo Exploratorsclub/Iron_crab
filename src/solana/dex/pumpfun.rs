@@ -441,9 +441,21 @@ impl PumpFunDex {
             "pump.fun: attempting to fetch bonding curve (with_fallback)"
         );
 
-        // OPTIMIZATION: For fresh Pump.fun launches via Geyser (use_fallback=true, buy_token=true),
-        // skip RPC entirely and use initial state directly. This saves ~4.5s of latency!
-        // The RPC is always behind Geyser for fresh launches anyway.
+        // DISABLED: The "instant initial state" optimization is broken because the creator
+        // extracted from Geyser TX accounts is NOT the same as the creator stored in the
+        // bonding curve account data. The bonding curve stores a different creator pubkey
+        // than the signer of the CREATE transaction.
+        //
+        // Example: Burunduk token (EjBy3VxK7wh7idnCidDK1yxGndWdh4PE29RNPpGsR4Aa)
+        // - Geyser TX signer: 6JaLPLDYpaZ2RPh1vYeStbWDZEEGdyZ62KhgYeiXZGos
+        // - Bonding curve creator: CMwrm79Pj6iYTv6EQYu3ibs3RcNgzibGVmB4bALhCfg6
+        // These produce different creator_vault PDAs, causing Error 2006 (ConstraintSeeds).
+        //
+        // TODO: Fix by extracting creator from bonding curve account data via Geyser account
+        // subscription instead of from TX accounts.
+        //
+        // For now, always fetch bonding curve from RPC to get the correct creator.
+        /*
         if let Some(creator) = fallback_creator.filter(|_| use_fallback && buy_token) {
             info!(
                 token_mint=%token_mint_str,
@@ -475,8 +487,10 @@ impl PumpFunDex {
                 tick_spacing: None,
             }));
         }
+        */
+        let _ = fallback_creator; // Suppress unused warning
 
-        // For sells or non-fallback mode, try to fetch bonding curve state with retry
+        // Always fetch bonding curve state from RPC to get the correct creator
         const MAX_RETRIES: usize = 8;
         const INITIAL_DELAY_MS: u64 = 50;
         const MAX_DELAY_MS: u64 = 1000;
@@ -515,38 +529,29 @@ impl PumpFunDex {
             }
         }
 
-        // If RPC fetch failed, use fallback for fresh launches
+        // If RPC fetch failed, skip the trade
+        // IMPORTANT: We can no longer use fallback because the creator from Geyser TX accounts
+        // is NOT the same as the creator stored in the bonding curve data.
+        // Using the wrong creator causes Error 2006 (ConstraintSeeds) on the BUY instruction.
         let state = match state_opt {
             Some(s) => s,
             None => {
-                if use_fallback {
-                    // USE INITIAL STATE FALLBACK for fresh token launches!
-                    // This is safe because:
-                    // 1. The Geyser CREATE event proves the bonding curve is being created NOW
-                    // 2. All Pump.fun bonding curves start with the same deterministic state
-                    // 3. Our transaction will land AFTER the CREATE tx (same or later block)
-
-                    // Need creator for the new buy instruction account format
-                    let creator = fallback_creator.ok_or_else(|| {
-                        anyhow!("fallback mode requires creator pubkey from Geyser event")
-                    })?;
-
-                    warn!(
-                        token_mint=%token_mint_str,
-                        bonding_curve=%bonding_curve,
-                        creator=%creator,
-                        "pump.fun: ⚡ USING INITIAL STATE FALLBACK - RPC too slow, bonding curve being created"
-                    );
-                    Self::initial_bonding_curve_state(creator)
-                } else {
-                    info!(
-                        token_mint=%token_mint_str,
-                        bonding_curve=%bonding_curve,
-                        "pump.fun: bonding curve not found after {} fast retries - SKIPPING (use_fallback=false)",
-                        MAX_RETRIES
-                    );
-                    return Ok(None);
-                }
+                // Previously we used initial_bonding_curve_state(fallback_creator) here,
+                // but that's broken because the fallback_creator from Geyser is the TX signer,
+                // not the actual creator stored in the bonding curve.
+                //
+                // TODO: To re-enable fast sniping, we need to:
+                // 1. Subscribe to bonding curve account data via Geyser
+                // 2. Extract the real creator from bonding curve bytes [49..81]
+                // 3. Use that creator for initial_bonding_curve_state()
+                warn!(
+                    token_mint=%token_mint_str,
+                    bonding_curve=%bonding_curve,
+                    use_fallback,
+                    "pump.fun: bonding curve not found after {} retries - SKIPPING (fallback disabled due to creator mismatch bug)",
+                    MAX_RETRIES
+                );
+                return Ok(None);
             }
         };
 

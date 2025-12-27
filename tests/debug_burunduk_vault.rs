@@ -15,8 +15,7 @@ fn test_burunduk_creator_vault() {
     // Left (bot sends):  9HXMFwiLUpTRapAKsiiSPK3a3UqcqdWpEhrmvtsDugcC
     // Right (expected):  J7w9yXLLUKeVodeKkBJuCwt5DCubieBX69ebQntN8our
 
-    let bot_sends_vault =
-        Pubkey::from_str("9HXMFwiLUpTRapAKsiiSPK3a3UqcqdWpEhrmvtsDugcC").unwrap();
+    let bot_sends_vault = Pubkey::from_str("9HXMFwiLUpTRapAKsiiSPK3a3UqcqdWpEhrmvtsDugcC").unwrap();
     let expected_vault = Pubkey::from_str("J7w9yXLLUKeVodeKkBJuCwt5DCubieBX69ebQntN8our").unwrap();
 
     println!("Bot sends creator_vault:  {}", bot_sends_vault);
@@ -31,8 +30,7 @@ fn test_burunduk_creator_vault() {
     let mint = Pubkey::from_str("EjBy3VxK7wh7idnCidDK1yxGndWdh4PE29RNPpGsR4Aa").unwrap();
 
     // Bonding curve
-    let bonding_curve =
-        Pubkey::from_str("3yH3TtmGECKM8xZYcqRLPnL59NUSrkFh7qSsDBEKWoam").unwrap();
+    let bonding_curve = Pubkey::from_str("3yH3TtmGECKM8xZYcqRLPnL59NUSrkFh7qSsDBEKWoam").unwrap();
 
     println!("Creator from Geyser:      {}", creator_from_geyser);
     println!("Token mint:               {}", mint);
@@ -93,7 +91,10 @@ fn test_burunduk_creator_vault() {
     // Let's check all accounts from the CREATE tx
 
     let accounts = vec![
-        ("index 0 (mint)", "EjBy3VxK7wh7idnCidDK1yxGndWdh4PE29RNPpGsR4Aa"),
+        (
+            "index 0 (mint)",
+            "EjBy3VxK7wh7idnCidDK1yxGndWdh4PE29RNPpGsR4Aa",
+        ),
         ("index 1", "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM"),
         (
             "index 2 (bonding_curve)",
@@ -121,7 +122,10 @@ fn test_burunduk_creator_vault() {
             let (derived, _) =
                 Pubkey::find_program_address(&[b"creator-vault", pubkey.as_ref()], &program_id);
             if derived == bot_sends_vault {
-                println!("*** FOUND: {} ({}) produces bot_sends_vault! ***", name, addr);
+                println!(
+                    "*** FOUND: {} ({}) produces bot_sends_vault! ***",
+                    name, addr
+                );
             }
             if derived == expected_vault {
                 println!(
@@ -130,6 +134,40 @@ fn test_burunduk_creator_vault() {
                 );
             }
         }
+    }
+
+    println!();
+
+    // NEW: Test with the REAL creator from bonding curve data
+    // Decoded from: solana account 3yH3TtmGECKM8xZYcqRLPnL59NUSrkFh7qSsDBEKWoam --output json
+    // Bytes [49..81] contain the creator pubkey
+    // Hex: a8 ce 33 50 10 ff 3a 26 36 ce 17 a3 3a 15 0f 11 cd 67 54 18 fd d7 47 88 fa f0 78 0c 2e be e5 8b
+    println!("=== REAL CREATOR FROM BONDING CURVE DATA ===\n");
+
+    let real_creator_bytes: [u8; 32] = [
+        0xa8, 0xce, 0x33, 0x50, 0x10, 0xff, 0x3a, 0x26, 0x36, 0xce, 0x17, 0xa3, 0x3a, 0x15, 0x0f,
+        0x11, 0xcd, 0x67, 0x54, 0x18, 0xfd, 0xd7, 0x47, 0x88, 0xfa, 0xf0, 0x78, 0x0c, 0x2e, 0xbe,
+        0xe5, 0x8b,
+    ];
+    let real_creator = Pubkey::new_from_array(real_creator_bytes);
+    println!("Real creator from BC data: {}", real_creator);
+
+    let (vault_from_real, bump_real) =
+        Pubkey::find_program_address(&[b"creator-vault", real_creator.as_ref()], &program_id);
+    println!(
+        "Vault from REAL creator:        {} (bump: {})",
+        vault_from_real, bump_real
+    );
+    println!(
+        "  Matches expected?      {}",
+        vault_from_real == expected_vault
+    );
+
+    if vault_from_real == expected_vault {
+        println!(
+            "\n*** SUCCESS: The REAL creator from bonding curve produces the correct vault! ***"
+        );
+        println!("*** FIX: Bot must read creator from bonding curve data, NOT from Geyser tx accounts! ***");
     }
 
     println!();

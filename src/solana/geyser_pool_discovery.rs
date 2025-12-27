@@ -133,13 +133,11 @@ impl GeyserPoolDiscovery {
             "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" => DexType::RaydiumAmmV4,
             "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" => DexType::OrcaWhirlpool,
             "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" => {
-                // Pump.fun: Skip account-based discovery, use transaction-based instead
-                // Account data parsing at offset 40-72 produces wrong mints (12xtdJLo...)
-                debug!(
-                    pool = %update.pubkey,
-                    slot = update.slot,
-                    "geyser_pool_discovery: Pump.fun account update ignored (using transaction-based discovery)"
-                );
+                // Pump.fun: Extract creator from bonding curve account data
+                // This is the REAL creator stored at bytes [49..81], NOT the tx signer!
+                if let Some(event) = Self::parse_pumpfun_bonding_curve_full(&update) {
+                    return Some(event);
+                }
                 return None;
             }
             _ => {
@@ -251,158 +249,14 @@ impl GeyserPoolDiscovery {
 
         let token_mint = match dex_type {
             DexType::PumpFun => {
-                // DEBUG: Log instruction extraction status
-                if tx_update.instruction_accounts.is_empty() {
-                    debug!(
-                        signature = %tx_update.signature,
-                        account_keys_len = tx_update.account_keys.len(),
-                        instruction_data_len = tx_update.instruction_data.len(),
-                        "geyser_pool_discovery: No instruction accounts extracted - Pump.fun instruction not found"
-                    );
-                    return None;
-                }
-
-                // Filter: Pump.fun Create needs at least 4 instruction accounts
-                // (mint, authority, bonding_curve, vault)
-                if tx_update.instruction_accounts.len() < 4 {
-                    return None; // Not a CREATE instruction
-                }
-
-                // Filter by instruction discriminator to distinguish CREATE from BUY/SELL
-                // Pump.fun instruction discriminators (first 8 bytes of instruction data):
-                // - CREATE: 0x181ec828051c0777 (sighash of "global:create")
-                // - BUY: 0x66063d1201daebea (sighash of "global:buy")
-                // - SELL: 0x33e685a4017f83ad (sighash of "global:sell")
-                const PUMPFUN_CREATE_DISCRIMINATOR: [u8; 8] =
-                    [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
-
-                if tx_update.instruction_data.len() >= 8 {
-                    let discriminator = &tx_update.instruction_data[0..8];
-
-                    // DEBUG: Log discriminator for analysis
-                    tracing::debug!(
-                        signature = %tx_update.signature,
-                        discriminator_hex = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                            discriminator[0], discriminator[1], discriminator[2], discriminator[3],
-                            discriminator[4], discriminator[5], discriminator[6], discriminator[7]),
-                        instruction_count = tx_update.instruction_accounts.len(),
-                        "geyser_pool_discovery: Pump.fun instruction discriminator check"
-                    );
-
-                    if discriminator != PUMPFUN_CREATE_DISCRIMINATOR {
-                        // Not a CREATE instruction (likely BUY or SELL)
-                        return None;
-                    }
-
-                    // Log successful CREATE detection
-                    tracing::info!(
-                        signature = %tx_update.signature,
-                        "geyser_pool_discovery: ✅ FOUND Pump.fun CREATE INSTRUCTION"
-                    );
-                } else {
-                    // No instruction data or too short - can't verify
-                    debug!(
-                        signature = %tx_update.signature,
-                        data_len = tx_update.instruction_data.len(),
-                        "geyser_pool_discovery: Pump.fun instruction has no discriminator - ignoring"
-                    );
-                    return None;
-                }
-
-                // Use INSTRUCTION accounts, not transaction account_keys!
-                // Based on observed logs:
-                // ix_account[0]: Global
-                // ix_account[1]: Fee Recipient
-                // ix_account[2]: Mint (writable, newly created)
-                // ix_account[3]: Bonding Curve PDA (writable)
-
-                // ROBUST MINT DETECTION:
-                // Iterate through accounts to find the Mint.
-                // Criteria:
-                // 1. Writable (it's being initialized)
-                // 2. Signer (it must sign to be created)
-                // 3. On-Curve (not a PDA)
-                // 4. Not the Fee Payer (usually index 0 of transaction, but hard to know here. However, Mint is usually NOT the first account in instruction if Global is 0)
-
-                let mut found_mint = None;
-
-                // Log all accounts for debugging
-                for (i, acc) in tx_update.instruction_accounts.iter().enumerate() {
-                    tracing::info!(
-                        signature = %tx_update.signature,
-                        index = i,
-                        pubkey = %acc,
-                        // We don't have is_signer/is_writable in the Pubkey struct here,
-                        // assuming tx_update.instruction_accounts is just Vec<Pubkey>.
-                        // Wait, if it's just Pubkey, we can't check signer status!
-                        // We need to look up the account in the transaction message if possible,
-                        // or rely on position/curve check.
-                        is_on_curve = acc.is_on_curve(),
-                        "geyser_pool_discovery: Account Analysis"
-                    );
-                }
-
-                // Since we only have Pubkeys in instruction_accounts (based on usage),
-                // we can't check signer/writable status directly unless we have the full message.
-                // However, we know:
-                // - Global (index 0) is on-curve but known.
-                // - Fee Recipient (index 1) is on-curve but known.
-                // - Bonding Curve (index 3?) is OFF-curve (PDA).
-                // - Associated Bonding Curve (index 4?) is OFF-curve (PDA).
-                // - Mint is ON-curve.
-
-                // So, skip index 0 and 1. Find the first ON-curve account.
-                // Also skip System Program, Token Program, etc.
-
-                let known_programs = [
-                    pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), // Token
-                    pubkey!("11111111111111111111111111111111"),            // System
-                    pubkey!("SysvarRent111111111111111111111111111111111"), // Rent
-                    pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"), // Metadata
-                    pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"), // ATA
-                    pubkey!("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1"), // Event Auth
-                    pubkey!("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM"), // Fee Recipient (correct)
-                    pubkey!("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf"), // Global
-                    pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),  // Pump.fun Program
-                ];
-
-                for acc in tx_update.instruction_accounts.iter() {
-                    // Skip known accounts
-                    if known_programs.contains(acc) {
-                        continue;
-                    }
-
-                    // Skip PDAs (Bonding Curve is PDA)
-                    if !acc.is_on_curve() {
-                        continue;
-                    }
-
-                    // The first remaining on-curve account is likely the Mint or the Mint Authority (Payer).
-                    // In Create instruction, Mint comes before Mint Authority usually?
-                    // Or Mint Authority comes first?
-                    // In the log: ix_2 (4AJX...) was Mint? ix_3 (6ydT...) was Bonding Curve.
-                    // If 4AJX... is on curve, and 6ydT... is off curve.
-                    // Then 4AJX... is the candidate.
-
-                    // We assume the Mint is the first unknown on-curve account.
-                    found_mint = Some(*acc);
-                    break;
-                }
-
-                if let Some(mint) = found_mint {
-                    tracing::info!(
-                        signature = %tx_update.signature,
-                        mint = %mint,
-                        "geyser_pool_discovery: ✅ DETECTED MINT via Heuristic"
-                    );
-                    mint
-                } else {
-                    tracing::warn!(
-                        signature = %tx_update.signature,
-                        "geyser_pool_discovery: ❌ FAILED TO DETECT MINT - Fallback to index 2"
-                    );
-                    tx_update.instruction_accounts.get(2).copied()?
-                }
+                // DISABLED: Transaction-based discovery for Pump.fun
+                // Now using Account-based discovery which extracts the REAL creator from bonding curve data
+                // This avoids the bug where tx signer != actual creator stored in bonding curve
+                debug!(
+                    signature = %tx_update.signature,
+                    "geyser_pool_discovery: Pump.fun TX ignored - using account-based discovery instead"
+                );
+                return None;
             }
             DexType::RaydiumAmmV4 => {
                 // For Raydium: need to analyze transaction structure
@@ -416,90 +270,16 @@ impl GeyserPoolDiscovery {
             }
         };
 
-        // Verify token mint exists on-chain via simple account fetch
-        // REMOVED: RPC check is too slow and prone to race conditions for new mints
-        // We trust the Geyser stream which just told us the mint is being created
-        /*
-        match rpc.get_account_retry(&token_mint).await {
-            Ok(_) => {
-                // Mint exists, continue
-            }
-            Err(_) => {
-                debug!(
-                    token_mint = %token_mint,
-                    signature = %tx_update.signature,
-                    "geyser_pool_discovery: token mint does not exist or fetch failed"
-                );
-                return None;
-            }
-        }
-        */
-
-        // Extract pool address (bonding curve for Pump.fun)
-        // For Pump.fun: instruction account[2] is the bonding curve PDA (the "pool")
-        // Index 3 is the associated bonding curve (token vault), NOT the bonding curve!
-        let pool_address = match dex_type {
-            DexType::PumpFun => tx_update.instruction_accounts.get(2).copied()?,
-            _ => tx_update.account_keys.first().copied()?,
-        };
-
-        // Extract creator (for Pump.fun - needed for new buy instruction accounts)
-        // Pump.fun CREATE instruction accounts:
-        // [0]: Global, [1]: Fee Recipient, [2]: Mint, [3]: Bonding Curve,
-        // [4]: Associated Bonding Curve, [5]: User/Creator (Signer)
-        // However, based on actual tx logs, user is usually at index 6
-        let creator = match dex_type {
-            DexType::PumpFun => {
-                // User/Creator is typically at index 6 in the CREATE instruction
-                // But let's find the first signer that's on-curve and not a known program
-                // Known programs to skip (many are on-curve!):
-                let metaplex = pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
-                let token_prog = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-                let ata_prog = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-                let system_prog = pubkey!("11111111111111111111111111111111");
-                let rent = pubkey!("SysvarRent111111111111111111111111111111111");
-                let event_auth = pubkey!("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1");
-                let pumpfun_global = pubkey!("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
-                let pumpfun_prog = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-                let fee_prog = pubkey!("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
-                // Fee recipients (multiple possible)
-                let fee_recip_1 = pubkey!("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM");
-                let fee_recip_2 = pubkey!("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV");
-
-                let known_to_skip = [
-                    metaplex,
-                    token_prog,
-                    ata_prog,
-                    system_prog,
-                    rent,
-                    event_auth,
-                    pumpfun_global,
-                    pumpfun_prog,
-                    fee_prog,
-                    fee_recip_1,
-                    fee_recip_2,
-                ];
-
-                tx_update
-                    .instruction_accounts
-                    .iter()
-                    .skip(5) // Skip known accounts: Global, Fee, Mint, Bonding, AssocBonding
-                    .find(|acc| acc.is_on_curve() && !known_to_skip.contains(acc))
-                    .copied()
-            }
-            _ => None,
-        };
-
         // SOL mint for quote
+        #[allow(unreachable_code)]
         let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
 
         tracing::info!(
             signature = %tx_update.signature,
             slot = tx_update.slot,
             dex = ?dex_type,
-            pool = %pool_address,
+            pool = %token_mint, // placeholder since all branches return None
             token_mint = %token_mint,
-            creator = ?creator,
             account_count = account_count,
             "geyser_pool_discovery: NEW POOL via TRANSACTION (professional method)"
         );
@@ -511,17 +291,17 @@ impl GeyserPoolDiscovery {
             .as_millis() as u64;
 
         Some(PoolDiscoveryEvent {
-            pool_address,
+            pool_address: token_mint, // placeholder
             dex_type,
             slot: tx_update.slot,
             base_mint: token_mint,
             quote_mint,
-            base_decimals: 9,  // Standard for Pump.fun, fetch actual later if needed
-            quote_decimals: 9, // SOL decimals
-            liquidity_estimate_lamports: 30_000_000_000, // Default 30 SOL for new pools
-            coin_vault: None,  // Will be fetched in background if needed
+            base_decimals: 9,
+            quote_decimals: 9,
+            liquidity_estimate_lamports: 30_000_000_000,
+            coin_vault: None,
             pc_vault: None,
-            creator,
+            creator: None,
             discovered_at_ms,
         })
     }
@@ -684,6 +464,103 @@ impl GeyserPoolDiscovery {
             liquidity_lamports,
             coin_vault: None, // Pump.fun uses bonding curve, not traditional vaults
             pc_vault: None,
+        })
+    }
+
+    /// Parse Pump.fun bonding curve from Geyser account update
+    /// Returns a full PoolDiscoveryEvent with the REAL creator from bytes [49..81]
+    ///
+    /// Bonding Curve Layout (from pump.fun program):
+    /// - Offset 0: discriminator (8 bytes)
+    /// - Offset 8: virtual_token_reserves (u64)
+    /// - Offset 16: virtual_sol_reserves (u64)  
+    /// - Offset 24: real_token_reserves (u64)
+    /// - Offset 32: real_sol_reserves (u64)
+    /// - Offset 40: token_total_supply (u64)
+    /// - Offset 48: complete (u8, bool)
+    /// - Offset 49: creator (Pubkey, 32 bytes) <-- THE REAL CREATOR!
+    /// - Offset 81: mint (Pubkey, 32 bytes)
+    fn parse_pumpfun_bonding_curve_full(
+        update: &GeyserAccountUpdate,
+    ) -> Option<PoolDiscoveryEvent> {
+        let data = &update.data;
+
+        // Minimum size: discriminator(8) + reserves(32) + total_supply(8) + complete(1) + creator(32) + mint(32) = 113 bytes
+        if data.len() < 113 {
+            debug!(
+                data_len = data.len(),
+                pool = %update.pubkey,
+                "pump.fun bonding curve too short for full parse"
+            );
+            return None;
+        }
+
+        // Parse reserves
+        let virtual_token_reserves = u64::from_le_bytes(data[8..16].try_into().ok()?);
+        let virtual_sol_reserves = u64::from_le_bytes(data[16..24].try_into().ok()?);
+        let real_token_reserves = u64::from_le_bytes(data[24..32].try_into().ok()?);
+        let real_sol_reserves = u64::from_le_bytes(data[32..40].try_into().ok()?);
+
+        // Parse complete flag (offset 48)
+        let complete = data[48] != 0;
+
+        // Parse REAL creator (offset 49-81) - THIS IS THE KEY FIX!
+        let creator = Pubkey::new_from_array(data[49..81].try_into().ok()?);
+
+        // Parse token mint (offset 81-113)
+        let base_mint = Pubkey::new_from_array(data[81..113].try_into().ok()?);
+
+        // SOL as quote
+        let quote_mint = pubkey!("So11111111111111111111111111111111111111112");
+
+        // Sanity checks
+        if base_mint.to_bytes() == [0u8; 32] {
+            debug!("pump.fun: base_mint is zero, skipping");
+            return None;
+        }
+
+        // Skip if already completed (migrated to Raydium)
+        if complete {
+            debug!(
+                pool = %update.pubkey,
+                mint = %base_mint,
+                "pump.fun: bonding curve complete (migrated), skipping"
+            );
+            return None;
+        }
+
+        // Use real SOL reserves as liquidity estimate
+        let liquidity_lamports = real_sol_reserves.max(virtual_sol_reserves);
+
+        let discovered_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        tracing::info!(
+            pool = %update.pubkey,
+            slot = update.slot,
+            mint = %base_mint,
+            creator = %creator,
+            real_sol = real_sol_reserves,
+            virtual_sol = virtual_sol_reserves,
+            complete = complete,
+            "geyser_pool_discovery: PUMPFUN pool via ACCOUNT UPDATE (with REAL creator!)"
+        );
+
+        Some(PoolDiscoveryEvent {
+            pool_address: update.pubkey,
+            dex_type: DexType::PumpFun,
+            slot: update.slot,
+            base_mint,
+            quote_mint,
+            base_decimals: 6,  // Pump.fun tokens use 6 decimals
+            quote_decimals: 9, // SOL decimals
+            liquidity_estimate_lamports: liquidity_lamports,
+            coin_vault: None,
+            pc_vault: None,
+            creator: Some(creator),
+            discovered_at_ms,
         })
     }
 }
