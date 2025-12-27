@@ -2,10 +2,13 @@
 
 To run tests and build the project locally on Windows, you need to ensure your environment is correctly configured.
 
-> **Note**: Production runs on Debian Linux (same server as the validator). 
-> This guide is for local development/testing only.
+> **⚠️ Windows Native Build Not Supported**  
+> The `yellowstone-grpc-proto` dependency uses `protobuf-src` which fails to compile on Windows 
+> due to path length and toolchain issues. **Use WSL2 for local development** (see section 5).
+>
+> Production runs on Debian Linux (same server as the validator).
 
-## 1. Install Prerequisites
+## 1. Install Prerequisites (for WSL2)
 
 ### Rust Toolchain
 ```powershell
@@ -92,18 +95,39 @@ cargo fmt -- --check
 | `linker link.exe not found` | Install VS Build Tools with C++ workload |
 | `LINK : fatal error LNK1181` | Missing C++ libs, reinstall VS Build Tools |
 
-## 5. Alternative: Build on Linux/WSL
+## 5. Recommended: Build via WSL2
 
-If Windows build issues persist, use WSL2:
+**Windows native build is not supported** due to `protobuf-src` compilation issues.
 
+### Setup WSL2
+```powershell
+# Install WSL2 with Ubuntu (in PowerShell as Admin)
+wsl --install -d Ubuntu
+```
+
+### Build in WSL2
 ```bash
 # In WSL2 (Ubuntu)
 sudo apt-get update
-sudo apt-get install -y build-essential protobuf-compiler libprotobuf-dev
+sudo apt-get install -y build-essential protobuf-compiler libprotobuf-dev pkg-config libssl-dev
 
-# Clone and build
+# Navigate to project (Windows paths accessible via /mnt/c/)
 cd /mnt/c/Users/rober/Iron_crab
+
+# Build
 cargo build --release
+
+# Run tests
+cargo test --features test_helpers
 ```
 
-This matches the CI environment exactly.
+This matches the CI and production environment exactly.
+
+## 6. IDE Setup (VS Code with WSL)
+
+For the best development experience, use VS Code with the WSL extension:
+
+1. Install [Remote - WSL](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-wsl) extension
+2. Open VS Code, press `Ctrl+Shift+P` → "WSL: Connect to WSL"
+3. Open the project folder from within WSL
+4. Install rust-analyzer extension in WSL context
