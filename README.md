@@ -267,10 +267,18 @@ Hinweis: Ohne `--replay-trace` generiert der Driver eine minimale Slot-Sequenz. 
 
 ## Build & Run (PowerShell)
 ```powershell
-## Build & Run (PowerShell)
-```powershell
 cargo run --release -- --config .\config.example.toml
 ```
+
+### Fuzzing
+Parser (Replay-Loader, Orca Whirlpool Layout) werden via `cargo-fuzz` getestet:
+```bash
+cargo install cargo-fuzz
+cd fuzz
+cargo fuzz run fuzz_replay_log_parser -- -max_total_time=60
+cargo fuzz run fuzz_orca_whirlpool_layout -- -max_total_time=60
+```
+Crash-Artefakte landen in `fuzz/artifacts/<target>/`, minimieren via `cargo fuzz tmin <target> <crash-file>`.
 
 ### Grafana‑Panels (Hinweise)
 - Quote Latenz: `quote_latency_seconds_*` (Heatmap/Histogram + P50/P90)
