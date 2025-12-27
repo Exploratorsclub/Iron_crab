@@ -601,10 +601,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle burn confirmations
     if !needs_burn.is_empty() {
-        println!("\n" + "=".repeat(60).as_str());
+        println!("\n{}", "=".repeat(60));
         println!("⚠️  WARNING: The following tokens could NOT be sold on any DEX!");
         println!("These tokens have NO LIQUIDITY and can only be BURNED to recover rent (~0.002 SOL each).");
-        println!("=".repeat(60));
+        println!("{}", "=".repeat(60));
 
         for (task, reason) in &needs_burn {
             println!(
@@ -613,7 +613,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
-        println!("\n" + "=".repeat(60).as_str());
+        println!("\n{}", "=".repeat(60));
 
         if force_burn {
             println!(
