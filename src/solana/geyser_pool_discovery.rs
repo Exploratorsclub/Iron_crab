@@ -46,8 +46,7 @@ impl GeyserPoolDiscovery {
             loop {
                 match rx.recv().await {
                     Ok(update) => {
-                        if let Some(event) =
-                            Self::process_account_update(update, &rpc_clone).await
+                        if let Some(event) = Self::process_account_update(update, &rpc_clone).await
                         {
                             tracing::debug!(
                                 dex = ?event.dex_type,
@@ -454,14 +453,6 @@ impl GeyserPoolDiscovery {
             pc_vault: None,
         })
     }
-
-    /// Extract creator from Pump.fun bonding curve account data
-    ///
-    /// Bonding Curve Layout (151 bytes total):
-    /// - Offset 0: discriminator (8 bytes)
-    /// - Offset 8: virtual_token_reserves (u64)
-    /// - Offset 16: virtual_sol_reserves (u64)  
-    /// - Offset 24: real_token_reserves (u64)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
