@@ -6,12 +6,18 @@ use crate::solana::geyser_listener::{
 };
 use crate::solana::rpc::SolanaRpc;
 use anyhow::Result;
+use parking_lot::RwLock;
 use solana_sdk::pubkey;
 use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::debug;
+
+/// Cache for bonding curve -> creator mappings from account updates
+/// This is needed because the mint is in the TX but the creator is in the account data
+type CreatorCache = Arc<RwLock<HashMap<Pubkey, Pubkey>>>;
 
 /// Pool discovery via Geyser account updates
 pub struct GeyserPoolDiscovery {
@@ -36,17 +42,25 @@ impl GeyserPoolDiscovery {
         // Create event channel for pool discoveries
         let (event_tx, event_rx) = broadcast::channel(10000);
 
+        // Creator cache: bonding_curve -> creator (from account data)
+        // Pump.fun bonding curve doesn't store the mint, only the creator
+        // We need to get mint from TX and creator from account update
+        let creator_cache: CreatorCache = Arc::new(RwLock::new(HashMap::new()));
+
         let discovery = Self { listener };
 
         // Spawn account processor
         let rpc_clone = rpc.clone();
         let event_tx_clone = event_tx.clone();
+        let creator_cache_clone = creator_cache.clone();
         tokio::spawn(async move {
             let mut rx = account_rx;
             loop {
                 match rx.recv().await {
                     Ok(update) => {
-                        if let Some(event) = Self::process_account_update(update, &rpc_clone).await
+                        if let Some(event) =
+                            Self::process_account_update(update, &rpc_clone, &creator_cache_clone)
+                                .await
                         {
                             // Log before sending
                             tracing::debug!(
@@ -70,13 +84,18 @@ impl GeyserPoolDiscovery {
 
         // Spawn transaction processor
         let rpc_clone2 = rpc.clone();
+        let creator_cache_clone2 = creator_cache.clone();
         tokio::spawn(async move {
             let mut rx = transaction_rx;
             loop {
                 match rx.recv().await {
                     Ok(tx_update) => {
-                        if let Some(event) =
-                            Self::process_transaction_update(tx_update, &rpc_clone2).await
+                        if let Some(event) = Self::process_transaction_update(
+                            tx_update,
+                            &rpc_clone2,
+                            &creator_cache_clone2,
+                        )
+                        .await
                         {
                             // Log before sending to verify event is created
                             tracing::info!(
@@ -124,20 +143,39 @@ impl GeyserPoolDiscovery {
     }
 
     /// Process account update and determine if it's a new pool
+    /// For Pump.fun: caches the creator (doesn't emit event - TX-based does that)
     async fn process_account_update(
         update: GeyserAccountUpdate,
         _rpc: &Arc<SolanaRpc>,
+        creator_cache: &CreatorCache,
     ) -> Option<PoolDiscoveryEvent> {
         // Identify DEX by owner
         let dex_type = match update.owner.to_string().as_str() {
             "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" => DexType::RaydiumAmmV4,
             "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" => DexType::OrcaWhirlpool,
             "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" => {
-                // Pump.fun: Extract creator from bonding curve account data
-                // This is the REAL creator stored at bytes [49..81], NOT the tx signer!
-                if let Some(event) = Self::parse_pumpfun_bonding_curve_full(&update) {
-                    return Some(event);
+                // Pump.fun: Cache the creator from bonding curve account data
+                // The bonding curve doesn't contain the mint, only the creator
+                // We cache (bonding_curve -> creator) and the TX processor uses it
+                if let Some(creator) = Self::extract_pumpfun_creator(&update.data) {
+                    let mut cache = creator_cache.write();
+                    cache.insert(update.pubkey, creator);
+                    // Limit cache size to prevent unbounded growth
+                    if cache.len() > 100_000 {
+                        // Remove oldest entries (HashMap doesn't track order, so just clear half)
+                        let keys: Vec<_> = cache.keys().take(50_000).copied().collect();
+                        for k in keys {
+                            cache.remove(&k);
+                        }
+                    }
+                    debug!(
+                        bonding_curve = %update.pubkey,
+                        creator = %creator,
+                        cache_size = cache.len(),
+                        "geyser_pool_discovery: cached Pump.fun creator"
+                    );
                 }
+                // Don't emit event - TX-based discovery will do that with the mint
                 return None;
             }
             _ => {
@@ -190,11 +228,11 @@ impl GeyserPoolDiscovery {
     }
 
     /// Process transaction update to extract token mints from instruction accounts
-    /// This is the professional approach - transaction instructions contain token mints
-    /// as instruction accounts, avoiding the need to parse account data layouts
+    /// For Pump.fun: gets mint from TX, creator from cache (set by account processor)
     async fn process_transaction_update(
         tx_update: GeyserTransactionUpdate,
         _rpc: &Arc<SolanaRpc>,
+        creator_cache: &CreatorCache,
     ) -> Option<PoolDiscoveryEvent> {
         // Identify DEX by looking for known program IDs in account_keys
         let raydium_program =
@@ -213,97 +251,83 @@ impl GeyserPoolDiscovery {
             return None;
         };
 
-        // Filter: Only process pool creation transactions
-        // REMOVED: account_count == 18 check was too brittle and filtering valid transactions
-        // We now rely on the instruction discriminator check which is much more robust
-        let account_count = tx_update.account_keys.len();
+        let _account_count = tx_update.account_keys.len();
 
-        // Extract token mint from instruction accounts
-        // For Pump.fun Create instruction:
-        // account[0]: Token Mint (writable, to be created) ← THIS IS WHAT WE NEED!
-        // account[1]: Mint Authority / Creator (signer)
-        // account[2]: Bonding Curve (writable, PDA)
-        // account[3]: Associated Bonding Curve Vault (writable)
-        // account[4]: Global state
-        // account[5]: MPL Token Metadata
-        // account[6]: Metadata account
-        // account[7]: System Program
-        // account[8]: Token Program
-        // account[9]: Associated Token Program
-        // account[10]: Rent
-        // account[11]: Event Authority
-        // account[12]: Program
-
-        // DEBUG: Log complete account_keys array to analyze structure
-        if dex_type == DexType::PumpFun {
-            tracing::debug!(
-                message = "DEBUG: Pump.fun CREATE - instruction accounts",
-                account_count = tx_update.account_keys.len(),
-                instruction_count = tx_update.instruction_accounts.len(),
-                ix_account_0 = %tx_update.instruction_accounts.first().map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
-                ix_account_1 = %tx_update.instruction_accounts.get(1).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
-                ix_account_2 = %tx_update.instruction_accounts.get(2).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
-                ix_account_3 = %tx_update.instruction_accounts.get(3).map(|k| k.to_string()).unwrap_or_else(|| "None".to_string()),
-            );
-        }
-
-        let token_mint = match dex_type {
+        // Process based on DEX type
+        match dex_type {
             DexType::PumpFun => {
-                // DISABLED: Transaction-based discovery for Pump.fun
-                // Now using Account-based discovery which extracts the REAL creator from bonding curve data
-                // This avoids the bug where tx signer != actual creator stored in bonding curve
-                debug!(
+                // Need at least 4 instruction accounts for CREATE
+                if tx_update.instruction_accounts.len() < 4 {
+                    return None;
+                }
+
+                // Check for CREATE discriminator
+                const PUMPFUN_CREATE_DISCRIMINATOR: [u8; 8] =
+                    [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
+
+                if tx_update.instruction_data.len() < 8 {
+                    return None;
+                }
+                let discriminator = &tx_update.instruction_data[0..8];
+                if discriminator != PUMPFUN_CREATE_DISCRIMINATOR {
+                    return None; // Not CREATE, likely BUY or SELL
+                }
+
+                // Pump.fun CREATE instruction accounts:
+                // [0]: Global
+                // [1]: Fee Recipient
+                // [2]: Mint (the token being created!)
+                // [3]: Bonding Curve PDA
+                // [4]: Associated Bonding Curve (token vault)
+                // [5+]: User, programs, etc.
+
+                // Get the mint (account index 2)
+                let token_mint = *tx_update.instruction_accounts.get(2)?;
+
+                // Get the bonding curve (account index 3)
+                let bonding_curve = *tx_update.instruction_accounts.get(3)?;
+
+                // Try to get creator from cache (set by account processor)
+                let creator = creator_cache.read().get(&bonding_curve).copied();
+
+                let quote_mint = pubkey!("So11111111111111111111111111111111111111112");
+
+                let discovered_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
+                tracing::info!(
                     signature = %tx_update.signature,
-                    "geyser_pool_discovery: Pump.fun TX ignored - using account-based discovery instead"
+                    slot = tx_update.slot,
+                    mint = %token_mint,
+                    bonding_curve = %bonding_curve,
+                    creator = ?creator,
+                    creator_from_cache = creator.is_some(),
+                    "geyser_pool_discovery: PUMPFUN CREATE via TX (with cached creator)"
                 );
-                return None;
+
+                Some(PoolDiscoveryEvent {
+                    pool_address: bonding_curve,
+                    dex_type: DexType::PumpFun,
+                    slot: tx_update.slot,
+                    base_mint: token_mint,
+                    quote_mint,
+                    base_decimals: 6,  // Pump.fun uses 6 decimals
+                    quote_decimals: 9, // SOL
+                    liquidity_estimate_lamports: 30_000_000_000, // 30 SOL default
+                    coin_vault: None,
+                    pc_vault: None,
+                    creator,
+                    discovered_at_ms,
+                })
             }
-            DexType::RaydiumAmmV4 => {
-                // For Raydium: need to analyze transaction structure
-                // For now, skip until we analyze Raydium pool creations
-                return None;
+            DexType::RaydiumAmmV4 | DexType::OrcaWhirlpool => {
+                // Raydium/Orca: TX-based discovery not implemented yet
+                // We use account-based discovery for these
+                None
             }
-            DexType::OrcaWhirlpool => {
-                // For Orca: need to analyze transaction structure
-                // For now, skip until we analyze Orca pool creations
-                return None;
-            }
-        };
-
-        // SOL mint for quote
-        #[allow(unreachable_code)]
-        let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
-
-        tracing::info!(
-            signature = %tx_update.signature,
-            slot = tx_update.slot,
-            dex = ?dex_type,
-            pool = %token_mint, // placeholder since all branches return None
-            token_mint = %token_mint,
-            account_count = account_count,
-            "geyser_pool_discovery: NEW POOL via TRANSACTION (professional method)"
-        );
-
-        // Create pool discovery event with transaction-based mint
-        let discovered_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        Some(PoolDiscoveryEvent {
-            pool_address: token_mint, // placeholder
-            dex_type,
-            slot: tx_update.slot,
-            base_mint: token_mint,
-            quote_mint,
-            base_decimals: 9,
-            quote_decimals: 9,
-            liquidity_estimate_lamports: 30_000_000_000,
-            coin_vault: None,
-            pc_vault: None,
-            creator: None,
-            discovered_at_ms,
-        })
+        }
     }
 
     /// Parse Raydium AMM v4 pool account (based on official program/src/state.rs)
@@ -467,10 +491,9 @@ impl GeyserPoolDiscovery {
         })
     }
 
-    /// Parse Pump.fun bonding curve from Geyser account update
-    /// Returns a full PoolDiscoveryEvent with the REAL creator from bytes [49..81]
+    /// Extract creator from Pump.fun bonding curve account data
     ///
-    /// Bonding Curve Layout (from pump.fun program):
+    /// Bonding Curve Layout (151 bytes total):
     /// - Offset 0: discriminator (8 bytes)
     /// - Offset 8: virtual_token_reserves (u64)
     /// - Offset 16: virtual_sol_reserves (u64)  
@@ -479,89 +502,25 @@ impl GeyserPoolDiscovery {
     /// - Offset 40: token_total_supply (u64)
     /// - Offset 48: complete (u8, bool)
     /// - Offset 49: creator (Pubkey, 32 bytes) <-- THE REAL CREATOR!
-    /// - Offset 81: mint (Pubkey, 32 bytes)
-    fn parse_pumpfun_bonding_curve_full(
-        update: &GeyserAccountUpdate,
-    ) -> Option<PoolDiscoveryEvent> {
-        let data = &update.data;
-
-        // Minimum size: discriminator(8) + reserves(32) + total_supply(8) + complete(1) + creator(32) + mint(32) = 113 bytes
-        if data.len() < 113 {
-            debug!(
-                data_len = data.len(),
-                pool = %update.pubkey,
-                "pump.fun bonding curve too short for full parse"
-            );
+    /// - Offset 81-151: padding/other data (NO MINT!)
+    ///
+    /// NOTE: The mint is NOT stored in the bonding curve!
+    /// It must be extracted from the CREATE transaction.
+    fn extract_pumpfun_creator(data: &[u8]) -> Option<Pubkey> {
+        // Minimum size: discriminator(8) + reserves(40) + complete(1) + creator(32) = 81 bytes
+        if data.len() < 81 {
             return None;
         }
 
-        // Parse reserves
-        let virtual_token_reserves = u64::from_le_bytes(data[8..16].try_into().ok()?);
-        let virtual_sol_reserves = u64::from_le_bytes(data[16..24].try_into().ok()?);
-        let real_token_reserves = u64::from_le_bytes(data[24..32].try_into().ok()?);
-        let real_sol_reserves = u64::from_le_bytes(data[32..40].try_into().ok()?);
-
-        // Parse complete flag (offset 48)
-        let complete = data[48] != 0;
-
-        // Parse REAL creator (offset 49-81) - THIS IS THE KEY FIX!
+        // Creator is at bytes [49..81]
         let creator = Pubkey::new_from_array(data[49..81].try_into().ok()?);
 
-        // Parse token mint (offset 81-113)
-        let base_mint = Pubkey::new_from_array(data[81..113].try_into().ok()?);
-
-        // SOL as quote
-        let quote_mint = pubkey!("So11111111111111111111111111111111111111112");
-
-        // Sanity checks
-        if base_mint.to_bytes() == [0u8; 32] {
-            debug!("pump.fun: base_mint is zero, skipping");
+        // Sanity check - creator shouldn't be zero
+        if creator.to_bytes() == [0u8; 32] {
             return None;
         }
 
-        // Skip if already completed (migrated to Raydium)
-        if complete {
-            debug!(
-                pool = %update.pubkey,
-                mint = %base_mint,
-                "pump.fun: bonding curve complete (migrated), skipping"
-            );
-            return None;
-        }
-
-        // Use real SOL reserves as liquidity estimate
-        let liquidity_lamports = real_sol_reserves.max(virtual_sol_reserves);
-
-        let discovered_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        tracing::info!(
-            pool = %update.pubkey,
-            slot = update.slot,
-            mint = %base_mint,
-            creator = %creator,
-            real_sol = real_sol_reserves,
-            virtual_sol = virtual_sol_reserves,
-            complete = complete,
-            "geyser_pool_discovery: PUMPFUN pool via ACCOUNT UPDATE (with REAL creator!)"
-        );
-
-        Some(PoolDiscoveryEvent {
-            pool_address: update.pubkey,
-            dex_type: DexType::PumpFun,
-            slot: update.slot,
-            base_mint,
-            quote_mint,
-            base_decimals: 6,  // Pump.fun tokens use 6 decimals
-            quote_decimals: 9, // SOL decimals
-            liquidity_estimate_lamports: liquidity_lamports,
-            coin_vault: None,
-            pc_vault: None,
-            creator: Some(creator),
-            discovered_at_ms,
-        })
+        Some(creator)
     }
 }
 
