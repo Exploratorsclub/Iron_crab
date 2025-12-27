@@ -16,7 +16,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
@@ -39,8 +39,6 @@ struct PendingAtaBalance {
     notify: oneshot::Sender<AtaBalanceResult>,
     /// When this was registered (for timeout)
     registered_at: std::time::Instant,
-    /// The mint (for logging)
-    mint: Pubkey,
     /// Expected minimum balance (usually 0 = any tokens)
     min_balance: u64,
 }
@@ -378,7 +376,6 @@ impl GeyserTxConfirm {
         let pending = PendingAtaBalance {
             notify: tx,
             registered_at: std::time::Instant::now(),
-            mint: ata,      // Use ATA as identifier (mint not needed for simplicity)
             min_balance: 1, // Any tokens > 0
         };
 
