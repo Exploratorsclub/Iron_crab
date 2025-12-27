@@ -12,7 +12,7 @@ use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::Transaction;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -27,6 +27,10 @@ struct Args {
     /// Override RPC URL (e.g. https://api.mainnet-beta.solana.com)
     #[arg(long)]
     rpc_url: Option<String>,
+
+    /// Force burn without confirmation (DANGEROUS - use with caution)
+    #[arg(long, default_value = "false")]
+    force_burn: bool,
 }
 
 struct SellTask {
@@ -106,118 +110,33 @@ async fn burn_and_close_account(
     }
 }
 
-async fn sell_token_pumpfun(
-    rpc: Arc<SolanaRpc>,
-    pumpfun: Arc<PumpFunDex>,
-    treasury: Arc<Treasury>,
-    task: &SellTask,
-) -> anyhow::Result<()> {
-    let mint = task.mint;
-    let amount = task.amount;
-    let sol_mint_str = "So11111111111111111111111111111111111111112";
-
-    info!("Selling {} {} via Pump.fun...", amount, mint);
-
-    // Get quote first
-    let quote = match pumpfun
-        .quote_exact_in(&mint.to_string(), sol_mint_str, amount)
-        .await
-    {
-        Ok(Some(q)) => q,
-        Ok(None) => {
-            warn!("No Pump.fun quote available for {}", mint);
-            return Err(anyhow::anyhow!("No quote"));
-        }
-        Err(e) => {
-            warn!("Failed to get Pump.fun quote for {}: {:?}", mint, e);
-            return Err(e);
-        }
-    };
-
-    // Very low min_out for panic sell (1% of expected)
-    let min_out = quote.amount_out / 100;
-
-    info!(
-        "Pump.fun quote: {} tokens -> {} lamports (min_out={})",
-        amount, quote.amount_out, min_out
-    );
-
-    // Build sell instruction
-    match pumpfun
-        .build_swap_ix_async(&mint.to_string(), sol_mint_str, amount, min_out, None)
-        .await
-    {
-        Ok(ixs) if !ixs.is_empty() => {
-            let latest_blockhash = rpc.get_latest_blockhash_retry().await?;
-            let mut tx = Transaction::new_with_payer(&ixs, Some(&treasury.pubkey()));
-
-            if let Err(e) = tx.try_sign(&[treasury.signer_ref()], latest_blockhash) {
-                warn!("Failed to sign Pump.fun sell for {}: {:?}", mint, e);
-                return Err(anyhow::anyhow!("Failed to sign"));
-            }
-
-            match rpc.rpc.send_and_confirm_transaction(&tx).await {
-                Ok(sig) => {
-                    info!("Sold {} via Pump.fun! Sig: {}", mint, sig);
-                }
-                Err(e) => {
-                    warn!("Failed to sell {} via Pump.fun: {:?}", mint, e);
-                    return Err(anyhow::anyhow!("TX failed: {:?}", e));
-                }
-            }
-        }
-        Ok(_) => {
-            warn!("No Pump.fun instructions generated for {}", mint);
-            return Err(anyhow::anyhow!("No instructions"));
-        }
-        Err(e) => {
-            warn!("Failed to build Pump.fun sell for {}: {:?}", mint, e);
-            return Err(e);
-        }
-    }
-
-    Ok(())
+/// Result of sell attempt - either sold or needs burn
+#[derive(Debug)]
+enum SellResult {
+    Sold,
+    NeedsConfirmation(SellTask, String), // task + reason why it failed
 }
 
-async fn sell_token(
+/// Try to sell on Raydium - returns true if successful
+async fn try_sell_raydium(
     rpc: Arc<SolanaRpc>,
     raydium: Arc<Raydium>,
-    pumpfun: Arc<PumpFunDex>,
     treasury: Arc<Treasury>,
-    task: SellTask,
+    task: &SellTask,
     wsol_ata: Pubkey,
-) -> anyhow::Result<()> {
+) -> bool {
     let mint = task.mint;
     let amount = task.amount;
     let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+    let slippage_bps = 9900; // 99% slippage for panic sell
 
-    // Check if this is a Pump.fun token first
-    if is_pumpfun_mint(&mint) {
-        info!(
-            "{} appears to be a Pump.fun token, trying Pump.fun first...",
-            mint
-        );
-        if sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task)
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-        info!("Pump.fun sell failed, falling back to Raydium...");
-    }
+    info!("Trying Raydium for {} ({} tokens)...", mint, amount);
 
-    // Slippage 99% for panic sell (force execution)
-    let slippage_bps = 9900;
-
-    // Try to fetch pool specifically for this pair if not in cache
-    // Use Raydium V3 API via curl to avoid RPC scanning issues
-    // Fetch multiple pools (pageSize=10) and filter for V4 (AMM)
+    // Fetch pool from Raydium API
     let url = format!(
         "https://api-v3.raydium.io/pools/info/mint?mint1={}&mint2={}&poolType=all&poolSortField=liquidity&sortType=desc&pageSize=10&page=1",
         mint, sol_mint
     );
-
-    info!("Fetching pool for {} from Raydium API...", mint);
 
     let output = std::process::Command::new("curl")
         .arg("-s")
@@ -231,22 +150,11 @@ async fn sell_token(
                 serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
 
             if let Some(arr) = v["data"]["data"].as_array() {
-                // Find first pool with Raydium V4 Program ID
                 let v4_prog = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
-                let found = arr
-                    .iter()
-                    .find(|p| p["programId"].as_str().unwrap_or("") == v4_prog);
-
-                if let Some(pool) = found {
-                    if let Some(id_str) = pool["id"].as_str() {
-                        Pubkey::from_str(id_str).ok()
-                    } else {
-                        None
-                    }
-                } else {
-                    warn!("No Raydium V4 pool found in API response for {}", mint);
-                    None
-                }
+                arr.iter()
+                    .find(|p| p["programId"].as_str().unwrap_or("") == v4_prog)
+                    .and_then(|pool| pool["id"].as_str())
+                    .and_then(|id_str| Pubkey::from_str(id_str).ok())
             } else {
                 None
             }
@@ -256,114 +164,196 @@ async fn sell_token(
 
     if let Some(pid) = pool_id {
         if pid != Pubkey::default() {
-            info!("Found pool {} via API. Loading...", pid);
+            info!("Found Raydium pool {} for {}", pid, mint);
             if let Err(e) = raydium.load_pool_from_geyser(&pid).await {
                 warn!("Failed to load pool {}: {}", pid, e);
             }
         }
     } else {
-        warn!("No pool found for {} via API", mint);
+        warn!("No Raydium pool found for {}", mint);
+        return false;
     }
 
     match raydium
-        .build_swap_plan_auto(
-            &mint.to_string(),
-            &sol_mint.to_string(),
-            amount,
-            slippage_bps,
-        )
+        .build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), amount, slippage_bps)
         .await
     {
         Ok(Some(plan)) => {
-            info!(
-                "Selling {} {} -> SOL (Expected: {})",
-                amount, mint, plan.expected_out
-            );
+            info!("Raydium quote: {} tokens -> {} lamports", amount, plan.expected_out);
 
             let mut ixs = plan.ixs;
-
-            // Patch Raydium instructions with actual user accounts
-            let raydium_prog =
-                Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").unwrap();
-            let source_pubkey = task.ta_pubkey;
+            let raydium_prog = Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").unwrap();
 
             for ix in ixs.iter_mut() {
-                if ix.program_id == raydium_prog {
-                    // Raydium V4 Swap Instruction has 18 accounts.
-                    // Index 15: User Source
-                    // Index 16: User Destination
-                    // Index 17: User Authority
-                    if ix.accounts.len() >= 18 {
-                        // Patch User Source
-                        if ix.accounts[15].pubkey == Pubkey::default() {
-                            ix.accounts[15].pubkey = source_pubkey;
-                        }
-                        // Patch User Destination
-                        if ix.accounts[16].pubkey == Pubkey::default() {
-                            ix.accounts[16].pubkey = wsol_ata;
-                        }
-                        // Patch User Authority
-                        if ix.accounts[17].pubkey == Pubkey::default() {
-                            ix.accounts[17].pubkey = treasury.pubkey();
-                        }
+                if ix.program_id == raydium_prog && ix.accounts.len() >= 18 {
+                    if ix.accounts[15].pubkey == Pubkey::default() {
+                        ix.accounts[15].pubkey = task.ta_pubkey;
+                    }
+                    if ix.accounts[16].pubkey == Pubkey::default() {
+                        ix.accounts[16].pubkey = wsol_ata;
+                    }
+                    if ix.accounts[17].pubkey == Pubkey::default() {
+                        ix.accounts[17].pubkey = treasury.pubkey();
                     }
                 }
             }
 
-            let latest_blockhash = rpc.get_latest_blockhash_retry().await?;
-            let mut tx = Transaction::new_with_payer(&ixs, Some(&treasury.pubkey()));
+            let latest_blockhash = match rpc.get_latest_blockhash_retry().await {
+                Ok(bh) => bh,
+                Err(e) => {
+                    warn!("Failed to get blockhash: {:?}", e);
+                    return false;
+                }
+            };
 
-            if let Err(e) = tx.try_sign(&[treasury.signer_ref()], latest_blockhash) {
-                warn!("Failed to sign transaction for {}: {:?}", mint, e);
-                return Err(anyhow::anyhow!("Failed to sign"));
+            let mut tx = Transaction::new_with_payer(&ixs, Some(&treasury.pubkey()));
+            if tx.try_sign(&[treasury.signer_ref()], latest_blockhash).is_err() {
+                warn!("Failed to sign Raydium tx for {}", mint);
+                return false;
             }
 
             match rpc.rpc.send_and_confirm_transaction(&tx).await {
                 Ok(sig) => {
-                    info!("Sold {}! Sig: {}", mint, sig);
+                    info!("✅ Sold {} via Raydium! Sig: {}", mint, sig);
+                    true
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to sell {} via Raydium: {:?}, trying Pump.fun...",
-                        mint, e
-                    );
-                    // Fallback to Pump.fun when Raydium TX fails (e.g., slippage)
-                    if sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task)
-                        .await
-                        .is_err()
-                    {
-                        // Last resort: burn and close account to recover rent
-                        let _ = burn_and_close_account(rpc.clone(), treasury.clone(), &task).await;
-                    }
+                    warn!("Raydium TX failed for {}: {:?}", mint, e);
+                    false
                 }
             }
         }
         Ok(None) => {
-            warn!("No Raydium route for {}, trying Pump.fun...", mint);
-            if sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task)
-                .await
-                .is_err()
-            {
-                // Last resort: burn and close account to recover rent
-                let _ = burn_and_close_account(rpc.clone(), treasury.clone(), &task).await;
-            }
+            warn!("No Raydium swap plan for {}", mint);
+            false
         }
         Err(e) => {
-            warn!(
-                "Error planning Raydium swap for {}: {:?}, trying Pump.fun...",
-                mint, e
-            );
-            if sell_token_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task)
-                .await
-                .is_err()
-            {
-                // Last resort: burn and close account to recover rent
-                let _ = burn_and_close_account(rpc.clone(), treasury.clone(), &task).await;
-            }
+            warn!("Raydium error for {}: {:?}", mint, e);
+            false
         }
     }
+}
 
-    Ok(())
+/// Try to sell on Pump.fun - returns true if successful
+async fn try_sell_pumpfun(
+    rpc: Arc<SolanaRpc>,
+    pumpfun: Arc<PumpFunDex>,
+    treasury: Arc<Treasury>,
+    task: &SellTask,
+) -> bool {
+    let mint = task.mint;
+    let amount = task.amount;
+    let sol_mint_str = "So11111111111111111111111111111111111111112";
+
+    info!("Trying Pump.fun for {} ({} tokens)...", mint, amount);
+
+    // Get quote
+    let quote = match pumpfun.quote_exact_in(&mint.to_string(), sol_mint_str, amount).await {
+        Ok(Some(q)) => q,
+        Ok(None) => {
+            warn!("No Pump.fun quote for {}", mint);
+            return false;
+        }
+        Err(e) => {
+            warn!("Pump.fun quote error for {}: {:?}", mint, e);
+            return false;
+        }
+    };
+
+    let min_out = quote.amount_out / 100; // 1% min for panic sell
+    info!("Pump.fun quote: {} tokens -> {} lamports", amount, quote.amount_out);
+
+    match pumpfun.build_swap_ix_async(&mint.to_string(), sol_mint_str, amount, min_out, None).await {
+        Ok(ixs) if !ixs.is_empty() => {
+            let latest_blockhash = match rpc.get_latest_blockhash_retry().await {
+                Ok(bh) => bh,
+                Err(e) => {
+                    warn!("Failed to get blockhash: {:?}", e);
+                    return false;
+                }
+            };
+
+            let mut tx = Transaction::new_with_payer(&ixs, Some(&treasury.pubkey()));
+            if tx.try_sign(&[treasury.signer_ref()], latest_blockhash).is_err() {
+                warn!("Failed to sign Pump.fun tx for {}", mint);
+                return false;
+            }
+
+            match rpc.rpc.send_and_confirm_transaction(&tx).await {
+                Ok(sig) => {
+                    info!("✅ Sold {} via Pump.fun! Sig: {}", mint, sig);
+                    true
+                }
+                Err(e) => {
+                    warn!("Pump.fun TX failed for {}: {:?}", mint, e);
+                    false
+                }
+            }
+        }
+        Ok(_) => {
+            warn!("No Pump.fun instructions for {}", mint);
+            false
+        }
+        Err(e) => {
+            warn!("Pump.fun build error for {}: {:?}", mint, e);
+            false
+        }
+    }
+}
+
+/// Try ALL DEXes before giving up. Returns SellResult indicating if burn is needed.
+async fn sell_token(
+    rpc: Arc<SolanaRpc>,
+    raydium: Arc<Raydium>,
+    pumpfun: Arc<PumpFunDex>,
+    treasury: Arc<Treasury>,
+    task: SellTask,
+    wsol_ata: Pubkey,
+) -> SellResult {
+    let mint = task.mint;
+    let mut errors = Vec::new();
+
+    // Strategy: Try the most likely DEX first based on mint pattern
+    let is_pumpfun_token = is_pumpfun_mint(&mint);
+
+    if is_pumpfun_token {
+        // Pump.fun token: try Pump.fun first, then Raydium (for migrated tokens)
+        info!("{} looks like a Pump.fun token, trying Pump.fun first...", mint);
+
+        if try_sell_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task).await {
+            return SellResult::Sold;
+        }
+        errors.push("Pump.fun failed");
+
+        info!("Pump.fun failed, trying Raydium (token may have migrated)...");
+        if try_sell_raydium(rpc.clone(), raydium.clone(), treasury.clone(), &task, wsol_ata).await {
+            return SellResult::Sold;
+        }
+        errors.push("Raydium failed");
+    } else {
+        // Non-Pump.fun token: try Raydium first, then Pump.fun as fallback
+        info!("{} trying Raydium first...", mint);
+
+        if try_sell_raydium(rpc.clone(), raydium.clone(), treasury.clone(), &task, wsol_ata).await {
+            return SellResult::Sold;
+        }
+        errors.push("Raydium failed");
+
+        info!("Raydium failed, trying Pump.fun as fallback...");
+        if try_sell_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task).await {
+            return SellResult::Sold;
+        }
+        errors.push("Pump.fun failed");
+    }
+
+    // All DEXes failed - return for user confirmation
+    let reason = errors.join(", ");
+    warn!(
+        "❌ All DEXes failed for {} ({} tokens): {}",
+        mint, task.amount, reason
+    );
+
+    SellResult::NeedsConfirmation(task, reason)
 }
 
 #[tokio::main]
@@ -541,8 +531,10 @@ async fn main() -> anyhow::Result<()> {
 
     let concurrency = 5;
     let treasury = Arc::new(treasury); // Wrap in Arc for sharing
+    let force_burn = args.force_burn;
 
-    stream::iter(tasks)
+    // Collect results to handle burns separately
+    let results: Vec<SellResult> = stream::iter(tasks)
         .map(|task| {
             let rpc = rpc.clone();
             let raydium = raydium.clone();
@@ -551,8 +543,57 @@ async fn main() -> anyhow::Result<()> {
             async move { sell_token(rpc, raydium, pumpfun, treasury, task, wsol_ata).await }
         })
         .buffer_unordered(concurrency)
-        .collect::<Vec<_>>()
+        .collect()
         .await;
+
+    // Collect tokens that need burn confirmation
+    let needs_burn: Vec<(SellTask, String)> = results
+        .into_iter()
+        .filter_map(|r| match r {
+            SellResult::NeedsConfirmation(task, reason) => Some((task, reason)),
+            SellResult::Sold => None,
+        })
+        .collect();
+
+    // Handle burn confirmations
+    if !needs_burn.is_empty() {
+        println!("\n" + "=".repeat(60).as_str());
+        println!("⚠️  WARNING: The following tokens could NOT be sold on any DEX!");
+        println!("These tokens have NO LIQUIDITY and can only be BURNED to recover rent (~0.002 SOL each).");
+        println!("=".repeat(60));
+
+        for (task, reason) in &needs_burn {
+            println!(
+                "\n  Mint: {}\n  Amount: {} tokens\n  Reason: {}",
+                task.mint, task.amount, reason
+            );
+        }
+
+        println!("\n" + "=".repeat(60).as_str());
+
+        if force_burn {
+            println!("--force-burn flag set, burning all {} tokens...", needs_burn.len());
+        } else {
+            print!("\nDo you want to BURN these {} token(s) and close accounts? [y/N]: ", needs_burn.len());
+            io::stdout().flush()?;
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let input = input.trim().to_lowercase();
+
+            if input != "y" && input != "yes" {
+                println!("Burn cancelled. Tokens remain in wallet.");
+                info!("User declined burn for {} tokens", needs_burn.len());
+            } else {
+                println!("Burning {} tokens...", needs_burn.len());
+                for (task, _) in needs_burn {
+                    if let Err(e) = burn_and_close_account(rpc.clone(), treasury.clone(), &task).await {
+                        warn!("Failed to burn {}: {:?}", task.mint, e);
+                    }
+                }
+            }
+        }
+    }
 
     info!("All sells completed. Unwrapping WSOL...");
     let _ = treasury.unwrap_wsol(&rpc, None).await;
