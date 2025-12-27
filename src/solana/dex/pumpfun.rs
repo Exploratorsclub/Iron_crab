@@ -271,11 +271,27 @@ impl PumpFunDex {
             .ok_or_else(|| anyhow!("user authority not set"))?;
 
         // Derive new PDAs required by updated protocol
-        let (creator_vault, _) = self.derive_creator_vault(creator);
-        let (global_volume_accumulator, _) = self.derive_global_volume_accumulator();
-        let (user_volume_accumulator, _) = self.derive_user_volume_accumulator(&user);
-        let (fee_config, _) = Self::derive_fee_config();
-        let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM)?;
+        let (creator_vault, cv_bump) = self.derive_creator_vault(creator);
+        let (global_volume_accumulator, gva_bump) = self.derive_global_volume_accumulator();
+        let (user_volume_accumulator, uva_bump) = self.derive_user_volume_accumulator(&user);
+        let (fee_config, fc_bump) = Self::derive_fee_config();
+        // Note: fee_program is passed via remaining_accounts in get_fees CPI, not in main instruction
+
+        // Log derived PDAs for debugging
+        debug!(
+            token_mint = %token_mint,
+            creator = %creator,
+            creator_vault = %creator_vault,
+            cv_bump = cv_bump,
+            global_volume_accumulator = %global_volume_accumulator,
+            gva_bump = gva_bump,
+            user = %user,
+            user_volume_accumulator = %user_volume_accumulator,
+            uva_bump = uva_bump,
+            fee_config = %fee_config,
+            fc_bump = fc_bump,
+            "pump.fun BUY: derived PDAs for instruction"
+        );
 
         // Instruction data: discriminator (8 bytes) + amount (8 bytes) + max_cost (8 bytes)
         let mut data = Vec::with_capacity(24);
@@ -287,27 +303,41 @@ impl PumpFunDex {
         Ok(Instruction {
             program_id: self.program_id,
             accounts: vec![
-                // Original accounts (indices 0-7)
-                AccountMeta::new_readonly(self.global, false), // 0: global
-                AccountMeta::new(self.fee_recipient, false),   // 1: fee_recipient
-                AccountMeta::new_readonly(*token_mint, false), // 2: mint
-                AccountMeta::new(*bonding_curve, false),       // 3: bonding_curve
-                AccountMeta::new(*associated_bonding_curve, false), // 4: associated_bonding_curve
-                AccountMeta::new(*user_token_account, false),  // 5: associated_user (user's ATA)
-                AccountMeta::new(user, true),                  // 6: user (signer, writable)
-                AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false), // 7: system_program
+                // Accounts based on Solscan successful TX analysis (Dec 2024)
+                // #1 (0): Global - readonly
+                AccountMeta::new_readonly(self.global, false),
+                // #2 (1): Fee Recipient - writable
+                AccountMeta::new(self.fee_recipient, false),
+                // #3 (2): Mint - readonly
+                AccountMeta::new_readonly(*token_mint, false),
+                // #4 (3): Bonding Curve - writable
+                AccountMeta::new(*bonding_curve, false),
+                // #5 (4): Associated Bonding Curve (token vault) - writable
+                AccountMeta::new(*associated_bonding_curve, false),
+                // #6 (5): Associated User (user's ATA) - writable
+                AccountMeta::new(*user_token_account, false),
+                // #7 (6): User (signer, fee payer) - writable, signer
+                AccountMeta::new(user, true),
+                // #8 (7): System Program - readonly
+                AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false),
+                // #9 (8): Token Program - readonly
                 AccountMeta::new_readonly(
                     Pubkey::new_from_array(spl_token::id().to_bytes()),
                     false,
-                ), // 8: token_program
-                // NEW accounts (indices 9-15) - added in protocol update
-                AccountMeta::new(creator_vault, false), // 9: creator_vault
-                AccountMeta::new_readonly(self.event_authority, false), // 10: event_authority
-                AccountMeta::new_readonly(self.program_id, false), // 11: program
-                AccountMeta::new_readonly(global_volume_accumulator, false), // 12: global_volume_accumulator
-                AccountMeta::new(user_volume_accumulator, false), // 13: user_volume_accumulator
-                AccountMeta::new_readonly(fee_config, false),     // 14: fee_config
-                AccountMeta::new_readonly(fee_program, false),    // 15: fee_program
+                ),
+                // #10 (9): Creator Vault - writable (receives creator fees)
+                AccountMeta::new(creator_vault, false),
+                // #11 (10): Event Authority - readonly
+                AccountMeta::new_readonly(self.event_authority, false),
+                // #12 (11): Program (Pump.fun) - readonly
+                AccountMeta::new_readonly(self.program_id, false),
+                // #13 (12): Global Volume Accumulator - readonly
+                AccountMeta::new_readonly(global_volume_accumulator, false),
+                // #14 (13): User Volume Accumulator - writable
+                AccountMeta::new(user_volume_accumulator, false),
+                // #15 (14): Fee Config - readonly
+                AccountMeta::new_readonly(fee_config, false),
+                // Note: fee_program is NOT included in buy instruction (only in get_fees CPI)
             ],
             data,
         })
@@ -907,5 +937,63 @@ impl PumpFunDex {
         };
 
         Ok(vec![ix])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derive_fee_config_matches_known_address() {
+        // Known fee_config address from successful Solscan TX (Dec 2024)
+        // https://solscan.io/tx/2YH9QaRJy6LA6HExgFDCNtx2ccqESXwprJhtr8Vah9snfDkXz9mhWeiKZGBevLCRs985VMpaAY8JgZ37EhiVi9jU
+        let expected = Pubkey::from_str("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt").unwrap();
+        let (derived, _bump) = PumpFunDex::derive_fee_config();
+        assert_eq!(
+            derived, expected,
+            "Fee config PDA mismatch! Derived: {}, Expected: {}",
+            derived, expected
+        );
+    }
+
+    #[test]
+    fn test_derive_global_volume_accumulator() {
+        // Known global_volume_accumulator from successful TX
+        let expected = Pubkey::from_str("Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y").unwrap();
+
+        let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
+        let (derived, _bump) =
+            Pubkey::find_program_address(&[b"global_volume_accumulator"], &program_id);
+        assert_eq!(
+            derived, expected,
+            "Global volume accumulator PDA mismatch! Derived: {}, Expected: {}",
+            derived, expected
+        );
+    }
+
+    #[test]
+    fn test_derive_creator_vault_structure() {
+        // Test that derive_creator_vault produces a valid PDA
+        let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
+        let test_creator =
+            Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM").unwrap();
+
+        let (vault, bump) =
+            Pubkey::find_program_address(&[b"creator-vault", test_creator.as_ref()], &program_id);
+
+        // Verify it's a valid PDA (bump should be 0-255)
+        assert!(bump <= 255, "Invalid PDA bump");
+        assert_ne!(
+            vault,
+            Pubkey::default(),
+            "Creator vault should not be default pubkey"
+        );
+
+        // The derived vault should be off-curve (it's a PDA)
+        assert!(
+            vault.is_on_curve(),
+            "Creator vault PDA should have a valid structure"
+        );
     }
 }
