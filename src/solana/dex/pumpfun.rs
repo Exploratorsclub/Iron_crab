@@ -275,7 +275,7 @@ impl PumpFunDex {
         let (global_volume_accumulator, gva_bump) = self.derive_global_volume_accumulator();
         let (user_volume_accumulator, uva_bump) = self.derive_user_volume_accumulator(&user);
         let (fee_config, fc_bump) = Self::derive_fee_config();
-        // Note: fee_program is passed via remaining_accounts in get_fees CPI, not in main instruction
+        let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM)?;
 
         // Log derived PDAs for debugging
         debug!(
@@ -337,7 +337,8 @@ impl PumpFunDex {
                 AccountMeta::new(user_volume_accumulator, false),
                 // #15 (14): Fee Config - readonly
                 AccountMeta::new_readonly(fee_config, false),
-                // Note: fee_program is NOT included in buy instruction (only in get_fees CPI)
+                // #16 (15): Fee Program (Pump Fees Program) - required for get_fees CPI
+                AccountMeta::new_readonly(fee_program, false),
             ],
             data,
         })
