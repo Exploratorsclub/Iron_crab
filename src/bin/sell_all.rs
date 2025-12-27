@@ -175,14 +175,23 @@ async fn try_sell_raydium(
     }
 
     match raydium
-        .build_swap_plan_auto(&mint.to_string(), &sol_mint.to_string(), amount, slippage_bps)
+        .build_swap_plan_auto(
+            &mint.to_string(),
+            &sol_mint.to_string(),
+            amount,
+            slippage_bps,
+        )
         .await
     {
         Ok(Some(plan)) => {
-            info!("Raydium quote: {} tokens -> {} lamports", amount, plan.expected_out);
+            info!(
+                "Raydium quote: {} tokens -> {} lamports",
+                amount, plan.expected_out
+            );
 
             let mut ixs = plan.ixs;
-            let raydium_prog = Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").unwrap();
+            let raydium_prog =
+                Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").unwrap();
 
             for ix in ixs.iter_mut() {
                 if ix.program_id == raydium_prog && ix.accounts.len() >= 18 {
@@ -207,7 +216,10 @@ async fn try_sell_raydium(
             };
 
             let mut tx = Transaction::new_with_payer(&ixs, Some(&treasury.pubkey()));
-            if tx.try_sign(&[treasury.signer_ref()], latest_blockhash).is_err() {
+            if tx
+                .try_sign(&[treasury.signer_ref()], latest_blockhash)
+                .is_err()
+            {
                 warn!("Failed to sign Raydium tx for {}", mint);
                 return false;
             }
@@ -248,7 +260,10 @@ async fn try_sell_pumpfun(
     info!("Trying Pump.fun for {} ({} tokens)...", mint, amount);
 
     // Get quote
-    let quote = match pumpfun.quote_exact_in(&mint.to_string(), sol_mint_str, amount).await {
+    let quote = match pumpfun
+        .quote_exact_in(&mint.to_string(), sol_mint_str, amount)
+        .await
+    {
         Ok(Some(q)) => q,
         Ok(None) => {
             warn!("No Pump.fun quote for {}", mint);
@@ -261,9 +276,15 @@ async fn try_sell_pumpfun(
     };
 
     let min_out = quote.amount_out / 100; // 1% min for panic sell
-    info!("Pump.fun quote: {} tokens -> {} lamports", amount, quote.amount_out);
+    info!(
+        "Pump.fun quote: {} tokens -> {} lamports",
+        amount, quote.amount_out
+    );
 
-    match pumpfun.build_swap_ix_async(&mint.to_string(), sol_mint_str, amount, min_out, None).await {
+    match pumpfun
+        .build_swap_ix_async(&mint.to_string(), sol_mint_str, amount, min_out, None)
+        .await
+    {
         Ok(ixs) if !ixs.is_empty() => {
             let latest_blockhash = match rpc.get_latest_blockhash_retry().await {
                 Ok(bh) => bh,
@@ -274,7 +295,10 @@ async fn try_sell_pumpfun(
             };
 
             let mut tx = Transaction::new_with_payer(&ixs, Some(&treasury.pubkey()));
-            if tx.try_sign(&[treasury.signer_ref()], latest_blockhash).is_err() {
+            if tx
+                .try_sign(&[treasury.signer_ref()], latest_blockhash)
+                .is_err()
+            {
                 warn!("Failed to sign Pump.fun tx for {}", mint);
                 return false;
             }
@@ -318,7 +342,10 @@ async fn sell_token(
 
     if is_pumpfun_token {
         // Pump.fun token: try Pump.fun first, then Raydium (for migrated tokens)
-        info!("{} looks like a Pump.fun token, trying Pump.fun first...", mint);
+        info!(
+            "{} looks like a Pump.fun token, trying Pump.fun first...",
+            mint
+        );
 
         if try_sell_pumpfun(rpc.clone(), pumpfun.clone(), treasury.clone(), &task).await {
             return SellResult::Sold;
@@ -326,7 +353,15 @@ async fn sell_token(
         errors.push("Pump.fun failed");
 
         info!("Pump.fun failed, trying Raydium (token may have migrated)...");
-        if try_sell_raydium(rpc.clone(), raydium.clone(), treasury.clone(), &task, wsol_ata).await {
+        if try_sell_raydium(
+            rpc.clone(),
+            raydium.clone(),
+            treasury.clone(),
+            &task,
+            wsol_ata,
+        )
+        .await
+        {
             return SellResult::Sold;
         }
         errors.push("Raydium failed");
@@ -334,7 +369,15 @@ async fn sell_token(
         // Non-Pump.fun token: try Raydium first, then Pump.fun as fallback
         info!("{} trying Raydium first...", mint);
 
-        if try_sell_raydium(rpc.clone(), raydium.clone(), treasury.clone(), &task, wsol_ata).await {
+        if try_sell_raydium(
+            rpc.clone(),
+            raydium.clone(),
+            treasury.clone(),
+            &task,
+            wsol_ata,
+        )
+        .await
+        {
             return SellResult::Sold;
         }
         errors.push("Raydium failed");
@@ -572,9 +615,15 @@ async fn main() -> anyhow::Result<()> {
         println!("\n" + "=".repeat(60).as_str());
 
         if force_burn {
-            println!("--force-burn flag set, burning all {} tokens...", needs_burn.len());
+            println!(
+                "--force-burn flag set, burning all {} tokens...",
+                needs_burn.len()
+            );
         } else {
-            print!("\nDo you want to BURN these {} token(s) and close accounts? [y/N]: ", needs_burn.len());
+            print!(
+                "\nDo you want to BURN these {} token(s) and close accounts? [y/N]: ",
+                needs_burn.len()
+            );
             io::stdout().flush()?;
 
             let mut input = String::new();
@@ -587,7 +636,9 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("Burning {} tokens...", needs_burn.len());
                 for (task, _) in needs_burn {
-                    if let Err(e) = burn_and_close_account(rpc.clone(), treasury.clone(), &task).await {
+                    if let Err(e) =
+                        burn_and_close_account(rpc.clone(), treasury.clone(), &task).await
+                    {
                         warn!("Failed to burn {}: {:?}", task.mint, e);
                     }
                 }
