@@ -2252,10 +2252,9 @@ impl SniperEngine {
                     ChosenDex::PumpFun => {
                         info!(mint=%mint, sig=%sig, lamports_in, expected_out=pumpfun_quote_out, liq_sol, "sniper: initial buy submitted (pump.fun)");
                         let sol_in = lamports_in as f64 / 1e9;
-                        // NOTE: Position is only created in finalize_fill if tokens actually arrive
-                        self.finalize_fill(*mint, sol_in, creator).await;
 
-                        // Record pending trade for reconciliation
+                        // CRITICAL: Insert pending trade BEFORE finalize_fill!
+                        // finalize_fill needs to read this to extract actual SOL spent from TX metadata
                         {
                             let mut rs = self.risk.write();
                             rs.pending.insert(
@@ -2271,6 +2270,10 @@ impl SniperEngine {
                                 },
                             );
                         }
+
+                        // NOTE: Position is only created in finalize_fill if tokens actually arrive
+                        self.finalize_fill(*mint, sol_in, creator).await;
+
                         record_network_fee(fee_estimate);
                         let line = format!(
                             "{ts},BUY,{mint},PUMPFUN,{sig},{lamports_in},0,0,{exp_tokens},{exp_tokens},,0,,{fee},,",
@@ -2288,26 +2291,28 @@ impl SniperEngine {
                             info!(mint=%mint, sig=%sig, lamports_in, expected_out=pm.expected_out, min_out=pm.min_out, pool=?pm.pool, liq_sol, "sniper: initial buy submitted (raydium)");
                             if pm.expected_out > 0 {
                                 let sol_in = lamports_in as f64 / 1e9;
+
+                                // CRITICAL: Insert pending trade BEFORE finalize_fill!
+                                {
+                                    let mut rs = self.risk.write();
+                                    rs.pending.insert(
+                                        *mint,
+                                        PendingTrade {
+                                            expected_out_tokens: pm.expected_out,
+                                            dex: "RAYDIUM".into(),
+                                            sig: sig.to_string(),
+                                            lamports_in,
+                                            network_fee_lamports: fee_estimate,
+                                            ts: ChronoUtc::now().timestamp(),
+                                            fee_bps: pm.fee_bps,
+                                        },
+                                    );
+                                }
+
                                 // NOTE: Position is only created in finalize_fill if tokens actually arrive
                                 self.finalize_fill(*mint, sol_in, None).await; // Raydium: no creator needed
                             }
 
-                            // Record pending trade
-                            {
-                                let mut rs = self.risk.write();
-                                rs.pending.insert(
-                                    *mint,
-                                    PendingTrade {
-                                        expected_out_tokens: pm.expected_out,
-                                        dex: "RAYDIUM".into(),
-                                        sig: sig.to_string(),
-                                        lamports_in,
-                                        network_fee_lamports: fee_estimate,
-                                        ts: ChronoUtc::now().timestamp(),
-                                        fee_bps: pm.fee_bps,
-                                    },
-                                );
-                            }
                             record_network_fee(fee_estimate);
                             let line = format!(
                                 "{ts},BUY,{mint},RAYDIUM,{sig},{lamports_in},0,0,{exp_tokens},{exp_tokens},,0,,{fee},,expected_min_out={min_out}",
@@ -2325,6 +2330,24 @@ impl SniperEngine {
                     ChosenDex::Orca => {
                         info!(mint=%mint, sig=%sig, lamports_in, expected_out=orca_quote_out, liq_sol, "sniper: initial buy submitted (orca)");
                         let sol_in = lamports_in as f64 / 1e9;
+
+                        // CRITICAL: Insert pending trade BEFORE finalize_fill!
+                        {
+                            let mut rs = self.risk.write();
+                            rs.pending.insert(
+                                *mint,
+                                PendingTrade {
+                                    expected_out_tokens: orca_quote_out,
+                                    dex: "ORCA".into(),
+                                    sig: sig.to_string(),
+                                    lamports_in,
+                                    network_fee_lamports: fee_estimate,
+                                    ts: ChronoUtc::now().timestamp(),
+                                    fee_bps: 30, // Orca default fee
+                                },
+                            );
+                        }
+
                         // NOTE: Position is only created in finalize_fill if tokens actually arrive
                         self.finalize_fill(*mint, sol_in, None).await; // Orca: no creator needed
 
