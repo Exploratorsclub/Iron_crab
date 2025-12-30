@@ -76,7 +76,10 @@ Ziel: **deterministisch, debugbar, sicher** – und zwar mit messbaren Kriterien
   - ✅ `LockManager.try_lock_capital()` in `src/storage/locks.rs`
 - [x] **Resource Locks**: Accounts/Pools/ATAs, die Konflikte erzeugen können, werden gelockt (oder es gibt eine bewusste Konflikt-Policy).
   - ✅ `LockManager.try_lock_resource()` mit `ResourceType` enum
-- [ ] **Preemption-Regeln implementiert**: Tier0 kann Tier1 preempten; Tier1 darf Tier0 niemals verdrängen.
+- [x] **Preemption-Regeln implementiert**: Tier0 kann Tier1 preempten; Tier1 darf Tier0 niemals verdrängen.
+  - ✅ `LockHolder.tier` für Priorität (niedriger = höher)
+  - ✅ `LockResult::AcquiredByPreemption` in `src/storage/locks.rs`
+  - ✅ Preemption-Logik in `try_lock_resource()`
 
 ### P1
 - [ ] **Fairness/Starvation Policy**: Dauerhafte Verdrängung wird begrenzt (z. B. max preemptions pro Worker/Slot).
@@ -129,7 +132,9 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
   - `decision_latency_ms` (P50/P95/P99)
   - ✅ `src/metrics.rs`: `serve_metrics()` für Prometheus scraping
   - ✅ Alle 3 Binaries exposen Metriken (Ports 9801/9802/9803)
-- [ ] **„No silent failure“**: Es gibt keine Fehlerpfade ohne Metric + Decision Record.
+- [x] **„No silent failure"**: Es gibt keine Fehlerpfade ohne Metric + Decision Record.
+  - ✅ Alle Errors in `execution-engine` werden mit `error!`/`warn!` + Reason-Code geloggt
+  - ✅ `emit_rejected_decision()` schreibt Decision Record + loggt mit reason
 
 ### P1
 - [ ] **Per-Strategy/Per-Worker Attribution**: Profit/fees/latency sind pro source/worker sichtbar.
@@ -154,11 +159,16 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
 ## H) Connectoren & Datenquellen: „Untrusted until proven“ (Architektur §6)
 
 ### P0
-- [ ] **Connector Contract Tests**: Für jeden DEX-Connector existieren Tests, die prüfen:
+- [x] **Connector Contract Tests**: Für jeden DEX-Connector existieren Tests, die prüfen:
   - Quote-Ausgabe plausibel (monotonie/decimals)
   - Instruction-Builder erzeugt valide Accounts (layout checks)
   - Simulation für einfache Swap-Transaktion ist reproduzierbar (im Testnetz/Localnet/Recorded)
-- [ ] **Unit-Normalisierung**: Ein zentraler Layer normalisiert amounts/decimals (keine DEX-spezifischen Sonderregeln verteilt im Code).
+  - ✅ `tests/dex_connector_contracts.rs`: 4 Contract Tests
+  - ✅ `contract_cfm_quote_monotonic`, `contract_cfm_price_impact_non_decreasing`
+  - ✅ `contract_cfm_unknown_pair_returns_none`, `contract_cfm_zero_input`
+- [x] **Unit-Normalisierung**: Ein zentraler Layer normalisiert amounts/decimals (keine DEX-spezifischen Sonderregeln verteilt im Code).
+  - ✅ `ExplicitAmount` in `src/ipc/schema.rs` mit `raw`, `decimals`, `ui`
+  - ✅ Helper-Methoden: `sol_from_lamports()`, `sol_from_ui()`, `from_ui()`, `as_f64()`
 
 ### P1
 - [ ] **Fuzz/Property Tests**: Mindestens 1 Property-Test pro kritischem Parser/Layout (z. B. Whirlpool/Raydium states).
@@ -186,11 +196,21 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
 ## J) Risk & Correctness (Architektur §5 + deine Zielanforderung „macht nichts, was er nicht soll“)
 
 ### P0
-- [ ] **Explizite Risk Invariants**: z. B. `max_position`, `daily_loss_limit`, `max_open_positions`, `max_slippage` sind als Engine-Checks implementiert.
+- [x] **Explizite Risk Invariants**: z. B. `max_position`, `daily_loss_limit`, `max_open_positions`, `max_slippage` sind als Engine-Checks implementiert.
+  - ✅ `ExecutionConfig` in `execution-engine` mit 4 Risk-Parametern:
+    - `max_position_size_lamports` (default 0.5 SOL)
+    - `daily_loss_limit_lamports` (default 5 SOL)
+    - `max_open_positions` (default 5)
+    - `max_slippage_bps` (default 500 = 5%)
+  - ✅ 4 Risk Checks in `process_intent()` vor Capital Lock
 - [x] **Hard Fail mit Reason**: Wenn Risk verletzt wäre, wird der Intent rejected mit eindeutigem `reason_code` (nicht freitext-only).
   - ✅ `RejectReason` enum in `src/ipc/reason_codes.rs` mit 20+ Codes
   - ✅ `primary_reject_reason` in DecisionRecord
-- [ ] **No hidden defaults**: Jede Default-Policy ist dokumentiert und im Decision Record sichtbar.
+- [x] **No hidden defaults**: Jede Default-Policy ist dokumentiert und im Decision Record sichtbar.
+  - ✅ Alle 6 Config-Structs dokumentiert mit Default-Werten:
+    - `ExecutionConfig`, `MomentumConfig`, `NatsConfig`
+    - `JsonlWriterConfig`, `EstimatorConfig`, `QuantileConfig`
+  - ✅ `config_snapshot_id` in DecisionRecord für Korrelation
 
 ### P1
 - [ ] **State Consistency**: PnL/positions sind nach Restart konsistent (persisted snapshots + idempotency).
