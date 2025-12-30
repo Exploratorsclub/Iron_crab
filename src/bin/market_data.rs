@@ -22,9 +22,15 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use ironcrab::ipc::{MarketEvent, MarketEventKind, RecordHeader, SCHEMA_VERSION};
+use ironcrab::ipc::{
+    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, MarketEvent, MarketEventKind,
+    RecordHeader, SCHEMA_VERSION,
+};
 use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
+
+/// NATS topic for config reload (P1: Runtime Configuration via UI)
+const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
 use ironcrab::solana::geyser_listener::GeyserListener;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
@@ -39,6 +45,30 @@ const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+
+/// Market data configuration (hot-reloadable via NATS)
+#[derive(Debug, Clone)]
+struct MarketDataConfig {
+    /// Enable Raydium discovery. Default: true
+    enable_raydium: bool,
+    /// Enable Orca discovery. Default: true
+    enable_orca: bool,
+    /// Enable PumpFun discovery. Default: true
+    enable_pumpfun: bool,
+    /// Max events per second rate limit. Default: 10000
+    max_events_per_sec: u32,
+}
+
+impl Default for MarketDataConfig {
+    fn default() -> Self {
+        Self {
+            enable_raydium: true,
+            enable_orca: true,
+            enable_pumpfun: true,
+            max_events_per_sec: 10_000,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "market-data")]
@@ -76,6 +106,8 @@ struct Args {
 /// Runtime context for market-data
 struct MarketDataContext {
     run_id: String,
+    /// P1: Config in RwLock for runtime hot-reload
+    config: parking_lot::RwLock<MarketDataConfig>,
     nats: Option<NatsClient>,
     jsonl_writer: JsonlWriter,
     event_counter: std::sync::atomic::AtomicU64,
@@ -87,6 +119,76 @@ impl MarketDataContext {
             .event_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!("evt-{}-{:06}", &self.run_id[..8], n)
+    }
+    
+    /// P1: Apply config update from control-plane (Runtime Configuration via UI)
+    fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
+        let mut config = self.config.write();
+        let mut applied = Vec::new();
+        let mut rejected = Vec::new();
+        
+        for (key, value) in &update.config {
+            match key.as_str() {
+                "enable_raydium" => {
+                    if let Some(v) = value.as_bool() {
+                        config.enable_raydium = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "enable_orca" => {
+                    if let Some(v) = value.as_bool() {
+                        config.enable_orca = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "enable_pumpfun" => {
+                    if let Some(v) = value.as_bool() {
+                        config.enable_pumpfun = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "max_events_per_sec" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 && v <= 1_000_000 {
+                            config.max_events_per_sec = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-1000000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                _ => {
+                    rejected.push((key.clone(), format!("Unknown config key: {}", key)));
+                }
+            }
+        }
+        
+        let status = if rejected.is_empty() {
+            ConfigUpdateStatus::Applied
+        } else if applied.is_empty() {
+            ConfigUpdateStatus::Rejected
+        } else {
+            ConfigUpdateStatus::PartiallyApplied
+        };
+        
+        ConfigUpdateResponse {
+            status,
+            applied_keys: applied,
+            rejected_keys: rejected,
+            new_snapshot_id: None,
+        }
     }
 }
 
@@ -160,6 +262,7 @@ async fn main() -> Result<()> {
 
     let ctx = Arc::new(MarketDataContext {
         run_id: run_id.clone(),
+        config: parking_lot::RwLock::new(MarketDataConfig::default()),
         nats,
         jsonl_writer,
         event_counter: std::sync::atomic::AtomicU64::new(0),
@@ -174,12 +277,28 @@ async fn main() -> Result<()> {
         debug!("Sent sd_notify READY to systemd");
     }
     
+    // P1: Subscribe to Config Updates (Runtime Configuration via UI)
+    let config_subscription = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_CONFIG_RELOAD).await {
+            Ok(sub) => {
+                info!(topic = TOPIC_CONFIG_RELOAD, "Subscribed to Config Updates");
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to Config Updates");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if args.simulate {
         info!("Simulation mode: emitting fake slot events");
-        run_simulation_loop(ctx.clone(), &run_id).await?;
+        run_simulation_loop(ctx.clone(), &run_id, config_subscription).await?;
     } else {
         info!(geyser_url = %args.geyser_url, "Starting Geyser integration");
-        run_geyser_loop(ctx.clone(), &run_id, &args.geyser_url).await?;
+        run_geyser_loop(ctx.clone(), &run_id, &args.geyser_url, config_subscription).await?;
     }
 
     // Flush JSONL on shutdown
@@ -190,7 +309,12 @@ async fn main() -> Result<()> {
 }
 
 /// Run with real Geyser connection
-async fn run_geyser_loop(ctx: Arc<MarketDataContext>, run_id: &str, geyser_url: &str) -> Result<()> {
+async fn run_geyser_loop(
+    ctx: Arc<MarketDataContext>,
+    run_id: &str,
+    geyser_url: &str,
+    mut config_subscription: Option<ironcrab::nats::NatsSubscription>,
+) -> Result<()> {
     // DEX program IDs to monitor
     let program_ids = vec![
         Pubkey::from_str(RAYDIUM_AMM_V4).expect("valid raydium pubkey"),
@@ -279,6 +403,41 @@ async fn run_geyser_loop(ctx: Arc<MarketDataContext>, run_id: &str, geyser_url: 
                 }
             }
 
+            // P1: Handle Config Updates (Runtime Configuration via UI)
+            msg = async {
+                if let Some(ref mut sub) = config_subscription {
+                    sub.next().await
+                } else {
+                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
+                }
+            } => {
+                if let Some(nats_msg) = msg {
+                    match serde_json::from_slice::<ConfigUpdate>(&nats_msg.payload) {
+                        Ok(update) => {
+                            if update.component == "market-data" {
+                                info!(
+                                    component = %update.component,
+                                    keys = ?update.config.keys().collect::<Vec<_>>(),
+                                    "Received Config Update from control-plane"
+                                );
+                                let response = ctx.apply_config_update(&update);
+                                info!(
+                                    status = ?response.status,
+                                    applied = ?response.applied_keys,
+                                    rejected = ?response.rejected_keys,
+                                    "Config update processed"
+                                );
+                            } else {
+                                debug!(component = %update.component, "Ignoring config update for other component");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to deserialize ConfigUpdate");
+                        }
+                    }
+                }
+            }
+
             // Periodic heartbeat
             _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                 if last_heartbeat.elapsed().as_secs() >= 60 {
@@ -310,7 +469,11 @@ async fn run_geyser_loop(ctx: Arc<MarketDataContext>, run_id: &str, geyser_url: 
 }
 
 /// Run simulation loop (for testing without Geyser)
-async fn run_simulation_loop(ctx: Arc<MarketDataContext>, run_id: &str) -> Result<()> {
+async fn run_simulation_loop(
+    ctx: Arc<MarketDataContext>,
+    run_id: &str,
+    mut config_subscription: Option<ironcrab::nats::NatsSubscription>,
+) -> Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut slot: u64 = 0;
 
@@ -360,6 +523,42 @@ async fn run_simulation_loop(ctx: Arc<MarketDataContext>, run_id: &str) -> Resul
                     let _ = sd_notify::notify(true, &[NotifyState::Watchdog]);
                 }
             }
+            
+            // P1: Handle Config Updates (Runtime Configuration via UI)
+            msg = async {
+                if let Some(ref mut sub) = config_subscription {
+                    sub.next().await
+                } else {
+                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
+                }
+            } => {
+                if let Some(nats_msg) = msg {
+                    match serde_json::from_slice::<ConfigUpdate>(&nats_msg.payload) {
+                        Ok(update) => {
+                            if update.component == "market-data" {
+                                info!(
+                                    component = %update.component,
+                                    keys = ?update.config.keys().collect::<Vec<_>>(),
+                                    "Received Config Update from control-plane"
+                                );
+                                let response = ctx.apply_config_update(&update);
+                                info!(
+                                    status = ?response.status,
+                                    applied = ?response.applied_keys,
+                                    rejected = ?response.rejected_keys,
+                                    "Config update processed"
+                                );
+                            } else {
+                                debug!(component = %update.component, "Ignoring config update for other component");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to deserialize ConfigUpdate");
+                        }
+                    }
+                }
+            }
+            
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
                 break;

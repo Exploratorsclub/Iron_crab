@@ -23,12 +23,16 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ironcrab::ipc::{
-    ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind, TradeIntent,
-    TradeResources, TradeSide, TradingRegime,
+    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
+    IntentTier, MarketEvent, MarketEventKind, TradeIntent, TradeResources, TradeSide,
+    TradingRegime,
 };
 use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{NatsClient, NatsConfig, NatsMessage, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
+
+/// NATS topic for config reload (P1: Runtime Configuration via UI)
+const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
 
 // P1 Crash Isolation: Systemd Watchdog support
 #[cfg(unix)]
@@ -104,7 +108,8 @@ impl Default for MomentumConfig {
 /// Runtime context for momentum-bot
 struct MomentumContext {
     run_id: String,
-    config: MomentumConfig,
+    /// P1: Config in RwLock for runtime hot-reload
+    config: parking_lot::RwLock<MomentumConfig>,
     nats: Option<NatsClient>,
     jsonl_writer: JsonlWriter,
     intent_counter: std::sync::atomic::AtomicU64,
@@ -123,11 +128,12 @@ impl MomentumContext {
     /// Classify trading regime for a pool
     fn classify_regime(&self, pool_address: &str, current_slot: u64) -> TradingRegime {
         let first_seen = self.pool_first_seen.read().get(pool_address).copied();
+        let config = self.config.read();
 
         match first_seen {
             Some(first_slot) => {
                 let age_slots = current_slot.saturating_sub(first_slot);
-                if age_slots < self.config.early_slot_threshold {
+                if age_slots < config.early_slot_threshold {
                     TradingRegime::Early
                 } else {
                     TradingRegime::Established
@@ -141,6 +147,114 @@ impl MomentumContext {
     fn record_pool_seen(&self, pool_address: &str, slot: u64) {
         let mut pools = self.pool_first_seen.write();
         pools.entry(pool_address.to_string()).or_insert(slot);
+    }
+    
+    /// P1: Apply config update from control-plane (Runtime Configuration via UI)
+    fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
+        let mut config = self.config.write();
+        let mut applied = Vec::new();
+        let mut rejected = Vec::new();
+        
+        for (key, value) in &update.config {
+            match key.as_str() {
+                "early_min_liquidity_sol" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 {
+                            config.early_min_liquidity_sol = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be >= 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "established_min_liquidity_sol" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 {
+                            config.established_min_liquidity_sol = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be >= 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "early_slot_threshold" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.early_slot_threshold = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "early_max_slippage_bps" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 && v <= 10000 {
+                            config.early_max_slippage_bps = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-10000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "established_max_slippage_bps" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 && v <= 10000 {
+                            config.established_max_slippage_bps = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-10000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "default_position_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.default_position_lamports = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                _ => {
+                    rejected.push((key.clone(), format!("Unknown config key: {}", key)));
+                }
+            }
+        }
+        
+        let status = if rejected.is_empty() {
+            ConfigUpdateStatus::Applied
+        } else if applied.is_empty() {
+            ConfigUpdateStatus::Rejected
+        } else {
+            ConfigUpdateStatus::PartiallyApplied
+        };
+        
+        ConfigUpdateResponse {
+            status,
+            applied_keys: applied,
+            rejected_keys: rejected,
+            new_snapshot_id: None,
+        }
     }
 }
 
@@ -225,7 +339,7 @@ async fn main() -> Result<()> {
 
     let ctx = Arc::new(MomentumContext {
         run_id: run_id.clone(),
-        config: momentum_config,
+        config: parking_lot::RwLock::new(momentum_config),
         nats,
         jsonl_writer,
         intent_counter: std::sync::atomic::AtomicU64::new(0),
@@ -256,6 +370,22 @@ async fn main() -> Result<()> {
         }
     } else {
         info!("NATS not connected, running in offline mode");
+        None
+    };
+
+    // P1: Subscribe to Config Updates (Runtime Configuration via UI)
+    let mut config_subscription = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_CONFIG_RELOAD).await {
+            Ok(sub) => {
+                info!(topic = TOPIC_CONFIG_RELOAD, "Subscribed to Config Updates");
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to Config Updates");
+                None
+            }
+        }
+    } else {
         None
     };
 
@@ -296,6 +426,42 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to deserialize MarketEvent");
+                        }
+                    }
+                }
+            }
+
+            // P1: Handle Config Updates (Runtime Configuration via UI)
+            msg = async {
+                if let Some(ref mut sub) = config_subscription {
+                    sub.next().await
+                } else {
+                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
+                }
+            } => {
+                if let Some(nats_msg) = msg {
+                    match serde_json::from_slice::<ConfigUpdate>(&nats_msg.payload) {
+                        Ok(update) => {
+                            // Only process if targeted at momentum-bot
+                            if update.component == "momentum-bot" {
+                                info!(
+                                    component = %update.component,
+                                    keys = ?update.config.keys().collect::<Vec<_>>(),
+                                    "Received Config Update from control-plane"
+                                );
+                                let response = ctx.apply_config_update(&update);
+                                info!(
+                                    status = ?response.status,
+                                    applied = ?response.applied_keys,
+                                    rejected = ?response.rejected_keys,
+                                    "Config update processed"
+                                );
+                            } else {
+                                debug!(component = %update.component, "Ignoring config update for other component");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to deserialize ConfigUpdate");
                         }
                     }
                 }
@@ -357,6 +523,9 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 "Pool created event"
             );
 
+            // Read config once for this event (P1: thread-safe access)
+            let config = ctx.config.read();
+
             // Check if we should generate an intent
             let should_trade = match regime {
                 TradingRegime::Early => {
@@ -365,9 +534,9 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                         .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
                         .unwrap_or(0.0);
 
-                    let in_allowlist = ctx.config.test_allowlist.contains(base_mint);
+                    let in_allowlist = config.test_allowlist.contains(base_mint);
 
-                    liq >= ctx.config.early_min_liquidity_sol || in_allowlist
+                    liq >= config.early_min_liquidity_sol || in_allowlist
                 }
                 TradingRegime::Established => {
                     // ESTABLISHED policy: more relaxed
@@ -375,16 +544,19 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                         .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
                         .unwrap_or(0.0);
 
-                    liq >= ctx.config.established_min_liquidity_sol
+                    liq >= config.established_min_liquidity_sol
                 }
                 TradingRegime::NotApplicable => false,
             };
 
             if should_trade {
                 let max_slippage = match regime {
-                    TradingRegime::Early => ctx.config.early_max_slippage_bps,
-                    _ => ctx.config.established_max_slippage_bps,
+                    TradingRegime::Early => config.early_max_slippage_bps,
+                    _ => config.established_max_slippage_bps,
                 };
+                let position_lamports = config.default_position_lamports;
+                // Drop lock before async operations
+                drop(config);
 
                 let intent = TradeIntent::new(
                     "momentum-bot",
@@ -394,7 +566,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     "momentum-bot",
                     IntentTier::Tier1,
                     IntentOrigin::StrategyA,
-                    ExplicitAmount::new(ctx.config.default_position_lamports, 9),
+                    ExplicitAmount::new(position_lamports, 9),
                     TradeResources {
                         input_mint: quote_mint.clone(), // SOL
                         output_mint: base_mint.clone(),
