@@ -7,6 +7,28 @@ Geyser gegen über rpc calls bevorzugen für höhere performance.
 Alle arbitrage transaktionen sollen atomar sein und über jito gesendet werden um fehlgeschlagene transaktionen und fronntrunning zu vermeiden.
 Keine eigenständigen ssh verbindungsversuche zum server wenn ssh benötigt wird den user darauf hinweisen und warten bis eine verbindung hergestellt wird.
 
+## Zielarchitektur (Debuggable-First Umbau)
+
+Diese Repo-Historie enthält AI-schnellgeschriebenen Code. Priorität ist daher **Debuggability + Determinismus + Safety** vor Feature-Breite.
+
+**Non-negotiables (P0 / Live-verboten ohne Erfüllung)**
+- **Single-Signer**: Nur die Execution Engine darf signieren/senden. Strategien/Worker/Bots sind **keyless**.
+- **Intent-only**: Strategien/Worker erzeugen ausschließlich `TradeIntent`s. Keine direkten RPC/TPU/Jito Sends außerhalb der Execution Engine.
+- **Simulate-gated**: Wenn Simulation fehlschlägt, wird **nie** gesendet (insb. Arbitrage).
+- **Decision Records**: Jede Entscheidung muss nachvollziehbar sein (Input-Snapshots + Reasons + Outcome).
+- **Units/Decimals explizit**: Keine impliziten UI/raw Konventionen; jede Amount ist eindeutig normalisiert oder trägt Decimals.
+
+**Process Boundaries (für Debuggability & Fault Isolation)**
+- System wird als **mehrere Binaries/Prozesse** aufgebaut (nicht als ein riesiger Monolith), mindestens:
+    - `execution-engine` (Rust): Arbitration + Locks + Tx Plan/Sim/Send/Confirm, besitzt Keys.
+    - `market-data` (Rust): Geyser/Events ingest + Cache/Normalisierung + Discovery Worker → `MarketEvents` (lädt Daten einmal).
+    - `momentum-bot` (Rust): konsumiert `MarketEvents` und erzeugt `TradeIntent` (Policies: EARLY + ESTABLISHED).
+    - `control-plane` (FastAPI): Start/Stop/Config/Risk/Monitoring; niemals Teil des Trading-Hot-Path; keine Keys.
+
+**MVP-Regel („First Results Fast“ ohne Debug-Sumpf)**
+- Immer zuerst einen **kleinen Vertical Slice** liefern (1 DEX / 1 Pair / 1 Strategy / 1 Tx-Typ), bis `docs/DEFINITION_OF_DONE.md` (P0) erfüllt ist.
+- Keine neuen Features, wenn sie nicht Decision Records + Reason-coded Rejects + (wo passend) Simulation-Gates mitliefern.
+
 ## Architecture Overview
 
 ```
