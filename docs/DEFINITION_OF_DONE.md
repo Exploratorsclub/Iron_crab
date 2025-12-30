@@ -69,7 +69,12 @@ Ziel: **deterministisch, debugbar, sicher** – und zwar mit messbaren Kriterien
   - ✅ `JitoClient` in execution-engine für Bundle Submission
   - ✅ `RejectReason::BundleFailed/BundleTimeout/BundleNotConfigured` für atomicity violations
   - ✅ Process checks bundle requirement before send; rejects if Jito not configured
-- [ ] **Fee/Compute Policies sind zentral**: compute budget, priority fee, tip-Policy sind Engine-owned (nicht in Strategien verteilt).
+- [x] **Fee/Compute Policies sind zentral**: compute budget, priority fee, tip-Policy sind Engine-owned (nicht in Strategien verteilt).
+  - ✅ `FeePolicy` struct in `src/ipc/schema.rs` with compute/fee/cost limits
+  - ✅ `TradeIntent.hint_*` fields for strategy fee hints (engine has final authority)
+  - ✅ `RejectReason::FeeComputeExceedsLimit/FeePriorityExceedsLimit/FeeExceedsMaxCost/FeeUnprofitable`
+  - ✅ `FeePolicy.compute_units_for_intent()` / `priority_fee_for_intent()` / `is_profitable_after_fees()`
+  - ✅ Process checks in execution-engine apply fee policy before capital lock
 
 ---
 

@@ -73,6 +73,16 @@ pub enum RejectReason {
     BundleTimeout,
     /// Bundle required but Jito not configured
     BundleNotConfigured,
+
+    // === P1: Fee / Compute Policies ===
+    /// Requested compute units exceed engine limit
+    FeeComputeExceedsLimit,
+    /// Requested priority fee exceeds engine limit
+    FeePriorityExceedsLimit,
+    /// Transaction fee would exceed max allowed total cost
+    FeeExceedsMaxCost,
+    /// Estimated fees make trade unprofitable
+    FeeUnprofitable,
 }
 
 impl RejectReason {
@@ -104,6 +114,10 @@ impl RejectReason {
             Self::BundleFailed => "BUNDLE_FAILED",
             Self::BundleTimeout => "BUNDLE_TIMEOUT",
             Self::BundleNotConfigured => "BUNDLE_NOT_CONFIGURED",
+            Self::FeeComputeExceedsLimit => "FEE_COMPUTE_EXCEEDS_LIMIT",
+            Self::FeePriorityExceedsLimit => "FEE_PRIORITY_EXCEEDS_LIMIT",
+            Self::FeeExceedsMaxCost => "FEE_EXCEEDS_MAX_COST",
+            Self::FeeUnprofitable => "FEE_UNPROFITABLE",
         }
     }
 
@@ -134,6 +148,10 @@ impl RejectReason {
             "BUNDLE_FAILED" => Self::BundleFailed,
             "BUNDLE_TIMEOUT" => Self::BundleTimeout,
             "BUNDLE_NOT_CONFIGURED" => Self::BundleNotConfigured,
+            "FEE_COMPUTE_EXCEEDS_LIMIT" => Self::FeeComputeExceedsLimit,
+            "FEE_PRIORITY_EXCEEDS_LIMIT" => Self::FeePriorityExceedsLimit,
+            "FEE_EXCEEDS_MAX_COST" => Self::FeeExceedsMaxCost,
+            "FEE_UNPROFITABLE" => Self::FeeUnprofitable,
             _ => Self::Unknown,
         }
     }
@@ -174,6 +192,17 @@ impl RejectReason {
         matches!(
             self,
             Self::BundleFailed | Self::BundleTimeout | Self::BundleNotConfigured
+        )
+    }
+
+    /// P1: Check if this is a fee/compute policy rejection
+    pub fn is_fee_related(&self) -> bool {
+        matches!(
+            self,
+            Self::FeeComputeExceedsLimit
+                | Self::FeePriorityExceedsLimit
+                | Self::FeeExceedsMaxCost
+                | Self::FeeUnprofitable
         )
     }
 }

@@ -195,6 +195,152 @@ impl MarketEvent {
 }
 
 // ============================================================================
+// P1: Fee/Compute Policy (owned by execution-engine)
+// ============================================================================
+
+/// Fee policy configuration for execution engine
+/// 
+/// P1 requirement: Engine owns compute budget, priority fee, and tip policies.
+/// Strategies can provide hints but engine has final authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FeePolicy {
+    // === Compute Budget ===
+    
+    /// Default compute unit limit for transactions
+    pub default_compute_units: u32,
+    
+    /// Maximum compute units allowed (hard limit)
+    pub max_compute_units: u32,
+    
+    /// Compute units for arbitrage (multi-hop, higher complexity)
+    pub arb_compute_units: u32,
+
+    // === Priority Fees ===
+    
+    /// Default priority fee (micro-lamports per CU)
+    pub default_priority_fee_micro_lamports: u64,
+    
+    /// Maximum priority fee allowed (hard limit)
+    pub max_priority_fee_micro_lamports: u64,
+    
+    /// Priority fee for Tier0 urgent intents
+    pub tier0_priority_fee_micro_lamports: u64,
+
+    /// Multiplier for elevated urgency (urgency=1)
+    pub urgency_multiplier_elevated: f64,
+    
+    /// Multiplier for urgent priority (urgency=2)
+    pub urgency_multiplier_urgent: f64,
+
+    // === Cost Limits ===
+    
+    /// Maximum total transaction cost (base + priority, lamports)
+    pub max_tx_cost_lamports: u64,
+    
+    /// Minimum expected profit after fees to proceed (basis points)
+    pub min_profit_after_fees_bps: i32,
+}
+
+impl Default for FeePolicy {
+    fn default() -> Self {
+        Self {
+            // Compute budget
+            default_compute_units: 200_000,
+            max_compute_units: 1_400_000,      // Solana max is 1.4M
+            arb_compute_units: 400_000,        // Multi-hop arb needs more
+            
+            // Priority fees (micro-lamports per CU)
+            default_priority_fee_micro_lamports: 1_000,       // 0.001 lamports/CU
+            max_priority_fee_micro_lamports: 100_000,         // 0.1 lamports/CU
+            tier0_priority_fee_micro_lamports: 10_000,        // 0.01 lamports/CU
+            
+            // Urgency multipliers
+            urgency_multiplier_elevated: 2.0,
+            urgency_multiplier_urgent: 5.0,
+            
+            // Cost limits
+            max_tx_cost_lamports: 50_000_000,  // 0.05 SOL max total cost
+            min_profit_after_fees_bps: 10,     // Must profit at least 0.1% after fees
+        }
+    }
+}
+
+impl FeePolicy {
+    /// Calculate effective compute units for an intent
+    pub fn compute_units_for_intent(&self, intent: &TradeIntent) -> u32 {
+        // Use hint if provided and within limits
+        if let Some(hint) = intent.hint_compute_units {
+            return hint.min(self.max_compute_units);
+        }
+        
+        // Use arb CU for bundle/atomic intents (likely multi-hop)
+        if intent.requires_bundle() {
+            return self.arb_compute_units;
+        }
+        
+        self.default_compute_units
+    }
+    
+    /// Calculate effective priority fee for an intent
+    pub fn priority_fee_for_intent(&self, intent: &TradeIntent) -> u64 {
+        let base_fee = match intent.tier {
+            IntentTier::Tier0 => self.tier0_priority_fee_micro_lamports,
+            IntentTier::Tier1 => self.default_priority_fee_micro_lamports,
+        };
+        
+        // Apply urgency multiplier
+        let multiplier = match intent.urgency() {
+            0 => 1.0,
+            1 => self.urgency_multiplier_elevated,
+            _ => self.urgency_multiplier_urgent, // 2+
+        };
+        
+        let scaled_fee = (base_fee as f64 * multiplier) as u64;
+        
+        // Override with hint if provided (but cap at max)
+        let effective = intent.hint_priority_fee_micro_lamports
+            .unwrap_or(scaled_fee)
+            .min(self.max_priority_fee_micro_lamports);
+        
+        effective
+    }
+    
+    /// Estimate total transaction cost (base fee + priority fee)
+    /// Returns (base_fee_lamports, priority_fee_lamports, total_lamports)
+    pub fn estimate_tx_cost(&self, intent: &TradeIntent) -> (u64, u64, u64) {
+        let compute_units = self.compute_units_for_intent(intent);
+        let priority_fee_per_cu = self.priority_fee_for_intent(intent);
+        
+        // Base fee is 5000 lamports per signature (typically 1 signature)
+        let base_fee = 5_000u64;
+        
+        // Priority fee = (price_per_cu * compute_units) / 1_000_000
+        // (micro-lamports to lamports)
+        let priority_fee = (priority_fee_per_cu as u128 * compute_units as u128 / 1_000_000) as u64;
+        
+        let total = base_fee + priority_fee;
+        (base_fee, priority_fee, total)
+    }
+    
+    /// Check if intent's fees would be profitable
+    /// Returns (is_profitable, profit_bps_after_fees)
+    pub fn is_profitable_after_fees(&self, intent: &TradeIntent) -> (bool, i32) {
+        let (_, _, total_cost) = self.estimate_tx_cost(intent);
+        
+        // Convert cost to basis points of required capital
+        let capital = intent.required_capital.raw;
+        if capital == 0 {
+            return (false, 0);
+        }
+        
+        let cost_bps = ((total_cost as u128 * 10_000) / capital as u128) as i32;
+        let profit_after_fees = intent.expected_roi_bps - cost_bps;
+        
+        (profit_after_fees >= self.min_profit_after_fees_bps, profit_after_fees)
+    }
+}
+
+// ============================================================================
 // TradeIntent (produced by strategy bots)
 // ============================================================================
 
@@ -276,6 +422,20 @@ pub struct TradeIntent {
     /// P1: Custom tip amount for Jito bundle (overrides default)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub bundle_tip_lamports: Option<u64>,
+
+    // === P1: Fee Hints (Engine has final authority) ===
+    
+    /// Hint: suggested compute unit limit (engine may override)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hint_compute_units: Option<u32>,
+
+    /// Hint: suggested priority fee in micro-lamports per CU (engine may override)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hint_priority_fee_micro_lamports: Option<u64>,
+
+    /// Hint: urgency level for fee scaling (0=normal, 1=elevated, 2=urgent)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hint_urgency: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -327,6 +487,9 @@ impl TradeIntent {
             trigger_event_id: None,
             require_bundle: None,
             bundle_tip_lamports: None,
+            hint_compute_units: None,
+            hint_priority_fee_micro_lamports: None,
+            hint_urgency: None,
         }
     }
 
@@ -357,6 +520,25 @@ impl TradeIntent {
     /// Check if this intent requires atomic bundle execution
     pub fn requires_bundle(&self) -> bool {
         self.require_bundle.unwrap_or(false)
+    }
+
+    /// P1: Add fee hints for execution engine
+    /// Engine has final authority and may override these hints based on policy.
+    pub fn with_fee_hints(
+        mut self,
+        compute_units: Option<u32>,
+        priority_fee_micro_lamports: Option<u64>,
+        urgency: Option<u8>,
+    ) -> Self {
+        self.hint_compute_units = compute_units;
+        self.hint_priority_fee_micro_lamports = priority_fee_micro_lamports;
+        self.hint_urgency = urgency;
+        self
+    }
+
+    /// Get effective urgency level (0=normal if not specified)
+    pub fn urgency(&self) -> u8 {
+        self.hint_urgency.unwrap_or(0)
     }
 }
 

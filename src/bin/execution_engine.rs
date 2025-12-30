@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
-    DecisionRecord, ExecutionResult, ExecutionStatus, IntentOrigin, RejectReason,
+    DecisionRecord, ExecutionResult, ExecutionStatus, FeePolicy, IntentOrigin, RejectReason,
     SimulationResult, TradeIntent, TradingRegime,
 };
 use ironcrab::metrics::serve_metrics;
@@ -134,6 +134,11 @@ struct ExecutionConfig {
     
     /// Timeout for bundle confirmation (seconds)
     jito_timeout_secs: u64,
+
+    // === P1: Fee/Compute Policies ===
+    
+    /// Centralized fee policy (engine owns compute budget and priority fees)
+    fee_policy: FeePolicy,
 }
 
 impl Default for ExecutionConfig {
@@ -152,6 +157,8 @@ impl Default for ExecutionConfig {
             jito_tip_lamports: 10_000, // 0.00001 SOL default tip
             jito_region: "frankfurt".to_string(),
             jito_timeout_secs: 30,
+            // P1: Fee/Compute Policy
+            fee_policy: FeePolicy::default(),
         }
     }
 }
@@ -1058,6 +1065,108 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             "daily_loss={} < limit={}",
             daily_loss,
             config.daily_loss_limit_lamports
+        )),
+    });
+
+    // === P1: Fee/Compute Policy Checks ===
+    let fee_policy = &config.fee_policy;
+    
+    // Check: Compute units within limit
+    let compute_units = fee_policy.compute_units_for_intent(&intent);
+    if compute_units > fee_policy.max_compute_units {
+        let reason = RejectReason::FeeComputeExceedsLimit;
+        checks.push(CheckResult {
+            check_name: "fee_compute_limit".to_string(),
+            passed: false,
+            reason_code: Some(reason.to_string()),
+            details: Some(format!(
+                "compute_units={} > max={}",
+                compute_units,
+                fee_policy.max_compute_units
+            )),
+        });
+        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    }
+    checks.push(CheckResult {
+        check_name: "fee_compute_limit".to_string(),
+        passed: true,
+        reason_code: None,
+        details: Some(format!("compute_units={}", compute_units)),
+    });
+    
+    // Check: Priority fee within limit
+    let priority_fee = fee_policy.priority_fee_for_intent(&intent);
+    if priority_fee > fee_policy.max_priority_fee_micro_lamports {
+        let reason = RejectReason::FeePriorityExceedsLimit;
+        checks.push(CheckResult {
+            check_name: "fee_priority_limit".to_string(),
+            passed: false,
+            reason_code: Some(reason.to_string()),
+            details: Some(format!(
+                "priority_fee={} > max={}",
+                priority_fee,
+                fee_policy.max_priority_fee_micro_lamports
+            )),
+        });
+        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    }
+    checks.push(CheckResult {
+        check_name: "fee_priority_limit".to_string(),
+        passed: true,
+        reason_code: None,
+        details: Some(format!("priority_fee_micro_lamports={}", priority_fee)),
+    });
+    
+    // Check: Total transaction cost within limit
+    let (base_fee, priority_fee_lamports, total_cost) = fee_policy.estimate_tx_cost(&intent);
+    if total_cost > fee_policy.max_tx_cost_lamports {
+        let reason = RejectReason::FeeExceedsMaxCost;
+        checks.push(CheckResult {
+            check_name: "fee_max_cost".to_string(),
+            passed: false,
+            reason_code: Some(reason.to_string()),
+            details: Some(format!(
+                "total_cost={} (base={}, priority={}) > max={}",
+                total_cost, base_fee, priority_fee_lamports,
+                fee_policy.max_tx_cost_lamports
+            )),
+        });
+        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    }
+    checks.push(CheckResult {
+        check_name: "fee_max_cost".to_string(),
+        passed: true,
+        reason_code: None,
+        details: Some(format!(
+            "total_cost={} (base={}, priority={})",
+            total_cost, base_fee, priority_fee_lamports
+        )),
+    });
+    
+    // Check: Trade profitable after fees
+    let (is_profitable, profit_after_fees_bps) = fee_policy.is_profitable_after_fees(&intent);
+    if !is_profitable {
+        let reason = RejectReason::FeeUnprofitable;
+        checks.push(CheckResult {
+            check_name: "fee_profitability".to_string(),
+            passed: false,
+            reason_code: Some(reason.to_string()),
+            details: Some(format!(
+                "profit_after_fees={}bps < min={}bps",
+                profit_after_fees_bps,
+                fee_policy.min_profit_after_fees_bps
+            )),
+        });
+        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    }
+    checks.push(CheckResult {
+        check_name: "fee_profitability".to_string(),
+        passed: true,
+        reason_code: None,
+        details: Some(format!(
+            "profit_after_fees={}bps >= min={}bps",
+            profit_after_fees_bps,
+            fee_policy.min_profit_after_fees_bps
         )),
     });
 
