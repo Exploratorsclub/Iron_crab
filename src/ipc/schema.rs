@@ -48,7 +48,15 @@ impl RecordHeader {
 // ============================================================================
 
 /// Amount with explicit unit specification
-/// P0 requirement: Units/Decimals explizit – keine impliziten UI/raw Konventionen
+/// 
+/// P0 requirement (DoD P): Units/Decimals explizit – keine impliziten UI/raw Konventionen.
+/// 
+/// All monetary amounts in the system MUST use this type to prevent unit confusion.
+/// - `raw`: on-chain value (lamports for SOL, smallest unit for tokens)
+/// - `decimals`: token decimals (9 for SOL, 6 for USDC, 8 for BONK, etc.)
+/// - `ui`: human-readable value (computed as raw / 10^decimals)
+/// 
+/// Example: 1 SOL = ExplicitAmount { raw: 1_000_000_000, decimals: 9, ui: Some(1.0) }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExplicitAmount {
     /// Raw on-chain value (lamports for SOL, smallest unit for tokens)
@@ -61,6 +69,7 @@ pub struct ExplicitAmount {
 }
 
 impl ExplicitAmount {
+    /// Create a new ExplicitAmount from raw value and decimals
     pub fn new(raw: u64, decimals: u8) -> Self {
         let ui = Decimal::from(raw) / Decimal::from(10u64.pow(decimals as u32));
         Self {
@@ -70,12 +79,39 @@ impl ExplicitAmount {
         }
     }
 
+    /// Create zero amount with specified decimals
     pub fn zero(decimals: u8) -> Self {
         Self {
             raw: 0,
             decimals,
             ui: Some(Decimal::ZERO),
         }
+    }
+    
+    /// Create from UI value (human-readable) and decimals
+    pub fn from_ui(ui_value: Decimal, decimals: u8) -> Self {
+        let multiplier = Decimal::from(10u64.pow(decimals as u32));
+        let raw = (ui_value * multiplier).to_u64().unwrap_or(0);
+        Self {
+            raw,
+            decimals,
+            ui: Some(ui_value),
+        }
+    }
+    
+    /// Create SOL amount from lamports
+    pub fn sol_from_lamports(lamports: u64) -> Self {
+        Self::new(lamports, 9)
+    }
+    
+    /// Create SOL amount from UI value (e.g., 1.5 SOL)
+    pub fn sol_from_ui(sol: f64) -> Self {
+        Self::from_ui(Decimal::from_f64_retain(sol).unwrap_or(Decimal::ZERO), 9)
+    }
+    
+    /// Get UI value as f64 (for calculations)
+    pub fn as_f64(&self) -> f64 {
+        self.ui.and_then(|d| d.to_f64()).unwrap_or(0.0)
     }
 }
 

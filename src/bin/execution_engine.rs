@@ -15,6 +15,7 @@
 //! - Simulate-gated: simulation fail = never send
 //! - Decision Records for every intent
 //! - Reason-coded rejects
+//! - No silent failure: all errors logged with reason code (DoD O)
 
 use anyhow::Result;
 use clap::Parser;
