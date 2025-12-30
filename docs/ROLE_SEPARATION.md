@@ -16,6 +16,66 @@ Dieses Dokument beschreibt die **Sicherheitsarchitektur** und **Zugriffsrechte**
 - Keine direkten RPC/TPU/Jito Sends außerhalb der Execution Engine
 - Intents werden über NATS IPC übermittelt
 
+## RBAC: Role-Based Access Control (Control Plane API)
+
+### Rollen
+
+| Rolle     | Beschreibung                      | Permissions                        |
+|-----------|-----------------------------------|------------------------------------|
+| `admin`   | Vollzugriff                       | read + write + kill switch         |
+| `viewer`  | Nur-Lese-Zugriff                  | status, metrics, positions, logs   |
+| `anonymous` | Dev-Mode ohne Auth             | Alle (nur wenn REQUIRE_AUTH=false) |
+
+### Endpoint-Berechtigungen
+
+| Endpoint                | Methode | Rolle erforderlich |
+|-------------------------|---------|-------------------|
+| `/health`               | GET     | (keine)           |
+| `/rbac/info`            | GET     | (keine)           |
+| `/whoami`               | GET     | viewer            |
+| `/status`               | GET     | viewer            |
+| `/positions`            | GET     | viewer            |
+| `/metrics`              | GET     | viewer            |
+| `/logs/{component}`     | GET     | viewer            |
+| `/kill`                 | POST    | **admin**         |
+| `/kill/reset`           | POST    | **admin**         |
+| `/command/{component}`  | POST    | **admin**         |
+| `/config`               | POST    | **admin**         |
+
+### Konfiguration
+
+```bash
+# API Keys generieren
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+# Environment Variables für Control Plane
+CONTROL_PLANE_REQUIRE_AUTH=true       # Auth aktivieren (false = dev mode)
+CONTROL_PLANE_ADMIN_KEY=<admin-key>   # Admin API Key
+CONTROL_PLANE_VIEWER_KEY=<viewer-key> # Viewer API Key
+```
+
+### API-Nutzung
+
+```bash
+# Mit Admin-Key
+curl -H "X-API-Key: $ADMIN_KEY" http://localhost:8080/kill -d '{"reason":"test"}'
+
+# Mit Viewer-Key
+curl -H "X-API-Key: $VIEWER_KEY" http://localhost:8080/status
+
+# Ohne Auth (nur wenn REQUIRE_AUTH=false)
+curl http://localhost:8080/status
+```
+
+### Audit-Logging
+
+Alle authentifizierten Aktionen werden geloggt:
+```
+AUTH_SUCCESS: role=admin, key_prefix=abc12345
+STATUS_VIEW: user=viewer, role=viewer
+KILL_SWITCH_ACTIVATED: user=admin, reason='Manual stop', liquidate=True
+```
+
 ## Prozess-Zugriffsmatrix
 
 | Prozess           | Wallet Keys | NATS Publish          | NATS Subscribe        | Tx Sign/Send |

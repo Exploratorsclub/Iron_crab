@@ -34,10 +34,13 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, Security
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 import httpx
+import hashlib
+import secrets
 
 # Optional NATS support
 try:
@@ -79,8 +82,94 @@ class Config:
     TOPIC_COMMANDS: str = "ironcrab.control.commands"
     TOPIC_KILL_SWITCH: str = "ironcrab.control.kill"
     TOPIC_CONFIG_RELOAD: str = "ironcrab.control.config.reload"
+    
+    # RBAC: API Keys (in production, load from secure storage)
+    # Format: {"hashed_key": {"role": "admin|viewer", "name": "description"}}
+    # Generate keys with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+    ADMIN_API_KEY: str = os.getenv("CONTROL_PLANE_ADMIN_KEY", "")
+    VIEWER_API_KEY: str = os.getenv("CONTROL_PLANE_VIEWER_KEY", "")
+    
+    # If no keys configured, allow unauthenticated access (dev mode)
+    REQUIRE_AUTH: bool = os.getenv("CONTROL_PLANE_REQUIRE_AUTH", "false").lower() == "true"
 
 config = Config()
+
+# ============================================================================
+# RBAC: Role-Based Access Control
+# ============================================================================
+
+class Role:
+    """User roles with their permissions"""
+    ADMIN = "admin"      # Full access: read + write + kill switch
+    VIEWER = "viewer"    # Read-only: status, metrics, positions
+    ANONYMOUS = "anonymous"  # No authentication (dev mode only)
+
+class User(BaseModel):
+    """Authenticated user context"""
+    role: str
+    name: str
+    api_key_prefix: str  # First 8 chars for logging (never log full key)
+
+# API Key security scheme
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def hash_api_key(key: str) -> str:
+    """Hash API key for secure comparison"""
+    return hashlib.sha256(key.encode()).hexdigest()
+
+def get_current_user(api_key: str = Security(api_key_header)) -> User:
+    """
+    Validate API key and return user context.
+    
+    Permissions:
+    - ADMIN: All endpoints (read + write + kill)
+    - VIEWER: Read-only endpoints (GET requests)
+    - ANONYMOUS: Only if REQUIRE_AUTH=false (dev mode)
+    """
+    # Dev mode: no auth required
+    if not config.REQUIRE_AUTH:
+        return User(role=Role.ANONYMOUS, name="dev-mode", api_key_prefix="no-auth")
+    
+    if not api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key. Provide X-API-Key header.",
+            headers={"WWW-Authenticate": "ApiKey"}
+        )
+    
+    key_prefix = api_key[:8] if len(api_key) >= 8 else api_key
+    
+    # Check admin key
+    if config.ADMIN_API_KEY and secrets.compare_digest(api_key, config.ADMIN_API_KEY):
+        audit_logger.info(f"AUTH_SUCCESS: role=admin, key_prefix={key_prefix}")
+        return User(role=Role.ADMIN, name="admin", api_key_prefix=key_prefix)
+    
+    # Check viewer key
+    if config.VIEWER_API_KEY and secrets.compare_digest(api_key, config.VIEWER_API_KEY):
+        audit_logger.info(f"AUTH_SUCCESS: role=viewer, key_prefix={key_prefix}")
+        return User(role=Role.VIEWER, name="viewer", api_key_prefix=key_prefix)
+    
+    # Invalid key
+    audit_logger.warning(f"AUTH_FAILED: invalid key, prefix={key_prefix}")
+    raise HTTPException(
+        status_code=403,
+        detail="Invalid API key",
+    )
+
+def require_admin(user: User = Depends(get_current_user)) -> User:
+    """Dependency that requires admin role"""
+    if user.role not in [Role.ADMIN, Role.ANONYMOUS]:
+        audit_logger.warning(f"ACCESS_DENIED: user={user.name}, required=admin, has={user.role}")
+        raise HTTPException(
+            status_code=403,
+            detail=f"Admin role required. Your role: {user.role}"
+        )
+    return user
+
+def require_viewer(user: User = Depends(get_current_user)) -> User:
+    """Dependency that requires at least viewer role (admin also allowed)"""
+    # All authenticated users can view
+    return user
 
 # ============================================================================
 # Models
@@ -238,12 +327,13 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
+    """Health check endpoint (no auth required)"""
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/status", response_model=SystemStatus)
-async def get_status():
-    """Get status of all system components"""
+async def get_status(user: User = Depends(require_viewer)):
+    """Get status of all system components (requires: viewer)"""
+    audit_logger.info(f"STATUS_VIEW: user={user.name}, role={user.role}")
     components = []
     
     # Check each component's /live endpoint
@@ -280,8 +370,9 @@ async def get_status():
     )
 
 @app.get("/positions")
-async def get_positions():
-    """Get current open positions from execution-engine"""
+async def get_positions(user: User = Depends(require_viewer)):
+    """Get current open positions from execution-engine (requires: viewer)"""
+    audit_logger.info(f"POSITIONS_VIEW: user={user.name}, role={user.role}")
     # In production: query execution-engine via NATS request/reply
     # For MVP: return mock data
     return {
@@ -292,8 +383,9 @@ async def get_positions():
     }
 
 @app.get("/metrics")
-async def get_aggregated_metrics():
-    """Aggregate metrics from all components"""
+async def get_aggregated_metrics(user: User = Depends(require_viewer)):
+    """Aggregate metrics from all components (requires: viewer)"""
+    audit_logger.info(f"METRICS_VIEW: user={user.name}, role={user.role}")
     metrics = {}
     
     component_configs = [
@@ -321,17 +413,21 @@ async def get_aggregated_metrics():
     }
 
 @app.post("/kill")
-async def trigger_kill_switch(request: KillRequest, background_tasks: BackgroundTasks):
+async def trigger_kill_switch(
+    request: KillRequest, 
+    background_tasks: BackgroundTasks,
+    user: User = Depends(require_admin)
+):
     """
-    Trigger emergency kill switch.
+    Trigger emergency kill switch (requires: admin).
     
     This will:
     1. Set kill_switch_active flag
     2. Publish kill command to NATS
     3. Optionally trigger position liquidation
     """
-    logger.warning(f"KILL SWITCH TRIGGERED: {request.reason}")
-    audit_logger.warning(f"KILL_SWITCH_ACTIVATED: reason='{request.reason}', liquidate={request.liquidate_positions}")
+    logger.warning(f"KILL SWITCH TRIGGERED by {user.name}: {request.reason}")
+    audit_logger.warning(f"KILL_SWITCH_ACTIVATED: user={user.name}, reason='{request.reason}', liquidate={request.liquidate_positions}")
     
     state.kill_switch_active = True
     state.kill_switch_reason = request.reason
@@ -356,13 +452,13 @@ async def trigger_kill_switch(request: KillRequest, background_tasks: Background
     }
 
 @app.post("/kill/reset")
-async def reset_kill_switch():
-    """Reset kill switch (requires manual intervention)"""
+async def reset_kill_switch(user: User = Depends(require_admin)):
+    """Reset kill switch (requires: admin)"""
     if not state.kill_switch_active:
         return {"status": "kill_switch_not_active"}
     
-    logger.info("Kill switch reset requested")
-    audit_logger.info(f"KILL_SWITCH_RESET: previous_reason='{state.kill_switch_reason}'")
+    logger.info(f"Kill switch reset requested by {user.name}")
+    audit_logger.info(f"KILL_SWITCH_RESET: user={user.name}, previous_reason='{state.kill_switch_reason}'")
     state.kill_switch_active = False
     
     # Publish reset command
@@ -378,15 +474,19 @@ async def reset_kill_switch():
     }
 
 @app.post("/command/{component}")
-async def send_command(component: str, request: CommandRequest):
-    """Send command to a specific component via NATS request/reply"""
+async def send_command(
+    component: str, 
+    request: CommandRequest,
+    user: User = Depends(require_admin)
+):
+    """Send command to a specific component via NATS request/reply (requires: admin)"""
     
     valid_components = ["market-data", "momentum-bot", "execution-engine"]
     if component not in valid_components:
         raise HTTPException(status_code=400, detail=f"Invalid component. Must be one of: {valid_components}")
     
     # Audit log the command (before execution)
-    audit_logger.info(f"COMMAND: component={component}, command={request.command}, params={request.params}")
+    audit_logger.info(f"COMMAND: user={user.name}, component={component}, command={request.command}, params={request.params}")
     
     topic = f"ironcrab.{component.replace('-', '_')}.commands"
     
@@ -416,9 +516,9 @@ async def send_command(component: str, request: CommandRequest):
     }
 
 @app.post("/config")
-async def update_config(update: ConfigUpdate):
+async def update_config(update: ConfigUpdate, user: User = Depends(require_admin)):
     """
-    Update configuration for a component.
+    Update configuration for a component (requires: admin).
     
     Publishes config update to NATS for hot reload.
     """
@@ -427,7 +527,7 @@ async def update_config(update: ConfigUpdate):
         raise HTTPException(status_code=400, detail=f"Invalid component. Must be one of: {valid_components}")
     
     # Audit log the config change
-    audit_logger.info(f"CONFIG_UPDATE: component={update.component}, keys={list(update.config.keys())}")
+    audit_logger.info(f"CONFIG_UPDATE: user={user.name}, component={update.component}, keys={list(update.config.keys())}")
     
     config_msg = {
         "command": "config_update",
@@ -445,14 +545,47 @@ async def update_config(update: ConfigUpdate):
     }
 
 @app.get("/logs/{component}")
-async def get_recent_logs(component: str, lines: int = 100):
-    """Get recent log entries for a component"""
+async def get_recent_logs(component: str, lines: int = 100, user: User = Depends(require_viewer)):
+    """Get recent log entries for a component (requires: viewer)"""
+    audit_logger.info(f"LOGS_VIEW: user={user.name}, component={component}, lines={lines}")
     # In production: read from log files or log aggregation service
     return {
         "component": component,
         "lines": lines,
         "logs": [],
         "note": "Log aggregation not yet implemented"
+    }
+
+@app.get("/whoami")
+async def whoami(user: User = Depends(get_current_user)):
+    """Get current authenticated user info"""
+    return {
+        "role": user.role,
+        "name": user.name,
+        "api_key_prefix": user.api_key_prefix,
+        "permissions": {
+            "can_view": True,
+            "can_modify": user.role in [Role.ADMIN, Role.ANONYMOUS],
+            "can_kill": user.role in [Role.ADMIN, Role.ANONYMOUS],
+        }
+    }
+
+@app.get("/rbac/info")
+async def rbac_info():
+    """Get RBAC configuration info (no auth required)"""
+    return {
+        "auth_required": config.REQUIRE_AUTH,
+        "roles": {
+            Role.ADMIN: {
+                "description": "Full access: read, write, kill switch",
+                "endpoints": ["ALL"]
+            },
+            Role.VIEWER: {
+                "description": "Read-only access",
+                "endpoints": ["GET /status", "GET /positions", "GET /metrics", "GET /logs/*"]
+            }
+        },
+        "note": "Set CONTROL_PLANE_REQUIRE_AUTH=true to enable authentication"
     }
 
 # ============================================================================
