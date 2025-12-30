@@ -26,6 +26,7 @@ use ironcrab::ipc::{
     ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind, TradeIntent,
     TradeResources, TradeSide, TradingRegime,
 };
+use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
@@ -155,8 +156,18 @@ async fn main() -> Result<()> {
         run_id = %run_id,
         config = %args.config.display(),
         test_mode = args.test_mode,
+        metrics_port = args.metrics_port,
         "Starting momentum-bot service"
     );
+
+    // Start metrics server
+    let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
+    tokio::spawn(async move {
+        if let Err(e) = serve_metrics(metrics_addr).await {
+            error!(error = %e, "Metrics server failed");
+        }
+    });
+    info!(port = args.metrics_port, "Metrics server started at /metrics");
 
     // === P0 Check: Ensure no wallet keys are loaded ===
     // momentum-bot is KEYLESS per architecture

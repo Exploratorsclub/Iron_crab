@@ -23,6 +23,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use ironcrab::ipc::{MarketEvent, MarketEventKind, RecordHeader, SCHEMA_VERSION};
+use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
 use ironcrab::solana::geyser_listener::GeyserListener;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
@@ -103,8 +104,18 @@ async fn main() -> Result<()> {
         run_id = %run_id,
         config = %args.config.display(),
         geyser_url = %args.geyser_url,
+        metrics_port = args.metrics_port,
         "Starting market-data service"
     );
+
+    // Start metrics server
+    let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
+    tokio::spawn(async move {
+        if let Err(e) = serve_metrics(metrics_addr).await {
+            error!(error = %e, "Metrics server failed");
+        }
+    });
+    info!(port = args.metrics_port, "Metrics server started at /metrics");
 
     // === P0 Check: Ensure no wallet keys are loaded ===
     // market-data is KEYLESS per architecture

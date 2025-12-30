@@ -27,6 +27,7 @@ use ironcrab::ipc::{
     CheckResult, DecisionOutcome, DecisionRecord, ExecutionResult, ExecutionStatus, IntentOrigin,
     RejectReason, SimulationResult, TradeIntent, TradingRegime,
 };
+use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{
     NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS,
 };
@@ -162,8 +163,18 @@ async fn main() -> Result<()> {
         config = %args.config.display(),
         simulate_only = args.simulate_only,
         dry_run = args.dry_run,
+        metrics_port = args.metrics_port,
         "Starting execution-engine service"
     );
+
+    // Start metrics server
+    let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
+    tokio::spawn(async move {
+        if let Err(e) = serve_metrics(metrics_addr).await {
+            error!(error = %e, "Metrics server failed");
+        }
+    });
+    info!(port = args.metrics_port, "Metrics server started at /metrics");
 
     // === This is the ONLY binary that should load keys ===
     // In production, load keys here. For MVP, we just acknowledge the pattern.
