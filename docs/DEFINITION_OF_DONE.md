@@ -29,8 +29,11 @@ Ziel: **deterministisch, debugbar, sicher** – und zwar mit messbaren Kriterien
   - ✅ `execution-engine` subscribed NATS kill topic → sets `kill_switch_active`
 
 ### P1
-- [ ] **Role separation**: Control Plane kann Parameter ändern/stoppen, aber niemals signieren.
-- [ ] **Least privilege**: Bots/Worker besitzen nur NATS- oder gRPC-Creds, keine Wallets.
+- [x] **Role separation**: Control Plane kann Parameter ändern/stoppen, aber niemals signieren.
+  - ✅ Control Plane ist keyless und blockt Start, wenn Key-Env-Vars gesetzt sind (`control_plane/main.py`)
+  - ✅ Signing/Sending findet ausschließlich in der Execution Engine statt
+- [x] **Least privilege**: Bots/Worker besitzen nur NATS- oder gRPC-Creds, keine Wallets.
+  - ✅ Nur die Execution Engine lädt Keys; andere Prozesse sind keyless (siehe P0 oben)
 
 ---
 
@@ -132,6 +135,7 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
 
 ### P1
 - [x] **UI/Control zeigt Entscheidungen**: In der UI/Control Plane kann man die letzten N Decisions ansehen (inkl. „rejected reasons").
+  - Hinweis: Das ist **Live/Recent Debug-Ansicht** (Operator-UI). Time-Series Charts/Trends/Alerting gehören in **Prometheus/Grafana** (siehe Abschnitt F).
   - ✅ `DecisionRecord`, `DecisionQuery`, `DecisionStats` models in `control_plane/main.py`
   - ✅ `GET /decisions` - List recent decisions with filters (limit, source, outcome, since, intent_id)
   - ✅ `GET /decisions/stats` - Aggregated statistics (by outcome, source, reject reason)
@@ -144,6 +148,8 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
 ---
 
 ## F) Metrics: Prometheus/Grafana Abnahme (Architektur §10)
+
+Leitlinie: **Charts/Trends über Zeit** (Latenz, Reject-Rates, PnL/ROI, Queue Depth) gehören hierher (Prometheus → Grafana), nicht in die Control/UI.
 
 ### P0
 - [x] **Pflicht-Metriken vorhanden**: 
@@ -179,7 +185,9 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
   - ✅ `test_decision_record_roundtrip`, `test_replay_determinism`, `test_decision_outcomes_correct`, `test_jsonl_append_integrity`
 
 ### P1
-- [ ] **Golden Replays**: Es gibt mindestens 3 gespeicherte „golden“ Replay-Szenarien, die in CI laufen.
+- [x] **Golden Replays**: Es gibt mindestens 3 gespeicherte „golden“ Replay-Szenarien, die in CI laufen.
+  - ✅ Fixtures: `tests/fixtures/golden_replays/` (normal_trade, rejected_trade, sim_failed)
+  - ✅ Tests: `tests/golden_replay_test.rs`
 
 ---
 
@@ -198,7 +206,11 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
   - ✅ Helper-Methoden: `sol_from_lamports()`, `sol_from_ui()`, `from_ui()`, `as_f64()`
 
 ### P1
-- [ ] **Fuzz/Property Tests**: Mindestens 1 Property-Test pro kritischem Parser/Layout (z. B. Whirlpool/Raydium states).
+- [x] **Fuzz/Property Tests**: Mindestens 1 Property-Test pro kritischem Parser/Layout (z. B. Whirlpool/Raydium states).
+  - ✅ `fuzz/fuzz_targets/fuzz_orca_whirlpool_layout.rs`
+  - ✅ `fuzz/fuzz_targets/fuzz_raydium_pool_v4.rs`
+  - ✅ `fuzz/fuzz_targets/fuzz_pumpfun_bonding_curve.rs`
+  - ✅ `fuzz/fuzz_targets/fuzz_replay_log_parser.rs`
 
 ---
 
@@ -216,11 +228,18 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
   - ✅ Control Plane (Python) nur für Management, nicht im Trading Hot Path
 
 ### P1
-- [ ] **RBAC (minimal)**: Mindestens Admin/Viewer Rollen (UI/API), Auditing der Control-Aktionen.
-- [ ] **Runtime-Konfiguration via UI**: Alle Binary-Parameter (MomentumConfig, ExecutionConfig, etc.) sind über Control Plane/UI änderbar ohne Neustart.
+- [x] **RBAC (minimal)**: Mindestens Admin/Viewer Rollen (UI/API), Auditing der Control-Aktionen.
+  - ✅ `control_plane/main.py`: Admin/Viewer via `X-API-Key`
+  - ✅ Audit-Log `control_plane_audit.log`
+- [x] **Runtime-Konfiguration via UI**: Alle Binary-Parameter (MomentumConfig, ExecutionConfig, etc.) sind über Control Plane/UI änderbar ohne Neustart.
   - MomentumConfig: Liquidity-Thresholds, Slippage, Position Size
   - ExecutionConfig: Risk Limits (max_position, daily_loss, max_slippage)
+  - MarketDataConfig: DEX enables, rate limits
   - Änderungen werden über NATS gepusht und von Binaries hot-reloaded
+  - ✅ Control Plane publisht Config Updates (`POST /config`)
+  - ✅ Execution Engine subscribed `ironcrab.control.config.reload` und wendet Updates an
+  - ✅ Momentum Bot subscribed + `apply_config_update()` für MomentumConfig
+  - ✅ Market Data subscribed + `apply_config_update()` für MarketDataConfig
 
 ---
 
@@ -244,7 +263,9 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
   - ✅ `config_snapshot_id` in DecisionRecord für Korrelation
 
 ### P1
-- [ ] **State Consistency**: PnL/positions sind nach Restart konsistent (persisted snapshots + idempotency).
+- [x] **State Consistency**: PnL/positions sind nach Restart konsistent (persisted snapshots + idempotency).
+  - ✅ Execution Engine Snapshot: `execution_state.json` (daily loss, open positions, counters, processed intents)
+  - ✅ Idempotency Restore: processed intents werden aus Snapshot zurückgeladen
 
 ---
 
@@ -269,7 +290,9 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
 - [x] **Bots getrennt startbar**: Sniper (Scout), Arbitrage-Scanner und ggf. Momentum sind eigene Binaries/Services (start/stop separat), um Fehlerquellen isoliert debuggen zu können.
   - ✅ `market-data`, `momentum-bot`, `execution-engine` als separate Binaries
   - ✅ `run_new.ps1` / `run_new.sh` zum separaten Starten
-- [ ] **Crash-Isolation**: Crash eines Bots darf Execution nicht crashen; Crash der Control Plane darf Trading nicht beeinflussen.
+- [x] **Crash-Isolation**: Crash eines Bots darf Execution nicht crashen; Crash der Control Plane darf Trading nicht beeinflussen.
+  - ✅ Separate Prozesse/Binaries; keine In-Process Kopplung
+  - ✅ Trading-Hot-Path ist unabhängig von der Control Plane (Management-only)
 
 ---
 
