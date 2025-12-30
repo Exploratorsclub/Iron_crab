@@ -624,7 +624,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     });
 
     // === Check 4: Capital lock ===
-    let holder = LockHolder::new(&intent.intent_id).with_decision(&decision_id);
+    let holder = LockHolder::new(&intent.intent_id)
+        .with_decision(&decision_id)
+        .with_tier(intent.tier as u8);
     let lock_result = ctx.lock_manager.try_lock_capital(
         holder,
         intent.required_capital.raw,
@@ -638,6 +640,20 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 passed: true,
                 reason_code: None,
                 details: None,
+            });
+        }
+        LockResult::AcquiredByPreemption { preempted } => {
+            // DoD L) P0: Higher-priority intent preempted lower-priority lock
+            info!(
+                intent_id = %intent.intent_id,
+                preempted_intent = %preempted.intent_id,
+                "Capital lock acquired by preemption (DoD L)"
+            );
+            checks.push(CheckResult {
+                check_name: "capital_lock".to_string(),
+                passed: true,
+                reason_code: None,
+                details: Some(format!("Preempted: {}", preempted.intent_id)),
             });
         }
         LockResult::InsufficientCapital { available, requested } => {

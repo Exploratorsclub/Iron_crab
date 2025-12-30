@@ -4,17 +4,20 @@
 //! - Capital Locks: reserve SOL + tokens, no overbooking
 //! - Resource Locks: pools/accounts that could conflict
 //! - Idempotency: prevent duplicate processing
+//! - Preemption: higher-priority intents can preempt lower-priority locks (DoD L)
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Unique identifier for a lock holder
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct LockHolder {
     pub intent_id: String,
     pub decision_id: Option<String>,
+    /// Priority tier (lower = higher priority). Default: 255 (lowest)
+    pub tier: u8,
 }
 
 impl LockHolder {
@@ -22,11 +25,18 @@ impl LockHolder {
         Self {
             intent_id: intent_id.to_string(),
             decision_id: None,
+            tier: 255, // Default lowest priority
         }
     }
 
     pub fn with_decision(mut self, decision_id: &str) -> Self {
         self.decision_id = Some(decision_id.to_string());
+        self
+    }
+    
+    /// Set priority tier (lower = higher priority, 0 = highest)
+    pub fn with_tier(mut self, tier: u8) -> Self {
+        self.tier = tier;
         self
     }
 }
@@ -64,6 +74,8 @@ pub enum ResourceType {
 #[derive(Debug)]
 pub enum LockResult {
     Acquired,
+    /// Lock acquired by preempting a lower-priority holder
+    AcquiredByPreemption { preempted: LockHolder },
     Conflict { holder: LockHolder },
     InsufficientCapital { available: u64, requested: u64 },
 }
@@ -186,7 +198,10 @@ impl LockManager {
         LockResult::Acquired
     }
 
-    /// Try to acquire a resource lock
+    /// Try to acquire a resource lock with preemption support (DoD L) P0)
+    ///
+    /// If the resource is locked by a lower-priority intent (higher tier number),
+    /// the lock will be preempted and acquired by the higher-priority intent.
     pub fn try_lock_resource(
         &self,
         holder: LockHolder,
@@ -200,9 +215,24 @@ impl LockManager {
         // Check if resource is already locked
         if let Some(existing) = locks.get(resource_id) {
             if existing.holder.intent_id != holder.intent_id {
-                return LockResult::Conflict {
-                    holder: existing.holder.clone(),
-                };
+                // Preemption check: lower tier number = higher priority
+                if holder.tier < existing.holder.tier {
+                    // Preempt the lower-priority lock
+                    let preempted = existing.holder.clone();
+                    info!(
+                        preempting = %holder.intent_id,
+                        preempting_tier = holder.tier,
+                        preempted = %preempted.intent_id,
+                        preempted_tier = preempted.tier,
+                        resource_id,
+                        "Resource lock preempted (DoD L)"
+                    );
+                    // Continue to acquire lock below
+                } else {
+                    return LockResult::Conflict {
+                        holder: existing.holder.clone(),
+                    };
+                }
             }
         }
 
@@ -220,8 +250,16 @@ impl LockManager {
             "Resource lock acquired"
         );
 
+        // Check if we're preempting (resource was previously locked)
+        let was_preempted = locks.get(resource_id).map(|l| l.holder.clone());
         locks.insert(resource_id.to_string(), lock);
-        LockResult::Acquired
+        
+        match was_preempted {
+            Some(preempted) if preempted.intent_id != holder.intent_id => {
+                LockResult::AcquiredByPreemption { preempted }
+            }
+            _ => LockResult::Acquired,
+        }
     }
 
     /// Release all locks for an intent
