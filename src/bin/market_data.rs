@@ -311,7 +311,7 @@ async fn run_simulation_loop(ctx: Arc<MarketDataContext>, run_id: &str) -> Resul
                     ctx.next_event_id(),
                     "simulated",
                     Some(slot),
-                    MarketEventKind::SlotUpdate { slot },
+                    MarketEventKind::SlotUpdate { current_slot: slot },
                 );
 
                 // Write to JSONL (P0 requirement)

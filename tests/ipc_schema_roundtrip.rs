@@ -400,7 +400,7 @@ fn test_jsonl_format() {
             "e1".to_string(),
             "test",
             Some(1),
-            MarketEventKind::SlotUpdate { slot: 1 },
+            MarketEventKind::SlotUpdate { current_slot: 1 },
         ),
         MarketEvent::new(
             "test",
@@ -409,7 +409,7 @@ fn test_jsonl_format() {
             "e2".to_string(),
             "test",
             Some(2),
-            MarketEventKind::SlotUpdate { slot: 2 },
+            MarketEventKind::SlotUpdate { current_slot: 2 },
         ),
     ];
 

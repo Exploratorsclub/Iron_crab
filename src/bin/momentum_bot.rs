@@ -384,9 +384,9 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 }
             }
         }
-        MarketEventKind::SlotUpdate { slot } => {
+        MarketEventKind::SlotUpdate { current_slot } => {
             // Just track slot progression
-            debug!(slot, "Slot update");
+            debug!(current_slot, "Slot update");
         }
         _ => {
             // Other event types: log for now

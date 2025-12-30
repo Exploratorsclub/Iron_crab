@@ -111,7 +111,7 @@ pub enum MarketEventKind {
         liquidity_sol: Option<Decimal>,
     },
     /// Slot progression (heartbeat)
-    SlotUpdate { slot: u64 },
+    SlotUpdate { current_slot: u64 },
     /// Raw account update from Geyser
     AccountUpdate {
         pubkey: String,
@@ -600,7 +600,7 @@ mod tests {
             "evt-001".to_string(),
             "geyser",
             Some(12345),
-            MarketEventKind::SlotUpdate { slot: 12345 },
+            MarketEventKind::SlotUpdate { current_slot: 12345 },
         );
 
         let json = serde_json::to_string(&event).unwrap();
