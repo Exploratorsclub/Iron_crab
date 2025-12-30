@@ -44,7 +44,8 @@ use ironcrab::storage::{
     JsonlWriter, JsonlWriterConfig,
 };
 
-// P1 Crash Isolation: Systemd Watchdog support
+// P1 Crash Isolation: Systemd Watchdog support (Linux only)
+#[cfg(unix)]
 use sd_notify::NotifyState;
 
 /// Build version for decision records
@@ -522,8 +523,11 @@ async fn main() -> Result<()> {
     info!("Entering main execution loop");
     
     // P1 Crash Isolation: Signal systemd that we're ready
-    let _ = sd_notify::notify(true, &[NotifyState::Ready]);
-    debug!("Sent sd_notify READY to systemd");
+    #[cfg(unix)]
+    {
+        let _ = sd_notify::notify(true, &[NotifyState::Ready]);
+        debug!("Sent sd_notify READY to systemd");
+    }
 
     // Subscribe to TradeIntents if NATS connected
     let intent_subscription = if let Some(ref nats) = ctx.nats {
@@ -613,6 +617,7 @@ async fn main() -> Result<()> {
                     );
                     
                     // P1 Crash Isolation: Ping systemd watchdog (every 30s heartbeat)
+                    #[cfg(unix)]
                     let _ = sd_notify::notify(true, &[NotifyState::Watchdog]);
                 }
                 

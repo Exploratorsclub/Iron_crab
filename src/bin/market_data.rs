@@ -29,6 +29,7 @@ use ironcrab::solana::geyser_listener::GeyserListener;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 // P1 Crash Isolation: Systemd Watchdog support
+#[cfg(unix)]
 use sd_notify::NotifyState;
 
 /// Build version for decision records
@@ -164,8 +165,11 @@ async fn main() -> Result<()> {
     // === Main Loop: Geyser subscription or simulation ===
     
     // P1 Crash Isolation: Signal systemd that we're ready
-    let _ = sd_notify::notify(true, &[NotifyState::Ready]);
-    debug!("Sent sd_notify READY to systemd");
+    #[cfg(unix)]
+    {
+        let _ = sd_notify::notify(true, &[NotifyState::Ready]);
+        debug!("Sent sd_notify READY to systemd");
+    }
     
     if args.simulate {
         info!("Simulation mode: emitting fake slot events");
@@ -286,6 +290,7 @@ async fn run_geyser_loop(ctx: Arc<MarketDataContext>, run_id: &str, geyser_url: 
                     last_heartbeat = std::time::Instant::now();
                     
                     // P1 Crash Isolation: Ping systemd watchdog
+                    #[cfg(unix)]
                     let _ = sd_notify::notify(true, &[NotifyState::Watchdog]);
                 }
             }
@@ -348,6 +353,7 @@ async fn run_simulation_loop(ctx: Arc<MarketDataContext>, run_id: &str) -> Resul
                     );
                     
                     // P1 Crash Isolation: Ping systemd watchdog
+                    #[cfg(unix)]
                     let _ = sd_notify::notify(true, &[NotifyState::Watchdog]);
                 }
             }

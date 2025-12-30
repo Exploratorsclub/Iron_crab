@@ -6,6 +6,7 @@ publish = false
 [dependencies]
 libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
 arbitrary = { version = "1", features = ["derive"] }
+solana-sdk = "2.2"
 
 [dependencies.ironcrab]
 path = ".."
@@ -22,3 +23,11 @@ path = "fuzz_targets/fuzz_replay_log_parser.rs"
 [[bin]]
 name = "fuzz_orca_whirlpool_layout"
 path = "fuzz_targets/fuzz_orca_whirlpool_layout.rs"
+
+[[bin]]
+name = "fuzz_raydium_pool_v4"
+path = "fuzz_targets/fuzz_raydium_pool_v4.rs"
+
+[[bin]]
+name = "fuzz_pumpfun_bonding_curve"
+path = "fuzz_targets/fuzz_pumpfun_bonding_curve.rs"
