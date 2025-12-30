@@ -33,8 +33,8 @@ use uuid::Uuid;
 
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
-    DecisionRecord, ExecutionResult, ExecutionStatus, FeePolicy, IntentOrigin, RejectReason,
-    SimulationResult, TradeIntent, TradingRegime,
+    DecisionRecord, ExecutionResult, ExecutionStatus, FairnessPolicy, FeePolicy, IntentOrigin,
+    RejectReason, SimulationResult, TradeIntent, TradingRegime,
 };
 use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{
@@ -139,6 +139,11 @@ struct ExecutionConfig {
     
     /// Centralized fee policy (engine owns compute budget and priority fees)
     fee_policy: FeePolicy,
+
+    // === P1: Fairness/Starvation Policy ===
+    
+    /// Fairness policy to prevent strategy starvation
+    fairness_policy: FairnessPolicy,
 }
 
 impl Default for ExecutionConfig {
@@ -159,6 +164,8 @@ impl Default for ExecutionConfig {
             jito_timeout_secs: 30,
             // P1: Fee/Compute Policy
             fee_policy: FeePolicy::default(),
+            // P1: Fairness Policy
+            fairness_policy: FairnessPolicy::default(),
         }
     }
 }
@@ -1173,7 +1180,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // === Check 4: Capital lock ===
     let holder = LockHolder::new(&intent.intent_id)
         .with_decision(&decision_id)
-        .with_tier(intent.tier as u8);
+        .with_tier(intent.tier as u8)
+        .with_source(&intent.source); // P1: Source for fairness tracking
     let lock_result = ctx.lock_manager.try_lock_capital(
         holder,
         intent.required_capital.raw,

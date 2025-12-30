@@ -91,7 +91,13 @@ Ziel: **deterministisch, debugbar, sicher** – und zwar mit messbaren Kriterien
   - ✅ Preemption-Logik in `try_lock_resource()`
 
 ### P1
-- [ ] **Fairness/Starvation Policy**: Dauerhafte Verdrängung wird begrenzt (z. B. max preemptions pro Worker/Slot).
+- [x] **Fairness/Starvation Policy**: Dauerhafte Verdrängung wird begrenzt (z. B. max preemptions pro Worker/Slot).
+  - ✅ `FairnessPolicy` struct in `src/ipc/schema.rs` with max_preemptions, window, protection duration
+  - ✅ `FairnessTracker` in `src/storage/locks.rs` tracks preemption events per source
+  - ✅ `RejectReason::FairnessStarved/FairnessBlocked` for starvation protection
+  - ✅ `LockHolder.source` field for fairness attribution
+  - ✅ `try_lock_resource()` checks fairness policy before allowing preemption
+  - ✅ Starved sources get temporary protection from further preemption
 
 ---
 

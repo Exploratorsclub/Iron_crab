@@ -341,6 +341,44 @@ impl FeePolicy {
 }
 
 // ============================================================================
+// P1: Fairness/Starvation Policy (DoD D.1)
+// ============================================================================
+
+/// Fairness policy to prevent one strategy from monopolizing execution capacity
+/// 
+/// P1 requirement: Dauerhafte Verdrängung wird begrenzt (max preemptions pro Worker/Slot)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FairnessPolicy {
+    /// Maximum preemptions allowed per source within the time window
+    pub max_preemptions_per_source: u32,
+    
+    /// Time window for preemption tracking (seconds)
+    pub preemption_window_secs: u64,
+    
+    /// Block duration after max preemptions reached (seconds)
+    /// During this time, the starved source's intents get elevated priority
+    pub starvation_block_secs: u64,
+    
+    /// Enable fairness tracking
+    pub enabled: bool,
+    
+    /// Log preemption events for debugging/tuning
+    pub log_preemptions: bool,
+}
+
+impl Default for FairnessPolicy {
+    fn default() -> Self {
+        Self {
+            max_preemptions_per_source: 5,      // Max 5 preemptions
+            preemption_window_secs: 60,          // Within 60 seconds
+            starvation_block_secs: 30,           // 30s elevated priority after starvation
+            enabled: true,
+            log_preemptions: true,
+        }
+    }
+}
+
+// ============================================================================
 // TradeIntent (produced by strategy bots)
 // ============================================================================
 

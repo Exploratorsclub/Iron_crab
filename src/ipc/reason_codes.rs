@@ -83,6 +83,12 @@ pub enum RejectReason {
     FeeExceedsMaxCost,
     /// Estimated fees make trade unprofitable
     FeeUnprofitable,
+
+    // === P1: Fairness / Starvation ===
+    /// Source/worker has been preempted too many times recently
+    FairnessStarved,
+    /// Source/worker is temporarily blocked due to excessive preemption
+    FairnessBlocked,
 }
 
 impl RejectReason {
@@ -118,6 +124,8 @@ impl RejectReason {
             Self::FeePriorityExceedsLimit => "FEE_PRIORITY_EXCEEDS_LIMIT",
             Self::FeeExceedsMaxCost => "FEE_EXCEEDS_MAX_COST",
             Self::FeeUnprofitable => "FEE_UNPROFITABLE",
+            Self::FairnessStarved => "FAIRNESS_STARVED",
+            Self::FairnessBlocked => "FAIRNESS_BLOCKED",
         }
     }
 
@@ -152,6 +160,8 @@ impl RejectReason {
             "FEE_PRIORITY_EXCEEDS_LIMIT" => Self::FeePriorityExceedsLimit,
             "FEE_EXCEEDS_MAX_COST" => Self::FeeExceedsMaxCost,
             "FEE_UNPROFITABLE" => Self::FeeUnprofitable,
+            "FAIRNESS_STARVED" => Self::FairnessStarved,
+            "FAIRNESS_BLOCKED" => Self::FairnessBlocked,
             _ => Self::Unknown,
         }
     }
@@ -204,6 +214,11 @@ impl RejectReason {
                 | Self::FeeExceedsMaxCost
                 | Self::FeeUnprofitable
         )
+    }
+
+    /// P1: Check if this is a fairness/starvation rejection
+    pub fn is_fairness_related(&self) -> bool {
+        matches!(self, Self::FairnessStarved | Self::FairnessBlocked)
     }
 }
 
