@@ -165,6 +165,17 @@ default_ui_amount = 0.05      # scan amount used for quotes on discovered pairs
 top_n_per_base = 20           # cap per base to avoid combinatorial explosion
 interval_secs = 30            # discovery refresh interval
 
+[arbitrage.execution]
+# Execution / safety gates for triangular arbitrage
+max_slippage_bps = 500
+min_profit_bps_to_execute = 50
+max_position_lamports = 5_000_000_000
+dry_run = true
+# If true, runs RPC `simulateTransaction` for the assembled 3-hop tx and logs results.
+# When simulation returns an error, the trade is NOT sent.
+simulate = true
+priority_fee_micro_lamports = 1000
+
 # Discovery sources (optional; default: both enabled)
 # enable_raydium = true
 # enable_orca = true
