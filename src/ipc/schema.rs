@@ -7,6 +7,7 @@
 //! - build (string)
 //! - run_id (string/uuid)
 
+use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
