@@ -509,6 +509,7 @@ impl Engine {
                             min_profit_bps_to_execute: exec_cfg.min_profit_bps_to_execute,
                             max_position_lamports: exec_cfg.max_position_lamports,
                             dry_run: exec_cfg.dry_run,
+                            simulate: exec_cfg.simulate,
                             priority_fee_micro_lamports: exec_cfg.priority_fee_micro_lamports,
                         }
                     } else {

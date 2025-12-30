@@ -22,6 +22,9 @@ pub struct ExecutionConfig {
     pub max_position_lamports: u64,
     /// Whether to actually execute or just simulate
     pub dry_run: bool,
+    /// If true, run `simulateTransaction` for the assembled TX and log result.
+    /// For safety/debugging: when simulation returns an error, the trade is not sent.
+    pub simulate: bool,
     /// Priority fee in micro-lamports (adjust for network congestion)
     pub priority_fee_micro_lamports: u64,
 }
@@ -33,6 +36,7 @@ impl Default for ExecutionConfig {
             min_profit_bps_to_execute: 50,        // 0.5% minimum profit
             max_position_lamports: 5_000_000_000, // 5 SOL max per trade
             dry_run: true,
+            simulate: false,
             priority_fee_micro_lamports: 1_000, // Low priority fee
         }
     }
@@ -224,7 +228,83 @@ impl ExecutionEngine {
         )?;
         all_ixs.extend(ixs3);
 
-        // =========== Execution ===========
+        // =========== Build, (optional) simulate, execute ===========
+
+        // Build and sign transaction
+        let recent_blockhash = self.rpc.get_latest_blockhash_retry().await?;
+        let ix_count = all_ixs.len();
+        let tx = self.build_signed_transaction(all_ixs.clone(), recent_blockhash)?;
+
+        // Optional: simulate preflight and log results.
+        // IMPORTANT: if simulation returns an error, we do not send the tx.
+        if self.config.simulate {
+            match self.rpc.rpc.simulate_transaction(&tx).await {
+                Ok(sim) => {
+                    let value = sim.value;
+                    let err = value.err.map(|e| format!("{:?}", e));
+                    let logs = value.logs.unwrap_or_default();
+                    let units = value.units_consumed;
+
+                    if let Some(ref e) = err {
+                        // Keep journal noise bounded: log count + first few lines
+                        let preview: Vec<&String> = logs.iter().take(25).collect();
+                        tracing::warn!(
+                            path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
+                            amount_in = amount_in,
+                            expected_out = final_out_actual,
+                            units_consumed = ?units,
+                            error = %e,
+                            log_lines = logs.len(),
+                            log_preview = %preview.join("\\n"),
+                            "execution: SIMULATION FAILED"
+                        );
+
+                        let estimated_gas = self.estimate_gas_cost(ix_count);
+                        return Ok(ExecutionResult {
+                            signature: "SIMULATION_FAILED".to_string(),
+                            path: (base.clone(), mid1.clone(), mid2.clone()),
+                            amount_in,
+                            expected_out: final_out_actual,
+                            actual_out: None,
+                            gas_cost: estimated_gas,
+                            net_profit: net_profit_norm.into(),
+                            status: ExecutionStatus::Failed(format!("simulation failed: {e}")),
+                        });
+                    }
+
+                    tracing::info!(
+                        path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
+                        amount_in = amount_in,
+                        expected_out = final_out_actual,
+                        units_consumed = ?units,
+                        log_lines = logs.len(),
+                        "execution: simulation ok"
+                    );
+
+                    if self.config.dry_run {
+                        let estimated_gas = self.estimate_gas_cost(ix_count);
+                        return Ok(ExecutionResult {
+                            signature: "SIMULATED".to_string(),
+                            path: (base.clone(), mid1.clone(), mid2.clone()),
+                            amount_in,
+                            expected_out: final_out_actual,
+                            actual_out: None,
+                            gas_cost: estimated_gas,
+                            net_profit: net_profit_norm.into(),
+                            status: ExecutionStatus::Simulated,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
+                        error = %e,
+                        "execution: simulate_transaction RPC failed"
+                    );
+                    // If simulate fails due to RPC, fall through to normal behavior.
+                }
+            }
+        }
 
         if self.config.dry_run {
             info!(
@@ -232,11 +312,11 @@ impl ExecutionEngine {
                 amount_in = amount_in,
                 expected_out = final_out_actual,
                 profit = final_out_actual.saturating_sub(amount_in),
-                ix_count = all_ixs.len(),
+                ix_count = ix_count,
                 "execution: DRY RUN - would execute this trade"
             );
 
-            let estimated_gas = self.estimate_gas_cost(all_ixs.len());
+            let estimated_gas = self.estimate_gas_cost(ix_count);
             return Ok(ExecutionResult {
                 signature: "DRY_RUN".to_string(),
                 path: (base.clone(), mid1.clone(), mid2.clone()),
@@ -248,11 +328,6 @@ impl ExecutionEngine {
                 status: ExecutionStatus::DryRun,
             });
         }
-
-        // Build and sign transaction
-        let recent_blockhash = self.rpc.get_latest_blockhash_retry().await?;
-        let ix_count = all_ixs.len(); // Save before move
-        let tx = self.build_signed_transaction(all_ixs, recent_blockhash)?;
 
         // Send transaction
         let signature = self.rpc.rpc.send_and_confirm_transaction(&tx).await?;

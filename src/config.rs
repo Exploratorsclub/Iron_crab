@@ -131,6 +131,10 @@ pub struct ExecutionCfg {
     pub max_position_lamports: u64,
     #[serde(default = "default_dry_run")]
     pub dry_run: bool,
+    /// If true, run `simulateTransaction` for the assembled arbitrage TX and log results.
+    /// Useful for debugging why opportunities never execute successfully.
+    #[serde(default)]
+    pub simulate: bool,
     #[serde(default = "default_priority_fee_micro_lamports")]
     pub priority_fee_micro_lamports: u64,
 }
@@ -158,6 +162,7 @@ impl Default for ExecutionCfg {
             min_profit_bps_to_execute: default_min_profit_bps_to_execute(),
             max_position_lamports: default_max_position_lamports(),
             dry_run: default_dry_run(),
+            simulate: false,
             priority_fee_micro_lamports: default_priority_fee_micro_lamports(),
         }
     }
