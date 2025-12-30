@@ -5,12 +5,15 @@
 //! - Backpressure policy (drop with metrics)
 //! - Reconnection handling
 //!
-//! Note: This module compiles without async-nats dependency for now.
-//! When NATS is enabled, add `async-nats = "0.35"` to Cargo.toml.
+//! Compile with `--features nats` to enable real NATS connection.
+//! Without the feature, a stub implementation is used that logs messages.
 
 use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
+
+#[cfg(feature = "nats")]
+use async_nats;
 
 /// NATS client configuration
 #[derive(Debug, Clone)]
@@ -49,9 +52,132 @@ impl NatsConfig {
     }
 }
 
-/// Placeholder NATS client (compile-time stub)
-///
-/// When NATS feature is enabled, replace with real async-nats client.
+// ============================================================================
+// Real NATS implementation (feature-gated)
+// ============================================================================
+
+#[cfg(feature = "nats")]
+pub struct NatsClient {
+    config: NatsConfig,
+    client: Option<async_nats::Client>,
+    messages_published: std::sync::atomic::AtomicU64,
+    messages_dropped: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "nats")]
+impl NatsClient {
+    pub fn new(config: NatsConfig) -> Self {
+        Self {
+            config,
+            client: None,
+            messages_published: std::sync::atomic::AtomicU64::new(0),
+            messages_dropped: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub async fn connect(&mut self) -> anyhow::Result<()> {
+        info!(url = %self.config.url, name = %self.config.name, "Connecting to NATS");
+
+        let client = async_nats::ConnectOptions::new()
+            .name(&self.config.name)
+            .request_timeout(Some(self.config.request_timeout))
+            .connect(&self.config.url)
+            .await?;
+
+        info!(url = %self.config.url, "Connected to NATS");
+        self.client = Some(client);
+        Ok(())
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.client.is_some()
+    }
+
+    pub async fn publish<T: Serialize>(&self, topic: &str, msg: &T) -> anyhow::Result<bool> {
+        let Some(ref client) = self.client else {
+            self.messages_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(false);
+        };
+
+        let json = serde_json::to_vec(msg)?;
+
+        match tokio::time::timeout(
+            self.config.publish_timeout,
+            client.publish(topic.to_string(), json.into()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                self.messages_published.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(true)
+            }
+            Ok(Err(e)) => {
+                error!(error = %e, topic, "NATS publish error");
+                self.messages_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(false)
+            }
+            Err(_) => {
+                warn!(topic, "NATS publish timeout (backpressure)");
+                self.messages_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(false)
+            }
+        }
+    }
+
+    pub async fn request<T: Serialize, R: DeserializeOwned>(
+        &self,
+        topic: &str,
+        msg: &T,
+    ) -> anyhow::Result<R> {
+        let Some(ref client) = self.client else {
+            anyhow::bail!("NATS not connected");
+        };
+
+        let json = serde_json::to_vec(msg)?;
+        let response = client.request(topic.to_string(), json.into()).await?;
+        Ok(serde_json::from_slice(&response.payload)?)
+    }
+
+    pub async fn subscribe(&self, topic: &str) -> anyhow::Result<NatsSubscription> {
+        let Some(ref client) = self.client else {
+            anyhow::bail!("NATS not connected");
+        };
+
+        let subscriber = client.subscribe(topic.to_string()).await?;
+        Ok(NatsSubscription { subscriber })
+    }
+
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.messages_published.load(std::sync::atomic::Ordering::Relaxed),
+            self.messages_dropped.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+#[cfg(feature = "nats")]
+pub struct NatsSubscription {
+    subscriber: async_nats::Subscriber,
+}
+
+#[cfg(feature = "nats")]
+impl NatsSubscription {
+    pub async fn next(&mut self) -> Option<NatsMessage> {
+        self.subscriber.next().await.map(|msg| NatsMessage {
+            topic: msg.subject.to_string(),
+            payload: msg.payload.to_vec(),
+        })
+    }
+}
+
+#[cfg(feature = "nats")]
+use futures::StreamExt;
+
+// ============================================================================
+// Stub NATS implementation (no feature)
+// ============================================================================
+
+#[cfg(not(feature = "nats"))]
 pub struct NatsClient {
     config: NatsConfig,
     connected: bool,
@@ -59,6 +185,7 @@ pub struct NatsClient {
     messages_dropped: std::sync::atomic::AtomicU64,
 }
 
+#[cfg(not(feature = "nats"))]
 impl NatsClient {
     /// Create a new NATS client (stub - does not actually connect)
     pub fn new(config: NatsConfig) -> Self {
@@ -72,12 +199,11 @@ impl NatsClient {
 
     /// Connect to NATS server
     ///
-    /// Note: This is a stub. Real implementation requires async-nats.
+    /// Note: This is a stub. Compile with --features nats for real NATS.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
-        // Stub: just mark as "connected" for testing
         warn!(
             url = %self.config.url,
-            "NATS connect called (stub implementation - add async-nats dependency for real NATS)"
+            "NATS connect (stub) - compile with --features nats for real NATS"
         );
         self.connected = true;
         Ok(())
@@ -116,16 +242,14 @@ impl NatsClient {
     pub async fn request<T: Serialize, R: DeserializeOwned>(
         &self,
         topic: &str,
-        msg: &T,
+        _msg: &T,
     ) -> anyhow::Result<R> {
         if !self.connected {
             anyhow::bail!("NATS not connected");
         }
 
-        let _json = serde_json::to_vec(msg)?;
-
         // Stub: cannot actually do request/reply without real NATS
-        anyhow::bail!("NATS request/reply not implemented (stub)")
+        anyhow::bail!("NATS request/reply requires --features nats")
     }
 
     /// Subscribe to a topic (returns a stub receiver)
@@ -151,21 +275,25 @@ impl NatsClient {
     }
 }
 
-/// Stub subscription
+#[cfg(not(feature = "nats"))]
 pub struct NatsSubscription {
     pub topic: String,
 }
 
+#[cfg(not(feature = "nats"))]
 impl NatsSubscription {
     /// Receive next message (stub - always returns None after timeout)
     pub async fn next(&mut self) -> Option<NatsMessage> {
-        // Stub: sleep briefly then return None
         tokio::time::sleep(Duration::from_millis(100)).await;
         None
     }
 }
 
-/// Stub message
+// ============================================================================
+// Common types (both implementations)
+// ============================================================================
+
+/// NATS message wrapper
 pub struct NatsMessage {
     pub topic: String,
     pub payload: Vec<u8>,
@@ -176,19 +304,6 @@ impl NatsMessage {
     pub fn deserialize<T: DeserializeOwned>(&self) -> anyhow::Result<T> {
         Ok(serde_json::from_slice(&self.payload)?)
     }
-}
-
-// ============================================================================
-// Feature-gated real NATS implementation
-// ============================================================================
-
-/// When async-nats is available, this module provides the real implementation.
-/// Add to Cargo.toml: async-nats = { version = "0.35", optional = true }
-/// Add feature: nats = ["async-nats"]
-#[cfg(feature = "nats")]
-pub mod real {
-    // Real implementation would go here
-    // using async_nats::Client, etc.
 }
 
 #[cfg(test)]

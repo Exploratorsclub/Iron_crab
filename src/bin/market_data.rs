@@ -15,17 +15,25 @@
 
 use anyhow::Result;
 use clap::Parser;
+use solana_sdk::pubkey::Pubkey;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use ironcrab::ipc::{MarketEvent, MarketEventKind, RecordHeader, SCHEMA_VERSION};
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
+use ironcrab::solana::geyser_listener::GeyserListener;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// Build version for decision records
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Known DEX program IDs
+const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
 #[derive(Parser, Debug)]
 #[command(name = "market-data")]
@@ -54,6 +62,10 @@ struct Args {
     /// Dry run: don't publish to NATS
     #[arg(long)]
     dry_run: bool,
+
+    /// Simulate mode: emit fake slot events instead of real Geyser connection
+    #[arg(long)]
+    simulate: bool,
 }
 
 /// Runtime context for market-data
@@ -135,10 +147,140 @@ async fn main() -> Result<()> {
         event_counter: std::sync::atomic::AtomicU64::new(0),
     });
 
-    // === Main Loop: Geyser subscription ===
-    // For MVP, we emit slot heartbeats and listen for pool creations
-    info!("Entering main event loop (MVP: slot heartbeats)");
+    // === Main Loop: Geyser subscription or simulation ===
+    if args.simulate {
+        info!("Simulation mode: emitting fake slot events");
+        run_simulation_loop(ctx.clone(), &run_id).await?;
+    } else {
+        info!(geyser_url = %args.geyser_url, "Starting Geyser integration");
+        run_geyser_loop(ctx.clone(), &run_id, &args.geyser_url).await?;
+    }
 
+    // Flush JSONL on shutdown
+    ctx.jsonl_writer.flush()?;
+    info!(run_id = %run_id, "market-data shutdown complete");
+
+    Ok(())
+}
+
+/// Run with real Geyser connection
+async fn run_geyser_loop(ctx: Arc<MarketDataContext>, run_id: &str, geyser_url: &str) -> Result<()> {
+    // DEX program IDs to monitor
+    let program_ids = vec![
+        Pubkey::from_str(RAYDIUM_AMM_V4).expect("valid raydium pubkey"),
+        Pubkey::from_str(ORCA_WHIRLPOOL).expect("valid orca pubkey"),
+        Pubkey::from_str(PUMPFUN_PROGRAM).expect("valid pumpfun pubkey"),
+    ];
+
+    let (listener, mut account_rx, mut transaction_rx) =
+        GeyserListener::new(geyser_url.to_string(), program_ids);
+
+    // Spawn Geyser listener task
+    let listener_handle = tokio::spawn(async move {
+        if let Err(e) = listener.start().await {
+            error!(error = %e, "Geyser listener crashed");
+        }
+    });
+
+    // Graceful shutdown handling
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+
+    let mut account_count = 0u64;
+    let mut tx_count = 0u64;
+    let mut last_heartbeat = std::time::Instant::now();
+
+    loop {
+        tokio::select! {
+            // Account updates (pool state changes)
+            Ok(account_update) = account_rx.recv() => {
+                account_count += 1;
+
+                let event = MarketEvent::new(
+                    "market-data",
+                    BUILD_VERSION,
+                    run_id,
+                    ctx.next_event_id(),
+                    "geyser",
+                    Some(account_update.slot),
+                    MarketEventKind::AccountUpdate {
+                        pubkey: account_update.pubkey.to_string(),
+                        owner: account_update.owner.to_string(),
+                        data_len: account_update.data.len(),
+                    },
+                );
+
+                // Write to JSONL
+                if let Err(e) = ctx.jsonl_writer.write(&event) {
+                    error!(error = %e, "Failed to write account event to JSONL");
+                }
+
+                // Publish to NATS
+                if let Some(ref nats) = ctx.nats {
+                    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
+                        warn!(error = %e, "Failed to publish account event to NATS");
+                    }
+                }
+            }
+
+            // Transaction updates (pool creations, swaps)
+            Ok(tx_update) = transaction_rx.recv() => {
+                tx_count += 1;
+
+                let event = MarketEvent::new(
+                    "market-data",
+                    BUILD_VERSION,
+                    run_id,
+                    ctx.next_event_id(),
+                    "geyser",
+                    Some(tx_update.slot),
+                    MarketEventKind::TransactionDetected {
+                        signature: tx_update.signature.clone(),
+                        program: tx_update.account_keys.first().map(|k| k.to_string()).unwrap_or_default(),
+                    },
+                );
+
+                // Write to JSONL
+                if let Err(e) = ctx.jsonl_writer.write(&event) {
+                    error!(error = %e, "Failed to write tx event to JSONL");
+                }
+
+                // Publish to NATS
+                if let Some(ref nats) = ctx.nats {
+                    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
+                        warn!(error = %e, "Failed to publish tx event to NATS");
+                    }
+                }
+            }
+
+            // Periodic heartbeat
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                if last_heartbeat.elapsed().as_secs() >= 60 {
+                    let (records, bytes) = ctx.jsonl_writer.stats();
+                    info!(
+                        accounts = account_count,
+                        transactions = tx_count,
+                        records_written = records,
+                        bytes_written = bytes,
+                        "market-data heartbeat (Geyser)"
+                    );
+                    last_heartbeat = std::time::Instant::now();
+                }
+            }
+
+            _ = &mut shutdown => {
+                info!("Shutdown signal received");
+                listener_handle.abort();
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Run simulation loop (for testing without Geyser)
+async fn run_simulation_loop(ctx: Arc<MarketDataContext>, run_id: &str) -> Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut slot: u64 = 0;
 
@@ -149,14 +291,14 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                slot += 1; // Simulated slot progression for MVP
+                slot += 1; // Simulated slot progression
 
                 let event = MarketEvent::new(
                     "market-data",
                     BUILD_VERSION,
-                    &ctx.run_id,
+                    run_id,
                     ctx.next_event_id(),
-                    "simulated", // In production: "geyser"
+                    "simulated",
                     Some(slot),
                     MarketEventKind::SlotUpdate { slot },
                 );
@@ -180,7 +322,7 @@ async fn main() -> Result<()> {
                         slot,
                         records_written = records,
                         bytes_written = bytes,
-                        "Market-data heartbeat"
+                        "market-data heartbeat (simulation)"
                     );
                 }
             }
@@ -190,10 +332,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-
-    // Flush JSONL on shutdown
-    ctx.jsonl_writer.flush()?;
-    info!(run_id = %run_id, "market-data shutdown complete");
 
     Ok(())
 }

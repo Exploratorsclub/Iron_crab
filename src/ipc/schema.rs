@@ -112,6 +112,17 @@ pub enum MarketEventKind {
     },
     /// Slot progression (heartbeat)
     SlotUpdate { slot: u64 },
+    /// Raw account update from Geyser
+    AccountUpdate {
+        pubkey: String,
+        owner: String,
+        data_len: usize,
+    },
+    /// Transaction detected via Geyser
+    TransactionDetected {
+        signature: String,
+        program: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

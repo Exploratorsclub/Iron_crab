@@ -244,9 +244,25 @@ async fn main() -> Result<()> {
     // === Main Loop: Process TradeIntents ===
     info!("Entering main execution loop");
 
+    // Subscribe to TradeIntents if NATS connected
+    let intent_subscription = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_TRADE_INTENTS).await {
+            Ok(sub) => {
+                info!(topic = TOPIC_TRADE_INTENTS, "Subscribed to TradeIntents");
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to TradeIntents");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
-    // For MVP, simulate receiving an intent
+    // For MVP dry-run test
     let mut simulated_tick: u64 = 0;
     let mut test_intent_processed = false;
 
@@ -254,8 +270,32 @@ async fn main() -> Result<()> {
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
+    // Wrap subscription in Option for ownership
+    let mut intent_sub_opt = intent_subscription;
+
     loop {
         tokio::select! {
+            // NATS subscription: receive TradeIntents
+            Some(msg) = async {
+                if let Some(ref mut sub) = intent_sub_opt {
+                    sub.next().await
+                } else {
+                    None
+                }
+            } => {
+                match msg.deserialize::<TradeIntent>() {
+                    Ok(intent) => {
+                        info!(intent_id = %intent.intent_id, source = %intent.source, "Received TradeIntent from NATS");
+                        if let Err(e) = process_intent(&ctx, intent).await {
+                            error!(error = %e, "Failed to process intent");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to deserialize TradeIntent");
+                    }
+                }
+            }
+
             _ = interval.tick() => {
                 simulated_tick += 1;
 
