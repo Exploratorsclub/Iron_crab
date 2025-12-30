@@ -24,7 +24,6 @@ use uuid::Uuid;
 
 use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, MarketEvent, MarketEventKind,
-    RecordHeader, SCHEMA_VERSION,
 };
 use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};

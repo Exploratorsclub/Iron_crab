@@ -28,7 +28,7 @@ use ironcrab::ipc::{
     TradingRegime,
 };
 use ironcrab::metrics::serve_metrics;
-use ironcrab::nats::{NatsClient, NatsConfig, NatsMessage, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
+use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// NATS topic for config reload (P1: Runtime Configuration via UI)

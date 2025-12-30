@@ -25,20 +25,20 @@
 use anyhow::Result;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
-    DecisionRecord, ExecutionResult, ExecutionStatus, FairnessPolicy, FeePolicy, IntentOrigin,
+    DecisionRecord, FairnessPolicy, FeePolicy, IntentOrigin,
     RejectReason, SimulationResult, TradeIntent, TradingRegime,
 };
 use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{
-    NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS,
+    NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_TRADE_INTENTS,
 };
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
 use ironcrab::storage::{
@@ -1296,7 +1296,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 "Sending atomic bundle via Jito"
             );
             
-            if let Some(ref jito) = ctx.jito_client {
+            if let Some(ref _jito) = ctx.jito_client {
                 // In production: build transaction from intent and submit via bundle
                 // For MVP: just track that bundle would be submitted
                 ctx.bundles_submitted
