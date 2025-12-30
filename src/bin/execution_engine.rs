@@ -16,9 +16,16 @@
 //! - Decision Records for every intent
 //! - Reason-coded rejects
 //! - No silent failure: all errors logged with reason code (DoD O)
+//!
+//! P1: State Persistence (DoD K)
+//! - State survives restarts via StateSnapshot
+//! - Idempotency store persisted and loaded
+//! - Daily loss tracking persisted
 
 use anyhow::Result;
 use clap::Parser;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -131,6 +138,114 @@ impl ExecutionConfig {
     }
 }
 
+// ============================================================================
+// P1: State Persistence (DoD K) - State survives restarts
+// ============================================================================
+
+/// Persistent state snapshot for crash recovery
+/// 
+/// Saved on graceful shutdown and periodic intervals.
+/// Loaded on startup to restore state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StateSnapshot {
+    /// Version for forward compatibility
+    version: u32,
+    /// UTC date for daily tracking
+    day: String,
+    /// Cumulative daily loss (lamports, positive = loss)
+    daily_loss_lamports: i64,
+    /// Current open positions count
+    open_positions: usize,
+    /// Decision counter (for generating unique IDs)
+    decision_counter: u64,
+    /// Execution counter
+    execution_counter: u64,
+    /// Processed intent IDs (idempotency store)
+    processed_intents: Vec<String>,
+    /// Timestamp when snapshot was created
+    saved_at: String,
+    /// Run ID that created this snapshot
+    run_id: String,
+}
+
+impl StateSnapshot {
+    const CURRENT_VERSION: u32 = 1;
+    const SNAPSHOT_FILE: &'static str = "execution_state.json";
+    
+    /// Create a new snapshot from current state
+    fn from_context(ctx: &ExecutionContext) -> Self {
+        Self {
+            version: Self::CURRENT_VERSION,
+            day: ctx.current_day.read().to_string(),
+            daily_loss_lamports: ctx.daily_loss_lamports.load(std::sync::atomic::Ordering::Relaxed),
+            open_positions: ctx.open_positions.load(std::sync::atomic::Ordering::Relaxed),
+            decision_counter: ctx.decision_counter.load(std::sync::atomic::Ordering::Relaxed),
+            execution_counter: ctx.execution_counter.load(std::sync::atomic::Ordering::Relaxed),
+            processed_intents: ctx.lock_manager.get_processed_intents(),
+            saved_at: chrono::Utc::now().to_rfc3339(),
+            run_id: ctx.run_id.clone(),
+        }
+    }
+    
+    /// Save snapshot to disk
+    fn save(&self, log_dir: &PathBuf) -> Result<()> {
+        let path = log_dir.join(Self::SNAPSHOT_FILE);
+        std::fs::create_dir_all(log_dir)?;
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(&path, json)?;
+        info!(path = %path.display(), "State snapshot saved");
+        Ok(())
+    }
+    
+    /// Load snapshot from disk (returns None if not found or invalid)
+    fn load(log_dir: &PathBuf) -> Option<Self> {
+        let path = log_dir.join(Self::SNAPSHOT_FILE);
+        if !path.exists() {
+            info!(path = %path.display(), "No state snapshot found, starting fresh");
+            return None;
+        }
+        
+        match std::fs::read_to_string(&path) {
+            Ok(json) => {
+                match serde_json::from_str::<StateSnapshot>(&json) {
+                    Ok(snapshot) => {
+                        if snapshot.version != Self::CURRENT_VERSION {
+                            warn!(
+                                found_version = snapshot.version,
+                                expected_version = Self::CURRENT_VERSION,
+                                "State snapshot version mismatch, starting fresh"
+                            );
+                            return None;
+                        }
+                        info!(
+                            path = %path.display(),
+                            saved_at = %snapshot.saved_at,
+                            prev_run_id = %snapshot.run_id,
+                            processed_intents = snapshot.processed_intents.len(),
+                            "Loaded state snapshot"
+                        );
+                        Some(snapshot)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to parse state snapshot, starting fresh");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to read state snapshot, starting fresh");
+                None
+            }
+        }
+    }
+    
+    /// Check if the snapshot is from the same day
+    fn is_same_day(&self) -> bool {
+        let today = chrono::Utc::now().date_naive().to_string();
+        self.day == today
+    }
+}
+
 /// Runtime context for execution-engine
 struct ExecutionContext {
     run_id: String,
@@ -140,6 +255,7 @@ struct ExecutionContext {
     decision_writer: JsonlWriter,
     execution_writer: JsonlWriter,
     lock_manager: LockManager,
+    log_base: PathBuf,  // P1: For state persistence
     decision_counter: std::sync::atomic::AtomicU64,
     execution_counter: std::sync::atomic::AtomicU64,
     
@@ -159,6 +275,12 @@ struct ExecutionContext {
 }
 
 impl ExecutionContext {
+    /// Save state snapshot for crash recovery (P1: DoD K)
+    fn save_state(&self) -> Result<()> {
+        let snapshot = StateSnapshot::from_context(self);
+        snapshot.save(&self.log_base)
+    }
+    
     fn next_decision_id(&self) -> String {
         let n = self
             .decision_counter
@@ -304,6 +426,18 @@ async fn main() -> Result<()> {
         initial_sol = args.initial_sol_lamports,
         "Lock manager initialized"
     );
+    
+    // P1: Load state snapshot if available (DoD K)
+    let snapshot = StateSnapshot::load(&log_base);
+    
+    // Restore processed intents (idempotency)
+    if let Some(ref snap) = snapshot {
+        lock_manager.set_processed_intents(snap.processed_intents.clone());
+        info!(
+            restored_intents = snap.processed_intents.len(),
+            "Idempotency store restored from snapshot"
+        );
+    }
 
     // Setup NATS
     let nats = if args.dry_run {
@@ -321,6 +455,44 @@ async fn main() -> Result<()> {
         }
     };
 
+    // P1: Determine initial values from snapshot (DoD K)
+    let (initial_day, initial_daily_loss, initial_positions, initial_decision_counter, initial_execution_counter) = 
+        if let Some(ref snap) = snapshot {
+            if snap.is_same_day() {
+                // Same day: restore all counters
+                info!(
+                    daily_loss = snap.daily_loss_lamports,
+                    open_positions = snap.open_positions,
+                    decision_counter = snap.decision_counter,
+                    "Restored same-day state from snapshot"
+                );
+                (
+                    chrono::NaiveDate::parse_from_str(&snap.day, "%Y-%m-%d")
+                        .unwrap_or_else(|_| chrono::Utc::now().date_naive()),
+                    snap.daily_loss_lamports,
+                    snap.open_positions,
+                    snap.decision_counter,
+                    snap.execution_counter,
+                )
+            } else {
+                // New day: reset daily counters but keep counters for ID generation
+                info!(
+                    old_day = %snap.day,
+                    "New day detected, resetting daily loss but keeping ID counters"
+                );
+                (
+                    chrono::Utc::now().date_naive(),
+                    0,  // Reset daily loss
+                    0,  // Reset positions (they would have been closed or expired)
+                    snap.decision_counter, // Keep for unique IDs across restarts
+                    snap.execution_counter,
+                )
+            }
+        } else {
+            // Fresh start
+            (chrono::Utc::now().date_naive(), 0, 0, 0, 0)
+        };
+
     let ctx = Arc::new(ExecutionContext {
         run_id: run_id.clone(),
         config_snapshot_id: exec_config.snapshot_id(),
@@ -329,12 +501,13 @@ async fn main() -> Result<()> {
         decision_writer,
         execution_writer,
         lock_manager,
-        decision_counter: std::sync::atomic::AtomicU64::new(0),
-        execution_counter: std::sync::atomic::AtomicU64::new(0),
-        // Risk tracking
-        current_day: parking_lot::RwLock::new(chrono::Utc::now().date_naive()),
-        daily_loss_lamports: std::sync::atomic::AtomicI64::new(0),
-        open_positions: std::sync::atomic::AtomicUsize::new(0),
+        log_base: log_base.clone(),
+        decision_counter: std::sync::atomic::AtomicU64::new(initial_decision_counter),
+        execution_counter: std::sync::atomic::AtomicU64::new(initial_execution_counter),
+        // Risk tracking - restored from snapshot
+        current_day: parking_lot::RwLock::new(initial_day),
+        daily_loss_lamports: std::sync::atomic::AtomicI64::new(initial_daily_loss),
+        open_positions: std::sync::atomic::AtomicUsize::new(initial_positions),
         // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
@@ -432,12 +605,26 @@ async fn main() -> Result<()> {
                         "Execution-engine heartbeat"
                     );
                 }
+                
+                // P1: Periodic state save every 60 ticks (~1 minute) (DoD K)
+                if simulated_tick % 60 == 0 {
+                    if let Err(e) = ctx.save_state() {
+                        warn!(error = %e, "Failed to save periodic state snapshot");
+                    } else {
+                        debug!(tick = simulated_tick, "Periodic state snapshot saved");
+                    }
+                }
             }
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
                 break;
             }
         }
+    }
+
+    // P1: Save state snapshot on shutdown (DoD K)
+    if let Err(e) = ctx.save_state() {
+        error!(error = %e, "Failed to save state snapshot");
     }
 
     // Flush JSONL on shutdown

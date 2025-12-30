@@ -342,6 +342,24 @@ impl LockManager {
     pub fn processed_count(&self) -> usize {
         self.processed_intents.read().len()
     }
+    
+    // ========================================================================
+    // P1: State Persistence support (DoD K)
+    // ========================================================================
+    
+    /// Get all processed intent IDs for persistence
+    pub fn get_processed_intents(&self) -> Vec<String> {
+        self.processed_intents.read().iter().cloned().collect()
+    }
+    
+    /// Restore processed intent IDs from snapshot
+    /// 
+    /// Note: This replaces the current set. Only call during initialization.
+    pub fn set_processed_intents(&self, intents: Vec<String>) {
+        let mut processed = self.processed_intents.write();
+        processed.clear();
+        processed.extend(intents);
+    }
 }
 
 #[cfg(test)]
