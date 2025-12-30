@@ -13,7 +13,7 @@ WorkingDirectory=/home/ironcrab/Iron_crab
 ExecStart=/home/ironcrab/Iron_crab/target/release/market-data \
     --config /home/ironcrab/Iron_crab/my_config.server.toml \
     --nats-url nats://localhost:4222 \
-    --geyser-url http://127.0.0.1:10001 \
+    --geyser-url http://127.0.0.1:10000 \
     --metrics-port 9801
 
 Environment=RUST_LOG=info,market_data=info,ironcrab::solana::geyser_listener=warn

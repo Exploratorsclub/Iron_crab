@@ -16,7 +16,7 @@ ExecStart=/home/ironcrab/Iron_crab/target/release/execution-engine \
     --metrics-port 9803
 
 Environment=RUST_LOG=info,execution_engine=info,ironcrab::engine=debug
-Environment=KEYPAIR_PATH=/home/ironcrab/.config/solana/id.json
+Environment=IRONCRAB_KEYPAIR_PATH=/home/ironcrab/.config/solana/id.json
 
 Restart=on-failure
 RestartSec=5
