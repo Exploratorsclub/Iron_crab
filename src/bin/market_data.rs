@@ -122,12 +122,15 @@ async fn main() -> Result<()> {
     info!(port = args.metrics_port, "Metrics server started at /metrics");
 
     // === P0 Check: Ensure no wallet keys are loaded ===
-    // market-data is KEYLESS per architecture
+    // market-data is KEYLESS per architecture – exit immediately if keys are detected
     if std::env::var("IRONCRAB_KEYPAIR_JSON").is_ok()
         || std::env::var("IRONCRAB_KEYPAIR_B64").is_ok()
         || std::env::var("IRONCRAB_KEYPAIR_PATH").is_ok()
     {
-        warn!("Wallet key environment variables detected but market-data is KEYLESS. Ignoring keys.");
+        error!("ERROR: Wallet key environment variables detected!");
+        error!("market-data is KEYLESS per architecture. Remove key variables and restart.");
+        error!("Only execution-engine should have access to wallet keys.");
+        std::process::exit(1);
     }
 
     // Setup JSONL writer

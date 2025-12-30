@@ -55,6 +55,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("control-plane")
 
+# Audit logger for control actions (separate log stream)
+audit_logger = logging.getLogger("control-plane.audit")
+audit_handler = logging.FileHandler("control_plane_audit.log")
+audit_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - AUDIT - %(message)s'
+))
+audit_logger.addHandler(audit_handler)
+audit_logger.setLevel(logging.INFO)
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -177,6 +186,20 @@ state = ControlPlaneState()
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Control plane starting...")
+    
+    # P0 Security Check: Control Plane must NEVER have access to wallet keys
+    forbidden_vars = ["IRONCRAB_KEYPAIR_JSON", "IRONCRAB_KEYPAIR_B64", 
+                      "IRONCRAB_KEYPAIR_PATH", "IRONCRAB_KEYPAIR_BASE58"]
+    detected_keys = [v for v in forbidden_vars if os.getenv(v)]
+    if detected_keys:
+        logger.critical(f"SECURITY VIOLATION: Control Plane detected wallet key variables: {detected_keys}")
+        logger.critical("Control Plane must be KEYLESS. Remove these variables immediately!")
+        audit_logger.critical(f"STARTUP_BLOCKED: Wallet keys detected in environment: {detected_keys}")
+        raise RuntimeError("Control Plane cannot start with wallet key environment variables")
+    
+    logger.info("Security check passed: No wallet keys in environment")
+    audit_logger.info("STARTUP: Control Plane started (keyless mode verified)")
+    
     state.http_client = httpx.AsyncClient(timeout=5.0)
     await state.connect_nats()
     logger.info("Control plane ready")
@@ -185,6 +208,7 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Control plane shutting down...")
+    audit_logger.info("SHUTDOWN: Control Plane stopping")
     if state.http_client:
         await state.http_client.aclose()
     await state.disconnect_nats()
@@ -307,6 +331,7 @@ async def trigger_kill_switch(request: KillRequest, background_tasks: Background
     3. Optionally trigger position liquidation
     """
     logger.warning(f"KILL SWITCH TRIGGERED: {request.reason}")
+    audit_logger.warning(f"KILL_SWITCH_ACTIVATED: reason='{request.reason}', liquidate={request.liquidate_positions}")
     
     state.kill_switch_active = True
     state.kill_switch_reason = request.reason
@@ -337,6 +362,7 @@ async def reset_kill_switch():
         return {"status": "kill_switch_not_active"}
     
     logger.info("Kill switch reset requested")
+    audit_logger.info(f"KILL_SWITCH_RESET: previous_reason='{state.kill_switch_reason}'")
     state.kill_switch_active = False
     
     # Publish reset command
@@ -358,6 +384,9 @@ async def send_command(component: str, request: CommandRequest):
     valid_components = ["market-data", "momentum-bot", "execution-engine"]
     if component not in valid_components:
         raise HTTPException(status_code=400, detail=f"Invalid component. Must be one of: {valid_components}")
+    
+    # Audit log the command (before execution)
+    audit_logger.info(f"COMMAND: component={component}, command={request.command}, params={request.params}")
     
     topic = f"ironcrab.{component.replace('-', '_')}.commands"
     
@@ -396,6 +425,9 @@ async def update_config(update: ConfigUpdate):
     valid_components = ["market-data", "momentum-bot", "execution-engine"]
     if update.component not in valid_components:
         raise HTTPException(status_code=400, detail=f"Invalid component. Must be one of: {valid_components}")
+    
+    # Audit log the config change
+    audit_logger.info(f"CONFIG_UPDATE: component={update.component}, keys={list(update.config.keys())}")
     
     config_msg = {
         "command": "config_update",
