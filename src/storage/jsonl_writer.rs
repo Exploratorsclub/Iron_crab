@@ -14,15 +14,17 @@ use std::sync::Mutex;
 use tracing::{debug, error, warn};
 
 /// Configuration for JSONL writer
+///
+/// All defaults documented (DoD K) P0: No hidden defaults).
 #[derive(Debug, Clone)]
 pub struct JsonlWriterConfig {
-    /// Base directory for logs
+    /// Base directory for logs. Default: $IRONCRAB_LOG_DIR or "trade_logs"
     pub log_dir: PathBuf,
-    /// Prefix for filenames (e.g., "market_events", "trade_intents")
+    /// Prefix for filenames (e.g., "market_events", "trade_intents"). Default: "records"
     pub prefix: String,
-    /// Buffer size for writes (default: 8KB)
+    /// Buffer size for writes. Default: 8KB
     pub buffer_size: usize,
-    /// Flush after each write (safer but slower)
+    /// Flush after each write (safer but slower). Default: false
     pub flush_each_write: bool,
 }
 
@@ -33,8 +35,8 @@ impl Default for JsonlWriterConfig {
                 std::env::var("IRONCRAB_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string()),
             ),
             prefix: "records".to_string(),
-            buffer_size: 8192,
-            flush_each_write: false,
+            buffer_size: 8192,        // 8KB buffer
+            flush_each_write: false,  // batch writes for performance
         }
     }
 }

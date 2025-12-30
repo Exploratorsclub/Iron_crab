@@ -19,17 +19,19 @@ use tracing::{error, info};
 use async_nats;
 
 /// NATS client configuration
+///
+/// All defaults documented (DoD K) P0: No hidden defaults).
 #[derive(Debug, Clone)]
 pub struct NatsConfig {
-    /// NATS server URL (e.g., "nats://localhost:4222")
+    /// NATS server URL. Default: $NATS_URL or "nats://localhost:4222"
     pub url: String,
-    /// Connection name for debugging
+    /// Connection name for debugging. Default: "ironcrab"
     pub name: String,
-    /// Reconnect attempts (-1 for infinite)
+    /// Reconnect attempts (-1 for infinite). Default: -1
     pub max_reconnects: i32,
-    /// Request timeout
+    /// Request timeout. Default: 5s
     pub request_timeout: Duration,
-    /// Publish timeout (for backpressure)
+    /// Publish timeout (for backpressure). Default: 100ms
     pub publish_timeout: Duration,
 }
 
@@ -38,9 +40,9 @@ impl Default for NatsConfig {
         Self {
             url: std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string()),
             name: "ironcrab".to_string(),
-            max_reconnects: -1,
-            request_timeout: Duration::from_secs(5),
-            publish_timeout: Duration::from_millis(100),
+            max_reconnects: -1,                        // infinite reconnects
+            request_timeout: Duration::from_secs(5),   // 5s request timeout
+            publish_timeout: Duration::from_millis(100), // 100ms publish timeout
         }
     }
 }

@@ -63,34 +63,36 @@ struct Args {
 }
 
 /// Momentum policy configuration
+///
+/// All defaults are documented (DoD K) P0: No hidden defaults).
 #[derive(Debug, Clone)]
 struct MomentumConfig {
-    /// Minimum liquidity (SOL) for EARLY regime
+    /// Minimum liquidity (SOL) for EARLY regime. Default: 5.0 SOL
     early_min_liquidity_sol: f64,
-    /// Minimum liquidity (SOL) for ESTABLISHED regime
+    /// Minimum liquidity (SOL) for ESTABLISHED regime. Default: 20.0 SOL
     established_min_liquidity_sol: f64,
-    /// Slot threshold for EARLY -> ESTABLISHED transition
+    /// Slot threshold for EARLY -> ESTABLISHED transition. Default: 1000 slots
     early_slot_threshold: u64,
-    /// Max slippage BPS for EARLY trades
+    /// Max slippage BPS for EARLY trades. Default: 300 (3%)
     early_max_slippage_bps: u32,
-    /// Max slippage BPS for ESTABLISHED trades
+    /// Max slippage BPS for ESTABLISHED trades. Default: 100 (1%)
     established_max_slippage_bps: u32,
-    /// Default position size (SOL lamports)
+    /// Default position size (SOL lamports). Default: 0.1 SOL
     default_position_lamports: u64,
-    /// Allowlist for test mode (mints that trigger intents)
+    /// Allowlist for test mode (mints that trigger intents). Default: empty
     test_allowlist: HashSet<String>,
 }
 
 impl Default for MomentumConfig {
     fn default() -> Self {
         Self {
-            early_min_liquidity_sol: 5.0,
-            established_min_liquidity_sol: 20.0,
-            early_slot_threshold: 1000,
-            early_max_slippage_bps: 300,
-            established_max_slippage_bps: 100,
-            default_position_lamports: 100_000_000, // 0.1 SOL
-            test_allowlist: HashSet::new(),
+            early_min_liquidity_sol: 5.0,              // 5 SOL min for early trades
+            established_min_liquidity_sol: 20.0,       // 20 SOL min for established
+            early_slot_threshold: 1000,                // ~400s until established
+            early_max_slippage_bps: 300,               // 3% for volatile early stage
+            established_max_slippage_bps: 100,         // 1% for stable pools
+            default_position_lamports: 100_000_000,    // 0.1 SOL per trade
+            test_allowlist: HashSet::new(),            // empty = all mints allowed
         }
     }
 }

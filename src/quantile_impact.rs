@@ -33,28 +33,30 @@ pub enum SizeCategory {
 }
 
 /// Configuration for quantile-based slippage calculation
+///
+/// All defaults documented (DoD K) P0: No hidden defaults).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuantileConfig {
-    /// Confidence level (0.95 = P95, 0.99 = P99)
+    /// Confidence level (0.95 = P95, 0.99 = P99). Default: 0.95
     pub confidence_level: f64,
-    /// Minimum historical samples required before using quantile
+    /// Minimum historical samples required before using quantile. Default: 20
     pub min_samples: usize,
-    /// Maximum age of samples in seconds
+    /// Maximum age of samples in seconds. Default: 86400 (24h)
     pub max_sample_age_secs: u64,
-    /// Maximum samples to retain per pool
+    /// Maximum samples to retain per pool. Default: 500
     pub max_samples_per_pool: usize,
-    /// Fallback slippage if insufficient data (basis points)
+    /// Fallback slippage if insufficient data (basis points). Default: 100 (1%)
     pub fallback_slippage_bps: u32,
 }
 
 impl Default for QuantileConfig {
     fn default() -> Self {
         Self {
-            confidence_level: 0.95, // P95
-            min_samples: 20,
-            max_sample_age_secs: 86400, // 24 hours
-            max_samples_per_pool: 500,
-            fallback_slippage_bps: 100, // 1%
+            confidence_level: 0.95,     // P95 confidence
+            min_samples: 20,            // need 20 samples for quantile
+            max_sample_age_secs: 86400, // 24 hours max age
+            max_samples_per_pool: 500,  // cap at 500 per pool
+            fallback_slippage_bps: 100, // 1% if insufficient data
         }
     }
 }

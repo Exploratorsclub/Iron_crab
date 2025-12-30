@@ -12,20 +12,22 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 /// Configuration for trade execution
+///
+/// All defaults documented (DoD K) P0: No hidden defaults).
 #[derive(Debug, Clone, Copy)]
 pub struct ExecutionConfig {
-    /// Maximum slippage tolerance in basis points (e.g., 500 = 5%)
+    /// Maximum slippage tolerance (basis points). Default: 500 (5%)
     pub max_slippage_bps: u32,
-    /// Minimum profit required to execute (bps)
+    /// Minimum profit required to execute (bps). Default: 50 (0.5%)
     pub min_profit_bps_to_execute: u32,
-    /// Maximum lamports to risk per trade
+    /// Maximum lamports to risk per trade. Default: 5 SOL
     pub max_position_lamports: u64,
-    /// Whether to actually execute or just simulate
+    /// Whether to actually execute or just simulate. Default: true (dry run)
     pub dry_run: bool,
-    /// If true, run `simulateTransaction` for the assembled TX and log result.
-    /// For safety/debugging: when simulation returns an error, the trade is not sent.
+    /// Run simulateTransaction before sending. Default: false
+    /// When simulation errors, trade is not sent.
     pub simulate: bool,
-    /// Priority fee in micro-lamports (adjust for network congestion)
+    /// Priority fee in micro-lamports. Default: 1000
     pub priority_fee_micro_lamports: u64,
 }
 
@@ -35,9 +37,9 @@ impl Default for ExecutionConfig {
             max_slippage_bps: 500,                // 5% slippage tolerance
             min_profit_bps_to_execute: 50,        // 0.5% minimum profit
             max_position_lamports: 5_000_000_000, // 5 SOL max per trade
-            dry_run: true,
-            simulate: false,
-            priority_fee_micro_lamports: 1_000, // Low priority fee
+            dry_run: true,                        // dry run by default (safe)
+            simulate: false,                      // no simulation by default
+            priority_fee_micro_lamports: 1_000,   // low priority fee
         }
     }
 }
