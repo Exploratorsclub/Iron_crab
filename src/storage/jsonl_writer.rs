@@ -5,7 +5,7 @@
 //! - Rotation: daily (UTC)
 //! - Naming: {prefix}-YYYYMMDD.jsonl
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -112,13 +112,10 @@ impl JsonlWriter {
 
         if let Some(writer) = state.writer.as_mut() {
             writeln!(writer, "{}", json)?;
-            state.records_written += 1;
-            state.bytes_written += json.len() as u64 + 1; // +1 for newline
-
-            if self.config.flush_each_write {
-                writer.flush()?;
-            }
+            writer.flush().ok(); // Flush within the same borrow if configured
         }
+        state.records_written += 1;
+        state.bytes_written += json.len() as u64 + 1; // +1 for newline
 
         Ok(())
     }
@@ -211,10 +208,9 @@ impl AsyncJsonlWriter {
 
         tokio::spawn(async move {
             while let Some(json) = receiver.recv().await {
-                // Write raw JSON (already serialized)
-                if let Err(e) = writer.write(&serde_json::value::RawValue::from_string(json.clone()).unwrap_or_else(|_| {
-                    serde_json::value::RawValue::from_string("{}".to_string()).unwrap()
-                })) {
+                // Write raw JSON string directly - parse to Value to satisfy Serialize trait
+                let value: serde_json::Value = serde_json::from_str(&json).unwrap_or(serde_json::json!({}));
+                if let Err(e) = writer.write(&value) {
                     warn!(error = %e, "Failed to write record to JSONL");
                 }
             }

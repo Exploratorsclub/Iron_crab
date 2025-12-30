@@ -10,7 +10,10 @@
 
 use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, warn};
+
+#[cfg(feature = "nats")]
+use tracing::{error, info};
 
 #[cfg(feature = "nats")]
 use async_nats;
@@ -241,7 +244,7 @@ impl NatsClient {
     /// Request/reply pattern
     pub async fn request<T: Serialize, R: DeserializeOwned>(
         &self,
-        topic: &str,
+        _topic: &str,
         _msg: &T,
     ) -> anyhow::Result<R> {
         if !self.connected {
