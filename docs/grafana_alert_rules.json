@@ -1,0 +1,594 @@
+{
+  "apiVersion": 1,
+  "groups": [
+    {
+      "orgId": 1,
+      "name": "IronCrab Fairness & Starvation",
+      "folder": "IronCrab Alerts",
+      "interval": "1m",
+      "rules": [
+        {
+          "uid": "ironcrab-starvation-high-priority",
+          "title": "High Priority Intent Starvation",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 300,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "expr": "ironcrab_arbitration_starved_intents_total{tier=\"high\"}",
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "relativeTimeRange": {
+                "from": 300,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [],
+                      "type": "gt"
+                    },
+                    "operator": {
+                      "type": "and"
+                    },
+                    "query": {
+                      "params": ["B"]
+                    },
+                    "reducer": {
+                      "params": [],
+                      "type": "last"
+                    }
+                  }
+                ],
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "A",
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "reducer": "mean",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 300,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [5],
+                      "type": "gt"
+                    },
+                    "operator": {
+                      "type": "and"
+                    },
+                    "query": {
+                      "params": ["C"]
+                    },
+                    "reducer": {
+                      "params": [],
+                      "type": "last"
+                    }
+                  }
+                ],
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "B",
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "5m",
+          "annotations": {
+            "summary": "High priority intents are being starved",
+            "description": "More than 5 high-priority intents have been starved in the last 5 minutes. This indicates capital contention or fairness policy issues."
+          },
+          "labels": {
+            "severity": "warning",
+            "component": "execution-engine",
+            "type": "fairness"
+          }
+        },
+        {
+          "uid": "ironcrab-starvation-critical",
+          "title": "Critical Intent Starvation Rate",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "expr": "rate(ironcrab_arbitration_starved_intents_total[5m])",
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "mean",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [0.1],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "10m",
+          "annotations": {
+            "summary": "Intent starvation rate is critically high",
+            "description": "Starvation rate > 0.1/sec sustained for 10 minutes. Consider increasing capital limits or reviewing fairness policies."
+          },
+          "labels": {
+            "severity": "critical",
+            "component": "execution-engine",
+            "type": "fairness"
+          }
+        },
+        {
+          "uid": "ironcrab-fairness-imbalance",
+          "title": "Fairness Imbalance Between Sources",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 3600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "expr": "ironcrab_arbitration_processed_total{source=\"momentum\"}",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "relativeTimeRange": {
+                "from": 3600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "expr": "ironcrab_arbitration_processed_total{source=\"arbitrage\"}",
+                "refId": "B"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [10],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "expression": "abs($A - $B)",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "30m",
+          "annotations": {
+            "summary": "Large imbalance between momentum and arbitrage execution",
+            "description": "One source is executing significantly more than the other. This may indicate fairness policy misconfiguration."
+          },
+          "labels": {
+            "severity": "info",
+            "component": "execution-engine",
+            "type": "fairness"
+          }
+        },
+        {
+          "uid": "ironcrab-capital-exhaustion",
+          "title": "Capital Exhaustion Warning",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 300,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "expr": "ironcrab_locked_capital_sol / ironcrab_available_capital_sol",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "last",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [0.9],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "5m",
+          "annotations": {
+            "summary": "More than 90% of capital is locked",
+            "description": "Capital utilization is very high. New intents will likely be rejected due to insufficient capital."
+          },
+          "labels": {
+            "severity": "warning",
+            "component": "execution-engine",
+            "type": "capital"
+          }
+        },
+        {
+          "uid": "ironcrab-rejection-rate-high",
+          "title": "High Intent Rejection Rate",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "expr": "rate(ironcrab_intents_rejected_total[5m]) / rate(ironcrab_intents_received_total[5m])",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "mean",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [0.5],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "10m",
+          "annotations": {
+            "summary": "More than 50% of intents are being rejected",
+            "description": "High rejection rate indicates strategy-engine mismatch or aggressive risk limits. Review decision records for reject reasons."
+          },
+          "labels": {
+            "severity": "warning",
+            "component": "execution-engine",
+            "type": "performance"
+          }
+        },
+        {
+          "uid": "ironcrab-daily-loss-limit",
+          "title": "Approaching Daily Loss Limit",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 300,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "expr": "ironcrab_daily_realized_pnl_sol / ironcrab_daily_loss_limit_sol",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "last",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [-0.8],
+                      "type": "lt"
+                    }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "1m",
+          "annotations": {
+            "summary": "Daily PnL is approaching loss limit",
+            "description": "Daily loss has reached 80% of limit. Trading will be automatically stopped if limit is reached."
+          },
+          "labels": {
+            "severity": "critical",
+            "component": "execution-engine",
+            "type": "risk"
+          }
+        }
+      ]
+    },
+    {
+      "orgId": 1,
+      "name": "IronCrab Component Health",
+      "folder": "IronCrab Alerts",
+      "interval": "30s",
+      "rules": [
+        {
+          "uid": "ironcrab-component-down",
+          "title": "Component Not Responding",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 120,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "expr": "up{job=~\"ironcrab.*\"}",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "last",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [1],
+                      "type": "lt"
+                    }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Alerting",
+          "for": "1m",
+          "annotations": {
+            "summary": "IronCrab component is down",
+            "description": "{{ $labels.job }} has not reported metrics for over 1 minute. Check systemd status and logs."
+          },
+          "labels": {
+            "severity": "critical",
+            "type": "availability"
+          }
+        },
+        {
+          "uid": "ironcrab-nats-disconnected",
+          "title": "NATS Connection Lost",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 120,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "expr": "ironcrab_nats_connected",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "last",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [1],
+                      "type": "lt"
+                    }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "30s",
+          "annotations": {
+            "summary": "NATS connection lost",
+            "description": "Component has lost connection to NATS. Inter-process communication is degraded."
+          },
+          "labels": {
+            "severity": "warning",
+            "type": "connectivity"
+          }
+        },
+        {
+          "uid": "ironcrab-kill-switch-active",
+          "title": "Kill Switch Activated",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 60,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "expr": "ironcrab_kill_switch_active",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "last",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [0],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "0s",
+          "annotations": {
+            "summary": "Kill switch is active",
+            "description": "Trading has been halted by kill switch. Manual intervention required to resume."
+          },
+          "labels": {
+            "severity": "critical",
+            "type": "emergency"
+          }
+        }
+      ]
+    }
+  ]
+}

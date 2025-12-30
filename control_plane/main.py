@@ -18,7 +18,9 @@ This service does NOT:
 - Make trading decisions
 
 Endpoints:
-- GET /health - Health check
+- GET /health - Detailed health check with component status
+- GET /live - Liveness probe (K8s/Systemd)
+- GET /ready - Readiness probe (K8s/Systemd)
 - GET /status - System status (all components)
 - GET /positions - Current open positions
 - GET /metrics - Aggregated metrics from all components
@@ -208,6 +210,32 @@ class KillRequest(BaseModel):
     liquidate_positions: bool = Field(default=True, description="Whether to liquidate open positions")
 
 # ============================================================================
+# Health Check Models (K8s / Systemd compatible)
+# ============================================================================
+
+class HealthStatus(BaseModel):
+    """Detailed health status response"""
+    status: str  # "ok", "degraded", "unhealthy"
+    timestamp: str
+    version: str = "1.0.0"
+    uptime_seconds: float
+    checks: Dict[str, bool] = Field(default_factory=dict)
+    details: Optional[Dict[str, Any]] = None
+
+class LivenessStatus(BaseModel):
+    """Liveness probe response (is the process alive?)"""
+    alive: bool
+    timestamp: str
+    pid: int
+
+class ReadinessStatus(BaseModel):
+    """Readiness probe response (is the service ready to accept traffic?)"""
+    ready: bool
+    timestamp: str
+    checks: Dict[str, bool] = Field(default_factory=dict)
+    reason: Optional[str] = None
+
+# ============================================================================
 # Decision Record Models (matching Rust IPC schema)
 # ============================================================================
 
@@ -307,6 +335,7 @@ class ControlPlaneState:
         self.kill_switch_reason: Optional[str] = None
         self.kill_switch_time: Optional[datetime] = None
         self.http_client: Optional[httpx.AsyncClient] = None
+        self.startup_time: Optional[datetime] = None  # P2: Track uptime
         # P1: Decision record cache (ring buffer for recent decisions)
         self.decisions: List[Dict[str, Any]] = []
         self.decisions_lock = asyncio.Lock()
@@ -491,6 +520,7 @@ async def lifespan(app: FastAPI):
     audit_logger.info("STARTUP: Control Plane started (keyless mode verified)")
     
     state.http_client = httpx.AsyncClient(timeout=5.0)
+    state.startup_time = datetime.now(timezone.utc)  # Track uptime
     await state.connect_nats()
     logger.info("Control plane ready")
     
@@ -526,10 +556,101 @@ app.add_middleware(
 # Endpoints
 # ============================================================================
 
-@app.get("/health")
+# ----------------------------------------------------------------------------
+# Health / Liveness / Readiness Probes (P2: K8s/Systemd compatible)
+# ----------------------------------------------------------------------------
+
+@app.get("/health", response_model=HealthStatus)
 async def health():
-    """Health check endpoint (no auth required)"""
-    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+    """
+    Detailed health check endpoint (no auth required).
+    
+    Returns comprehensive health status including:
+    - Overall status (ok/degraded/unhealthy)
+    - Uptime
+    - Individual component checks
+    
+    Use for monitoring dashboards and alerting.
+    """
+    now = datetime.now(timezone.utc)
+    uptime = (now - state.startup_time).total_seconds() if state.startup_time else 0.0
+    
+    checks = {
+        "nats_connected": state.nats_client is not None and state.nats_client.is_connected if state.nats_client else False,
+        "http_client_ready": state.http_client is not None,
+        "kill_switch_inactive": not state.kill_switch_active,
+    }
+    
+    # Determine overall status
+    if all(checks.values()):
+        status = "ok"
+    elif checks["kill_switch_inactive"] and checks["http_client_ready"]:
+        status = "degraded"  # Can operate without NATS
+    else:
+        status = "unhealthy"
+    
+    return HealthStatus(
+        status=status,
+        timestamp=now.isoformat(),
+        version="1.0.0",
+        uptime_seconds=uptime,
+        checks=checks,
+        details={
+            "kill_switch_reason": state.kill_switch_reason,
+            "cached_decisions": len(state.decisions),
+        }
+    )
+
+@app.get("/live", response_model=LivenessStatus)
+async def liveness():
+    """
+    Liveness probe (no auth required).
+    
+    K8s/Systemd uses this to determine if the process is alive.
+    Returns 200 if the process is running, regardless of dependencies.
+    
+    If this fails, K8s will restart the pod.
+    """
+    import os
+    return LivenessStatus(
+        alive=True,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        pid=os.getpid(),
+    )
+
+@app.get("/ready", response_model=ReadinessStatus)
+async def readiness():
+    """
+    Readiness probe (no auth required).
+    
+    K8s/Systemd uses this to determine if the service can accept traffic.
+    Returns 200 only if core dependencies are available.
+    
+    If this fails, K8s will stop routing traffic to this pod.
+    """
+    checks = {
+        "http_client": state.http_client is not None,
+        "nats": state.nats_client is not None and (state.nats_client.is_connected if state.nats_client else False),
+        "not_killed": not state.kill_switch_active,
+    }
+    
+    # Ready if HTTP client is available and not in kill switch mode
+    # NATS is optional (service can run in degraded mode without it)
+    ready = checks["http_client"] and checks["not_killed"]
+    
+    reason = None
+    if not ready:
+        if state.kill_switch_active:
+            reason = f"Kill switch active: {state.kill_switch_reason}"
+        elif not checks["http_client"]:
+            reason = "HTTP client not initialized"
+    
+    return ReadinessStatus(
+        ready=ready,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        checks=checks,
+        reason=reason,
+    )
 
 @app.get("/status", response_model=SystemStatus)
 async def get_status(user: User = Depends(require_viewer)):
