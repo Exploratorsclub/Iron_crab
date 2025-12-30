@@ -3,9 +3,12 @@ Description=IronCrab Execution Engine (Single Signer)
 After=network-online.target nats.service
 Wants=network-online.target
 PartOf=ironcrab.target
+# P1 Crash Isolation: NO hard dependencies - execution-engine runs independently
+# If NATS is down, it reconnects. If other services crash, execution continues.
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=ironcrab
 Group=ironcrab
 WorkingDirectory=/home/ironcrab/Iron_crab
@@ -18,8 +21,13 @@ ExecStart=/home/ironcrab/Iron_crab/target/release/execution-engine \
 Environment=RUST_LOG=info,execution_engine=info,ironcrab::engine=debug
 Environment=IRONCRAB_KEYPAIR_PATH=/home/ironcrab/.config/solana/id.json
 
+# P1 Crash Isolation: Watchdog for liveness detection
+WatchdogSec=30
+# Restart on failure, but limit restart attempts to prevent crash loops
 Restart=on-failure
 RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 # Resource controls: execution engine gets higher priority
 Nice=5
@@ -31,6 +39,9 @@ CPUAffinity=60-63
 # Hardening
 NoNewPrivileges=yes
 PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ironcrab/Iron_crab/trade_logs
 # File ACL on keypair should restrict read to ironcrab user only
 
 [Install]

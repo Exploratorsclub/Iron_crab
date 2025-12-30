@@ -73,6 +73,9 @@ uuid = { version = "1", features = ["v4"] }
 # Database for reserve cache persistence
 rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
 
+# P1: Systemd Watchdog/Notify support (Crash Isolation)
+sd-notify = "0.4"
+
 [features]
 default = []
 test_helpers = []

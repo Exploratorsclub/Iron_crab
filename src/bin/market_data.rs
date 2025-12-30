@@ -19,7 +19,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ironcrab::ipc::{MarketEvent, MarketEventKind, RecordHeader, SCHEMA_VERSION};
@@ -27,6 +27,9 @@ use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
 use ironcrab::solana::geyser_listener::GeyserListener;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
+
+// P1 Crash Isolation: Systemd Watchdog support
+use sd_notify::NotifyState;
 
 /// Build version for decision records
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -159,6 +162,11 @@ async fn main() -> Result<()> {
     });
 
     // === Main Loop: Geyser subscription or simulation ===
+    
+    // P1 Crash Isolation: Signal systemd that we're ready
+    let _ = sd_notify::notify(true, &[NotifyState::Ready]);
+    debug!("Sent sd_notify READY to systemd");
+    
     if args.simulate {
         info!("Simulation mode: emitting fake slot events");
         run_simulation_loop(ctx.clone(), &run_id).await?;
@@ -276,6 +284,9 @@ async fn run_geyser_loop(ctx: Arc<MarketDataContext>, run_id: &str, geyser_url: 
                         "market-data heartbeat (Geyser)"
                     );
                     last_heartbeat = std::time::Instant::now();
+                    
+                    // P1 Crash Isolation: Ping systemd watchdog
+                    let _ = sd_notify::notify(true, &[NotifyState::Watchdog]);
                 }
             }
 
@@ -335,6 +346,9 @@ async fn run_simulation_loop(ctx: Arc<MarketDataContext>, run_id: &str) -> Resul
                         bytes_written = bytes,
                         "market-data heartbeat (simulation)"
                     );
+                    
+                    // P1 Crash Isolation: Ping systemd watchdog
+                    let _ = sd_notify::notify(true, &[NotifyState::Watchdog]);
                 }
             }
             _ = &mut shutdown => {

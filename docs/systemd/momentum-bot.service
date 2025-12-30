@@ -3,9 +3,13 @@ Description=IronCrab Momentum Bot (Strategy)
 After=network-online.target nats.service market-data.service
 Wants=network-online.target
 PartOf=ironcrab.target
+# P1 Crash Isolation: NO hard dependencies - momentum-bot runs independently
+# If market-data crashes, momentum-bot keeps running (no events = no intents).
+# Crash here does NOT affect execution-engine which continues processing.
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=ironcrab
 Group=ironcrab
 WorkingDirectory=/home/ironcrab/Iron_crab
@@ -20,8 +24,13 @@ Environment=RUST_LOG=info,momentum_bot=info
 # WICHTIG: Keine Wallet-Keys! momentum-bot exit(1) wenn Keys erkannt werden.
 # Environment=KEYPAIR_PATH=  # NICHT SETZEN!
 
+# P1 Crash Isolation: Watchdog for liveness detection
+WatchdogSec=30
+# Restart on failure, but limit restart attempts
 Restart=on-failure
 RestartSec=3
+StartLimitBurst=10
+StartLimitIntervalSec=300
 
 # Resource controls
 Nice=10
@@ -33,6 +42,8 @@ CPUAffinity=56-59
 # Hardening
 NoNewPrivileges=yes
 PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
 
 [Install]
 WantedBy=ironcrab.target

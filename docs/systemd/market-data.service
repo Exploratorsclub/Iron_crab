@@ -3,9 +3,12 @@ Description=IronCrab Market Data Service (Geyser Ingest)
 After=network-online.target nats.service
 Wants=network-online.target
 PartOf=ironcrab.target
+# P1 Crash Isolation: NO hard dependencies - market-data runs independently
+# If Geyser is down, it reconnects. Crash here does NOT affect execution-engine.
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=ironcrab
 Group=ironcrab
 WorkingDirectory=/home/ironcrab/Iron_crab
@@ -18,8 +21,13 @@ ExecStart=/home/ironcrab/Iron_crab/target/release/market-data \
 
 Environment=RUST_LOG=info,market_data=info,ironcrab::solana::geyser_listener=warn
 
+# P1 Crash Isolation: Watchdog for liveness detection
+WatchdogSec=30
+# Restart on failure, but limit restart attempts
 Restart=on-failure
 RestartSec=3
+StartLimitBurst=10
+StartLimitIntervalSec=300
 
 # Resource controls: lower priority than validator
 Nice=10
@@ -31,6 +39,9 @@ CPUAffinity=48-55
 # Hardening
 NoNewPrivileges=yes
 PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ironcrab/Iron_crab/trade_logs
 
 [Install]
 WantedBy=ironcrab.target

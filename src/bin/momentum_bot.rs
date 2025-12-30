@@ -30,6 +30,9 @@ use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{NatsClient, NatsConfig, NatsMessage, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
+// P1 Crash Isolation: Systemd Watchdog support
+use sd_notify::NotifyState;
+
 /// Build version for decision records
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -230,6 +233,10 @@ async fn main() -> Result<()> {
 
     // === Main Loop: Process MarketEvents from NATS ===
     info!("Entering main event loop");
+    
+    // P1 Crash Isolation: Signal systemd that we're ready
+    let _ = sd_notify::notify(true, &[NotifyState::Ready]);
+    debug!("Sent sd_notify READY to systemd");
 
     // Subscribe to MarketEvents from NATS
     let mut subscription = if let Some(ref nats) = ctx.nats {
@@ -302,6 +309,9 @@ async fn main() -> Result<()> {
                     pools_tracked = pools,
                     "Momentum-bot heartbeat"
                 );
+                
+                // P1 Crash Isolation: Ping systemd watchdog
+                let _ = sd_notify::notify(true, &[NotifyState::Watchdog]);
             }
 
             _ = &mut shutdown => {
