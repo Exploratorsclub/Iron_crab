@@ -27,7 +27,7 @@ use ironcrab::ipc::{
     TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::serve_metrics;
-use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
+use ironcrab::nats::{NatsClient, NatsConfig, NatsMessage, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// Build version for decision records
@@ -228,12 +228,30 @@ async fn main() -> Result<()> {
         pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
     });
 
-    // === Main Loop: Process MarketEvents ===
+    // === Main Loop: Process MarketEvents from NATS ===
     info!("Entering main event loop");
 
-    // For MVP without real NATS, simulate receiving events
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-    let mut simulated_slot: u64 = 0;
+    // Subscribe to MarketEvents from NATS
+    let mut subscription = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_MARKET_EVENTS).await {
+            Ok(sub) => {
+                info!(topic = TOPIC_MARKET_EVENTS, "Subscribed to MarketEvents");
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to NATS, running in offline mode");
+                None
+            }
+        }
+    } else {
+        info!("NATS not connected, running in offline mode");
+        None
+    };
+
+    // Heartbeat and stats tracking
+    let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut events_received: u64 = 0;
+    let mut last_slot: u64 = 0;
 
     // Graceful shutdown handling
     let shutdown = tokio::signal::ctrl_c();
@@ -241,45 +259,51 @@ async fn main() -> Result<()> {
 
     loop {
         tokio::select! {
-            _ = interval.tick() => {
-                simulated_slot += 5;
+            // Process incoming MarketEvents from NATS
+            msg = async {
+                if let Some(ref mut sub) = subscription {
+                    sub.next().await
+                } else {
+                    // No subscription - just wait forever (heartbeat will still fire)
+                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
+                }
+            } => {
+                if let Some(nats_msg) = msg {
+                    events_received += 1;
 
-                // MVP: Simulate receiving a pool creation event in test mode
-                if args.test_mode && simulated_slot == 10 {
-                    let event = MarketEvent::new(
-                        "market-data",
-                        BUILD_VERSION,
-                        &ctx.run_id,
-                        format!("evt-sim-{}", simulated_slot),
-                        "simulated",
-                        Some(simulated_slot),
-                        MarketEventKind::PoolCreated {
-                            pool_address: "TestPool123".to_string(),
-                            base_mint: "TestMint111111111111111111111111111111111111".to_string(),
-                            quote_mint: "So11111111111111111111111111111111111111112".to_string(),
-                            dex: "raydium".to_string(),
-                            initial_liquidity_sol: Some(rust_decimal::Decimal::from(10)),
-                        },
-                    );
+                    // Deserialize MarketEvent
+                    match serde_json::from_slice::<MarketEvent>(&nats_msg.payload) {
+                        Ok(event) => {
+                            if let Some(slot) = event.slot {
+                                last_slot = slot;
+                            }
 
-                    if let Err(e) = process_market_event(&ctx, &event).await {
-                        error!(error = %e, "Failed to process market event");
+                            // Process the event
+                            if let Err(e) = process_market_event(&ctx, &event).await {
+                                warn!(error = %e, event_id = %event.event_id, "Failed to process market event");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to deserialize MarketEvent");
+                        }
                     }
                 }
-
-                // Periodic heartbeat
-                if simulated_slot % 60 == 0 {
-                    let (records, bytes) = ctx.jsonl_writer.stats();
-                    let pools = ctx.pool_first_seen.read().len();
-                    info!(
-                        slot = simulated_slot,
-                        intents_written = records,
-                        bytes_written = bytes,
-                        pools_tracked = pools,
-                        "Momentum-bot heartbeat"
-                    );
-                }
             }
+
+            // Periodic heartbeat
+            _ = heartbeat_interval.tick() => {
+                let (records, bytes) = ctx.jsonl_writer.stats();
+                let pools = ctx.pool_first_seen.read().len();
+                info!(
+                    events_received = events_received,
+                    last_slot = last_slot,
+                    intents_written = records,
+                    bytes_written = bytes,
+                    pools_tracked = pools,
+                    "Momentum-bot heartbeat"
+                );
+            }
+
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
                 break;
