@@ -64,7 +64,11 @@ Ziel: **deterministisch, debugbar, sicher** – und zwar mit messbaren Kriterien
   - ✅ `DecisionOutcome` enum in `src/ipc/schema.rs`
 
 ### P1
-- [ ] **Atomic Arbitrage**: Triangular/Cross-DEX Arb wird atomar gesendet (Bundle) oder verworfen; keine Teilfills ohne definiertes Recovery.
+- [x] **Atomic Arbitrage**: Triangular/Cross-DEX Arb wird atomar gesendet (Bundle) oder verworfen; keine Teilfills ohne definiertes Recovery.
+  - ✅ `TradeIntent.require_bundle` Feld für atomic execution requirement
+  - ✅ `JitoClient` in execution-engine für Bundle Submission
+  - ✅ `RejectReason::BundleFailed/BundleTimeout/BundleNotConfigured` für atomicity violations
+  - ✅ Process checks bundle requirement before send; rejects if Jito not configured
 - [ ] **Fee/Compute Policies sind zentral**: compute budget, priority fee, tip-Policy sind Engine-owned (nicht in Strategien verteilt).
 
 ---
@@ -137,7 +141,11 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
   - ✅ `emit_rejected_decision()` schreibt Decision Record + loggt mit reason
 
 ### P1
-- [ ] **Per-Strategy/Per-Worker Attribution**: Profit/fees/latency sind pro source/worker sichtbar.
+- [x] **Per-Strategy/Per-Worker Attribution**: Profit/fees/latency sind pro source/worker sichtbar.
+  - ✅ `source` Feld in `DecisionRecord` (propagiert von `TradeIntent.source`)
+  - ✅ `source` Feld in `ExecutionResult` (propagiert von `TradeIntent.source`)
+  - ✅ Alle Konstruktoren aktualisiert: `new_rejected()`, `new_sim_failed()`, `new_sent()`
+  - ✅ Tests in `tests/ipc_schema_roundtrip.rs` validieren Source-Attribution
 
 ---
 

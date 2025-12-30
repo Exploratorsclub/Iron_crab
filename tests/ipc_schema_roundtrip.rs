@@ -181,6 +181,7 @@ fn test_decision_record_required_fields() {
         "run-123",
         "dec-001".to_string(),
         "intent-001".to_string(),
+        "momentum-bot".to_string(),
         IntentOrigin::StrategyA,
         TradingRegime::Early,
         checks,
@@ -198,6 +199,10 @@ fn test_decision_record_required_fields() {
     assert!(json.contains("outcome"));
     assert!(json.contains("Rejected"));
 
+    // P1: Source attribution (DoD §F.P1)
+    assert!(json.contains("source"));
+    assert!(json.contains("momentum-bot"));
+
     // DoD §D.1: origin_type classification
     assert!(json.contains("origin_type"));
 
@@ -212,6 +217,7 @@ fn test_decision_record_required_fields() {
     let parsed: DecisionRecord = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.decision_id, "dec-001");
     assert_eq!(parsed.intent_id, "intent-001");
+    assert_eq!(parsed.source, "momentum-bot"); // P1: Source attribution
     assert_eq!(parsed.outcome, DecisionOutcome::Rejected);
     assert_eq!(parsed.checks.len(), 2);
     assert!(!parsed.checks[1].passed);
@@ -240,6 +246,7 @@ fn test_decision_record_sim_failed() {
         "run-456",
         "dec-002".to_string(),
         "intent-002".to_string(),
+        "arb-strategy".to_string(),
         IntentOrigin::StrategyA,
         TradingRegime::Established,
         checks,
@@ -271,6 +278,7 @@ fn test_execution_result_required_fields() {
         "exe-001".to_string(),
         "dec-001".to_string(),
         "intent-001".to_string(),
+        "momentum-bot".to_string(),
         Some("5abcdef123456...".to_string()),
         None,
     )
@@ -299,6 +307,10 @@ fn test_execution_result_required_fields() {
     assert!(json.contains("status"));
     assert!(json.contains("Confirmed"));
 
+    // P1: Source attribution (DoD §F.P1)
+    assert!(json.contains("source"));
+    assert!(json.contains("momentum-bot"));
+
     // Fees and PnL
     assert!(json.contains("fees"));
     assert!(json.contains("pnl"));
@@ -306,6 +318,7 @@ fn test_execution_result_required_fields() {
 
     let parsed: ExecutionResult = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.execution_id, "exe-001");
+    assert_eq!(parsed.source, "momentum-bot"); // P1: Source attribution
     assert_eq!(parsed.status, ExecutionStatus::Confirmed);
     assert!(parsed.fees.is_some());
     assert!(parsed.pnl.is_some());
@@ -363,6 +376,7 @@ fn test_id_correlation() {
         "run-test",
         decision_id.to_string(),
         intent_id.to_string(),
+        "test-strategy".to_string(),
         IntentOrigin::StrategyA,
         TradingRegime::NotApplicable,
         vec![],
@@ -376,6 +390,7 @@ fn test_id_correlation() {
         execution_id.to_string(),
         decision_id.to_string(),
         intent_id.to_string(),
+        "test-strategy".to_string(),
         None,
         None,
     );
@@ -387,6 +402,11 @@ fn test_id_correlation() {
 
     // Decision and execution should be correlated
     assert_eq!(execution.decision_id, decision_id);
+
+    // P1: Source attribution - all records from same source chain
+    assert_eq!(intent.source, "test-strategy");
+    assert_eq!(decision.source, "test-strategy");
+    assert_eq!(execution.source, "test-strategy");
 }
 
 /// Test JSONL format compatibility (one JSON object per line)

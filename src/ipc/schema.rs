@@ -266,6 +266,16 @@ pub struct TradeIntent {
     /// Optional: trigger event that caused this intent
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_event_id: Option<String>,
+
+    /// P1: Require atomic bundle execution (Jito) - for arbitrage
+    /// If true, execution-engine MUST use Jito bundle submission.
+    /// If bundle submission fails, intent is rejected (atomic guarantee).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub require_bundle: Option<bool>,
+
+    /// P1: Custom tip amount for Jito bundle (overrides default)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bundle_tip_lamports: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -315,6 +325,8 @@ impl TradeIntent {
             side,
             regime,
             trigger_event_id: None,
+            require_bundle: None,
+            bundle_tip_lamports: None,
         }
     }
 
@@ -333,6 +345,18 @@ impl TradeIntent {
     pub fn with_trigger(mut self, event_id: String) -> Self {
         self.trigger_event_id = Some(event_id);
         self
+    }
+
+    /// P1: Mark intent as requiring atomic bundle execution (Jito)
+    pub fn with_bundle(mut self, tip_lamports: Option<u64>) -> Self {
+        self.require_bundle = Some(true);
+        self.bundle_tip_lamports = tip_lamports;
+        self
+    }
+
+    /// Check if this intent requires atomic bundle execution
+    pub fn requires_bundle(&self) -> bool {
+        self.require_bundle.unwrap_or(false)
     }
 }
 
@@ -395,6 +419,8 @@ pub struct DecisionRecord {
 
     pub decision_id: String,
     pub intent_id: String,
+    /// P1: Source strategy/worker for attribution (e.g., "momentum-bot", "arb-strategy")
+    pub source: String,
     pub origin_type: IntentOrigin,
     pub regime: TradingRegime,
 
@@ -436,6 +462,7 @@ impl DecisionRecord {
         run_id: &str,
         decision_id: String,
         intent_id: String,
+        source: String,
         origin_type: IntentOrigin,
         regime: TradingRegime,
         checks: Vec<CheckResult>,
@@ -445,6 +472,7 @@ impl DecisionRecord {
             header: RecordHeader::new(component, build, run_id),
             decision_id,
             intent_id,
+            source,
             origin_type,
             regime,
             checks,
@@ -464,6 +492,7 @@ impl DecisionRecord {
         run_id: &str,
         decision_id: String,
         intent_id: String,
+        source: String,
         origin_type: IntentOrigin,
         regime: TradingRegime,
         checks: Vec<CheckResult>,
@@ -474,6 +503,7 @@ impl DecisionRecord {
             header: RecordHeader::new(component, build, run_id),
             decision_id,
             intent_id,
+            source,
             origin_type,
             regime,
             checks,
@@ -538,6 +568,8 @@ pub struct ExecutionResult {
     pub execution_id: String,
     pub decision_id: String,
     pub intent_id: String,
+    /// P1: Source strategy/worker for attribution (e.g., "momentum-bot", "arb-strategy")
+    pub source: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
@@ -571,6 +603,7 @@ impl ExecutionResult {
         execution_id: String,
         decision_id: String,
         intent_id: String,
+        source: String,
         signature: Option<String>,
         bundle_id: Option<String>,
     ) -> Self {
@@ -579,6 +612,7 @@ impl ExecutionResult {
             execution_id,
             decision_id,
             intent_id,
+            source,
             signature,
             bundle_id,
             status: ExecutionStatus::Sent,
@@ -610,6 +644,86 @@ impl ExecutionResult {
         self.error_message = Some(error);
         self
     }
+}
+
+// ============================================================================
+// ConfigUpdate (from control-plane for runtime config changes)
+// ============================================================================
+
+/// Configuration update request from control-plane
+/// 
+/// Allows runtime parameter changes without restarting services.
+/// Per ROLE_SEPARATION.md: only admin role can send these via control-plane.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigUpdate {
+    #[serde(flatten)]
+    pub header: RecordHeader,
+    
+    /// Command type (always "config_update" from control-plane)
+    pub command: String,
+    
+    /// Target component: "execution-engine", "momentum-bot", "market-data"
+    pub component: String,
+    
+    /// Key-value pairs to update
+    pub config: HashMap<String, serde_json::Value>,
+    
+    /// ISO timestamp from control-plane
+    pub timestamp: String,
+}
+
+impl ConfigUpdate {
+    pub fn new(
+        component: &str,
+        build: &str,
+        run_id: &str,
+        target: &str,
+        config: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            header: RecordHeader::new(component, build, run_id),
+            command: "config_update".to_string(),
+            component: target.to_string(),
+            config,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+    
+    /// Get a config value as u64
+    pub fn get_u64(&self, key: &str) -> Option<u64> {
+        self.config.get(key).and_then(|v| v.as_u64())
+    }
+    
+    /// Get a config value as f64
+    pub fn get_f64(&self, key: &str) -> Option<f64> {
+        self.config.get(key).and_then(|v| v.as_f64())
+    }
+    
+    /// Get a config value as bool
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        self.config.get(key).and_then(|v| v.as_bool())
+    }
+    
+    /// Get a config value as string
+    pub fn get_string(&self, key: &str) -> Option<&str> {
+        self.config.get(key).and_then(|v| v.as_str())
+    }
+}
+
+/// Response to a config update request
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigUpdateResponse {
+    pub status: ConfigUpdateStatus,
+    pub applied_keys: Vec<String>,
+    pub rejected_keys: Vec<(String, String)>, // (key, reason)
+    pub new_snapshot_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ConfigUpdateStatus {
+    Applied,
+    PartiallyApplied,
+    Rejected,
 }
 
 // ============================================================================
@@ -705,6 +819,7 @@ mod tests {
             "run-789",
             "dec-001".to_string(),
             "intent-001".to_string(),
+            "momentum-bot".to_string(),
             IntentOrigin::StrategyA,
             TradingRegime::Early,
             checks,
@@ -729,6 +844,7 @@ mod tests {
             "exec-001".to_string(),
             "dec-001".to_string(),
             "intent-001".to_string(),
+            "momentum-bot".to_string(),
             Some("5abc123...".to_string()),
             None,
         );

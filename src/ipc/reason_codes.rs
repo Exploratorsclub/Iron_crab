@@ -65,6 +65,14 @@ pub enum RejectReason {
     InternalError,
     /// Unknown reason (should not happen)
     Unknown,
+
+    // === P1: Bundle / Jito ===
+    /// Jito bundle submission failed
+    BundleFailed,
+    /// Bundle not confirmed within timeout
+    BundleTimeout,
+    /// Bundle required but Jito not configured
+    BundleNotConfigured,
 }
 
 impl RejectReason {
@@ -93,6 +101,9 @@ impl RejectReason {
             Self::KillSwitchActive => "KILL_SWITCH_ACTIVE",
             Self::InternalError => "INTERNAL_ERROR",
             Self::Unknown => "UNKNOWN",
+            Self::BundleFailed => "BUNDLE_FAILED",
+            Self::BundleTimeout => "BUNDLE_TIMEOUT",
+            Self::BundleNotConfigured => "BUNDLE_NOT_CONFIGURED",
         }
     }
 
@@ -120,6 +131,9 @@ impl RejectReason {
             "INVALID_INTENT" => Self::InvalidIntent,
             "KILL_SWITCH_ACTIVE" => Self::KillSwitchActive,
             "INTERNAL_ERROR" => Self::InternalError,
+            "BUNDLE_FAILED" => Self::BundleFailed,
+            "BUNDLE_TIMEOUT" => Self::BundleTimeout,
+            "BUNDLE_NOT_CONFIGURED" => Self::BundleNotConfigured,
             _ => Self::Unknown,
         }
     }
@@ -152,6 +166,14 @@ impl RejectReason {
         matches!(
             self,
             Self::LockCapitalConflict | Self::LockResourceConflict | Self::LockDuplicateIntent
+        )
+    }
+
+    /// P1: Check if this is a bundle/Jito-related rejection
+    pub fn is_bundle_related(&self) -> bool {
+        matches!(
+            self,
+            Self::BundleFailed | Self::BundleTimeout | Self::BundleNotConfigured
         )
     }
 }

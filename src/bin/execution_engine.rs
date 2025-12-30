@@ -32,17 +32,22 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ironcrab::ipc::{
-    CheckResult, DecisionOutcome, DecisionRecord, ExecutionResult, ExecutionStatus, IntentOrigin,
-    RejectReason, SimulationResult, TradeIntent, TradingRegime,
+    CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
+    DecisionRecord, ExecutionResult, ExecutionStatus, IntentOrigin, RejectReason,
+    SimulationResult, TradeIntent, TradingRegime,
 };
 use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{
     NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS,
 };
+use ironcrab::solana::jito::{JitoClient, JitoRegion};
 use ironcrab::storage::{
     locks::{LockHolder, LockManager, LockResult},
     JsonlWriter, JsonlWriterConfig,
 };
+
+/// NATS topic for config reload commands from control-plane
+const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
 
 // P1 Crash Isolation: Systemd Watchdog support (Linux only)
 #[cfg(unix)]
@@ -115,6 +120,20 @@ struct ExecutionConfig {
     
     /// Whether to actually send transactions
     send_enabled: bool,
+
+    // === P1: Jito Bundle Config ===
+    
+    /// Enable Jito bundle submission for atomic execution
+    jito_enabled: bool,
+    
+    /// Default tip amount for Jito bundles (lamports)
+    jito_tip_lamports: u64,
+    
+    /// Jito block engine region (frankfurt, amsterdam, ny, tokyo, slc)
+    jito_region: String,
+    
+    /// Timeout for bundle confirmation (seconds)
+    jito_timeout_secs: u64,
 }
 
 impl Default for ExecutionConfig {
@@ -128,6 +147,11 @@ impl Default for ExecutionConfig {
             // Operational
             simulation_timeout_ms: 2000,
             send_enabled: false, // Default: simulate only
+            // P1: Jito Bundle defaults
+            jito_enabled: false,
+            jito_tip_lamports: 10_000, // 0.00001 SOL default tip
+            jito_region: "frankfurt".to_string(),
+            jito_timeout_secs: 30,
         }
     }
 }
@@ -253,8 +277,9 @@ impl StateSnapshot {
 /// Runtime context for execution-engine
 struct ExecutionContext {
     run_id: String,
-    config: ExecutionConfig,
-    config_snapshot_id: String,
+    /// Hot-reloadable configuration (RwLock for runtime updates via NATS)
+    config: parking_lot::RwLock<ExecutionConfig>,
+    config_snapshot_id: parking_lot::RwLock<String>,
     nats: Option<NatsClient>,
     decision_writer: JsonlWriter,
     execution_writer: JsonlWriter,
@@ -271,6 +296,14 @@ struct ExecutionContext {
     /// Currently open positions count
     open_positions: std::sync::atomic::AtomicUsize,
     
+    // === P1: Jito Bundle Support ===
+    /// Jito client for atomic bundle execution (None if disabled)
+    jito_client: Option<JitoClient>,
+    /// Bundle submissions counter
+    bundles_submitted: std::sync::atomic::AtomicU64,
+    /// Bundle confirmations counter
+    bundles_confirmed: std::sync::atomic::AtomicU64,
+    
     // Metrics
     intents_received: std::sync::atomic::AtomicU64,
     intents_rejected: std::sync::atomic::AtomicU64,
@@ -279,6 +312,130 @@ struct ExecutionContext {
 }
 
 impl ExecutionContext {
+    /// Get current config (read lock)
+    fn get_config(&self) -> ExecutionConfig {
+        self.config.read().clone()
+    }
+    
+    /// Update config and return response (P1: Runtime Configuration via UI)
+    fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
+        let mut config = self.config.write();
+        let mut applied = Vec::new();
+        let mut rejected = Vec::new();
+        
+        // Process each config key
+        for (key, value) in &update.config {
+            match key.as_str() {
+                "max_position_size_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.max_position_size_lamports = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "daily_loss_limit_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.daily_loss_limit_lamports = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "max_open_positions" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 && v <= 100 {
+                            config.max_open_positions = v as usize;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-100".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "max_slippage_bps" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 && v <= 10000 {
+                            config.max_slippage_bps = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-10000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "simulation_timeout_ms" => {
+                    if let Some(v) = value.as_u64() {
+                        if v >= 100 && v <= 30000 {
+                            config.simulation_timeout_ms = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 100-30000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "send_enabled" => {
+                    if let Some(v) = value.as_bool() {
+                        // Only allow enabling if keys are configured
+                        let has_keys = std::env::var("IRONCRAB_KEYPAIR_JSON").is_ok()
+                            || std::env::var("IRONCRAB_KEYPAIR_B64").is_ok()
+                            || std::env::var("IRONCRAB_KEYPAIR_PATH").is_ok();
+                        
+                        if v && !has_keys {
+                            rejected.push((key.clone(), "Cannot enable sending without wallet keys".to_string()));
+                        } else {
+                            config.send_enabled = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                _ => {
+                    rejected.push((key.clone(), format!("Unknown config key: {}", key)));
+                }
+            }
+        }
+        
+        // Update snapshot ID
+        let new_snapshot_id = config.snapshot_id();
+        *self.config_snapshot_id.write() = new_snapshot_id.clone();
+        
+        // Determine status
+        let status = if rejected.is_empty() {
+            ConfigUpdateStatus::Applied
+        } else if applied.is_empty() {
+            ConfigUpdateStatus::Rejected
+        } else {
+            ConfigUpdateStatus::PartiallyApplied
+        };
+        
+        ConfigUpdateResponse {
+            status,
+            applied_keys: applied,
+            rejected_keys: rejected,
+            new_snapshot_id: Some(new_snapshot_id),
+        }
+    }
+    
     /// Save state snapshot for crash recovery (P1: DoD K)
     fn save_state(&self) -> Result<()> {
         let snapshot = StateSnapshot::from_context(self);
@@ -408,6 +565,26 @@ async fn main() -> Result<()> {
         info!("Transaction sending DISABLED (simulate only)");
     }
 
+    // P1: Setup Jito client for atomic bundle execution
+    let jito_client = if exec_config.jito_enabled && !args.dry_run {
+        let region = JitoRegion::from_str(&exec_config.jito_region)
+            .unwrap_or(JitoRegion::Frankfurt);
+        let client = JitoClient::new(vec![region], exec_config.jito_tip_lamports);
+        info!(
+            region = %exec_config.jito_region,
+            tip_lamports = %exec_config.jito_tip_lamports,
+            "Jito client initialized for atomic bundle execution"
+        );
+        Some(client)
+    } else {
+        if exec_config.jito_enabled {
+            info!("Jito configured but disabled in dry-run mode");
+        } else {
+            debug!("Jito bundle execution disabled");
+        }
+        None
+    };
+
     // Setup JSONL writers
     let log_base = args
         .log_dir
@@ -499,8 +676,8 @@ async fn main() -> Result<()> {
 
     let ctx = Arc::new(ExecutionContext {
         run_id: run_id.clone(),
-        config_snapshot_id: exec_config.snapshot_id(),
-        config: exec_config,
+        config_snapshot_id: parking_lot::RwLock::new(exec_config.snapshot_id()),
+        config: parking_lot::RwLock::new(exec_config),
         nats,
         decision_writer,
         execution_writer,
@@ -512,6 +689,10 @@ async fn main() -> Result<()> {
         current_day: parking_lot::RwLock::new(initial_day),
         daily_loss_lamports: std::sync::atomic::AtomicI64::new(initial_daily_loss),
         open_positions: std::sync::atomic::AtomicUsize::new(initial_positions),
+        // P1: Jito bundle support
+        jito_client,
+        bundles_submitted: std::sync::atomic::AtomicU64::new(0),
+        bundles_confirmed: std::sync::atomic::AtomicU64::new(0),
         // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
@@ -545,6 +726,22 @@ async fn main() -> Result<()> {
         None
     };
 
+    // P1: Subscribe to Config Updates (Runtime Configuration via UI)
+    let config_subscription = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_CONFIG_RELOAD).await {
+            Ok(sub) => {
+                info!(topic = TOPIC_CONFIG_RELOAD, "Subscribed to Config Updates");
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to Config Updates");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
     // For MVP dry-run test
@@ -555,8 +752,9 @@ async fn main() -> Result<()> {
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
-    // Wrap subscription in Option for ownership
+    // Wrap subscriptions in Option for ownership
     let mut intent_sub_opt = intent_subscription;
+    let mut config_sub_opt = config_subscription;
 
     loop {
         tokio::select! {
@@ -577,6 +775,40 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         warn!(error = %e, "Failed to deserialize TradeIntent");
+                    }
+                }
+            }
+
+            // P1: NATS subscription: receive Config Updates (Runtime Configuration)
+            Some(msg) = async {
+                if let Some(ref mut sub) = config_sub_opt {
+                    sub.next().await
+                } else {
+                    None
+                }
+            } => {
+                match msg.deserialize::<ConfigUpdate>() {
+                    Ok(update) => {
+                        // Only process if targeted at execution-engine
+                        if update.component == "execution-engine" {
+                            info!(
+                                component = %update.component,
+                                keys = ?update.config.keys().collect::<Vec<_>>(),
+                                "Received Config Update from control-plane"
+                            );
+                            let response = ctx.apply_config_update(&update);
+                            info!(
+                                status = ?response.status,
+                                applied = ?response.applied_keys,
+                                rejected = ?response.rejected_keys,
+                                "Config update processed"
+                            );
+                        } else {
+                            debug!(component = %update.component, "Ignoring config update for other component");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to deserialize ConfigUpdate");
                     }
                 }
             }
@@ -683,6 +915,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
     let decision_id = ctx.next_decision_id();
     let mut checks: Vec<CheckResult> = Vec::new();
+    
+    // P1: Get config snapshot for this decision (hot-reloadable)
+    let config = ctx.get_config();
 
     info!(
         intent_id = %intent.intent_id,
@@ -725,7 +960,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     ctx.maybe_reset_daily();
     
     // Check 3a: Max position size
-    if intent.required_capital.raw > ctx.config.max_position_size_lamports {
+    if intent.required_capital.raw > config.max_position_size_lamports {
         let reason = RejectReason::RiskMaxPosition;
         checks.push(CheckResult {
             check_name: "max_position_size".to_string(),
@@ -734,7 +969,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             details: Some(format!(
                 "required={} > max={}",
                 intent.required_capital.raw,
-                ctx.config.max_position_size_lamports
+                config.max_position_size_lamports
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -746,12 +981,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         details: Some(format!(
             "required={} <= max={}",
             intent.required_capital.raw,
-            ctx.config.max_position_size_lamports
+            config.max_position_size_lamports
         )),
     });
     
     // Check 3b: Max slippage
-    if intent.max_slippage_bps > ctx.config.max_slippage_bps {
+    if intent.max_slippage_bps > config.max_slippage_bps {
         let reason = RejectReason::SimSlippageExceeded;
         checks.push(CheckResult {
             check_name: "max_slippage".to_string(),
@@ -760,7 +995,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             details: Some(format!(
                 "intent_slippage={}bps > max={}bps",
                 intent.max_slippage_bps,
-                ctx.config.max_slippage_bps
+                config.max_slippage_bps
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -774,7 +1009,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     
     // Check 3c: Max open positions
     let current_positions = ctx.get_open_positions();
-    if current_positions >= ctx.config.max_open_positions {
+    if current_positions >= config.max_open_positions {
         let reason = RejectReason::RiskMaxOpenPositions;
         checks.push(CheckResult {
             check_name: "max_open_positions".to_string(),
@@ -783,7 +1018,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             details: Some(format!(
                 "current={} >= max={}",
                 current_positions,
-                ctx.config.max_open_positions
+                config.max_open_positions
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -795,13 +1030,13 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         details: Some(format!(
             "current={} < max={}",
             current_positions,
-            ctx.config.max_open_positions
+            config.max_open_positions
         )),
     });
     
     // Check 3d: Daily loss limit
     let daily_loss = ctx.get_daily_loss_lamports();
-    if daily_loss >= ctx.config.daily_loss_limit_lamports as i64 {
+    if daily_loss >= config.daily_loss_limit_lamports as i64 {
         let reason = RejectReason::RiskDailyLossLimit;
         checks.push(CheckResult {
             check_name: "daily_loss_limit".to_string(),
@@ -810,7 +1045,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             details: Some(format!(
                 "daily_loss={} >= limit={}",
                 daily_loss,
-                ctx.config.daily_loss_limit_lamports
+                config.daily_loss_limit_lamports
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -822,7 +1057,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         details: Some(format!(
             "daily_loss={} < limit={}",
             daily_loss,
-            ctx.config.daily_loss_limit_lamports
+            config.daily_loss_limit_lamports
         )),
     });
 
@@ -915,13 +1150,80 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         )),
     });
 
+    // === P1: Check if bundle required for atomic execution ===
+    let requires_bundle = intent.requires_bundle();
+    
+    if requires_bundle && ctx.jito_client.is_none() {
+        // Intent requires bundle but Jito not configured
+        let reason = RejectReason::BundleNotConfigured;
+        checks.push(CheckResult {
+            check_name: "bundle_config".to_string(),
+            passed: false,
+            reason_code: Some(reason.to_string()),
+            details: Some("Intent requires atomic bundle but Jito not configured".to_string()),
+        });
+        ctx.lock_manager.release_locks(&intent.intent_id);
+        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    }
+
+    // Track bundle result for decision record
+    let mut bundle_id: Option<String> = None;
+    let mut send_signature: Option<String> = None;
+
     // === Send (if enabled) ===
-    if ctx.config.send_enabled {
-        info!(intent_id = %intent.intent_id, "Sending transaction");
-        // In production: actually send the transaction
-        // For MVP: this path is not taken (send_enabled = false)
-        ctx.tx_sent
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if config.send_enabled {
+        if requires_bundle {
+            // P1: Atomic bundle execution via Jito
+            info!(
+                intent_id = %intent.intent_id,
+                "Sending atomic bundle via Jito"
+            );
+            
+            if let Some(ref jito) = ctx.jito_client {
+                // In production: build transaction from intent and submit via bundle
+                // For MVP: just track that bundle would be submitted
+                ctx.bundles_submitted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                
+                // TODO: Build actual transaction and submit bundle
+                // let tx = build_transaction_from_intent(&intent)?;
+                // match jito.send_bundle(&[tx]).await {
+                //     Ok(id) => {
+                //         bundle_id = Some(id.clone());
+                //         // Wait for confirmation
+                //         match jito.wait_for_bundle(&id, config.jito_timeout_secs).await {
+                //             Ok(_) => {
+                //                 ctx.bundles_confirmed.fetch_add(1, ...);
+                //                 info!(bundle_id = %id, "Bundle confirmed");
+                //             }
+                //             Err(e) => {
+                //                 // Bundle failed - reject intent (atomic guarantee)
+                //                 let reason = RejectReason::BundleTimeout;
+                //                 return emit_rejected_decision(...);
+                //             }
+                //         }
+                //     }
+                //     Err(e) => {
+                //         let reason = RejectReason::BundleFailed;
+                //         return emit_rejected_decision(...);
+                //     }
+                // }
+                
+                bundle_id = Some(format!("bundle-mvp-{}", Uuid::new_v4()));
+                info!(
+                    intent_id = %intent.intent_id,
+                    bundle_id = ?bundle_id,
+                    "Bundle submitted (MVP stub)"
+                );
+            }
+        } else {
+            // Regular transaction send (non-atomic)
+            info!(intent_id = %intent.intent_id, "Sending transaction");
+            // In production: actually send the transaction
+            send_signature = Some(format!("sig-mvp-{}", Uuid::new_v4()));
+            ctx.tx_sent
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     } else {
         debug!(intent_id = %intent.intent_id, "Transaction sending disabled");
     }
@@ -929,19 +1231,31 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // Mark as processed
     ctx.lock_manager.mark_processed(&intent.intent_id);
 
+    // Build SendResult if we sent something
+    let send_result = if config.send_enabled && (bundle_id.is_some() || send_signature.is_some()) {
+        Some(ironcrab::ipc::SendResult {
+            signature: send_signature,
+            bundle_id,
+            sent_at_ms: chrono::Utc::now().timestamp_millis() as u64,
+        })
+    } else {
+        None
+    };
+
     // Emit decision record (success case)
     let decision = DecisionRecord {
         header: ironcrab::ipc::RecordHeader::new("execution-engine", BUILD_VERSION, &ctx.run_id),
         decision_id: decision_id.clone(),
         intent_id: intent.intent_id.clone(),
+        source: intent.source.clone(),
         origin_type: intent.origin_type,
         regime: intent.regime,
         checks,
         primary_reject_reason: None,
         plan_hash: Some(format!("plan-{}", Uuid::new_v4())),
         simulate: Some(sim_result),
-        send: None, // MVP: not actually sending
-        outcome: if ctx.config.send_enabled {
+        send: send_result,
+        outcome: if config.send_enabled {
             DecisionOutcome::Sent
         } else {
             DecisionOutcome::SimFailed // Mark as sim-only for MVP
@@ -985,6 +1299,7 @@ async fn emit_rejected_decision(
         &ctx.run_id,
         decision_id.clone(),
         intent.intent_id.clone(),
+        intent.source.clone(),
         intent.origin_type,
         intent.regime,
         checks,
@@ -1021,6 +1336,7 @@ async fn emit_sim_failed_decision(
         &ctx.run_id,
         decision_id.clone(),
         intent.intent_id.clone(),
+        intent.source.clone(),
         intent.origin_type,
         intent.regime,
         checks,

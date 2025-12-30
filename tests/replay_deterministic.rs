@@ -141,6 +141,7 @@ fn make_decision(intent: &TradeIntent, sequence_num: u64) -> DecisionRecord {
         header: RecordHeader::new("replay-test", "0.1.0", "test-run-123"),
         decision_id: format!("dec-{:06}", sequence_num),
         intent_id: intent.intent_id.clone(),
+        source: intent.source.clone(),
         origin_type: intent.origin_type,
         regime: intent.regime,
         checks,

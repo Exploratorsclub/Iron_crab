@@ -521,6 +521,14 @@ async def update_config(update: ConfigUpdate, user: User = Depends(require_admin
     Update configuration for a component (requires: admin).
     
     Publishes config update to NATS for hot reload.
+    
+    Supported keys for execution-engine:
+    - max_position_size_lamports: u64 (must be > 0)
+    - daily_loss_limit_lamports: u64 (must be > 0)
+    - max_open_positions: u64 (1-100)
+    - max_slippage_bps: u64 (1-10000)
+    - simulation_timeout_ms: u64 (100-30000)
+    - send_enabled: bool (can only enable if wallet configured)
     """
     valid_components = ["market-data", "momentum-bot", "execution-engine"]
     if update.component not in valid_components:
@@ -529,11 +537,10 @@ async def update_config(update: ConfigUpdate, user: User = Depends(require_admin
     # Audit log the config change
     audit_logger.info(f"CONFIG_UPDATE: user={user.name}, component={update.component}, keys={list(update.config.keys())}")
     
+    # P1: Format matches Rust IPC schema (ConfigUpdate)
     config_msg = {
-        "command": "config_update",
         "component": update.component,
         "config": update.config,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     
     published = await state.publish(config.TOPIC_CONFIG_RELOAD, config_msg)
