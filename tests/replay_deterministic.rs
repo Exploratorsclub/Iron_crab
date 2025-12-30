@@ -132,7 +132,7 @@ fn make_decision(intent: &TradeIntent, sequence_num: u64) -> DecisionRecord {
             success: true,
             error_code: None,
             logs_preview: Some(format!("Simulated at seq {}", sequence_num)),
-            compute_units_consumed: Some(150_000 + (sequence_num * 100) as u32),
+            compute_units_consumed: Some(150_000 + (sequence_num * 100) as u64),
         };
         (DecisionOutcome::Sent, None, Some(sim))
     };
@@ -162,7 +162,7 @@ fn create_test_intent(seq: u64, regime: TradingRegime, capital_lamports: u64) ->
         "test-run-123",
         format!("intent-{:06}", seq),
         "test-harness",
-        IntentTier::Tier2,
+        IntentTier::Tier1,
         IntentOrigin::StrategyA,
         ExplicitAmount::new(capital_lamports, 9),
         TradeResources {
