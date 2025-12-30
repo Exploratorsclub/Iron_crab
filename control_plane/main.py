@@ -10,6 +10,7 @@ Responsibilities:
 - Position overview and P&L dashboard
 - Kill switch trigger
 - NATS Request/Reply for commands to execution-engine
+- Decision record display and statistics (P1 DoD)
 
 This service does NOT:
 - Sign or send transactions
@@ -24,6 +25,10 @@ Endpoints:
 - POST /config - Update configuration
 - POST /kill - Emergency kill switch
 - POST /command/{component} - Send command to component via NATS
+- GET /decisions - Get recent decision records (with filters)
+- GET /decisions/stats - Get decision statistics
+- GET /decisions/{decision_id} - Get specific decision by ID
+- POST /decisions/query - Query decisions with complex filters
 """
 
 import asyncio
@@ -202,6 +207,86 @@ class KillRequest(BaseModel):
     reason: str = Field(..., description="Reason for triggering kill switch")
     liquidate_positions: bool = Field(default=True, description="Whether to liquidate open positions")
 
+# ============================================================================
+# Decision Record Models (matching Rust IPC schema)
+# ============================================================================
+
+class CheckResult(BaseModel):
+    """Single check result from decision pipeline"""
+    check_name: str
+    passed: bool
+    reason_code: Optional[str] = None
+    details: Optional[str] = None
+
+class SimulationResult(BaseModel):
+    """Simulation result from execution"""
+    success: bool
+    compute_units: Optional[int] = None
+    error_code: Optional[str] = None
+    logs: Optional[List[str]] = None
+
+class SendResult(BaseModel):
+    """Transaction send result"""
+    signature: Optional[str] = None
+    slot: Optional[int] = None
+    error: Optional[str] = None
+
+class DecisionRecord(BaseModel):
+    """
+    Decision record from execution-engine.
+    Matches Rust DecisionRecord in src/ipc/schema.rs.
+    """
+    # Header fields
+    ts: str  # ISO timestamp
+    component: str
+    build: Optional[str] = None
+    run_id: Optional[str] = None
+    
+    # Core fields
+    decision_id: str
+    intent_id: str
+    source: str  # P1: Strategy attribution
+    origin_type: str  # "Manual", "Momentum", "Arbitrage", etc.
+    regime: str  # "Early", "Established", etc.
+    
+    # Checks
+    checks: List[CheckResult] = Field(default_factory=list)
+    primary_reject_reason: Optional[str] = None
+    
+    # Simulation
+    plan_hash: Optional[str] = None
+    simulate: Optional[SimulationResult] = None
+    
+    # Send
+    send: Optional[SendResult] = None
+    
+    # Outcome: "Executed", "Rejected", "SimFailed", "SendFailed"
+    outcome: str
+    
+    # Replay support
+    config_snapshot_id: Optional[str] = None
+    input_snapshots: Dict[str, str] = Field(default_factory=dict)
+
+class DecisionQuery(BaseModel):
+    """Query parameters for decision records"""
+    limit: int = Field(default=50, ge=1, le=500, description="Max records to return")
+    source: Optional[str] = Field(default=None, description="Filter by source strategy")
+    outcome: Optional[str] = Field(default=None, description="Filter by outcome (Executed, Rejected, SimFailed, SendFailed)")
+    since: Optional[str] = Field(default=None, description="ISO timestamp to filter records after")
+    intent_id: Optional[str] = Field(default=None, description="Filter by specific intent ID")
+
+class DecisionStats(BaseModel):
+    """Aggregated statistics for decision records"""
+    total: int
+    executed: int
+    rejected: int
+    sim_failed: int
+    send_failed: int
+    by_source: Dict[str, int]
+    by_reject_reason: Dict[str, int]
+    period_start: Optional[str] = None
+    period_end: Optional[str] = None
+
 class CommandRequest(BaseModel):
     command: str = Field(..., description="Command to send")
     params: Optional[Dict[str, Any]] = Field(default=None, description="Command parameters")
@@ -222,6 +307,11 @@ class ControlPlaneState:
         self.kill_switch_reason: Optional[str] = None
         self.kill_switch_time: Optional[datetime] = None
         self.http_client: Optional[httpx.AsyncClient] = None
+        # P1: Decision record cache (ring buffer for recent decisions)
+        self.decisions: List[Dict[str, Any]] = []
+        self.decisions_lock = asyncio.Lock()
+        self.max_cached_decisions: int = 1000
+        self.decision_subscriber_task: Optional[asyncio.Task] = None
     
     async def connect_nats(self):
         if not HAS_NATS:
@@ -231,13 +321,124 @@ class ControlPlaneState:
         try:
             self.nats_client = await nats.connect(config.NATS_URL)
             logger.info(f"Connected to NATS at {config.NATS_URL}")
+            # Start decision record subscriber
+            self.decision_subscriber_task = asyncio.create_task(self._subscribe_decisions())
+        except Exception as e:
+            logger.error(f"Failed to connect to NATS: {e}")
+    
+    async def _subscribe_decisions(self):
+        """Subscribe to decision records topic for live updates"""
+        if not self.nats_client:
+            return
+        
+        try:
+            # Subscribe to decision records topic
+            sub = await self.nats_client.subscribe("ironcrab.v1.decision_records")
+            logger.info("Subscribed to decision records topic")
+            
+            async for msg in sub.messages:
+                try:
+                    decision = json.loads(msg.data.decode())
+                    async with self.decisions_lock:
+                        self.decisions.append(decision)
+                        # Keep only most recent decisions (ring buffer)
+                        if len(self.decisions) > self.max_cached_decisions:
+                            self.decisions = self.decisions[-self.max_cached_decisions:]
+                    logger.debug(f"Cached decision: {decision.get('decision_id', 'unknown')}")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse decision record: {e}")
+        except Exception as e:
+            if "cancelled" not in str(e).lower():
+                logger.error(f"Decision subscriber error: {e}")
         except Exception as e:
             logger.error(f"Failed to connect to NATS: {e}")
     
     async def disconnect_nats(self):
+        if self.decision_subscriber_task:
+            self.decision_subscriber_task.cancel()
+            try:
+                await self.decision_subscriber_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Decision subscriber stopped")
         if self.nats_client:
             await self.nats_client.close()
             logger.info("Disconnected from NATS")
+    
+    async def get_cached_decisions(
+        self, 
+        limit: int = 50,
+        source: Optional[str] = None,
+        outcome: Optional[str] = None,
+        since: Optional[str] = None,
+        intent_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get cached decision records with optional filtering"""
+        async with self.decisions_lock:
+            filtered = self.decisions.copy()
+        
+        # Apply filters
+        if source:
+            filtered = [d for d in filtered if d.get("source") == source]
+        if outcome:
+            filtered = [d for d in filtered if d.get("outcome") == outcome]
+        if since:
+            try:
+                since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                filtered = [d for d in filtered 
+                           if datetime.fromisoformat(d.get("ts", "").replace("Z", "+00:00")) > since_dt]
+            except (ValueError, TypeError):
+                pass  # Invalid date, skip filter
+        if intent_id:
+            filtered = [d for d in filtered if d.get("intent_id") == intent_id]
+        
+        # Return most recent first, limited
+        return list(reversed(filtered))[:limit]
+    
+    def get_decision_stats(self) -> Dict[str, Any]:
+        """Calculate statistics from cached decisions"""
+        decisions = self.decisions  # snapshot
+        
+        stats = {
+            "total": len(decisions),
+            "executed": 0,
+            "rejected": 0,
+            "sim_failed": 0,
+            "send_failed": 0,
+            "by_source": {},
+            "by_reject_reason": {},
+            "period_start": None,
+            "period_end": None,
+        }
+        
+        for d in decisions:
+            outcome = d.get("outcome", "").lower()
+            if "executed" in outcome:
+                stats["executed"] += 1
+            elif "rejected" in outcome:
+                stats["rejected"] += 1
+            elif "simfailed" in outcome or "sim_failed" in outcome:
+                stats["sim_failed"] += 1
+            elif "sendfailed" in outcome or "send_failed" in outcome:
+                stats["send_failed"] += 1
+            
+            # By source
+            source = d.get("source", "unknown")
+            stats["by_source"][source] = stats["by_source"].get(source, 0) + 1
+            
+            # By reject reason
+            reason = d.get("primary_reject_reason")
+            if reason:
+                stats["by_reject_reason"][reason] = stats["by_reject_reason"].get(reason, 0) + 1
+        
+        # Period
+        if decisions:
+            timestamps = [d.get("ts") for d in decisions if d.get("ts")]
+            if timestamps:
+                stats["period_start"] = min(timestamps)
+                stats["period_end"] = max(timestamps)
+        
+        return stats
     
     async def publish(self, topic: str, data: dict):
         if not self.nats_client:
@@ -561,6 +762,94 @@ async def get_recent_logs(component: str, lines: int = 100, user: User = Depends
         "lines": lines,
         "logs": [],
         "note": "Log aggregation not yet implemented"
+    }
+
+# ============================================================================
+# Decision Display Endpoints (P1 DoD: UI shows decision records)
+# ============================================================================
+
+@app.get("/decisions", response_model=List[DecisionRecord])
+async def get_decisions(
+    limit: int = 50,
+    source: Optional[str] = None,
+    outcome: Optional[str] = None,
+    since: Optional[str] = None,
+    intent_id: Optional[str] = None,
+    user: User = Depends(require_viewer)
+):
+    """
+    Get recent decision records (requires: viewer).
+    
+    Returns decisions from the in-memory cache (populated via NATS subscription).
+    
+    Filters:
+    - limit: Max number of records (1-500, default 50)
+    - source: Filter by source strategy (e.g., "momentum-bot")
+    - outcome: Filter by outcome ("Executed", "Rejected", "SimFailed", "SendFailed")
+    - since: ISO timestamp to get records after
+    - intent_id: Get specific intent's decision
+    """
+    audit_logger.info(f"DECISIONS_VIEW: user={user.name}, limit={limit}, source={source}, outcome={outcome}")
+    
+    limit = min(max(limit, 1), 500)
+    decisions = await state.get_cached_decisions(
+        limit=limit,
+        source=source,
+        outcome=outcome,
+        since=since,
+        intent_id=intent_id,
+    )
+    
+    return decisions
+
+@app.get("/decisions/stats", response_model=DecisionStats)
+async def get_decision_stats(user: User = Depends(require_viewer)):
+    """
+    Get aggregated statistics for decision records (requires: viewer).
+    
+    Shows counts by outcome, source, and reject reason.
+    """
+    audit_logger.info(f"DECISIONS_STATS: user={user.name}")
+    return state.get_decision_stats()
+
+@app.get("/decisions/{decision_id}")
+async def get_decision_by_id(decision_id: str, user: User = Depends(require_viewer)):
+    """
+    Get a specific decision record by ID (requires: viewer).
+    """
+    audit_logger.info(f"DECISION_VIEW: user={user.name}, decision_id={decision_id}")
+    
+    async with state.decisions_lock:
+        for d in state.decisions:
+            if d.get("decision_id") == decision_id:
+                return d
+    
+    raise HTTPException(status_code=404, detail=f"Decision {decision_id} not found in cache")
+
+@app.post("/decisions/query")
+async def query_decisions(query: DecisionQuery, user: User = Depends(require_viewer)):
+    """
+    Query decision records with complex filters (requires: viewer).
+    
+    POST body allows for more complex queries than GET parameters.
+    """
+    audit_logger.info(f"DECISIONS_QUERY: user={user.name}, query={query.model_dump()}")
+    
+    decisions = await state.get_cached_decisions(
+        limit=query.limit,
+        source=query.source,
+        outcome=query.outcome,
+        since=query.since,
+        intent_id=query.intent_id,
+    )
+    
+    stats = state.get_decision_stats()
+    
+    return {
+        "decisions": decisions,
+        "count": len(decisions),
+        "stats": stats,
+        "query": query.model_dump(),
     }
 
 @app.get("/whoami")

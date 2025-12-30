@@ -131,7 +131,15 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
   - ✅ `decision_id`, `intent_id` Felder; `ExecutionResult.signature`
 
 ### P1
-- [ ] **UI/Control zeigt Entscheidungen**: In der UI/Control Plane kann man die letzten N Decisions ansehen (inkl. „rejected reasons“).
+- [x] **UI/Control zeigt Entscheidungen**: In der UI/Control Plane kann man die letzten N Decisions ansehen (inkl. „rejected reasons").
+  - ✅ `DecisionRecord`, `DecisionQuery`, `DecisionStats` models in `control_plane/main.py`
+  - ✅ `GET /decisions` - List recent decisions with filters (limit, source, outcome, since, intent_id)
+  - ✅ `GET /decisions/stats` - Aggregated statistics (by outcome, source, reject reason)
+  - ✅ `GET /decisions/{decision_id}` - Get specific decision
+  - ✅ `POST /decisions/query` - Complex query with full stats
+  - ✅ NATS subscriber for `ironcrab.v1.decision_records` (live updates)
+  - ✅ In-memory ring buffer cache (1000 decisions)
+  - ✅ Audit logging for all decision views
 
 ---
 
