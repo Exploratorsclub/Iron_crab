@@ -21,7 +21,9 @@ Ziel: **deterministisch, debugbar, sicher** – und zwar mit messbaren Kriterien
   - ✅ `momentum-bot` exit(1) wenn Key-Env-Vars erkannt werden
 - [x] **Kein „rogue send" möglich**: Strategy-Bots/Worker haben keinerlei Send-/Sign-Codepfad (kein RPC send, kein TPU send, kein Jito send).
   - ✅ Binaries `market-data` und `momentum-bot` erzeugen nur Events/Intents
-- [ ] **Key-Material ist nicht im Hot Path leakbar**: Keine Secrets in Logs/Events; keine Keys in Env Vars; klare Storage-Quelle (z. B. File + OS ACL oder Vault).
+- [x] **Key-Material ist nicht im Hot Path leakbar**: Keine Secrets in Logs/Events; keine Keys in Env Vars; klare Storage-Quelle (z. B. File + OS ACL oder Vault).
+  - ✅ Keys nur via `KEYPAIR_PATH` File, nicht als Env-Var-Inhalt
+  - ✅ Kein Logging von Key-Material in allen Binaries
 - [x] **Panic/Kill Switch**: Ein globaler Kill Switch kann Trading deterministisch deaktivieren (Control Plane + Engine-seitig), inkl. Nachweis in Logs/Metrics.
   - ✅ `control_plane/main.py`: POST /kill → publishes zu `ironcrab.control.kill`
   - ✅ `execution-engine` subscribed NATS kill topic → sets `kill_switch_active`
