@@ -247,7 +247,8 @@ impl ExecutionEngine {
 
                     if let Some(ref e) = err {
                         // Keep journal noise bounded: log count + first few lines
-                        let preview: Vec<&String> = logs.iter().take(25).collect();
+                        // NOTE: use owned Strings so we can call `.join()` on the slice.
+                        let preview: Vec<String> = logs.iter().take(25).cloned().collect();
                         tracing::warn!(
                             path = %format!("{} -> {} -> {} -> {}", base, mid1, mid2, base),
                             amount_in = amount_in,
