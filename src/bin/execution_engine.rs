@@ -73,14 +73,34 @@ struct Args {
 }
 
 /// Execution engine configuration
+/// 
+/// All risk limits are documented here (DoD J) P0: No hidden defaults).
+/// These values are checked before every trade execution.
 #[derive(Debug, Clone)]
 struct ExecutionConfig {
-    /// Maximum daily loss (lamports) before kill switch
+    // === Risk Invariants (DoD J) P0) ===
+    
+    /// Maximum single position size (lamports). Default: 0.5 SOL
+    /// Rejects any intent with required_capital > this value.
+    max_position_size_lamports: u64,
+    
+    /// Maximum daily loss (lamports) before kill switch. Default: 5 SOL
+    /// Tracks cumulative losses within a calendar day (UTC).
     daily_loss_limit_lamports: u64,
-    /// Maximum concurrent open positions
+    
+    /// Maximum concurrent open positions. Default: 5
+    /// Rejects new intents if this limit is reached.
     max_open_positions: usize,
+    
+    /// Maximum allowed slippage (basis points). Default: 500 (5%)
+    /// Rejects any intent with max_slippage_bps > this value.
+    max_slippage_bps: u32,
+    
+    // === Operational Config ===
+    
     /// Simulation timeout (ms)
     simulation_timeout_ms: u64,
+    
     /// Whether to actually send transactions
     send_enabled: bool,
 }
@@ -88,11 +108,25 @@ struct ExecutionConfig {
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
-            daily_loss_limit_lamports: 5_000_000_000, // 5 SOL
-            max_open_positions: 5,
+            // Risk Invariants - conservative defaults for safety
+            max_position_size_lamports: 500_000_000,  // 0.5 SOL max per trade
+            daily_loss_limit_lamports: 5_000_000_000, // 5 SOL daily loss limit
+            max_open_positions: 5,                     // max 5 concurrent positions
+            max_slippage_bps: 500,                     // max 5% slippage allowed
+            // Operational
             simulation_timeout_ms: 2000,
             send_enabled: false, // Default: simulate only
         }
+    }
+}
+
+impl ExecutionConfig {
+    /// Returns a snapshot ID for this config (for Decision Record correlation)
+    fn snapshot_id(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self).hash(&mut hasher);
+        format!("cfg-{:016x}", hasher.finish())
     }
 }
 
@@ -100,12 +134,22 @@ impl Default for ExecutionConfig {
 struct ExecutionContext {
     run_id: String,
     config: ExecutionConfig,
+    config_snapshot_id: String,
     nats: Option<NatsClient>,
     decision_writer: JsonlWriter,
     execution_writer: JsonlWriter,
     lock_manager: LockManager,
     decision_counter: std::sync::atomic::AtomicU64,
     execution_counter: std::sync::atomic::AtomicU64,
+    
+    // === Risk Tracking (DoD J) P0) ===
+    /// Current day (UTC) for daily loss tracking
+    current_day: parking_lot::RwLock<chrono::NaiveDate>,
+    /// Cumulative loss today (lamports, positive = loss)
+    daily_loss_lamports: std::sync::atomic::AtomicI64,
+    /// Currently open positions count
+    open_positions: std::sync::atomic::AtomicUsize,
+    
     // Metrics
     intents_received: std::sync::atomic::AtomicU64,
     intents_rejected: std::sync::atomic::AtomicU64,
@@ -141,6 +185,45 @@ impl ExecutionContext {
     fn record_sim_failure(&self) {
         self.sim_failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    
+    // Risk Invariant helpers
+    
+    /// Check if we need to reset daily counters (new day)
+    fn maybe_reset_daily(&self) {
+        let today = chrono::Utc::now().date_naive();
+        let mut current = self.current_day.write();
+        if *current != today {
+            tracing::info!(old_day = %current, new_day = %today, "Daily reset triggered");
+            *current = today;
+            self.daily_loss_lamports.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    
+    /// Record a loss (positive = loss, negative = profit)
+    fn record_pnl_lamports(&self, pnl: i64) {
+        // Positive pnl = loss, negative = profit
+        self.daily_loss_lamports.fetch_add(pnl, std::sync::atomic::Ordering::Relaxed);
+    }
+    
+    /// Get current daily loss
+    fn get_daily_loss_lamports(&self) -> i64 {
+        self.daily_loss_lamports.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    
+    /// Increment open positions
+    fn increment_open_positions(&self) {
+        self.open_positions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    
+    /// Decrement open positions
+    fn decrement_open_positions(&self) {
+        self.open_positions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    
+    /// Get current open positions count
+    fn get_open_positions(&self) -> usize {
+        self.open_positions.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -239,6 +322,7 @@ async fn main() -> Result<()> {
 
     let ctx = Arc::new(ExecutionContext {
         run_id: run_id.clone(),
+        config_snapshot_id: exec_config.snapshot_id(),
         config: exec_config,
         nats,
         decision_writer,
@@ -246,6 +330,11 @@ async fn main() -> Result<()> {
         lock_manager,
         decision_counter: std::sync::atomic::AtomicU64::new(0),
         execution_counter: std::sync::atomic::AtomicU64::new(0),
+        // Risk tracking
+        current_day: parking_lot::RwLock::new(chrono::Utc::now().date_naive()),
+        daily_loss_lamports: std::sync::atomic::AtomicI64::new(0),
+        open_positions: std::sync::atomic::AtomicUsize::new(0),
+        // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
         sim_failures: std::sync::atomic::AtomicU64::new(0),
@@ -427,7 +516,114 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         details: None,
     });
 
-    // === Check 3: Capital lock ===
+    // === Risk Invariant Checks (DoD J) ===
+    
+    // Reset daily counters if new day
+    ctx.maybe_reset_daily();
+    
+    // Check 3a: Max position size
+    if intent.required_capital.raw > ctx.config.max_position_size_lamports {
+        let reason = RejectReason::RiskMaxPosition;
+        checks.push(CheckResult {
+            check_name: "max_position_size".to_string(),
+            passed: false,
+            reason_code: Some(reason.to_string()),
+            details: Some(format!(
+                "required={} > max={}",
+                intent.required_capital.raw,
+                ctx.config.max_position_size_lamports
+            )),
+        });
+        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    }
+    checks.push(CheckResult {
+        check_name: "max_position_size".to_string(),
+        passed: true,
+        reason_code: None,
+        details: Some(format!(
+            "required={} <= max={}",
+            intent.required_capital.raw,
+            ctx.config.max_position_size_lamports
+        )),
+    });
+    
+    // Check 3b: Max slippage
+    if intent.max_slippage_bps > ctx.config.max_slippage_bps {
+        let reason = RejectReason::SimSlippageExceeded;
+        checks.push(CheckResult {
+            check_name: "max_slippage".to_string(),
+            passed: false,
+            reason_code: Some(reason.to_string()),
+            details: Some(format!(
+                "intent_slippage={}bps > max={}bps",
+                intent.max_slippage_bps,
+                ctx.config.max_slippage_bps
+            )),
+        });
+        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    }
+    checks.push(CheckResult {
+        check_name: "max_slippage".to_string(),
+        passed: true,
+        reason_code: None,
+        details: None,
+    });
+    
+    // Check 3c: Max open positions
+    let current_positions = ctx.get_open_positions();
+    if current_positions >= ctx.config.max_open_positions {
+        let reason = RejectReason::RiskMaxOpenPositions;
+        checks.push(CheckResult {
+            check_name: "max_open_positions".to_string(),
+            passed: false,
+            reason_code: Some(reason.to_string()),
+            details: Some(format!(
+                "current={} >= max={}",
+                current_positions,
+                ctx.config.max_open_positions
+            )),
+        });
+        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    }
+    checks.push(CheckResult {
+        check_name: "max_open_positions".to_string(),
+        passed: true,
+        reason_code: None,
+        details: Some(format!(
+            "current={} < max={}",
+            current_positions,
+            ctx.config.max_open_positions
+        )),
+    });
+    
+    // Check 3d: Daily loss limit
+    let daily_loss = ctx.get_daily_loss_lamports();
+    if daily_loss >= ctx.config.daily_loss_limit_lamports as i64 {
+        let reason = RejectReason::RiskDailyLossLimit;
+        checks.push(CheckResult {
+            check_name: "daily_loss_limit".to_string(),
+            passed: false,
+            reason_code: Some(reason.to_string()),
+            details: Some(format!(
+                "daily_loss={} >= limit={}",
+                daily_loss,
+                ctx.config.daily_loss_limit_lamports
+            )),
+        });
+        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    }
+    checks.push(CheckResult {
+        check_name: "daily_loss_limit".to_string(),
+        passed: true,
+        reason_code: None,
+        details: Some(format!(
+            "daily_loss={} < limit={}",
+            daily_loss,
+            ctx.config.daily_loss_limit_lamports
+        )),
+    });
+
+    // === Check 4: Capital lock ===
     let holder = LockHolder::new(&intent.intent_id).with_decision(&decision_id);
     let lock_result = ctx.lock_manager.try_lock_capital(
         holder,
