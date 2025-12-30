@@ -1,0 +1,36 @@
+[Unit]
+Description=IronCrab Market Data Service (Geyser Ingest)
+After=network-online.target nats.service
+Wants=network-online.target
+PartOf=ironcrab.target
+
+[Service]
+Type=simple
+User=ironcrab
+Group=ironcrab
+WorkingDirectory=/home/ironcrab/Iron_crab
+
+ExecStart=/home/ironcrab/Iron_crab/target/release/market-data \
+    --config /home/ironcrab/Iron_crab/my_config.server.toml \
+    --nats-url nats://localhost:4222 \
+    --geyser-url http://127.0.0.1:10001 \
+    --metrics-port 9801
+
+Environment=RUST_LOG=info,market_data=info,ironcrab::solana::geyser_listener=warn
+
+Restart=on-failure
+RestartSec=3
+
+# Resource controls: lower priority than validator
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUWeight=100
+CPUAffinity=48-55
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=ironcrab.target

@@ -1,0 +1,37 @@
+[Unit]
+Description=IronCrab Execution Engine (Single Signer)
+After=network-online.target nats.service
+Wants=network-online.target
+PartOf=ironcrab.target
+
+[Service]
+Type=simple
+User=ironcrab
+Group=ironcrab
+WorkingDirectory=/home/ironcrab/Iron_crab
+
+ExecStart=/home/ironcrab/Iron_crab/target/release/execution-engine \
+    --config /home/ironcrab/Iron_crab/my_config.server.toml \
+    --nats-url nats://localhost:4222 \
+    --metrics-port 9803
+
+Environment=RUST_LOG=info,execution_engine=info,ironcrab::engine=debug
+Environment=KEYPAIR_PATH=/home/ironcrab/.config/solana/id.json
+
+Restart=on-failure
+RestartSec=5
+
+# Resource controls: execution engine gets higher priority
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=4
+CPUWeight=200
+CPUAffinity=60-63
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+# File ACL on keypair should restrict read to ironcrab user only
+
+[Install]
+WantedBy=ironcrab.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=IronCrab Trading System Target
+After=network-online.target nats.service
+Wants=market-data.service momentum-bot.service execution-engine.service control-plane.service
+
+[Install]
+WantedBy=multi-user.target

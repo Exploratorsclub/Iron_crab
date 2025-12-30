@@ -22,7 +22,9 @@ Ziel: **deterministisch, debugbar, sicher** – und zwar mit messbaren Kriterien
 - [x] **Kein „rogue send" möglich**: Strategy-Bots/Worker haben keinerlei Send-/Sign-Codepfad (kein RPC send, kein TPU send, kein Jito send).
   - ✅ Binaries `market-data` und `momentum-bot` erzeugen nur Events/Intents
 - [ ] **Key-Material ist nicht im Hot Path leakbar**: Keine Secrets in Logs/Events; keine Keys in Env Vars; klare Storage-Quelle (z. B. File + OS ACL oder Vault).
-- [ ] **Panic/Kill Switch**: Ein globaler Kill Switch kann Trading deterministisch deaktivieren (Control Plane + Engine-seitig), inkl. Nachweis in Logs/Metrics.
+- [x] **Panic/Kill Switch**: Ein globaler Kill Switch kann Trading deterministisch deaktivieren (Control Plane + Engine-seitig), inkl. Nachweis in Logs/Metrics.
+  - ✅ `control_plane/main.py`: POST /kill → publishes zu `ironcrab.control.kill`
+  - ✅ `execution-engine` subscribed NATS kill topic → sets `kill_switch_active`
 
 ### P1
 - [ ] **Role separation**: Control Plane kann Parameter ändern/stoppen, aber niemals signieren.
@@ -116,13 +118,15 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
 ## F) Metrics: Prometheus/Grafana Abnahme (Architektur §10)
 
 ### P0
-- [ ] **Pflicht-Metriken vorhanden**: 
+- [x] **Pflicht-Metriken vorhanden**: 
   - `intents_received_total` (labels: source, tier)
   - `intents_rejected_total` (label: reason)
   - `plans_built_total`
   - `simulate_failed_total` (label: error_code)
   - `tx_sent_total`, `tx_confirmed_total`, `tx_failed_total`
   - `decision_latency_ms` (P50/P95/P99)
+  - ✅ `src/metrics.rs`: `serve_metrics()` für Prometheus scraping
+  - ✅ Alle 3 Binaries exposen Metriken (Ports 9801/9802/9803)
 - [ ] **„No silent failure“**: Es gibt keine Fehlerpfade ohne Metric + Decision Record.
 
 ### P1
@@ -133,8 +137,12 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
 ## G) Storage & Replay (Architektur §11)
 
 ### P0
-- [ ] **Replay-Paket definierbar**: Für einen Zeitraum kann man MarketEvents + Intents + Decisions exportieren (Flat files).
-- [ ] **Deterministischer Replay-Run**: Offline-Replay reproduziert Decisions für denselben Input-Stream (mindestens für `Rejected/Planned/SimFailed`).
+- [x] **Replay-Paket definierbar**: Für einen Zeitraum kann man MarketEvents + Intents + Decisions exportieren (Flat files).
+  - ✅ `JsonlWriter` mit täglicher Rotation schreibt alle Records
+  - ✅ Pfadformat: `{prefix}/{date}/{stream}-{N}.jsonl`
+- [x] **Deterministischer Replay-Run**: Offline-Replay reproduziert Decisions für denselben Input-Stream (mindestens für `Rejected/Planned/SimFailed`).
+  - ✅ `tests/replay_deterministic.rs`: 4 Tests für Decision Record Determinismus
+  - ✅ `test_decision_record_roundtrip`, `test_replay_determinism`, `test_decision_outcomes_correct`, `test_jsonl_append_integrity`
 
 ### P1
 - [ ] **Golden Replays**: Es gibt mindestens 3 gespeicherte „golden“ Replay-Szenarien, die in CI laufen.
@@ -161,9 +169,12 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
 - [x] **NATS Topics fixiert**: `MarketEvents`, `TradeIntents`, `ExecutionResults`, `ControlRequests` sind definiert, versioniert und dokumentiert.
   - ✅ `src/nats/topics.rs`: TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS, etc.
   - ✅ Version: `ironcrab.v1.*` Format
-- [ ] **Request/Reply für Control**: Start/Stop, risk limits, config reload laufen über request/reply (mit Timeout + Ack).
+- [x] **Request/Reply für Control**: Start/Stop, risk limits, config reload laufen über request/reply (mit Timeout + Ack).
+  - ✅ `control_plane/main.py`: POST /command/{component} → NATS request/reply
+  - ✅ TOPIC_CONTROL_REQUESTS für Commands
 - [x] **Hot Path bleibt Rust**: Kein Python/HTTP im Execution Hot Path.
   - ✅ Alle drei Binaries sind Rust
+  - ✅ Control Plane (Python) nur für Management, nicht im Trading Hot Path
 
 ### P1
 - [ ] **RBAC (minimal)**: Mindestens Admin/Viewer Rollen (UI/API), Auditing der Control-Aktionen.

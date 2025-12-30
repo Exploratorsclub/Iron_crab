@@ -1,0 +1,31 @@
+[Unit]
+Description=IronCrab Control Plane (FastAPI)
+After=network-online.target nats.service
+Wants=network-online.target
+PartOf=ironcrab.target
+
+[Service]
+Type=simple
+User=ironcrab
+Group=ironcrab
+WorkingDirectory=/home/ironcrab/Iron_crab/control_plane
+
+ExecStart=/home/ironcrab/Iron_crab/.venv/bin/uvicorn main:app \
+    --host 127.0.0.1 \
+    --port 8080
+
+Environment=NATS_URL=nats://localhost:4222
+
+Restart=on-failure
+RestartSec=3
+
+# Resource controls: control plane is not time-critical
+Nice=15
+CPUWeight=50
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=ironcrab.target

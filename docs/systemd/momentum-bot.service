@@ -1,0 +1,38 @@
+[Unit]
+Description=IronCrab Momentum Bot (Strategy)
+After=network-online.target nats.service market-data.service
+Wants=network-online.target
+PartOf=ironcrab.target
+
+[Service]
+Type=simple
+User=ironcrab
+Group=ironcrab
+WorkingDirectory=/home/ironcrab/Iron_crab
+
+ExecStart=/home/ironcrab/Iron_crab/target/release/momentum-bot \
+    --config /home/ironcrab/Iron_crab/my_config.server.toml \
+    --nats-url nats://localhost:4222 \
+    --metrics-port 9802
+
+Environment=RUST_LOG=info,momentum_bot=info
+
+# WICHTIG: Keine Wallet-Keys! momentum-bot exit(1) wenn Keys erkannt werden.
+# Environment=KEYPAIR_PATH=  # NICHT SETZEN!
+
+Restart=on-failure
+RestartSec=3
+
+# Resource controls
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUWeight=100
+CPUAffinity=56-59
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=ironcrab.target
