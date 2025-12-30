@@ -258,7 +258,7 @@ async fn main() -> Result<()> {
                             dex: "raydium".to_string(),
                             initial_liquidity_sol: Some(rust_decimal::Decimal::from(10)),
                         },
-                    };
+                    );
 
                     if let Err(e) = process_market_event(&ctx, &event).await {
                         error!(error = %e, "Failed to process market event");
