@@ -190,6 +190,10 @@ Ziel: Verhindert „Arbitrage gehört wohin?“-Verwirrung durch harte Abnahmekr
 
 ### P1
 - [ ] **RBAC (minimal)**: Mindestens Admin/Viewer Rollen (UI/API), Auditing der Control-Aktionen.
+- [ ] **Runtime-Konfiguration via UI**: Alle Binary-Parameter (MomentumConfig, ExecutionConfig, etc.) sind über Control Plane/UI änderbar ohne Neustart.
+  - MomentumConfig: Liquidity-Thresholds, Slippage, Position Size
+  - ExecutionConfig: Risk Limits (max_position, daily_loss, max_slippage)
+  - Änderungen werden über NATS gepusht und von Binaries hot-reloaded
 
 ---
 
