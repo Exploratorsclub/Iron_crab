@@ -1306,7 +1306,10 @@ impl Engine {
 
         let date = chrono::Utc::now().format("%Y%m%d").to_string();
         let dir = std::path::Path::new(&log_dir);
-        let file_path = dir.join(format!("trades-{}.csv", date));
+        // IMPORTANT: Do not write into the sniper trade CSV (trades-YYYYMMDD.csv).
+        // That file is parsed by the Grafana /trades table using the sniper schema.
+        // Mixing schemas produces incorrect amounts/prices in the dashboard.
+        let file_path = dir.join(format!("strategy-trades-{}.csv", date));
 
         let mut options = std::fs::OpenOptions::new();
         options.create(true).append(true);

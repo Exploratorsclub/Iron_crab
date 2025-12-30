@@ -2275,8 +2275,11 @@ impl SniperEngine {
                         self.finalize_fill(*mint, sol_in, creator).await;
 
                         record_network_fee(fee_estimate);
+                        // NOTE: We intentionally avoid logging raw expected token amounts here
+                        // because the dashboard expects UI units (decimals-adjusted). The accurate
+                        // token amount is recorded in the subsequent FILL row.
                         let line = format!(
-                            "{ts},BUY,{mint},PUMPFUN,{sig},{lamports_in},0,0,{exp_tokens},{exp_tokens},,0,,{fee},,",
+                            "{ts},BUY,{mint},PUMPFUN,{sig},{lamports_in},0,0,0,0,,0,,{fee},,expected_raw_tokens={exp_tokens}",
                             ts=ChronoUtc::now().to_rfc3339(),
                             mint=mint,
                             sig=sig,
@@ -2314,8 +2317,9 @@ impl SniperEngine {
                             }
 
                             record_network_fee(fee_estimate);
+                            // NOTE: Avoid raw token amounts (decimals unknown here). FILL row is authoritative.
                             let line = format!(
-                                "{ts},BUY,{mint},RAYDIUM,{sig},{lamports_in},0,0,{exp_tokens},{exp_tokens},,0,,{fee},,expected_min_out={min_out}",
+                                "{ts},BUY,{mint},RAYDIUM,{sig},{lamports_in},0,0,0,0,,0,,{fee},,expected_raw_tokens={exp_tokens};expected_min_out={min_out}",
                                 ts=ChronoUtc::now().to_rfc3339(),
                                 mint=mint,
                                 sig=sig,
@@ -2352,8 +2356,9 @@ impl SniperEngine {
                         self.finalize_fill(*mint, sol_in, None).await; // Orca: no creator needed
 
                         record_network_fee(fee_estimate);
+                        // NOTE: Avoid raw token amounts (decimals unknown here). FILL row is authoritative.
                         let line = format!(
-                            "{ts},BUY,{mint},ORCA,{sig},{lamports_in},0,0,{exp_tokens},{exp_tokens},,0,,{fee},,",
+                            "{ts},BUY,{mint},ORCA,{sig},{lamports_in},0,0,0,0,,0,,{fee},,expected_raw_tokens={exp_tokens}",
                             ts=ChronoUtc::now().to_rfc3339(),
                             mint=mint,
                             sig=sig,
@@ -2400,7 +2405,7 @@ impl SniperEngine {
                         ChosenDex::Orca => orca_quote_out,
                     };
                     let line = format!(
-                        "{ts},BUY,{mint},{dex},TIMEOUT,{lamports_in},0,0,{exp_tokens},{exp_tokens},,0,,{fee},,confirmation_timeout",
+                        "{ts},BUY,{mint},{dex},TIMEOUT,{lamports_in},0,0,0,0,,0,,{fee},,confirmation_timeout;expected_raw_tokens={exp_tokens}",
                         ts=ChronoUtc::now().to_rfc3339(),
                         mint=mint,
                         dex=dex_name,
@@ -3091,22 +3096,29 @@ impl SniperEngine {
 
             record_shortfall(shortfall, shortfall_sol);
             // Use actual SOL spent (final_lamports_in) instead of config estimate (pend.lamports_in)
+            // IMPORTANT: Write token amounts in UI units (decimals-adjusted) for dashboard correctness.
+            let expected_ui = if scale > 0.0 {
+                expected_raw as f64 / scale
+            } else {
+                expected_raw as f64
+            };
             let line = format!(
-                "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens},{expected_tokens},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9};protocol_fee_tokens={fee_tokens};network_fee_exact={network_fee_exact};config_lamports={config_lamports}",
+                "{ts},FILL,{mint},{dex},{sig},{lamports_in},0,0,{actual_tokens_ui},{expected_tokens_ui},,{shortfall_tokens},,{fee},,shortfall_ui={shortfall_ui:.9};shortfall_sol={shortfall_sol:.9};protocol_fee_tokens={fee_tokens};network_fee_exact={network_fee_exact};config_lamports={config_lamports};decimals={decimals}",
                 ts=ChronoUtc::now().to_rfc3339(),
                 mint=mint,
                 dex=pend.dex,
                 sig=pend.sig,
                 lamports_in=final_lamports_in,  // ACTUAL SOL spent from TX metadata
-                actual_tokens=actual_raw,
-                expected_tokens=expected_raw,
+                actual_tokens_ui=amt,
+                expected_tokens_ui=expected_ui,
                 shortfall_tokens=shortfall,
                 fee=exact_network_fee,
                 shortfall_ui=shortfall_ui,
                 shortfall_sol=shortfall_sol,
                 fee_tokens=fee_tokens,
                 network_fee_exact=exact_network_fee,
-                config_lamports=pend.lamports_in  // Original config value for reference
+                config_lamports=pend.lamports_in,  // Original config value for reference
+                decimals=decimals
             );
             self.append_trade_record(&line, true);
 
@@ -4385,11 +4397,24 @@ impl SniperEngine {
                 // Also record absolute realized PnL (SOL) histogram using net
                 record_realized_pnl_sol(net);
 
-                // Record SELL trade for dashboard
+                // Record SELL trade for dashboard (UI units)
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
+                let token_decimals = self
+                    .risk
+                    .read()
+                    .open
+                    .get(mint)
+                    .and_then(|v| v.get(lot_idx))
+                    .map(|l| l.token_decimals)
+                    .unwrap_or(0);
+                let sell_tokens_ui = if token_decimals == 0 {
+                    sell_tokens as f64
+                } else {
+                    sell_tokens as f64 / 10f64.powi(token_decimals as i32)
+                };
                 let pnl_pct = if notional > 0.0 {
                     Some((net / notional) * 100.0)
                 } else {
@@ -4400,9 +4425,9 @@ impl SniperEngine {
                     mint: mint.to_string(),
                     action: "SELL".to_string(),
                     tx_hash: sig.to_string(),
-                    amount_tokens: sell_tokens as f64,
-                    price_sol: if sell_tokens > 0 {
-                        delta_sol / (sell_tokens as f64)
+                    amount_tokens: sell_tokens_ui,
+                    price_sol: if sell_tokens_ui > 0.0 {
+                        delta_sol / sell_tokens_ui
                     } else {
                         0.0
                     },
@@ -4412,16 +4437,17 @@ impl SniperEngine {
                 });
 
                 let line = format!(
-                    "{ts},SELL,{mint},*,{sig},0,{lamports_out},{tok_in},{tok_out},,,0,,{fee},{realized},exit_fraction={fraction}",
+                    // IMPORTANT: tokens_in is UI units (decimals-adjusted) for dashboard correctness.
+                    "{ts},SELL,{mint},*,{sig},0,{lamports_out},{tok_in_ui},0,,,0,,{fee},{realized},exit_fraction={fraction};decimals={decimals}",
                     ts=ChronoUtc::now().to_rfc3339(),
                     mint=mint,
                     sig=sig,
                     lamports_out=lamports_out,
-                    tok_in=sell_tokens,
-                    tok_out=sell_tokens,
+                    tok_in_ui=sell_tokens_ui,
                     fee=fee_estimate,
-                    realized=realized,
-                    fraction=fraction
+                    realized=net,
+                    fraction=fraction,
+                    decimals=token_decimals
                 );
                 self.append_trade_record(&line, true);
                 self.persist_risk_state();

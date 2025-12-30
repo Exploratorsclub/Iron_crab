@@ -78,7 +78,10 @@ fn read_trades_from_csv(limit: usize) -> Vec<RecentTrade> {
 
 /// Parse a CSV line into RecentTrade
 fn parse_csv_line(line: &str) -> Option<RecentTrade> {
-    // CSV format: timestamp_utc,side,mint,dex,signature,lamports_in,lamports_out,tokens_in,tokens_out,expected_tokens_out,...,realized_pnl_sol,notes
+    // CSV format (sniper):
+    // timestamp_utc,side,mint,dex,signature,lamports_in,lamports_out,tokens_in,tokens_out,
+    // expected_tokens_out,expected_sol_out,shortfall_tokens,shortfall_sol,network_fee_lamports,
+    // realized_pnl_sol,notes
     let parts: Vec<&str> = line.split(',').collect();
     if parts.len() < 10 {
         return None;
@@ -99,9 +102,9 @@ fn parse_csv_line(line: &str) -> Option<RecentTrade> {
     // Fallback to expected_tokens_out (index 9) for old CSV format compatibility
     let expected_tokens_out: f64 = parts.get(9).and_then(|s| s.parse().ok()).unwrap_or(0.0);
 
-    // For BUY: lamports_in is spent, tokens_out received (use expected as fallback)
+    // For BUY/FILL: lamports_in is spent, tokens_out received (use expected as fallback)
     // For SELL: tokens_in sold, lamports_out received
-    let (amount_tokens, price_sol) = if action == "BUY" {
+    let (amount_tokens, price_sol) = if action == "BUY" || action == "FILL" {
         let tokens = if tokens_out > 0.0 {
             tokens_out
         } else {

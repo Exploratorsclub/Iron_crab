@@ -2,7 +2,42 @@
 
 Version: **0.3.1-dev** (Agave / Solana 3.x)
 
-High-frequency Solana trading bot with meme token sniper and arbitrage modules. Runs alongside a self-hosted Agave 3.0.11 validator for minimal latency.
+Dieses Repository befindet sich in einem **Debuggable-First Architektur-Umbau** (Multi-Prozess, deterministisch, intent-only). Der Validator (Agave 3.x) läuft co-located für minimale Latenz.
+
+## Architektur-Umbau Status (Debuggable-First)
+
+**Source of Truth (bei Widerspruch gewinnt diese Doku):**
+- `docs/TARGET_ARCHITECTURE.md`
+- `docs/DEFINITION_OF_DONE.md`
+- `docs/STORAGE_CONVENTIONS.md`
+
+**Non-negotiables (P0 / Live-verboten ohne Erfüllung):**
+- **Single-Signer**: Nur die Execution Engine signiert/sendet.
+- **Intent-only**: Strategien/Worker erzeugen nur `TradeIntent`s.
+- **Simulate-gated**: Simulation-fail ⇒ niemals senden (insb. Arbitrage).
+- **Decision Records**: Jede Entscheidung ist forensisch nachvollziehbar.
+
+## Target Architecture (High-Level)
+
+Kernaussage: Kein „klassischer Sniper“ (kein „alle neuen Mints sofort kaufen“). Stattdessen: Data Plane lädt/normalisiert Markt-Daten einmal; Momentum-Policy erzeugt Intents; Execution Engine führt deterministisch aus.
+
+```text
+Geyser/RPC
+	│
+	▼
+market-data  ── MarketEvents ──►  momentum-bot  ── TradeIntents ──►  execution-engine  ── ExecutionResults ──►  control-plane/UI
+																		 │
+																		 └──────────── (optional) arb-strategy (Typ A) ─────┘
+```
+
+## Rebuild Quickstart (WIP)
+
+Dieser Abschnitt beschreibt den **geplanten** neuen Startpunkt gemäß Target Architecture. Falls Code/Tasks/Configs dafür noch fehlen, gilt die Doku als Richtlinie – nicht als „läuft schon“.
+
+- Binaries/Prozesse: `market-data`, `momentum-bot`, `execution-engine`, `control-plane` (optional: `arb-strategy` Typ A)
+- NATS Topics (Minimum): `MarketEvents`, `TradeIntents`, `ExecutionResults`, `ControlRequests`
+- Local Dev Ziel: erst Vertical Slice (1 DEX / 1 Pair / 1 Policy / 1 Tx-Typ) bis P0 aus `docs/DEFINITION_OF_DONE.md` erfüllt ist
+- Storage P0: append-only Flat Files für Events/Intents/Decisions/Executions gemäß `docs/STORAGE_CONVENTIONS.md`
 
 ## Validator Entry Point Latency Testing
 To select the fastest Solana mainnet-beta entrypoints (Gossip port 8001) from your Frankfurt host you can use the helper script:
@@ -44,7 +79,10 @@ Interpreting results:
 
 Add lines produced by the script into your validator launch (each as separate `--entrypoint host:8001`). Review trust & stability before adding unknown peers.
 
-## Features (aktueller Stand)
+## Features (Legacy-Code / aktueller Stand – wird abgelöst)
+
+Wichtig: Die folgende Liste beschreibt primär den aktuellen Legacy/Monolith-Stand im Repo. Neue Entwicklung soll sich an der Target Architecture orientieren (siehe `docs/TARGET_ARCHITECTURE.md`) und muss die DoD erfüllen.
+
 Core
 - Treasury: ATA Erstellung, SPL Transfers, WSOL wrap/unwrap
 - Engine: Strategie-Interface (Rust; optional Python via Feature `python`)
@@ -64,7 +102,7 @@ Geyser gRPC (Low-Latency Data)
 - ATA Confirmation: Dynamische Subscription für spezifische ATAs (nicht gesamtes Token Program)
 - Kill Switch: Echtzeit Dev-Sell Detection, Sell-Burst Monitoring, Negative Flow Detection
 
-Sniper & Risk
+Sniper & Risk (Legacy)
 - Geyser Pool Discovery (ersetzt WS Log Subscription)
 - WS Resilience: Subscribe-ACK Gating, Bounded Backpressure, Heartbeat/Staleness, Multi-Endpoint Failover, optionale Auth-Header
 - Heuristiken (Blacklist, Liquidity, FreezeAuth, Decimals Range)
@@ -109,6 +147,8 @@ Backtest & Tools
 - CLI: `raydium_pools`, `backtest_driver`
 
 ## 🚀 Quickstart Guide
+
+Hinweis: Dieser Quickstart bezieht sich auf den aktuellen Legacy/Monolith-Stand. Für den Umbau gilt: Keys gehören ausschließlich in die `execution-engine`, Strategien sind keyless und senden nie direkt. Siehe `docs/TARGET_ARCHITECTURE.md` + `docs/DEFINITION_OF_DONE.md`.
 
 ### Prerequisites
 1. **Rust Installation**: Ensure you have Rust installed (latest stable)
@@ -214,7 +254,7 @@ Before going live, verify:
 - [ ] `daily_loss_limit_sol` will protect your capital  
 - [ ] `stop_loss_bps` is not too aggressive (consider 1500-2000 instead of 3000)
 - [ ] Your RPC endpoint is reliable and fast
-- [ ] You understand that sniper trading is HIGH RISK
+- [ ] You understand that live trading is HIGH RISK
 - [ ] You've tested with small amounts first
 
 ### Common Commands

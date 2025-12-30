@@ -1,11 +1,16 @@
 # IronCrab AI Coding Guide
 
-High-frequency Solana trading bot with meme token sniper and arbitrage modules. Runs alongside a self-hosted Agave 3.0.11 validator for minimal latency.
-Das ziel ist einen hochfrequenz solana bot zu erstellen mit einem meme token sniper und einem arbitrage modul. Es wird ein eigener agave 3.0.11 validator auf dem gleichen server wie der bot betrieben die config ist im file agave-validator-optimized.service einsehbar. Der bot soll in der lage sein meme tokens sofort nach deren launch zu kaufen und arbitrage möglichkeiten zwischen verschiedenen dezentralen exchanges auf der solana blockchain zu erkennen und auszunutzen. Alle entwicklungen sollen dokumentiert werden und der code soll sauber und wartbar sein. Der bot soll in der lage sein mehrere transaktionen pro sekunde durchzuführen und dabei die netzwerkgebühren zu minimieren. Sicherheitsaspekte sind besonders zu beachten, insbesondere im Umgang mit privaten schlüsseln und sensiblen daten. Der bot soll so konzipiert sein, dass er leicht erweitert und angepasst werden kann, um auf zukünftige änderungen im solana-ökosystem reagieren zu können. Es soll eine benutzeroberfläche geben, die es ermöglicht, den bot zu konfigurieren und seine leistung in Echtzeit zu überwachen. Alle entwicklungen sollen unter berücksichtigung der geltenden rechtlichen rahmenbedingungen erfolgen. Der bot soll in der lage sein, auf verschiedene marktsituationen zu reagieren und seine strategie entsprechend anzupassen. Der bot soll in der lage sein, mit anderen solana-bots zu konkurrieren und sich einen wettbewerbsvorteil zu verschaffen. Der bot soll in der lage sein, große mengen an daten in kurzer zeit zu verarbeiten und schnelle entscheidungen zu treffen. Der bot soll in der lage sein, fehler zu erkennen und sich selbst zu korrigieren, um eine hohe verfügbarkeit zu gewährleisten. Der bot soll in der lage sein, verschiedene meme tokens zu analysieren und deren potenzial für schnelle gewinne zu bewerten. Der bot soll in der lage sein, seine strategie basierend auf historischen daten und aktuellen markttrends anzupassen. Der bot soll in der lage sein, mit minimaler latenz zu arbeiten, um schnelle transaktionen zu ermöglichen. Der bot soll in der lage sein, verschiedene dezentrale exchanges zu integrieren und deren liquidität zu nutzen. Der bot soll in der lage sein, benachrichtigungen zu senden, wenn bestimmte ereignisse eintreten, wie z.b. erfolgreiche käufe oder arbitrage-möglichkeiten. Der bot soll in der lage sein, seine leistung kontinuierlich zu überwachen und optimierungen vorzunehmen, um die effizienz zu steigern. Der bot soll in der lage sein, verschiedene risikomanagement-strategien zu implementieren, um verluste zu minimieren. Der bot soll in der lage sein, mit verschiedenen solana-wallets zu arbeiten und deren sicherheit zu gewährleisten.
+Dieses Repository wird aktuell **Debuggable-First** in eine klar getrennte Multi-Prozess-Architektur umgebaut.
 
-Geyser gegen über rpc calls bevorzugen für höhere performance.
-Alle arbitrage transaktionen sollen atomar sein und über jito gesendet werden um fehlgeschlagene transaktionen und fronntrunning zu vermeiden.
-Keine eigenständigen ssh verbindungsversuche zum server wenn ssh benötigt wird den user darauf hinweisen und warten bis eine verbindung hergestellt wird.
+**Source of Truth (bei Widerspruch gewinnt diese Doku):**
+- `docs/TARGET_ARCHITECTURE.md`
+- `docs/DEFINITION_OF_DONE.md`
+- `docs/STORAGE_CONVENTIONS.md`
+
+**Grundregeln:**
+- Geyser gegenüber RPC bevorzugen (Latenz/Last).
+- Arbitrage-Ausführungen atomar (Bundle) und über Jito senden.
+- Keine eigenständigen SSH-Verbindungsversuche: wenn SSH nötig ist, User informieren und warten.
 
 ## Zielarchitektur (Debuggable-First Umbau)
 
@@ -25,26 +30,24 @@ Diese Repo-Historie enthält AI-schnellgeschriebenen Code. Priorität ist daher 
     - `momentum-bot` (Rust): konsumiert `MarketEvents` und erzeugt `TradeIntent` (Policies: EARLY + ESTABLISHED).
     - `control-plane` (FastAPI): Start/Stop/Config/Risk/Monitoring; niemals Teil des Trading-Hot-Path; keine Keys.
 
+**Architektur-Topologie (vereinfachte Sicht):**
+
+```
+Geyser/RPC
+    │
+    ▼
+market-data  ── MarketEvents ──►  momentum-bot  ── TradeIntents ──►  execution-engine  ── ExecutionResults ──►  control-plane/UI
+                                                                         │
+                                                                         └──────────── (optional) arb-strategy (Typ A) ─────┘
+
+Hinweis:
+- Typ A (marktgetriebene Arbitrage) gehört in Strategy Plane (erzeugt Intents).
+- Typ B (reaktive Tx-abhängige MEV) sind Worker **in** der execution-engine.
+```
+
 **MVP-Regel („First Results Fast“ ohne Debug-Sumpf)**
 - Immer zuerst einen **kleinen Vertical Slice** liefern (1 DEX / 1 Pair / 1 Strategy / 1 Tx-Typ), bis `docs/DEFINITION_OF_DONE.md` (P0) erfüllt ist.
 - Keine neuen Features, wenn sie nicht Decision Records + Reason-coded Rejects + (wo passend) Simulation-Gates mitliefern.
-
-## Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         SniperEngine                            │
-│  (src/solana/sniper.rs - 6000+ lines, core trading logic)      │
-├─────────────────────────────────────────────────────────────────┤
-│  Geyser gRPC          │  DEX Connectors       │  Risk Manager   │
-│  - Pool Discovery     │  - Raydium            │  - Position     │
-│  - ATA Confirmation   │  - Orca Whirlpool     │    Tracking     │
-│  - Kill Switch        │  - Pump.fun           │  - Stop Loss/TP │
-│                       │  - Router (multi-hop) │  - Daily Limits │
-├─────────────────────────────────────────────────────────────────┤
-│  Treasury (wallet.rs)  │  Metrics (9898)      │  Jito Bundles   │
-└─────────────────────────────────────────────────────────────────┘
-```
 
 ## Critical Dev Workflows
 
@@ -52,7 +55,7 @@ Diese Repo-Historie enthält AI-schnellgeschriebenen Code. Priorität ist daher 
 ```bash
 cargo fmt --check              # CI enforces this
 cargo clippy -- -D warnings    # Must pass with zero warnings
-cargo test --features test_helpers  # Enables SniperEngine test helpers
+cargo test --features test_helpers  # Enables internal test helpers
 ```
 
 ### Local Run
@@ -91,8 +94,8 @@ pub trait Dex: Send + Sync {
 Use `#[cfg(any(test, feature = "test_helpers"))]` to expose internal methods for testing:
 ```rust
 #[cfg(any(test, feature = "test_helpers"))]
-impl SniperEngine {
-    pub fn test_insert_lot(&self, mint: Pubkey, ...) { ... }
+impl Engine {
+    pub fn test_insert_position_lot(&self, mint: Pubkey, ...) { ... }
     pub fn test_get_realized_pnl_sol(&self) -> f64 { ... }
 }
 ```
@@ -100,7 +103,7 @@ impl SniperEngine {
 ### Concurrency with `parking_lot`
 Use `parking_lot::RwLock` instead of `std::sync::RwLock` for better performance:
 ```rust
-risk: Arc<parking_lot::RwLock<RiskState>>
+state: Arc<parking_lot::RwLock<State>>
 ```
 
 ## Key Integration Points
@@ -122,255 +125,22 @@ use crate::solana::jito::JitoClient;
 
 ## Geyser Configuration
 
-### Plugin Config (`docs/geyser-grpc-plugin-config.json`)
-```json
-{
-  "libPath": "/home/sol/geyser-plugins/solana_geyser_plugin_grpc.so",
-  "bind_address": "127.0.0.1:10001",
-  "accounts": [
-    { "owner": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" },  // Raydium AMM V4
-    { "owner": "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" }   // Orca Whirlpool
-  ]
-}
-```
+Die Geyser-Plugin-Konfiguration muss zu Validator + Plugin-Pfad passen.
+Siehe `docs/geyser-grpc-plugin-config.json`.
 
-### Geyser Modules
-| Module | Purpose |
-|--------|---------|
-| `geyser_pool_discovery.rs` | Pool creation events for sniping |
-| `geyser_kill_switch.rs` | Real-time dev sell detection, flow monitoring |
-| `geyser_tx_confirm.rs` | Dynamic ATA subscription for balance confirmation |
+## Dynamic Subscription Pattern
 
-### Dynamic ATA Subscription Pattern
-For efficient TX confirmation, subscribe only to specific ATA addresses (not entire Token Program):
-```rust
-// ✅ Good: Dynamic subscription to specific ATAs
-let ata = get_associated_token_address(&wallet, &mint);
-geyser_confirm.watch_ata(ata, expected_balance).await;
+Für Confirmation/Balance-Watches nur spezifische Accounts (z. B. ATA) subscriben; keine Vollabos auf Token Program.
 
-// ❌ Avoid: Subscribing to entire Token Program (millions of updates/sec)
-```
+## Storage / Replay
 
-## Risk Management
+- Hot-Path-safe: keine DB/FS-Blocker im Execution Hot Path.
+- Append-only Flat Files als P0-Standard, siehe `docs/STORAGE_CONVENTIONS.md`.
 
-### RiskState (`src/solana/sniper.rs`)
-Central risk tracking with the following components:
-```rust
-struct RiskState {
-    open: HashMap<Pubkey, Vec<PositionLot>>,  // Multi-lot per mint
-    realized_pnl_sol: f64,
-    realized_loss_today_sol: f64,
-    cooldown_until: HashMap<Pubkey, i64>,     // Per-mint cooldown after SL
-    recent_realized: Vec<f64>,                // Rolling window for Sharpe
-    adaptive_slippage_bps: Option<u32>,       // Auto-adjusted slippage
-}
-```
+## Legacy-Code Hinweis (wichtig)
 
-### Key Risk Parameters (TOML Config)
-```toml
-[sniper]
-stop_loss_bps = 500              # 5% stop-loss
-take_profit_bps = 1000           # 10% take-profit
-daily_loss_limit_sol = 5.0       # Max daily loss
-max_open_positions = 5           # Concurrent position limit
-stop_loss_cooldown_secs = 300    # 5min cooldown after SL trigger
-max_position_sol = 2.0           # Max SOL per position
-
-# Drawdown scaling (reduce size during drawdown)
-drawdown_scale_start = 0.1       # Start scaling at 10% drawdown
-drawdown_max_reduction = 0.5     # Reduce max to 50% at max drawdown
-```
-
-### Tiered Take-Profit
-```toml
-[[sniper.take_profit_tiers]]
-threshold_bps = 500   # At +5%
-exit_fraction = 0.25  # Sell 25%
-
-[[sniper.take_profit_tiers]]
-threshold_bps = 1000  # At +10%
-exit_fraction = 0.50  # Sell 50%
-```
-
-### Time-Based Exits
-Force exits after holding too long (prevents bag-holding):
-```toml
-[sniper]
-enable_time_based_exits = true
-max_hold_secs = 90               # Force full exit after 90 seconds
-
-# Tiered time exits (sell fractions at intervals)
-[[sniper.timed_exit_tiers]]
-secs = 30        # After 30 seconds
-fraction = 0.25  # Sell 25%
-
-[[sniper.timed_exit_tiers]]
-secs = 60        # After 60 seconds
-fraction = 0.50  # Sell 50%
-```
-
-**Logic**: `max_hold_secs` triggers 100% exit; timed tiers are partial exits tracked per-lot via `executed_timed_tiers`.
-
-## Sniper Module (`src/solana/sniper.rs`)
-
-The `SniperEngine` is the core trading engine (~6000 LOC). Key responsibilities:
-
-### Entry Flow
-1. **Pool Discovery** (Geyser): Detect new Raydium/Orca/Pump.fun pools
-2. **Token Validation**: Check freeze authority, decimals, LP concentration
-3. **Risk Check**: Open positions, daily loss limits, cooldowns
-4. **Execute Buy**: Build swap IX, send TX, track pending
-
-### Exit Flow
-1. **Price Monitoring**: Continuous quote fetching via Router
-2. **Stop-Loss/Take-Profit**: BPS-based triggers with tiered exits
-3. **Time-Based Exits**: Force exits after `max_hold_secs`
-4. **Kill Switch**: Emergency exit on dev sells or negative flow
-
-### Key Structs
-```rust
-struct SniperCfg { ... }       // All config parameters
-struct RiskState { ... }       // Position tracking, PnL, cooldowns
-struct PositionLot { ... }     // Individual position with entry price
-struct PendingTrade { ... }    // In-flight TX tracking
-```
-
-### Exit Priority Order
-1. **Kill Switch** (emergency) → Jito bundle, max slippage
-2. **Stop-Loss** → Immediate exit, triggers cooldown
-3. **Take-Profit Tiers** → Partial exits at profit thresholds
-4. **Time-Based Exits** → Partial/full exits after time thresholds
-5. **Trailing Stop** → Dynamic SL that follows price up
-
-## Arbitrage Module (`src/solana/arbitrage.rs`)
-
-The `ArbitrageEngine` scans for triangular arbitrage opportunities across DEX pools.
-
-### How It Works
-1. **Pool Discovery**: Syncs Raydium (700k+ pools) and Orca (4k+ pools) snapshots
-2. **Cycle Enumeration**: For each base token, DFS searches for 3-hop paths (A→B→C→A)
-3. **Quote Evaluation**: Gets best quotes per hop via Router
-4. **Profitability Filter**: Net profit after DEX fees + TX costs + slippage
-5. **Execution**: Atomic Jito bundles (prevents frontrunning)
-
-### Configuration
-```toml
-[arbitrage]
-interval_ms = 2000                    # Scan every 2 seconds
-min_profit_bps = 10                   # Minimum 10 bps profit
-est_tx_cost_lamports = 5000000        # 0.05 SOL estimated cost
-
-[arbitrage.discovery]
-enable = true
-mode = "full-auto"
-base_tokens = [
-    "So11111111111111111111111111111111111111112",    # SOL
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-]
-min_liquidity_sol = 20.0
-```
-
-### Key Methods
-```rust
-impl ArbitrageEngine {
-    // Enumerate all profitable triangles
-    pub async fn enumerate_triangular_cycles(&self, base_tokens: &[String], amount_in: u64) -> Result<Vec<CycleOpportunity>>;
-    
-    // Build atomic TX plan for a triangle
-    pub async fn assemble_triangle_plan(&self, a, b, c, amount, slippage_bps) -> Result<Option<TransactionPlan>>;
-    
-    // Simulate before sending
-    pub async fn simulate_transaction_plan(&self, plan, fee_payer) -> Result<SimulationOutcome>;
-}
-```
-
-### Metrics
-| Metric | Description |
-|--------|-------------|
-| `arb_triangle_attempts_total` | Triangles evaluated |
-| `arb_triangle_profitable_total` | Profitable cycles found |
-| `arb_triangle_opportunities_total` | Opportunities per scan |
-
-### Decimal Normalization
-All amounts normalized to 9 decimals (SOL standard) for profit comparison:
-```rust
-fn normalize_amount(amount: u64, from_decimals: u8, to_decimals: u8) -> u64;
-fn get_mint_decimals_fast(&self, mint: &str) -> u8;  // Hardcoded for common tokens
-```
-
-## Config Hot-Reload
-
-**Feature-gated**: `cargo build --features notify_watch`
-
-### Mechanisms
-1. **File Watcher** (`notify_watch` feature): Watches config file for changes
-2. **SIGHUP Handler** (Unix only): `kill -HUP <pid>` triggers reload
-
-### Usage
-```bash
-# With file watcher
-cargo run --release --features notify_watch -- --config my_config.toml
-
-# Via environment variable
-$env:IRONCRAB_SNIPER_RELOAD_PATH = "my_config.toml"
-cargo run --release --features notify_watch
-```
-
-### Reload Behavior
-- Changes are validated via `validate_sniper_cfg()` before applying
-- Diff is logged via `diff_sniper_cfg()` showing what changed
-- Invalid configs are rejected (bot continues with old config)
-- Reload interval configurable: `hot_reload_secs = 30`
-
-```rust
-// src/config_reload.rs
-pub fn diff_sniper_cfg(old: &SniperCfg, new: &SniperCfg) -> String;
-pub fn validate_sniper_cfg(cfg: &SniperCfg) -> Result<(), String>;
-```
-
-## Backtest Engine
-
-### Location
-`src/backtest/engine.rs` - Historical simulation framework
-
-### Running Backtests
-```bash
-# Windows
-.\backtest.ps1 -config config.example.toml -start 2024-01-01 -end 2024-12-01
-
-# Linux
-./backtest.sh --config config.example.toml --start 2024-01-01 --end 2024-12-01
-```
-
-### Key Concepts
-- Replay historical pool events from Geyser logs
-- Simulate fills with realistic slippage model
-- Track virtual PnL with same RiskState logic as live trading
-- Output metrics compatible with Grafana dashboard
-
-## Common Gotchas
-
-1. **SPL Token Balance Offset**: Token account balance is at bytes `[64..72]`, not `[0..8]`
-2. **Pump.fun 1% Fee**: Actual swap amount = `sol_sent * 0.99` (4 transfers per buy)
-3. **ATA Must Exist Before Swap**: Use `spl_associated_token_account::get_associated_token_address` to derive, but check existence
-4. **Commitment Levels**: Use `Confirmed` for speed (~2s), not `Finalized` (~20s) unless critical
-5. **Config Reload**: Changes require `notify_watch` feature; validate before applying
-6. **RiskState Persistence**: Positions auto-saved to `state.json` every `autosave_state_secs`
-
-## File Quick Reference
-
-| Path | Purpose |
-|------|---------|
-| `src/solana/sniper.rs` | Main trading engine (6000+ LOC) |
-| `src/solana/arbitrage.rs` | Triangular arbitrage cycle detection |
-| `src/solana/dex/*.rs` | DEX connectors (Raydium, Orca, Pump.fun) |
-| `src/solana/geyser_*.rs` | Real-time Geyser streams |
-| `src/config.rs` | TOML config parsing |
-| `src/config_reload.rs` | Hot-reload, diff & validation |
-| `src/metrics.rs` | Prometheus metrics |
-| `src/backtest/engine.rs` | Historical backtesting |
-| `tests/*.rs` | Integration tests |
-| `docs/*.service` | Systemd configs |
+Dieses Repo enthält noch Legacy-/Monolith-Code aus der Vorgängerphase.
+Neue Änderungen sollen sich an `docs/TARGET_ARCHITECTURE.md` orientieren (neue Binaries/Prozesse, Intent-only, Single-Signer), statt den Legacy-Monolithen weiter auszubauen.
 
 ## SSH/Server Operations
 **Never attempt SSH connections autonomously** - always inform the user and wait for confirmation when server access is needed.

@@ -64,6 +64,12 @@ spl-token = { version = "8", features = ["no-entrypoint"] }
 spl-token-2022 = { version = "9", features = ["no-entrypoint"] }
 notify = { version = "6", optional = true }
 
+# NATS for IPC (optional for now, stub implementation without it)
+async-nats = { version = "0.35", optional = true }
+
+# UUID for run_id / intent_id generation
+uuid = { version = "1", features = ["v4"] }
+
 # Database for reserve cache persistence
 rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
 
@@ -74,6 +80,7 @@ python = ["pyo3"]
 python_ipc = []
 jito = []
 notify_watch = ["notify"]
+nats = ["async-nats"]
 
 [dependencies.pyo3]
 version = "0.24.2"
@@ -87,3 +94,16 @@ serial_test = "2"
 [package.metadata.docs.rs]
 features = ["python"]
 no-default-features = true
+
+# New binaries for target architecture
+[[bin]]
+name = "market-data"
+path = "src/bin/market_data.rs"
+
+[[bin]]
+name = "momentum-bot"
+path = "src/bin/momentum_bot.rs"
+
+[[bin]]
+name = "execution-engine"
+path = "src/bin/execution_engine.rs"
