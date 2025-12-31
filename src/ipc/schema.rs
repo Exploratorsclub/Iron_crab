@@ -131,7 +131,17 @@ pub enum MarketEventKind {
         dex: String,
         initial_liquidity_sol: Option<Decimal>,
     },
-    /// Swap observed on-chain
+    /// Trade/swap observed on-chain (detailed for 4-filter strategy)
+    Trade {
+        pool_address: String,
+        mint: String,
+        trader: String,
+        is_buy: bool,
+        sol_amount: u64,       // lamports
+        token_amount: u64,
+        signature: Option<String>,
+    },
+    /// Swap observed on-chain (legacy format)
     SwapObserved {
         pool_address: String,
         signature: String,
@@ -146,6 +156,20 @@ pub enum MarketEventKind {
         quote_mint: String,
         price: Decimal,
         liquidity_sol: Option<Decimal>,
+    },
+    /// Liquidity removed from pool (potential rug signal)
+    LiquidityRemoved {
+        pool_address: String,
+        mint: String,
+        sol_amount: u64,       // lamports removed
+        token_amount: u64,
+        signature: Option<String>,
+    },
+    /// Dev wallet identified with supply percentage
+    DevWalletIdentified {
+        mint: String,
+        dev_wallet: String,
+        supply_percentage: f64,
     },
     /// Slot progression (heartbeat)
     SlotUpdate { current_slot: u64 },

@@ -312,3 +312,44 @@ Wenn eine neue Funktionalität nicht mindestens erfüllt:
 - reason-coded rejects,
 
 …dann gilt sie als **nicht fertig** und darf nicht mit realem Kapital laufen.
+---
+
+## M) Live-Test Protokoll (Phase 1-3)
+
+### Phase 1: Local Integration (2025-12-31) ✅
+- [x] Alle 3 Binaries starten ohne Crash
+- [x] NATS Verbindung funktioniert
+- [x] JSONL Logs werden geschrieben
+- [x] Market Events fließen (Simulate Mode: 1500+ Events)
+- [x] Decision Records werden generiert
+- [x] Idempotency-Check funktioniert (`LOCK_DUPLICATE_INTENT`)
+
+### Phase 2: Mainnet Dry-Run (2025-12-31) ✅
+- [x] Geyser-Verbindung zum lokalen Validator (Port 10000)
+- [x] Echte Mainnet-Events (Raydium, Orca, PumpFun)
+- [x] 250.000+ Market Events pro Tag verarbeitet
+- [x] NATS IPC zwischen allen Services funktioniert
+- [x] Momentum-Bot empfängt Events (12.505+ events_received)
+- [x] Execution-Engine im Dry-Run (keine echten TXs)
+
+### Phase 3: Mainnet Live (2025-12-31) 🔄 In Progress
+- [x] Wallet konfiguriert: `Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM`
+- [x] Balance: 2.32 SOL
+- [x] TX Sending: ENABLED
+- [x] Safety Limits aktiv:
+  - Max Trade: 0.01 SOL (10M lamports)
+  - Daily Loss Limit: 0.3 SOL (300M lamports)
+  - Max Slippage: 3% (300 bps)
+- [ ] Trading-Strategie generiert Intents (in Entwicklung)
+- [ ] Erster erfolgreicher Trade
+
+### Infrastruktur-Status
+| Service | Port | Status | Daten |
+|---------|------|--------|-------|
+| agave-validator | 8899/10000 | ✅ Läuft | Mainnet RPC + Geyser |
+| nats-server | 4222 | ✅ Läuft | IPC Bus |
+| market-data | 9801 | ✅ Läuft | Geyser → MarketEvents |
+| momentum-bot | 9802 | ✅ Läuft | Events → Intents |
+| execution-engine | 9803 | ✅ Läuft | Intents → TXs (Live) |
+| control-plane | 8080 | ✅ Läuft | Monitoring API |
+
