@@ -22,12 +22,14 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use ironcrab::config::WalletTrackerCfg;
 use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, MarketEvent, MarketEventKind,
 };
 use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
-use ironcrab::solana::dex_parser::{parse_account_update, parse_transaction_update};
+use ironcrab::solana::dex_parser::{parse_account_update, parse_transaction_update, ParsedDexEvent};
+use ironcrab::solana::wallet_tracker::WalletTracker;
 
 /// NATS topic for config reload (P1: Runtime Configuration via UI)
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
@@ -111,6 +113,8 @@ struct MarketDataContext {
     nats: Option<NatsClient>,
     jsonl_writer: JsonlWriter,
     event_counter: std::sync::atomic::AtomicU64,
+    /// P1: Wallet tracker for smart money / early buyer detection
+    wallet_tracker: WalletTracker,
 }
 
 impl MarketDataContext {
@@ -260,12 +264,23 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Initialize WalletTracker (P1: Smart Money / Insider Detection)
+    // TODO: Load config from file for production
+    let wallet_tracker_cfg = WalletTrackerCfg::default();
+    let wallet_tracker = WalletTracker::new(wallet_tracker_cfg);
+    info!(
+        smart_money = wallet_tracker.stats().smart_money_count,
+        bad_actors = wallet_tracker.stats().bad_actor_count,
+        "WalletTracker initialized"
+    );
+
     let ctx = Arc::new(MarketDataContext {
         run_id: run_id.clone(),
         config: parking_lot::RwLock::new(MarketDataConfig::default()),
         nats,
         jsonl_writer,
         event_counter: std::sync::atomic::AtomicU64::new(0),
+        wallet_tracker,
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -390,7 +405,51 @@ async fn run_geyser_loop(
                 tx_count += 1;
 
                 // Try to parse as DEX event (PoolCreated, Trade)
-                let event_kind = if let Some(parsed) = parse_transaction_update(&tx_update) {
+                let parsed_event = parse_transaction_update(&tx_update);
+                
+                // P1: Process wallet tracking events
+                let wallet_events = if let Some(ref parsed) = parsed_event {
+                    match parsed {
+                        ParsedDexEvent::PoolCreated { base_mint, .. } => {
+                            // Record pool creation for early buyer tracking
+                            ctx.wallet_tracker.record_pool_created(&base_mint.to_string(), tx_update.slot);
+                            Vec::new()
+                        }
+                        ParsedDexEvent::Trade { mint, trader, is_buy, sol_amount, token_amount, signature, slot, .. } => {
+                            // Check for smart money, early buyers, insider activity
+                            ctx.wallet_tracker.process_trade(
+                                &mint.to_string(),
+                                &trader.to_string(),
+                                *is_buy,
+                                *sol_amount,
+                                *token_amount,
+                                *slot,
+                                signature,
+                                &ctx.run_id,
+                                "market-data",
+                            )
+                        }
+                        ParsedDexEvent::LiquidityRemoved { .. } => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                
+                // Publish wallet tracking events
+                for wallet_event in wallet_events {
+                    // Write to JSONL
+                    if let Err(e) = ctx.jsonl_writer.write(&wallet_event) {
+                        error!(error = %e, "Failed to write wallet event to JSONL");
+                    }
+                    // Publish to NATS
+                    if let Some(ref nats) = ctx.nats {
+                        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &wallet_event).await {
+                            warn!(error = %e, "Failed to publish wallet event to NATS");
+                        }
+                    }
+                }
+                
+                let event_kind = if let Some(parsed) = parsed_event {
                     info!(
                         slot = tx_update.slot,
                         sig = %tx_update.signature,

@@ -184,6 +184,95 @@ pub enum MarketEventKind {
         signature: String,
         program: String,
     },
+    
+    // =========================================================================
+    // Wallet Tracking Events (P1: Smart Money / Insider Detection)
+    // =========================================================================
+    
+    /// Known wallet activity detected (smart money, insider, dev)
+    WalletActivity {
+        wallet: String,
+        wallet_type: WalletType,
+        action: WalletAction,
+        mint: String,
+        amount_sol: u64,        // lamports
+        amount_tokens: u64,
+        signature: String,
+        /// Historical win rate of this wallet (0.0-1.0), None if unknown
+        wallet_win_rate: Option<f64>,
+    },
+    
+    /// Early buyer detected for a token (first N minutes after pool creation)
+    EarlyBuyerDetected {
+        mint: String,
+        buyer_wallet: String,
+        buy_slot: u64,
+        slots_after_creation: u64,
+        amount_sol: u64,
+        amount_tokens: u64,
+        buyer_rank: u32,  // 1 = first buyer, 2 = second, etc.
+    },
+    
+    /// Insider alert: coordinated activity or known bad actor
+    InsiderAlert {
+        mint: String,
+        alert_type: InsiderAlertType,
+        wallets_involved: Vec<String>,
+        description: String,
+        severity: AlertSeverity,
+    },
+}
+
+/// Type of tracked wallet
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WalletType {
+    /// Known profitable trader ("smart money")
+    SmartMoney,
+    /// Token creator/dev wallet
+    DevWallet,
+    /// Early buyer (bought in first N slots)
+    EarlyBuyer,
+    /// Known insider/team wallet
+    Insider,
+    /// Known rug puller or scammer
+    KnownBadActor,
+    /// Whale (large holder)
+    Whale,
+}
+
+/// Action performed by tracked wallet
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WalletAction {
+    Buy,
+    Sell,
+    Transfer,
+    /// Adding liquidity to pool
+    AddLiquidity,
+    /// Removing liquidity from pool
+    RemoveLiquidity,
+}
+
+/// Type of insider alert
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InsiderAlertType {
+    /// Multiple wallets buying in coordinated pattern
+    CoordinatedBuying,
+    /// Dev wallet selling
+    DevSelling,
+    /// Known bad actor active
+    BadActorActive,
+    /// Same wallet cluster active on multiple new tokens
+    WalletClusterActive,
+    /// Large holder dumping
+    WhaleDumping,
+}
+
+/// Severity level for alerts
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AlertSeverity {
+    Info,
+    Warning,
+    Critical,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -10,6 +10,7 @@ pub mod jito;
 pub mod kill_switch;
 pub mod rpc;
 pub mod sniper;
+pub mod wallet_tracker;
 #[cfg(any(test, feature = "test_helpers"))]
 pub use sniper::*; // limited re-export only when testing / helpers enabled
 pub mod compute_budget_estimator;
