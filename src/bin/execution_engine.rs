@@ -1073,6 +1073,11 @@ fn create_test_intent(run_id: &str) -> TradeIntent {
 async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<()> {
     ctx.record_intent_received();
 
+    // Keep Prometheus counters aligned with persisted decision/intents logs.
+    // (The periodic heartbeat also stores aggregated counts; this makes the metric
+    // responsive and avoids confusing under-counting after restarts.)
+    INTENTS_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+
     let decision_id = ctx.next_decision_id();
     let mut checks: Vec<CheckResult> = Vec::new();
     
@@ -1564,6 +1569,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             send_signature = Some(format!("sig-mvp-{}", Uuid::new_v4()));
             ctx.tx_sent
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // Dashboard-level metric: "executed" means we attempted to send.
+            INTENTS_EXECUTED_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
     } else {
         debug!(intent_id = %intent.intent_id, "Transaction sending disabled");
@@ -1583,26 +1591,63 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         None
     };
 
-    // Emit decision record (success case)
-    let decision = DecisionRecord {
-        header: ironcrab::ipc::RecordHeader::new("execution-engine", BUILD_VERSION, &ctx.run_id),
-        decision_id: decision_id.clone(),
-        intent_id: intent.intent_id.clone(),
-        source: intent.source.clone(),
-        origin_type: intent.origin_type,
-        regime: intent.regime,
-        checks,
-        primary_reject_reason: None,
-        plan_hash: Some(format!("plan-{}", Uuid::new_v4())),
-        simulate: Some(sim_result),
-        send: send_result,
-        outcome: if config.send_enabled {
-            DecisionOutcome::Sent
-        } else {
-            DecisionOutcome::SimFailed // Mark as sim-only for MVP
-        },
-        config_snapshot_id: None,
-        input_snapshots: std::collections::HashMap::new(),
+    // Emit decision record
+    let decision = if config.send_enabled {
+        DecisionRecord {
+            header: ironcrab::ipc::RecordHeader::new(
+                "execution-engine",
+                BUILD_VERSION,
+                &ctx.run_id,
+            ),
+            decision_id: decision_id.clone(),
+            intent_id: intent.intent_id.clone(),
+            source: intent.source.clone(),
+            origin_type: intent.origin_type,
+            regime: intent.regime,
+            checks,
+            primary_reject_reason: None,
+            plan_hash: Some(format!("plan-{}", Uuid::new_v4())),
+            simulate: Some(sim_result),
+            send: send_result,
+            outcome: DecisionOutcome::Sent,
+            config_snapshot_id: None,
+            input_snapshots: std::collections::HashMap::new(),
+        }
+    } else {
+        // Don't mark this as a simulation failure: simulation succeeded, but sending is disabled.
+        // Persist a clear reason for post-mortem debugging.
+        let mut checks = checks;
+        checks.push(CheckResult {
+            check_name: "send_enabled".to_string(),
+            passed: false,
+            reason_code: Some("send_disabled".to_string()),
+            details: Some("execution-engine config.send_enabled=false".to_string()),
+        });
+
+        // This is a policy rejection, not a sim failure.
+        ctx.record_intent_rejected();
+        INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+        DecisionRecord {
+            header: ironcrab::ipc::RecordHeader::new(
+                "execution-engine",
+                BUILD_VERSION,
+                &ctx.run_id,
+            ),
+            decision_id: decision_id.clone(),
+            intent_id: intent.intent_id.clone(),
+            source: intent.source.clone(),
+            origin_type: intent.origin_type,
+            regime: intent.regime,
+            checks,
+            primary_reject_reason: Some("send_disabled".to_string()),
+            plan_hash: Some(format!("plan-{}", Uuid::new_v4())),
+            simulate: Some(sim_result),
+            send: None,
+            outcome: DecisionOutcome::Rejected,
+            config_snapshot_id: None,
+            input_snapshots: std::collections::HashMap::new(),
+        }
     };
 
     ctx.decision_writer.write(&decision)?;
@@ -1633,6 +1678,9 @@ async fn emit_rejected_decision(
     reason: RejectReason,
 ) -> Result<()> {
     ctx.record_intent_rejected();
+
+    // Keep Prometheus counters aligned with decision records.
+    INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 
     let decision = DecisionRecord::new_rejected(
         "execution-engine",
@@ -1671,6 +1719,12 @@ async fn emit_sim_failed_decision(
     checks: Vec<CheckResult>,
     sim_result: SimulationResult,
 ) -> Result<()> {
+    // Simulation failures are rejections and should show up both in totals and by-reason.
+    ctx.record_sim_failure();
+    ctx.record_intent_rejected();
+    INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    REJECT_SIMULATION_FAIL.fetch_add(1, Ordering::Relaxed);
+
     let decision = DecisionRecord::new_sim_failed(
         "execution-engine",
         BUILD_VERSION,
