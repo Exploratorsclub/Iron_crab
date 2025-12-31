@@ -548,6 +548,25 @@ impl ExecutionContext {
     }
 }
 
+/// Convert raw bytes to 32-byte seed array for Keypair
+/// Supports both 32-byte seed and 64-byte full keypair formats (takes first 32)
+fn bytes_to_secret_array(bytes: &[u8]) -> Option<[u8; 32]> {
+    match bytes.len() {
+        32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(bytes);
+            Some(arr)
+        }
+        64 => {
+            // 64 bytes = full keypair (secret + public), take first 32
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes[..32]);
+            Some(arr)
+        }
+        _ => None,
+    }
+}
+
 /// Load wallet keypair from environment variables
 /// Priority: IRONCRAB_KEYPAIR_PATH > IRONCRAB_KEYPAIR_JSON > IRONCRAB_KEYPAIR_B64
 fn load_wallet_keypair() -> Option<Keypair> {
@@ -568,14 +587,12 @@ fn load_wallet_keypair() -> Option<Keypair> {
     if let Ok(json) = std::env::var("IRONCRAB_KEYPAIR_JSON") {
         match serde_json::from_str::<Vec<u8>>(&json) {
             Ok(bytes) => {
-                match Keypair::from_bytes(&bytes) {
-                    Ok(kp) => {
-                        tracing::info!("Loaded keypair from JSON env var");
-                        return Some(kp);
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to parse keypair from JSON bytes");
-                    }
+                if let Some(secret) = bytes_to_secret_array(&bytes) {
+                    let kp = Keypair::new_from_array(secret);
+                    tracing::info!("Loaded keypair from JSON env var");
+                    return Some(kp);
+                } else {
+                    tracing::error!("IRONCRAB_KEYPAIR_JSON must be 32 or 64 bytes, got {}", bytes.len());
                 }
             }
             Err(e) => {
@@ -589,14 +606,12 @@ fn load_wallet_keypair() -> Option<Keypair> {
         use base64::Engine;
         match base64::engine::general_purpose::STANDARD.decode(&b64) {
             Ok(bytes) => {
-                match Keypair::from_bytes(&bytes) {
-                    Ok(kp) => {
-                        tracing::info!("Loaded keypair from B64 env var");
-                        return Some(kp);
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to parse keypair from B64 bytes");
-                    }
+                if let Some(secret) = bytes_to_secret_array(&bytes) {
+                    let kp = Keypair::new_from_array(secret);
+                    tracing::info!("Loaded keypair from B64 env var");
+                    return Some(kp);
+                } else {
+                    tracing::error!("IRONCRAB_KEYPAIR_B64 must decode to 32 or 64 bytes, got {}", bytes.len());
                 }
             }
             Err(e) => {
@@ -699,7 +714,7 @@ async fn main() -> Result<()> {
     info!(log_dir = %log_base.display(), "JSONL writers initialized");
 
     // Load wallet keypair and fetch real balance
-    let (wallet_pubkey, initial_balance) = if has_keys && !args.dry_run {
+    let (_wallet_pubkey, initial_balance) = if has_keys && !args.dry_run {
         let keypair = load_wallet_keypair();
         match keypair {
             Some(kp) => {
