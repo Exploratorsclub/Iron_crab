@@ -26,16 +26,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use ironcrab::ipc::{
-    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
-    IntentTier, MarketEvent, MarketEventKind, TradeIntent, TradeResources, TradeSide,
-    TradingRegime,
+    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult, ExecutionStatus,
+    ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind, TradeIntent,
+    TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::serve_metrics;
-use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
+use ironcrab::nats::{
+    NatsClient, NatsConfig, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS,
+};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// NATS topic for config reload (P1: Runtime Configuration via UI)
@@ -646,6 +648,19 @@ struct TokenMetrics {
     initial_liquidity_sol: f64,
 }
 
+/// Cached info about a pending intent (awaiting execution result)
+#[derive(Debug, Clone)]
+struct PendingIntent {
+    intent_id: String,
+    mint: String,
+    pool: String,
+    dex: String,
+    side: TradeSide,
+    sol_amount: u64,        // For BUY: SOL invested
+    token_amount: u64,      // For SELL: tokens to sell
+    created_at: Instant,
+}
+
 /// Runtime context for momentum-bot
 struct MomentumContext {
     run_id: String,
@@ -660,6 +675,8 @@ struct MomentumContext {
     token_trackers: parking_lot::RwLock<HashMap<String, TokenTracker>>,
     /// Position trackers for exit strategy (mint -> position)
     positions: parking_lot::RwLock<HashMap<String, PositionTracker>>,
+    /// Pending intents awaiting execution results (intent_id -> PendingIntent)
+    pending_intents: parking_lot::RwLock<HashMap<String, PendingIntent>>,
     /// Stats
     tokens_tracked: std::sync::atomic::AtomicU64,
     tokens_blacklisted: std::sync::atomic::AtomicU64,
@@ -866,6 +883,146 @@ impl MomentumContext {
     fn position_count(&self) -> usize {
         self.positions.read().len()
     }
+    
+    /// Get pending intent count for heartbeat
+    fn pending_count(&self) -> usize {
+        self.pending_intents.read().len()
+    }
+    
+    // =========================================================================
+    // Pending Intent Management (for execution result handling)
+    // =========================================================================
+    
+    /// Register a pending BUY intent
+    fn register_buy_intent(&self, intent_id: &str, mint: &str, pool: &str, dex: &str, sol_amount: u64) {
+        let mut pending = self.pending_intents.write();
+        pending.insert(intent_id.to_string(), PendingIntent {
+            intent_id: intent_id.to_string(),
+            mint: mint.to_string(),
+            pool: pool.to_string(),
+            dex: dex.to_string(),
+            side: TradeSide::Buy,
+            sol_amount,
+            token_amount: 0,
+            created_at: Instant::now(),
+        });
+        debug!(intent_id = %intent_id, mint = %mint, "Registered pending BUY intent");
+    }
+    
+    /// Register a pending SELL intent
+    fn register_sell_intent(&self, intent_id: &str, mint: &str, pool: &str, dex: &str, token_amount: u64) {
+        let mut pending = self.pending_intents.write();
+        pending.insert(intent_id.to_string(), PendingIntent {
+            intent_id: intent_id.to_string(),
+            mint: mint.to_string(),
+            pool: pool.to_string(),
+            dex: dex.to_string(),
+            side: TradeSide::Sell,
+            sol_amount: 0,
+            token_amount,
+            created_at: Instant::now(),
+        });
+        debug!(intent_id = %intent_id, mint = %mint, "Registered pending SELL intent");
+    }
+    
+    /// Handle execution result from execution-engine
+    fn handle_execution_result(&self, result: &ExecutionResult) {
+        // Only process results from our own intents
+        if result.source != "momentum-bot" && !result.source.starts_with("4filter:") && !result.source.starts_with("exit:") {
+            trace!(source = %result.source, "Ignoring execution result from other source");
+            return;
+        }
+        
+        // Find the pending intent
+        let pending_opt = {
+            let mut pending = self.pending_intents.write();
+            pending.remove(&result.intent_id)
+        };
+        
+        let Some(pending) = pending_opt else {
+            debug!(intent_id = %result.intent_id, "No pending intent found for execution result");
+            return;
+        };
+        
+        match result.status {
+            ExecutionStatus::Confirmed => {
+                match pending.side {
+                    TradeSide::Buy => {
+                        // BUY confirmed - open position
+                        // Estimate entry price: we don't have exact token amount from ExecutionResult
+                        // For now, use a placeholder and update from market data
+                        let estimated_price = 1.0; // Will be updated from market trades
+                        let estimated_tokens = pending.sol_amount; // Placeholder
+                        
+                        info!(
+                            intent_id = %result.intent_id,
+                            mint = %pending.mint,
+                            pool = %pending.pool,
+                            sol_invested = pending.sol_amount,
+                            signature = ?result.signature,
+                            "✅ BUY CONFIRMED - Opening position"
+                        );
+                        
+                        self.open_position(
+                            &pending.mint,
+                            &pending.pool,
+                            &pending.dex,
+                            estimated_price,
+                            estimated_tokens,
+                            pending.sol_amount,
+                        );
+                    }
+                    TradeSide::Sell => {
+                        // SELL confirmed - close position
+                        info!(
+                            intent_id = %result.intent_id,
+                            mint = %pending.mint,
+                            token_amount = pending.token_amount,
+                            signature = ?result.signature,
+                            pnl = ?result.pnl,
+                            "✅ SELL CONFIRMED - Closing position"
+                        );
+                        
+                        self.close_position(&pending.mint);
+                    }
+                }
+            }
+            ExecutionStatus::Failed => {
+                warn!(
+                    intent_id = %result.intent_id,
+                    mint = %pending.mint,
+                    side = ?pending.side,
+                    error = ?result.error_message,
+                    "❌ Execution FAILED"
+                );
+                // Don't open position on failure
+            }
+            ExecutionStatus::Timeout => {
+                warn!(
+                    intent_id = %result.intent_id,
+                    mint = %pending.mint,
+                    side = ?pending.side,
+                    "⏱️ Execution TIMEOUT"
+                );
+            }
+            ExecutionStatus::Sent => {
+                // Still in flight, shouldn't see this as final result
+                debug!(intent_id = %result.intent_id, "Execution still in flight");
+            }
+        }
+    }
+    
+    /// Cleanup stale pending intents (older than 2 minutes)
+    fn cleanup_stale_pending(&self) {
+        let mut pending = self.pending_intents.write();
+        let cutoff = Duration::from_secs(120);
+        let before = pending.len();
+        pending.retain(|_, p| p.created_at.elapsed() < cutoff);
+        let removed = before - pending.len();
+        if removed > 0 {
+            debug!(removed = removed, "Cleaned up stale pending intents");
+        }
+    }
 
     /// P1: Apply config update from control-plane (Runtime Configuration via UI)
     fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
@@ -1064,6 +1221,7 @@ async fn main() -> Result<()> {
         pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
         token_trackers: parking_lot::RwLock::new(HashMap::new()),
         positions: parking_lot::RwLock::new(HashMap::new()),
+        pending_intents: parking_lot::RwLock::new(HashMap::new()),
         tokens_tracked: std::sync::atomic::AtomicU64::new(0),
         tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
         intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -1106,6 +1264,22 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 warn!(error = %e, "Failed to subscribe to Config Updates");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Subscribe to ExecutionResults (for position management)
+    let mut execution_subscription = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_EXECUTION_RESULTS).await {
+            Ok(sub) => {
+                info!(topic = TOPIC_EXECUTION_RESULTS, "Subscribed to ExecutionResults");
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to ExecutionResults");
                 None
             }
         }
@@ -1191,6 +1365,32 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Handle ExecutionResults (position management)
+            msg = async {
+                if let Some(ref mut sub) = execution_subscription {
+                    sub.next().await
+                } else {
+                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
+                }
+            } => {
+                if let Some(nats_msg) = msg {
+                    match serde_json::from_slice::<ExecutionResult>(&nats_msg.payload) {
+                        Ok(result) => {
+                            debug!(
+                                intent_id = %result.intent_id,
+                                status = ?result.status,
+                                source = %result.source,
+                                "Received ExecutionResult"
+                            );
+                            ctx.handle_execution_result(&result);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to deserialize ExecutionResult");
+                        }
+                    }
+                }
+            }
+
             // Periodic heartbeat
             _ = heartbeat_interval.tick() => {
                 let (records, bytes) = ctx.jsonl_writer.stats();
@@ -1200,6 +1400,7 @@ async fn main() -> Result<()> {
                 let intents_generated = ctx.intents_generated.load(std::sync::atomic::Ordering::Relaxed);
                 let exits_generated = ctx.exits_generated.load(std::sync::atomic::Ordering::Relaxed);
                 let open_positions = ctx.position_count();
+                let pending_intents = ctx.pending_count();
                 
                 info!(
                     events_received = events_received,
@@ -1212,11 +1413,13 @@ async fn main() -> Result<()> {
                     intents_generated = intents_generated,
                     exits_generated = exits_generated,
                     open_positions = open_positions,
+                    pending_intents = pending_intents,
                     "Momentum-bot heartbeat"
                 );
                 
-                // Cleanup old trackers
+                // Cleanup old trackers and stale pending intents
                 ctx.cleanup_old_trackers();
+                ctx.cleanup_stale_pending();
                 
                 // === Check for ENTRY signals ===
                 let signals = ctx.check_for_signals();
@@ -1292,11 +1495,13 @@ async fn generate_and_publish_intent(
     // Assume SOL (So11111...) as quote mint for PumpFun/meme tokens
     let sol_mint = "So11111111111111111111111111111111111111112";
     
+    let intent_id = ctx.next_intent_id();
+    
     let intent = TradeIntent::new(
         "momentum-bot",
         BUILD_VERSION,
         &ctx.run_id,
-        ctx.next_intent_id(),
+        intent_id.clone(),
         &format!("4filter:{}", reason),
         IntentTier::Tier1,
         IntentOrigin::StrategyA,
@@ -1313,6 +1518,9 @@ async fn generate_and_publish_intent(
         TradingRegime::Early,
     )
     .with_ttl_ms(5000);
+
+    // Register pending intent BEFORE publishing
+    ctx.register_buy_intent(&intent_id, mint, pool, dex, position_lamports);
 
     info!(
         intent_id = %intent.intent_id,
@@ -1355,11 +1563,13 @@ async fn generate_and_publish_exit_intent(
     // Use 6 as common default for PumpFun tokens
     let token_decimals = 6u8;
     
+    let intent_id = ctx.next_intent_id();
+    
     let intent = TradeIntent::new(
         "momentum-bot",
         BUILD_VERSION,
         &ctx.run_id,
-        ctx.next_intent_id(),
+        intent_id.clone(),
         &format!("exit:{}:{}", exit_type, reason),
         IntentTier::Tier1,
         IntentOrigin::StrategyA,
@@ -1376,6 +1586,9 @@ async fn generate_and_publish_exit_intent(
         TradingRegime::Early,
     )
     .with_ttl_ms(3000); // Shorter TTL for exits - urgency
+
+    // Register pending intent BEFORE publishing
+    ctx.register_sell_intent(&intent_id, mint, pool, dex, token_amount);
 
     info!(
         intent_id = %intent.intent_id,
