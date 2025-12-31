@@ -359,7 +359,7 @@ impl PositionTracker {
 }
 
 /// Tracks token metrics for strategy decisions
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TokenTracker {
     /// Token mint address
     mint: String,
@@ -1639,7 +1639,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
 
             // Initialize a TokenTracker for this token
             let config = ctx.config.read();
-            let min_liq = config.min_liquidity_sol;
+            let min_liq = config.early_min_liquidity_sol;
             drop(config);
             
             // Create tracker if liquidity meets minimum threshold
@@ -1680,41 +1680,39 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             let sol_lamports = *sol_amount as u64;
             let sig = signature.clone().unwrap_or_default();
             
-            // Check if this trader is the dev wallet
-            let tracker_opt = {
+            // Check if this trader is the dev wallet and record dev behavior
+            let is_dev = {
                 let trackers = ctx.token_trackers.read();
-                trackers.get(mint).cloned()
+                trackers.get(mint)
+                    .and_then(|t| t.dev_wallet.as_ref())
+                    .map(|dw| dw == trader)
+                    .unwrap_or(false)
             };
             
-            if let Some(tracker) = tracker_opt {
-                let is_dev = {
-                    let t = tracker.read();
-                    t.dev_wallet.as_ref() == Some(trader)
-                };
-                
-                ctx.record_trade(mint, trader, *is_buy, sol_lamports, &sig);
-                
-                if is_dev {
-                    // Record dev trade behavior
-                    let mut t = tracker.write();
+            ctx.record_trade(mint, trader, *is_buy, sol_lamports, &sig);
+            
+            if is_dev {
+                // Record dev trade behavior in tracker
+                let mut trackers = ctx.token_trackers.write();
+                if let Some(tracker) = trackers.get_mut(mint) {
                     if *is_buy {
-                        t.dev_rebought = true;
+                        tracker.dev_rebought = true;
                         info!(mint = %mint, trader = %trader, "📈 Dev rebuy detected - positive signal");
                     } else {
-                        t.dev_sold = true;
+                        tracker.dev_sold = true;
                         info!(mint = %mint, trader = %trader, sol = sol_lamports, "⚠️ Dev sell detected");
                     }
                 }
-                
-                debug!(
-                    pool = %pool_address,
-                    mint = %mint,
-                    trader = %trader,
-                    is_buy = is_buy,
-                    sol_lamports = sol_lamports,
-                    "Trade recorded"
-                );
             }
+            
+            debug!(
+                pool = %pool_address,
+                mint = %mint,
+                trader = %trader,
+                is_buy = is_buy,
+                sol_lamports = sol_lamports,
+                "Trade recorded"
+            );
         }
         
         MarketEventKind::LiquidityRemoved {
@@ -1748,16 +1746,11 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             
             if *supply_percentage > max_dev_pct {
                 // Blacklist token with high dev supply
-                let tracker_opt = {
-                    let trackers = ctx.token_trackers.read();
-                    trackers.get(mint).cloned()
-                };
-                
-                if let Some(tracker) = tracker_opt {
-                    let mut t = tracker.write();
-                    if !t.blacklisted {
-                        t.blacklisted = true;
-                        t.blacklist_reason = Some(format!(
+                let mut trackers = ctx.token_trackers.write();
+                if let Some(tracker) = trackers.get_mut(mint) {
+                    if !tracker.blacklisted {
+                        tracker.blacklisted = true;
+                        tracker.blacklist_reason = Some(format!(
                             "Dev supply too high: {:.1}% > {:.1}%",
                             supply_percentage, max_dev_pct
                         ));
