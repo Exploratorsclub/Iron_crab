@@ -2,7 +2,7 @@
   "title": "IronCrab Multi-Process Architecture",
   "description": "Dashboard for the Debuggable-First Multi-Process Architecture",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "time": { "from": "now-1h", "to": "now" },
   "refresh": "5s",
   "tags": ["ironcrab", "multi-process", "trading"],
@@ -45,10 +45,25 @@
     },
     {
       "type": "stat",
+      "title": "arb-strategy",
+      "description": "Typ A market-driven arbitrage strategy",
+      "targets": [{ "expr": "up{job=\"ironcrab-arb-strategy\"}", "refId": "A" }],
+      "gridPos": {"h":3,"w":4,"x":8,"y":1},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "1": { "text": "UP", "color": "green" } } },
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" } } }
+          ]
+        }
+      }
+    },
+    {
+      "type": "stat",
       "title": "execution-engine",
       "description": "Single-signer execution service",
       "targets": [{ "expr": "up{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":8,"y":1},
+      "gridPos": {"h":3,"w":4,"x":12,"y":1},
       "fieldConfig": {
         "defaults": {
           "mappings": [
@@ -63,7 +78,7 @@
       "title": "Events Published",
       "description": "Total market events published",
       "targets": [{ "expr": "market_events_published_total{job=\"ironcrab-market-data\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":12,"y":1},
+      "gridPos": {"h":3,"w":4,"x":16,"y":1},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } } }
     },
     {
@@ -71,7 +86,7 @@
       "title": "Events Consumed",
       "description": "Market events consumed by momentum-bot",
       "targets": [{ "expr": "market_events_consumed_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":16,"y":1},
+      "gridPos": {"h":3,"w":4,"x":20,"y":1},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "purple" } } }
     },
     {
@@ -79,13 +94,13 @@
       "title": "NATS Messages",
       "description": "Total NATS messages published",
       "targets": [{ "expr": "nats_messages_published_total{job=\"ironcrab-market-data\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":20,"y":1},
+      "gridPos": {"h":3,"w":4,"x":0,"y":4},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } }
     },
     {
       "type": "row",
       "title": "📊 Market Data Service (Port 9801)",
-      "gridPos": {"h":1,"w":24,"x":0,"y":4},
+      "gridPos": {"h":1,"w":24,"x":0,"y":7},
       "collapsed": false
     },
     {
@@ -93,48 +108,48 @@
       "title": "Events Published/sec",
       "description": "Market events published per second",
       "targets": [{ "expr": "rate(market_events_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "events/s" }],
-      "gridPos": {"h":6,"w":8,"x":0,"y":5},
+      "gridPos": {"h":6,"w":8,"x":0,"y":8},
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "ops" } }
     },
     {
       "type": "stat",
       "title": "Pools Tracked",
       "targets": [{ "expr": "pools_tracked_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":8,"y":5},
+      "gridPos": {"h":3,"w":4,"x":8,"y":8},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "purple" } } }
     },
     {
       "type": "stat",
       "title": "Tokens Tracked",
       "targets": [{ "expr": "tokens_tracked_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":12,"y":5},
+      "gridPos": {"h":3,"w":4,"x":12,"y":8},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "orange" } } }
     },
     {
       "type": "timeseries",
       "title": "NATS Message Rate",
       "targets": [{ "expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "msgs/s" }],
-      "gridPos": {"h":6,"w":8,"x":16,"y":5},
+      "gridPos": {"h":6,"w":8,"x":16,"y":8},
       "fieldConfig": { "defaults": { "unit": "ops" } }
     },
     {
       "type": "stat",
       "title": "Geyser Reconnects",
       "targets": [{ "expr": "geyser_reconnects_total{job=\"ironcrab-market-data\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":8,"y":8},
+      "gridPos": {"h":3,"w":4,"x":8,"y":11},
       "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } } }
     },
     {
       "type": "stat",
       "title": "Geyser Errors",
       "targets": [{ "expr": "geyser_errors_total{job=\"ironcrab-market-data\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":12,"y":8},
+      "gridPos": {"h":3,"w":4,"x":12,"y":11},
       "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } } }
     },
     {
       "type": "row",
       "title": "🎯 Momentum Bot (Port 9802)",
-      "gridPos": {"h":1,"w":24,"x":0,"y":11},
+      "gridPos": {"h":1,"w":24,"x":0,"y":14},
       "collapsed": false
     },
     {
@@ -142,89 +157,126 @@
       "title": "Intents Generated",
       "description": "TradeIntents published to NATS",
       "targets": [{ "expr": "intents_generated_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":0,"y":12},
+      "gridPos": {"h":4,"w":4,"x":0,"y":15},
       "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "yellow", "value": null }, { "color": "green", "value": 1 }] } } }
     },
     {
       "type": "stat",
       "title": "4-Filter Passed",
       "targets": [{ "expr": "filter_passed_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":4,"y":12},
+      "gridPos": {"h":4,"w":4,"x":4,"y":15},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } }
     },
     {
       "type": "stat",
       "title": "4-Filter Rejected",
       "targets": [{ "expr": "filter_rejected_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":8,"y":12},
+      "gridPos": {"h":4,"w":4,"x":8,"y":15},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "red" } } }
     },
     {
       "type": "piechart",
       "title": "Filter Rejection Reasons",
       "targets": [{ "expr": "filter_rejection_by_reason{job=\"ironcrab-momentum-bot\"}", "refId": "A", "legendFormat": "{{reason}}" }],
-      "gridPos": {"h":8,"w":8,"x":12,"y":12},
+      "gridPos": {"h":8,"w":8,"x":12,"y":15},
       "options": { "legend": { "displayMode": "table", "placement": "right" } }
     },
     {
       "type": "timeseries",
       "title": "Intent Generation Rate",
       "targets": [{ "expr": "rate(intents_generated_total{job=\"ironcrab-momentum-bot\"}[5m]) * 60", "refId": "A", "legendFormat": "intents/min" }],
-      "gridPos": {"h":4,"w":12,"x":0,"y":16},
+      "gridPos": {"h":4,"w":12,"x":0,"y":19},
       "fieldConfig": { "defaults": { "unit": "short" } }
     },
     {
       "type": "row",
+      "title": "🧮 Arb Strategy (Port 9803)",
+      "gridPos": {"h":1,"w":24,"x":0,"y":23},
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "Market Events Consumed",
+      "targets": [{ "expr": "market_events_consumed_total{job=\"ironcrab-arb-strategy\"}", "refId": "A" }],
+      "gridPos": {"h":4,"w":6,"x":0,"y":24},
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "purple" } } }
+    },
+    {
+      "type": "stat",
+      "title": "Arb Intents Published",
+      "targets": [{ "expr": "intents_generated_total{job=\"ironcrab-arb-strategy\"}", "refId": "A" }],
+      "gridPos": {"h":4,"w":6,"x":6,"y":24},
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "yellow", "value": null }, { "color": "green", "value": 1 }] } } }
+    },
+    {
+      "type": "stat",
+      "title": "Opportunities Detected",
+      "targets": [{ "expr": "arb_triangle_opportunities_total{job=\"ironcrab-arb-strategy\"}", "refId": "A" }],
+      "gridPos": {"h":4,"w":6,"x":12,"y":24},
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Arb NATS Message Rate",
+      "targets": [
+        { "expr": "rate(nats_messages_received_total{job=\"ironcrab-arb-strategy\"}[1m])", "refId": "A", "legendFormat": "recv/s" },
+        { "expr": "rate(nats_messages_published_total{job=\"ironcrab-arb-strategy\"}[1m])", "refId": "B", "legendFormat": "pub/s" }
+      ],
+      "gridPos": {"h":4,"w":6,"x":18,"y":24},
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "type": "row",
       "title": "⚡ Execution Engine (Port 9804)",
-      "gridPos": {"h":1,"w":24,"x":0,"y":20},
+      "gridPos": {"h":1,"w":24,"x":0,"y":28},
       "collapsed": false
     },
     {
       "type": "stat",
       "title": "Intents Received",
       "targets": [{ "expr": "intents_received_total{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":0,"y":21},
+      "gridPos": {"h":4,"w":4,"x":0,"y":29},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } } }
     },
     {
       "type": "stat",
       "title": "Intents Executed",
       "targets": [{ "expr": "intents_executed_total{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":4,"y":21},
+      "gridPos": {"h":4,"w":4,"x":4,"y":29},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } }
     },
     {
       "type": "stat",
       "title": "Intents Rejected",
       "targets": [{ "expr": "intents_rejected_total{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":8,"y":21},
+      "gridPos": {"h":4,"w":4,"x":8,"y":29},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "orange" } } }
     },
     {
       "type": "stat",
       "title": "Simulation Failures",
       "targets": [{ "expr": "simulation_failures_total{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":12,"y":21},
+      "gridPos": {"h":4,"w":4,"x":12,"y":29},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "red" } } }
     },
     {
       "type": "stat",
       "title": "Available SOL",
       "targets": [{ "expr": "available_sol_lamports{job=\"ironcrab-execution-engine\"} / 1e9", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":16,"y":21},
+      "gridPos": {"h":4,"w":4,"x":16,"y":29},
       "fieldConfig": { "defaults": { "unit": "short", "decimals": 2 } }
     },
     {
       "type": "stat",
       "title": "Active Locks",
       "targets": [{ "expr": "active_capital_locks{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":20,"y":21}
+      "gridPos": {"h":4,"w":4,"x":20,"y":29}
     },
     {
       "type": "piechart",
       "title": "Intent Rejection Reasons",
       "targets": [{ "expr": "intent_rejection_by_reason{job=\"ironcrab-execution-engine\"}", "refId": "A", "legendFormat": "{{reason}}" }],
-      "gridPos": {"h":6,"w":8,"x":0,"y":25},
+      "gridPos": {"h":6,"w":8,"x":0,"y":33},
       "options": { "legend": { "displayMode": "table", "placement": "right" } }
     },
     {
@@ -234,20 +286,20 @@
         { "expr": "rate(intents_executed_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "A", "legendFormat": "executed/min" },
         { "expr": "rate(intents_rejected_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "B", "legendFormat": "rejected/min" }
       ],
-      "gridPos": {"h":6,"w":8,"x":8,"y":25},
+      "gridPos": {"h":6,"w":8,"x":8,"y":33},
       "fieldConfig": { "defaults": { "unit": "short" } }
     },
     {
       "type": "timeseries",
       "title": "Simulation Failure Rate",
       "targets": [{ "expr": "rate(simulation_failures_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "A", "legendFormat": "sim failures/min" }],
-      "gridPos": {"h":6,"w":8,"x":16,"y":25},
+      "gridPos": {"h":6,"w":8,"x":16,"y":33},
       "fieldConfig": { "defaults": { "unit": "short" } }
     },
     {
       "type": "row",
       "title": "🔗 NATS Message Flow",
-      "gridPos": {"h":1,"w":24,"x":0,"y":31},
+      "gridPos": {"h":1,"w":24,"x":0,"y":39},
       "collapsed": false
     },
     {
@@ -256,30 +308,31 @@
       "targets": [
         { "expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "market-data pub" },
         { "expr": "rate(nats_messages_published_total{job=\"ironcrab-momentum-bot\"}[1m])", "refId": "B", "legendFormat": "momentum-bot pub" },
+        { "expr": "rate(nats_messages_published_total{job=\"ironcrab-arb-strategy\"}[1m])", "refId": "D", "legendFormat": "arb-strategy pub" },
         { "expr": "rate(nats_messages_received_total{job=\"ironcrab-execution-engine\"}[1m])", "refId": "C", "legendFormat": "exec-engine recv" }
       ],
-      "gridPos": {"h":6,"w":12,"x":0,"y":32},
+      "gridPos": {"h":6,"w":12,"x":0,"y":40},
       "fieldConfig": { "defaults": { "unit": "ops" } }
     },
     {
       "type": "stat",
       "title": "NATS Reconnects",
       "targets": [{ "expr": "sum(nats_reconnects_total)", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":12,"y":32},
+      "gridPos": {"h":3,"w":4,"x":12,"y":40},
       "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } } }
     },
     {
       "type": "stat",
       "title": "NATS Errors",
       "targets": [{ "expr": "sum(nats_errors_total)", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":16,"y":32},
+      "gridPos": {"h":3,"w":4,"x":16,"y":40},
       "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } } }
     },
     {
       "type": "stat",
       "title": "Total Published",
       "targets": [{ "expr": "sum(nats_messages_published_total)", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":20,"y":32}
+      "gridPos": {"h":3,"w":4,"x":20,"y":40}
     }
   ]
 }

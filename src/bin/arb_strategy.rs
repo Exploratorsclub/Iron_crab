@@ -30,7 +30,11 @@ use ironcrab::ipc::{
     TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
-use ironcrab::metrics::serve_metrics;
+use ironcrab::metrics::{
+    serve_metrics, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
+    TOKENS_TRACKED_GAUGE,
+};
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
@@ -591,10 +595,14 @@ async fn main() -> Result<()> {
                 }
             } => {
                 if let Some(nats_msg) = msg {
+                    // Prometheus: count inbound NATS messages for this process
+                    NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     ctx.events_received.fetch_add(1, Ordering::Relaxed);
                     
                     match serde_json::from_slice::<MarketEvent>(&nats_msg.payload) {
                         Ok(event) => {
+                            // Prometheus: count consumed MarketEvents for this process
+                            MARKET_EVENTS_CONSUMED_TOTAL.fetch_add(1, Ordering::Relaxed);
                             if let Some(intent) = handle_market_event(&ctx, &event).await {
                                 // Write to JSONL
                                 if let Err(e) = ctx.jsonl_writer.write(&intent) {
@@ -606,6 +614,9 @@ async fn main() -> Result<()> {
                                     if let Err(e) = nats.publish(TOPIC_TRADE_INTENTS, &intent).await {
                                         warn!(error = %e, "Failed to publish intent to NATS");
                                     } else {
+                                        // Prometheus: count outbound NATS messages and intents
+                                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                        INTENTS_GENERATED_TOTAL.fetch_add(1, Ordering::Relaxed);
                                         ctx.intents_generated.fetch_add(1, Ordering::Relaxed);
                                         info!(
                                             intent_id = %intent.intent_id,
@@ -631,6 +642,10 @@ async fn main() -> Result<()> {
                 let multi_dex_tokens = trackers.values()
                     .filter(|t| t.pools_by_dex.len() >= 2)
                     .count();
+
+                // Prometheus: publish current gauges for this process
+                POOLS_TRACKED_GAUGE.store(ctx.pools_tracked.load(Ordering::Relaxed), Ordering::Relaxed);
+                TOKENS_TRACKED_GAUGE.store(trackers.len() as u64, Ordering::Relaxed);
                 
                 info!(
                     events_received = ctx.events_received.load(Ordering::Relaxed),
@@ -683,6 +698,8 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             ..
         } => {
             if let Some(opp) = ctx.handle_trade(pool_address, mint, *sol_amount, *token_amount, *is_buy) {
+                // Prometheus: count arbitrage opportunities detected
+                ARB_TRIANGLE_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
                 info!(
                     mint = %opp.base_mint,
                     buy_dex = %opp.buy_dex,
