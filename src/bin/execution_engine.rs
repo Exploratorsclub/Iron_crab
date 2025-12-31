@@ -1471,7 +1471,6 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     let sim_result = simulate_transaction(&intent).await;
 
     if !sim_result.success {
-        ctx.record_sim_failure();
         let reason = RejectReason::SimFailed;
         checks.push(CheckResult {
             check_name: "simulation".to_string(),
