@@ -22,7 +22,7 @@ uvicorn control_plane.main:app --host 0.0.0.0 --port 8080 --reload
 | `NATS_URL` | `nats://localhost:4222` | NATS server URL |
 | `MARKET_DATA_URL` | `http://localhost:9801` | market-data metrics endpoint |
 | `MOMENTUM_BOT_URL` | `http://localhost:9802` | momentum-bot metrics endpoint |
-| `EXECUTION_ENGINE_URL` | `http://localhost:9803` | execution-engine metrics endpoint |
+| `EXECUTION_ENGINE_URL` | `http://localhost:9804` | execution-engine metrics endpoint |
 | `CONTROL_PLANE_PORT` | `8080` | Control plane HTTP port |
 
 ## Endpoints

@@ -83,7 +83,7 @@ class Config:
     NATS_URL: str = os.getenv("NATS_URL", "nats://localhost:4222")
     MARKET_DATA_URL: str = os.getenv("MARKET_DATA_URL", "http://localhost:9801")
     MOMENTUM_BOT_URL: str = os.getenv("MOMENTUM_BOT_URL", "http://localhost:9802")
-    EXECUTION_ENGINE_URL: str = os.getenv("EXECUTION_ENGINE_URL", "http://localhost:9803")
+    EXECUTION_ENGINE_URL: str = os.getenv("EXECUTION_ENGINE_URL", "http://localhost:9804")
     
     # NATS topics
     TOPIC_COMMANDS: str = "ironcrab.control.commands"

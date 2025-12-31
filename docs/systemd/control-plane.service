@@ -15,6 +15,9 @@ ExecStart=/home/ironcrab/Iron_crab/.venv/bin/uvicorn main:app \
     --port 8080
 
 Environment=NATS_URL=nats://localhost:4222
+Environment=MARKET_DATA_URL=http://localhost:9801
+Environment=MOMENTUM_BOT_URL=http://localhost:9802
+Environment=EXECUTION_ENGINE_URL=http://localhost:9804
 
 Restart=on-failure
 RestartSec=3
