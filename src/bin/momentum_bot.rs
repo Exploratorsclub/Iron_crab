@@ -126,6 +126,24 @@ struct MomentumConfig {
     dev_early_sell_window_secs: u64,
     /// Dev rebuy is positive signal. Default: true
     dev_rebuy_positive: bool,
+    
+    // === Exit Strategy ===
+    /// Hard stop-loss percentage from entry (e.g., 15 = -15%). Default: 15%
+    hard_stop_loss_pct: f64,
+    /// Trailing stop percentage from ATH (e.g., 20 = -20% from high). Default: 20%
+    trailing_stop_pct: f64,
+    /// Minimum profit to activate trailing stop (e.g., 10 = +10%). Default: 10%
+    trailing_activation_pct: f64,
+    /// Take profit percentage (e.g., 100 = +100% = 2x). Default: 100%
+    take_profit_pct: f64,
+    /// Max hold time in seconds before forced exit. Default: 300s (5 min)
+    max_hold_time_secs: u64,
+    /// Momentum exit: min buy ratio to stay in (e.g., 0.4 = 40% buys). Default: 0.4
+    momentum_exit_buy_ratio: f64,
+    /// Momentum exit window (seconds). Default: 30s
+    momentum_exit_window_secs: u64,
+    /// Min trades in momentum window to evaluate exit. Default: 5
+    momentum_exit_min_trades: u32,
 }
 
 impl Default for MomentumConfig {
@@ -157,6 +175,16 @@ impl Default for MomentumConfig {
             // Filter 4: Dev Behavior
             dev_early_sell_window_secs: 60,            // Dev sells in first 60s = bad
             dev_rebuy_positive: true,                  // Dev rebuy = positive signal
+            
+            // Exit Strategy
+            hard_stop_loss_pct: 15.0,                  // -15% hard stop
+            trailing_stop_pct: 20.0,                   // -20% from ATH
+            trailing_activation_pct: 10.0,            // Activate trailing after +10%
+            take_profit_pct: 100.0,                    // Take profit at +100% (2x)
+            max_hold_time_secs: 300,                   // Max 5 minutes hold
+            momentum_exit_buy_ratio: 0.4,             // Exit if buy ratio < 40%
+            momentum_exit_window_secs: 30,            // Check last 30s of trades
+            momentum_exit_min_trades: 5,              // Need 5+ trades to evaluate
         }
     }
 }
@@ -173,6 +201,159 @@ struct TradeEvent {
     is_buy: bool,
     sol_amount: u64,  // in lamports
     signature: String,
+}
+
+/// Tracks an open position for exit strategy
+#[derive(Debug, Clone)]
+struct PositionTracker {
+    /// Token mint address
+    mint: String,
+    /// Pool address for selling
+    pool: String,
+    /// DEX name
+    dex: String,
+    /// Entry time
+    entry_time: Instant,
+    /// Entry price (token per SOL, estimated from trade)
+    entry_price: f64,
+    /// Amount of tokens held (raw)
+    token_amount: u64,
+    /// SOL invested (lamports)
+    sol_invested: u64,
+    /// Highest price seen since entry
+    highest_price: f64,
+    /// Current estimated price
+    current_price: f64,
+    /// Recent trades for momentum calculation
+    recent_trades: Vec<TradeEvent>,
+    /// Has trailing stop been activated?
+    trailing_active: bool,
+    /// Exit intent already generated?
+    exit_generated: bool,
+}
+
+impl PositionTracker {
+    fn new(mint: &str, pool: &str, dex: &str, entry_price: f64, token_amount: u64, sol_invested: u64) -> Self {
+        Self {
+            mint: mint.to_string(),
+            pool: pool.to_string(),
+            dex: dex.to_string(),
+            entry_time: Instant::now(),
+            entry_price,
+            token_amount,
+            sol_invested,
+            highest_price: entry_price,
+            current_price: entry_price,
+            recent_trades: Vec::new(),
+            trailing_active: false,
+            exit_generated: false,
+        }
+    }
+    
+    /// Update price and track ATH
+    fn update_price(&mut self, new_price: f64) {
+        self.current_price = new_price;
+        if new_price > self.highest_price {
+            self.highest_price = new_price;
+        }
+    }
+    
+    /// Record a trade for momentum tracking
+    fn record_trade(&mut self, trade: TradeEvent) {
+        self.recent_trades.push(trade);
+        // Keep only last 100 trades
+        if self.recent_trades.len() > 100 {
+            self.recent_trades.remove(0);
+        }
+    }
+    
+    /// Calculate current P&L percentage
+    fn pnl_pct(&self) -> f64 {
+        if self.entry_price <= 0.0 {
+            return 0.0;
+        }
+        ((self.current_price - self.entry_price) / self.entry_price) * 100.0
+    }
+    
+    /// Calculate drawdown from ATH percentage
+    fn drawdown_from_ath_pct(&self) -> f64 {
+        if self.highest_price <= 0.0 {
+            return 0.0;
+        }
+        ((self.highest_price - self.current_price) / self.highest_price) * 100.0
+    }
+    
+    /// Check if we should exit this position
+    fn should_exit(&mut self, config: &MomentumConfig) -> Option<(String, String)> {
+        // Returns: Some((exit_type, reason)) or None
+        
+        let pnl = self.pnl_pct();
+        let drawdown = self.drawdown_from_ath_pct();
+        let hold_secs = self.entry_time.elapsed().as_secs();
+        
+        // 1. Hard Stop Loss - immediate exit
+        if pnl <= -config.hard_stop_loss_pct {
+            return Some((
+                "STOP_LOSS".to_string(),
+                format!("Hard stop hit: {:.1}% loss (limit: -{:.1}%)", pnl, config.hard_stop_loss_pct)
+            ));
+        }
+        
+        // 2. Take Profit - lock in gains
+        if pnl >= config.take_profit_pct {
+            return Some((
+                "TAKE_PROFIT".to_string(),
+                format!("Take profit hit: +{:.1}% gain (target: +{:.1}%)", pnl, config.take_profit_pct)
+            ));
+        }
+        
+        // 3. Trailing Stop - activate after profit threshold
+        if pnl >= config.trailing_activation_pct {
+            self.trailing_active = true;
+        }
+        
+        if self.trailing_active && drawdown >= config.trailing_stop_pct {
+            return Some((
+                "TRAILING_STOP".to_string(),
+                format!("Trailing stop hit: -{:.1}% from ATH (limit: -{:.1}%), P&L: {:.1}%", 
+                    drawdown, config.trailing_stop_pct, pnl)
+            ));
+        }
+        
+        // 4. Time Exit - max hold time exceeded
+        if hold_secs >= config.max_hold_time_secs {
+            return Some((
+                "TIME_EXIT".to_string(),
+                format!("Max hold time exceeded: {}s (limit: {}s), P&L: {:.1}%", 
+                    hold_secs, config.max_hold_time_secs, pnl)
+            ));
+        }
+        
+        // 5. Momentum Exit - selling pressure detected
+        let momentum_window = Duration::from_secs(config.momentum_exit_window_secs);
+        let now = Instant::now();
+        let recent: Vec<_> = self.recent_trades.iter()
+            .filter(|t| now.duration_since(t.timestamp) < momentum_window)
+            .collect();
+        
+        if recent.len() >= config.momentum_exit_min_trades as usize {
+            let buy_count = recent.iter().filter(|t| t.is_buy).count();
+            let total = recent.len();
+            let buy_ratio = buy_count as f64 / total as f64;
+            
+            if buy_ratio < config.momentum_exit_buy_ratio {
+                return Some((
+                    "MOMENTUM_EXIT".to_string(),
+                    format!("Momentum fading: buy ratio {:.0}% < {:.0}% ({}b/{}t), P&L: {:.1}%",
+                        buy_ratio * 100.0, 
+                        config.momentum_exit_buy_ratio * 100.0,
+                        buy_count, total, pnl)
+                ));
+            }
+        }
+        
+        None // No exit signal
+    }
 }
 
 /// Tracks token metrics for strategy decisions
@@ -477,10 +658,13 @@ struct MomentumContext {
     pool_first_seen: parking_lot::RwLock<std::collections::HashMap<String, u64>>,
     /// Token trackers for strategy filters (mint -> tracker)
     token_trackers: parking_lot::RwLock<HashMap<String, TokenTracker>>,
+    /// Position trackers for exit strategy (mint -> position)
+    positions: parking_lot::RwLock<HashMap<String, PositionTracker>>,
     /// Stats
     tokens_tracked: std::sync::atomic::AtomicU64,
     tokens_blacklisted: std::sync::atomic::AtomicU64,
     intents_generated: std::sync::atomic::AtomicU64,
+    exits_generated: std::sync::atomic::AtomicU64,
 }
 
 impl MomentumContext {
@@ -601,6 +785,88 @@ impl MomentumContext {
         });
     }
     
+    // =========================================================================
+    // Position Management for Exit Strategy
+    // =========================================================================
+    
+    /// Open a new position after buy intent is executed
+    fn open_position(&self, mint: &str, pool: &str, dex: &str, entry_price: f64, token_amount: u64, sol_invested: u64) {
+        let mut positions = self.positions.write();
+        if positions.contains_key(mint) {
+            warn!(mint = %mint, "Position already exists, not opening duplicate");
+            return;
+        }
+        positions.insert(
+            mint.to_string(),
+            PositionTracker::new(mint, pool, dex, entry_price, token_amount, sol_invested)
+        );
+        info!(
+            mint = %mint,
+            entry_price = entry_price,
+            sol_invested = sol_invested,
+            "📈 Position opened"
+        );
+    }
+    
+    /// Update position price from market trade
+    fn update_position_price(&self, mint: &str, new_price: f64, trade: Option<TradeEvent>) {
+        let mut positions = self.positions.write();
+        if let Some(pos) = positions.get_mut(mint) {
+            pos.update_price(new_price);
+            if let Some(t) = trade {
+                pos.record_trade(t);
+            }
+        }
+    }
+    
+    /// Close position (after sell executed)
+    fn close_position(&self, mint: &str) {
+        let mut positions = self.positions.write();
+        if let Some(pos) = positions.remove(mint) {
+            let pnl = pos.pnl_pct();
+            let hold_secs = pos.entry_time.elapsed().as_secs();
+            info!(
+                mint = %mint,
+                pnl_pct = pnl,
+                hold_time_secs = hold_secs,
+                "📉 Position closed"
+            );
+        }
+    }
+    
+    /// Check all positions for exit signals
+    fn check_for_exits(&self) -> Vec<(String, String, String, String, String, u64)> {
+        // Returns: Vec<(mint, pool, dex, exit_type, reason, token_amount)>
+        let config = self.config.read().clone();
+        let mut positions = self.positions.write();
+        let mut exits = Vec::new();
+        
+        for (mint, pos) in positions.iter_mut() {
+            if pos.exit_generated {
+                continue;
+            }
+            
+            if let Some((exit_type, reason)) = pos.should_exit(&config) {
+                pos.exit_generated = true;
+                exits.push((
+                    mint.clone(),
+                    pos.pool.clone(),
+                    pos.dex.clone(),
+                    exit_type,
+                    reason,
+                    pos.token_amount,
+                ));
+            }
+        }
+        
+        exits
+    }
+    
+    /// Get position count for heartbeat
+    fn position_count(&self) -> usize {
+        self.positions.read().len()
+    }
+
     /// P1: Apply config update from control-plane (Runtime Configuration via UI)
     fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
         let mut config = self.config.write();
@@ -797,9 +1063,11 @@ async fn main() -> Result<()> {
         intent_counter: std::sync::atomic::AtomicU64::new(0),
         pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
         token_trackers: parking_lot::RwLock::new(HashMap::new()),
+        positions: parking_lot::RwLock::new(HashMap::new()),
         tokens_tracked: std::sync::atomic::AtomicU64::new(0),
         tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
         intents_generated: std::sync::atomic::AtomicU64::new(0),
+        exits_generated: std::sync::atomic::AtomicU64::new(0),
     });
 
     // === Main Loop: Process MarketEvents from NATS ===
@@ -930,6 +1198,8 @@ async fn main() -> Result<()> {
                 let tokens_tracked = ctx.tokens_tracked.load(std::sync::atomic::Ordering::Relaxed);
                 let tokens_blacklisted = ctx.tokens_blacklisted.load(std::sync::atomic::Ordering::Relaxed);
                 let intents_generated = ctx.intents_generated.load(std::sync::atomic::Ordering::Relaxed);
+                let exits_generated = ctx.exits_generated.load(std::sync::atomic::Ordering::Relaxed);
+                let open_positions = ctx.position_count();
                 
                 info!(
                     events_received = events_received,
@@ -940,13 +1210,15 @@ async fn main() -> Result<()> {
                     tokens_tracked = tokens_tracked,
                     tokens_blacklisted = tokens_blacklisted,
                     intents_generated = intents_generated,
+                    exits_generated = exits_generated,
+                    open_positions = open_positions,
                     "Momentum-bot heartbeat"
                 );
                 
                 // Cleanup old trackers
                 ctx.cleanup_old_trackers();
                 
-                // Check for trading signals
+                // === Check for ENTRY signals ===
                 let signals = ctx.check_for_signals();
                 for (mint, pool, dex, reason) in signals {
                     info!(
@@ -954,14 +1226,34 @@ async fn main() -> Result<()> {
                         pool = %pool,
                         dex = %dex,
                         reason = %reason,
-                        "🎯 TRADING SIGNAL DETECTED"
+                        "🎯 ENTRY SIGNAL DETECTED"
                     );
                     
-                    // Generate and publish intent
+                    // Generate and publish BUY intent
                     if let Err(e) = generate_and_publish_intent(&ctx, &mint, &pool, &dex, &reason).await {
-                        error!(error = %e, mint = %mint, "Failed to generate/publish intent");
+                        error!(error = %e, mint = %mint, "Failed to generate/publish buy intent");
                     } else {
                         ctx.intents_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                
+                // === Check for EXIT signals ===
+                let exits = ctx.check_for_exits();
+                for (mint, pool, dex, exit_type, reason, token_amount) in exits {
+                    info!(
+                        mint = %mint,
+                        pool = %pool,
+                        exit_type = %exit_type,
+                        reason = %reason,
+                        token_amount = token_amount,
+                        "🚨 EXIT SIGNAL DETECTED"
+                    );
+                    
+                    // Generate and publish SELL intent
+                    if let Err(e) = generate_and_publish_exit_intent(&ctx, &mint, &pool, &dex, &exit_type, &reason, token_amount).await {
+                        error!(error = %e, mint = %mint, "Failed to generate/publish sell intent");
+                    } else {
+                        ctx.exits_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 
@@ -1029,6 +1321,71 @@ async fn generate_and_publish_intent(
         dex = %dex,
         reason = %reason,
         "🚀 Generated 4-Filter TradeIntent"
+    );
+
+    // Write to JSONL (P0 requirement)
+    ctx.jsonl_writer.write(&intent)?;
+
+    // Publish to NATS
+    if let Some(ref nats) = ctx.nats {
+        nats.publish(TOPIC_TRADE_INTENTS, &intent).await?;
+    }
+
+    Ok(())
+}
+
+/// Generate and publish a SELL intent for position exit
+async fn generate_and_publish_exit_intent(
+    ctx: &MomentumContext,
+    mint: &str,
+    pool: &str,
+    dex: &str,
+    exit_type: &str,
+    reason: &str,
+    token_amount: u64,
+) -> Result<()> {
+    let config = ctx.config.read();
+    let max_slippage = config.early_max_slippage_bps; // Use higher slippage for exits
+    drop(config);
+    
+    // SOL as output (selling tokens for SOL)
+    let sol_mint = "So11111111111111111111111111111111111111112";
+    
+    // Decimals depend on token, usually 6 or 9 for meme tokens
+    // Use 6 as common default for PumpFun tokens
+    let token_decimals = 6u8;
+    
+    let intent = TradeIntent::new(
+        "momentum-bot",
+        BUILD_VERSION,
+        &ctx.run_id,
+        ctx.next_intent_id(),
+        &format!("exit:{}:{}", exit_type, reason),
+        IntentTier::Tier1,
+        IntentOrigin::StrategyA,
+        ExplicitAmount::new(token_amount, token_decimals),
+        TradeResources {
+            input_mint: mint.to_string(),  // Selling tokens
+            output_mint: sol_mint.to_string(), // Receiving SOL
+            pools: vec![pool.to_string()],
+            accounts: vec![],
+        },
+        0, // No expected ROI for exits
+        max_slippage,
+        TradeSide::Sell,
+        TradingRegime::Early,
+    )
+    .with_ttl_ms(3000); // Shorter TTL for exits - urgency
+
+    info!(
+        intent_id = %intent.intent_id,
+        pool = %pool,
+        mint = %mint,
+        dex = %dex,
+        exit_type = %exit_type,
+        reason = %reason,
+        token_amount = token_amount,
+        "🔴 Generated EXIT TradeIntent"
     );
 
     // Write to JSONL (P0 requirement)
