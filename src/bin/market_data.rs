@@ -82,7 +82,7 @@ struct Args {
     nats_url: String,
 
     /// Geyser gRPC endpoint
-    #[arg(long, env = "GEYSER_URL", default_value = "http://127.0.0.1:10001")]
+    #[arg(long, env = "GEYSER_URL", default_value = "http://127.0.0.1:10000")]
     geyser_url: String,
 
     /// Prometheus metrics port
