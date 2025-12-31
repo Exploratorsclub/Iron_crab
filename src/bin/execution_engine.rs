@@ -885,7 +885,7 @@ async fn main() -> Result<()> {
     }
 
     // Keep readiness fresh even when idle.
-    crate::metrics::record_activity();
+    ironcrab::metrics::record_activity();
 
     // Subscribe to TradeIntents if NATS connected
     let intent_subscription = if let Some(ref nats) = ctx.nats {
@@ -994,7 +994,7 @@ async fn main() -> Result<()> {
                 simulated_tick += 1;
 
                 // Keep /ready fresh even when no intents flow.
-                crate::metrics::record_activity();
+                ironcrab::metrics::record_activity();
 
                 // MVP: Simulate receiving a test intent once
                 if simulated_tick == 5 && !test_intent_processed && args.dry_run {

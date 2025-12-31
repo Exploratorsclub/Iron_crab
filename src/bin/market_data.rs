@@ -304,7 +304,7 @@ async fn main() -> Result<()> {
     }
 
     // Keep readiness fresh even when idle.
-    crate::metrics::record_activity();
+    ironcrab::metrics::record_activity();
 
     // P1: Subscribe to Config Updates (Runtime Configuration via UI)
     let config_subscription = if let Some(ref nats) = ctx.nats {
@@ -374,7 +374,7 @@ async fn run_geyser_loop(
         tokio::select! {
             // Keep /ready fresh even if Geyser/NATS are quiet.
             _ = activity_interval.tick() => {
-                crate::metrics::record_activity();
+                ironcrab::metrics::record_activity();
 
                 // P1 Crash Isolation: Ping systemd watchdog frequently enough.
                 #[cfg(unix)]
@@ -384,7 +384,7 @@ async fn run_geyser_loop(
             // Account updates (pool state changes)
             Ok(account_update) = account_rx.recv() => {
                 account_count += 1;
-                crate::metrics::record_activity();
+                ironcrab::metrics::record_activity();
 
                 // Try to parse as DEX pool event
                 let event_kind = if let Some(parsed) = parse_account_update(&account_update) {
@@ -432,7 +432,7 @@ async fn run_geyser_loop(
             // Transaction updates (pool creations, swaps)
             Ok(tx_update) = transaction_rx.recv() => {
                 tx_count += 1;
-                crate::metrics::record_activity();
+                ironcrab::metrics::record_activity();
 
                 // Try to parse as DEX event (PoolCreated, Trade)
                 let parsed_event = parse_transaction_update(&tx_update);
@@ -559,7 +559,7 @@ async fn run_geyser_loop(
             // Periodic heartbeat
             _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                 if last_heartbeat.elapsed().as_secs() >= 60 {
-                    crate::metrics::record_activity();
+                    ironcrab::metrics::record_activity();
                     let (records, bytes) = ctx.jsonl_writer.stats();
                     let total_events = account_count + tx_count;
 
@@ -608,7 +608,7 @@ async fn run_simulation_loop(
                 slot += 1; // Simulated slot progression
 
                 // Keep /ready fresh even when only simulating.
-                crate::metrics::record_activity();
+                ironcrab::metrics::record_activity();
 
                 let event = MarketEvent::new(
                     "market-data",

@@ -1376,7 +1376,7 @@ async fn main() -> Result<()> {
     }
 
     // Keep readiness fresh even when idle.
-    crate::metrics::record_activity();
+    ironcrab::metrics::record_activity();
 
     // Subscribe to MarketEvents from NATS
     let mut subscription = if let Some(ref nats) = ctx.nats {
@@ -1444,7 +1444,7 @@ async fn main() -> Result<()> {
         tokio::select! {
             // Keep /ready fresh even if there are no events.
             _ = activity_interval.tick() => {
-                crate::metrics::record_activity();
+                ironcrab::metrics::record_activity();
 
                 // P1 Crash Isolation: Ping systemd watchdog frequently enough.
                 #[cfg(unix)]
@@ -1461,7 +1461,7 @@ async fn main() -> Result<()> {
                 }
             } => {
                 if let Some(nats_msg) = msg {
-                    crate::metrics::record_activity();
+                    ironcrab::metrics::record_activity();
                     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     events_received += 1;
 
@@ -1493,7 +1493,7 @@ async fn main() -> Result<()> {
                 }
             } => {
                 if let Some(nats_msg) = msg {
-                    crate::metrics::record_activity();
+                    ironcrab::metrics::record_activity();
                     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     match serde_json::from_slice::<ConfigUpdate>(&nats_msg.payload) {
                         Ok(update) => {
@@ -1531,7 +1531,7 @@ async fn main() -> Result<()> {
                 }
             } => {
                 if let Some(nats_msg) = msg {
-                    crate::metrics::record_activity();
+                    ironcrab::metrics::record_activity();
                     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     match serde_json::from_slice::<ExecutionResult>(&nats_msg.payload) {
                         Ok(result) => {
@@ -1552,7 +1552,7 @@ async fn main() -> Result<()> {
 
             // Periodic heartbeat
             _ = heartbeat_interval.tick() => {
-                crate::metrics::record_activity();
+                ironcrab::metrics::record_activity();
                 let (records, bytes) = ctx.jsonl_writer.stats();
                 let pools = ctx.pool_first_seen.read().len();
                 let tokens_tracked = ctx.tokens_tracked.load(std::sync::atomic::Ordering::Relaxed);
