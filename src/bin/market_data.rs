@@ -33,7 +33,9 @@ use ironcrab::metrics::{
     POOLS_DISCOVERED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
-use ironcrab::solana::dex_parser::{parse_account_update, parse_transaction_update, ParsedDexEvent};
+use ironcrab::solana::dex_parser::{
+    parse_account_update, parse_transaction_update, ParsedDexEvent,
+};
 use ironcrab::solana::wallet_tracker::WalletTracker;
 
 /// NATS topic for config reload (P1: Runtime Configuration via UI)
@@ -129,13 +131,13 @@ impl MarketDataContext {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!("evt-{}-{:06}", &self.run_id[..8], n)
     }
-    
+
     /// P1: Apply config update from control-plane (Runtime Configuration via UI)
     fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
         let mut config = self.config.write();
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
-        
+
         for (key, value) in &update.config {
             match key.as_str() {
                 "enable_raydium" => {
@@ -183,7 +185,7 @@ impl MarketDataContext {
                 }
             }
         }
-        
+
         let status = if rejected.is_empty() {
             ConfigUpdateStatus::Applied
         } else if applied.is_empty() {
@@ -191,7 +193,7 @@ impl MarketDataContext {
         } else {
             ConfigUpdateStatus::PartiallyApplied
         };
-        
+
         ConfigUpdateResponse {
             status,
             applied_keys: applied,
@@ -230,7 +232,10 @@ async fn main() -> Result<()> {
             error!(error = %e, "Metrics server failed");
         }
     });
-    info!(port = args.metrics_port, "Metrics server started at /metrics");
+    info!(
+        port = args.metrics_port,
+        "Metrics server started at /metrics"
+    );
 
     // === P0 Check: Ensure no wallet keys are loaded ===
     // market-data is KEYLESS per architecture – exit immediately if keys are detected
@@ -289,14 +294,18 @@ async fn main() -> Result<()> {
     });
 
     // === Main Loop: Geyser subscription or simulation ===
-    
+
     // P1 Crash Isolation: Signal systemd that we're ready
     #[cfg(unix)]
     {
-        let _ = sd_notify::notify(true, &[NotifyState::Ready]);
+        // NOTE: Do NOT unset NOTIFY_SOCKET here; we need it for Watchdog pings.
+        let _ = sd_notify::notify(false, &[NotifyState::Ready]);
         debug!("Sent sd_notify READY to systemd");
     }
-    
+
+    // Keep readiness fresh even when idle.
+    crate::metrics::record_activity();
+
     // P1: Subscribe to Config Updates (Runtime Configuration via UI)
     let config_subscription = if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_CONFIG_RELOAD).await {
@@ -359,12 +368,23 @@ async fn run_geyser_loop(
     let mut account_count = 0u64;
     let mut tx_count = 0u64;
     let mut last_heartbeat = std::time::Instant::now();
+    let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
     loop {
         tokio::select! {
+            // Keep /ready fresh even if Geyser/NATS are quiet.
+            _ = activity_interval.tick() => {
+                crate::metrics::record_activity();
+
+                // P1 Crash Isolation: Ping systemd watchdog frequently enough.
+                #[cfg(unix)]
+                let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+            }
+
             // Account updates (pool state changes)
             Ok(account_update) = account_rx.recv() => {
                 account_count += 1;
+                crate::metrics::record_activity();
 
                 // Try to parse as DEX pool event
                 let event_kind = if let Some(parsed) = parse_account_update(&account_update) {
@@ -412,10 +432,11 @@ async fn run_geyser_loop(
             // Transaction updates (pool creations, swaps)
             Ok(tx_update) = transaction_rx.recv() => {
                 tx_count += 1;
+                crate::metrics::record_activity();
 
                 // Try to parse as DEX event (PoolCreated, Trade)
                 let parsed_event = parse_transaction_update(&tx_update);
-                
+
                 // P1: Process wallet tracking events
                 let wallet_events = if let Some(ref parsed) = parsed_event {
                     match parsed {
@@ -443,7 +464,7 @@ async fn run_geyser_loop(
                 } else {
                     Vec::new()
                 };
-                
+
                 // Publish wallet tracking events
                 for wallet_event in wallet_events {
                     // Write to JSONL
@@ -457,7 +478,7 @@ async fn run_geyser_loop(
                         }
                     }
                 }
-                
+
                 let event_kind = if let Some(parsed) = parsed_event {
                     info!(
                         slot = tx_update.slot,
@@ -538,13 +559,14 @@ async fn run_geyser_loop(
             // Periodic heartbeat
             _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                 if last_heartbeat.elapsed().as_secs() >= 60 {
+                    crate::metrics::record_activity();
                     let (records, bytes) = ctx.jsonl_writer.stats();
                     let total_events = account_count + tx_count;
-                    
+
                     // Update Prometheus metrics
                     MARKET_EVENTS_RECEIVED_TOTAL.store(total_events, Ordering::Relaxed);
                     POOLS_TRACKED_GAUGE.store(account_count, Ordering::Relaxed);
-                    
+
                     info!(
                         accounts = account_count,
                         transactions = tx_count,
@@ -553,10 +575,6 @@ async fn run_geyser_loop(
                         "market-data heartbeat (Geyser)"
                     );
                     last_heartbeat = std::time::Instant::now();
-                    
-                    // P1 Crash Isolation: Ping systemd watchdog
-                    #[cfg(unix)]
-                    let _ = sd_notify::notify(true, &[NotifyState::Watchdog]);
                 }
             }
 
@@ -589,6 +607,9 @@ async fn run_simulation_loop(
             _ = interval.tick() => {
                 slot += 1; // Simulated slot progression
 
+                // Keep /ready fresh even when only simulating.
+                crate::metrics::record_activity();
+
                 let event = MarketEvent::new(
                     "market-data",
                     BUILD_VERSION,
@@ -620,13 +641,15 @@ async fn run_simulation_loop(
                         bytes_written = bytes,
                         "market-data heartbeat (simulation)"
                     );
-                    
-                    // P1 Crash Isolation: Ping systemd watchdog
+                }
+
+                // P1 Crash Isolation: Ping systemd watchdog frequently enough.
+                if slot % 10 == 0 {
                     #[cfg(unix)]
-                    let _ = sd_notify::notify(true, &[NotifyState::Watchdog]);
+                    let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
                 }
             }
-            
+
             // P1: Handle Config Updates (Runtime Configuration via UI)
             msg = async {
                 if let Some(ref mut sub) = config_subscription {
@@ -661,7 +684,7 @@ async fn run_simulation_loop(
                     }
                 }
             }
-            
+
             _ = &mut shutdown => {
                 info!("Shutdown signal received");
                 break;

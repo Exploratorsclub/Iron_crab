@@ -381,7 +381,14 @@ pub static TRADE_RETURN_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0))
 pub static TRADE_RETURN_SUM_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0)); // signed sum(ret * 1e6) for average
 pub static SHARPE_RATIO_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 pub static DRAWDOWN_PCT_MICRO: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
-pub static LAST_ACTIVITY_TS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static LAST_ACTIVITY_TS: Lazy<AtomicU64> = Lazy::new(|| {
+    // Default to "ready" on startup; it will go stale if the process stops updating.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    AtomicU64::new(now)
+});
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct LatencyTimer {
@@ -616,27 +623,61 @@ async fn metrics_response() -> Response<Body> {
             out.push('\n');
         };
     }
-    
+
     // =============================================================================
     // Multi-Process Architecture Metrics
     // =============================================================================
-    
+
     // --- market-data service ---
-    line!("market_events_received_total", MARKET_EVENTS_RECEIVED_TOTAL.load(Ordering::Relaxed));
-    line!("market_events_published_total", MARKET_EVENTS_PUBLISHED_TOTAL.load(Ordering::Relaxed));
-    line!("pools_discovered_total", POOLS_DISCOVERED_TOTAL.load(Ordering::Relaxed));
-    line!("pools_tracked_total", POOLS_TRACKED_GAUGE.load(Ordering::Relaxed));
-    line!("tokens_tracked_total", TOKENS_TRACKED_GAUGE.load(Ordering::Relaxed));
-    line!("geyser_reconnects_total", GEYSER_RECONNECTS_TOTAL.load(Ordering::Relaxed));
-    line!("geyser_errors_total", GEYSER_ERRORS_TOTAL.load(Ordering::Relaxed));
-    
+    line!(
+        "market_events_received_total",
+        MARKET_EVENTS_RECEIVED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_events_published_total",
+        MARKET_EVENTS_PUBLISHED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "pools_discovered_total",
+        POOLS_DISCOVERED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "pools_tracked_total",
+        POOLS_TRACKED_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "tokens_tracked_total",
+        TOKENS_TRACKED_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_reconnects_total",
+        GEYSER_RECONNECTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_errors_total",
+        GEYSER_ERRORS_TOTAL.load(Ordering::Relaxed)
+    );
+
     // --- momentum-bot service ---
-    line!("intents_generated_total", INTENTS_GENERATED_TOTAL.load(Ordering::Relaxed));
-    line!("filter_passed_total", FILTER_PASSED_TOTAL.load(Ordering::Relaxed));
-    line!("filter_rejected_total", FILTER_REJECTED_TOTAL.load(Ordering::Relaxed));
+    line!(
+        "intents_generated_total",
+        INTENTS_GENERATED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "filter_passed_total",
+        FILTER_PASSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "filter_rejected_total",
+        FILTER_REJECTED_TOTAL.load(Ordering::Relaxed)
+    );
     // Filter rejection breakdown
     out.push_str("filter_rejection_by_reason{reason=\"liquidity\"} ");
-    out.push_str(&FILTER_REJECTED_LIQUIDITY.load(Ordering::Relaxed).to_string());
+    out.push_str(
+        &FILTER_REJECTED_LIQUIDITY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
     out.push('\n');
     out.push_str("filter_rejection_by_reason{reason=\"velocity\"} ");
     out.push_str(&FILTER_REJECTED_VELOCITY.load(Ordering::Relaxed).to_string());
@@ -645,18 +686,46 @@ async fn metrics_response() -> Response<Body> {
     out.push_str(&FILTER_REJECTED_INFLOW.load(Ordering::Relaxed).to_string());
     out.push('\n');
     out.push_str("filter_rejection_by_reason{reason=\"dev_behavior\"} ");
-    out.push_str(&FILTER_REJECTED_DEV_BEHAVIOR.load(Ordering::Relaxed).to_string());
+    out.push_str(
+        &FILTER_REJECTED_DEV_BEHAVIOR
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
     out.push('\n');
-    line!("market_events_consumed_total", MARKET_EVENTS_CONSUMED_TOTAL.load(Ordering::Relaxed));
-    
+    line!(
+        "market_events_consumed_total",
+        MARKET_EVENTS_CONSUMED_TOTAL.load(Ordering::Relaxed)
+    );
+
     // --- execution-engine service ---
-    line!("intents_received_total", INTENTS_RECEIVED_TOTAL.load(Ordering::Relaxed));
-    line!("intents_executed_total", INTENTS_EXECUTED_TOTAL.load(Ordering::Relaxed));
-    line!("intents_rejected_total", INTENTS_REJECTED_TOTAL.load(Ordering::Relaxed));
-    line!("simulation_failures_total", SIMULATION_FAILURES_TOTAL.load(Ordering::Relaxed));
-    line!("available_sol_lamports", AVAILABLE_SOL_LAMPORTS.load(Ordering::Relaxed));
-    line!("active_capital_locks", ACTIVE_CAPITAL_LOCKS.load(Ordering::Relaxed));
-    line!("active_resource_locks", ACTIVE_RESOURCE_LOCKS.load(Ordering::Relaxed));
+    line!(
+        "intents_received_total",
+        INTENTS_RECEIVED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "intents_executed_total",
+        INTENTS_EXECUTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "intents_rejected_total",
+        INTENTS_REJECTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "simulation_failures_total",
+        SIMULATION_FAILURES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "available_sol_lamports",
+        AVAILABLE_SOL_LAMPORTS.load(Ordering::Relaxed)
+    );
+    line!(
+        "active_capital_locks",
+        ACTIVE_CAPITAL_LOCKS.load(Ordering::Relaxed)
+    );
+    line!(
+        "active_resource_locks",
+        ACTIVE_RESOURCE_LOCKS.load(Ordering::Relaxed)
+    );
     // Intent rejection reasons breakdown
     out.push_str("intent_rejection_by_reason{reason=\"ttl_expired\"} ");
     out.push_str(&REJECT_TTL_EXPIRED.load(Ordering::Relaxed).to_string());
@@ -676,17 +745,29 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("intent_rejection_by_reason{reason=\"simulation_fail\"} ");
     out.push_str(&REJECT_SIMULATION_FAIL.load(Ordering::Relaxed).to_string());
     out.push('\n');
-    
+
     // --- NATS messaging ---
-    line!("nats_messages_published_total", NATS_MESSAGES_PUBLISHED_TOTAL.load(Ordering::Relaxed));
-    line!("nats_messages_received_total", NATS_MESSAGES_RECEIVED_TOTAL.load(Ordering::Relaxed));
-    line!("nats_reconnects_total", NATS_RECONNECTS_TOTAL.load(Ordering::Relaxed));
-    line!("nats_errors_total", NATS_ERRORS_TOTAL.load(Ordering::Relaxed));
-    
+    line!(
+        "nats_messages_published_total",
+        NATS_MESSAGES_PUBLISHED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "nats_messages_received_total",
+        NATS_MESSAGES_RECEIVED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "nats_reconnects_total",
+        NATS_RECONNECTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "nats_errors_total",
+        NATS_ERRORS_TOTAL.load(Ordering::Relaxed)
+    );
+
     // =============================================================================
     // Legacy / Shared Metrics
     // =============================================================================
-    
+
     line!(
         "quote_requests_total",
         QUOTE_REQUESTS.load(Ordering::Relaxed)
@@ -1133,6 +1214,7 @@ pub async fn serve_metrics(addr: SocketAddr) -> anyhow::Result<()> {
         Ok::<_, hyper::Error>(service_fn(|req: Request<Body>| async move {
             let path = req.uri().path();
             if path == "/metrics" {
+                record_activity();
                 return Ok::<_, hyper::Error>(metrics_response().await);
             }
             if path == "/trades" {
@@ -1148,6 +1230,7 @@ pub async fn serve_metrics(addr: SocketAddr) -> anyhow::Result<()> {
                 );
             }
             if path == "/live" {
+                record_activity();
                 return Ok::<_, hyper::Error>(Response::new(Body::from("ok")));
             }
             if path == "/ready" {

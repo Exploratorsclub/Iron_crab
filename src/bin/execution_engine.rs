@@ -27,7 +27,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, Signer, read_keypair_file};
+use solana_sdk::signature::{read_keypair_file, Keypair, Signer};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -37,19 +37,17 @@ use uuid::Uuid;
 
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
-    DecisionRecord, FairnessPolicy, FeePolicy, IntentOrigin,
-    RejectReason, SimulationResult, TradeIntent, TradingRegime,
+    DecisionRecord, FairnessPolicy, FeePolicy, IntentOrigin, RejectReason, SimulationResult,
+    TradeIntent, TradingRegime,
 };
 use ironcrab::metrics::{
     serve_metrics, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS,
-    INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
-    NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
-    REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_RISK_LIMIT,
-    REJECT_SIMULATION_FAIL, REJECT_TTL_EXPIRED, SIMULATION_FAILURES_TOTAL,
+    INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL, NATS_ERRORS_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, REJECT_CAPITAL_LOCK,
+    REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_RISK_LIMIT, REJECT_SIMULATION_FAIL,
+    REJECT_TTL_EXPIRED, SIMULATION_FAILURES_TOTAL,
 };
-use ironcrab::nats::{
-    NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_TRADE_INTENTS,
-};
+use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_TRADE_INTENTS};
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
 use ironcrab::storage::{
@@ -105,58 +103,53 @@ struct Args {
 }
 
 /// Execution engine configuration
-/// 
+///
 /// All risk limits are documented here (DoD J) P0: No hidden defaults).
 /// These values are checked before every trade execution.
 #[derive(Debug, Clone)]
 struct ExecutionConfig {
     // === Risk Invariants (DoD J) P0) ===
-    
     /// Maximum single position size (lamports). Default: 0.5 SOL
     /// Rejects any intent with required_capital > this value.
     max_position_size_lamports: u64,
-    
+
     /// Maximum daily loss (lamports) before kill switch. Default: 5 SOL
     /// Tracks cumulative losses within a calendar day (UTC).
     daily_loss_limit_lamports: u64,
-    
+
     /// Maximum concurrent open positions. Default: 5
     /// Rejects new intents if this limit is reached.
     max_open_positions: usize,
-    
+
     /// Maximum allowed slippage (basis points). Default: 500 (5%)
     /// Rejects any intent with max_slippage_bps > this value.
     max_slippage_bps: u32,
-    
+
     // === Operational Config ===
-    
     /// Simulation timeout (ms)
     simulation_timeout_ms: u64,
-    
+
     /// Whether to actually send transactions
     send_enabled: bool,
 
     // === P1: Jito Bundle Config ===
-    
     /// Enable Jito bundle submission for atomic execution
     jito_enabled: bool,
-    
+
     /// Default tip amount for Jito bundles (lamports)
     jito_tip_lamports: u64,
-    
+
     /// Jito block engine region (frankfurt, amsterdam, ny, tokyo, slc)
     jito_region: String,
-    
+
     /// Timeout for bundle confirmation (seconds)
     jito_timeout_secs: u64,
 
     // === P1: Fee/Compute Policies ===
-    
     /// Centralized fee policy (engine owns compute budget and priority fees)
     fee_policy: FeePolicy,
 
     // === P1: Fairness/Starvation Policy ===
-    
     /// Fairness policy to prevent strategy starvation
     fairness_policy: FairnessPolicy,
 }
@@ -165,10 +158,10 @@ impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             // Risk Invariants - conservative defaults for safety
-            max_position_size_lamports: 500_000_000,  // 0.5 SOL max per trade
+            max_position_size_lamports: 500_000_000, // 0.5 SOL max per trade
             daily_loss_limit_lamports: 5_000_000_000, // 5 SOL daily loss limit
-            max_open_positions: 5,                     // max 5 concurrent positions
-            max_slippage_bps: 500,                     // max 5% slippage allowed
+            max_open_positions: 5,                   // max 5 concurrent positions
+            max_slippage_bps: 500,                   // max 5% slippage allowed
             // Operational
             simulation_timeout_ms: 2000,
             send_enabled: false, // Default: simulate only
@@ -200,7 +193,7 @@ impl ExecutionConfig {
 // ============================================================================
 
 /// Persistent state snapshot for crash recovery
-/// 
+///
 /// Saved on graceful shutdown and periodic intervals.
 /// Loaded on startup to restore state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,22 +221,30 @@ struct StateSnapshot {
 impl StateSnapshot {
     const CURRENT_VERSION: u32 = 1;
     const SNAPSHOT_FILE: &'static str = "execution_state.json";
-    
+
     /// Create a new snapshot from current state
     fn from_context(ctx: &ExecutionContext) -> Self {
         Self {
             version: Self::CURRENT_VERSION,
             day: ctx.current_day.read().to_string(),
-            daily_loss_lamports: ctx.daily_loss_lamports.load(std::sync::atomic::Ordering::Relaxed),
-            open_positions: ctx.open_positions.load(std::sync::atomic::Ordering::Relaxed),
-            decision_counter: ctx.decision_counter.load(std::sync::atomic::Ordering::Relaxed),
-            execution_counter: ctx.execution_counter.load(std::sync::atomic::Ordering::Relaxed),
+            daily_loss_lamports: ctx
+                .daily_loss_lamports
+                .load(std::sync::atomic::Ordering::Relaxed),
+            open_positions: ctx
+                .open_positions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            decision_counter: ctx
+                .decision_counter
+                .load(std::sync::atomic::Ordering::Relaxed),
+            execution_counter: ctx
+                .execution_counter
+                .load(std::sync::atomic::Ordering::Relaxed),
             processed_intents: ctx.lock_manager.get_processed_intents(),
             saved_at: chrono::Utc::now().to_rfc3339(),
             run_id: ctx.run_id.clone(),
         }
     }
-    
+
     /// Save snapshot to disk
     fn save(&self, log_dir: &PathBuf) -> Result<()> {
         let path = log_dir.join(Self::SNAPSHOT_FILE);
@@ -253,7 +254,7 @@ impl StateSnapshot {
         info!(path = %path.display(), "State snapshot saved");
         Ok(())
     }
-    
+
     /// Load snapshot from disk (returns None if not found or invalid)
     fn load(log_dir: &PathBuf) -> Option<Self> {
         let path = log_dir.join(Self::SNAPSHOT_FILE);
@@ -261,41 +262,39 @@ impl StateSnapshot {
             info!(path = %path.display(), "No state snapshot found, starting fresh");
             return None;
         }
-        
+
         match std::fs::read_to_string(&path) {
-            Ok(json) => {
-                match serde_json::from_str::<StateSnapshot>(&json) {
-                    Ok(snapshot) => {
-                        if snapshot.version != Self::CURRENT_VERSION {
-                            warn!(
-                                found_version = snapshot.version,
-                                expected_version = Self::CURRENT_VERSION,
-                                "State snapshot version mismatch, starting fresh"
-                            );
-                            return None;
-                        }
-                        info!(
-                            path = %path.display(),
-                            saved_at = %snapshot.saved_at,
-                            prev_run_id = %snapshot.run_id,
-                            processed_intents = snapshot.processed_intents.len(),
-                            "Loaded state snapshot"
+            Ok(json) => match serde_json::from_str::<StateSnapshot>(&json) {
+                Ok(snapshot) => {
+                    if snapshot.version != Self::CURRENT_VERSION {
+                        warn!(
+                            found_version = snapshot.version,
+                            expected_version = Self::CURRENT_VERSION,
+                            "State snapshot version mismatch, starting fresh"
                         );
-                        Some(snapshot)
+                        return None;
                     }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to parse state snapshot, starting fresh");
-                        None
-                    }
+                    info!(
+                        path = %path.display(),
+                        saved_at = %snapshot.saved_at,
+                        prev_run_id = %snapshot.run_id,
+                        processed_intents = snapshot.processed_intents.len(),
+                        "Loaded state snapshot"
+                    );
+                    Some(snapshot)
                 }
-            }
+                Err(e) => {
+                    warn!(error = %e, "Failed to parse state snapshot, starting fresh");
+                    None
+                }
+            },
             Err(e) => {
                 warn!(error = %e, "Failed to read state snapshot, starting fresh");
                 None
             }
         }
     }
-    
+
     /// Check if the snapshot is from the same day
     fn is_same_day(&self) -> bool {
         let today = chrono::Utc::now().date_naive().to_string();
@@ -313,10 +312,10 @@ struct ExecutionContext {
     decision_writer: JsonlWriter,
     execution_writer: JsonlWriter,
     lock_manager: LockManager,
-    log_base: PathBuf,  // P1: For state persistence
+    log_base: PathBuf, // P1: For state persistence
     decision_counter: std::sync::atomic::AtomicU64,
     execution_counter: std::sync::atomic::AtomicU64,
-    
+
     // === Risk Tracking (DoD J) P0) ===
     /// Current day (UTC) for daily loss tracking
     current_day: parking_lot::RwLock<chrono::NaiveDate>,
@@ -324,7 +323,7 @@ struct ExecutionContext {
     daily_loss_lamports: std::sync::atomic::AtomicI64,
     /// Currently open positions count
     open_positions: std::sync::atomic::AtomicUsize,
-    
+
     // === P1: Jito Bundle Support ===
     /// Jito client for atomic bundle execution (None if disabled)
     jito_client: Option<JitoClient>,
@@ -332,13 +331,13 @@ struct ExecutionContext {
     bundles_submitted: std::sync::atomic::AtomicU64,
     /// Bundle confirmations counter
     bundles_confirmed: std::sync::atomic::AtomicU64,
-    
+
     // === Cross-DEX Arbitrage Handler ===
     /// Handler for cross-DEX arb intents (optional, requires RPC)
     cross_dex_handler: Option<parking_lot::RwLock<CrossDexHandler>>,
     /// RPC client for simulations and queries
     rpc_client: Option<Arc<RpcClient>>,
-    
+
     // Metrics
     intents_received: std::sync::atomic::AtomicU64,
     intents_rejected: std::sync::atomic::AtomicU64,
@@ -353,13 +352,13 @@ impl ExecutionContext {
     fn get_config(&self) -> ExecutionConfig {
         self.config.read().clone()
     }
-    
+
     /// Update config and return response (P1: Runtime Configuration via UI)
     fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
         let mut config = self.config.write();
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
-        
+
         // Process each config key
         for (key, value) in &update.config {
             match key.as_str() {
@@ -434,9 +433,12 @@ impl ExecutionContext {
                         let has_keys = std::env::var("IRONCRAB_KEYPAIR_JSON").is_ok()
                             || std::env::var("IRONCRAB_KEYPAIR_B64").is_ok()
                             || std::env::var("IRONCRAB_KEYPAIR_PATH").is_ok();
-                        
+
                         if v && !has_keys {
-                            rejected.push((key.clone(), "Cannot enable sending without wallet keys".to_string()));
+                            rejected.push((
+                                key.clone(),
+                                "Cannot enable sending without wallet keys".to_string(),
+                            ));
                         } else {
                             config.send_enabled = v;
                             applied.push(key.clone());
@@ -451,11 +453,11 @@ impl ExecutionContext {
                 }
             }
         }
-        
+
         // Update snapshot ID
         let new_snapshot_id = config.snapshot_id();
         *self.config_snapshot_id.write() = new_snapshot_id.clone();
-        
+
         // Determine status
         let status = if rejected.is_empty() {
             ConfigUpdateStatus::Applied
@@ -464,7 +466,7 @@ impl ExecutionContext {
         } else {
             ConfigUpdateStatus::PartiallyApplied
         };
-        
+
         ConfigUpdateResponse {
             status,
             applied_keys: applied,
@@ -472,13 +474,13 @@ impl ExecutionContext {
             new_snapshot_id: Some(new_snapshot_id),
         }
     }
-    
+
     /// Save state snapshot for crash recovery (P1: DoD K)
     fn save_state(&self) -> Result<()> {
         let snapshot = StateSnapshot::from_context(self);
         snapshot.save(&self.log_base)
     }
-    
+
     fn next_decision_id(&self) -> String {
         let n = self
             .decision_counter
@@ -507,9 +509,9 @@ impl ExecutionContext {
         self.sim_failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    
+
     // Risk Invariant helpers
-    
+
     /// Check if we need to reset daily counters (new day)
     fn maybe_reset_daily(&self) {
         let today = chrono::Utc::now().date_naive();
@@ -517,34 +519,40 @@ impl ExecutionContext {
         if *current != today {
             tracing::info!(old_day = %current, new_day = %today, "Daily reset triggered");
             *current = today;
-            self.daily_loss_lamports.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.daily_loss_lamports
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    
+
     /// Record a loss (positive = loss, negative = profit)
     fn record_pnl_lamports(&self, pnl: i64) {
         // Positive pnl = loss, negative = profit
-        self.daily_loss_lamports.fetch_add(pnl, std::sync::atomic::Ordering::Relaxed);
+        self.daily_loss_lamports
+            .fetch_add(pnl, std::sync::atomic::Ordering::Relaxed);
     }
-    
+
     /// Get current daily loss
     fn get_daily_loss_lamports(&self) -> i64 {
-        self.daily_loss_lamports.load(std::sync::atomic::Ordering::Relaxed)
+        self.daily_loss_lamports
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
-    
+
     /// Increment open positions
     fn increment_open_positions(&self) {
-        self.open_positions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.open_positions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    
+
     /// Decrement open positions
     fn decrement_open_positions(&self) {
-        self.open_positions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.open_positions
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
-    
+
     /// Get current open positions count
     fn get_open_positions(&self) -> usize {
-        self.open_positions.load(std::sync::atomic::Ordering::Relaxed)
+        self.open_positions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -582,7 +590,7 @@ fn load_wallet_keypair() -> Option<Keypair> {
             }
         }
     }
-    
+
     // Try IRONCRAB_KEYPAIR_JSON (JSON array string)
     if let Ok(json) = std::env::var("IRONCRAB_KEYPAIR_JSON") {
         match serde_json::from_str::<Vec<u8>>(&json) {
@@ -592,7 +600,10 @@ fn load_wallet_keypair() -> Option<Keypair> {
                     tracing::info!("Loaded keypair from JSON env var");
                     return Some(kp);
                 } else {
-                    tracing::error!("IRONCRAB_KEYPAIR_JSON must be 32 or 64 bytes, got {}", bytes.len());
+                    tracing::error!(
+                        "IRONCRAB_KEYPAIR_JSON must be 32 or 64 bytes, got {}",
+                        bytes.len()
+                    );
                 }
             }
             Err(e) => {
@@ -600,7 +611,7 @@ fn load_wallet_keypair() -> Option<Keypair> {
             }
         }
     }
-    
+
     // Try IRONCRAB_KEYPAIR_B64 (base64 encoded)
     if let Ok(b64) = std::env::var("IRONCRAB_KEYPAIR_B64") {
         use base64::Engine;
@@ -611,7 +622,10 @@ fn load_wallet_keypair() -> Option<Keypair> {
                     tracing::info!("Loaded keypair from B64 env var");
                     return Some(kp);
                 } else {
-                    tracing::error!("IRONCRAB_KEYPAIR_B64 must decode to 32 or 64 bytes, got {}", bytes.len());
+                    tracing::error!(
+                        "IRONCRAB_KEYPAIR_B64 must decode to 32 or 64 bytes, got {}",
+                        bytes.len()
+                    );
                 }
             }
             Err(e) => {
@@ -619,7 +633,7 @@ fn load_wallet_keypair() -> Option<Keypair> {
             }
         }
     }
-    
+
     None
 }
 
@@ -653,7 +667,10 @@ async fn main() -> Result<()> {
             error!(error = %e, "Metrics server failed");
         }
     });
-    info!(port = args.metrics_port, "Metrics server started at /metrics");
+    info!(
+        port = args.metrics_port,
+        "Metrics server started at /metrics"
+    );
 
     // === This is the ONLY binary that should load keys ===
     // In production, load keys here. For MVP, we just acknowledge the pattern.
@@ -679,8 +696,8 @@ async fn main() -> Result<()> {
 
     // P1: Setup Jito client for atomic bundle execution
     let jito_client = if exec_config.jito_enabled && !args.dry_run {
-        let region = JitoRegion::from_str(&exec_config.jito_region)
-            .unwrap_or(JitoRegion::Frankfurt);
+        let region =
+            JitoRegion::from_str(&exec_config.jito_region).unwrap_or(JitoRegion::Frankfurt);
         let client = JitoClient::new(vec![region], exec_config.jito_tip_lamports);
         info!(
             region = %exec_config.jito_region,
@@ -720,7 +737,7 @@ async fn main() -> Result<()> {
             Some(kp) => {
                 let pubkey = kp.pubkey();
                 info!(wallet = %pubkey, "Wallet keypair loaded");
-                
+
                 // Fetch real balance from RPC
                 let rpc = RpcClient::new(args.rpc_url.clone());
                 match rpc.get_balance(&pubkey) {
@@ -750,13 +767,13 @@ async fn main() -> Result<()> {
         balance_sol = initial_balance as f64 / 1e9,
         "Lock manager initialized with wallet balance"
     );
-    
+
     // Update metrics with real balance
     AVAILABLE_SOL_LAMPORTS.store(initial_balance, Ordering::Relaxed);
-    
+
     // P1: Load state snapshot if available (DoD K)
     let snapshot = StateSnapshot::load(&log_base);
-    
+
     // Restore processed intents (idempotency)
     if let Some(ref snap) = snapshot {
         lock_manager.set_processed_intents(snap.processed_intents.clone());
@@ -783,42 +800,47 @@ async fn main() -> Result<()> {
     };
 
     // P1: Determine initial values from snapshot (DoD K)
-    let (initial_day, initial_daily_loss, initial_positions, initial_decision_counter, initial_execution_counter) = 
-        if let Some(ref snap) = snapshot {
-            if snap.is_same_day() {
-                // Same day: restore all counters
-                info!(
-                    daily_loss = snap.daily_loss_lamports,
-                    open_positions = snap.open_positions,
-                    decision_counter = snap.decision_counter,
-                    "Restored same-day state from snapshot"
-                );
-                (
-                    chrono::NaiveDate::parse_from_str(&snap.day, "%Y-%m-%d")
-                        .unwrap_or_else(|_| chrono::Utc::now().date_naive()),
-                    snap.daily_loss_lamports,
-                    snap.open_positions,
-                    snap.decision_counter,
-                    snap.execution_counter,
-                )
-            } else {
-                // New day: reset daily counters but keep counters for ID generation
-                info!(
-                    old_day = %snap.day,
-                    "New day detected, resetting daily loss but keeping ID counters"
-                );
-                (
-                    chrono::Utc::now().date_naive(),
-                    0,  // Reset daily loss
-                    0,  // Reset positions (they would have been closed or expired)
-                    snap.decision_counter, // Keep for unique IDs across restarts
-                    snap.execution_counter,
-                )
-            }
+    let (
+        initial_day,
+        initial_daily_loss,
+        initial_positions,
+        initial_decision_counter,
+        initial_execution_counter,
+    ) = if let Some(ref snap) = snapshot {
+        if snap.is_same_day() {
+            // Same day: restore all counters
+            info!(
+                daily_loss = snap.daily_loss_lamports,
+                open_positions = snap.open_positions,
+                decision_counter = snap.decision_counter,
+                "Restored same-day state from snapshot"
+            );
+            (
+                chrono::NaiveDate::parse_from_str(&snap.day, "%Y-%m-%d")
+                    .unwrap_or_else(|_| chrono::Utc::now().date_naive()),
+                snap.daily_loss_lamports,
+                snap.open_positions,
+                snap.decision_counter,
+                snap.execution_counter,
+            )
         } else {
-            // Fresh start
-            (chrono::Utc::now().date_naive(), 0, 0, 0, 0)
-        };
+            // New day: reset daily counters but keep counters for ID generation
+            info!(
+                old_day = %snap.day,
+                "New day detected, resetting daily loss but keeping ID counters"
+            );
+            (
+                chrono::Utc::now().date_naive(),
+                0,                     // Reset daily loss
+                0,                     // Reset positions (they would have been closed or expired)
+                snap.decision_counter, // Keep for unique IDs across restarts
+                snap.execution_counter,
+            )
+        }
+    } else {
+        // Fresh start
+        (chrono::Utc::now().date_naive(), 0, 0, 0, 0)
+    };
 
     let ctx = Arc::new(ExecutionContext {
         run_id: run_id.clone(),
@@ -853,13 +875,17 @@ async fn main() -> Result<()> {
 
     // === Main Loop: Process TradeIntents ===
     info!("Entering main execution loop");
-    
+
     // P1 Crash Isolation: Signal systemd that we're ready
     #[cfg(unix)]
     {
-        let _ = sd_notify::notify(true, &[NotifyState::Ready]);
+        // NOTE: Do NOT unset NOTIFY_SOCKET here; we need it for Watchdog pings.
+        let _ = sd_notify::notify(false, &[NotifyState::Ready]);
         debug!("Sent sd_notify READY to systemd");
     }
+
+    // Keep readiness fresh even when idle.
+    crate::metrics::record_activity();
 
     // Subscribe to TradeIntents if NATS connected
     let intent_subscription = if let Some(ref nats) = ctx.nats {
@@ -967,6 +993,9 @@ async fn main() -> Result<()> {
             _ = interval.tick() => {
                 simulated_tick += 1;
 
+                // Keep /ready fresh even when no intents flow.
+                crate::metrics::record_activity();
+
                 // MVP: Simulate receiving a test intent once
                 if simulated_tick == 5 && !test_intent_processed && args.dry_run {
                     test_intent_processed = true;
@@ -1007,12 +1036,14 @@ async fn main() -> Result<()> {
                         available_sol = available_sol,
                         "Execution-engine heartbeat"
                     );
-                    
-                    // P1 Crash Isolation: Ping systemd watchdog (every 30s heartbeat)
-                    #[cfg(unix)]
-                    let _ = sd_notify::notify(true, &[NotifyState::Watchdog]);
                 }
-                
+
+                // P1 Crash Isolation: Ping systemd watchdog frequently enough to avoid edge timing.
+                if simulated_tick % 10 == 0 {
+                    #[cfg(unix)]
+                    let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+                }
+
                 // P1: Periodic state save every 60 ticks (~1 minute) (DoD K)
                 if simulated_tick % 60 == 0 {
                     if let Err(e) = ctx.save_state() {
@@ -1061,8 +1092,8 @@ fn create_test_intent(run_id: &str) -> TradeIntent {
             pools: vec!["TestPool456".to_string()],
             accounts: vec![],
         },
-        100,  // 1% expected ROI
-        200,  // 2% max slippage
+        100, // 1% expected ROI
+        200, // 2% max slippage
         TradeSide::Buy,
         TradingRegime::Early,
     )
@@ -1080,7 +1111,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
     let decision_id = ctx.next_decision_id();
     let mut checks: Vec<CheckResult> = Vec::new();
-    
+
     // P1: Get config snapshot for this decision (hot-reloadable)
     let config = ctx.get_config();
 
@@ -1090,7 +1121,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         source = %intent.source,
         "Processing intent"
     );
-    
+
     // Update received counter
     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
 
@@ -1124,10 +1155,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     });
 
     // === Risk Invariant Checks (DoD J) ===
-    
+
     // Reset daily counters if new day
     ctx.maybe_reset_daily();
-    
+
     // Check 3a: Max position size
     if intent.required_capital.raw > config.max_position_size_lamports {
         let reason = RejectReason::RiskMaxPosition;
@@ -1137,8 +1168,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             reason_code: Some(reason.to_string()),
             details: Some(format!(
                 "required={} > max={}",
-                intent.required_capital.raw,
-                config.max_position_size_lamports
+                intent.required_capital.raw, config.max_position_size_lamports
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -1149,11 +1179,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         reason_code: None,
         details: Some(format!(
             "required={} <= max={}",
-            intent.required_capital.raw,
-            config.max_position_size_lamports
+            intent.required_capital.raw, config.max_position_size_lamports
         )),
     });
-    
+
     // Check 3b: Max slippage
     if intent.max_slippage_bps > config.max_slippage_bps {
         let reason = RejectReason::SimSlippageExceeded;
@@ -1163,8 +1192,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             reason_code: Some(reason.to_string()),
             details: Some(format!(
                 "intent_slippage={}bps > max={}bps",
-                intent.max_slippage_bps,
-                config.max_slippage_bps
+                intent.max_slippage_bps, config.max_slippage_bps
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -1175,7 +1203,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         reason_code: None,
         details: None,
     });
-    
+
     // Check 3c: Max open positions
     let current_positions = ctx.get_open_positions();
     if current_positions >= config.max_open_positions {
@@ -1186,8 +1214,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             reason_code: Some(reason.to_string()),
             details: Some(format!(
                 "current={} >= max={}",
-                current_positions,
-                config.max_open_positions
+                current_positions, config.max_open_positions
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -1198,11 +1225,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         reason_code: None,
         details: Some(format!(
             "current={} < max={}",
-            current_positions,
-            config.max_open_positions
+            current_positions, config.max_open_positions
         )),
     });
-    
+
     // Check 3d: Daily loss limit
     let daily_loss = ctx.get_daily_loss_lamports();
     if daily_loss >= config.daily_loss_limit_lamports as i64 {
@@ -1213,8 +1239,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             reason_code: Some(reason.to_string()),
             details: Some(format!(
                 "daily_loss={} >= limit={}",
-                daily_loss,
-                config.daily_loss_limit_lamports
+                daily_loss, config.daily_loss_limit_lamports
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -1225,14 +1250,13 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         reason_code: None,
         details: Some(format!(
             "daily_loss={} < limit={}",
-            daily_loss,
-            config.daily_loss_limit_lamports
+            daily_loss, config.daily_loss_limit_lamports
         )),
     });
 
     // === P1: Fee/Compute Policy Checks ===
     let fee_policy = &config.fee_policy;
-    
+
     // Check: Compute units within limit
     let compute_units = fee_policy.compute_units_for_intent(&intent);
     if compute_units > fee_policy.max_compute_units {
@@ -1243,8 +1267,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             reason_code: Some(reason.to_string()),
             details: Some(format!(
                 "compute_units={} > max={}",
-                compute_units,
-                fee_policy.max_compute_units
+                compute_units, fee_policy.max_compute_units
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -1255,7 +1278,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         reason_code: None,
         details: Some(format!("compute_units={}", compute_units)),
     });
-    
+
     // Check: Priority fee within limit
     let priority_fee = fee_policy.priority_fee_for_intent(&intent);
     if priority_fee > fee_policy.max_priority_fee_micro_lamports {
@@ -1266,8 +1289,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             reason_code: Some(reason.to_string()),
             details: Some(format!(
                 "priority_fee={} > max={}",
-                priority_fee,
-                fee_policy.max_priority_fee_micro_lamports
+                priority_fee, fee_policy.max_priority_fee_micro_lamports
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -1278,7 +1300,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         reason_code: None,
         details: Some(format!("priority_fee_micro_lamports={}", priority_fee)),
     });
-    
+
     // Check: Total transaction cost within limit
     let (base_fee, priority_fee_lamports, total_cost) = fee_policy.estimate_tx_cost(&intent);
     if total_cost > fee_policy.max_tx_cost_lamports {
@@ -1289,8 +1311,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             reason_code: Some(reason.to_string()),
             details: Some(format!(
                 "total_cost={} (base={}, priority={}) > max={}",
-                total_cost, base_fee, priority_fee_lamports,
-                fee_policy.max_tx_cost_lamports
+                total_cost, base_fee, priority_fee_lamports, fee_policy.max_tx_cost_lamports
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -1304,7 +1325,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             total_cost, base_fee, priority_fee_lamports
         )),
     });
-    
+
     // Check: Trade profitable after fees
     let (is_profitable, profit_after_fees_bps) = fee_policy.is_profitable_after_fees(&intent);
     if !is_profitable {
@@ -1315,8 +1336,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             reason_code: Some(reason.to_string()),
             details: Some(format!(
                 "profit_after_fees={}bps < min={}bps",
-                profit_after_fees_bps,
-                fee_policy.min_profit_after_fees_bps
+                profit_after_fees_bps, fee_policy.min_profit_after_fees_bps
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -1327,8 +1347,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         reason_code: None,
         details: Some(format!(
             "profit_after_fees={}bps >= min={}bps",
-            profit_after_fees_bps,
-            fee_policy.min_profit_after_fees_bps
+            profit_after_fees_bps, fee_policy.min_profit_after_fees_bps
         )),
     });
 
@@ -1366,7 +1385,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 details: Some(format!("Preempted: {}", preempted.intent_id)),
             });
         }
-        LockResult::InsufficientCapital { available, requested } => {
+        LockResult::InsufficientCapital {
+            available,
+            requested,
+        } => {
             let reason = RejectReason::LockCapitalConflict;
             checks.push(CheckResult {
                 check_name: "capital_lock".to_string(),
@@ -1394,20 +1416,24 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // === Cross-DEX Arbitrage Validation (if applicable) ===
     let is_cross_dex_arb = CrossDexHandler::is_cross_dex_arb_intent(&intent);
     let mut cross_dex_validation = None;
-    
+
     if is_cross_dex_arb {
         info!(intent_id = %intent.intent_id, "Processing as Cross-DEX arbitrage intent");
-        
+
         if let Some(ref handler_lock) = ctx.cross_dex_handler {
             let handler = handler_lock.read();
-            
+
             // Estimate tx cost for profitability check
             let estimated_tx_cost = 50_000u64; // ~0.00005 SOL (TODO: use fee policy)
-            
-            match handler.validate_arb_opportunity(&intent, estimated_tx_cost).await {
+
+            match handler
+                .validate_arb_opportunity(&intent, estimated_tx_cost)
+                .await
+            {
                 Ok(validation) => {
-                    ctx.arb_validated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    
+                    ctx.arb_validated
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                     if !validation.is_valid {
                         let reason = RejectReason::ArbSpreadInsufficient;
                         checks.push(CheckResult {
@@ -1416,24 +1442,24 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                             reason_code: Some(reason.to_string()),
                             details: validation.reject_reason.clone(),
                         });
-                        
+
                         // Release lock on rejection
                         ctx.lock_manager.release_locks(&intent.intent_id);
-                        
-                        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+
+                        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason)
+                            .await;
                     }
-                    
+
                     checks.push(CheckResult {
                         check_name: "cross_dex_validation".to_string(),
                         passed: true,
                         reason_code: None,
                         details: Some(format!(
                             "spread={}bps profit={}lamports",
-                            validation.actual_spread_bps,
-                            validation.estimated_profit_lamports
+                            validation.actual_spread_bps, validation.estimated_profit_lamports
                         )),
                     });
-                    
+
                     cross_dex_validation = Some(validation);
                 }
                 Err(e) => {
@@ -1445,7 +1471,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         reason_code: Some(reason.to_string()),
                         details: Some(e.to_string()),
                     });
-                    
+
                     ctx.lock_manager.release_locks(&intent.intent_id);
                     return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
                 }
@@ -1459,7 +1485,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 reason_code: Some(reason.to_string()),
                 details: Some("Cross-DEX handler not initialized".to_string()),
             });
-            
+
             ctx.lock_manager.release_locks(&intent.intent_id);
             return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
         }
@@ -1497,7 +1523,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
     // === P1: Check if bundle required for atomic execution ===
     let requires_bundle = intent.requires_bundle();
-    
+
     if requires_bundle && ctx.jito_client.is_none() {
         // Intent requires bundle but Jito not configured
         let reason = RejectReason::BundleNotConfigured;
@@ -1523,13 +1549,13 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 intent_id = %intent.intent_id,
                 "Sending atomic bundle via Jito"
             );
-            
+
             if let Some(ref _jito) = ctx.jito_client {
                 // In production: build transaction from intent and submit via bundle
                 // For MVP: just track that bundle would be submitted
                 ctx.bundles_submitted
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                
+
                 // TODO: Build actual transaction and submit bundle
                 // let tx = build_transaction_from_intent(&intent)?;
                 // match jito.send_bundle(&[tx]).await {
@@ -1553,7 +1579,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 //         return emit_rejected_decision(...);
                 //     }
                 // }
-                
+
                 bundle_id = Some(format!("bundle-mvp-{}", Uuid::new_v4()));
                 info!(
                     intent_id = %intent.intent_id,

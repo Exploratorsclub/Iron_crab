@@ -105,13 +105,13 @@ struct MomentumConfig {
     default_position_lamports: u64,
     /// Allowlist for test mode (mints that trigger intents). Default: empty
     test_allowlist: HashSet<String>,
-    
+
     // === Filter 1: Liquidity Check ===
     /// Max dev supply percentage (e.g., 90.0 = 90%). Default: 90%
     max_dev_supply_pct: f64,
     /// Window to detect LP removal (seconds). Default: 60s
     lp_removal_window_secs: u64,
-    
+
     // === Filter 2: Buyer Velocity ===
     /// Min unique buyers in early window. Default: 10
     min_unique_buyers: u32,
@@ -121,7 +121,7 @@ struct MomentumConfig {
     min_trades_per_sec: f64,
     /// Min buy dominance ratio (buys / total). Default: 0.6 (60%)
     min_buy_dominance: f64,
-    
+
     // === Filter 3: SOL Inflow ===
     /// Min net SOL inflow in window (lamports). Default: 20 SOL
     min_sol_inflow_lamports: u64,
@@ -129,13 +129,13 @@ struct MomentumConfig {
     inflow_window_secs: u64,
     /// Max single dump size (lamports). Default: 5 SOL
     max_single_dump_lamports: u64,
-    
+
     // === Filter 4: Dev Behavior ===
     /// Dev early sell triggers exit (seconds after pool creation). Default: 60s
     dev_early_sell_window_secs: u64,
     /// Dev rebuy is positive signal. Default: true
     dev_rebuy_positive: bool,
-    
+
     // === Exit Strategy ===
     /// Hard stop-loss percentage from entry (e.g., 15 = -15%). Default: 15%
     hard_stop_loss_pct: f64,
@@ -158,42 +158,42 @@ struct MomentumConfig {
 impl Default for MomentumConfig {
     fn default() -> Self {
         Self {
-            early_min_liquidity_sol: 5.0,              // 5 SOL min for early trades
-            established_min_liquidity_sol: 20.0,       // 20 SOL min for established
-            early_slot_threshold: 1000,                // ~400s until established
-            early_max_slippage_bps: 300,               // 3% for volatile early stage
-            established_max_slippage_bps: 100,         // 1% for stable pools
-            default_position_lamports: 100_000_000,    // 0.1 SOL per trade
-            test_allowlist: HashSet::new(),            // empty = all mints allowed
-            
+            early_min_liquidity_sol: 5.0,           // 5 SOL min for early trades
+            established_min_liquidity_sol: 20.0,    // 20 SOL min for established
+            early_slot_threshold: 1000,             // ~400s until established
+            early_max_slippage_bps: 300,            // 3% for volatile early stage
+            established_max_slippage_bps: 100,      // 1% for stable pools
+            default_position_lamports: 100_000_000, // 0.1 SOL per trade
+            test_allowlist: HashSet::new(),         // empty = all mints allowed
+
             // Filter 1: Liquidity Check
-            max_dev_supply_pct: 90.0,                  // Max 90% dev supply
-            lp_removal_window_secs: 60,                // Track LP removals for 60s
-            
+            max_dev_supply_pct: 90.0,   // Max 90% dev supply
+            lp_removal_window_secs: 60, // Track LP removals for 60s
+
             // Filter 2: Buyer Velocity
-            min_unique_buyers: 10,                     // 10 unique buyers min
-            buyer_window_secs: 20,                     // in first 20 seconds
-            min_trades_per_sec: 0.5,                   // 0.5 trades/sec momentum
-            min_buy_dominance: 0.6,                    // 60% buys vs sells
-            
+            min_unique_buyers: 10,   // 10 unique buyers min
+            buyer_window_secs: 20,   // in first 20 seconds
+            min_trades_per_sec: 0.5, // 0.5 trades/sec momentum
+            min_buy_dominance: 0.6,  // 60% buys vs sells
+
             // Filter 3: SOL Inflow
-            min_sol_inflow_lamports: 20_000_000_000,   // 20 SOL net inflow
-            inflow_window_secs: 30,                    // in 30 seconds
-            max_single_dump_lamports: 5_000_000_000,   // Max 5 SOL single sell
-            
+            min_sol_inflow_lamports: 20_000_000_000, // 20 SOL net inflow
+            inflow_window_secs: 30,                  // in 30 seconds
+            max_single_dump_lamports: 5_000_000_000, // Max 5 SOL single sell
+
             // Filter 4: Dev Behavior
-            dev_early_sell_window_secs: 60,            // Dev sells in first 60s = bad
-            dev_rebuy_positive: true,                  // Dev rebuy = positive signal
-            
+            dev_early_sell_window_secs: 60, // Dev sells in first 60s = bad
+            dev_rebuy_positive: true,       // Dev rebuy = positive signal
+
             // Exit Strategy
-            hard_stop_loss_pct: 15.0,                  // -15% hard stop
-            trailing_stop_pct: 20.0,                   // -20% from ATH
-            trailing_activation_pct: 10.0,            // Activate trailing after +10%
-            take_profit_pct: 100.0,                    // Take profit at +100% (2x)
-            max_hold_time_secs: 300,                   // Max 5 minutes hold
-            momentum_exit_buy_ratio: 0.4,             // Exit if buy ratio < 40%
-            momentum_exit_window_secs: 30,            // Check last 30s of trades
-            momentum_exit_min_trades: 5,              // Need 5+ trades to evaluate
+            hard_stop_loss_pct: 15.0,      // -15% hard stop
+            trailing_stop_pct: 20.0,       // -20% from ATH
+            trailing_activation_pct: 10.0, // Activate trailing after +10%
+            take_profit_pct: 100.0,        // Take profit at +100% (2x)
+            max_hold_time_secs: 300,       // Max 5 minutes hold
+            momentum_exit_buy_ratio: 0.4,  // Exit if buy ratio < 40%
+            momentum_exit_window_secs: 30, // Check last 30s of trades
+            momentum_exit_min_trades: 5,   // Need 5+ trades to evaluate
         }
     }
 }
@@ -208,7 +208,7 @@ struct TradeEvent {
     timestamp: Instant,
     trader: String,
     is_buy: bool,
-    sol_amount: u64,  // in lamports
+    sol_amount: u64, // in lamports
     signature: String,
 }
 
@@ -242,7 +242,14 @@ struct PositionTracker {
 }
 
 impl PositionTracker {
-    fn new(mint: &str, pool: &str, dex: &str, entry_price: f64, token_amount: u64, sol_invested: u64) -> Self {
+    fn new(
+        mint: &str,
+        pool: &str,
+        dex: &str,
+        entry_price: f64,
+        token_amount: u64,
+        sol_invested: u64,
+    ) -> Self {
         Self {
             mint: mint.to_string(),
             pool: pool.to_string(),
@@ -258,7 +265,7 @@ impl PositionTracker {
             exit_generated: false,
         }
     }
-    
+
     /// Update price and track ATH
     fn update_price(&mut self, new_price: f64) {
         self.current_price = new_price;
@@ -266,7 +273,7 @@ impl PositionTracker {
             self.highest_price = new_price;
         }
     }
-    
+
     /// Record a trade for momentum tracking
     fn record_trade(&mut self, trade: TradeEvent) {
         self.recent_trades.push(trade);
@@ -275,7 +282,7 @@ impl PositionTracker {
             self.recent_trades.remove(0);
         }
     }
-    
+
     /// Calculate current P&L percentage
     fn pnl_pct(&self) -> f64 {
         if self.entry_price <= 0.0 {
@@ -283,7 +290,7 @@ impl PositionTracker {
         }
         ((self.current_price - self.entry_price) / self.entry_price) * 100.0
     }
-    
+
     /// Calculate drawdown from ATH percentage
     fn drawdown_from_ath_pct(&self) -> f64 {
         if self.highest_price <= 0.0 {
@@ -291,76 +298,92 @@ impl PositionTracker {
         }
         ((self.highest_price - self.current_price) / self.highest_price) * 100.0
     }
-    
+
     /// Check if we should exit this position
     fn should_exit(&mut self, config: &MomentumConfig) -> Option<(String, String)> {
         // Returns: Some((exit_type, reason)) or None
-        
+
         let pnl = self.pnl_pct();
         let drawdown = self.drawdown_from_ath_pct();
         let hold_secs = self.entry_time.elapsed().as_secs();
-        
+
         // 1. Hard Stop Loss - immediate exit
         if pnl <= -config.hard_stop_loss_pct {
             return Some((
                 "STOP_LOSS".to_string(),
-                format!("Hard stop hit: {:.1}% loss (limit: -{:.1}%)", pnl, config.hard_stop_loss_pct)
+                format!(
+                    "Hard stop hit: {:.1}% loss (limit: -{:.1}%)",
+                    pnl, config.hard_stop_loss_pct
+                ),
             ));
         }
-        
+
         // 2. Take Profit - lock in gains
         if pnl >= config.take_profit_pct {
             return Some((
                 "TAKE_PROFIT".to_string(),
-                format!("Take profit hit: +{:.1}% gain (target: +{:.1}%)", pnl, config.take_profit_pct)
+                format!(
+                    "Take profit hit: +{:.1}% gain (target: +{:.1}%)",
+                    pnl, config.take_profit_pct
+                ),
             ));
         }
-        
+
         // 3. Trailing Stop - activate after profit threshold
         if pnl >= config.trailing_activation_pct {
             self.trailing_active = true;
         }
-        
+
         if self.trailing_active && drawdown >= config.trailing_stop_pct {
             return Some((
                 "TRAILING_STOP".to_string(),
-                format!("Trailing stop hit: -{:.1}% from ATH (limit: -{:.1}%), P&L: {:.1}%", 
-                    drawdown, config.trailing_stop_pct, pnl)
+                format!(
+                    "Trailing stop hit: -{:.1}% from ATH (limit: -{:.1}%), P&L: {:.1}%",
+                    drawdown, config.trailing_stop_pct, pnl
+                ),
             ));
         }
-        
+
         // 4. Time Exit - max hold time exceeded
         if hold_secs >= config.max_hold_time_secs {
             return Some((
                 "TIME_EXIT".to_string(),
-                format!("Max hold time exceeded: {}s (limit: {}s), P&L: {:.1}%", 
-                    hold_secs, config.max_hold_time_secs, pnl)
+                format!(
+                    "Max hold time exceeded: {}s (limit: {}s), P&L: {:.1}%",
+                    hold_secs, config.max_hold_time_secs, pnl
+                ),
             ));
         }
-        
+
         // 5. Momentum Exit - selling pressure detected
         let momentum_window = Duration::from_secs(config.momentum_exit_window_secs);
         let now = Instant::now();
-        let recent: Vec<_> = self.recent_trades.iter()
+        let recent: Vec<_> = self
+            .recent_trades
+            .iter()
             .filter(|t| now.duration_since(t.timestamp) < momentum_window)
             .collect();
-        
+
         if recent.len() >= config.momentum_exit_min_trades as usize {
             let buy_count = recent.iter().filter(|t| t.is_buy).count();
             let total = recent.len();
             let buy_ratio = buy_count as f64 / total as f64;
-            
+
             if buy_ratio < config.momentum_exit_buy_ratio {
                 return Some((
                     "MOMENTUM_EXIT".to_string(),
-                    format!("Momentum fading: buy ratio {:.0}% < {:.0}% ({}b/{}t), P&L: {:.1}%",
-                        buy_ratio * 100.0, 
+                    format!(
+                        "Momentum fading: buy ratio {:.0}% < {:.0}% ({}b/{}t), P&L: {:.1}%",
+                        buy_ratio * 100.0,
                         config.momentum_exit_buy_ratio * 100.0,
-                        buy_count, total, pnl)
+                        buy_count,
+                        total,
+                        pnl
+                    ),
                 ));
             }
         }
-        
+
         None // No exit signal
     }
 }
@@ -384,30 +407,30 @@ struct TokenTracker {
     initial_liquidity: u64,
     /// Dev supply percentage at creation
     dev_supply_pct: Option<f64>,
-    
+
     // Trade tracking
     trades: Vec<TradeEvent>,
     unique_buyers: HashSet<String>,
     unique_sellers: HashSet<String>,
-    
+
     // Aggregates
-    total_buy_volume: u64,      // lamports
-    total_sell_volume: u64,     // lamports
+    total_buy_volume: u64,  // lamports
+    total_sell_volume: u64, // lamports
     buy_count: u32,
     sell_count: u32,
-    
+
     // Dev behavior
     dev_sold: bool,
-    dev_sold_early: bool,       // Sold within dev_early_sell_window
+    dev_sold_early: bool, // Sold within dev_early_sell_window
     dev_rebought: bool,
-    
+
     // LP tracking
     lp_removed: bool,
     lp_removal_time: Option<Instant>,
-    
+
     // State
-    intent_generated: bool,     // Already generated an intent for this token
-    blacklisted: bool,          // Failed filters, don't trade
+    intent_generated: bool, // Already generated an intent for this token
+    blacklisted: bool,      // Failed filters, don't trade
     blacklist_reason: Option<String>,
 }
 
@@ -439,9 +462,16 @@ impl TokenTracker {
             blacklist_reason: None,
         }
     }
-    
+
     /// Record a trade event
-    fn record_trade(&mut self, trader: &str, is_buy: bool, sol_amount: u64, signature: &str, config: &MomentumConfig) {
+    fn record_trade(
+        &mut self,
+        trader: &str,
+        is_buy: bool,
+        sol_amount: u64,
+        signature: &str,
+        config: &MomentumConfig,
+    ) {
         let trade = TradeEvent {
             timestamp: Instant::now(),
             trader: trader.to_string(),
@@ -449,7 +479,7 @@ impl TokenTracker {
             sol_amount,
             signature: signature.to_string(),
         };
-        
+
         if is_buy {
             self.unique_buyers.insert(trader.to_string());
             self.total_buy_volume += sol_amount;
@@ -458,17 +488,17 @@ impl TokenTracker {
             self.unique_sellers.insert(trader.to_string());
             self.total_sell_volume += sol_amount;
             self.sell_count += 1;
-            
+
             // Check for large dump
             if sol_amount > config.max_single_dump_lamports {
                 self.blacklisted = true;
                 self.blacklist_reason = Some(format!(
-                    "Large dump detected: {} SOL", 
+                    "Large dump detected: {} SOL",
                     sol_amount as f64 / 1_000_000_000.0
                 ));
             }
         }
-        
+
         // Dev behavior tracking
         if let Some(ref dev) = self.dev_wallet {
             if trader == dev {
@@ -490,10 +520,10 @@ impl TokenTracker {
                 }
             }
         }
-        
+
         self.trades.push(trade);
     }
-    
+
     /// Record LP removal
     fn record_lp_removal(&mut self) {
         self.lp_removed = true;
@@ -502,12 +532,12 @@ impl TokenTracker {
         self.blacklist_reason = Some("LP removed".to_string());
         warn!(mint = %self.mint, "LP removed - blacklisting");
     }
-    
+
     /// Set dev wallet and supply percentage
     fn set_dev_info(&mut self, dev_wallet: &str, supply_pct: f64, config: &MomentumConfig) {
         self.dev_wallet = Some(dev_wallet.to_string());
         self.dev_supply_pct = Some(supply_pct);
-        
+
         if supply_pct > config.max_dev_supply_pct {
             self.blacklisted = true;
             self.blacklist_reason = Some(format!(
@@ -517,28 +547,36 @@ impl TokenTracker {
             warn!(mint = %self.mint, supply_pct, "Dev supply too high - blacklisting");
         }
     }
-    
+
     /// Calculate metrics for strategy decision
     fn calculate_metrics(&self, config: &MomentumConfig) -> TokenMetrics {
         let age = self.first_seen.elapsed();
         let age_secs = age.as_secs().max(1) as f64;
-        
+
         // Filter recent trades within windows
         let now = Instant::now();
         let buyer_window = Duration::from_secs(config.buyer_window_secs);
         let inflow_window = Duration::from_secs(config.inflow_window_secs);
-        
-        let recent_buyers: HashSet<_> = self.trades.iter()
+
+        let recent_buyers: HashSet<_> = self
+            .trades
+            .iter()
             .filter(|t| t.is_buy && now.duration_since(t.timestamp) < buyer_window)
             .map(|t| t.trader.clone())
             .collect();
-            
-        let (recent_buy_vol, recent_sell_vol) = self.trades.iter()
+
+        let (recent_buy_vol, recent_sell_vol) = self
+            .trades
+            .iter()
             .filter(|t| now.duration_since(t.timestamp) < inflow_window)
             .fold((0u64, 0u64), |(b, s), t| {
-                if t.is_buy { (b + t.sol_amount, s) } else { (b, s + t.sol_amount) }
+                if t.is_buy {
+                    (b + t.sol_amount, s)
+                } else {
+                    (b, s + t.sol_amount)
+                }
             });
-        
+
         let total_trades = self.buy_count + self.sell_count;
         let trades_per_sec = total_trades as f64 / age_secs;
         let buy_dominance = if total_trades > 0 {
@@ -546,7 +584,7 @@ impl TokenTracker {
         } else {
             0.0
         };
-        
+
         TokenMetrics {
             age_secs: age.as_secs(),
             unique_buyers_in_window: recent_buyers.len() as u32,
@@ -562,7 +600,7 @@ impl TokenTracker {
             initial_liquidity_sol: self.initial_liquidity as f64 / 1_000_000_000.0,
         }
     }
-    
+
     /// Check all 4 filters and return if we should trade
     fn should_generate_intent(&self, config: &MomentumConfig) -> (bool, String) {
         // Already generated or blacklisted
@@ -570,74 +608,95 @@ impl TokenTracker {
             return (false, "Already generated intent".to_string());
         }
         if self.blacklisted {
-            return (false, self.blacklist_reason.clone().unwrap_or("Blacklisted".to_string()));
+            return (
+                false,
+                self.blacklist_reason
+                    .clone()
+                    .unwrap_or("Blacklisted".to_string()),
+            );
         }
-        
+
         let metrics = self.calculate_metrics(config);
-        
+
         // Filter 1: Liquidity Check
         if metrics.initial_liquidity_sol < config.early_min_liquidity_sol {
             FILTER_REJECTED_LIQUIDITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return (false, format!(
-                "Liquidity too low: {:.2} SOL (min {:.2})",
-                metrics.initial_liquidity_sol, config.early_min_liquidity_sol
-            ));
+            return (
+                false,
+                format!(
+                    "Liquidity too low: {:.2} SOL (min {:.2})",
+                    metrics.initial_liquidity_sol, config.early_min_liquidity_sol
+                ),
+            );
         }
-        
+
         // Filter 1b: LP removal
         if metrics.lp_removed {
             FILTER_REJECTED_LIQUIDITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return (false, "LP removed".to_string());
         }
-        
+
         // Filter 2: Buyer Velocity
         if metrics.unique_buyers_in_window < config.min_unique_buyers {
             FILTER_REJECTED_VELOCITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return (false, format!(
-                "Not enough buyers: {} (min {})",
-                metrics.unique_buyers_in_window, config.min_unique_buyers
-            ));
+            return (
+                false,
+                format!(
+                    "Not enough buyers: {} (min {})",
+                    metrics.unique_buyers_in_window, config.min_unique_buyers
+                ),
+            );
         }
-        
+
         if metrics.trades_per_sec < config.min_trades_per_sec {
             FILTER_REJECTED_VELOCITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return (false, format!(
-                "Trade velocity too low: {:.2}/s (min {:.2})",
-                metrics.trades_per_sec, config.min_trades_per_sec
-            ));
+            return (
+                false,
+                format!(
+                    "Trade velocity too low: {:.2}/s (min {:.2})",
+                    metrics.trades_per_sec, config.min_trades_per_sec
+                ),
+            );
         }
-        
+
         if metrics.buy_dominance < config.min_buy_dominance {
             FILTER_REJECTED_VELOCITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return (false, format!(
-                "Buy dominance too low: {:.1}% (min {:.1}%)",
-                metrics.buy_dominance * 100.0, config.min_buy_dominance * 100.0
-            ));
+            return (
+                false,
+                format!(
+                    "Buy dominance too low: {:.1}% (min {:.1}%)",
+                    metrics.buy_dominance * 100.0,
+                    config.min_buy_dominance * 100.0
+                ),
+            );
         }
-        
+
         // Filter 3: SOL Inflow
         if metrics.net_sol_inflow < config.min_sol_inflow_lamports {
             FILTER_REJECTED_INFLOW.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return (false, format!(
-                "SOL inflow too low: {:.2} SOL (min {:.2})",
-                metrics.net_sol_inflow as f64 / 1_000_000_000.0,
-                config.min_sol_inflow_lamports as f64 / 1_000_000_000.0
-            ));
+            return (
+                false,
+                format!(
+                    "SOL inflow too low: {:.2} SOL (min {:.2})",
+                    metrics.net_sol_inflow as f64 / 1_000_000_000.0,
+                    config.min_sol_inflow_lamports as f64 / 1_000_000_000.0
+                ),
+            );
         }
-        
+
         // Filter 4: Dev Behavior
         if metrics.dev_sold_early {
             FILTER_REJECTED_DEV_BEHAVIOR.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return (false, "Dev sold early".to_string());
         }
-        
+
         // All filters passed!
         FILTER_PASSED_TOTAL.fetch_add(1, Ordering::Relaxed);
         let reason = format!(
@@ -648,7 +707,7 @@ impl TokenTracker {
             metrics.buy_dominance * 100.0,
             metrics.net_sol_inflow as f64 / 1_000_000_000.0
         );
-        
+
         (true, reason)
     }
 }
@@ -678,8 +737,8 @@ struct PendingIntent {
     pool: String,
     dex: String,
     side: TradeSide,
-    sol_amount: u64,        // For BUY: SOL invested
-    token_amount: u64,      // For SELL: tokens to sell
+    sol_amount: u64,   // For BUY: SOL invested
+    token_amount: u64, // For SELL: tokens to sell
     created_at: Instant,
 }
 
@@ -737,32 +796,51 @@ impl MomentumContext {
         let mut pools = self.pool_first_seen.write();
         pools.entry(pool_address.to_string()).or_insert(slot);
     }
-    
+
     /// Get or create a token tracker
-    fn get_or_create_tracker(&self, mint: &str, pool: &str, dex: &str, slot: u64, liquidity: u64) -> bool {
+    fn get_or_create_tracker(
+        &self,
+        mint: &str,
+        pool: &str,
+        dex: &str,
+        slot: u64,
+        liquidity: u64,
+    ) -> bool {
         let mut trackers = self.token_trackers.write();
         if trackers.contains_key(mint) {
             false // Already exists
         } else {
-            trackers.insert(mint.to_string(), TokenTracker::new(mint, pool, dex, slot, liquidity));
-            self.tokens_tracked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            trackers.insert(
+                mint.to_string(),
+                TokenTracker::new(mint, pool, dex, slot, liquidity),
+            );
+            self.tokens_tracked
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true // New tracker created
         }
     }
-    
+
     /// Record a trade for a token
-    fn record_trade(&self, mint: &str, trader: &str, is_buy: bool, sol_amount: u64, signature: &str) {
+    fn record_trade(
+        &self,
+        mint: &str,
+        trader: &str,
+        is_buy: bool,
+        sol_amount: u64,
+        signature: &str,
+    ) {
         let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
         if let Some(tracker) = trackers.get_mut(mint) {
             let was_blacklisted = tracker.blacklisted;
             tracker.record_trade(trader, is_buy, sol_amount, signature, &config);
             if !was_blacklisted && tracker.blacklisted {
-                self.tokens_blacklisted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.tokens_blacklisted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
-    
+
     /// Record dev info for a token
     fn record_dev_info(&self, mint: &str, dev_wallet: &str, supply_pct: f64) {
         let config = self.config.read().clone();
@@ -771,11 +849,12 @@ impl MomentumContext {
             let was_blacklisted = tracker.blacklisted;
             tracker.set_dev_info(dev_wallet, supply_pct, &config);
             if !was_blacklisted && tracker.blacklisted {
-                self.tokens_blacklisted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.tokens_blacklisted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
-    
+
     /// Record LP removal for a token
     fn record_lp_removal(&self, mint: &str) {
         let mut trackers = self.token_trackers.write();
@@ -783,23 +862,24 @@ impl MomentumContext {
             let was_blacklisted = tracker.blacklisted;
             tracker.record_lp_removal();
             if !was_blacklisted && tracker.blacklisted {
-                self.tokens_blacklisted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.tokens_blacklisted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
-    
+
     /// Check if any tracked token should generate an intent
     fn check_for_signals(&self) -> Vec<(String, String, String, String)> {
         // Returns: Vec<(mint, pool, dex, reason)>
         let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
         let mut signals = Vec::new();
-        
+
         for (mint, tracker) in trackers.iter_mut() {
             if tracker.intent_generated || tracker.blacklisted {
                 continue;
             }
-            
+
             let (should_trade, reason) = tracker.should_generate_intent(&config);
             if should_trade {
                 tracker.intent_generated = true;
@@ -811,10 +891,10 @@ impl MomentumContext {
                 ));
             }
         }
-        
+
         signals
     }
-    
+
     /// Clean up old trackers (older than 5 minutes)
     fn cleanup_old_trackers(&self) {
         let mut trackers = self.token_trackers.write();
@@ -823,13 +903,21 @@ impl MomentumContext {
             tracker.first_seen.elapsed() < cutoff || !tracker.intent_generated
         });
     }
-    
+
     // =========================================================================
     // Position Management for Exit Strategy
     // =========================================================================
-    
+
     /// Open a new position after buy intent is executed
-    fn open_position(&self, mint: &str, pool: &str, dex: &str, entry_price: f64, token_amount: u64, sol_invested: u64) {
+    fn open_position(
+        &self,
+        mint: &str,
+        pool: &str,
+        dex: &str,
+        entry_price: f64,
+        token_amount: u64,
+        sol_invested: u64,
+    ) {
         let mut positions = self.positions.write();
         if positions.contains_key(mint) {
             warn!(mint = %mint, "Position already exists, not opening duplicate");
@@ -837,7 +925,7 @@ impl MomentumContext {
         }
         positions.insert(
             mint.to_string(),
-            PositionTracker::new(mint, pool, dex, entry_price, token_amount, sol_invested)
+            PositionTracker::new(mint, pool, dex, entry_price, token_amount, sol_invested),
         );
         info!(
             mint = %mint,
@@ -846,7 +934,7 @@ impl MomentumContext {
             "📈 Position opened"
         );
     }
-    
+
     /// Update position price from market trade
     fn update_position_price(&self, mint: &str, new_price: f64, trade: Option<TradeEvent>) {
         let mut positions = self.positions.write();
@@ -857,7 +945,7 @@ impl MomentumContext {
             }
         }
     }
-    
+
     /// Close position (after sell executed)
     fn close_position(&self, mint: &str) {
         let mut positions = self.positions.write();
@@ -872,19 +960,19 @@ impl MomentumContext {
             );
         }
     }
-    
+
     /// Check all positions for exit signals
     fn check_for_exits(&self) -> Vec<(String, String, String, String, String, u64)> {
         // Returns: Vec<(mint, pool, dex, exit_type, reason, token_amount)>
         let config = self.config.read().clone();
         let mut positions = self.positions.write();
         let mut exits = Vec::new();
-        
+
         for (mint, pos) in positions.iter_mut() {
             if pos.exit_generated {
                 continue;
             }
-            
+
             if let Some((exit_type, reason)) = pos.should_exit(&config) {
                 pos.exit_generated = true;
                 exits.push((
@@ -897,75 +985,98 @@ impl MomentumContext {
                 ));
             }
         }
-        
+
         exits
     }
-    
+
     /// Get position count for heartbeat
     fn position_count(&self) -> usize {
         self.positions.read().len()
     }
-    
+
     /// Get pending intent count for heartbeat
     fn pending_count(&self) -> usize {
         self.pending_intents.read().len()
     }
-    
+
     // =========================================================================
     // Pending Intent Management (for execution result handling)
     // =========================================================================
-    
+
     /// Register a pending BUY intent
-    fn register_buy_intent(&self, intent_id: &str, mint: &str, pool: &str, dex: &str, sol_amount: u64) {
+    fn register_buy_intent(
+        &self,
+        intent_id: &str,
+        mint: &str,
+        pool: &str,
+        dex: &str,
+        sol_amount: u64,
+    ) {
         let mut pending = self.pending_intents.write();
-        pending.insert(intent_id.to_string(), PendingIntent {
-            intent_id: intent_id.to_string(),
-            mint: mint.to_string(),
-            pool: pool.to_string(),
-            dex: dex.to_string(),
-            side: TradeSide::Buy,
-            sol_amount,
-            token_amount: 0,
-            created_at: Instant::now(),
-        });
+        pending.insert(
+            intent_id.to_string(),
+            PendingIntent {
+                intent_id: intent_id.to_string(),
+                mint: mint.to_string(),
+                pool: pool.to_string(),
+                dex: dex.to_string(),
+                side: TradeSide::Buy,
+                sol_amount,
+                token_amount: 0,
+                created_at: Instant::now(),
+            },
+        );
         debug!(intent_id = %intent_id, mint = %mint, "Registered pending BUY intent");
     }
-    
+
     /// Register a pending SELL intent
-    fn register_sell_intent(&self, intent_id: &str, mint: &str, pool: &str, dex: &str, token_amount: u64) {
+    fn register_sell_intent(
+        &self,
+        intent_id: &str,
+        mint: &str,
+        pool: &str,
+        dex: &str,
+        token_amount: u64,
+    ) {
         let mut pending = self.pending_intents.write();
-        pending.insert(intent_id.to_string(), PendingIntent {
-            intent_id: intent_id.to_string(),
-            mint: mint.to_string(),
-            pool: pool.to_string(),
-            dex: dex.to_string(),
-            side: TradeSide::Sell,
-            sol_amount: 0,
-            token_amount,
-            created_at: Instant::now(),
-        });
+        pending.insert(
+            intent_id.to_string(),
+            PendingIntent {
+                intent_id: intent_id.to_string(),
+                mint: mint.to_string(),
+                pool: pool.to_string(),
+                dex: dex.to_string(),
+                side: TradeSide::Sell,
+                sol_amount: 0,
+                token_amount,
+                created_at: Instant::now(),
+            },
+        );
         debug!(intent_id = %intent_id, mint = %mint, "Registered pending SELL intent");
     }
-    
+
     /// Handle execution result from execution-engine
     fn handle_execution_result(&self, result: &ExecutionResult) {
         // Only process results from our own intents
-        if result.source != "momentum-bot" && !result.source.starts_with("4filter:") && !result.source.starts_with("exit:") {
+        if result.source != "momentum-bot"
+            && !result.source.starts_with("4filter:")
+            && !result.source.starts_with("exit:")
+        {
             trace!(source = %result.source, "Ignoring execution result from other source");
             return;
         }
-        
+
         // Find the pending intent
         let pending_opt = {
             let mut pending = self.pending_intents.write();
             pending.remove(&result.intent_id)
         };
-        
+
         let Some(pending) = pending_opt else {
             debug!(intent_id = %result.intent_id, "No pending intent found for execution result");
             return;
         };
-        
+
         match result.status {
             ExecutionStatus::Confirmed => {
                 match pending.side {
@@ -975,7 +1086,7 @@ impl MomentumContext {
                         // For now, use a placeholder and update from market data
                         let estimated_price = 1.0; // Will be updated from market trades
                         let estimated_tokens = pending.sol_amount; // Placeholder
-                        
+
                         info!(
                             intent_id = %result.intent_id,
                             mint = %pending.mint,
@@ -984,7 +1095,7 @@ impl MomentumContext {
                             signature = ?result.signature,
                             "✅ BUY CONFIRMED - Opening position"
                         );
-                        
+
                         self.open_position(
                             &pending.mint,
                             &pending.pool,
@@ -1004,7 +1115,7 @@ impl MomentumContext {
                             pnl = ?result.pnl,
                             "✅ SELL CONFIRMED - Closing position"
                         );
-                        
+
                         self.close_position(&pending.mint);
                     }
                 }
@@ -1033,7 +1144,7 @@ impl MomentumContext {
             }
         }
     }
-    
+
     /// Cleanup stale pending intents (older than 2 minutes)
     fn cleanup_stale_pending(&self) {
         let mut pending = self.pending_intents.write();
@@ -1051,7 +1162,7 @@ impl MomentumContext {
         let mut config = self.config.write();
         let mut applied = Vec::new();
         let mut rejected = Vec::new();
-        
+
         for (key, value) in &update.config {
             match key.as_str() {
                 "early_min_liquidity_sol" => {
@@ -1137,7 +1248,7 @@ impl MomentumContext {
                 }
             }
         }
-        
+
         let status = if rejected.is_empty() {
             ConfigUpdateStatus::Applied
         } else if applied.is_empty() {
@@ -1145,7 +1256,7 @@ impl MomentumContext {
         } else {
             ConfigUpdateStatus::PartiallyApplied
         };
-        
+
         ConfigUpdateResponse {
             status,
             applied_keys: applied,
@@ -1184,7 +1295,10 @@ async fn main() -> Result<()> {
             error!(error = %e, "Metrics server failed");
         }
     });
-    info!(port = args.metrics_port, "Metrics server started at /metrics");
+    info!(
+        port = args.metrics_port,
+        "Metrics server started at /metrics"
+    );
 
     // === P0 Check: Ensure no wallet keys are loaded ===
     // momentum-bot is KEYLESS per architecture
@@ -1252,13 +1366,17 @@ async fn main() -> Result<()> {
 
     // === Main Loop: Process MarketEvents from NATS ===
     info!("Entering main event loop");
-    
+
     // P1 Crash Isolation: Signal systemd that we're ready
     #[cfg(unix)]
     {
-        let _ = sd_notify::notify(true, &[NotifyState::Ready]);
+        // NOTE: Do NOT unset NOTIFY_SOCKET here; we need it for Watchdog pings.
+        let _ = sd_notify::notify(false, &[NotifyState::Ready]);
         debug!("Sent sd_notify READY to systemd");
     }
+
+    // Keep readiness fresh even when idle.
+    crate::metrics::record_activity();
 
     // Subscribe to MarketEvents from NATS
     let mut subscription = if let Some(ref nats) = ctx.nats {
@@ -1297,7 +1415,10 @@ async fn main() -> Result<()> {
     let mut execution_subscription = if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_EXECUTION_RESULTS).await {
             Ok(sub) => {
-                info!(topic = TOPIC_EXECUTION_RESULTS, "Subscribed to ExecutionResults");
+                info!(
+                    topic = TOPIC_EXECUTION_RESULTS,
+                    "Subscribed to ExecutionResults"
+                );
                 Some(sub)
             }
             Err(e) => {
@@ -1311,6 +1432,7 @@ async fn main() -> Result<()> {
 
     // Heartbeat and stats tracking
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     let mut events_received: u64 = 0;
     let mut last_slot: u64 = 0;
 
@@ -1320,6 +1442,15 @@ async fn main() -> Result<()> {
 
     loop {
         tokio::select! {
+            // Keep /ready fresh even if there are no events.
+            _ = activity_interval.tick() => {
+                crate::metrics::record_activity();
+
+                // P1 Crash Isolation: Ping systemd watchdog frequently enough.
+                #[cfg(unix)]
+                let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+            }
+
             // Process incoming MarketEvents from NATS
             msg = async {
                 if let Some(ref mut sub) = subscription {
@@ -1330,6 +1461,7 @@ async fn main() -> Result<()> {
                 }
             } => {
                 if let Some(nats_msg) = msg {
+                    crate::metrics::record_activity();
                     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     events_received += 1;
 
@@ -1361,6 +1493,7 @@ async fn main() -> Result<()> {
                 }
             } => {
                 if let Some(nats_msg) = msg {
+                    crate::metrics::record_activity();
                     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     match serde_json::from_slice::<ConfigUpdate>(&nats_msg.payload) {
                         Ok(update) => {
@@ -1398,6 +1531,7 @@ async fn main() -> Result<()> {
                 }
             } => {
                 if let Some(nats_msg) = msg {
+                    crate::metrics::record_activity();
                     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     match serde_json::from_slice::<ExecutionResult>(&nats_msg.payload) {
                         Ok(result) => {
@@ -1418,6 +1552,7 @@ async fn main() -> Result<()> {
 
             // Periodic heartbeat
             _ = heartbeat_interval.tick() => {
+                crate::metrics::record_activity();
                 let (records, bytes) = ctx.jsonl_writer.stats();
                 let pools = ctx.pool_first_seen.read().len();
                 let tokens_tracked = ctx.tokens_tracked.load(std::sync::atomic::Ordering::Relaxed);
@@ -1426,13 +1561,13 @@ async fn main() -> Result<()> {
                 let exits_generated = ctx.exits_generated.load(std::sync::atomic::Ordering::Relaxed);
                 let open_positions = ctx.position_count();
                 let pending_intents = ctx.pending_count();
-                
+
                 // Update Prometheus metrics
                 MARKET_EVENTS_CONSUMED_TOTAL.store(events_received, Ordering::Relaxed);
                 POOLS_TRACKED_GAUGE.store(pools as u64, Ordering::Relaxed);
                 TOKENS_TRACKED_GAUGE.store(tokens_tracked, Ordering::Relaxed);
                 INTENTS_GENERATED_TOTAL.store(intents_generated, Ordering::Relaxed);
-                
+
                 info!(
                     events_received = events_received,
                     last_slot = last_slot,
@@ -1447,11 +1582,11 @@ async fn main() -> Result<()> {
                     pending_intents = pending_intents,
                     "Momentum-bot heartbeat"
                 );
-                
+
                 // Cleanup old trackers and stale pending intents
                 ctx.cleanup_old_trackers();
                 ctx.cleanup_stale_pending();
-                
+
                 // === Check for ENTRY signals ===
                 let signals = ctx.check_for_signals();
                 for (mint, pool, dex, reason) in signals {
@@ -1462,7 +1597,7 @@ async fn main() -> Result<()> {
                         reason = %reason,
                         "🎯 ENTRY SIGNAL DETECTED"
                     );
-                    
+
                     // Generate and publish BUY intent
                     if let Err(e) = generate_and_publish_intent(&ctx, &mint, &pool, &dex, &reason).await {
                         error!(error = %e, mint = %mint, "Failed to generate/publish buy intent");
@@ -1470,7 +1605,7 @@ async fn main() -> Result<()> {
                         ctx.intents_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                
+
                 // === Check for EXIT signals ===
                 let exits = ctx.check_for_exits();
                 for (mint, pool, dex, exit_type, reason, token_amount) in exits {
@@ -1482,7 +1617,7 @@ async fn main() -> Result<()> {
                         token_amount = token_amount,
                         "🚨 EXIT SIGNAL DETECTED"
                     );
-                    
+
                     // Generate and publish SELL intent
                     if let Err(e) = generate_and_publish_exit_intent(&ctx, &mint, &pool, &dex, &exit_type, &reason, token_amount).await {
                         error!(error = %e, mint = %mint, "Failed to generate/publish sell intent");
@@ -1490,10 +1625,7 @@ async fn main() -> Result<()> {
                         ctx.exits_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                
-                // P1 Crash Isolation: Ping systemd watchdog
-                #[cfg(unix)]
-                let _ = sd_notify::notify(true, &[NotifyState::Watchdog]);
+
             }
 
             _ = &mut shutdown => {
@@ -1522,12 +1654,12 @@ async fn generate_and_publish_intent(
     let position_lamports = config.default_position_lamports;
     let max_slippage = config.early_max_slippage_bps;
     drop(config);
-    
+
     // Assume SOL (So11111...) as quote mint for PumpFun/meme tokens
     let sol_mint = "So11111111111111111111111111111111111111112";
-    
+
     let intent_id = ctx.next_intent_id();
-    
+
     let intent = TradeIntent::new(
         "momentum-bot",
         BUILD_VERSION,
@@ -1598,16 +1730,16 @@ async fn generate_and_publish_exit_intent(
     let config = ctx.config.read();
     let max_slippage = config.early_max_slippage_bps; // Use higher slippage for exits
     drop(config);
-    
+
     // SOL as output (selling tokens for SOL)
     let sol_mint = "So11111111111111111111111111111111111111112";
-    
+
     // Decimals depend on token, usually 6 or 9 for meme tokens
     // Use 6 as common default for PumpFun tokens
     let token_decimals = 6u8;
-    
+
     let intent_id = ctx.next_intent_id();
-    
+
     let intent = TradeIntent::new(
         "momentum-bot",
         BUILD_VERSION,
@@ -1618,7 +1750,7 @@ async fn generate_and_publish_exit_intent(
         IntentOrigin::StrategyA,
         ExplicitAmount::new(token_amount, token_decimals),
         TradeResources {
-            input_mint: mint.to_string(),  // Selling tokens
+            input_mint: mint.to_string(),      // Selling tokens
             output_mint: sol_mint.to_string(), // Receiving SOL
             pools: vec![pool.to_string()],
             accounts: vec![],
@@ -1696,13 +1828,14 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             let config = ctx.config.read();
             let min_liq = config.early_min_liquidity_sol;
             drop(config);
-            
+
             // Create tracker if liquidity meets minimum threshold
             if liq_sol >= min_liq {
                 let slot = event.slot.unwrap_or(0);
                 let liq_lamports = (liq_sol * 1_000_000_000.0) as u64;
-                let created = ctx.get_or_create_tracker(base_mint, pool_address, dex, slot, liq_lamports);
-                
+                let created =
+                    ctx.get_or_create_tracker(base_mint, pool_address, dex, slot, liq_lamports);
+
                 if created {
                     info!(
                         mint = %base_mint,
@@ -1721,7 +1854,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 );
             }
         }
-        
+
         MarketEventKind::Trade {
             pool_address,
             mint,
@@ -1734,18 +1867,19 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             // Record the trade in the tracker
             let sol_lamports = *sol_amount as u64;
             let sig = signature.clone().unwrap_or_default();
-            
+
             // Check if this trader is the dev wallet and record dev behavior
             let is_dev = {
                 let trackers = ctx.token_trackers.read();
-                trackers.get(mint)
+                trackers
+                    .get(mint)
                     .and_then(|t| t.dev_wallet.as_ref())
                     .map(|dw| dw == trader)
                     .unwrap_or(false)
             };
-            
+
             ctx.record_trade(mint, trader, *is_buy, sol_lamports, &sig);
-            
+
             if is_dev {
                 // Record dev trade behavior in tracker
                 let mut trackers = ctx.token_trackers.write();
@@ -1759,7 +1893,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     }
                 }
             }
-            
+
             debug!(
                 pool = %pool_address,
                 mint = %mint,
@@ -1769,7 +1903,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 "Trade recorded"
             );
         }
-        
+
         MarketEventKind::LiquidityRemoved {
             pool_address,
             mint,
@@ -1779,7 +1913,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             // LP removal - potential rug signal
             let sol_lamports = *sol_amount as u64;
             ctx.record_lp_removal(mint);
-            
+
             warn!(
                 pool = %pool_address,
                 mint = %mint,
@@ -1787,18 +1921,18 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 "🚨 LP REMOVAL DETECTED - blacklisting token"
             );
         }
-        
+
         MarketEventKind::DevWalletIdentified {
             mint,
             dev_wallet,
             supply_percentage,
         } => {
             ctx.record_dev_info(mint, dev_wallet, *supply_percentage);
-            
+
             let config = ctx.config.read();
             let max_dev_pct = config.max_dev_supply_pct;
             drop(config);
-            
+
             if *supply_percentage > max_dev_pct {
                 // Blacklist token with high dev supply
                 let mut trackers = ctx.token_trackers.write();
@@ -1809,8 +1943,9 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                             "Dev supply too high: {:.1}% > {:.1}%",
                             supply_percentage, max_dev_pct
                         ));
-                        ctx.tokens_blacklisted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        
+                        ctx.tokens_blacklisted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                         warn!(
                             mint = %mint,
                             dev_supply = supply_percentage,
@@ -1828,11 +1963,11 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 );
             }
         }
-        
+
         MarketEventKind::SlotUpdate { current_slot } => {
             debug!(current_slot, "Slot update");
         }
-        
+
         _ => {
             trace!(event_id = %event.event_id, "Unhandled event type");
         }
