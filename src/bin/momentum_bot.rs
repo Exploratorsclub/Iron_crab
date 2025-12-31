@@ -1330,6 +1330,7 @@ async fn main() -> Result<()> {
                 }
             } => {
                 if let Some(nats_msg) = msg {
+                    NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     events_received += 1;
 
                     // Deserialize MarketEvent
@@ -1360,6 +1361,7 @@ async fn main() -> Result<()> {
                 }
             } => {
                 if let Some(nats_msg) = msg {
+                    NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     match serde_json::from_slice::<ConfigUpdate>(&nats_msg.payload) {
                         Ok(update) => {
                             // Only process if targeted at momentum-bot
@@ -1396,6 +1398,7 @@ async fn main() -> Result<()> {
                 }
             } => {
                 if let Some(nats_msg) = msg {
+                    NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     match serde_json::from_slice::<ExecutionResult>(&nats_msg.payload) {
                         Ok(result) => {
                             debug!(
@@ -1564,7 +1567,19 @@ async fn generate_and_publish_intent(
 
     // Publish to NATS
     if let Some(ref nats) = ctx.nats {
-        nats.publish(TOPIC_TRADE_INTENTS, &intent).await?;
+        match nats.publish(TOPIC_TRADE_INTENTS, &intent).await {
+            Ok(true) => {
+                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {
+                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("NATS publish dropped/failed topic={}", TOPIC_TRADE_INTENTS);
+            }
+            Err(e) => {
+                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                return Err(e);
+            }
+        }
     }
 
     Ok(())
@@ -1634,7 +1649,19 @@ async fn generate_and_publish_exit_intent(
 
     // Publish to NATS
     if let Some(ref nats) = ctx.nats {
-        nats.publish(TOPIC_TRADE_INTENTS, &intent).await?;
+        match nats.publish(TOPIC_TRADE_INTENTS, &intent).await {
+            Ok(true) => {
+                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {
+                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("NATS publish dropped/failed topic={}", TOPIC_TRADE_INTENTS);
+            }
+            Err(e) => {
+                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                return Err(e);
+            }
+        }
     }
 
     Ok(())
