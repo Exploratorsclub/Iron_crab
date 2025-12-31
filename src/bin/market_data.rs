@@ -348,8 +348,7 @@ async fn run_geyser_loop(
 
                 // Try to parse as DEX pool event
                 let event_kind = if let Some(parsed) = parse_account_update(&account_update) {
-                    info!(
-                        pool = %parsed.to_market_event_kind(),
+                    debug!(
                         slot = account_update.slot,
                         "Parsed DEX account update"
                     );
@@ -393,8 +392,8 @@ async fn run_geyser_loop(
                 // Try to parse as DEX event (PoolCreated, Trade)
                 let event_kind = if let Some(parsed) = parse_transaction_update(&tx_update) {
                     info!(
-                        event = %format!("{:?}", parsed),
                         slot = tx_update.slot,
+                        sig = %tx_update.signature,
                         "Parsed DEX transaction"
                     );
                     parsed.to_market_event_kind()
