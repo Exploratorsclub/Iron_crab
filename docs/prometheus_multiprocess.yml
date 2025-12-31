@@ -1,0 +1,49 @@
+# Prometheus configuration for IronCrab Multi-Process Architecture
+# Place in /etc/prometheus/prometheus.yml or include via prometheus.yml
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Market Data Service (Geyser ingest + pool discovery)
+  - job_name: 'market-data'
+    static_configs:
+      - targets: ['localhost:9801']
+    metrics_path: /metrics
+
+  # Momentum Bot (Strategy Plane - 4-Filter policy)
+  - job_name: 'momentum-bot'
+    static_configs:
+      - targets: ['localhost:9802']
+    metrics_path: /metrics
+
+  # Arb Strategy (Arbitrage detection)
+  - job_name: 'arb-strategy'
+    static_configs:
+      - targets: ['localhost:9803']
+    metrics_path: /metrics
+
+  # Execution Engine (Single-signer, simulation-gated)
+  - job_name: 'execution-engine'
+    static_configs:
+      - targets: ['localhost:9804']
+    metrics_path: /metrics
+
+  # Control Plane (FastAPI)
+  - job_name: 'control-plane'
+    static_configs:
+      - targets: ['localhost:8080']
+    metrics_path: /metrics
+
+  # NATS Server (optional, if nats-prometheus-exporter is running)
+  - job_name: 'nats'
+    static_configs:
+      - targets: ['localhost:7777']
+    metrics_path: /metrics
+
+  # Legacy Monolith (if still running)
+  - job_name: 'ironcrab-monolith'
+    static_configs:
+      - targets: ['localhost:9898']
+    metrics_path: /metrics
