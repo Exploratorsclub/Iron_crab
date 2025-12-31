@@ -9,8 +9,8 @@
 //! This module is used by execution-engine to process arb-strategy intents.
 
 use anyhow::{anyhow, Result};
-use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
     pubkey::Pubkey,
     signature::Keypair,
@@ -23,7 +23,8 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::ipc::TradeIntent;
-use crate::solana::dex::{pumpfun::PumpFunDex, raydium::RaydiumDex, Dex, Quote};
+use crate::solana::dex::{pumpfun::PumpFunDex, raydium::Raydium, Dex, Quote};
+use crate::solana::solana_rpc::SolanaRpc;
 
 /// SOL mint address
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -59,7 +60,7 @@ pub struct CrossDexSwapPlan {
 /// Manages DEX connectors and provides methods for validating and executing
 /// cross-DEX arbitrage opportunities.
 pub struct CrossDexHandler {
-    rpc: Arc<RpcClient>,
+    rpc: Arc<SolanaRpc>,
     /// DEX connectors by name
     dexes: HashMap<String, Arc<dyn Dex>>,
     /// Wallet keypair (for building transactions)
@@ -70,7 +71,7 @@ pub struct CrossDexHandler {
 
 impl CrossDexHandler {
     /// Create a new CrossDexHandler
-    pub fn new(rpc: Arc<RpcClient>, wallet: Option<Keypair>) -> Self {
+    pub fn new(rpc: Arc<SolanaRpc>, wallet: Option<Keypair>) -> Self {
         Self {
             rpc,
             dexes: HashMap::new(),
@@ -82,12 +83,12 @@ impl CrossDexHandler {
     /// Initialize DEX connectors
     pub async fn init_dexes(&mut self) -> Result<()> {
         // Initialize Raydium
-        let raydium = RaydiumDex::new((*self.rpc).clone());
+        let raydium = Raydium::new(Arc::clone(&self.rpc));
         self.dexes.insert("raydium".to_string(), Arc::new(raydium));
         info!("Initialized Raydium DEX connector");
 
         // Initialize PumpFun
-        let pumpfun = PumpFunDex::new((*self.rpc).clone());
+        let pumpfun = PumpFunDex::new(Arc::clone(&self.rpc))?;
         self.dexes.insert("pumpfun".to_string(), Arc::new(pumpfun));
         info!("Initialized PumpFun DEX connector");
 
