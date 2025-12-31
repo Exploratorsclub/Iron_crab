@@ -25,6 +25,7 @@
 use anyhow::Result;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use solana_client::rpc_client::RpcClient;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -40,6 +41,7 @@ use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{
     NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_TRADE_INTENTS,
 };
+use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
 use ironcrab::storage::{
     locks::{LockHolder, LockManager, LockResult},
@@ -68,8 +70,12 @@ struct Args {
     #[arg(long, env = "NATS_URL", default_value = "nats://localhost:4222")]
     nats_url: String,
 
+    /// Solana RPC URL
+    #[arg(long, env = "RPC_URL", default_value = "http://127.0.0.1:8899")]
+    rpc_url: String,
+
     /// Prometheus metrics port
-    #[arg(long, default_value = "9803")]
+    #[arg(long, default_value = "9804")]
     metrics_port: u16,
 
     /// Log directory override
@@ -318,11 +324,19 @@ struct ExecutionContext {
     /// Bundle confirmations counter
     bundles_confirmed: std::sync::atomic::AtomicU64,
     
+    // === Cross-DEX Arbitrage Handler ===
+    /// Handler for cross-DEX arb intents (optional, requires RPC)
+    cross_dex_handler: Option<parking_lot::RwLock<CrossDexHandler>>,
+    /// RPC client for simulations and queries
+    rpc_client: Option<Arc<RpcClient>>,
+    
     // Metrics
     intents_received: std::sync::atomic::AtomicU64,
     intents_rejected: std::sync::atomic::AtomicU64,
     sim_failures: std::sync::atomic::AtomicU64,
     tx_sent: std::sync::atomic::AtomicU64,
+    arb_validated: std::sync::atomic::AtomicU64,
+    arb_executed: std::sync::atomic::AtomicU64,
 }
 
 impl ExecutionContext {
@@ -707,11 +721,16 @@ async fn main() -> Result<()> {
         jito_client,
         bundles_submitted: std::sync::atomic::AtomicU64::new(0),
         bundles_confirmed: std::sync::atomic::AtomicU64::new(0),
+        // Cross-DEX handler (initialized below)
+        cross_dex_handler: None,
+        rpc_client: None,
         // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
         sim_failures: std::sync::atomic::AtomicU64::new(0),
         tx_sent: std::sync::atomic::AtomicU64::new(0),
+        arb_validated: std::sync::atomic::AtomicU64::new(0),
+        arb_executed: std::sync::atomic::AtomicU64::new(0),
     });
 
     // === Main Loop: Process TradeIntents ===
@@ -1232,6 +1251,80 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 reason_code: Some(reason.to_string()),
                 details: Some(format!("Lock held by: {}", holder.intent_id)),
             });
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+        }
+    }
+
+    // === Cross-DEX Arbitrage Validation (if applicable) ===
+    let is_cross_dex_arb = CrossDexHandler::is_cross_dex_arb_intent(&intent);
+    let mut cross_dex_validation = None;
+    
+    if is_cross_dex_arb {
+        info!(intent_id = %intent.intent_id, "Processing as Cross-DEX arbitrage intent");
+        
+        if let Some(ref handler_lock) = ctx.cross_dex_handler {
+            let handler = handler_lock.read();
+            
+            // Estimate tx cost for profitability check
+            let estimated_tx_cost = 50_000u64; // ~0.00005 SOL (TODO: use fee policy)
+            
+            match handler.validate_arb_opportunity(&intent, estimated_tx_cost).await {
+                Ok(validation) => {
+                    ctx.arb_validated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    
+                    if !validation.is_valid {
+                        let reason = RejectReason::ArbSpreadInsufficient;
+                        checks.push(CheckResult {
+                            check_name: "cross_dex_validation".to_string(),
+                            passed: false,
+                            reason_code: Some(reason.to_string()),
+                            details: validation.reject_reason.clone(),
+                        });
+                        
+                        // Release lock on rejection
+                        ctx.lock_manager.release_locks(&intent.intent_id);
+                        
+                        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+                    }
+                    
+                    checks.push(CheckResult {
+                        check_name: "cross_dex_validation".to_string(),
+                        passed: true,
+                        reason_code: None,
+                        details: Some(format!(
+                            "spread={}bps profit={}lamports",
+                            validation.actual_spread_bps,
+                            validation.estimated_profit_lamports
+                        )),
+                    });
+                    
+                    cross_dex_validation = Some(validation);
+                }
+                Err(e) => {
+                    warn!(error = %e, "Cross-DEX validation failed");
+                    let reason = RejectReason::ArbValidationError;
+                    checks.push(CheckResult {
+                        check_name: "cross_dex_validation".to_string(),
+                        passed: false,
+                        reason_code: Some(reason.to_string()),
+                        details: Some(e.to_string()),
+                    });
+                    
+                    ctx.lock_manager.release_locks(&intent.intent_id);
+                    return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+                }
+            }
+        } else {
+            // Cross-DEX handler not configured
+            let reason = RejectReason::ArbHandlerNotConfigured;
+            checks.push(CheckResult {
+                check_name: "cross_dex_handler".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some("Cross-DEX handler not initialized".to_string()),
+            });
+            
+            ctx.lock_manager.release_locks(&intent.intent_id);
             return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
         }
     }

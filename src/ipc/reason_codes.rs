@@ -89,6 +89,16 @@ pub enum RejectReason {
     FairnessStarved,
     /// Source/worker is temporarily blocked due to excessive preemption
     FairnessBlocked,
+
+    // === Cross-DEX Arbitrage ===
+    /// Spread no longer profitable after live quote validation
+    ArbSpreadInsufficient,
+    /// Cross-DEX validation encountered an error
+    ArbValidationError,
+    /// Cross-DEX handler not configured
+    ArbHandlerNotConfigured,
+    /// One or both DEX quotes unavailable
+    ArbQuoteUnavailable,
 }
 
 impl RejectReason {
@@ -126,6 +136,10 @@ impl RejectReason {
             Self::FeeUnprofitable => "FEE_UNPROFITABLE",
             Self::FairnessStarved => "FAIRNESS_STARVED",
             Self::FairnessBlocked => "FAIRNESS_BLOCKED",
+            Self::ArbSpreadInsufficient => "ARB_SPREAD_INSUFFICIENT",
+            Self::ArbValidationError => "ARB_VALIDATION_ERROR",
+            Self::ArbHandlerNotConfigured => "ARB_HANDLER_NOT_CONFIGURED",
+            Self::ArbQuoteUnavailable => "ARB_QUOTE_UNAVAILABLE",
         }
     }
 
@@ -162,6 +176,10 @@ impl RejectReason {
             "FEE_UNPROFITABLE" => Self::FeeUnprofitable,
             "FAIRNESS_STARVED" => Self::FairnessStarved,
             "FAIRNESS_BLOCKED" => Self::FairnessBlocked,
+            "ARB_SPREAD_INSUFFICIENT" => Self::ArbSpreadInsufficient,
+            "ARB_VALIDATION_ERROR" => Self::ArbValidationError,
+            "ARB_HANDLER_NOT_CONFIGURED" => Self::ArbHandlerNotConfigured,
+            "ARB_QUOTE_UNAVAILABLE" => Self::ArbQuoteUnavailable,
             _ => Self::Unknown,
         }
     }
@@ -219,6 +237,17 @@ impl RejectReason {
     /// P1: Check if this is a fairness/starvation rejection
     pub fn is_fairness_related(&self) -> bool {
         matches!(self, Self::FairnessStarved | Self::FairnessBlocked)
+    }
+
+    /// Check if this is an arbitrage-related rejection
+    pub fn is_arb_related(&self) -> bool {
+        matches!(
+            self,
+            Self::ArbSpreadInsufficient
+                | Self::ArbValidationError
+                | Self::ArbHandlerNotConfigured
+                | Self::ArbQuoteUnavailable
+        )
     }
 }
 

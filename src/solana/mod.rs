@@ -1,5 +1,6 @@
 pub mod account_listener;
 pub mod arbitrage;
+pub mod cross_dex_handler;
 pub mod dex_parser;
 pub mod execution;
 pub mod geyser_listener;
