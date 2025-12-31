@@ -133,7 +133,7 @@ impl WalletTracker {
         // Check if this is a known wallet
         let wallet_type = self.classify_wallet(trader_wallet, mint);
         
-        if let Some(wtype) = wallet_type {
+        if let Some(ref wtype) = wallet_type {
             let action = if is_buy { WalletAction::Buy } else { WalletAction::Sell };
             let win_rate = self.wallet_win_rates.read().get(trader_wallet).copied();
             
@@ -156,7 +156,7 @@ impl WalletTracker {
             events.push(event);
             
             // Check for insider alerts
-            if let Some(alert) = self.check_insider_alert(&wtype, &action, mint, trader_wallet, amount_sol, run_id, component) {
+            if let Some(alert) = self.check_insider_alert(wtype, &action, mint, trader_wallet, amount_sol, run_id, component) {
                 events.push(alert);
             }
         }
