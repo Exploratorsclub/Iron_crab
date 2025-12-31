@@ -498,6 +498,11 @@ pub struct TradeIntent {
     /// Hint: urgency level for fee scaling (0=normal, 1=elevated, 2=urgent)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub hint_urgency: Option<u8>,
+
+    /// P1: Strategy-specific metadata for decision records and debugging
+    /// Key-value pairs set by strategy, consumed by execution-engine
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub metadata: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -552,6 +557,7 @@ impl TradeIntent {
             hint_compute_units: None,
             hint_priority_fee_micro_lamports: None,
             hint_urgency: None,
+            metadata: std::collections::HashMap::new(),
         }
     }
 
