@@ -26,6 +26,8 @@ use anyhow::Result;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::{Keypair, read_keypair_file};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -546,6 +548,66 @@ impl ExecutionContext {
     }
 }
 
+/// Load wallet keypair from environment variables
+/// Priority: IRONCRAB_KEYPAIR_PATH > IRONCRAB_KEYPAIR_JSON > IRONCRAB_KEYPAIR_B64
+fn load_wallet_keypair() -> Option<Keypair> {
+    // Try IRONCRAB_KEYPAIR_PATH first (file path)
+    if let Ok(path) = std::env::var("IRONCRAB_KEYPAIR_PATH") {
+        match read_keypair_file(&path) {
+            Ok(kp) => {
+                tracing::info!(path = %path, "Loaded keypair from file");
+                return Some(kp);
+            }
+            Err(e) => {
+                tracing::error!(path = %path, error = %e, "Failed to load keypair from file");
+            }
+        }
+    }
+    
+    // Try IRONCRAB_KEYPAIR_JSON (JSON array string)
+    if let Ok(json) = std::env::var("IRONCRAB_KEYPAIR_JSON") {
+        match serde_json::from_str::<Vec<u8>>(&json) {
+            Ok(bytes) => {
+                match Keypair::from_bytes(&bytes) {
+                    Ok(kp) => {
+                        tracing::info!("Loaded keypair from JSON env var");
+                        return Some(kp);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to parse keypair from JSON bytes");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to parse IRONCRAB_KEYPAIR_JSON");
+            }
+        }
+    }
+    
+    // Try IRONCRAB_KEYPAIR_B64 (base64 encoded)
+    if let Ok(b64) = std::env::var("IRONCRAB_KEYPAIR_B64") {
+        use base64::Engine;
+        match base64::engine::general_purpose::STANDARD.decode(&b64) {
+            Ok(bytes) => {
+                match Keypair::from_bytes(&bytes) {
+                    Ok(kp) => {
+                        tracing::info!("Loaded keypair from B64 env var");
+                        return Some(kp);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to parse keypair from B64 bytes");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to decode IRONCRAB_KEYPAIR_B64");
+            }
+        }
+    }
+    
+    None
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -636,12 +698,46 @@ async fn main() -> Result<()> {
 
     info!(log_dir = %log_base.display(), "JSONL writers initialized");
 
-    // Setup lock manager
-    let lock_manager = LockManager::new(args.initial_sol_lamports);
+    // Load wallet keypair and fetch real balance
+    let (wallet_pubkey, initial_balance) = if has_keys && !args.dry_run {
+        let keypair = load_wallet_keypair();
+        match keypair {
+            Some(kp) => {
+                let pubkey = kp.pubkey();
+                info!(wallet = %pubkey, "Wallet keypair loaded");
+                
+                // Fetch real balance from RPC
+                let rpc = RpcClient::new(args.rpc_url.clone());
+                match rpc.get_balance(&pubkey) {
+                    Ok(balance) => {
+                        info!(wallet = %pubkey, balance_sol = balance as f64 / 1e9, "Real wallet balance fetched");
+                        (Some(pubkey), balance)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to fetch wallet balance, using default");
+                        (Some(pubkey), args.initial_sol_lamports)
+                    }
+                }
+            }
+            None => {
+                warn!("Failed to load wallet keypair");
+                (None, args.initial_sol_lamports)
+            }
+        }
+    } else {
+        (None, args.initial_sol_lamports)
+    };
+
+    // Setup lock manager with real balance
+    let lock_manager = LockManager::new(initial_balance);
     info!(
-        initial_sol = args.initial_sol_lamports,
-        "Lock manager initialized"
+        initial_sol = initial_balance,
+        balance_sol = initial_balance as f64 / 1e9,
+        "Lock manager initialized with wallet balance"
     );
+    
+    // Update metrics with real balance
+    AVAILABLE_SOL_LAMPORTS.store(initial_balance, Ordering::Relaxed);
     
     // P1: Load state snapshot if available (DoD K)
     let snapshot = StateSnapshot::load(&log_base);
