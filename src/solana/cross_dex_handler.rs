@@ -10,7 +10,6 @@
 
 use anyhow::{anyhow, Result};
 use solana_sdk::{
-    compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
     pubkey::Pubkey,
     signature::Keypair,
@@ -23,8 +22,9 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::ipc::TradeIntent;
+use crate::solana::compute_budget_helper;
 use crate::solana::dex::{pumpfun::PumpFunDex, raydium::Raydium, Dex, Quote};
-use crate::solana::solana_rpc::SolanaRpc;
+use crate::solana::rpc::SolanaRpc;
 
 /// SOL mint address
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -340,18 +340,14 @@ impl CrossDexHandler {
 
         // Add compute budget instructions
         all_instructions.push(
-            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
-                plan.total_compute_units,
-            )
+            compute_budget_helper::set_compute_unit_limit(plan.total_compute_units)
         );
         
         if priority_fee_lamports > 0 {
             // Convert lamports to micro-lamports per CU
             let micro_lamports_per_cu = (priority_fee_lamports * 1_000_000) / plan.total_compute_units as u64;
             all_instructions.push(
-                solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(
-                    micro_lamports_per_cu,
-                )
+                compute_budget_helper::set_compute_unit_price(micro_lamports_per_cu)
             );
         }
 
