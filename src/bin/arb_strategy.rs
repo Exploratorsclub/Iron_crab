@@ -326,7 +326,7 @@ impl ArbContext {
         mint: &str,
         sol_amount: u64,
         token_amount: u64,
-        is_buy: bool,
+        _is_buy: bool,
     ) -> Option<ArbOpportunity> {
         if token_amount == 0 || sol_amount == 0 {
             return None;
@@ -352,7 +352,7 @@ impl ArbContext {
             }
 
             // Check for arbitrage opportunity
-            if let Some(mut opp) = tracker.check_arbitrage(&config) {
+            if let Some(opp) = tracker.check_arbitrage(&config) {
                 // Check cooldown
                 let cooldown = Duration::from_millis(config.intent_cooldown_ms);
                 if let Some(last_time) = tracker.last_intent_time {
@@ -557,8 +557,6 @@ async fn main() -> Result<()> {
                                             intent_id = %intent.intent_id,
                                             mint = %intent.resources.output_mint,
                                             spread_bps = intent.expected_roi_bps,
-                                            profit_est = ?intent.metadata.as_ref()
-                                                .and_then(|m| m.get("estimated_profit_lamports")),
                                             "🎯 Arb intent published"
                                         );
                                     }
