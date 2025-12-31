@@ -156,6 +156,11 @@ impl TokenArbTracker {
             .collect();
 
         if pools_with_price.len() < 2 {
+            debug!(
+                mint = %self.base_mint,
+                pools = pools_with_price.len(),
+                "Arb check: insufficient pools with prices"
+            );
             return None;
         }
 
@@ -179,6 +184,11 @@ impl TokenArbTracker {
 
         // Don't arb same DEX
         if buy_pool.dex == sell_pool.dex {
+            debug!(
+                mint = %self.base_mint,
+                dex = %buy_pool.dex,
+                "Arb check rejected: same DEX for buy/sell"
+            );
             return None;
         }
 
@@ -195,6 +205,14 @@ impl TokenArbTracker {
         let spread_bps = spread.to_string().parse::<i64>().unwrap_or(0);
 
         if spread_bps < config.min_spread_bps as i64 {
+            debug!(
+                mint = %self.base_mint,
+                buy_dex = %buy_pool.dex,
+                sell_dex = %sell_pool.dex,
+                spread_bps = spread_bps,
+                min_spread = config.min_spread_bps,
+                "Arb check rejected: spread below minimum"
+            );
             return None;
         }
 
@@ -212,6 +230,17 @@ impl TokenArbTracker {
         let net_profit = gross_profit_lamports.saturating_sub(config.est_tx_cost_lamports);
 
         if net_profit < config.min_profit_lamports {
+            debug!(
+                mint = %self.base_mint,
+                buy_dex = %buy_pool.dex,
+                sell_dex = %sell_pool.dex,
+                spread_bps = spread_bps,
+                gross_profit = gross_profit_lamports,
+                tx_cost = config.est_tx_cost_lamports,
+                net_profit = net_profit,
+                min_profit = config.min_profit_lamports,
+                "Arb check rejected: profit below minimum"
+            );
             return None;
         }
 
@@ -416,6 +445,31 @@ fn create_arb_intent(
 
     // Set TTL
     intent = intent.with_ttl_ms(config.intent_ttl_ms);
+
+    // Add Cross-DEX metadata for execution-engine
+    intent.metadata.insert("cross_dex_arb".to_string(), "true".to_string());
+    intent.metadata.insert("buy_dex".to_string(), opp.buy_dex.clone());
+    intent.metadata.insert("buy_pool".to_string(), opp.buy_pool.clone());
+    intent.metadata.insert("buy_price".to_string(), opp.buy_price.to_string());
+    intent.metadata.insert("sell_dex".to_string(), opp.sell_dex.clone());
+    intent.metadata.insert("sell_pool".to_string(), opp.sell_pool.clone());
+    intent.metadata.insert("sell_price".to_string(), opp.sell_price.to_string());
+    intent.metadata.insert("spread_bps".to_string(), opp.spread_bps.to_string());
+    intent.metadata.insert("estimated_profit_lamports".to_string(), opp.estimated_profit_lamports.to_string());
+    
+    // Decision record: why this opportunity was chosen
+    intent.metadata.insert("decision_reason".to_string(), format!(
+        "Cross-DEX arb: Buy {} @ {} ({}), Sell @ {} ({}). Spread {}bps > min {}bps. Estimated profit {} lamports > min {}",
+        opp.base_mint,
+        opp.buy_price,
+        opp.buy_dex,
+        opp.sell_price,
+        opp.sell_dex,
+        opp.spread_bps,
+        config.min_spread_bps,
+        opp.estimated_profit_lamports,
+        config.min_profit_lamports
+    ));
 
     intent
 }

@@ -135,9 +135,22 @@ impl CrossDexHandler {
         let token_mint = &intent.resources.output_mint;
         let trade_amount = intent.required_capital.raw;
 
-        // Determine which DEX each pool belongs to
-        let (buy_dex, buy_pool) = self.identify_dex(&pools[0])?;
-        let (sell_dex, sell_pool) = self.identify_dex(&pools[1])?;
+        // Extract DEX info from intent metadata (set by arb-strategy)
+        // Fallback to identify_dex if metadata not present
+        let buy_dex = intent.metadata.get("buy_dex")
+            .cloned()
+            .unwrap_or_else(|| self.identify_dex(&pools[0]).map(|(d, _)| d).unwrap_or_default());
+        let sell_dex = intent.metadata.get("sell_dex")
+            .cloned()
+            .unwrap_or_else(|| self.identify_dex(&pools[1]).map(|(d, _)| d).unwrap_or_default());
+
+        // Log original spread from strategy for comparison
+        if let Some(orig_spread) = intent.metadata.get("spread_bps") {
+            debug!(
+                original_spread_bps = %orig_spread,
+                "Cross-DEX validation using strategy's original spread for reference"
+            );
+        }
 
         debug!(
             token = %token_mint,
