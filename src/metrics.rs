@@ -140,6 +140,51 @@ fn parse_csv_line(line: &str) -> Option<RecentTrade> {
     })
 }
 
+// =============================================================================
+// Multi-Process Architecture Metrics (market-data, momentum-bot, execution-engine)
+// =============================================================================
+
+// --- market-data service metrics ---
+pub static MARKET_EVENTS_RECEIVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_EVENTS_PUBLISHED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static POOLS_DISCOVERED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static POOLS_TRACKED_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TOKENS_TRACKED_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static GEYSER_RECONNECTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static GEYSER_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+// --- momentum-bot service metrics ---
+pub static INTENTS_GENERATED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static FILTER_PASSED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static FILTER_REJECTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static FILTER_REJECTED_LIQUIDITY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static FILTER_REJECTED_VELOCITY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static FILTER_REJECTED_INFLOW: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static FILTER_REJECTED_DEV_BEHAVIOR: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_EVENTS_CONSUMED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+// --- execution-engine service metrics ---
+pub static INTENTS_RECEIVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static INTENTS_EXECUTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static INTENTS_REJECTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static SIMULATION_FAILURES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static AVAILABLE_SOL_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ACTIVE_CAPITAL_LOCKS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static ACTIVE_RESOURCE_LOCKS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// Rejection reasons (labeled counters)
+pub static REJECT_TTL_EXPIRED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REJECT_DUPLICATE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REJECT_CAPITAL_LOCK: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REJECT_RESOURCE_LOCK: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REJECT_RISK_LIMIT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REJECT_SIMULATION_FAIL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+// --- NATS messaging metrics ---
+pub static NATS_MESSAGES_PUBLISHED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static NATS_MESSAGES_RECEIVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static NATS_RECONNECTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static NATS_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
 // Global counters (simple, lock-free). For production consider Prometheus exporter.
 pub static QUOTE_REQUESTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static QUOTE_SUCCESSES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -562,7 +607,7 @@ pub fn record_slippage(_slippage_bps: f64) {
 
 async fn metrics_response() -> Response<Body> {
     // Build Prometheus exposition text
-    let mut out = String::with_capacity(4096);
+    let mut out = String::with_capacity(8192);
     macro_rules! line {
         ($name:expr, $val:expr) => {
             out.push_str($name);
@@ -571,6 +616,77 @@ async fn metrics_response() -> Response<Body> {
             out.push('\n');
         };
     }
+    
+    // =============================================================================
+    // Multi-Process Architecture Metrics
+    // =============================================================================
+    
+    // --- market-data service ---
+    line!("market_events_received_total", MARKET_EVENTS_RECEIVED_TOTAL.load(Ordering::Relaxed));
+    line!("market_events_published_total", MARKET_EVENTS_PUBLISHED_TOTAL.load(Ordering::Relaxed));
+    line!("pools_discovered_total", POOLS_DISCOVERED_TOTAL.load(Ordering::Relaxed));
+    line!("pools_tracked_total", POOLS_TRACKED_GAUGE.load(Ordering::Relaxed));
+    line!("tokens_tracked_total", TOKENS_TRACKED_GAUGE.load(Ordering::Relaxed));
+    line!("geyser_reconnects_total", GEYSER_RECONNECTS_TOTAL.load(Ordering::Relaxed));
+    line!("geyser_errors_total", GEYSER_ERRORS_TOTAL.load(Ordering::Relaxed));
+    
+    // --- momentum-bot service ---
+    line!("intents_generated_total", INTENTS_GENERATED_TOTAL.load(Ordering::Relaxed));
+    line!("filter_passed_total", FILTER_PASSED_TOTAL.load(Ordering::Relaxed));
+    line!("filter_rejected_total", FILTER_REJECTED_TOTAL.load(Ordering::Relaxed));
+    // Filter rejection breakdown
+    out.push_str("filter_rejection_by_reason{reason=\"liquidity\"} ");
+    out.push_str(&FILTER_REJECTED_LIQUIDITY.load(Ordering::Relaxed).to_string());
+    out.push('\n');
+    out.push_str("filter_rejection_by_reason{reason=\"velocity\"} ");
+    out.push_str(&FILTER_REJECTED_VELOCITY.load(Ordering::Relaxed).to_string());
+    out.push('\n');
+    out.push_str("filter_rejection_by_reason{reason=\"inflow\"} ");
+    out.push_str(&FILTER_REJECTED_INFLOW.load(Ordering::Relaxed).to_string());
+    out.push('\n');
+    out.push_str("filter_rejection_by_reason{reason=\"dev_behavior\"} ");
+    out.push_str(&FILTER_REJECTED_DEV_BEHAVIOR.load(Ordering::Relaxed).to_string());
+    out.push('\n');
+    line!("market_events_consumed_total", MARKET_EVENTS_CONSUMED_TOTAL.load(Ordering::Relaxed));
+    
+    // --- execution-engine service ---
+    line!("intents_received_total", INTENTS_RECEIVED_TOTAL.load(Ordering::Relaxed));
+    line!("intents_executed_total", INTENTS_EXECUTED_TOTAL.load(Ordering::Relaxed));
+    line!("intents_rejected_total", INTENTS_REJECTED_TOTAL.load(Ordering::Relaxed));
+    line!("simulation_failures_total", SIMULATION_FAILURES_TOTAL.load(Ordering::Relaxed));
+    line!("available_sol_lamports", AVAILABLE_SOL_LAMPORTS.load(Ordering::Relaxed));
+    line!("active_capital_locks", ACTIVE_CAPITAL_LOCKS.load(Ordering::Relaxed));
+    line!("active_resource_locks", ACTIVE_RESOURCE_LOCKS.load(Ordering::Relaxed));
+    // Intent rejection reasons breakdown
+    out.push_str("intent_rejection_by_reason{reason=\"ttl_expired\"} ");
+    out.push_str(&REJECT_TTL_EXPIRED.load(Ordering::Relaxed).to_string());
+    out.push('\n');
+    out.push_str("intent_rejection_by_reason{reason=\"duplicate\"} ");
+    out.push_str(&REJECT_DUPLICATE.load(Ordering::Relaxed).to_string());
+    out.push('\n');
+    out.push_str("intent_rejection_by_reason{reason=\"capital_lock\"} ");
+    out.push_str(&REJECT_CAPITAL_LOCK.load(Ordering::Relaxed).to_string());
+    out.push('\n');
+    out.push_str("intent_rejection_by_reason{reason=\"resource_lock\"} ");
+    out.push_str(&REJECT_RESOURCE_LOCK.load(Ordering::Relaxed).to_string());
+    out.push('\n');
+    out.push_str("intent_rejection_by_reason{reason=\"risk_limit\"} ");
+    out.push_str(&REJECT_RISK_LIMIT.load(Ordering::Relaxed).to_string());
+    out.push('\n');
+    out.push_str("intent_rejection_by_reason{reason=\"simulation_fail\"} ");
+    out.push_str(&REJECT_SIMULATION_FAIL.load(Ordering::Relaxed).to_string());
+    out.push('\n');
+    
+    // --- NATS messaging ---
+    line!("nats_messages_published_total", NATS_MESSAGES_PUBLISHED_TOTAL.load(Ordering::Relaxed));
+    line!("nats_messages_received_total", NATS_MESSAGES_RECEIVED_TOTAL.load(Ordering::Relaxed));
+    line!("nats_reconnects_total", NATS_RECONNECTS_TOTAL.load(Ordering::Relaxed));
+    line!("nats_errors_total", NATS_ERRORS_TOTAL.load(Ordering::Relaxed));
+    
+    // =============================================================================
+    // Legacy / Shared Metrics
+    // =============================================================================
+    
     line!(
         "quote_requests_total",
         QUOTE_REQUESTS.load(Ordering::Relaxed)

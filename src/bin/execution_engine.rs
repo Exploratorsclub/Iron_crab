@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -37,7 +38,13 @@ use ironcrab::ipc::{
     DecisionRecord, FairnessPolicy, FeePolicy, IntentOrigin,
     RejectReason, SimulationResult, TradeIntent, TradingRegime,
 };
-use ironcrab::metrics::serve_metrics;
+use ironcrab::metrics::{
+    serve_metrics, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS,
+    INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
+    NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
+    REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_RISK_LIMIT,
+    REJECT_SIMULATION_FAIL, REJECT_TTL_EXPIRED, SIMULATION_FAILURES_TOTAL,
+};
 use ironcrab::nats::{
     NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_TRADE_INTENTS,
 };
@@ -869,6 +876,15 @@ async fn main() -> Result<()> {
                     let received = ctx.intents_received.load(std::sync::atomic::Ordering::Relaxed);
                     let rejected = ctx.intents_rejected.load(std::sync::atomic::Ordering::Relaxed);
                     let sim_fail = ctx.sim_failures.load(std::sync::atomic::Ordering::Relaxed);
+                    let available_sol = ctx.lock_manager.available_sol();
+
+                    // Update Prometheus metrics
+                    INTENTS_RECEIVED_TOTAL.store(received, Ordering::Relaxed);
+                    INTENTS_REJECTED_TOTAL.store(rejected, Ordering::Relaxed);
+                    SIMULATION_FAILURES_TOTAL.store(sim_fail, Ordering::Relaxed);
+                    ACTIVE_CAPITAL_LOCKS.store(cap_locks as u64, Ordering::Relaxed);
+                    ACTIVE_RESOURCE_LOCKS.store(res_locks as u64, Ordering::Relaxed);
+                    AVAILABLE_SOL_LAMPORTS.store(available_sol, Ordering::Relaxed);
 
                     info!(
                         tick = simulated_tick,
@@ -877,7 +893,7 @@ async fn main() -> Result<()> {
                         sim_failures = sim_fail,
                         active_capital_locks = cap_locks,
                         active_resource_locks = res_locks,
-                        available_sol = ctx.lock_manager.available_sol(),
+                        available_sol = available_sol,
                         "Execution-engine heartbeat"
                     );
                     
@@ -958,10 +974,14 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         source = %intent.source,
         "Processing intent"
     );
+    
+    // Update received counter
+    NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
 
     // === Check 1: Idempotency ===
     if ctx.lock_manager.is_duplicate(&intent.intent_id) {
         let reason = RejectReason::LockDuplicateIntent;
+        REJECT_DUPLICATE.fetch_add(1, Ordering::Relaxed);
         checks.push(CheckResult {
             check_name: "idempotency".to_string(),
             passed: false,

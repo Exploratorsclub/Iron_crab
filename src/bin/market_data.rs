@@ -18,6 +18,7 @@ use clap::Parser;
 use solana_sdk::pubkey::Pubkey;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -26,7 +27,11 @@ use ironcrab::config::WalletTrackerCfg;
 use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, MarketEvent, MarketEventKind,
 };
-use ironcrab::metrics::serve_metrics;
+use ironcrab::metrics::{
+    serve_metrics, GEYSER_ERRORS_TOTAL, GEYSER_RECONNECTS_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
+    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    POOLS_DISCOVERED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+};
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
 use ironcrab::solana::dex_parser::{parse_account_update, parse_transaction_update, ParsedDexEvent};
 use ironcrab::solana::wallet_tracker::WalletTracker;
@@ -396,6 +401,10 @@ async fn run_geyser_loop(
                 if let Some(ref nats) = ctx.nats {
                     if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
                         warn!(error = %e, "Failed to publish account event to NATS");
+                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -483,6 +492,10 @@ async fn run_geyser_loop(
                 if let Some(ref nats) = ctx.nats {
                     if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
                         warn!(error = %e, "Failed to publish tx event to NATS");
+                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -526,6 +539,12 @@ async fn run_geyser_loop(
             _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                 if last_heartbeat.elapsed().as_secs() >= 60 {
                     let (records, bytes) = ctx.jsonl_writer.stats();
+                    let total_events = account_count + tx_count;
+                    
+                    // Update Prometheus metrics
+                    MARKET_EVENTS_RECEIVED_TOTAL.store(total_events, Ordering::Relaxed);
+                    POOLS_TRACKED_GAUGE.store(account_count, Ordering::Relaxed);
+                    
                     info!(
                         accounts = account_count,
                         transactions = tx_count,

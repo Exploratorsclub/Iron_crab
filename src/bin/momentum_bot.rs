@@ -24,6 +24,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
@@ -34,7 +35,13 @@ use ironcrab::ipc::{
     ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind, TradeIntent,
     TradeResources, TradeSide, TradingRegime,
 };
-use ironcrab::metrics::serve_metrics;
+use ironcrab::metrics::{
+    serve_metrics, FILTER_PASSED_TOTAL, FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_INFLOW,
+    FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOTAL, FILTER_REJECTED_VELOCITY,
+    INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
+    TOKENS_TRACKED_GAUGE,
+};
 use ironcrab::nats::{
     NatsClient, NatsConfig, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS,
 };
@@ -570,6 +577,8 @@ impl TokenTracker {
         
         // Filter 1: Liquidity Check
         if metrics.initial_liquidity_sol < config.early_min_liquidity_sol {
+            FILTER_REJECTED_LIQUIDITY.fetch_add(1, Ordering::Relaxed);
+            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return (false, format!(
                 "Liquidity too low: {:.2} SOL (min {:.2})",
                 metrics.initial_liquidity_sol, config.early_min_liquidity_sol
@@ -578,11 +587,15 @@ impl TokenTracker {
         
         // Filter 1b: LP removal
         if metrics.lp_removed {
+            FILTER_REJECTED_LIQUIDITY.fetch_add(1, Ordering::Relaxed);
+            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return (false, "LP removed".to_string());
         }
         
         // Filter 2: Buyer Velocity
         if metrics.unique_buyers_in_window < config.min_unique_buyers {
+            FILTER_REJECTED_VELOCITY.fetch_add(1, Ordering::Relaxed);
+            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return (false, format!(
                 "Not enough buyers: {} (min {})",
                 metrics.unique_buyers_in_window, config.min_unique_buyers
@@ -590,6 +603,8 @@ impl TokenTracker {
         }
         
         if metrics.trades_per_sec < config.min_trades_per_sec {
+            FILTER_REJECTED_VELOCITY.fetch_add(1, Ordering::Relaxed);
+            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return (false, format!(
                 "Trade velocity too low: {:.2}/s (min {:.2})",
                 metrics.trades_per_sec, config.min_trades_per_sec
@@ -597,6 +612,8 @@ impl TokenTracker {
         }
         
         if metrics.buy_dominance < config.min_buy_dominance {
+            FILTER_REJECTED_VELOCITY.fetch_add(1, Ordering::Relaxed);
+            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return (false, format!(
                 "Buy dominance too low: {:.1}% (min {:.1}%)",
                 metrics.buy_dominance * 100.0, config.min_buy_dominance * 100.0
@@ -605,6 +622,8 @@ impl TokenTracker {
         
         // Filter 3: SOL Inflow
         if metrics.net_sol_inflow < config.min_sol_inflow_lamports {
+            FILTER_REJECTED_INFLOW.fetch_add(1, Ordering::Relaxed);
+            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return (false, format!(
                 "SOL inflow too low: {:.2} SOL (min {:.2})",
                 metrics.net_sol_inflow as f64 / 1_000_000_000.0,
@@ -614,10 +633,13 @@ impl TokenTracker {
         
         // Filter 4: Dev Behavior
         if metrics.dev_sold_early {
+            FILTER_REJECTED_DEV_BEHAVIOR.fetch_add(1, Ordering::Relaxed);
+            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return (false, "Dev sold early".to_string());
         }
         
         // All filters passed!
+        FILTER_PASSED_TOTAL.fetch_add(1, Ordering::Relaxed);
         let reason = format!(
             "All filters passed: liq={:.1}SOL, buyers={}, vel={:.2}/s, dom={:.0}%, inflow={:.1}SOL",
             metrics.initial_liquidity_sol,
@@ -1401,6 +1423,12 @@ async fn main() -> Result<()> {
                 let exits_generated = ctx.exits_generated.load(std::sync::atomic::Ordering::Relaxed);
                 let open_positions = ctx.position_count();
                 let pending_intents = ctx.pending_count();
+                
+                // Update Prometheus metrics
+                MARKET_EVENTS_CONSUMED_TOTAL.store(events_received, Ordering::Relaxed);
+                POOLS_TRACKED_GAUGE.store(pools as u64, Ordering::Relaxed);
+                TOKENS_TRACKED_GAUGE.store(tokens_tracked, Ordering::Relaxed);
+                INTENTS_GENERATED_TOTAL.store(intents_generated, Ordering::Relaxed);
                 
                 info!(
                     events_received = events_received,
