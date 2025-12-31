@@ -29,7 +29,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Components
-COMPONENTS=("market-data" "momentum-bot" "execution-engine")
+COMPONENTS=("market-data" "momentum-bot" "arb-strategy" "execution-engine")
 SYSTEMD_DIR="/etc/systemd/system"
 
 # -----------------------------------------------------------------------------
@@ -48,6 +48,7 @@ if [ "$SKIP_BUILD" = false ]; then
     cargo build --release --features nats \
         --bin market-data \
         --bin momentum-bot \
+            --bin arb-strategy \
         --bin execution-engine
     
     log_info "Build complete."
@@ -76,6 +77,7 @@ install_service() {
 log_info "Installing systemd services..."
 install_service "market-data"
 install_service "momentum-bot"
+install_service "arb-strategy"
 install_service "execution-engine"
 install_service "control-plane"
 sudo cp "docs/systemd/ironcrab.target" "$SYSTEMD_DIR/"
@@ -116,19 +118,28 @@ for svc in market-data momentum-bot execution-engine control-plane; do
     fi
 done
 
+status=$(systemctl is-active "arb-strategy" 2>/dev/null || echo "inactive")
+if [ "$status" = "active" ]; then
+    echo -e "  ${GREEN}●${NC} arb-strategy: $status"
+else
+    echo -e "  ${RED}●${NC} arb-strategy: $status"
+fi
+
 echo ""
 log_info "Deployment complete!"
 echo ""
 echo "📊 Metrics endpoints:"
 echo "   - market-data:      http://localhost:9801/metrics"
 echo "   - momentum-bot:     http://localhost:9802/metrics"
-echo "   - execution-engine: http://localhost:9803/metrics"
+echo "   - arb-strategy:     http://localhost:9803/metrics"
+echo "   - execution-engine: http://localhost:9804/metrics"
 echo ""
 echo "🔧 Control Plane:      http://localhost:8080"
 echo ""
 echo "📜 View logs:"
 echo "   journalctl -u market-data -f"
 echo "   journalctl -u momentum-bot -f"
+echo "   journalctl -u arb-strategy -f"
 echo "   journalctl -u execution-engine -f"
 echo "   journalctl -u control-plane -f"
 echo ""

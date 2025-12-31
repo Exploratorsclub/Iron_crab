@@ -1,0 +1,45 @@
+[Unit]
+Description=IronCrab Arb Strategy (Keyless)
+After=network-online.target nats.service market-data.service
+Wants=network-online.target
+PartOf=ironcrab.target
+
+[Service]
+# NOTE: arb-strategy currently does not sd_notify READY=1, so Type=simple.
+Type=simple
+User=ironcrab
+Group=ironcrab
+WorkingDirectory=/home/ironcrab/Iron_crab
+
+ExecStart=/home/ironcrab/Iron_crab/target/release/arb-strategy \
+    --config /home/ironcrab/Iron_crab/my_config.server.toml \
+    --nats-url nats://localhost:4222 \
+    --metrics-port 9803 \
+    --log-dir trade_logs
+
+Environment=RUST_LOG=info,arb_strategy=info
+
+# IMPORTANT: No wallet keys here (keyless strategy plane)
+# Do NOT set IRONCRAB_KEYPAIR_PATH/KEYPAIR_PATH in this service.
+
+Restart=on-failure
+RestartSec=3
+StartLimitBurst=10
+StartLimitIntervalSec=300
+
+# Resource controls
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUWeight=100
+CPUAffinity=56-59
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ironcrab/Iron_crab/trade_logs
+
+[Install]
+WantedBy=ironcrab.target
