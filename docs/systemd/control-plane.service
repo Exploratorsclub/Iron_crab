@@ -17,6 +17,7 @@ ExecStart=/home/ironcrab/Iron_crab/.venv/bin/uvicorn main:app \
 Environment=NATS_URL=nats://localhost:4222
 Environment=MARKET_DATA_URL=http://127.0.0.1:9801
 Environment=MOMENTUM_BOT_URL=http://127.0.0.1:9802
+Environment=ARB_STRATEGY_URL=http://127.0.0.1:9803
 Environment=EXECUTION_ENGINE_URL=http://127.0.0.1:9804
 
 Restart=on-failure
@@ -27,7 +28,10 @@ Nice=15
 CPUWeight=50
 
 # Hardening
-NoNewPrivileges=yes
+# NOTE: If you want to use the UI to start/stop/restart services via systemd,
+# the control-plane may need permission to call `systemctl` (commonly via sudoers).
+# `NoNewPrivileges=yes` prevents sudo from elevating.
+NoNewPrivileges=no
 PrivateTmp=yes
 
 [Install]

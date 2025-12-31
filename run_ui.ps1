@@ -20,13 +20,22 @@ if (-not (Test-Path $UiDir)) {
   throw "UI folder not found: $UiDir"
 }
 
-# Resolve npm
-$npmCmd = (Get-Command npm -ErrorAction SilentlyContinue)?.Source
+# Ensure Node.js is on PATH (some VS Code terminals don't inherit it)
+$nodeDir = 'C:\Program Files\nodejs'
+if (Test-Path (Join-Path $nodeDir 'node.exe')) {
+  if (($env:Path -split ';') -notcontains $nodeDir) {
+    $env:Path = "$nodeDir;" + $env:Path
+  }
+}
+
+# Resolve npm (prefer npm.cmd to avoid PowerShell execution-policy blocking npm.ps1)
+$npmCmd = (Get-Command npm.cmd -ErrorAction SilentlyContinue)?.Source
 if (-not $npmCmd) {
   $fallbackNpm = 'C:\Program Files\nodejs\npm.cmd'
-  if (Test-Path $fallbackNpm) {
-    $npmCmd = $fallbackNpm
-  }
+  if (Test-Path $fallbackNpm) { $npmCmd = $fallbackNpm }
+}
+if (-not $npmCmd) {
+  $npmCmd = (Get-Command npm -ErrorAction SilentlyContinue)?.Source
 }
 
 if (-not $npmCmd) {

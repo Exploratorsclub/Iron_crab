@@ -27,6 +27,83 @@ section {
   margin-top: 16px;
 }
 
+.card {
+  margin: 8px 0 0 0;
+  padding: 12px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  background: #fafafa;
+}
+
+.kv {
+  margin: 8px 0 0 0;
+}
+
+.kvRow {
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 4px 0;
+}
+
+.statusTable {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+}
+
+.statusTable th,
+.statusTable td {
+  text-align: left;
+  padding: 8px;
+  border: 1px solid #ddd;
+  vertical-align: top;
+}
+
+.statusTable th {
+  background: #fafafa;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.textInput {
+  width: min(520px, 70vw);
+  padding: 8px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #fff;
+  color: #111;
+}
+
+.checkboxRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+button {
+  padding: 6px 10px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #fafafa;
+}
+
+button.danger {
+  border-color: #b00020;
+  color: #b00020;
+}
+
 pre {
   margin: 8px 0 0 0;
   padding: 12px;

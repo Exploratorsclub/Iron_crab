@@ -22,6 +22,7 @@ uvicorn control_plane.main:app --host 0.0.0.0 --port 8080 --reload
 | `NATS_URL` | `nats://localhost:4222` | NATS server URL |
 | `MARKET_DATA_URL` | `http://127.0.0.1:9801` | market-data metrics endpoint |
 | `MOMENTUM_BOT_URL` | `http://127.0.0.1:9802` | momentum-bot metrics endpoint |
+| `ARB_STRATEGY_URL` | `http://127.0.0.1:9803` | arb-strategy metrics endpoint |
 | `EXECUTION_ENGINE_URL` | `http://127.0.0.1:9804` | execution-engine metrics endpoint |
 | `CONTROL_PLANE_PORT` | `8080` | Control plane HTTP port |
 
@@ -40,7 +41,19 @@ uvicorn control_plane.main:app --host 0.0.0.0 --port 8080 --reload
 ### Management
 - `POST /config` - Update component configuration
 - `POST /command/{component}` - Send command to component via NATS
+- `POST /systemd/{component}/{action}` - Start/stop/restart via systemd (admin)
 - `GET /logs/{component}` - Get recent logs
+
+#### systemd operator endpoint
+
+`POST /systemd/{component}/{action}`
+
+- `{component}`: `market-data`, `momentum-bot`, `arb-strategy`, `execution-engine`
+- `{action}`: `start`, `stop`, `restart`, `status`
+
+Notes:
+- Requires admin auth.
+- The control-plane service user must be allowed to run `systemctl` (commonly via sudoers).
 
 ## Kill Switch
 

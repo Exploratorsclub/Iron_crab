@@ -40,6 +40,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
+import shlex
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, Security
 from fastapi.middleware.cors import CORSMiddleware
@@ -83,6 +84,7 @@ class Config:
     NATS_URL: str = os.getenv("NATS_URL", "nats://localhost:4222")
     MARKET_DATA_URL: str = os.getenv("MARKET_DATA_URL", "http://127.0.0.1:9801")
     MOMENTUM_BOT_URL: str = os.getenv("MOMENTUM_BOT_URL", "http://127.0.0.1:9802")
+    ARB_STRATEGY_URL: str = os.getenv("ARB_STRATEGY_URL", "http://127.0.0.1:9803")
     EXECUTION_ENGINE_URL: str = os.getenv("EXECUTION_ENGINE_URL", "http://127.0.0.1:9804")
     
     # NATS topics
@@ -100,6 +102,51 @@ class Config:
     REQUIRE_AUTH: bool = os.getenv("CONTROL_PLANE_REQUIRE_AUTH", "false").lower() == "true"
 
 config = Config()
+
+SYSTEMD_COMPONENTS: Dict[str, str] = {
+    "market-data": "market-data.service",
+    "momentum-bot": "momentum-bot.service",
+    "arb-strategy": "arb-strategy.service",
+    "execution-engine": "execution-engine.service",
+}
+
+def _valid_component_list() -> List[str]:
+    return list(SYSTEMD_COMPONENTS.keys())
+
+async def _run_command(argv: List[str], timeout_s: float = 8.0) -> Dict[str, Any]:
+    """Run a command and capture stdout/stderr without raising.
+
+    Intended for operator actions (non hot-path).
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return {
+                "ok": False,
+                "argv": argv,
+                "timeout_s": timeout_s,
+                "error": "timeout",
+            }
+
+        stdout = stdout_b.decode(errors="replace") if stdout_b else ""
+        stderr = stderr_b.decode(errors="replace") if stderr_b else ""
+        return {
+            "ok": proc.returncode == 0,
+            "argv": argv,
+            "returncode": proc.returncode,
+            "stdout": stdout.strip(),
+            "stderr": stderr.strip(),
+        }
+    except Exception as e:
+        return {"ok": False, "argv": argv, "error": str(e)}
 
 # ============================================================================
 # RBAC: Role-Based Access Control
@@ -662,6 +709,7 @@ async def get_status(user: User = Depends(require_viewer)):
     component_configs = [
         ("market-data", config.MARKET_DATA_URL),
         ("momentum-bot", config.MOMENTUM_BOT_URL),
+        ("arb-strategy", config.ARB_STRATEGY_URL),
         ("execution-engine", config.EXECUTION_ENGINE_URL),
     ]
     
@@ -713,6 +761,7 @@ async def get_aggregated_metrics(user: User = Depends(require_viewer)):
     component_configs = [
         ("market-data", config.MARKET_DATA_URL),
         ("momentum-bot", config.MOMENTUM_BOT_URL),
+        ("arb-strategy", config.ARB_STRATEGY_URL),
         ("execution-engine", config.EXECUTION_ENGINE_URL),
     ]
     
@@ -803,7 +852,7 @@ async def send_command(
 ):
     """Send command to a specific component via NATS request/reply (requires: admin)"""
     
-    valid_components = ["market-data", "momentum-bot", "execution-engine"]
+    valid_components = _valid_component_list()
     if component not in valid_components:
         raise HTTPException(status_code=400, detail=f"Invalid component. Must be one of: {valid_components}")
     
@@ -835,6 +884,54 @@ async def send_command(
         "component": component,
         "command": request.command,
         "response": response,
+    }
+
+
+@app.post("/systemd/{component}/{action}")
+async def systemd_component_action(
+    component: str,
+    action: str,
+    user: User = Depends(require_admin),
+):
+    """Start/stop/restart a component via systemd (requires: admin)."""
+    valid_components = _valid_component_list()
+    if component not in valid_components:
+        raise HTTPException(status_code=400, detail=f"Invalid component. Must be one of: {valid_components}")
+
+    valid_actions = {"start", "stop", "restart", "status"}
+    if action not in valid_actions:
+        raise HTTPException(status_code=400, detail=f"Invalid action. Must be one of: {sorted(valid_actions)}")
+
+    unit = SYSTEMD_COMPONENTS[component]
+    audit_logger.warning(f"SYSTEMD: user={user.name}, component={component}, action={action}, unit={unit}")
+
+    # NOTE: This may require elevated privileges depending on the deployment.
+    argv = ["systemctl", "--no-pager", "--full", action, unit]
+    result = await _run_command(argv)
+
+    # If we hit a permissions wall, try sudo -n (requires sudoers config and NoNewPrivileges disabled).
+    stderr = (result.get("stderr") or "").lower()
+    if (not result.get("ok")) and (
+        "interactive authentication required" in stderr
+        or "access denied" in stderr
+        or "not authorized" in stderr
+    ):
+        sudo_argv = ["sudo", "-n", *argv]
+        sudo_result = await _run_command(sudo_argv)
+        if sudo_result.get("ok"):
+            result = sudo_result
+            argv = sudo_argv
+
+    # Return minimal, operator-friendly payload.
+    return {
+        "component": component,
+        "action": action,
+        "unit": unit,
+        "ok": result.get("ok", False),
+        "stdout": result.get("stdout", ""),
+        "stderr": result.get("stderr", ""),
+        "returncode": result.get("returncode"),
+        "argv": " ".join(shlex.quote(a) for a in argv),
     }
 
 @app.post("/config")
