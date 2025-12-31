@@ -111,3 +111,7 @@ path = "src/bin/momentum_bot.rs"
 [[bin]]
 name = "execution-engine"
 path = "src/bin/execution_engine.rs"
+
+[[bin]]
+name = "arb-strategy"
+path = "src/bin/arb_strategy.rs"
