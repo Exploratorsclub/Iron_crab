@@ -27,7 +27,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, read_keypair_file};
+use solana_sdk::signature::{Keypair, Signer, read_keypair_file};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
