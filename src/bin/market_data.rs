@@ -27,6 +27,7 @@ use ironcrab::ipc::{
 };
 use ironcrab::metrics::serve_metrics;
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
+use ironcrab::solana::dex_parser::{parse_account_update, parse_transaction_update};
 
 /// NATS topic for config reload (P1: Runtime Configuration via UI)
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
@@ -345,6 +346,23 @@ async fn run_geyser_loop(
             Ok(account_update) = account_rx.recv() => {
                 account_count += 1;
 
+                // Try to parse as DEX pool event
+                let event_kind = if let Some(parsed) = parse_account_update(&account_update) {
+                    info!(
+                        pool = %parsed.to_market_event_kind(),
+                        slot = account_update.slot,
+                        "Parsed DEX account update"
+                    );
+                    parsed.to_market_event_kind()
+                } else {
+                    // Fallback to raw event for unknown accounts
+                    MarketEventKind::AccountUpdate {
+                        pubkey: account_update.pubkey.to_string(),
+                        owner: account_update.owner.to_string(),
+                        data_len: account_update.data.len(),
+                    }
+                };
+
                 let event = MarketEvent::new(
                     "market-data",
                     BUILD_VERSION,
@@ -352,11 +370,7 @@ async fn run_geyser_loop(
                     ctx.next_event_id(),
                     "geyser",
                     Some(account_update.slot),
-                    MarketEventKind::AccountUpdate {
-                        pubkey: account_update.pubkey.to_string(),
-                        owner: account_update.owner.to_string(),
-                        data_len: account_update.data.len(),
-                    },
+                    event_kind,
                 );
 
                 // Write to JSONL
@@ -376,6 +390,22 @@ async fn run_geyser_loop(
             Ok(tx_update) = transaction_rx.recv() => {
                 tx_count += 1;
 
+                // Try to parse as DEX event (PoolCreated, Trade)
+                let event_kind = if let Some(parsed) = parse_transaction_update(&tx_update) {
+                    info!(
+                        event = %format!("{:?}", parsed),
+                        slot = tx_update.slot,
+                        "Parsed DEX transaction"
+                    );
+                    parsed.to_market_event_kind()
+                } else {
+                    // Fallback to raw event for unknown transactions
+                    MarketEventKind::TransactionDetected {
+                        signature: tx_update.signature.clone(),
+                        program: tx_update.account_keys.first().map(|k| k.to_string()).unwrap_or_default(),
+                    }
+                };
+
                 let event = MarketEvent::new(
                     "market-data",
                     BUILD_VERSION,
@@ -383,10 +413,7 @@ async fn run_geyser_loop(
                     ctx.next_event_id(),
                     "geyser",
                     Some(tx_update.slot),
-                    MarketEventKind::TransactionDetected {
-                        signature: tx_update.signature.clone(),
-                        program: tx_update.account_keys.first().map(|k| k.to_string()).unwrap_or_default(),
-                    },
+                    event_kind,
                 );
 
                 // Write to JSONL
