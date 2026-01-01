@@ -285,3 +285,48 @@ prefetch_top_pools = 100
 # Set to 0 to DISABLE completely, or use higher value (30-60 recommended)
 # Default: 5 (backwards compatible but heavy on RPC)
 vault_refresh_interval_secs = 60  # Refresh every 60s instead of 5s (12x less RPC load)
+
+# ============================================================================
+# MOMENTUM BOT FILTERS - Configurable thresholds (reduces 0-intent problem)
+# ============================================================================
+[momentum]
+# ENTRY FILTERS (relaxed from original hardcoded values)
+early_min_liquidity_sol = 3.0       # 3 SOL min liquidity (was 5)
+established_min_liquidity_sol = 10.0 # 10 SOL for established (was 20)
+early_slot_threshold = 1000         # Slots until considered "established"
+
+# Slippage limits  
+early_max_slippage_bps = 500        # 5% for early volatile stage (was 300)
+established_max_slippage_bps = 200  # 2% for stable pools (was 100)
+
+# Position sizing
+default_position_lamports = 100_000_000  # 0.1 SOL per trade
+
+# FILTER 1: Liquidity Check
+max_dev_supply_pct = 95.0           # Allow up to 95% dev supply (was 90)
+lp_removal_window_secs = 60         # Track LP removals for 60s
+
+# FILTER 2: Buyer Velocity (RELAXED - key filter causing 0 intents)
+min_unique_buyers = 3               # 3 unique buyers in window (WAS 10!)
+buyer_window_secs = 60              # 60 second window (was 20s)
+min_trades_per_sec = 0.1            # 0.1 trades/sec (WAS 0.5!)
+min_buy_dominance = 0.45            # 45% buys vs sells (WAS 60%)
+
+# FILTER 3: SOL Inflow (RELAXED - major blocker)
+min_sol_inflow_lamports = 500_000_000    # 0.5 SOL net inflow (WAS 20 SOL!!!)
+inflow_window_secs = 60              # 60 second window (was 30s)
+max_single_dump_lamports = 20_000_000_000 # 20 SOL max single sell (was 5 SOL)
+
+# FILTER 4: Dev Behavior
+dev_early_sell_window_secs = 90     # Dev sells in first 90s = bad (was 60s)
+dev_rebuy_positive = true           # Dev rebuy = positive signal
+
+# EXIT STRATEGY
+hard_stop_loss_pct = 20.0           # -20% hard stop (was 15)
+trailing_stop_pct = 25.0            # -25% from ATH (was 20)
+trailing_activation_pct = 15.0      # Activate trailing after +15% (was 10)
+take_profit_pct = 150.0             # Take profit at +150% (2.5x, was 2x)
+max_hold_time_secs = 600            # Max 10 minutes hold (was 5 min)
+momentum_exit_buy_ratio = 0.3       # Exit if buy ratio < 30% (was 40%)
+momentum_exit_window_secs = 45      # Check last 45s of trades (was 30s)
+momentum_exit_min_trades = 3        # Need 3+ trades to evaluate (was 5)

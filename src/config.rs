@@ -92,6 +92,8 @@ pub struct Config {
     pub orca: OrcaCfg,
     #[serde(default)]
     pub wallet_tracker: Option<WalletTrackerCfg>,
+    #[serde(default)]
+    pub momentum: Option<MomentumCfg>,
 }
 
 /// Wallet Tracker Configuration
@@ -140,6 +142,206 @@ fn default_whale_threshold() -> u64 {
 } // 10 SOL
 fn default_max_cached_wallets() -> usize {
     10_000
+}
+
+/// Momentum Strategy Configuration (for momentum-bot)
+/// All thresholds are configurable to tune filter aggressiveness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MomentumCfg {
+    /// Minimum liquidity (SOL) for EARLY regime. Default: 5.0 SOL
+    #[serde(default = "default_early_min_liquidity")]
+    pub early_min_liquidity_sol: f64,
+    /// Minimum liquidity (SOL) for ESTABLISHED regime. Default: 20.0 SOL
+    #[serde(default = "default_established_min_liquidity")]
+    pub established_min_liquidity_sol: f64,
+    /// Slot threshold for EARLY -> ESTABLISHED transition. Default: 1000 slots
+    #[serde(default = "default_early_slot_threshold")]
+    pub early_slot_threshold: u64,
+    /// Max slippage BPS for EARLY trades. Default: 300 (3%)
+    #[serde(default = "default_early_slippage")]
+    pub early_max_slippage_bps: u32,
+    /// Max slippage BPS for ESTABLISHED trades. Default: 100 (1%)
+    #[serde(default = "default_established_slippage")]
+    pub established_max_slippage_bps: u32,
+    /// Default position size (SOL lamports). Default: 0.1 SOL
+    #[serde(default = "default_position_lamports")]
+    pub default_position_lamports: u64,
+
+    // === Filter 1: Liquidity Check ===
+    /// Max dev supply percentage (e.g., 90.0 = 90%). Default: 90%
+    #[serde(default = "default_max_dev_supply_pct")]
+    pub max_dev_supply_pct: f64,
+    /// Window to detect LP removal (seconds). Default: 60s
+    #[serde(default = "default_lp_removal_window")]
+    pub lp_removal_window_secs: u64,
+
+    // === Filter 2: Buyer Velocity ===
+    /// Min unique buyers in early window. Default: 3 (was 10, too strict)
+    #[serde(default = "default_min_unique_buyers")]
+    pub min_unique_buyers: u32,
+    /// Early window for buyer count (seconds). Default: 30s
+    #[serde(default = "default_buyer_window")]
+    pub buyer_window_secs: u64,
+    /// Min trades per second for momentum. Default: 0.2 (was 0.5, too strict)
+    #[serde(default = "default_min_trades_per_sec")]
+    pub min_trades_per_sec: f64,
+    /// Min buy dominance ratio (buys / total). Default: 0.5 (was 0.6, too strict)
+    #[serde(default = "default_min_buy_dominance")]
+    pub min_buy_dominance: f64,
+
+    // === Filter 3: SOL Inflow ===
+    /// Min net SOL inflow in window (lamports). Default: 2 SOL (was 20 SOL, WAY too strict)
+    #[serde(default = "default_min_sol_inflow")]
+    pub min_sol_inflow_lamports: u64,
+    /// Inflow window (seconds). Default: 30s
+    #[serde(default = "default_inflow_window")]
+    pub inflow_window_secs: u64,
+    /// Max single dump size (lamports). Default: 10 SOL
+    #[serde(default = "default_max_single_dump")]
+    pub max_single_dump_lamports: u64,
+
+    // === Filter 4: Dev Behavior ===
+    /// Dev early sell triggers exit (seconds after pool creation). Default: 60s
+    #[serde(default = "default_dev_early_sell_window")]
+    pub dev_early_sell_window_secs: u64,
+    /// Dev rebuy is positive signal. Default: true
+    #[serde(default = "default_dev_rebuy_positive")]
+    pub dev_rebuy_positive: bool,
+
+    // === Exit Strategy ===
+    /// Hard stop-loss percentage from entry (e.g., 15 = -15%). Default: 15%
+    #[serde(default = "default_hard_stop_loss")]
+    pub hard_stop_loss_pct: f64,
+    /// Trailing stop percentage from ATH (e.g., 20 = -20% from high). Default: 20%
+    #[serde(default = "default_trailing_stop")]
+    pub trailing_stop_pct: f64,
+    /// Minimum profit to activate trailing stop (e.g., 10 = +10%). Default: 10%
+    #[serde(default = "default_trailing_activation")]
+    pub trailing_activation_pct: f64,
+    /// Take profit percentage (e.g., 100 = +100% = 2x). Default: 100%
+    #[serde(default = "default_take_profit")]
+    pub take_profit_pct: f64,
+    /// Max hold time in seconds before forced exit. Default: 300s (5 min)
+    #[serde(default = "default_max_hold_time")]
+    pub max_hold_time_secs: u64,
+    /// Momentum exit: min buy ratio to stay in (e.g., 0.4 = 40% buys). Default: 0.4
+    #[serde(default = "default_momentum_exit_ratio")]
+    pub momentum_exit_buy_ratio: f64,
+    /// Momentum exit window (seconds). Default: 30s
+    #[serde(default = "default_momentum_exit_window")]
+    pub momentum_exit_window_secs: u64,
+    /// Min trades in momentum window to evaluate exit. Default: 5
+    #[serde(default = "default_momentum_exit_min_trades")]
+    pub momentum_exit_min_trades: u32,
+}
+
+// Momentum config defaults - tuned to be less strict than original hardcoded values
+fn default_early_min_liquidity() -> f64 {
+    5.0
+}
+fn default_established_min_liquidity() -> f64 {
+    20.0
+}
+fn default_early_slot_threshold() -> u64 {
+    1000
+}
+fn default_early_slippage() -> u32 {
+    300
+}
+fn default_established_slippage() -> u32 {
+    100
+}
+fn default_position_lamports() -> u64 {
+    100_000_000
+} // 0.1 SOL
+fn default_max_dev_supply_pct() -> f64 {
+    90.0
+}
+fn default_lp_removal_window() -> u64 {
+    60
+}
+fn default_min_unique_buyers() -> u32 {
+    3
+} // Relaxed from 10
+fn default_buyer_window() -> u64 {
+    30
+} // Extended from 20
+fn default_min_trades_per_sec() -> f64 {
+    0.2
+} // Relaxed from 0.5
+fn default_min_buy_dominance() -> f64 {
+    0.5
+} // Relaxed from 0.6
+fn default_min_sol_inflow() -> u64 {
+    2_000_000_000
+} // 2 SOL, relaxed from 20 SOL!
+fn default_inflow_window() -> u64 {
+    30
+}
+fn default_max_single_dump() -> u64 {
+    10_000_000_000
+} // 10 SOL
+fn default_dev_early_sell_window() -> u64 {
+    60
+}
+fn default_dev_rebuy_positive() -> bool {
+    true
+}
+fn default_hard_stop_loss() -> f64 {
+    15.0
+}
+fn default_trailing_stop() -> f64 {
+    20.0
+}
+fn default_trailing_activation() -> f64 {
+    10.0
+}
+fn default_take_profit() -> f64 {
+    100.0
+}
+fn default_max_hold_time() -> u64 {
+    300
+}
+fn default_momentum_exit_ratio() -> f64 {
+    0.4
+}
+fn default_momentum_exit_window() -> u64 {
+    30
+}
+fn default_momentum_exit_min_trades() -> u32 {
+    5
+}
+
+impl Default for MomentumCfg {
+    fn default() -> Self {
+        Self {
+            early_min_liquidity_sol: default_early_min_liquidity(),
+            established_min_liquidity_sol: default_established_min_liquidity(),
+            early_slot_threshold: default_early_slot_threshold(),
+            early_max_slippage_bps: default_early_slippage(),
+            established_max_slippage_bps: default_established_slippage(),
+            default_position_lamports: default_position_lamports(),
+            max_dev_supply_pct: default_max_dev_supply_pct(),
+            lp_removal_window_secs: default_lp_removal_window(),
+            min_unique_buyers: default_min_unique_buyers(),
+            buyer_window_secs: default_buyer_window(),
+            min_trades_per_sec: default_min_trades_per_sec(),
+            min_buy_dominance: default_min_buy_dominance(),
+            min_sol_inflow_lamports: default_min_sol_inflow(),
+            inflow_window_secs: default_inflow_window(),
+            max_single_dump_lamports: default_max_single_dump(),
+            dev_early_sell_window_secs: default_dev_early_sell_window(),
+            dev_rebuy_positive: default_dev_rebuy_positive(),
+            hard_stop_loss_pct: default_hard_stop_loss(),
+            trailing_stop_pct: default_trailing_stop(),
+            trailing_activation_pct: default_trailing_activation(),
+            take_profit_pct: default_take_profit(),
+            max_hold_time_secs: default_max_hold_time(),
+            momentum_exit_buy_ratio: default_momentum_exit_ratio(),
+            momentum_exit_window_secs: default_momentum_exit_window(),
+            momentum_exit_min_trades: default_momentum_exit_min_trades(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -35,6 +35,7 @@ use ironcrab::ipc::{
     ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind, TradeIntent,
     TradeResources, TradeSide, TradingRegime,
 };
+use ironcrab::config::MomentumCfg;
 use ironcrab::metrics::{
     serve_metrics, FILTER_PASSED_TOTAL, FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_INFLOW,
     FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOTAL, FILTER_REJECTED_VELOCITY,
@@ -194,6 +195,40 @@ impl Default for MomentumConfig {
             momentum_exit_buy_ratio: 0.4,  // Exit if buy ratio < 40%
             momentum_exit_window_secs: 30, // Check last 30s of trades
             momentum_exit_min_trades: 5,   // Need 5+ trades to evaluate
+        }
+    }
+}
+
+impl MomentumConfig {
+    /// Create MomentumConfig from TOML-loaded MomentumCfg
+    fn from_cfg(cfg: &MomentumCfg) -> Self {
+        Self {
+            early_min_liquidity_sol: cfg.early_min_liquidity_sol,
+            established_min_liquidity_sol: cfg.established_min_liquidity_sol,
+            early_slot_threshold: cfg.early_slot_threshold,
+            early_max_slippage_bps: cfg.early_max_slippage_bps,
+            established_max_slippage_bps: cfg.established_max_slippage_bps,
+            default_position_lamports: cfg.default_position_lamports,
+            test_allowlist: HashSet::new(), // Not in TOML config
+            max_dev_supply_pct: cfg.max_dev_supply_pct,
+            lp_removal_window_secs: cfg.lp_removal_window_secs,
+            min_unique_buyers: cfg.min_unique_buyers,
+            buyer_window_secs: cfg.buyer_window_secs,
+            min_trades_per_sec: cfg.min_trades_per_sec,
+            min_buy_dominance: cfg.min_buy_dominance,
+            min_sol_inflow_lamports: cfg.min_sol_inflow_lamports,
+            inflow_window_secs: cfg.inflow_window_secs,
+            max_single_dump_lamports: cfg.max_single_dump_lamports,
+            dev_early_sell_window_secs: cfg.dev_early_sell_window_secs,
+            dev_rebuy_positive: cfg.dev_rebuy_positive,
+            hard_stop_loss_pct: cfg.hard_stop_loss_pct,
+            trailing_stop_pct: cfg.trailing_stop_pct,
+            trailing_activation_pct: cfg.trailing_activation_pct,
+            take_profit_pct: cfg.take_profit_pct,
+            max_hold_time_secs: cfg.max_hold_time_secs,
+            momentum_exit_buy_ratio: cfg.momentum_exit_buy_ratio,
+            momentum_exit_window_secs: cfg.momentum_exit_window_secs,
+            momentum_exit_min_trades: cfg.momentum_exit_min_trades,
         }
     }
 }
@@ -1312,8 +1347,48 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Setup config
+    // Setup config - load from TOML file with fallback to defaults
     let mut momentum_config = MomentumConfig::default();
+    
+    // Try to load config from file
+    if args.config.exists() {
+        match std::fs::read_to_string(&args.config) {
+            Ok(toml_str) => {
+                // Parse just the [momentum] section
+                if let Ok(parsed) = toml::from_str::<toml::Value>(&toml_str) {
+                    if let Some(momentum_table) = parsed.get("momentum") {
+                        match momentum_table.clone().try_into::<MomentumCfg>() {
+                            Ok(cfg) => {
+                                // Apply config to MomentumConfig
+                                momentum_config = MomentumConfig::from_cfg(&cfg);
+                                info!(
+                                    config_path = %args.config.display(),
+                                    min_sol_inflow = momentum_config.min_sol_inflow_lamports / 1_000_000_000,
+                                    min_unique_buyers = momentum_config.min_unique_buyers,
+                                    min_trades_per_sec = momentum_config.min_trades_per_sec,
+                                    min_buy_dominance = momentum_config.min_buy_dominance,
+                                    "Loaded momentum config from TOML"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to parse [momentum] section, using defaults");
+                            }
+                        }
+                    } else {
+                        info!("No [momentum] section in config, using defaults");
+                    }
+                } else {
+                    warn!(config_path = %args.config.display(), "Failed to parse TOML, using defaults");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, config_path = %args.config.display(), "Failed to read config file, using defaults");
+            }
+        }
+    } else {
+        info!(config_path = %args.config.display(), "Config file not found, using defaults");
+    }
+    
     if args.test_mode {
         // In test mode, add a test mint to allowlist
         momentum_config
