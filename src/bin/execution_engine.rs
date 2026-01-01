@@ -38,7 +38,7 @@ use uuid::Uuid;
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, FairnessPolicy, FeePolicy, IntentOrigin, RejectReason, SimulationResult,
-    TradeIntent, TradingRegime,
+    TradeIntent, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
     serve_metrics, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS,
@@ -51,7 +51,7 @@ use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_TRADE
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
 use ironcrab::storage::{
-    locks::{LockHolder, LockManager, LockResult},
+    locks::{LockHolder, LockManager, LockResult, ResourceType},
     JsonlWriter, JsonlWriterConfig,
 };
 
@@ -1168,29 +1168,38 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // Reset daily counters if new day
     ctx.maybe_reset_daily();
 
-    // Check 3a: Max position size
-    if intent.required_capital.raw > config.max_position_size_lamports {
-        let reason = RejectReason::RiskMaxPosition;
+    // Check 3a: Max position size (applies to BUY only)
+    if intent.side == TradeSide::Buy {
+        if intent.required_capital.raw > config.max_position_size_lamports {
+            let reason = RejectReason::RiskMaxPosition;
+            checks.push(CheckResult {
+                check_name: "max_position_size".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some(format!(
+                    "required={} > max={}",
+                    intent.required_capital.raw, config.max_position_size_lamports
+                )),
+            });
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+        }
         checks.push(CheckResult {
             check_name: "max_position_size".to_string(),
-            passed: false,
-            reason_code: Some(reason.to_string()),
+            passed: true,
+            reason_code: None,
             details: Some(format!(
-                "required={} > max={}",
+                "required={} <= max={}",
                 intent.required_capital.raw, config.max_position_size_lamports
             )),
         });
-        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    } else {
+        checks.push(CheckResult {
+            check_name: "max_position_size".to_string(),
+            passed: true,
+            reason_code: None,
+            details: Some("skipped_for_sell".to_string()),
+        });
     }
-    checks.push(CheckResult {
-        check_name: "max_position_size".to_string(),
-        passed: true,
-        reason_code: None,
-        details: Some(format!(
-            "required={} <= max={}",
-            intent.required_capital.raw, config.max_position_size_lamports
-        )),
-    });
 
     // Check 3b: Max slippage
     if intent.max_slippage_bps > config.max_slippage_bps {
@@ -1213,55 +1222,67 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         details: None,
     });
 
-    // Check 3c: Max open positions
-    let current_positions = ctx.get_open_positions();
-    if current_positions >= config.max_open_positions {
-        let reason = RejectReason::RiskMaxOpenPositions;
+    // Check 3c: Max open positions (applies to BUY only; SELL exits should remain possible)
+    if intent.side == TradeSide::Buy {
+        let current_positions = ctx.get_open_positions();
+        if current_positions >= config.max_open_positions {
+            let reason = RejectReason::RiskMaxOpenPositions;
+            checks.push(CheckResult {
+                check_name: "max_open_positions".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some(format!(
+                    "current={} >= max={}",
+                    current_positions, config.max_open_positions
+                )),
+            });
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+        }
         checks.push(CheckResult {
             check_name: "max_open_positions".to_string(),
-            passed: false,
-            reason_code: Some(reason.to_string()),
-            details: Some(format!(
-                "current={} >= max={}",
-                current_positions, config.max_open_positions
-            )),
+            passed: true,
+            reason_code: None,
+            details: Some(format!("current < max (buy_only)")),
         });
-        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    } else {
+        checks.push(CheckResult {
+            check_name: "max_open_positions".to_string(),
+            passed: true,
+            reason_code: None,
+            details: Some("skipped_for_sell".to_string()),
+        });
     }
-    checks.push(CheckResult {
-        check_name: "max_open_positions".to_string(),
-        passed: true,
-        reason_code: None,
-        details: Some(format!(
-            "current={} < max={}",
-            current_positions, config.max_open_positions
-        )),
-    });
 
-    // Check 3d: Daily loss limit
-    let daily_loss = ctx.get_daily_loss_lamports();
-    if daily_loss >= config.daily_loss_limit_lamports as i64 {
-        let reason = RejectReason::RiskDailyLossLimit;
+    // Check 3d: Daily loss limit (applies to BUY only; SELL exits should remain possible)
+    if intent.side == TradeSide::Buy {
+        let daily_loss = ctx.get_daily_loss_lamports();
+        if daily_loss >= config.daily_loss_limit_lamports as i64 {
+            let reason = RejectReason::RiskDailyLossLimit;
+            checks.push(CheckResult {
+                check_name: "daily_loss_limit".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some(format!(
+                    "daily_loss={} >= limit={}",
+                    daily_loss, config.daily_loss_limit_lamports
+                )),
+            });
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+        }
         checks.push(CheckResult {
             check_name: "daily_loss_limit".to_string(),
-            passed: false,
-            reason_code: Some(reason.to_string()),
-            details: Some(format!(
-                "daily_loss={} >= limit={}",
-                daily_loss, config.daily_loss_limit_lamports
-            )),
+            passed: true,
+            reason_code: None,
+            details: Some("ok (buy_only)".to_string()),
         });
-        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    } else {
+        checks.push(CheckResult {
+            check_name: "daily_loss_limit".to_string(),
+            passed: true,
+            reason_code: None,
+            details: Some("skipped_for_sell".to_string()),
+        });
     }
-    checks.push(CheckResult {
-        check_name: "daily_loss_limit".to_string(),
-        passed: true,
-        reason_code: None,
-        details: Some(format!(
-            "daily_loss={} < limit={}",
-            daily_loss, config.daily_loss_limit_lamports
-        )),
-    });
 
     // === P1: Fee/Compute Policy Checks ===
     let fee_policy = &config.fee_policy;
@@ -1360,66 +1381,140 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         )),
     });
 
-    // === Check 4: Capital lock ===
+    // === Check 4: Resource locks (pools + mints) ===
     let holder = LockHolder::new(&intent.intent_id)
         .with_decision(&decision_id)
         .with_tier(intent.tier as u8)
         .with_source(&intent.source); // P1: Source for fairness tracking
-    let lock_result = ctx.lock_manager.try_lock_capital(
-        holder,
-        intent.required_capital.raw,
-        std::collections::HashMap::new(),
-    );
 
-    match lock_result {
-        LockResult::Acquired => {
-            checks.push(CheckResult {
-                check_name: "capital_lock".to_string(),
-                passed: true,
-                reason_code: None,
-                details: None,
-            });
+    let mut locked_resources = 0u64;
+    for pool in &intent.resources.pools {
+        match ctx
+            .lock_manager
+            .try_lock_resource(holder.clone(), pool, ResourceType::Pool)
+        {
+            LockResult::Acquired | LockResult::AcquiredByPreemption { .. } => {
+                locked_resources += 1;
+            }
+            LockResult::Conflict { holder: existing } => {
+                let reason = RejectReason::LockResourceConflict;
+                REJECT_RESOURCE_LOCK.fetch_add(1, Ordering::Relaxed);
+                checks.push(CheckResult {
+                    check_name: "resource_lock".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some(format!("pool locked by {}", existing.intent_id)),
+                });
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+            LockResult::InsufficientCapital { .. } => {
+                // Not applicable for resource locks
+            }
         }
-        LockResult::AcquiredByPreemption { preempted } => {
-            // DoD L) P0: Higher-priority intent preempted lower-priority lock
-            info!(
-                intent_id = %intent.intent_id,
-                preempted_intent = %preempted.intent_id,
-                "Capital lock acquired by preemption (DoD L)"
-            );
-            checks.push(CheckResult {
-                check_name: "capital_lock".to_string(),
-                passed: true,
-                reason_code: None,
-                details: Some(format!("Preempted: {}", preempted.intent_id)),
-            });
+    }
+
+    for mint in [&intent.resources.input_mint, &intent.resources.output_mint] {
+        if mint.is_empty() {
+            continue;
         }
-        LockResult::InsufficientCapital {
-            available,
-            requested,
-        } => {
-            let reason = RejectReason::LockCapitalConflict;
-            checks.push(CheckResult {
-                check_name: "capital_lock".to_string(),
-                passed: false,
-                reason_code: Some(reason.to_string()),
-                details: Some(format!(
-                    "Insufficient capital: available={}, requested={}",
-                    available, requested
-                )),
-            });
-            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+        match ctx
+            .lock_manager
+            .try_lock_resource(holder.clone(), mint, ResourceType::Mint)
+        {
+            LockResult::Acquired | LockResult::AcquiredByPreemption { .. } => {
+                locked_resources += 1;
+            }
+            LockResult::Conflict { holder: existing } => {
+                let reason = RejectReason::LockResourceConflict;
+                REJECT_RESOURCE_LOCK.fetch_add(1, Ordering::Relaxed);
+                checks.push(CheckResult {
+                    check_name: "resource_lock".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some(format!("mint locked by {}", existing.intent_id)),
+                });
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+            LockResult::InsufficientCapital { .. } => {
+                // Not applicable for resource locks
+            }
         }
-        LockResult::Conflict { holder } => {
-            let reason = RejectReason::LockCapitalConflict;
-            checks.push(CheckResult {
-                check_name: "capital_lock".to_string(),
-                passed: false,
-                reason_code: Some(reason.to_string()),
-                details: Some(format!("Lock held by: {}", holder.intent_id)),
-            });
-            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    }
+
+    checks.push(CheckResult {
+        check_name: "resource_locks".to_string(),
+        passed: true,
+        reason_code: None,
+        details: Some(format!("locked={}", locked_resources)),
+    });
+
+    // === Check 5: Capital lock (BUY only for now) ===
+    if intent.side == TradeSide::Buy {
+        let lock_result = ctx.lock_manager.try_lock_capital(
+            holder,
+            intent.required_capital.raw,
+            std::collections::HashMap::new(),
+        );
+
+        match lock_result {
+            LockResult::Acquired => {
+                checks.push(CheckResult {
+                    check_name: "capital_lock".to_string(),
+                    passed: true,
+                    reason_code: None,
+                    details: None,
+                });
+            }
+            LockResult::AcquiredByPreemption { preempted } => {
+                // DoD L) P0: Higher-priority intent preempted lower-priority lock
+                info!(
+                    intent_id = %intent.intent_id,
+                    preempted_intent = %preempted.intent_id,
+                    "Capital lock acquired by preemption (DoD L)"
+                );
+                checks.push(CheckResult {
+                    check_name: "capital_lock".to_string(),
+                    passed: true,
+                    reason_code: None,
+                    details: Some(format!("Preempted: {}", preempted.intent_id)),
+                });
+            }
+            LockResult::InsufficientCapital {
+                available,
+                requested,
+            } => {
+                let reason = RejectReason::LockCapitalConflict;
+                REJECT_CAPITAL_LOCK.fetch_add(1, Ordering::Relaxed);
+                checks.push(CheckResult {
+                    check_name: "capital_lock".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some(format!(
+                        "Insufficient capital: available={}, requested={}",
+                        available, requested
+                    )),
+                });
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+            LockResult::Conflict { holder } => {
+                let reason = RejectReason::LockCapitalConflict;
+                REJECT_CAPITAL_LOCK.fetch_add(1, Ordering::Relaxed);
+                checks.push(CheckResult {
+                    check_name: "capital_lock".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some(format!("Lock held by: {}", holder.intent_id)),
+                });
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
         }
+    } else {
+        checks.push(CheckResult {
+            check_name: "capital_lock".to_string(),
+            passed: true,
+            reason_code: None,
+            details: Some("skipped_for_sell".to_string()),
+        });
     }
 
     // === Cross-DEX Arbitrage Validation (if applicable) ===
