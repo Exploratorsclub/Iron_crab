@@ -7,6 +7,7 @@ Goals:
 
 Usage:
   ./run_local.ps1 -Action start -Host 109.230.239.43 -User ironcrab -Port 2222
+  ./run_local.ps1 -Action start -Host ironcrab-prod
   ./run_local.ps1 -Action status
   ./run_local.ps1 -Action stop
 
@@ -23,7 +24,8 @@ param(
   [string]$Action = 'start',
 
   [Parameter(Mandatory = $false)]
-  [string]$Host = '109.230.239.43',
+  [Alias('Host')]
+  [string]$SshHost = '109.230.239.43',
 
   [Parameter(Mandatory = $false)]
   [string]$User = 'ironcrab',
@@ -96,6 +98,14 @@ function Start-Tunnel {
   Initialize-StateDir
   $sshExe = Get-SshExe
 
+  $hostIsIpv4 = $SshHost -match '^(?:\d{1,3}\.){3}\d{1,3}$'
+  $hostLooksLikeAlias = (-not $hostIsIpv4) -and ($SshHost -notmatch '\.')
+
+  # NOTE: $Host is a reserved automatic variable in PowerShell; use $SshHost.
+  # We can only check which *script* parameters were provided here.
+  $scriptBound = $script:__RunLocalBoundParameters
+  $useSshConfigOnly = $hostLooksLikeAlias -and (-not $scriptBound.ContainsKey('User')) -and (-not $scriptBound.ContainsKey('Port')) -and (-not $scriptBound.ContainsKey('IdentityFile'))
+
   $forwards = @(
     '8080:127.0.0.1:8080',
     '3000:127.0.0.1:3000',
@@ -108,13 +118,16 @@ function Start-Tunnel {
 
   $sshArgList = @(
     '-N',
-    '-p', [string]$Port,
     '-o', 'ServerAliveInterval=30',
     '-o', 'ServerAliveCountMax=3',
     '-o', 'ExitOnForwardFailure=yes'
   )
 
-  if ($IdentityFile) {
+  if (-not $useSshConfigOnly) {
+    $sshArgList += @('-p', [string]$Port)
+  }
+
+  if ((-not $useSshConfigOnly) -and $IdentityFile) {
     $sshArgList += @('-i', $IdentityFile)
   }
 
@@ -122,7 +135,12 @@ function Start-Tunnel {
     $sshArgList += @('-L', $fwd)
   }
 
-  $sshArgList += @("$User@$Host")
+  if ($useSshConfigOnly) {
+    # Host is treated as an SSH config alias (e.g. "ironcrab-prod")
+    $sshArgList += @($SshHost)
+  } else {
+    $sshArgList += @("$User@$SshHost")
+  }
 
   $stdout = Join-Path $StateDir 'ssh_tunnel.stdout.log'
   $stderr = Join-Path $StateDir 'ssh_tunnel.stderr.log'
@@ -184,6 +202,10 @@ switch ($Action) {
   'start' {
     Initialize-StateDir
 
+    # Capture which script parameters were explicitly provided by the user.
+    # (Inside functions, $PSBoundParameters refers to the function parameters, not the script params.)
+    $script:__RunLocalBoundParameters = $PSBoundParameters
+
     # Stop existing if present
     $state = Get-LocalRunnerState
     if ($state) {
@@ -193,7 +215,7 @@ switch ($Action) {
 
     $newState = [ordered]@{
       started_at = (Get-Date).ToString('o')
-      host = $Host
+      host = $SshHost
       user = $User
       port = $Port
       identity_file = $IdentityFile

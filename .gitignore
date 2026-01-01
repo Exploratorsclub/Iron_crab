@@ -38,6 +38,7 @@ node_modules/
 *.old
 *.bak
 state/
+.local/
 trade_logs/
 orca_reserves.db
 *.db

@@ -6,22 +6,56 @@ Dieses Repository wird aktuell **Debuggable-First** in eine klar getrennte Multi
 - `docs/TARGET_ARCHITECTURE.md`
 - `docs/DEFINITION_OF_DONE.md`
 - `docs/STORAGE_CONVENTIONS.md`
+- `docs/ROLE_SEPARATION.md`
 
-**Grundregeln:**
-- Geyser gegenüber RPC bevorzugen (Latenz/Last).
-- Arbitrage-Ausführungen atomar (Bundle) und über Jito senden.
-- Keine eigenständigen SSH-Verbindungsversuche: wenn SSH nötig ist, User informieren und warten.
+## Grundregeln (P0 / Live-verboten ohne Erfüllung)
+
+- **Single-Signer**: Nur `execution-engine` lädt Keys und signiert/sendet.
+- **Intent-only**: Alle anderen Prozesse sind keyless und erzeugen nur `TradeIntent`s bzw. `MarketEvents`.
+- **Simulate-gated**: Simulation fail ⇒ niemals senden (insb. Arbitrage).
+- **Decision Records**: Jede Entscheidung ist forensisch nachvollziehbar (Inputs, Checks, Outcome).
+- **Units/Decimals explizit**: Keine impliziten Konventionen; Beträge müssen eindeutig sein.
+
+Weitere Leitlinien:
+- **Geyser gegenüber RPC bevorzugen** (Latenz/Last). RPC/WS nur als Fallback.
+- **Arbitrage atomar** (Bundle/Jito) oder reason-coded reject.
+
+## SSH/Server Operations
+
+- SSH/Server-Commands sind erlaubt, **wenn der User sie explizit anfordert** (z. B. Deploy, Logs, Status prüfen) oder ausdrücklich zustimmt.
+- Kein ungefragtes "mal schnell einloggen" oder Scannen/Probieren von Hosts/Ports.
+- In bestehenden SSH-Terminals: keine automatischen `exit`/Disconnects.
+- Preferred Auth: Key-based Login via `ssh-agent` (Passphrase nur einmal pro Session über `ssh-add`).
+
+**SSH Login via Alias (empfohlen)**
+
+Wenn lokal ein SSH-Config Alias existiert (z. B. `ironcrab-prod`), dann bevorzugt damit arbeiten (kürzer, weniger Fehler, Port/User/Key kommen aus `~/.ssh/config`).
+
+Minimaler Config-Block (Windows/Linux/macOS):
+```sshconfig
+Host ironcrab-prod
+    HostName 109.230.239.43
+    User ironcrab
+    Port 2222
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+```
+
+Login:
+```bash
+ssh ironcrab-prod
+```
+
+Port-Forward (Control Plane):
+```bash
+ssh -L 8080:127.0.0.1:8080 ironcrab-prod
+```
 
 ## Zielarchitektur (Debuggable-First Umbau)
 
 Diese Repo-Historie enthält AI-schnellgeschriebenen Code. Priorität ist daher **Debuggability + Determinismus + Safety** vor Feature-Breite.
 
-**Non-negotiables (P0 / Live-verboten ohne Erfüllung)**
-- **Single-Signer**: Nur die Execution Engine darf signieren/senden. Strategien/Worker/Bots sind **keyless**.
-- **Intent-only**: Strategien/Worker erzeugen ausschließlich `TradeIntent`s. Keine direkten RPC/TPU/Jito Sends außerhalb der Execution Engine.
-- **Simulate-gated**: Wenn Simulation fehlschlägt, wird **nie** gesendet (insb. Arbitrage).
-- **Decision Records**: Jede Entscheidung muss nachvollziehbar sein (Input-Snapshots + Reasons + Outcome).
-- **Units/Decimals explizit**: Keine impliziten UI/raw Konventionen; jede Amount ist eindeutig normalisiert oder trägt Decimals.
+P0 Non-Negotiables stehen oben unter „Grundregeln“.
 
 **Process Boundaries (für Debuggability & Fault Isolation)**
 - System wird als **mehrere Binaries/Prozesse** aufgebaut (nicht als ein riesiger Monolith), mindestens:
@@ -58,9 +92,73 @@ cargo clippy -- -D warnings    # Must pass with zero warnings
 cargo test --features test_helpers  # Enables internal test helpers
 ```
 
+Hinweis: Wenn du Tests oder Clippy laufen lässt, ändere keine “unrelated” Dinge.
+
 ### Local Run
 ```bash
 cargo run --release -- --config my_config.toml
+```
+
+## Ops / Repo Scripts (do not invent new ones)
+
+### Deploy (Server, systemd)
+
+Default = Multi-Process Deploy:
+```bash
+./deploy.sh
+```
+
+Direkt (mit Flags):
+```bash
+./deploy_new.sh
+./deploy_new.sh --skip-build
+./deploy_new.sh --component execution-engine
+```
+
+Legacy/Monolith (nur wenn explizit gewollt):
+```bash
+./deploy.sh --legacy
+```
+
+### UI/Dashboard (lokal, via SSH Port Forwarding)
+
+Prerequisite: Tunnel zum server-side Control Plane (läuft serverseitig auf `127.0.0.1:8080`):
+```bash
+ssh -L 8080:127.0.0.1:8080 ironcrab@<server>
+```
+
+Wenn du *alle* relevanten Ports (Control Plane + Grafana + Prometheus + Metrics) forwarden willst **und** Vite automatisch in einem separaten Prozess starten möchtest, nutze das Repo-Helper-Script:
+
+Windows (SSH Tunnel + Vite UI in separatem Prozess):
+```powershell
+.\run_local.ps1 -Action start -Host <server> -User ironcrab -Port 2222
+.\run_local.ps1 -Action start -Host ironcrab-prod
+.\run_local.ps1 -Action status
+.\run_local.ps1 -Action stop
+```
+
+Optional:
+- Tunnel ohne UI: `.\run_local.ps1 -Action start -NoUi`
+- UI ohne Tunnel: `.\run_local.ps1 -Action start -NoTunnel`
+- Keyfile: `.\run_local.ps1 -Action start -IdentityFile C:\path\to\id_rsa`
+
+Dann Vite UI lokal starten:
+
+Windows:
+```powershell
+./run_ui.ps1
+```
+
+Windows (wenn PowerShell `npm.ps1` blockt):
+```bat
+run_ui.cmd
+```
+
+macOS/Linux:
+```bash
+cd ui
+npm install
+npm run dev
 ```
 
 ### CI Requirements (`.github/workflows/ci.yml`)
@@ -69,6 +167,42 @@ cargo run --release -- --config my_config.toml
 - Clippy warnings are errors
 
 ## Project-Specific Patterns
+
+### IPC Schema / Decision Records
+- IPC Types liegen in `src/ipc/schema.rs`.
+- JSONL Storage muss die Minimalfelder aus `RecordHeader` enthalten (`schema_version`, `ts_unix_ms`, `component`, `build`, `run_id`).
+- Amounts müssen als `ExplicitAmount` modelliert werden (raw + decimals + optional ui).
+
+### NATS Topics (ist-Stand)
+
+Rust (versioniert, canonical): `src/nats/topics.rs`
+- `ironcrab.v1.market_events`
+- `ironcrab.v1.trade_intents`
+- `ironcrab.v1.execution_results`
+- `ironcrab.v1.control_requests` / `ironcrab.v1.control_responses`
+- `ironcrab.v1.decision_records`
+
+Control-Plane (Python) nutzt aktuell (und Rust-Binaries hören teils darauf):
+- `ironcrab.control.commands`
+- `ironcrab.control.kill`
+- `ironcrab.control.config.reload`
+
+Regel:
+- Keine neuen ad-hoc Topics erfinden.
+- Wenn du Control/IPC anfasst: Topics vereinheitlichen oder wenigstens klar dokumentieren (prefer: Versioned Topics).
+
+### Logs / Replay (JSONL)
+- Root ist `IRONCRAB_LOG_DIR` oder Default `trade_logs/`.
+- Binaries schreiben append-only JSONL mit täglicher Rotation via `JsonlWriter` (`src/storage/jsonl_writer.rs`).
+- Default Subdirs (ist-Stand):
+    - market-data: `trade_logs/market_events/` (`market_events-YYYYMMDD.jsonl`)
+    - momentum-bot: `trade_logs/intents/` (`trade_intents-YYYYMMDD.jsonl`)
+    - arb-strategy: `trade_logs/arb_intents/` (`arb_intents-YYYYMMDD.jsonl`)
+    - execution-engine: `trade_logs/decisions/`, `trade_logs/executions/`
+- Hot-Path safe: wenn FS/DB riskant wäre, `AsyncJsonlWriter` nutzen oder buffering/queueing.
+
+### Metrics Ports (multi-process)
+- market-data: `9801`, momentum-bot: `9802`, arb-strategy: `9803`, execution-engine: `9804` (jeweils `/metrics`).
 
 ### Geyser over RPC
 **Always prefer Geyser gRPC for real-time data** - reduces latency from ~400ms to <10ms:
@@ -123,27 +257,19 @@ All arbitrage TXs should use Jito bundles to prevent frontrunning:
 use crate::solana::jito::JitoClient;
 ```
 
-## Geyser Configuration
-
-Die Geyser-Plugin-Konfiguration muss zu Validator + Plugin-Pfad passen.
-Siehe `docs/geyser-grpc-plugin-config.json`.
+### Key Handling (Single-Signer Enforcement)
+- `execution-engine` ist der einzige Prozess mit Key-Loading/Signing/Sending.
+- Keyless Prozesse müssen beim Erkennen von Key-Env-Vars sofort `exit(1)` (mindestens `IRONCRAB_KEYPAIR_JSON|B64|PATH`; wenn du das anfasst, nimm auch `IRONCRAB_KEYPAIR_BASE58` dazu und halte es konsistent zu `docs/ROLE_SEPARATION.md`).
+- Wenn du Key-Loading anfasst: bevorzugt eine zentrale Implementierung (z. B. `Treasury::load_from_env()` aus `src/wallet.rs`) statt duplizierter Loader-Logik.
 
 ## Dynamic Subscription Pattern
 
 Für Confirmation/Balance-Watches nur spezifische Accounts (z. B. ATA) subscriben; keine Vollabos auf Token Program.
 
-## Storage / Replay
-
-- Hot-Path-safe: keine DB/FS-Blocker im Execution Hot Path.
-- Append-only Flat Files als P0-Standard, siehe `docs/STORAGE_CONVENTIONS.md`.
-
 ## Legacy-Code Hinweis (wichtig)
 
 Dieses Repo enthält noch Legacy-/Monolith-Code aus der Vorgängerphase.
 Neue Änderungen sollen sich an `docs/TARGET_ARCHITECTURE.md` orientieren (neue Binaries/Prozesse, Intent-only, Single-Signer), statt den Legacy-Monolithen weiter auszubauen.
-
-## SSH/Server Operations
-**Never attempt SSH connections autonomously** - always inform the user and wait for confirmation when server access is needed.
 
 ---
 description: 'Rust programming language coding conventions and best practices'
