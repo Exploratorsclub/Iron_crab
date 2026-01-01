@@ -300,7 +300,7 @@ early_max_slippage_bps = 500        # 5% for early volatile stage (was 300)
 established_max_slippage_bps = 200  # 2% for stable pools (was 100)
 
 # Position sizing
-default_position_lamports = 100_000_000  # 0.1 SOL per trade
+default_position_lamports = 5_000_000  # 0.005 SOL per trade
 
 # FILTER 1: Liquidity Check
 max_dev_supply_pct = 95.0           # Allow up to 95% dev supply (was 90)
@@ -322,11 +322,11 @@ dev_early_sell_window_secs = 90     # Dev sells in first 90s = bad (was 60s)
 dev_rebuy_positive = true           # Dev rebuy = positive signal
 
 # EXIT STRATEGY
-hard_stop_loss_pct = 20.0           # -20% hard stop (was 15)
-trailing_stop_pct = 25.0            # -25% from ATH (was 20)
-trailing_activation_pct = 15.0      # Activate trailing after +15% (was 10)
-take_profit_pct = 150.0             # Take profit at +150% (2.5x, was 2x)
-max_hold_time_secs = 600            # Max 10 minutes hold (was 5 min)
-momentum_exit_buy_ratio = 0.3       # Exit if buy ratio < 30% (was 40%)
-momentum_exit_window_secs = 45      # Check last 45s of trades (was 30s)
-momentum_exit_min_trades = 3        # Need 3+ trades to evaluate (was 5)
+hard_stop_loss_pct = 15.0           # -15% hard stop
+trailing_stop_pct = 20.0            # -20% from ATH
+trailing_activation_pct = 10.0      # Activate trailing after +10%
+take_profit_pct = 100.0             # Take profit at +100% (2x)
+max_hold_time_secs = 300            # Max 5 minutes hold
+momentum_exit_buy_ratio = 0.4       # Exit if buy ratio < 40%
+momentum_exit_window_secs = 30      # Check last 30s of trades
+momentum_exit_min_trades = 5        # Need 5+ trades to evaluate
