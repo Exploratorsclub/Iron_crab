@@ -44,6 +44,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
+ReadWritePaths=/home/ironcrab/Iron_crab/trade_logs
 
 [Install]
 WantedBy=ironcrab.target
