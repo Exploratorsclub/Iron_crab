@@ -29,13 +29,13 @@ use ironcrab::ipc::{
     ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind, TradeIntent,
     TradeResources, TradeSide, TradingRegime,
 };
-use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::metrics::{
-    serve_metrics, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
-    TOKENS_TRACKED_GAUGE,
+    serve_metrics, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL,
+    MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
+    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
+use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// NATS topic for config reload
@@ -69,13 +69,13 @@ struct ArbConfig {
 impl Default for ArbConfig {
     fn default() -> Self {
         Self {
-            min_spread_bps: 50,                    // 0.5% minimum spread
-            min_profit_lamports: 10_000_000,       // 0.01 SOL min profit
-            max_position_lamports: 1_000_000_000,  // 1 SOL max position
-            est_tx_cost_lamports: 50_000,          // 0.00005 SOL tx cost
-            max_slippage_bps: 100,                 // 1% max slippage
-            intent_cooldown_ms: 5000,              // 5s cooldown per pair
-            intent_ttl_ms: 3000,                   // 3s TTL
+            min_spread_bps: 50,                   // 0.5% minimum spread
+            min_profit_lamports: 10_000_000,      // 0.01 SOL min profit
+            max_position_lamports: 1_000_000_000, // 1 SOL max position
+            est_tx_cost_lamports: 50_000,         // 0.00005 SOL tx cost
+            max_slippage_bps: 100,                // 1% max slippage
+            intent_cooldown_ms: 5000,             // 5s cooldown per pair
+            intent_ttl_ms: 3000,                  // 3s TTL
         }
     }
 }
@@ -154,7 +154,8 @@ impl TokenArbTracker {
     /// Returns: Option<(buy_dex, sell_dex, spread_bps, estimated_profit_lamports)>
     fn check_arbitrage(&self, config: &ArbConfig) -> Option<ArbOpportunity> {
         // Need at least 2 DEXes with prices
-        let pools_with_price: Vec<_> = self.pools_by_dex
+        let pools_with_price: Vec<_> = self
+            .pools_by_dex
             .values()
             .filter(|p| p.last_price.is_some())
             .collect();
@@ -174,7 +175,7 @@ impl TokenArbTracker {
 
         for pool in &pools_with_price {
             let price = pool.last_price.unwrap();
-            
+
             if best_buy.is_none() || price < best_buy.unwrap().last_price.unwrap() {
                 best_buy = Some(pool);
             }
@@ -222,13 +223,17 @@ impl TokenArbTracker {
 
         // Estimate profit
         // Use smaller liquidity pool as constraint
-        let max_trade_sol = buy_pool.liquidity_sol.min(sell_pool.liquidity_sol)
+        let max_trade_sol = buy_pool
+            .liquidity_sol
+            .min(sell_pool.liquidity_sol)
             .min(Decimal::from(config.max_position_lamports) / Decimal::from(1_000_000_000u64));
 
         // Gross profit = trade_amount * spread_pct
         let gross_profit = max_trade_sol * (spread / Decimal::from(10000));
         let gross_profit_lamports = (gross_profit * Decimal::from(1_000_000_000u64))
-            .to_string().parse::<u64>().unwrap_or(0);
+            .to_string()
+            .parse::<u64>()
+            .unwrap_or(0);
 
         // Net profit after tx costs
         let net_profit = gross_profit_lamports.saturating_sub(config.est_tx_cost_lamports);
@@ -258,7 +263,9 @@ impl TokenArbTracker {
             sell_price,
             spread_bps: spread_bps as u32,
             trade_amount_lamports: (max_trade_sol * Decimal::from(1_000_000_000u64))
-                .to_string().parse::<u64>().unwrap_or(config.max_position_lamports),
+                .to_string()
+                .parse::<u64>()
+                .unwrap_or(config.max_position_lamports),
             estimated_profit_lamports: net_profit,
         })
     }
@@ -287,10 +294,10 @@ struct ArbContext {
     config: RwLock<ArbConfig>,
     nats: Option<NatsClient>,
     jsonl_writer: JsonlWriter,
-    
+
     /// Token trackers for cross-DEX arbitrage
     trackers: RwLock<HashMap<String, TokenArbTracker>>,
-    
+
     // Metrics
     events_received: AtomicU64,
     pools_tracked: AtomicU64,
@@ -408,12 +415,9 @@ impl ArbContext {
 // Intent Generation
 // ============================================================================
 
-fn create_arb_intent(
-    ctx: &ArbContext,
-    opp: &ArbOpportunity,
-) -> TradeIntent {
+fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> TradeIntent {
     let config = ctx.config.read();
-    
+
     let resources = TradeResources {
         input_mint: "So11111111111111111111111111111111111111112".to_string(),
         output_mint: opp.base_mint.clone(),
@@ -451,16 +455,35 @@ fn create_arb_intent(
     intent = intent.with_ttl_ms(config.intent_ttl_ms);
 
     // Add Cross-DEX metadata for execution-engine
-    intent.metadata.insert("cross_dex_arb".to_string(), "true".to_string());
-    intent.metadata.insert("buy_dex".to_string(), opp.buy_dex.clone());
-    intent.metadata.insert("buy_pool".to_string(), opp.buy_pool.clone());
-    intent.metadata.insert("buy_price".to_string(), opp.buy_price.to_string());
-    intent.metadata.insert("sell_dex".to_string(), opp.sell_dex.clone());
-    intent.metadata.insert("sell_pool".to_string(), opp.sell_pool.clone());
-    intent.metadata.insert("sell_price".to_string(), opp.sell_price.to_string());
-    intent.metadata.insert("spread_bps".to_string(), opp.spread_bps.to_string());
-    intent.metadata.insert("estimated_profit_lamports".to_string(), opp.estimated_profit_lamports.to_string());
-    
+    intent
+        .metadata
+        .insert("cross_dex_arb".to_string(), "true".to_string());
+    intent
+        .metadata
+        .insert("buy_dex".to_string(), opp.buy_dex.clone());
+    intent
+        .metadata
+        .insert("buy_pool".to_string(), opp.buy_pool.clone());
+    intent
+        .metadata
+        .insert("buy_price".to_string(), opp.buy_price.to_string());
+    intent
+        .metadata
+        .insert("sell_dex".to_string(), opp.sell_dex.clone());
+    intent
+        .metadata
+        .insert("sell_pool".to_string(), opp.sell_pool.clone());
+    intent
+        .metadata
+        .insert("sell_price".to_string(), opp.sell_price.to_string());
+    intent
+        .metadata
+        .insert("spread_bps".to_string(), opp.spread_bps.to_string());
+    intent.metadata.insert(
+        "estimated_profit_lamports".to_string(),
+        opp.estimated_profit_lamports.to_string(),
+    );
+
     // Decision record: why this opportunity was chosen
     intent.metadata.insert("decision_reason".to_string(), format!(
         "Cross-DEX arb: Buy {} @ {} ({}), Sell @ {} ({}). Spread {}bps > min {}bps. Estimated profit {} lamports > min {}",
@@ -511,7 +534,10 @@ async fn main() -> Result<()> {
             error!(error = %e, "Metrics server failed");
         }
     });
-    info!(port = args.metrics_port, "Metrics server started at /metrics");
+    info!(
+        port = args.metrics_port,
+        "Metrics server started at /metrics"
+    );
 
     // === P0 Check: Ensure no wallet keys are loaded ===
     if std::env::var("IRONCRAB_KEYPAIR_JSON").is_ok()
@@ -598,7 +624,7 @@ async fn main() -> Result<()> {
                     // Prometheus: count inbound NATS messages for this process
                     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     ctx.events_received.fetch_add(1, Ordering::Relaxed);
-                    
+
                     match serde_json::from_slice::<MarketEvent>(&nats_msg.payload) {
                         Ok(event) => {
                             // Prometheus: count consumed MarketEvents for this process
@@ -608,7 +634,7 @@ async fn main() -> Result<()> {
                                 if let Err(e) = ctx.jsonl_writer.write(&intent) {
                                     error!(error = %e, "Failed to write intent to JSONL");
                                 }
-                                
+
                                 // Publish to NATS
                                 if let Some(ref nats) = ctx.nats {
                                     if let Err(e) = nats.publish(TOPIC_TRADE_INTENTS, &intent).await {
@@ -646,7 +672,7 @@ async fn main() -> Result<()> {
                 // Prometheus: publish current gauges for this process
                 POOLS_TRACKED_GAUGE.store(ctx.pools_tracked.load(Ordering::Relaxed), Ordering::Relaxed);
                 TOKENS_TRACKED_GAUGE.store(trackers.len() as u64, Ordering::Relaxed);
-                
+
                 info!(
                     events_received = ctx.events_received.load(Ordering::Relaxed),
                     pools_tracked = ctx.pools_tracked.load(Ordering::Relaxed),
@@ -697,7 +723,9 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             is_buy,
             ..
         } => {
-            if let Some(opp) = ctx.handle_trade(pool_address, mint, *sol_amount, *token_amount, *is_buy) {
+            if let Some(opp) =
+                ctx.handle_trade(pool_address, mint, *sol_amount, *token_amount, *is_buy)
+            {
                 // Prometheus: count arbitrage opportunities detected
                 ARB_TRIANGLE_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
                 info!(

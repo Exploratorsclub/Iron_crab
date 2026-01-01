@@ -330,10 +330,7 @@ impl Default for TestState {
 
 /// Compare a generated decision against the golden expected decision
 fn assert_decision_matches(actual: &GoldenDecision, expected: &GoldenDecision) {
-    assert_eq!(
-        actual.intent_id, expected.intent_id,
-        "Intent ID mismatch"
-    );
+    assert_eq!(actual.intent_id, expected.intent_id, "Intent ID mismatch");
     assert_eq!(
         actual.outcome, expected.outcome,
         "Outcome mismatch for intent {}",

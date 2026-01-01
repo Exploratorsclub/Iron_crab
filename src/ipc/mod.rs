@@ -6,8 +6,8 @@
 //! - NATS pub/sub (JSON or bincode)
 //! - Append-only JSONL files for replay/forensics
 
-pub mod schema;
 pub mod reason_codes;
+pub mod schema;
 
-pub use schema::*;
 pub use reason_codes::*;
+pub use schema::*;

@@ -906,7 +906,9 @@ async def systemd_component_action(
     audit_logger.warning(f"SYSTEMD: user={user.name}, component={component}, action={action}, unit={unit}")
 
     # NOTE: This may require elevated privileges depending on the deployment.
-    argv = ["systemctl", "--no-pager", "--full", action, unit]
+    # Keep argv minimal so it matches tight sudoers allowlists.
+    # Also use an absolute path for determinism.
+    argv = ["/usr/bin/systemctl", action, unit]
     result = await _run_command(argv)
 
     # If we hit a permissions wall, try sudo -n (requires sudoers config and NoNewPrivileges disabled).

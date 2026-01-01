@@ -40,8 +40,8 @@ impl Default for NatsConfig {
         Self {
             url: std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string()),
             name: "ironcrab".to_string(),
-            max_reconnects: -1,                        // infinite reconnects
-            request_timeout: Duration::from_secs(5),   // 5s request timeout
+            max_reconnects: -1,                          // infinite reconnects
+            request_timeout: Duration::from_secs(5),     // 5s request timeout
             publish_timeout: Duration::from_millis(100), // 100ms publish timeout
         }
     }
@@ -100,7 +100,8 @@ impl NatsClient {
 
     pub async fn publish<T: Serialize>(&self, topic: &str, msg: &T) -> anyhow::Result<bool> {
         let Some(ref client) = self.client else {
-            self.messages_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.messages_dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(false);
         };
 
@@ -113,17 +114,20 @@ impl NatsClient {
         .await
         {
             Ok(Ok(())) => {
-                self.messages_published.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.messages_published
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(true)
             }
             Ok(Err(e)) => {
                 error!(error = %e, topic, "NATS publish error");
-                self.messages_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.messages_dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(false)
             }
             Err(_) => {
                 warn!(topic, "NATS publish timeout (backpressure)");
-                self.messages_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.messages_dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(false)
             }
         }
@@ -154,8 +158,10 @@ impl NatsClient {
 
     pub fn stats(&self) -> (u64, u64) {
         (
-            self.messages_published.load(std::sync::atomic::Ordering::Relaxed),
-            self.messages_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            self.messages_published
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.messages_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 }
@@ -232,11 +238,7 @@ impl NatsClient {
         let json = serde_json::to_vec(msg)?;
 
         // Stub: just log and count
-        debug!(
-            topic,
-            bytes = json.len(),
-            "NATS publish (stub)"
-        );
+        debug!(topic, bytes = json.len(), "NATS publish (stub)");
 
         self.messages_published
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

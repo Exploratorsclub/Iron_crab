@@ -29,6 +29,10 @@ type SystemStatus = {
   kill_switch_active: boolean
 }
 
+type RbacInfo = {
+  auth_required: boolean
+}
+
 async function fetchJson<T>(path: string): Promise<T> {
   const apiKey = localStorage.getItem('ironcrab_api_key') || ''
   const response = await fetch(path, {
@@ -69,6 +73,8 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 export default function App() {
   const [health, setHealth] = useState<LoadState<HealthStatus>>({ status: 'idle' })
   const [systemStatus, setSystemStatus] = useState<LoadState<SystemStatus>>({ status: 'idle' })
+  const [rbacInfo, setRbacInfo] = useState<RbacInfo | null>(null)
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false)
   const [apiKeyDraft, setApiKeyDraft] = useState<string>(() => localStorage.getItem('ironcrab_api_key') || '')
   const [killReason, setKillReason] = useState<string>('')
   const [liquidatePositions, setLiquidatePositions] = useState<boolean>(true)
@@ -81,22 +87,45 @@ export default function App() {
 
   const nowIso = useMemo(() => new Date().toISOString(), [])
 
-  async function loadAll() {
-    setHealth({ status: 'loading' })
-    setSystemStatus({ status: 'loading' })
+  async function loadAll(opts?: { background?: boolean }) {
+    const background = opts?.background === true
+
+    if (!background) {
+      setHealth({ status: 'loading' })
+      setSystemStatus({ status: 'loading' })
+    } else {
+      setIsRefreshing(true)
+    }
 
     try {
-      const [healthJson, statusJson] = await Promise.all([
+      const [healthJson, statusJson, rbacJson] = await Promise.all([
         fetchJson<HealthStatus>('/api/health'),
         fetchJson<SystemStatus>('/api/status'),
+        fetchJson<RbacInfo>('/api/rbac/info').catch(() => null),
       ])
 
       setHealth({ status: 'loaded', data: healthJson })
       setSystemStatus({ status: 'loaded', data: statusJson })
+      setRbacInfo(rbacJson)
+
+      if (background) {
+        setActionState((prev) => {
+          if (prev.status === 'error' && prev.message.startsWith('Auto-refresh failed:')) {
+            return { status: 'idle' }
+          }
+          return prev
+        })
+      }
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
-      setHealth({ status: 'error', error: message })
-      setSystemStatus({ status: 'error', error: message })
+      if (!background) {
+        setHealth({ status: 'error', error: message })
+        setSystemStatus({ status: 'error', error: message })
+      } else {
+        setActionState({ status: 'error', message: `Auto-refresh failed: ${message}` })
+      }
+    } finally {
+      if (background) setIsRefreshing(false)
     }
   }
 
@@ -108,7 +137,8 @@ export default function App() {
     }
     void run()
     const id = window.setInterval(() => {
-      void run()
+      if (cancelled) return
+      void loadAll({ background: true })
     }, 5000)
     return () => {
       cancelled = true
@@ -285,6 +315,7 @@ export default function App() {
           <strong>Operator</strong>
         </div>
         <div className="card">
+          {isRefreshing && <div className="small">Refreshing…</div>}
           <div className="kvRow">
             <span>API key (optional)</span>
             <input
@@ -302,7 +333,11 @@ export default function App() {
           {actionState.status === 'busy' && <div>Working: {actionState.message}</div>}
           {actionState.status === 'ok' && <div>{actionState.message}</div>}
           {actionState.status === 'error' && <div className="error">{actionState.message}</div>}
-          <div className="small">Start/stop/restart + kill switch require admin API key.</div>
+          <div className="small">
+            {rbacInfo?.auth_required
+              ? 'Auth enabled on control-plane: admin API key required for start/stop/kill.'
+              : 'Auth disabled on control-plane (dev mode): API key not required.'}
+          </div>
         </div>
       </section>
 

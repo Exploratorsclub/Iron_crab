@@ -10,10 +10,7 @@
 
 use anyhow::{anyhow, Result};
 use solana_sdk::{
-    instruction::Instruction,
-    pubkey::Pubkey,
-    signature::Keypair,
-    signer::Signer,
+    instruction::Instruction, pubkey::Pubkey, signature::Keypair, signer::Signer,
     transaction::Transaction,
 };
 use std::collections::HashMap;
@@ -56,7 +53,7 @@ pub struct CrossDexSwapPlan {
 }
 
 /// Cross-DEX Arbitrage Handler
-/// 
+///
 /// Manages DEX connectors and provides methods for validating and executing
 /// cross-DEX arbitrage opportunities.
 pub struct CrossDexHandler {
@@ -102,13 +99,13 @@ impl CrossDexHandler {
     /// Check if this intent is a cross-DEX arbitrage intent
     pub fn is_cross_dex_arb_intent(intent: &TradeIntent) -> bool {
         // Cross-DEX arb intents have 2 pools and require_bundle
-        intent.resources.pools.len() == 2 
+        intent.resources.pools.len() == 2
             && intent.requires_bundle()
             && intent.source == "arb-strategy"
     }
 
     /// Validate a cross-DEX arbitrage opportunity with live quotes
-    /// 
+    ///
     /// This fetches fresh quotes from both DEXes and validates:
     /// 1. The spread is still profitable
     /// 2. Both DEXes have sufficient liquidity
@@ -137,12 +134,16 @@ impl CrossDexHandler {
 
         // Extract DEX info from intent metadata (set by arb-strategy)
         // Fallback to identify_dex if metadata not present
-        let buy_dex = intent.metadata.get("buy_dex")
-            .cloned()
-            .unwrap_or_else(|| self.identify_dex(&pools[0]).map(|(d, _)| d).unwrap_or_default());
-        let sell_dex = intent.metadata.get("sell_dex")
-            .cloned()
-            .unwrap_or_else(|| self.identify_dex(&pools[1]).map(|(d, _)| d).unwrap_or_default());
+        let buy_dex = intent.metadata.get("buy_dex").cloned().unwrap_or_else(|| {
+            self.identify_dex(&pools[0])
+                .map(|(d, _)| d)
+                .unwrap_or_default()
+        });
+        let sell_dex = intent.metadata.get("sell_dex").cloned().unwrap_or_else(|| {
+            self.identify_dex(&pools[1])
+                .map(|(d, _)| d)
+                .unwrap_or_default()
+        });
 
         // Log original spread from strategy for comparison
         if let Some(orig_spread) = intent.metadata.get("spread_bps") {
@@ -161,9 +162,11 @@ impl CrossDexHandler {
         );
 
         // Get live quote from buy DEX (SOL -> Token)
-        let buy_connector = self.dexes.get(&buy_dex)
+        let buy_connector = self
+            .dexes
+            .get(&buy_dex)
             .ok_or_else(|| anyhow!("Unknown buy DEX: {}", buy_dex))?;
-        
+
         let buy_quote = buy_connector
             .quote_exact_in(SOL_MINT, token_mint, trade_amount)
             .await?;
@@ -183,7 +186,9 @@ impl CrossDexHandler {
         };
 
         // Get live quote from sell DEX (Token -> SOL)
-        let sell_connector = self.dexes.get(&sell_dex)
+        let sell_connector = self
+            .dexes
+            .get(&sell_dex)
             .ok_or_else(|| anyhow!("Unknown sell DEX: {}", sell_dex))?;
 
         let sell_quote = sell_connector
@@ -278,9 +283,13 @@ impl CrossDexHandler {
         intent: &TradeIntent,
         validation: &CrossDexValidation,
     ) -> Result<CrossDexSwapPlan> {
-        let buy_quote = validation.buy_quote.as_ref()
+        let buy_quote = validation
+            .buy_quote
+            .as_ref()
             .ok_or_else(|| anyhow!("No buy quote for swap plan"))?;
-        let sell_quote = validation.sell_quote.as_ref()
+        let sell_quote = validation
+            .sell_quote
+            .as_ref()
             .ok_or_else(|| anyhow!("No sell quote for swap plan"))?;
 
         let pools = &intent.resources.pools;
@@ -292,30 +301,32 @@ impl CrossDexHandler {
 
         // Calculate min_out with slippage
         let slippage_bps = intent.max_slippage_bps.min(self.default_slippage_bps);
-        
+
         // Buy leg: min tokens out
-        let buy_min_out = buy_quote.amount_out
+        let buy_min_out = buy_quote
+            .amount_out
             .saturating_mul(10000 - slippage_bps as u64)
             / 10000;
 
         // Sell leg: min SOL out
-        let sell_min_out = sell_quote.amount_out
+        let sell_min_out = sell_quote
+            .amount_out
             .saturating_mul(10000 - slippage_bps as u64)
             / 10000;
 
         // Build buy instructions
-        let buy_connector = self.dexes.get(&buy_dex)
+        let buy_connector = self
+            .dexes
+            .get(&buy_dex)
             .ok_or_else(|| anyhow!("Unknown buy DEX: {}", buy_dex))?;
 
-        let buy_instructions = buy_connector.build_swap_ix(
-            SOL_MINT,
-            token_mint,
-            trade_amount,
-            buy_min_out,
-        )?;
+        let buy_instructions =
+            buy_connector.build_swap_ix(SOL_MINT, token_mint, trade_amount, buy_min_out)?;
 
         // Build sell instructions
-        let sell_connector = self.dexes.get(&sell_dex)
+        let sell_connector = self
+            .dexes
+            .get(&sell_dex)
             .ok_or_else(|| anyhow!("Unknown sell DEX: {}", sell_dex))?;
 
         let sell_instructions = sell_connector.build_swap_ix(
@@ -346,22 +357,25 @@ impl CrossDexHandler {
         recent_blockhash: solana_sdk::hash::Hash,
         priority_fee_lamports: u64,
     ) -> Result<Transaction> {
-        let wallet = self.wallet.as_ref()
+        let wallet = self
+            .wallet
+            .as_ref()
             .ok_or_else(|| anyhow!("No wallet configured for transaction building"))?;
 
         let mut all_instructions = Vec::new();
 
         // Add compute budget instructions
-        all_instructions.push(
-            compute_budget_helper::set_compute_unit_limit(plan.total_compute_units)
-        );
-        
+        all_instructions.push(compute_budget_helper::set_compute_unit_limit(
+            plan.total_compute_units,
+        ));
+
         if priority_fee_lamports > 0 {
             // Convert lamports to micro-lamports per CU
-            let micro_lamports_per_cu = (priority_fee_lamports * 1_000_000) / plan.total_compute_units as u64;
-            all_instructions.push(
-                compute_budget_helper::set_compute_unit_price(micro_lamports_per_cu)
-            );
+            let micro_lamports_per_cu =
+                (priority_fee_lamports * 1_000_000) / plan.total_compute_units as u64;
+            all_instructions.push(compute_budget_helper::set_compute_unit_price(
+                micro_lamports_per_cu,
+            ));
         }
 
         // Add buy leg
@@ -390,20 +404,20 @@ impl CrossDexHandler {
 
         // For now, use simple heuristics based on pool address length and pattern
         // In production: query on-chain owner or use cached pool registry
-        
+
         // Raydium AMM pools typically have specific patterns
         // PumpFun bonding curves are derived from mint
         // Orca whirlpools have their own pattern
 
         // Simple heuristic: check if pool exists in our connectors
         // This is a placeholder - real implementation would query chain
-        
+
         let pubkey = Pubkey::from_str(pool_address)
             .map_err(|_| anyhow!("Invalid pool address: {}", pool_address))?;
 
         // Try to identify by checking pool data (simplified)
         // In production: use account owner check
-        
+
         // Default to checking if pool contains certain markers
         // This is a STUB - needs real implementation
         if pool_address.starts_with("5") || pool_address.starts_with("7") {

@@ -35,8 +35,8 @@ impl Default for JsonlWriterConfig {
                 std::env::var("IRONCRAB_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string()),
             ),
             prefix: "records".to_string(),
-            buffer_size: 8192,        // 8KB buffer
-            flush_each_write: false,  // batch writes for performance
+            buffer_size: 8192,       // 8KB buffer
+            flush_each_write: false, // batch writes for performance
         }
     }
 }
@@ -108,9 +108,8 @@ impl JsonlWriter {
         }
 
         // Serialize and write
-        let json = serde_json::to_string(record).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let json = serde_json::to_string(record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
         if let Some(writer) = state.writer.as_mut() {
             writeln!(writer, "{}", json)?;
@@ -169,10 +168,7 @@ impl JsonlWriter {
         );
 
         // Open for append
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         state.writer = Some(BufWriter::with_capacity(self.config.buffer_size, file));
         state.current_date = Some(date.to_string());
@@ -211,7 +207,8 @@ impl AsyncJsonlWriter {
         tokio::spawn(async move {
             while let Some(json) = receiver.recv().await {
                 // Write raw JSON string directly - parse to Value to satisfy Serialize trait
-                let value: serde_json::Value = serde_json::from_str(&json).unwrap_or(serde_json::json!({}));
+                let value: serde_json::Value =
+                    serde_json::from_str(&json).unwrap_or(serde_json::json!({}));
                 if let Err(e) = writer.write(&value) {
                     warn!(error = %e, "Failed to write record to JSONL");
                 }
@@ -230,7 +227,10 @@ impl AsyncJsonlWriter {
     }
 
     /// Queue with backpressure (async)
-    pub async fn write_async<T: Serialize>(&self, record: &T) -> Result<(), mpsc::error::SendError<String>> {
+    pub async fn write_async<T: Serialize>(
+        &self,
+        record: &T,
+    ) -> Result<(), mpsc::error::SendError<String>> {
         let json = serde_json::to_string(record).unwrap_or_else(|_| "{}".to_string());
         self.sender.send(json).await
     }
@@ -274,8 +274,18 @@ mod tests {
 
         let writer = JsonlWriter::new(config).unwrap();
 
-        writer.write(&TestRecord { id: "1".to_string(), value: 42 }).unwrap();
-        writer.write(&TestRecord { id: "2".to_string(), value: 99 }).unwrap();
+        writer
+            .write(&TestRecord {
+                id: "1".to_string(),
+                value: 42,
+            })
+            .unwrap();
+        writer
+            .write(&TestRecord {
+                id: "2".to_string(),
+                value: 99,
+            })
+            .unwrap();
 
         let (records, bytes) = writer.stats();
         assert_eq!(records, 2);
@@ -299,7 +309,12 @@ mod tests {
         let config = JsonlWriterConfig::new("rotate_test").with_log_dir(dir.path());
 
         let writer = JsonlWriter::new(config).unwrap();
-        writer.write(&TestRecord { id: "test".to_string(), value: 1 }).unwrap();
+        writer
+            .write(&TestRecord {
+                id: "test".to_string(),
+                value: 1,
+            })
+            .unwrap();
 
         let path = writer.current_path().unwrap();
         let filename = path.file_name().unwrap().to_str().unwrap();

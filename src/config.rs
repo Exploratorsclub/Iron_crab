@@ -100,37 +100,47 @@ pub struct WalletTrackerCfg {
     /// Enable wallet tracking. Default: true
     #[serde(default = "default_wallet_tracking_enabled")]
     pub enabled: bool,
-    
+
     /// List of known "smart money" wallet addresses
     #[serde(default)]
     pub smart_money_wallets: Vec<String>,
-    
+
     /// List of known bad actor wallet addresses (rug pullers, scammers)
     #[serde(default)]
     pub bad_actor_wallets: Vec<String>,
-    
+
     /// How many slots after pool creation to track "early buyers"
     #[serde(default = "default_early_buyer_slots")]
     pub early_buyer_slots: u64,
-    
+
     /// Maximum number of early buyers to track per token
     #[serde(default = "default_max_early_buyers")]
     pub max_early_buyers_per_token: usize,
-    
+
     /// Minimum SOL amount to consider a "whale" buy (lamports)
     #[serde(default = "default_whale_threshold")]
     pub whale_threshold_lamports: u64,
-    
+
     /// Maximum wallets to keep in memory cache (LRU eviction)
     #[serde(default = "default_max_cached_wallets")]
     pub max_cached_wallets: usize,
 }
 
-fn default_wallet_tracking_enabled() -> bool { true }
-fn default_early_buyer_slots() -> u64 { 100 } // ~40 seconds
-fn default_max_early_buyers() -> usize { 50 }
-fn default_whale_threshold() -> u64 { 10_000_000_000 } // 10 SOL
-fn default_max_cached_wallets() -> usize { 10_000 }
+fn default_wallet_tracking_enabled() -> bool {
+    true
+}
+fn default_early_buyer_slots() -> u64 {
+    100
+} // ~40 seconds
+fn default_max_early_buyers() -> usize {
+    50
+}
+fn default_whale_threshold() -> u64 {
+    10_000_000_000
+} // 10 SOL
+fn default_max_cached_wallets() -> usize {
+    10_000
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ArbPairCfg {

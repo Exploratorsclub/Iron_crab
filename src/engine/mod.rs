@@ -1597,6 +1597,7 @@ mod tests {
             arbitrage: None,
             sniper: None,
             orca: Default::default(),
+            wallet_tracker: None,
         };
         let rpc = Arc::new(crate::solana::rpc::SolanaRpc::new("http://127.0.0.1:8899"));
         let signer = Arc::new(solana_sdk::signature::Keypair::new());

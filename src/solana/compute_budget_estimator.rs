@@ -38,14 +38,14 @@ pub struct EstimatorConfig {
 impl Default for EstimatorConfig {
     fn default() -> Self {
         Self {
-            base_single_swap_cu: 120_000,             // base for single swap
-            per_extra_ix_cu: 10_000,                  // overhead per extra ix
-            per_hop_increment_cu: 40_000,             // multi-hop overhead
-            min_limit: 80_000,                        // minimum compute limit
-            max_limit: 400_000,                       // maximum compute limit
-            default_cu_price_micro_lamports: 1,       // 1 micro-lamport/CU
-            large_notional_threshold: 1_000_000_000,  // 1 SOL = large trade
-            large_notional_multiplier: 3,             // 3x price for large trades
+            base_single_swap_cu: 120_000,            // base for single swap
+            per_extra_ix_cu: 10_000,                 // overhead per extra ix
+            per_hop_increment_cu: 40_000,            // multi-hop overhead
+            min_limit: 80_000,                       // minimum compute limit
+            max_limit: 400_000,                      // maximum compute limit
+            default_cu_price_micro_lamports: 1,      // 1 micro-lamport/CU
+            large_notional_threshold: 1_000_000_000, // 1 SOL = large trade
+            large_notional_multiplier: 3,            // 3x price for large trades
         }
     }
 }

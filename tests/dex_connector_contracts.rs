@@ -21,22 +21,26 @@ fn contract_cfm_quote_monotonic() {
             pool: "test-pool".into(),
             base_mint: "SOL".into(),
             quote_mint: "USDC".into(),
-            base_reserve: 1_000_000_000, // 1000 SOL
+            base_reserve: 1_000_000_000,    // 1000 SOL
             quote_reserve: 150_000_000_000, // 150k USDC
-            fee_bps: 30, // 0.3%
+            fee_bps: 30,                    // 0.3%
             tick_spacing: None,
         }],
     };
 
     let inputs = [1_000_000u64, 10_000_000, 100_000_000, 500_000_000];
     let mut prev_output = 0u64;
-    
+
     for input in inputs {
-        let quote = adapter.quote("SOL", "USDC", input).expect("quote should succeed");
+        let quote = adapter
+            .quote("SOL", "USDC", input)
+            .expect("quote should succeed");
         assert!(
             quote.amount_out > prev_output,
             "Quote not monotonic: input {} gave {} (prev {})",
-            input, quote.amount_out, prev_output
+            input,
+            quote.amount_out,
+            prev_output
         );
         prev_output = quote.amount_out;
     }
@@ -63,13 +67,17 @@ fn contract_cfm_price_impact_non_decreasing() {
 
     let inputs = [1_000_000u64, 10_000_000, 100_000_000, 500_000_000];
     let mut prev_impact = 0u32;
-    
+
     for input in inputs {
-        let quote = adapter.quote("SOL", "USDC", input).expect("quote should succeed");
+        let quote = adapter
+            .quote("SOL", "USDC", input)
+            .expect("quote should succeed");
         assert!(
             quote.price_impact_bps >= prev_impact,
             "Price impact decreased: input {} gave {}bps (prev {}bps)",
-            input, quote.price_impact_bps, prev_impact
+            input,
+            quote.price_impact_bps,
+            prev_impact
         );
         prev_impact = quote.price_impact_bps;
     }
@@ -95,10 +103,16 @@ fn contract_cfm_unknown_pair_returns_none() {
 
     // Unknown mints should return None
     let result = adapter.quote("UNKNOWN", "USDC", 1_000_000);
-    assert!(result.is_none(), "Quote for unknown input mint should be None");
-    
+    assert!(
+        result.is_none(),
+        "Quote for unknown input mint should be None"
+    );
+
     let result = adapter.quote("SOL", "UNKNOWN", 1_000_000);
-    assert!(result.is_none(), "Quote for unknown output mint should be None");
+    assert!(
+        result.is_none(),
+        "Quote for unknown output mint should be None"
+    );
 }
 
 // ============================================================================
@@ -132,7 +146,7 @@ fn contract_cfm_zero_input() {
 
 #[cfg(feature = "live_tests")]
 mod live_connector_tests {
-    use ironcrab::solana::dex::{raydium::RaydiumDex, pumpfun::PumpFunDex, orca::OrcaDex, Dex};
+    use ironcrab::solana::dex::{orca::OrcaDex, pumpfun::PumpFunDex, raydium::RaydiumDex, Dex};
     use ironcrab::solana::rpc::SolanaRpc;
     use std::sync::Arc;
 
@@ -145,15 +159,19 @@ mod live_connector_tests {
     async fn contract_raydium_quote_monotonic() {
         let rpc = Arc::new(SolanaRpc::new("https://api.mainnet-beta.solana.com").unwrap());
         let dex = RaydiumDex::new(rpc).unwrap();
-        
+
         // Refresh to load pools
         dex.refresh_pools().await.unwrap();
-        
+
         let inputs = [1_000_000u64, 10_000_000, 100_000_000];
         let mut prev_output = 0u64;
-        
+
         for input in inputs {
-            if let Some(quote) = dex.quote_exact_in(SOL_MINT, USDC_MINT, input).await.unwrap() {
+            if let Some(quote) = dex
+                .quote_exact_in(SOL_MINT, USDC_MINT, input)
+                .await
+                .unwrap()
+            {
                 assert!(
                     quote.amount_out > prev_output,
                     "Raydium quote not monotonic"
@@ -167,10 +185,16 @@ mod live_connector_tests {
     async fn contract_pumpfun_quote_requires_bonding_curve() {
         let rpc = Arc::new(SolanaRpc::new("https://api.mainnet-beta.solana.com").unwrap());
         let dex = PumpFunDex::new(rpc).unwrap();
-        
+
         // PumpFun only works with its bonding curve tokens
         // Unknown tokens should return None
-        let result = dex.quote_exact_in(SOL_MINT, USDC_MINT, 1_000_000).await.unwrap();
-        assert!(result.is_none(), "PumpFun should not quote non-bonding-curve tokens");
+        let result = dex
+            .quote_exact_in(SOL_MINT, USDC_MINT, 1_000_000)
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "PumpFun should not quote non-bonding-curve tokens"
+        );
     }
 }

@@ -29,13 +29,16 @@ if (Test-Path (Join-Path $nodeDir 'node.exe')) {
 }
 
 # Resolve npm (prefer npm.cmd to avoid PowerShell execution-policy blocking npm.ps1)
-$npmCmd = (Get-Command npm.cmd -ErrorAction SilentlyContinue)?.Source
+$npmCmd = $null
+$npmCmdResolved = Get-Command npm.cmd -ErrorAction SilentlyContinue
+if ($npmCmdResolved) { $npmCmd = $npmCmdResolved.Source }
 if (-not $npmCmd) {
   $fallbackNpm = 'C:\Program Files\nodejs\npm.cmd'
   if (Test-Path $fallbackNpm) { $npmCmd = $fallbackNpm }
 }
 if (-not $npmCmd) {
-  $npmCmd = (Get-Command npm -ErrorAction SilentlyContinue)?.Source
+  $npmResolved = Get-Command npm -ErrorAction SilentlyContinue
+  if ($npmResolved) { $npmCmd = $npmResolved.Source }
 }
 
 if (-not $npmCmd) {

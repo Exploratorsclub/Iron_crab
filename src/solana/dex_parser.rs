@@ -98,7 +98,7 @@ const RAYDIUM_INITIALIZE2: u8 = 1;
 /// Used for Raydium and Orca where pool state lives in accounts
 pub fn parse_account_update(update: &GeyserAccountUpdate) -> Option<ParsedDexEvent> {
     let owner_str = update.owner.to_string();
-    
+
     match owner_str.as_str() {
         RAYDIUM_AMM_V4 => parse_raydium_account(update),
         ORCA_WHIRLPOOL => parse_orca_account(update),
@@ -118,7 +118,7 @@ pub fn parse_transaction_update(update: &GeyserTransactionUpdate) -> Option<Pars
     let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).ok()?;
     let orca = Pubkey::from_str(ORCA_WHIRLPOOL).ok()?;
     let pumpfun = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
-    
+
     if update.account_keys.contains(&pumpfun) {
         return parse_pumpfun_transaction(update);
     }
@@ -128,7 +128,7 @@ pub fn parse_transaction_update(update: &GeyserTransactionUpdate) -> Option<Pars
     if update.account_keys.contains(&orca) {
         return parse_orca_transaction(update);
     }
-    
+
     None
 }
 
@@ -141,37 +141,37 @@ fn parse_raydium_account(update: &GeyserAccountUpdate) -> Option<ParsedDexEvent>
     if update.data.len() != 752 {
         return None;
     }
-    
+
     let data = &update.data;
-    
+
     // Offset 0: status (u64) - check if initialized
     let status = u64::from_le_bytes(data[0..8].try_into().ok()?);
     if status == 0 {
         return None; // Uninitialized
     }
-    
+
     // Offset 400: coin_vault_mint (BASE MINT)
     let base_mint = Pubkey::new_from_array(data[400..432].try_into().ok()?);
     // Offset 432: pc_vault_mint (QUOTE MINT)
     let quote_mint = Pubkey::new_from_array(data[432..464].try_into().ok()?);
-    
+
     // Offset 720: lp_amount (u64) - liquidity indicator
     let lp_amount = u64::from_le_bytes(data[720..728].try_into().ok()?);
-    
+
     // Estimate liquidity (conservative)
     let liquidity_lamports = if lp_amount == 0 {
         5_000_000_000 // 5 SOL for new pools
     } else {
         50_000_000_000 // 50 SOL conservative
     };
-    
+
     debug!(
         pool = %update.pubkey,
         base_mint = %base_mint,
         quote_mint = %quote_mint,
         "Raydium pool detected"
     );
-    
+
     Some(ParsedDexEvent::PoolCreated {
         pool_address: update.pubkey,
         base_mint,
@@ -187,9 +187,9 @@ fn parse_raydium_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
     if update.instruction_data.is_empty() {
         return None;
     }
-    
+
     let discriminator = update.instruction_data[0];
-    
+
     match discriminator {
         RAYDIUM_SWAP_BASE_IN | RAYDIUM_SWAP_BASE_OUT => {
             parse_raydium_swap(update, discriminator == RAYDIUM_SWAP_BASE_IN)
@@ -203,7 +203,10 @@ fn parse_raydium_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
     }
 }
 
-fn parse_raydium_swap(update: &GeyserTransactionUpdate, is_base_in: bool) -> Option<ParsedDexEvent> {
+fn parse_raydium_swap(
+    update: &GeyserTransactionUpdate,
+    is_base_in: bool,
+) -> Option<ParsedDexEvent> {
     // Raydium swap instruction accounts:
     // [0]: Token program
     // [1]: AMM ID (pool)
@@ -222,30 +225,30 @@ fn parse_raydium_swap(update: &GeyserTransactionUpdate, is_base_in: bool) -> Opt
     // [14]: User source token
     // [15]: User destination token
     // [16]: User owner (TRADER!)
-    
+
     if update.instruction_accounts.len() < 17 {
         return None;
     }
-    
+
     let pool_address = update.instruction_accounts[1];
     let trader = update.instruction_accounts[16];
-    
+
     // Parse amounts from instruction data
     // Layout: discriminator(1) + amount_in(8) + min_amount_out(8)
     if update.instruction_data.len() < 17 {
         return None;
     }
-    
+
     let amount_in = u64::from_le_bytes(update.instruction_data[1..9].try_into().ok()?);
     let _min_out = u64::from_le_bytes(update.instruction_data[9..17].try_into().ok()?);
-    
+
     // Determine if buy or sell based on direction
     // For SOL/token pair: base_in means selling token, base_out means buying token
     let is_buy = !is_base_in;
-    
+
     // We need the mint - for now use placeholder, will be enriched by momentum-bot
     let mint = Pubkey::default();
-    
+
     debug!(
         pool = %pool_address,
         trader = %trader,
@@ -254,7 +257,7 @@ fn parse_raydium_swap(update: &GeyserTransactionUpdate, is_base_in: bool) -> Opt
         sig = %update.signature,
         "Raydium swap detected"
     );
-    
+
     Some(ParsedDexEvent::Trade {
         pool_address,
         mint,
@@ -274,20 +277,20 @@ fn parse_raydium_swap(update: &GeyserTransactionUpdate, is_base_in: bool) -> Opt
 fn parse_orca_account(update: &GeyserAccountUpdate) -> Option<ParsedDexEvent> {
     // Use existing orca_whirlpool_layout parser
     let parsed = crate::solana::dex::orca_whirlpool_layout::parse_whirlpool(&update.data)?;
-    
+
     let liquidity_lamports = if parsed.liquidity > 0 {
         (parsed.liquidity / 1_000_000).min(1_000_000_000_000) as u64
     } else {
         5_000_000_000
     };
-    
+
     debug!(
         pool = %update.pubkey,
         base_mint = %parsed.token_mint_a,
         quote_mint = %parsed.token_mint_b,
         "Orca pool detected"
     );
-    
+
     Some(ParsedDexEvent::PoolCreated {
         pool_address: update.pubkey,
         base_mint: parsed.token_mint_a,
@@ -305,15 +308,15 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
     if update.instruction_data.len() < 8 {
         return None;
     }
-    
+
     // Orca swap discriminator
     const ORCA_SWAP: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
-    
+
     let disc = &update.instruction_data[0..8];
     if disc != ORCA_SWAP {
         return None;
     }
-    
+
     // Orca swap accounts:
     // [0]: Token program
     // [1]: Token authority
@@ -323,21 +326,21 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
     if update.instruction_accounts.len() < 4 {
         return None;
     }
-    
+
     let pool_address = update.instruction_accounts[2];
     let trader = update.instruction_accounts[3];
-    
+
     // Parse amounts
     // Layout: discriminator(8) + amount(8) + other_amount_threshold(8) + sqrt_price_limit(16) + ...
     if update.instruction_data.len() < 25 {
         return None;
     }
-    
+
     let amount = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
     let a_to_b = update.instruction_data[24] == 1; // direction flag
-    
+
     let is_buy = !a_to_b; // a_to_b=true means selling token A
-    
+
     debug!(
         pool = %pool_address,
         trader = %trader,
@@ -346,7 +349,7 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
         sig = %update.signature,
         "Orca swap detected"
     );
-    
+
     Some(ParsedDexEvent::Trade {
         pool_address,
         mint: Pubkey::default(),
@@ -367,9 +370,9 @@ fn parse_pumpfun_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
     if update.instruction_data.len() < 8 {
         return None;
     }
-    
+
     let disc = &update.instruction_data[0..8];
-    
+
     if disc == PUMPFUN_CREATE {
         return parse_pumpfun_create(update);
     }
@@ -379,7 +382,7 @@ fn parse_pumpfun_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
     if disc == PUMPFUN_SELL {
         return parse_pumpfun_swap(update, false);
     }
-    
+
     None
 }
 
@@ -393,23 +396,21 @@ fn parse_pumpfun_create(update: &GeyserTransactionUpdate) -> Option<ParsedDexEve
     // [5]: Metaplex Token Metadata Program
     // [6]: Metadata account
     // [7]: User (creator, fee payer)
-    
+
     if update.instruction_accounts.len() < 8 {
         return None;
     }
-    
+
     let token_mint = update.instruction_accounts[0];
     let creator = update.instruction_accounts[7];
-    
+
     // Calculate Bonding Curve PDA
     let pumpfun_program = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
-    let (bonding_curve, _) = Pubkey::find_program_address(
-        &[b"bonding-curve", token_mint.as_ref()],
-        &pumpfun_program,
-    );
-    
+    let (bonding_curve, _) =
+        Pubkey::find_program_address(&[b"bonding-curve", token_mint.as_ref()], &pumpfun_program);
+
     let quote_mint = Pubkey::from_str(SOL_MINT).ok()?;
-    
+
     info!(
         sig = %update.signature,
         slot = update.slot,
@@ -418,7 +419,7 @@ fn parse_pumpfun_create(update: &GeyserTransactionUpdate) -> Option<ParsedDexEve
         creator = %creator,
         "🆕 PumpFun CREATE detected"
     );
-    
+
     Some(ParsedDexEvent::PoolCreated {
         pool_address: bonding_curve,
         base_mint: token_mint,
@@ -444,25 +445,25 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
     // [9]: Rent (optional)
     // [10]: Event Authority
     // [11]: Program
-    
+
     if update.instruction_accounts.len() < 7 {
         return None;
     }
-    
+
     let mint = update.instruction_accounts[2];
     let bonding_curve = update.instruction_accounts[3];
     let trader = update.instruction_accounts[6];
-    
+
     // Parse amounts from instruction data
     // BUY layout: discriminator(8) + amount(8) + max_sol_cost(8)
     // SELL layout: discriminator(8) + amount(8) + min_sol_output(8)
     if update.instruction_data.len() < 24 {
         return None;
     }
-    
+
     let token_amount = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
     let sol_amount = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
-    
+
     debug!(
         pool = %bonding_curve,
         mint = %mint,
@@ -473,7 +474,7 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
         sig = %update.signature,
         "PumpFun swap detected"
     );
-    
+
     Some(ParsedDexEvent::Trade {
         pool_address: bonding_curve,
         mint,
@@ -504,7 +505,8 @@ impl ParsedDexEvent {
                 initial_liquidity_lamports,
                 ..
             } => {
-                let liq_sol = Decimal::from(*initial_liquidity_lamports) / Decimal::from(1_000_000_000u64);
+                let liq_sol =
+                    Decimal::from(*initial_liquidity_lamports) / Decimal::from(1_000_000_000u64);
                 MarketEventKind::PoolCreated {
                     pool_address: pool_address.to_string(),
                     base_mint: base_mint.to_string(),
@@ -547,7 +549,7 @@ impl ParsedDexEvent {
             },
         }
     }
-    
+
     /// Get slot from event
     pub fn slot(&self) -> u64 {
         match self {
@@ -561,7 +563,7 @@ impl ParsedDexEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_dex_type_display() {
         assert_eq!(DexType::RaydiumAmmV4.to_string(), "raydium");

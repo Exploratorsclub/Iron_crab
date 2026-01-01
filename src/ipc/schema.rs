@@ -49,14 +49,14 @@ impl RecordHeader {
 // ============================================================================
 
 /// Amount with explicit unit specification
-/// 
+///
 /// P0 requirement (DoD P): Units/Decimals explizit – keine impliziten UI/raw Konventionen.
-/// 
+///
 /// All monetary amounts in the system MUST use this type to prevent unit confusion.
 /// - `raw`: on-chain value (lamports for SOL, smallest unit for tokens)
 /// - `decimals`: token decimals (9 for SOL, 6 for USDC, 8 for BONK, etc.)
 /// - `ui`: human-readable value (computed as raw / 10^decimals)
-/// 
+///
 /// Example: 1 SOL = ExplicitAmount { raw: 1_000_000_000, decimals: 9, ui: Some(1.0) }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExplicitAmount {
@@ -88,7 +88,7 @@ impl ExplicitAmount {
             ui: Some(Decimal::ZERO),
         }
     }
-    
+
     /// Create from UI value (human-readable) and decimals
     pub fn from_ui(ui_value: Decimal, decimals: u8) -> Self {
         let multiplier = Decimal::from(10u64.pow(decimals as u32));
@@ -99,17 +99,17 @@ impl ExplicitAmount {
             ui: Some(ui_value),
         }
     }
-    
+
     /// Create SOL amount from lamports
     pub fn sol_from_lamports(lamports: u64) -> Self {
         Self::new(lamports, 9)
     }
-    
+
     /// Create SOL amount from UI value (e.g., 1.5 SOL)
     pub fn sol_from_ui(sol: f64) -> Self {
         Self::from_ui(Decimal::from_f64_retain(sol).unwrap_or(Decimal::ZERO), 9)
     }
-    
+
     /// Get UI value as f64 (for calculations)
     pub fn as_f64(&self) -> f64 {
         self.ui.and_then(|d| d.to_f64()).unwrap_or(0.0)
@@ -137,7 +137,7 @@ pub enum MarketEventKind {
         mint: String,
         trader: String,
         is_buy: bool,
-        sol_amount: u64,       // lamports
+        sol_amount: u64, // lamports
         token_amount: u64,
         signature: Option<String>,
     },
@@ -161,7 +161,7 @@ pub enum MarketEventKind {
     LiquidityRemoved {
         pool_address: String,
         mint: String,
-        sol_amount: u64,       // lamports removed
+        sol_amount: u64, // lamports removed
         token_amount: u64,
         signature: Option<String>,
     },
@@ -180,28 +180,24 @@ pub enum MarketEventKind {
         data_len: usize,
     },
     /// Transaction detected via Geyser
-    TransactionDetected {
-        signature: String,
-        program: String,
-    },
-    
+    TransactionDetected { signature: String, program: String },
+
     // =========================================================================
     // Wallet Tracking Events (P1: Smart Money / Insider Detection)
     // =========================================================================
-    
     /// Known wallet activity detected (smart money, insider, dev)
     WalletActivity {
         wallet: String,
         wallet_type: WalletType,
         action: WalletAction,
         mint: String,
-        amount_sol: u64,        // lamports
+        amount_sol: u64, // lamports
         amount_tokens: u64,
         signature: String,
         /// Historical win rate of this wallet (0.0-1.0), None if unknown
         wallet_win_rate: Option<f64>,
     },
-    
+
     /// Early buyer detected for a token (first N minutes after pool creation)
     EarlyBuyerDetected {
         mint: String,
@@ -210,9 +206,9 @@ pub enum MarketEventKind {
         slots_after_creation: u64,
         amount_sol: u64,
         amount_tokens: u64,
-        buyer_rank: u32,  // 1 = first buyer, 2 = second, etc.
+        buyer_rank: u32, // 1 = first buyer, 2 = second, etc.
     },
-    
+
     /// Insider alert: coordinated activity or known bad actor
     InsiderAlert {
         mint: String,
@@ -312,44 +308,41 @@ impl MarketEvent {
 // ============================================================================
 
 /// Fee policy configuration for execution engine
-/// 
+///
 /// P1 requirement: Engine owns compute budget, priority fee, and tip policies.
 /// Strategies can provide hints but engine has final authority.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FeePolicy {
     // === Compute Budget ===
-    
     /// Default compute unit limit for transactions
     pub default_compute_units: u32,
-    
+
     /// Maximum compute units allowed (hard limit)
     pub max_compute_units: u32,
-    
+
     /// Compute units for arbitrage (multi-hop, higher complexity)
     pub arb_compute_units: u32,
 
     // === Priority Fees ===
-    
     /// Default priority fee (micro-lamports per CU)
     pub default_priority_fee_micro_lamports: u64,
-    
+
     /// Maximum priority fee allowed (hard limit)
     pub max_priority_fee_micro_lamports: u64,
-    
+
     /// Priority fee for Tier0 urgent intents
     pub tier0_priority_fee_micro_lamports: u64,
 
     /// Multiplier for elevated urgency (urgency=1)
     pub urgency_multiplier_elevated: f64,
-    
+
     /// Multiplier for urgent priority (urgency=2)
     pub urgency_multiplier_urgent: f64,
 
     // === Cost Limits ===
-    
     /// Maximum total transaction cost (base + priority, lamports)
     pub max_tx_cost_lamports: u64,
-    
+
     /// Minimum expected profit after fees to proceed (basis points)
     pub min_profit_after_fees_bps: i32,
 }
@@ -359,21 +352,21 @@ impl Default for FeePolicy {
         Self {
             // Compute budget
             default_compute_units: 200_000,
-            max_compute_units: 1_400_000,      // Solana max is 1.4M
-            arb_compute_units: 400_000,        // Multi-hop arb needs more
-            
+            max_compute_units: 1_400_000, // Solana max is 1.4M
+            arb_compute_units: 400_000,   // Multi-hop arb needs more
+
             // Priority fees (micro-lamports per CU)
-            default_priority_fee_micro_lamports: 1_000,       // 0.001 lamports/CU
-            max_priority_fee_micro_lamports: 100_000,         // 0.1 lamports/CU
-            tier0_priority_fee_micro_lamports: 10_000,        // 0.01 lamports/CU
-            
+            default_priority_fee_micro_lamports: 1_000, // 0.001 lamports/CU
+            max_priority_fee_micro_lamports: 100_000,   // 0.1 lamports/CU
+            tier0_priority_fee_micro_lamports: 10_000,  // 0.01 lamports/CU
+
             // Urgency multipliers
             urgency_multiplier_elevated: 2.0,
             urgency_multiplier_urgent: 5.0,
-            
+
             // Cost limits
-            max_tx_cost_lamports: 50_000_000,  // 0.05 SOL max total cost
-            min_profit_after_fees_bps: 10,     // Must profit at least 0.1% after fees
+            max_tx_cost_lamports: 50_000_000, // 0.05 SOL max total cost
+            min_profit_after_fees_bps: 10,    // Must profit at least 0.1% after fees
         }
     }
 }
@@ -385,71 +378,75 @@ impl FeePolicy {
         if let Some(hint) = intent.hint_compute_units {
             return hint.min(self.max_compute_units);
         }
-        
+
         // Use arb CU for bundle/atomic intents (likely multi-hop)
         if intent.requires_bundle() {
             return self.arb_compute_units;
         }
-        
+
         self.default_compute_units
     }
-    
+
     /// Calculate effective priority fee for an intent
     pub fn priority_fee_for_intent(&self, intent: &TradeIntent) -> u64 {
         let base_fee = match intent.tier {
             IntentTier::Tier0 => self.tier0_priority_fee_micro_lamports,
             IntentTier::Tier1 => self.default_priority_fee_micro_lamports,
         };
-        
+
         // Apply urgency multiplier
         let multiplier = match intent.urgency() {
             0 => 1.0,
             1 => self.urgency_multiplier_elevated,
             _ => self.urgency_multiplier_urgent, // 2+
         };
-        
+
         let scaled_fee = (base_fee as f64 * multiplier) as u64;
-        
+
         // Override with hint if provided (but cap at max)
-        let effective = intent.hint_priority_fee_micro_lamports
+        let effective = intent
+            .hint_priority_fee_micro_lamports
             .unwrap_or(scaled_fee)
             .min(self.max_priority_fee_micro_lamports);
-        
+
         effective
     }
-    
+
     /// Estimate total transaction cost (base fee + priority fee)
     /// Returns (base_fee_lamports, priority_fee_lamports, total_lamports)
     pub fn estimate_tx_cost(&self, intent: &TradeIntent) -> (u64, u64, u64) {
         let compute_units = self.compute_units_for_intent(intent);
         let priority_fee_per_cu = self.priority_fee_for_intent(intent);
-        
+
         // Base fee is 5000 lamports per signature (typically 1 signature)
         let base_fee = 5_000u64;
-        
+
         // Priority fee = (price_per_cu * compute_units) / 1_000_000
         // (micro-lamports to lamports)
         let priority_fee = (priority_fee_per_cu as u128 * compute_units as u128 / 1_000_000) as u64;
-        
+
         let total = base_fee + priority_fee;
         (base_fee, priority_fee, total)
     }
-    
+
     /// Check if intent's fees would be profitable
     /// Returns (is_profitable, profit_bps_after_fees)
     pub fn is_profitable_after_fees(&self, intent: &TradeIntent) -> (bool, i32) {
         let (_, _, total_cost) = self.estimate_tx_cost(intent);
-        
+
         // Convert cost to basis points of required capital
         let capital = intent.required_capital.raw;
         if capital == 0 {
             return (false, 0);
         }
-        
+
         let cost_bps = ((total_cost as u128 * 10_000) / capital as u128) as i32;
         let profit_after_fees = intent.expected_roi_bps - cost_bps;
-        
-        (profit_after_fees >= self.min_profit_after_fees_bps, profit_after_fees)
+
+        (
+            profit_after_fees >= self.min_profit_after_fees_bps,
+            profit_after_fees,
+        )
     }
 }
 
@@ -458,23 +455,23 @@ impl FeePolicy {
 // ============================================================================
 
 /// Fairness policy to prevent one strategy from monopolizing execution capacity
-/// 
+///
 /// P1 requirement: Dauerhafte Verdrängung wird begrenzt (max preemptions pro Worker/Slot)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FairnessPolicy {
     /// Maximum preemptions allowed per source within the time window
     pub max_preemptions_per_source: u32,
-    
+
     /// Time window for preemption tracking (seconds)
     pub preemption_window_secs: u64,
-    
+
     /// Block duration after max preemptions reached (seconds)
     /// During this time, the starved source's intents get elevated priority
     pub starvation_block_secs: u64,
-    
+
     /// Enable fairness tracking
     pub enabled: bool,
-    
+
     /// Log preemption events for debugging/tuning
     pub log_preemptions: bool,
 }
@@ -482,9 +479,9 @@ pub struct FairnessPolicy {
 impl Default for FairnessPolicy {
     fn default() -> Self {
         Self {
-            max_preemptions_per_source: 5,      // Max 5 preemptions
-            preemption_window_secs: 60,          // Within 60 seconds
-            starvation_block_secs: 30,           // 30s elevated priority after starvation
+            max_preemptions_per_source: 5, // Max 5 preemptions
+            preemption_window_secs: 60,    // Within 60 seconds
+            starvation_block_secs: 30,     // 30s elevated priority after starvation
             enabled: true,
             log_preemptions: true,
         }
@@ -575,7 +572,6 @@ pub struct TradeIntent {
     pub bundle_tip_lamports: Option<u64>,
 
     // === P1: Fee Hints (Engine has final authority) ===
-    
     /// Hint: suggested compute unit limit (engine may override)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub hint_compute_units: Option<u32>,
@@ -990,23 +986,23 @@ impl ExecutionResult {
 // ============================================================================
 
 /// Configuration update request from control-plane
-/// 
+///
 /// Allows runtime parameter changes without restarting services.
 /// Per ROLE_SEPARATION.md: only admin role can send these via control-plane.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigUpdate {
     #[serde(flatten)]
     pub header: RecordHeader,
-    
+
     /// Command type (always "config_update" from control-plane)
     pub command: String,
-    
+
     /// Target component: "execution-engine", "momentum-bot", "market-data"
     pub component: String,
-    
+
     /// Key-value pairs to update
     pub config: HashMap<String, serde_json::Value>,
-    
+
     /// ISO timestamp from control-plane
     pub timestamp: String,
 }
@@ -1027,22 +1023,22 @@ impl ConfigUpdate {
             timestamp: chrono::Utc::now().to_rfc3339(),
         }
     }
-    
+
     /// Get a config value as u64
     pub fn get_u64(&self, key: &str) -> Option<u64> {
         self.config.get(key).and_then(|v| v.as_u64())
     }
-    
+
     /// Get a config value as f64
     pub fn get_f64(&self, key: &str) -> Option<f64> {
         self.config.get(key).and_then(|v| v.as_f64())
     }
-    
+
     /// Get a config value as bool
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         self.config.get(key).and_then(|v| v.as_bool())
     }
-    
+
     /// Get a config value as string
     pub fn get_string(&self, key: &str) -> Option<&str> {
         self.config.get(key).and_then(|v| v.as_str())
@@ -1090,7 +1086,9 @@ mod tests {
             "evt-001".to_string(),
             "geyser",
             Some(12345),
-            MarketEventKind::SlotUpdate { current_slot: 12345 },
+            MarketEventKind::SlotUpdate {
+                current_slot: 12345,
+            },
         );
 
         let json = serde_json::to_string(&event).unwrap();
@@ -1119,7 +1117,7 @@ mod tests {
                 pools: vec!["Pool123".to_string()],
                 accounts: vec![],
             },
-            50, // 0.5% expected ROI
+            50,  // 0.5% expected ROI
             100, // 1% max slippage
             TradeSide::Buy,
             TradingRegime::Early,

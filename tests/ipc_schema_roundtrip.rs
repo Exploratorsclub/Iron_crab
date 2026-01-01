@@ -509,9 +509,10 @@ fn test_fee_policy_computation() {
     assert_eq!(fee_tier0, 10_000, "Tier0 intent should use tier0 fee");
 
     // Test fee hint override (capped at max)
-    let intent_with_hint = intent_normal
-        .clone()
-        .with_fee_hints(Some(300_000), Some(50_000), Some(1));
+    let intent_with_hint =
+        intent_normal
+            .clone()
+            .with_fee_hints(Some(300_000), Some(50_000), Some(1));
 
     let cu_hint = policy.compute_units_for_intent(&intent_with_hint);
     assert_eq!(cu_hint, 300_000, "Should use hinted CU");
@@ -520,9 +521,10 @@ fn test_fee_policy_computation() {
     assert_eq!(fee_hint, 50_000, "Should use hinted fee");
 
     // Test hint exceeding max (should be capped)
-    let intent_extreme_hint = intent_normal
-        .clone()
-        .with_fee_hints(Some(2_000_000), Some(500_000), None);
+    let intent_extreme_hint =
+        intent_normal
+            .clone()
+            .with_fee_hints(Some(2_000_000), Some(500_000), None);
 
     let cu_capped = policy.compute_units_for_intent(&intent_extreme_hint);
     assert_eq!(cu_capped, 1_400_000, "CU should be capped at max");
@@ -653,7 +655,11 @@ fn test_fee_reject_reasons() {
     ];
 
     for reason in reasons {
-        assert!(reason.is_fee_related(), "{:?} should be fee-related", reason);
+        assert!(
+            reason.is_fee_related(),
+            "{:?} should be fee-related",
+            reason
+        );
         assert!(!reason.is_risk_related());
         assert!(!reason.is_simulation_related());
         assert!(!reason.is_bundle_related());

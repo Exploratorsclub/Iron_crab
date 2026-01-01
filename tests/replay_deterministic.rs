@@ -234,10 +234,7 @@ fn test_decision_record_roundtrip() {
         assert_eq!(original.intent_id, loaded.intent_id);
         assert_eq!(original.outcome, loaded.outcome);
         assert_eq!(original.checks.len(), loaded.checks.len());
-        assert_eq!(
-            original.primary_reject_reason,
-            loaded.primary_reject_reason
-        );
+        assert_eq!(original.primary_reject_reason, loaded.primary_reject_reason);
     }
 }
 

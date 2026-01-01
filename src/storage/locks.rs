@@ -37,7 +37,7 @@ impl LockHolder {
         self.decision_id = Some(decision_id.to_string());
         self
     }
-    
+
     /// Set priority tier (lower = higher priority, 0 = highest)
     pub fn with_tier(mut self, tier: u8) -> Self {
         self.tier = tier;
@@ -85,9 +85,16 @@ pub enum ResourceType {
 pub enum LockResult {
     Acquired,
     /// Lock acquired by preempting a lower-priority holder
-    AcquiredByPreemption { preempted: LockHolder },
-    Conflict { holder: LockHolder },
-    InsufficientCapital { available: u64, requested: u64 },
+    AcquiredByPreemption {
+        preempted: LockHolder,
+    },
+    Conflict {
+        holder: LockHolder,
+    },
+    InsufficientCapital {
+        available: u64,
+        requested: u64,
+    },
 }
 
 // ============================================================================
@@ -109,19 +116,19 @@ pub struct PreemptionEvent {
 pub struct FairnessTracker {
     /// Preemption events per source (source -> events within window)
     preemption_counts: RwLock<HashMap<String, VecDeque<Instant>>>,
-    
+
     /// Sources currently in starvation protection (source -> protection_until)
     starved_sources: RwLock<HashMap<String, Instant>>,
-    
+
     /// Max preemptions before starvation protection activates
     max_preemptions: u32,
-    
+
     /// Time window for counting preemptions
     window_duration: Duration,
-    
+
     /// Duration of starvation protection
     protection_duration: Duration,
-    
+
     /// Whether fairness tracking is enabled
     enabled: bool,
 }
@@ -142,32 +149,32 @@ impl FairnessTracker {
             enabled,
         }
     }
-    
+
     /// Record a preemption event
     /// Returns true if the preempted source has now reached starvation threshold
     pub fn record_preemption(&self, preempted_source: &str, preempting_source: &str) -> bool {
         if !self.enabled {
             return false;
         }
-        
+
         let now = Instant::now();
         let cutoff = now - self.window_duration;
-        
+
         let mut counts = self.preemption_counts.write();
         let events = counts
             .entry(preempted_source.to_string())
             .or_insert_with(VecDeque::new);
-        
+
         // Remove old events outside the window
         while events.front().map(|t| *t < cutoff).unwrap_or(false) {
             events.pop_front();
         }
-        
+
         // Add new event
         events.push_back(now);
-        
+
         let count = events.len() as u32;
-        
+
         info!(
             preempted = %preempted_source,
             preempting = %preempting_source,
@@ -175,7 +182,7 @@ impl FairnessTracker {
             max = self.max_preemptions,
             "Preemption recorded"
         );
-        
+
         // Check if starvation threshold reached
         if count >= self.max_preemptions {
             // Activate starvation protection
@@ -183,46 +190,46 @@ impl FairnessTracker {
             self.starved_sources
                 .write()
                 .insert(preempted_source.to_string(), protection_until);
-            
+
             warn!(
                 source = %preempted_source,
                 preemption_count = count,
                 protection_secs = self.protection_duration.as_secs(),
                 "Starvation protection activated for source"
             );
-            
+
             return true;
         }
-        
+
         false
     }
-    
+
     /// Check if a source is currently under starvation protection
     /// Returns true if the source should get elevated priority
     pub fn is_starved(&self, source: &str) -> bool {
         if !self.enabled {
             return false;
         }
-        
+
         let now = Instant::now();
         let starved = self.starved_sources.read();
-        
+
         if let Some(protection_until) = starved.get(source) {
             if *protection_until > now {
                 return true;
             }
         }
-        
+
         false
     }
-    
+
     /// Check if preemption should be blocked due to fairness policy
     /// Returns true if the preemption should NOT proceed
     pub fn should_block_preemption(&self, preempted_source: &str, preempting_source: &str) -> bool {
         if !self.enabled {
             return false;
         }
-        
+
         // If the source being preempted is under starvation protection, block the preemption
         if self.is_starved(preempted_source) {
             info!(
@@ -232,33 +239,33 @@ impl FairnessTracker {
             );
             return true;
         }
-        
+
         false
     }
-    
+
     /// Get preemption count for a source within the current window
     pub fn get_preemption_count(&self, source: &str) -> u32 {
         if !self.enabled {
             return 0;
         }
-        
+
         let now = Instant::now();
         let cutoff = now - self.window_duration;
-        
+
         let counts = self.preemption_counts.read();
         counts.get(source).map_or(0, |events| {
             events.iter().filter(|t| **t >= cutoff).count() as u32
         })
     }
-    
+
     /// Clean up expired protection periods
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
         let cutoff = now - self.window_duration;
-        
+
         // Cleanup expired protection
         self.starved_sources.write().retain(|_, until| *until > now);
-        
+
         // Cleanup old preemption counts
         let mut counts = self.preemption_counts.write();
         for events in counts.values_mut() {
@@ -268,12 +275,12 @@ impl FairnessTracker {
         }
         counts.retain(|_, events| !events.is_empty());
     }
-    
+
     /// Get summary stats for monitoring
     pub fn stats(&self) -> FairnessStats {
         let counts = self.preemption_counts.read();
         let starved = self.starved_sources.read();
-        
+
         FairnessStats {
             sources_tracked: counts.len(),
             sources_protected: starved.len(),
@@ -334,7 +341,8 @@ impl LockManager {
         protection_secs: u64,
         enabled: bool,
     ) -> Self {
-        self.fairness = FairnessTracker::new(max_preemptions, window_secs, protection_secs, enabled);
+        self.fairness =
+            FairnessTracker::new(max_preemptions, window_secs, protection_secs, enabled);
         self
     }
 
@@ -429,7 +437,7 @@ impl LockManager {
     ///
     /// If the resource is locked by a lower-priority intent (higher tier number),
     /// the lock will be preempted and acquired by the higher-priority intent.
-    /// 
+    ///
     /// P1: Fairness policy may block preemption if the target source has been
     /// preempted too many times recently (starvation protection).
     pub fn try_lock_resource(
@@ -450,17 +458,22 @@ impl LockManager {
                     // P1: Check fairness policy before preempting
                     let preempted_source = existing.holder.source.as_deref().unwrap_or("unknown");
                     let preempting_source = holder.source.as_deref().unwrap_or("unknown");
-                    
-                    if self.fairness.should_block_preemption(preempted_source, preempting_source) {
+
+                    if self
+                        .fairness
+                        .should_block_preemption(preempted_source, preempting_source)
+                    {
                         // Fairness policy blocks this preemption
                         return LockResult::Conflict {
                             holder: existing.holder.clone(),
                         };
                     }
-                    
+
                     // Record the preemption for fairness tracking
-                    let _became_starved = self.fairness.record_preemption(preempted_source, preempting_source);
-                    
+                    let _became_starved = self
+                        .fairness
+                        .record_preemption(preempted_source, preempting_source);
+
                     // Preempt the lower-priority lock
                     let preempted = existing.holder.clone();
                     info!(
@@ -499,7 +512,7 @@ impl LockManager {
         // Check if we're preempting (resource was previously locked)
         let was_preempted = locks.get(resource_id).map(|l| l.holder.clone());
         locks.insert(resource_id.to_string(), lock);
-        
+
         match was_preempted {
             Some(preempted) if preempted.intent_id != holder.intent_id => {
                 LockResult::AcquiredByPreemption { preempted }
@@ -588,39 +601,39 @@ impl LockManager {
     pub fn processed_count(&self) -> usize {
         self.processed_intents.read().len()
     }
-    
+
     // ========================================================================
     // P1: State Persistence support (DoD K)
     // ========================================================================
-    
+
     /// Get all processed intent IDs for persistence
     pub fn get_processed_intents(&self) -> Vec<String> {
         self.processed_intents.read().iter().cloned().collect()
     }
-    
+
     /// Restore processed intent IDs from snapshot
-    /// 
+    ///
     /// Note: This replaces the current set. Only call during initialization.
     pub fn set_processed_intents(&self, intents: Vec<String>) {
         let mut processed = self.processed_intents.write();
         processed.clear();
         processed.extend(intents);
     }
-    
+
     // ========================================================================
     // P1: Fairness Policy Support
     // ========================================================================
-    
+
     /// Check if a source is under starvation protection
     pub fn is_source_starved(&self, source: &str) -> bool {
         self.fairness.is_starved(source)
     }
-    
+
     /// Get preemption count for a source
     pub fn get_preemption_count(&self, source: &str) -> u32 {
         self.fairness.get_preemption_count(source)
     }
-    
+
     /// Get fairness statistics
     pub fn fairness_stats(&self) -> FairnessStats {
         self.fairness.stats()
@@ -688,8 +701,7 @@ mod tests {
     #[test]
     fn test_preemption_with_source_tracking() {
         // Disable fairness for basic preemption test
-        let manager = LockManager::new(1_000_000_000)
-            .with_fairness(5, 60, 30, false);
+        let manager = LockManager::new(1_000_000_000).with_fairness(5, 60, 30, false);
 
         // Tier 1 (low priority) locks resource
         let holder1 = LockHolder::new("intent-1")
@@ -709,8 +721,7 @@ mod tests {
     #[test]
     fn test_fairness_starvation_protection() {
         // Enable fairness with low threshold for testing (2 preemptions)
-        let manager = LockManager::new(1_000_000_000)
-            .with_fairness(2, 60, 30, true);
+        let manager = LockManager::new(1_000_000_000).with_fairness(2, 60, 30, true);
 
         // Preempt strategy-a twice to trigger starvation protection
         for i in 0..2 {
@@ -755,7 +766,11 @@ mod tests {
         // Record some preemptions
         for i in 0..3 {
             let became_starved = tracker.record_preemption("victim", "aggressor");
-            assert!(!became_starved, "Should not be starved after {} preemptions", i + 1);
+            assert!(
+                !became_starved,
+                "Should not be starved after {} preemptions",
+                i + 1
+            );
         }
 
         assert_eq!(tracker.get_preemption_count("victim"), 3);
