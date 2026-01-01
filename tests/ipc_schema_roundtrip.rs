@@ -359,7 +359,7 @@ fn test_id_correlation() {
         "v0.1.0",
         "run-test",
         intent_id.to_string(),
-        "test",
+        "test-strategy",
         IntentTier::Tier1,
         IntentOrigin::StrategyA,
         ExplicitAmount::new(100, 9),

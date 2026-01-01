@@ -6,6 +6,10 @@ PartOf=ironcrab.target
 # P1 Crash Isolation: NO hard dependencies - execution-engine runs independently
 # If NATS is down, it reconnects. If other services crash, execution continues.
 
+# Restart rate limiting (prevents crash loops from pegging CPU)
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
 [Service]
 Type=notify
 NotifyAccess=main
@@ -23,11 +27,9 @@ Environment=IRONCRAB_KEYPAIR_PATH=/home/ironcrab/.config/solana/id.json
 
 # P1 Crash Isolation: Watchdog for liveness detection
 WatchdogSec=30
-# Restart on failure, but limit restart attempts to prevent crash loops
+# Restart on failure
 Restart=on-failure
 RestartSec=5
-StartLimitBurst=5
-StartLimitIntervalSec=300
 
 # Resource controls: execution engine gets higher priority
 Nice=5

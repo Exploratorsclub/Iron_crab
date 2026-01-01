@@ -691,7 +691,16 @@ async fn main() -> Result<()> {
     if exec_config.send_enabled {
         info!("Transaction sending ENABLED");
     } else {
-        info!("Transaction sending DISABLED (simulate only)");
+        let reason = if args.dry_run {
+            "dry_run"
+        } else if args.simulate_only {
+            "simulate_only"
+        } else if !has_keys {
+            "no_keys"
+        } else {
+            "disabled"
+        };
+        info!(reason, "Transaction sending DISABLED");
     }
 
     // P1: Setup Jito client for atomic bundle execution
@@ -784,10 +793,9 @@ async fn main() -> Result<()> {
     }
 
     // Setup NATS
-    let nats = if args.dry_run {
-        info!("Dry-run mode: NATS disabled");
-        None
-    } else {
+    // NOTE: `--dry-run` means "never send on-chain transactions".
+    // It must NOT disable NATS consumption, otherwise we can't end-to-end test the pipeline.
+    let nats = {
         let config = NatsConfig::new(&args.nats_url, "execution-engine");
         let mut client = NatsClient::new(config);
         if let Err(e) = client.connect().await {
@@ -996,8 +1004,9 @@ async fn main() -> Result<()> {
                 // Keep /ready fresh even when no intents flow.
                 ironcrab::metrics::record_activity();
 
-                // MVP: Simulate receiving a test intent once
-                if simulated_tick == 5 && !test_intent_processed && args.dry_run {
+                // MVP/dev convenience: simulate receiving a test intent once when running dry-run
+                // *without* NATS (so local dev still does something).
+                if simulated_tick == 5 && !test_intent_processed && args.dry_run && ctx.nats.is_none() {
                     test_intent_processed = true;
 
                     let test_intent = create_test_intent(&ctx.run_id);
@@ -1540,63 +1549,30 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // Track bundle result for decision record
     let mut bundle_id: Option<String> = None;
     let mut send_signature: Option<String> = None;
+    let mut sent_anything = false;
 
     // === Send (if enabled) ===
     if config.send_enabled {
+        // NOTE: As of now, the send path is still an MVP stub.
+        // We must not emit fake signatures or claim "Sent".
+        checks.push(CheckResult {
+            check_name: "send".to_string(),
+            passed: false,
+            reason_code: Some("send_not_implemented".to_string()),
+            details: Some(
+                "execution-engine send path is MVP stub (no on-chain submission); configure/implement real tx build+send before enabling".to_string(),
+            ),
+        });
+
+        // This is a policy rejection: simulation succeeded, but execution is not available.
+        ctx.record_intent_rejected();
+        INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+        // Keep a small hint for future implementation paths.
         if requires_bundle {
-            // P1: Atomic bundle execution via Jito
-            info!(
-                intent_id = %intent.intent_id,
-                "Sending atomic bundle via Jito"
-            );
-
-            if let Some(ref _jito) = ctx.jito_client {
-                // In production: build transaction from intent and submit via bundle
-                // For MVP: just track that bundle would be submitted
-                ctx.bundles_submitted
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                // TODO: Build actual transaction and submit bundle
-                // let tx = build_transaction_from_intent(&intent)?;
-                // match jito.send_bundle(&[tx]).await {
-                //     Ok(id) => {
-                //         bundle_id = Some(id.clone());
-                //         // Wait for confirmation
-                //         match jito.wait_for_bundle(&id, config.jito_timeout_secs).await {
-                //             Ok(_) => {
-                //                 ctx.bundles_confirmed.fetch_add(1, ...);
-                //                 info!(bundle_id = %id, "Bundle confirmed");
-                //             }
-                //             Err(e) => {
-                //                 // Bundle failed - reject intent (atomic guarantee)
-                //                 let reason = RejectReason::BundleTimeout;
-                //                 return emit_rejected_decision(...);
-                //             }
-                //         }
-                //     }
-                //     Err(e) => {
-                //         let reason = RejectReason::BundleFailed;
-                //         return emit_rejected_decision(...);
-                //     }
-                // }
-
-                bundle_id = Some(format!("bundle-mvp-{}", Uuid::new_v4()));
-                info!(
-                    intent_id = %intent.intent_id,
-                    bundle_id = ?bundle_id,
-                    "Bundle submitted (MVP stub)"
-                );
-            }
+            info!(intent_id = %intent.intent_id, "Send requested via Jito bundle, but not implemented");
         } else {
-            // Regular transaction send (non-atomic)
-            info!(intent_id = %intent.intent_id, "Sending transaction");
-            // In production: actually send the transaction
-            send_signature = Some(format!("sig-mvp-{}", Uuid::new_v4()));
-            ctx.tx_sent
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            // Dashboard-level metric: "executed" means we attempted to send.
-            INTENTS_EXECUTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            info!(intent_id = %intent.intent_id, "Send requested, but not implemented");
         }
     } else {
         debug!(intent_id = %intent.intent_id, "Transaction sending disabled");
@@ -1606,7 +1582,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     ctx.lock_manager.mark_processed(&intent.intent_id);
 
     // Build SendResult if we sent something
-    let send_result = if config.send_enabled && (bundle_id.is_some() || send_signature.is_some()) {
+    let send_result = if sent_anything && (bundle_id.is_some() || send_signature.is_some()) {
         Some(ironcrab::ipc::SendResult {
             signature: send_signature,
             bundle_id,
@@ -1617,7 +1593,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     };
 
     // Emit decision record
-    let decision = if config.send_enabled {
+    let decision = if config.send_enabled && sent_anything {
         DecisionRecord {
             header: ironcrab::ipc::RecordHeader::new(
                 "execution-engine",
@@ -1635,6 +1611,29 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             simulate: Some(sim_result),
             send: send_result,
             outcome: DecisionOutcome::Sent,
+            config_snapshot_id: None,
+            input_snapshots: std::collections::HashMap::new(),
+        }
+    } else if config.send_enabled {
+        // Simulation succeeded but execution is not implemented.
+        // Persist as a rejection so dashboards/explorers are not misleading.
+        DecisionRecord {
+            header: ironcrab::ipc::RecordHeader::new(
+                "execution-engine",
+                BUILD_VERSION,
+                &ctx.run_id,
+            ),
+            decision_id: decision_id.clone(),
+            intent_id: intent.intent_id.clone(),
+            source: intent.source.clone(),
+            origin_type: intent.origin_type,
+            regime: intent.regime,
+            checks,
+            primary_reject_reason: Some("send_not_implemented".to_string()),
+            plan_hash: Some(format!("plan-{}", Uuid::new_v4())),
+            simulate: Some(sim_result),
+            send: None,
+            outcome: DecisionOutcome::Rejected,
             config_snapshot_id: None,
             input_snapshots: std::collections::HashMap::new(),
         }

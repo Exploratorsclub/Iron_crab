@@ -30,12 +30,12 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
+use ironcrab::config::MomentumCfg;
 use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult, ExecutionStatus,
     ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind, TradeIntent,
     TradeResources, TradeSide, TradingRegime,
 };
-use ironcrab::config::MomentumCfg;
 use ironcrab::metrics::{
     serve_metrics, FILTER_PASSED_TOTAL, FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_INFLOW,
     FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOTAL, FILTER_REJECTED_VELOCITY,
@@ -1349,7 +1349,7 @@ async fn main() -> Result<()> {
 
     // Setup config - load from TOML file with fallback to defaults
     let mut momentum_config = MomentumConfig::default();
-    
+
     // Try to load config from file
     if args.config.exists() {
         match std::fs::read_to_string(&args.config) {
@@ -1388,7 +1388,7 @@ async fn main() -> Result<()> {
     } else {
         info!(config_path = %args.config.display(), "Config file not found, using defaults");
     }
-    
+
     if args.test_mode {
         // In test mode, add a test mint to allowlist
         momentum_config

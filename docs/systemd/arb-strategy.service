@@ -4,6 +4,10 @@ After=network-online.target nats.service market-data.service
 Wants=network-online.target
 PartOf=ironcrab.target
 
+# Restart rate limiting (prevents crash loops from pegging CPU)
+StartLimitBurst=10
+StartLimitIntervalSec=300
+
 [Service]
 # NOTE: arb-strategy currently does not sd_notify READY=1, so Type=simple.
 Type=simple
@@ -24,8 +28,6 @@ Environment=RUST_LOG=info,arb_strategy=info
 
 Restart=on-failure
 RestartSec=3
-StartLimitBurst=10
-StartLimitIntervalSec=300
 
 # Resource controls
 Nice=10
