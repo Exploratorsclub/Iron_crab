@@ -3827,16 +3827,22 @@ impl SniperEngine {
                 // and we only have the mint Pubkey.
                 let mint_pk = solana_sdk::pubkey::Pubkey::new_from_array(mint.to_bytes());
                 let (bonding_curve, _) = pf.derive_bonding_curve(&mint_pk);
-                let (associated_bonding_curve, _) =
-                    pf.derive_associated_bonding_curve(&bonding_curve, &mint_pk);
+
+                // Use the mint's actual token program (spl-token vs token-2022) for ATA derivation.
+                let token_program = self
+                    .treasury
+                    .token_program_for_mint(&self.rpc, &mint_pk)
+                    .await?;
+                let (associated_bonding_curve, _) = pf.derive_associated_bonding_curve(
+                    &bonding_curve,
+                    &mint_pk,
+                    &token_program,
+                );
 
                 // We also need the user's ATA for the token
                 let user_pk = self.treasury.pubkey();
-                let (user_token_account, _) = self
-                    .treasury
-                    .ata_address(&self.rpc, &user_pk, &mint_pk)
-                    .await
-                    .unwrap_or_default();
+                let (user_token_account, _) =
+                    self.treasury.ata_address(&self.rpc, &user_pk, &mint_pk).await?;
 
                 // CRITICAL: Creator MUST come from stored position data.
                 // Bonding curve parsing is DISABLED - layout changed and creator field is wrong.
@@ -3866,6 +3872,7 @@ impl SniperEngine {
                     &associated_bonding_curve,
                     &user_token_account,
                     &sell_creator,
+                    &token_program,
                     sell_tokens,
                     min_out,
                 ) {

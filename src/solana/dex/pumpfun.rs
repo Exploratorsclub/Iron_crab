@@ -15,6 +15,10 @@ use tracing::{debug, info, warn};
 use super::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 
+fn sdk_pubkey_to_spl(pk: &Pubkey) -> spl_token::solana_program::pubkey::Pubkey {
+    spl_token::solana_program::pubkey::Pubkey::new_from_array(pk.to_bytes())
+}
+
 fn prog_pubkey_to_sdk(pk: spl_token::solana_program::pubkey::Pubkey) -> Pubkey {
     Pubkey::new_from_array(pk.to_bytes())
 }
@@ -180,32 +184,43 @@ impl PumpFunDex {
         Pubkey::find_program_address(&[b"bonding-curve", token_mint.as_ref()], &self.program_id)
     }
 
-    /// Derive associated bonding curve token account (holds real token reserves)
-    /// This is simply the ATA (Associated Token Account) of the bonding curve for the token mint
-    /// Pump.fun tokens use Token-2022 program
+    /// Derive associated bonding curve token account (holds real token reserves).
+    /// This is simply the ATA of the bonding curve PDA for the token mint.
     pub fn derive_associated_bonding_curve(
         &self,
         bonding_curve: &Pubkey,
         token_mint: &Pubkey,
+        token_program: &Pubkey,
     ) -> (Pubkey, u8) {
-        // The associated bonding curve is a standard SPL Token ATA
-        // Derived using SPL Associated Token Account program with standard Token Program
-        let bonding_curve_spl =
-            spl_token::solana_program::pubkey::Pubkey::new_from_array(bonding_curve.to_bytes());
-        let token_mint_spl =
-            spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint.to_bytes());
-        let token_program =
-            spl_token::solana_program::pubkey::Pubkey::new_from_array(spl_token::id().to_bytes());
+        let bonding_curve_spl = sdk_pubkey_to_spl(bonding_curve);
+        let token_mint_spl = sdk_pubkey_to_spl(token_mint);
+        let token_program_spl = sdk_pubkey_to_spl(token_program);
 
         let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
             &bonding_curve_spl,
             &token_mint_spl,
-            &token_program,
+            &token_program_spl,
         );
 
-        // Convert back to solana_sdk::pubkey::Pubkey
-        // The bump is not relevant for ATAs (we use the address directly)
         (Pubkey::new_from_array(ata_spl.to_bytes()), 0)
+    }
+
+    async fn token_program_for_mint(&self, token_mint: &Pubkey) -> Result<Pubkey> {
+        let acct = self.rpc.get_account_retry(token_mint).await?;
+        let owner = acct.owner;
+
+        let spl_token = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let spl_token_2022 = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+
+        if owner == spl_token {
+            Ok(spl_token)
+        } else if owner == spl_token_2022 {
+            Ok(spl_token_2022)
+        } else {
+            Err(anyhow!(
+                "pump.fun: mint owner is neither spl-token nor spl-token-2022: {owner}"
+            ))
+        }
     }
 
     /// Derive creator vault PDA (NEW in Pump.fun protocol update)
@@ -272,7 +287,6 @@ impl PumpFunDex {
 
     /// Build buy instruction (SOL → Token)
     /// Instruction discriminator: 0x66063d1201daebea (8 bytes)
-    /// Uses standard SPL Token program (Pump.fun tokens are NOT Token-2022)
     ///
     /// UPDATED: Now requires 16 accounts (protocol update added fee-related accounts)
     #[allow(clippy::too_many_arguments)]
@@ -283,6 +297,7 @@ impl PumpFunDex {
         associated_bonding_curve: &Pubkey,
         user_token_account: &Pubkey,
         creator: &Pubkey,  // NEW: Creator pubkey for creator_vault derivation
+        token_program: &Pubkey,
         amount_in: u64,    // SOL lamports
         max_sol_cost: u64, // Slippage protection
     ) -> Result<Instruction> {
@@ -341,10 +356,7 @@ impl PumpFunDex {
                 // #8 (7): System Program - readonly
                 AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false),
                 // #9 (8): Token Program - readonly
-                AccountMeta::new_readonly(
-                    Pubkey::new_from_array(spl_token::id().to_bytes()),
-                    false,
-                ),
+                AccountMeta::new_readonly(*token_program, false),
                 // #10 (9): Creator Vault - writable (receives creator fees)
                 AccountMeta::new(creator_vault, false),
                 // #11 (10): Event Authority - readonly
@@ -366,7 +378,6 @@ impl PumpFunDex {
 
     /// Build sell instruction (Token → SOL)
     /// Instruction discriminator: 0x33e685a4017f83ad (8 bytes)
-    /// Uses standard SPL Token program (Pump.fun tokens are NOT Token-2022)
     #[allow(clippy::too_many_arguments)]
     pub fn build_sell_ix(
         &self,
@@ -375,6 +386,7 @@ impl PumpFunDex {
         associated_bonding_curve: &Pubkey,
         user_token_account: &Pubkey,
         creator: &Pubkey,    // NEW: Creator pubkey for creator_vault derivation
+        token_program: &Pubkey,
         amount_in: u64,      // Token amount
         min_sol_output: u64, // Slippage protection
     ) -> Result<Instruction> {
@@ -408,10 +420,7 @@ impl PumpFunDex {
                 AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false), // 7: system_program
                 // NEW accounts (indices 8-13) - added in protocol update
                 AccountMeta::new(creator_vault, false), // 8: creator_vault
-                AccountMeta::new_readonly(
-                    Pubkey::new_from_array(spl_token::id().to_bytes()),
-                    false,
-                ), // 9: token_program
+                AccountMeta::new_readonly(*token_program, false), // 9: token_program
                 AccountMeta::new_readonly(self.event_authority, false), // 10: event_authority
                 AccountMeta::new_readonly(self.program_id, false), // 11: program
                 AccountMeta::new_readonly(fee_config, false), // 12: fee_config
@@ -874,9 +883,13 @@ impl PumpFunDex {
         };
 
         let token_mint = Pubkey::from_str(token_mint_str)?;
+        let token_program_sdk = self.token_program_for_mint(&token_mint).await?;
         let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
-        let (associated_bonding_curve, _bump2) =
-            self.derive_associated_bonding_curve(&bonding_curve, &token_mint);
+        let (associated_bonding_curve, _bump2) = self.derive_associated_bonding_curve(
+            &bonding_curve,
+            &token_mint,
+            &token_program_sdk,
+        );
 
         // CRITICAL: Creator MUST come from Geyser event (trusted source).
         // The bonding curve layout changed (81 -> 154 bytes) and creator field is at wrong offset.
@@ -902,17 +915,17 @@ impl PumpFunDex {
             .user_authority
             .ok_or_else(|| anyhow!("user authority not set"))?;
 
-        // Derive user token account (ATA) using standard SPL Token program
-        let user_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(user.to_bytes());
-        let token_mint_spl =
-            spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint.to_bytes());
-        let token_program =
-            spl_token::solana_program::pubkey::Pubkey::new_from_array(spl_token::id().to_bytes());
+        // Derive user token account (ATA) using the mint's actual token program.
+        // If the mint is Token-2022, the ATA address and ATA-create instruction MUST use
+        // the Token-2022 program id, otherwise simulation fails (IncorrectProgramId).
+        let user_spl = sdk_pubkey_to_spl(&user);
+        let token_mint_spl = sdk_pubkey_to_spl(&token_mint);
+        let token_program_spl = sdk_pubkey_to_spl(&token_program_sdk);
         let user_token_account_spl =
             spl_associated_token_account::get_associated_token_address_with_program_id(
                 &user_spl,
                 &token_mint_spl,
-                &token_program,
+                &token_program_spl,
             );
         let user_token_account = Pubkey::new_from_array(user_token_account_spl.to_bytes());
 
@@ -943,6 +956,7 @@ impl PumpFunDex {
                 &associated_bonding_curve,
                 &user_token_account,
                 &creator,
+                &token_program_sdk,
                 min_out,      // amount (tokens we want)
                 max_sol_cost, // max SOL we're willing to pay (amount_in + slippage!)
             )?
@@ -953,6 +967,7 @@ impl PumpFunDex {
                 &associated_bonding_curve,
                 &user_token_account,
                 &creator,
+                &token_program_sdk,
                 amount_in,
                 min_out,
             )?
@@ -966,7 +981,7 @@ impl PumpFunDex {
                 &user_spl,      // payer
                 &user_spl,      // owner
                 &token_mint_spl,
-                &token_program, // Pump.fun uses standard SPL Token program
+                &token_program_spl,
             );
         let create_ata_ix = prog_ix_to_sdk(create_ata_ix_prog);
 
