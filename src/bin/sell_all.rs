@@ -756,7 +756,9 @@ async fn main() -> anyhow::Result<()> {
             solana_account_decoder::UiAccountData::LegacyBinary(b) => decode_raw_token_account(b),
             solana_account_decoder::UiAccountData::Json(parsed) => {
                 if let serde_json::Value::Object(info) = parsed.parsed {
-                    let info_obj = info.get("info")?;
+                    let Some(info_obj) = info.get("info") else {
+                        return None;
+                    };
 
                     let is_frozen = info_obj
                         .get("state")
@@ -767,14 +769,20 @@ async fn main() -> anyhow::Result<()> {
                     if is_frozen {
                         None
                     } else {
-                        let mint_str = info_obj.get("mint").and_then(|v| v.as_str())?;
+                        let Some(mint_str) = info_obj.get("mint").and_then(|v| v.as_str()) else {
+                            return None;
+                        };
+
                         let amount_str = info_obj
                             .get("tokenAmount")
                             .and_then(|v| v.get("amount"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("0");
 
-                        let mint = Pubkey::from_str(mint_str).ok()?;
+                        let Ok(mint) = Pubkey::from_str(mint_str) else {
+                            return None;
+                        };
+
                         let amount = u64::from_str(amount_str).unwrap_or(0);
                         Some((mint, amount))
                     }
