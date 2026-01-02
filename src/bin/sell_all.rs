@@ -11,12 +11,17 @@ use solana_sdk::bs58;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::VersionedTransaction;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{info, warn};
+
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+use serde_json::json;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -116,6 +121,155 @@ async fn burn_and_close_account(
 enum SellResult {
     Sold,
     NeedsConfirmation(SellTask, String), // task + reason why it failed
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct JupiterSwapResponse {
+    #[serde(rename = "swapTransaction")]
+    swap_transaction: String,
+}
+
+async fn try_sell_jupiter(
+    rpc: Arc<SolanaRpc>,
+    treasury: Arc<Treasury>,
+    task: &SellTask,
+) -> bool {
+    // Jupiter fallback is useful for migrated Pump.fun tokens (e.g. PumpSwap liquidity)
+    // and for any token where our native DEX connectors don't have coverage.
+    let mint = task.mint;
+    let amount = task.amount;
+    let sol_mint = "So11111111111111111111111111111111111111112";
+    let slippage_bps = 9900u16; // panic sell
+
+    info!("Trying Jupiter for {} ({} tokens)...", mint, amount);
+
+    let client = reqwest::Client::new();
+    let quote_url = format!(
+        "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+        mint,
+        sol_mint,
+        amount,
+        slippage_bps
+    );
+
+    let quote_resp = match client.get(&quote_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Jupiter quote request failed for {}: {:?}", mint, e);
+            return false;
+        }
+    };
+
+    if !quote_resp.status().is_success() {
+        warn!(
+            "Jupiter quote HTTP {} for {}",
+            quote_resp.status(),
+            mint
+        );
+        return false;
+    }
+
+    let quote_json: serde_json::Value = match quote_resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Jupiter quote parse failed for {}: {:?}", mint, e);
+            return false;
+        }
+    };
+
+    // If outAmount is missing/zero, treat as no liquidity.
+    let out_amount_ok = quote_json
+        .get("outAmount")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u128>().ok())
+        .map(|n| n > 0)
+        .unwrap_or(false);
+
+    if !out_amount_ok {
+        warn!("Jupiter returned no outAmount for {}", mint);
+        return false;
+    }
+
+    let swap_body = json!({
+        "quoteResponse": quote_json,
+        "userPublicKey": treasury.pubkey().to_string(),
+        "wrapAndUnwrapSol": true,
+        "dynamicComputeUnitLimit": true,
+    });
+
+    let swap_resp = match client
+        .post("https://quote-api.jup.ag/v6/swap")
+        .json(&swap_body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Jupiter swap request failed for {}: {:?}", mint, e);
+            return false;
+        }
+    };
+
+    if !swap_resp.status().is_success() {
+        warn!(
+            "Jupiter swap HTTP {} for {}",
+            swap_resp.status(),
+            mint
+        );
+        return false;
+    }
+
+    let swap_json: JupiterSwapResponse = match swap_resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Jupiter swap parse failed for {}: {:?}", mint, e);
+            return false;
+        }
+    };
+
+    let tx_bytes = match B64.decode(swap_json.swap_transaction) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("Jupiter swapTransaction base64 decode failed for {}: {:?}", mint, e);
+            return false;
+        }
+    };
+
+    let decoded: VersionedTransaction = match bincode::deserialize(&tx_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("Jupiter tx deserialize failed for {}: {:?}", mint, e);
+            return false;
+        }
+    };
+
+    // Re-sign with our key (drop any placeholder signatures from API)
+    let signed = match VersionedTransaction::try_new(decoded.message, &[treasury.signer_ref()]) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("Jupiter tx signing failed for {}: {:?}", mint, e);
+            return false;
+        }
+    };
+
+    let wire = match bincode::serialize(&signed) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("Jupiter tx bincode serialize failed for {}: {:?}", mint, e);
+            return false;
+        }
+    };
+
+    match rpc.rpc.send_and_confirm_raw_transaction(&wire).await {
+        Ok(sig) => {
+            info!("✅ Sold {} via Jupiter! Sig: {}", mint, sig);
+            true
+        }
+        Err(e) => {
+            warn!("Jupiter TX failed for {}: {:?}", mint, e);
+            false
+        }
+    }
 }
 
 /// Try to sell on Raydium - returns true if successful
@@ -366,6 +520,12 @@ async fn sell_token(
             return SellResult::Sold;
         }
         errors.push("Raydium failed");
+
+        info!("Pump.fun + Raydium failed, trying Jupiter fallback...");
+        if try_sell_jupiter(rpc.clone(), treasury.clone(), &task).await {
+            return SellResult::Sold;
+        }
+        errors.push("Jupiter failed");
     } else {
         // Non-Pump.fun token: try Raydium first, then Pump.fun as fallback
         info!("{} trying Raydium first...", mint);
@@ -388,6 +548,12 @@ async fn sell_token(
             return SellResult::Sold;
         }
         errors.push("Pump.fun failed");
+
+        info!("Raydium + Pump.fun failed, trying Jupiter fallback...");
+        if try_sell_jupiter(rpc.clone(), treasury.clone(), &task).await {
+            return SellResult::Sold;
+        }
+        errors.push("Jupiter failed");
     }
 
     // All DEXes failed - return for user confirmation
