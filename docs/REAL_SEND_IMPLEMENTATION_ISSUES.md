@@ -194,7 +194,7 @@ Status snapshot (2026-01-02):
 
 ## RS-6 — Config Surface (minimal, safe defaults)
 
-- [ ] **RS-6.1 – Add explicit send/confirm configuration knobs (documented)**
+- [x] **RS-6.1 – Add explicit send/confirm configuration knobs (documented)**
   - Scope:
     - Ensure `send_enabled` is clearly documented.
     - Add `confirm_timeout_ms` (or secs), `preflight_commitment`, and `skip_preflight` as explicit config options.

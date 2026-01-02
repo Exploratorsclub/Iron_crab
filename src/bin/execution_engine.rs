@@ -140,6 +140,12 @@ struct ExecutionConfig {
     /// Confirmation timeout (ms) for RPC send path
     confirmation_timeout_ms: u64,
 
+    /// RPC sendTransaction: skip preflight (safe default when simulate-gated)
+    send_skip_preflight: bool,
+
+    /// RPC sendTransaction: preflight commitment ("processed"|"confirmed"|"finalized"); None uses RPC default
+    send_preflight_commitment: Option<String>,
+
     /// Whether to actually send transactions
     send_enabled: bool,
 
@@ -176,6 +182,8 @@ impl Default for ExecutionConfig {
             // Operational
             simulation_timeout_ms: 2000,
             confirmation_timeout_ms: 30_000,
+            send_skip_preflight: true,
+            send_preflight_commitment: None,
             send_enabled: false, // Default: simulate only
             // P1: Jito Bundle defaults
             jito_enabled: false,
@@ -453,6 +461,51 @@ impl ExecutionContext {
                         }
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "confirm_timeout_ms" => {
+                    if let Some(v) = value.as_u64() {
+                        if v >= 500 && v <= 300_000 {
+                            config.confirmation_timeout_ms = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 500-300000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "skip_preflight" => {
+                    if let Some(v) = value.as_bool() {
+                        config.send_skip_preflight = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "preflight_commitment" => {
+                    if value.is_null() {
+                        config.send_preflight_commitment = None;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = "null", "Config updated");
+                    } else if let Some(v) = value.as_str() {
+                        let v_lc = v.to_lowercase();
+                        match v_lc.as_str() {
+                            "processed" | "confirmed" | "finalized" => {
+                                config.send_preflight_commitment = Some(v_lc);
+                                applied.push(key.clone());
+                                info!(key = %key, new_value = %v, "Config updated");
+                            }
+                            _ => rejected.push((
+                                key.clone(),
+                                "Must be one of: processed, confirmed, finalized (or null)"
+                                    .to_string(),
+                            )),
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected string or null".to_string()));
                     }
                 }
                 "send_enabled" => {
@@ -1808,7 +1861,14 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             info!(intent_id = %intent.intent_id, "Bundle send requested, but not implemented");
         } else {
-            match send_transaction_rpc(ctx, wallet_pubkey, &tx_plan).await {
+            match send_transaction_rpc(
+                ctx,
+                wallet_pubkey,
+                &tx_plan,
+                config.send_skip_preflight,
+                config.send_preflight_commitment.clone(),
+            )
+            .await {
                 Ok(sig_str) => {
                     TX_SEND_SUCCESS_TOTAL.fetch_add(1, Ordering::Relaxed);
                     sent_anything = true;
@@ -2192,6 +2252,8 @@ async fn send_transaction_rpc(
     ctx: &ExecutionContext,
     wallet_pubkey: Pubkey,
     plan: &tx_builder::TxPlan,
+    skip_preflight: bool,
+    preflight_commitment: Option<String>,
 ) -> std::result::Result<String, String> {
     TX_SEND_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let treasury = ctx
@@ -2214,8 +2276,8 @@ async fn send_transaction_rpc(
     );
 
     let config = RpcSendTransactionConfig {
-        skip_preflight: true,
-        preflight_commitment: None,
+        skip_preflight,
+        preflight_commitment,
         encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
         max_retries: None,
         min_context_slot: None,

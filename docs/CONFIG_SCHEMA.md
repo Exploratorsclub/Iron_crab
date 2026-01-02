@@ -49,6 +49,16 @@ Component name: `execution-engine`
 | `daily_loss_limit_lamports` | u64 | 5_000_000_000 | > 0 | Daily loss limit before auto-kill (5 SOL) |
 | `max_slippage_bps` | u32 | 500 | 1-10000 | Maximum slippage in basis points (5%) |
 
+### Operational (Send/Confirm)
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `simulation_timeout_ms` | u64 | 2000 | 100-30000 | RPC simulation timeout (used for engine-side time budgeting) |
+| `confirm_timeout_ms` | u64 | 30000 | 500-300000 | Confirmation polling timeout after RPC send (`getSignatureStatuses`) |
+| `send_enabled` | bool | false | true/false | If true, engine will sign and submit transactions (requires keys) |
+| `skip_preflight` | bool | true | true/false | Passed to `sendTransaction`. Safe default with simulate-gated execution |
+| `preflight_commitment` | string \| null | null | processed/confirmed/finalized/null | Passed to `sendTransaction` (null = RPC default) |
+
 ### Fee Policy
 
 | Key | Type | Default | Range | Description |
@@ -62,6 +72,9 @@ Component name: `execution-engine`
 - `max_slippage_bps` must be between 1 and 10000 (0.01% to 100%)
 - All `_lamports` values must be positive integers
 - Fee limits cannot exceed position size limits
+- `send_enabled=true` is rejected if wallet keys are not configured in the execution-engine environment
+- `confirm_timeout_ms` must be between 500 and 300000
+- `preflight_commitment` must be one of: processed, confirmed, finalized (or null)
 
 ---
 
