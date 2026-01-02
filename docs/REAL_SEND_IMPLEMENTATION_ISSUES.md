@@ -82,7 +82,7 @@ Status snapshot (2026-01-02):
 
 ## RS-2 — Tx Plan: deterministic instruction builder (MVP: Pump.fun BUY)
 
-- [ ] **RS-2.1 – Add TxBuilder module + intent validation**
+- [x] **RS-2.1 – Add TxBuilder module + intent validation**
   - Scope:
     - Add a focused builder that accepts `(intent, wallet_pubkey)` and returns either:
       - `UnsupportedIntent` (reason-coded), or
@@ -104,7 +104,7 @@ Status snapshot (2026-01-02):
     - Planning is currently enforced only when `send_enabled=true` to avoid breaking dry-run workflows.
     - Pump.fun BUY planning currently requires `metadata.creator` and `metadata.min_out_raw` (raw u64).
 
-- [ ] **RS-2.2 – Pump.fun adapter: build BUY ix for a provided user authority**
+- [x] **RS-2.2 – Pump.fun adapter: build BUY ix for a provided user authority**
   - Scope:
     - Extend `src/solana/dex/pumpfun.rs` to produce swap instructions for the engine wallet.
     - Ensure ATA derivations and token program handling are correct.
