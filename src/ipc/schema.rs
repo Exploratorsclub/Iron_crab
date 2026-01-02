@@ -519,6 +519,17 @@ pub enum TradingRegime {
     NotApplicable,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TradeExecutionConstraints {
+    /// Minimum acceptable output amount for deterministic tx planning.
+    ///
+    /// - For token->SOL sells: lamports (decimals=9)
+    /// - For SOL->token buys: raw token units (token decimals)
+    /// - For Orca: raw output mint units
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub min_out: Option<ExplicitAmount>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TradeIntent {
     #[serde(flatten)]
@@ -586,6 +597,12 @@ pub struct TradeIntent {
     /// Key-value pairs set by strategy, consumed by execution-engine
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub metadata: std::collections::HashMap<String, String>,
+
+    /// Typed execution constraints (preferred over stringly metadata).
+    ///
+    /// Backward compatible: older producers omit this field.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub execution: Option<TradeExecutionConstraints>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -641,6 +658,7 @@ impl TradeIntent {
             hint_priority_fee_micro_lamports: None,
             hint_urgency: None,
             metadata: std::collections::HashMap::new(),
+            execution: None,
         }
     }
 

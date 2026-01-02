@@ -157,6 +157,43 @@ fn test_trade_intent_required_fields() {
     assert_eq!(parsed.regime, TradingRegime::Early);
 }
 
+#[test]
+fn test_trade_intent_typed_execution_min_out_roundtrip() {
+    // Minimal JSON resembling a producer that sets typed execution constraints.
+    let json = r#"{
+        \"schema_version\":1,
+        \"ts_unix_ms\":1700000000000,
+        \"component\":\"test\",
+        \"build\":\"test\",
+        \"run_id\":\"run\",
+        \"intent_id\":\"intent-typed-1\",
+        \"source\":\"test\",
+        \"tier\":\"Tier1\",
+        \"origin_type\":\"StrategyA\",
+        \"ttl_ms\":5000,
+        \"required_capital\":{\"raw\":1,\"decimals\":9},
+        \"resources\":{\"input_mint\":\"in\",\"output_mint\":\"out\",\"pools\":[\"pool\"],\"accounts\":[]},
+        \"expected_roi_bps\":0,
+        \"max_slippage_bps\":0,
+        \"side\":\"Sell\",
+        \"regime\":\"Early\",
+        \"execution\":{\"min_out\":{\"raw\":42,\"decimals\":9}}
+    }"#;
+
+    let parsed: TradeIntent = serde_json::from_str(json).unwrap();
+    let min_out = parsed
+        .execution
+        .as_ref()
+        .and_then(|e| e.min_out.as_ref())
+        .expect("execution.min_out should parse");
+    assert_eq!(min_out.raw, 42);
+    assert_eq!(min_out.decimals, 9);
+
+    let serialized = serde_json::to_string(&parsed).unwrap();
+    assert!(serialized.contains("\"execution\""));
+    assert!(serialized.contains("\"min_out\""));
+}
+
 /// Test DecisionRecord has all required fields per DoD §E and STORAGE_CONVENTIONS.md §4.3
 #[test]
 fn test_decision_record_required_fields() {

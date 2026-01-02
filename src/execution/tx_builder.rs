@@ -48,6 +48,35 @@ pub enum TxPlanOutcome {
 
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
+fn min_out_raw_from_intent(intent: &TradeIntent) -> Result<u64, UnsupportedTxPlan> {
+    if let Some(execution) = intent.execution.as_ref() {
+        if let Some(min_out) = execution.min_out.as_ref() {
+            return Ok(min_out.raw);
+        }
+    }
+
+    // Legacy fallback (stringly-typed metadata)
+    // NOTE: We keep this for backward compatibility, but new producers should
+    // use intent.execution.min_out.
+    let min_out_raw = match intent.metadata.get("min_out_raw") {
+        Some(v) => v,
+        None => {
+            return Err(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: "missing execution.min_out and metadata.min_out_raw (required for deterministic tx plan)".to_string(),
+            })
+        }
+    };
+
+    match min_out_raw.parse() {
+        Ok(v) => Ok(v),
+        Err(e) => Err(UnsupportedTxPlan {
+            reason: RejectReason::InvalidIntent,
+            details: format!("invalid metadata.min_out_raw (u64): {e}"),
+        }),
+    }
+}
+
 pub async fn build_tx_plan(
     intent: &TradeIntent,
     wallet_pubkey: Pubkey,
@@ -98,24 +127,10 @@ pub async fn build_tx_plan(
     // - For Pump.fun BUY: min token out
     // - For Pump.fun SELL: min SOL out (lamports)
     // - For Orca: min output amount in raw base units of output mint
-    let min_out_raw = match intent.metadata.get("min_out_raw") {
-        Some(v) => v,
-        None => {
-            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                reason: RejectReason::UnsupportedIntent,
-                details: "missing metadata.min_out_raw (required for deterministic tx plan)"
-                    .to_string(),
-            })
-        }
-    };
-
-    let min_out: u64 = match min_out_raw.parse() {
+    let min_out: u64 = match min_out_raw_from_intent(intent) {
         Ok(v) => v,
         Err(e) => {
-            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                reason: RejectReason::InvalidIntent,
-                details: format!("invalid metadata.min_out_raw (u64): {e}"),
-            })
+            return TxPlanOutcome::Unsupported(e);
         }
     };
 
@@ -257,4 +272,73 @@ pub async fn build_tx_plan(
     };
 
     TxPlanOutcome::Planned(TxPlan { instructions: ixs })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::{ExplicitAmount, IntentOrigin, IntentTier, TradeExecutionConstraints, TradeResources, TradingRegime};
+
+    #[test]
+    fn min_out_prefers_typed_execution_field() {
+        let mut intent = TradeIntent::new(
+            "test",
+            "build",
+            "run",
+            "intent-1".to_string(),
+            "test",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(1, 9),
+            TradeResources {
+                input_mint: "in".to_string(),
+                output_mint: "out".to_string(),
+                pools: vec!["pool".to_string()],
+                accounts: vec![],
+            },
+            0,
+            0,
+            TradeSide::Sell,
+            TradingRegime::Early,
+        );
+
+        intent.metadata.insert("min_out_raw".to_string(), "123".to_string());
+        intent.execution = Some(TradeExecutionConstraints {
+            min_out: Some(ExplicitAmount::new(999, 9)),
+        });
+
+        let parsed = super::min_out_raw_from_intent(&intent).unwrap();
+
+        assert_eq!(parsed, 999);
+    }
+
+    #[test]
+    fn min_out_falls_back_to_legacy_metadata() {
+        let mut intent = TradeIntent::new(
+            "test",
+            "build",
+            "run",
+            "intent-2".to_string(),
+            "test",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(1, 9),
+            TradeResources {
+                input_mint: "in".to_string(),
+                output_mint: "out".to_string(),
+                pools: vec!["pool".to_string()],
+                accounts: vec![],
+            },
+            0,
+            0,
+            TradeSide::Sell,
+            TradingRegime::Early,
+        );
+
+        intent.metadata.insert("min_out_raw".to_string(), "456".to_string());
+
+        let parsed = super::min_out_raw_from_intent(&intent).unwrap();
+
+        assert_eq!(parsed, 456);
+    }
 }
