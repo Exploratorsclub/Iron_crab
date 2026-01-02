@@ -39,6 +39,12 @@ struct Args {
     /// Force burn without confirmation (DANGEROUS - use with caution)
     #[arg(long, default_value = "false")]
     force_burn: bool,
+
+    /// Override Jupiter base URL (default: https://quote-api.jup.ag).
+    /// Useful if the default hostname has DNS issues in your environment.
+    /// Example: --jupiter-base-url https://api.jup.ag
+    #[arg(long)]
+    jupiter_base_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -136,6 +142,7 @@ async fn try_sell_jupiter(
     rpc: Arc<SolanaRpc>,
     treasury: Arc<Treasury>,
     task: &SellTask,
+    jupiter_base_url: &str,
 ) -> bool {
     // Jupiter fallback is useful for migrated Pump.fun tokens (e.g. PumpSwap liquidity)
     // and for any token where our native DEX connectors don't have coverage.
@@ -147,95 +154,109 @@ async fn try_sell_jupiter(
     info!("Trying Jupiter for {} ({} tokens)...", mint, amount);
 
     let client = reqwest::Client::new();
-    let quote_url = format!(
-        "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
-        mint,
-        sol_mint,
-        amount,
-        slippage_bps
-    );
+    let primary_base = jupiter_base_url.trim_end_matches('/');
+    let mut bases = vec![primary_base.to_string()];
 
-    let quote_resp = match client.get(&quote_url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Jupiter quote request failed for {}: {:?}", mint, e);
-            return false;
-        }
-    };
+    // Safe fallback: try api.jup.ag with the same v6 paths if the default quote-api host
+    // is broken/unresolvable in the environment.
+    if primary_base == "https://quote-api.jup.ag" {
+        bases.push("https://api.jup.ag".to_string());
+    }
 
-    if !quote_resp.status().is_success() {
-        warn!(
-            "Jupiter quote HTTP {} for {}",
-            quote_resp.status(),
-            mint
+    let mut swap_json: Option<JupiterSwapResponse> = None;
+
+    for base in bases {
+        info!("Jupiter base URL: {}", base);
+
+        let quote_url = format!(
+            "{}/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+            base, mint, sol_mint, amount, slippage_bps
         );
-        return false;
+
+        let quote_resp = match client.get(&quote_url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Jupiter quote request failed for {} via {}: {:?}", mint, base, e);
+                continue;
+            }
+        };
+
+        if !quote_resp.status().is_success() {
+            let status = quote_resp.status();
+            let body = quote_resp.text().await.unwrap_or_default();
+            warn!("Jupiter quote HTTP {} for {} via {}: {}", status, mint, base, body);
+            continue;
+        }
+
+        let quote_json: serde_json::Value = match quote_resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Jupiter quote parse failed for {} via {}: {:?}", mint, base, e);
+                continue;
+            }
+        };
+
+        // Jupiter v6 quote returns { data: [route...] }. Pick the best route (first).
+        let route = match quote_json.get("data").and_then(|v| v.as_array()) {
+            Some(arr) if !arr.is_empty() => arr[0].clone(),
+            _ => {
+                warn!("Jupiter quote returned no routes for {} via {}", mint, base);
+                continue;
+            }
+        };
+
+        // If outAmount is missing/zero, treat as no liquidity.
+        let out_amount_ok = route
+            .get("outAmount")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u128>().ok())
+            .map(|n| n > 0)
+            .unwrap_or(false);
+
+        if !out_amount_ok {
+            warn!("Jupiter route outAmount is zero/missing for {} via {}", mint, base);
+            continue;
+        }
+
+        let swap_body = json!({
+            // IMPORTANT: /v6/swap expects a single route object from /v6/quote, not the whole response.
+            "quoteResponse": route,
+            "userPublicKey": treasury.pubkey().to_string(),
+            "wrapAndUnwrapSol": true,
+            "dynamicComputeUnitLimit": true,
+        });
+
+        let swap_url = format!("{}/v6/swap", base);
+        let swap_resp = match client.post(&swap_url).json(&swap_body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Jupiter swap request failed for {} via {}: {:?}", mint, base, e);
+                continue;
+            }
+        };
+
+        if !swap_resp.status().is_success() {
+            let status = swap_resp.status();
+            let body = swap_resp.text().await.unwrap_or_default();
+            warn!("Jupiter swap HTTP {} for {} via {}: {}", status, mint, base, body);
+            continue;
+        }
+
+        let parsed: JupiterSwapResponse = match swap_resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Jupiter swap parse failed for {} via {}: {:?}", mint, base, e);
+                continue;
+            }
+        };
+
+        swap_json = Some(parsed);
+        break;
     }
 
-    let quote_json: serde_json::Value = match quote_resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("Jupiter quote parse failed for {}: {:?}", mint, e);
-            return false;
-        }
-    };
-
-    // Jupiter v6 quote returns { data: [route...] }. Pick the best route (first).
-    let route = match quote_json.get("data").and_then(|v| v.as_array()) {
-        Some(arr) if !arr.is_empty() => arr[0].clone(),
-        _ => {
-            warn!("Jupiter quote returned no routes for {}", mint);
-            return false;
-        }
-    };
-
-    // If outAmount is missing/zero, treat as no liquidity.
-    let out_amount_ok = route
-        .get("outAmount")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<u128>().ok())
-        .map(|n| n > 0)
-        .unwrap_or(false);
-
-    if !out_amount_ok {
-        warn!("Jupiter route outAmount is zero/missing for {}", mint);
-        return false;
-    }
-
-    let swap_body = json!({
-        // IMPORTANT: /v6/swap expects a single route object from /v6/quote, not the whole response.
-        "quoteResponse": route,
-        "userPublicKey": treasury.pubkey().to_string(),
-        "wrapAndUnwrapSol": true,
-        "dynamicComputeUnitLimit": true,
-    });
-
-    let swap_resp = match client
-        .post("https://quote-api.jup.ag/v6/swap")
-        .json(&swap_body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Jupiter swap request failed for {}: {:?}", mint, e);
-            return false;
-        }
-    };
-
-    if !swap_resp.status().is_success() {
-        let status = swap_resp.status();
-        let body = swap_resp.text().await.unwrap_or_default();
-        warn!("Jupiter swap HTTP {} for {}: {}", status, mint, body);
-        return false;
-    }
-
-    let swap_json: JupiterSwapResponse = match swap_resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("Jupiter swap parse failed for {}: {:?}", mint, e);
-            return false;
-        }
+    let swap_json = match swap_json {
+        Some(v) => v,
+        None => return false,
     };
 
     let tx_bytes = match B64.decode(swap_json.swap_transaction) {
@@ -531,6 +552,7 @@ async fn sell_token(
     treasury: Arc<Treasury>,
     task: SellTask,
     wsol_ata: Pubkey,
+    jupiter_base_url: Arc<String>,
 ) -> SellResult {
     let mint = task.mint;
     let mut errors = Vec::new();
@@ -565,7 +587,14 @@ async fn sell_token(
         errors.push("Raydium failed");
 
         info!("Pump.fun + Raydium failed, trying Jupiter fallback...");
-        if try_sell_jupiter(rpc.clone(), treasury.clone(), &task).await {
+        if try_sell_jupiter(
+            rpc.clone(),
+            treasury.clone(),
+            &task,
+            jupiter_base_url.as_str(),
+        )
+        .await
+        {
             return SellResult::Sold;
         }
         errors.push("Jupiter failed");
@@ -593,7 +622,14 @@ async fn sell_token(
         errors.push("Pump.fun failed");
 
         info!("Raydium + Pump.fun failed, trying Jupiter fallback...");
-        if try_sell_jupiter(rpc.clone(), treasury.clone(), &task).await {
+        if try_sell_jupiter(
+            rpc.clone(),
+            treasury.clone(),
+            &task,
+            jupiter_base_url.as_str(),
+        )
+        .await
+        {
             return SellResult::Sold;
         }
         errors.push("Jupiter failed");
@@ -629,7 +665,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut raydium = Raydium::new(rpc.clone());
     raydium.set_user_authority(treasury.pubkey());
-    let raydium = Arc::new(raydium);
+        jupiter_base_url: Option<String>,
 
     // Initialize Pump.fun with user authority for selling
     let mut pumpfun = PumpFunDex::new(rpc.clone()).expect("Failed to create PumpFunDex");
@@ -664,7 +700,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Found {} token accounts total.", token_accounts.len());
 
     let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-    let mut tasks = Vec::new();
+            if try_sell_jupiter(rpc.clone(), treasury.clone(), &task, jupiter_base_url.as_deref().unwrap_or("https://quote-api.jup.ag")).await {
 
     for ta in token_accounts {
         let data = ta.account.data;
@@ -692,7 +728,7 @@ async fn main() -> anyhow::Result<()> {
                 let bytes = bs58::decode(b).into_vec().unwrap_or_default();
                 if bytes.len() < 72 {
                     None
-                } else {
+            if try_sell_jupiter(rpc.clone(), treasury.clone(), &task, jupiter_base_url.as_deref().unwrap_or("https://quote-api.jup.ag")).await {
                     // Check frozen
                     if bytes.len() >= 109 && bytes[108] == 2 {
                         None
@@ -712,7 +748,7 @@ async fn main() -> anyhow::Result<()> {
                         // Check frozen state
                         let is_frozen = info_obj
                             .get("state")
-                            .and_then(|s| s.as_str())
+        jupiter_base_url: &str,
                             .map(|s| s.eq_ignore_ascii_case("frozen"))
                             .unwrap_or(false);
 
@@ -787,6 +823,11 @@ async fn main() -> anyhow::Result<()> {
     let concurrency = 5;
     let treasury = Arc::new(treasury); // Wrap in Arc for sharing
     let force_burn = args.force_burn;
+    let jupiter_base_url = Arc::new(
+        args.jupiter_base_url
+            .clone()
+            .unwrap_or_else(|| "https://quote-api.jup.ag".to_string()),
+    );
 
     // Collect results to handle burns separately
     let results: Vec<SellResult> = stream::iter(tasks)
@@ -795,7 +836,19 @@ async fn main() -> anyhow::Result<()> {
             let raydium = raydium.clone();
             let pumpfun = pumpfun.clone();
             let treasury = treasury.clone();
-            async move { sell_token(rpc, raydium, pumpfun, treasury, task, wsol_ata).await }
+            let jupiter_base_url = jupiter_base_url.clone();
+            async move {
+                sell_token(
+                    rpc,
+                    raydium,
+                    pumpfun,
+                    treasury,
+                    task,
+                    wsol_ata,
+                    jupiter_base_url,
+                )
+                .await
+            }
         })
         .buffer_unordered(concurrency)
         .collect()
