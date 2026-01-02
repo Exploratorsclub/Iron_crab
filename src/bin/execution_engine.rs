@@ -27,7 +27,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::commitment_config::CommitmentLevel;
+use solana_commitment_config::CommitmentLevel;
 use solana_sdk::signature::Signature;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;

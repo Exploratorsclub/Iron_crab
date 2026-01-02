@@ -55,6 +55,7 @@ solana-transaction-status = "=3.0.0"
 solana-account-decoder = "=3.0.0"
 solana-program = "=3.0.0"
 solana-system-program = "=3.0.0"
+solana-commitment-config = "=3.0.0"
 
 # SPL crates (off-chain instruction builders)
 solana-rpc-client-api = "=3.0.0"
