@@ -33,8 +33,8 @@ use uuid::Uuid;
 use ironcrab::config::MomentumCfg;
 use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult, ExecutionStatus,
-    ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind, TradeIntent,
-    TradeResources, TradeSide, TradingRegime,
+    ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind, TradeExecutionConstraints,
+    TradeIntent, TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
     serve_metrics, FILTER_PASSED_TOTAL, FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_INFLOW,
@@ -244,6 +244,7 @@ struct TradeEvent {
     trader: String,
     is_buy: bool,
     sol_amount: u64, // in lamports
+    token_amount: u64, // raw token units
     signature: String,
 }
 
@@ -504,6 +505,7 @@ impl TokenTracker {
         trader: &str,
         is_buy: bool,
         sol_amount: u64,
+        token_amount: u64,
         signature: &str,
         config: &MomentumConfig,
     ) {
@@ -512,6 +514,7 @@ impl TokenTracker {
             trader: trader.to_string(),
             is_buy,
             sol_amount,
+            token_amount,
             signature: signature.to_string(),
         };
 
@@ -557,6 +560,15 @@ impl TokenTracker {
         }
 
         self.trades.push(trade);
+    }
+
+    fn last_trade_ratio(&self) -> Option<(u64, u64)> {
+        // Return (sol_lamports, token_amount_raw) from the most recent trade that has both.
+        self.trades
+            .iter()
+            .rev()
+            .find(|t| t.sol_amount > 0 && t.token_amount > 0)
+            .map(|t| (t.sol_amount, t.token_amount))
     }
 
     /// Record LP removal
@@ -862,13 +874,14 @@ impl MomentumContext {
         trader: &str,
         is_buy: bool,
         sol_amount: u64,
+        token_amount: u64,
         signature: &str,
     ) {
         let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
         if let Some(tracker) = trackers.get_mut(mint) {
             let was_blacklisted = tracker.blacklisted;
-            tracker.record_trade(trader, is_buy, sol_amount, signature, &config);
+            tracker.record_trade(trader, is_buy, sol_amount, token_amount, signature, &config);
             if !was_blacklisted && tracker.blacklisted {
                 self.tokens_blacklisted
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1735,7 +1748,44 @@ async fn generate_and_publish_intent(
 
     let intent_id = ctx.next_intent_id();
 
-    let intent = TradeIntent::new(
+    let (creator_opt, last_trade_ratio_opt) = {
+        let trackers = ctx.token_trackers.read();
+        let tracker = trackers.get(mint);
+        (
+            tracker.and_then(|t| t.dev_wallet.clone()),
+            tracker.and_then(|t| t.last_trade_ratio()),
+        )
+    };
+
+    let (last_sol_lamports, last_token_amount) = match last_trade_ratio_opt {
+        Some(v) => v,
+        None => {
+            warn!(
+                mint = %mint,
+                pool = %pool,
+                dex = %dex,
+                reason = %reason,
+                "Skipping BUY intent: no usable trade ratio yet (need sol_amount+token_amount)"
+            );
+            anyhow::bail!(
+                "cannot generate intent: no usable trade ratio yet (need sol_amount+token_amount)"
+            )
+        }
+    };
+
+    // Estimate expected token output using last observed ratio.
+    // expected_out_raw = position_lamports * last_token_amount / last_sol_lamports
+    let expected_out_raw: u64 = ((position_lamports as u128)
+        .saturating_mul(last_token_amount as u128)
+        / (last_sol_lamports as u128))
+        .min(u64::MAX as u128) as u64;
+
+    let min_out_raw: u64 = ((expected_out_raw as u128)
+        .saturating_mul((10_000u32.saturating_sub(max_slippage)) as u128)
+        / 10_000u128)
+        .min(u64::MAX as u128) as u64;
+
+    let mut intent = TradeIntent::new(
         "momentum-bot",
         BUILD_VERSION,
         &ctx.run_id,
@@ -1756,6 +1806,25 @@ async fn generate_and_publish_intent(
         TradingRegime::Early,
     )
     .with_ttl_ms(5000);
+
+    // Provide deterministic execution constraints required by the execution-engine.
+    // Use 6 as common default decimals for Pump.fun tokens.
+    intent.execution = Some(TradeExecutionConstraints {
+        min_out: Some(ExplicitAmount::new(min_out_raw, 6)),
+    });
+
+    // Keep legacy metadata for backward compatibility, and provide routing hints.
+    intent
+        .metadata
+        .insert("min_out_raw".to_string(), min_out_raw.to_string());
+    intent.metadata.insert("dex".to_string(), dex.to_string());
+
+    // Pump.fun tx building requires the creator/dev wallet.
+    if dex == "pumpfun" {
+        let creator = creator_opt
+            .ok_or_else(|| anyhow::anyhow!("cannot generate pumpfun intent: missing dev_wallet/creator"))?;
+        intent.metadata.insert("creator".to_string(), creator);
+    }
 
     // Register pending intent BEFORE publishing
     ctx.register_buy_intent(&intent_id, mint, pool, dex, position_lamports);
@@ -1815,7 +1884,45 @@ async fn generate_and_publish_exit_intent(
 
     let intent_id = ctx.next_intent_id();
 
-    let intent = TradeIntent::new(
+    let (creator_opt, last_trade_ratio_opt) = {
+        let trackers = ctx.token_trackers.read();
+        let tracker = trackers.get(mint);
+        (
+            tracker.and_then(|t| t.dev_wallet.clone()),
+            tracker.and_then(|t| t.last_trade_ratio()),
+        )
+    };
+
+    let (last_sol_lamports, last_token_amount) = match last_trade_ratio_opt {
+        Some(v) => v,
+        None => {
+            warn!(
+                mint = %mint,
+                pool = %pool,
+                dex = %dex,
+                exit_type = %exit_type,
+                reason = %reason,
+                "Skipping SELL intent: no usable trade ratio yet (need sol_amount+token_amount)"
+            );
+            anyhow::bail!(
+                "cannot generate exit intent: no usable trade ratio yet (need sol_amount+token_amount)"
+            )
+        }
+    };
+
+    // Estimate expected SOL output using last observed ratio.
+    // expected_out_sol_lamports = token_amount * last_sol_lamports / last_token_amount
+    let expected_out_sol_lamports: u64 = ((token_amount as u128)
+        .saturating_mul(last_sol_lamports as u128)
+        / (last_token_amount as u128))
+        .min(u64::MAX as u128) as u64;
+
+    let min_out_raw: u64 = ((expected_out_sol_lamports as u128)
+        .saturating_mul((10_000u32.saturating_sub(max_slippage)) as u128)
+        / 10_000u128)
+        .min(u64::MAX as u128) as u64;
+
+    let mut intent = TradeIntent::new(
         "momentum-bot",
         BUILD_VERSION,
         &ctx.run_id,
@@ -1836,6 +1943,24 @@ async fn generate_and_publish_exit_intent(
         TradingRegime::Early,
     )
     .with_ttl_ms(3000); // Shorter TTL for exits - urgency
+
+    // Deterministic execution constraints: min_out in SOL lamports.
+    intent.execution = Some(TradeExecutionConstraints {
+        min_out: Some(ExplicitAmount::new(min_out_raw, 9)),
+    });
+
+    // Keep legacy metadata for backward compatibility, and provide routing hints.
+    intent
+        .metadata
+        .insert("min_out_raw".to_string(), min_out_raw.to_string());
+    intent.metadata.insert("dex".to_string(), dex.to_string());
+
+    // Pump.fun sell tx building requires the creator/dev wallet.
+    if dex == "pumpfun" {
+        let creator = creator_opt
+            .ok_or_else(|| anyhow::anyhow!("cannot generate pumpfun exit: missing dev_wallet/creator"))?;
+        intent.metadata.insert("creator".to_string(), creator);
+    }
 
     // Register pending intent BEFORE publishing
     ctx.register_sell_intent(&intent_id, mint, pool, dex, token_amount);
@@ -1936,11 +2061,12 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             trader,
             is_buy,
             sol_amount,
-            token_amount: _,
+            token_amount,
             signature,
         } => {
             // Record the trade in the tracker
             let sol_lamports = *sol_amount as u64;
+            let token_raw = *token_amount as u64;
             let sig = signature.clone().unwrap_or_default();
 
             // Check if this trader is the dev wallet and record dev behavior
@@ -1953,7 +2079,21 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     .unwrap_or(false)
             };
 
-            ctx.record_trade(mint, trader, *is_buy, sol_lamports, &sig);
+            ctx.record_trade(mint, trader, *is_buy, sol_lamports, token_raw, &sig);
+
+            // Update open position price estimate (tokens per SOL) based on trade ratio.
+            if sol_lamports > 0 && token_raw > 0 {
+                let tokens_per_sol = (token_raw as f64) / (sol_lamports as f64 / 1_000_000_000.0);
+                let trade = TradeEvent {
+                    timestamp: Instant::now(),
+                    trader: trader.to_string(),
+                    is_buy: *is_buy,
+                    sol_amount: sol_lamports,
+                    token_amount: token_raw,
+                    signature: sig.clone(),
+                };
+                ctx.update_position_price(mint, tokens_per_sol, Some(trade));
+            }
 
             if is_dev {
                 // Record dev trade behavior in tracker
