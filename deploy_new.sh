@@ -50,6 +50,7 @@ done
 # Components
 COMPONENTS=("market-data" "momentum-bot" "arb-strategy" "execution-engine")
 SYSTEMD_DIR="/etc/systemd/system"
+SYSTEMD_SRC_DIR="$SCRIPT_DIR/docs/systemd"
 
 # -----------------------------------------------------------------------------
 # 1. Git Pull
@@ -92,7 +93,7 @@ fi
 install_service() {
     local name=$1
     log_info "Installing ${name}.service..."
-    sudo cp "docs/systemd/${name}.service" "$SYSTEMD_DIR/"
+    sudo cp "$SYSTEMD_SRC_DIR/${name}.service" "$SYSTEMD_DIR/"
 }
 
 log_info "Installing systemd services..."
@@ -101,7 +102,7 @@ install_service "momentum-bot"
 install_service "arb-strategy"
 install_service "execution-engine"
 install_service "control-plane"
-sudo cp "docs/systemd/ironcrab.target" "$SYSTEMD_DIR/"
+sudo cp "$SYSTEMD_SRC_DIR/ironcrab.target" "$SYSTEMD_DIR/"
 
 sudo systemctl daemon-reload
 

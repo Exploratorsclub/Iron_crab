@@ -1,0 +1,35 @@
+# Allow passwordless deploy-related actions for the IronCrab bot user.
+# Install:
+#   sudo install -m 0440 docs/systemd/ironcrab-deploy.sudoers /etc/sudoers.d/ironcrab-deploy
+# Validate:
+#   sudo visudo -c
+#
+# NOTE: This intentionally restricts to a narrow set of commands and paths.
+
+User_Alias IRONCRAB_BOT = ironcrab
+
+Cmnd_Alias IRONCRAB_DEPLOY_CP = \
+    /usr/bin/cp /home/ironcrab/Iron_crab/docs/systemd/market-data.service /etc/systemd/system/, \
+    /usr/bin/cp /home/ironcrab/Iron_crab/docs/systemd/momentum-bot.service /etc/systemd/system/, \
+    /usr/bin/cp /home/ironcrab/Iron_crab/docs/systemd/arb-strategy.service /etc/systemd/system/, \
+    /usr/bin/cp /home/ironcrab/Iron_crab/docs/systemd/execution-engine.service /etc/systemd/system/, \
+    /usr/bin/cp /home/ironcrab/Iron_crab/docs/systemd/control-plane.service /etc/systemd/system/, \
+    /usr/bin/cp /home/ironcrab/Iron_crab/docs/systemd/ironcrab.target /etc/systemd/system/
+
+Cmnd_Alias IRONCRAB_DEPLOY_SYSTEMCTL = \
+    /usr/bin/systemctl daemon-reload, \
+    /usr/bin/systemctl stop ironcrab.target, \
+    /usr/bin/systemctl start ironcrab.target, \
+    /usr/bin/systemctl restart market-data, \
+    /usr/bin/systemctl restart momentum-bot, \
+    /usr/bin/systemctl restart arb-strategy, \
+    /usr/bin/systemctl restart execution-engine, \
+    /usr/bin/systemctl restart control-plane, \
+    /usr/bin/systemctl enable ironcrab.target, \
+    /usr/bin/systemctl is-active market-data, \
+    /usr/bin/systemctl is-active momentum-bot, \
+    /usr/bin/systemctl is-active arb-strategy, \
+    /usr/bin/systemctl is-active execution-engine, \
+    /usr/bin/systemctl is-active control-plane
+
+IRONCRAB_BOT ALL=(root) NOPASSWD: IRONCRAB_DEPLOY_CP, IRONCRAB_DEPLOY_SYSTEMCTL
