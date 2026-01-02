@@ -16,6 +16,11 @@ Build/test environment note:
 - Per `docs/LOCAL_SETUP.md`, Windows-native builds are currently not supported because the Geyser dependency chain (`yellowstone-grpc-proto` → `protobuf-src`) fails on Windows.
 - For step-by-step implementation and verification, run builds/tests in **WSL2 (Ubuntu)** or on the Linux server/CI.
 
+Status snapshot (2026-01-02):
+- Done: execution-engine no longer emits fake signature-like values; send path is honest (rejects instead of claiming sent).
+- Done (SELL safety, dry-run compatible): SELL token balance preflight + token capital locking (validated via DecisionRecords).
+- Not done: Real simulation via RPC (`simulateTransaction`) and Real Send/Confirm.
+
 ---
 
 ## RS-0 — Baseline / Guardrails
@@ -32,6 +37,9 @@ Build/test environment note:
   - Acceptance:
     - No DecisionRecord is written with fake signature-like values.
     - Logs/metrics do not claim “sent” unless a real signature exists.
+  - Current state:
+    - ✅ Fake signature-like values removed.
+    - ⚠️ Simulation still contains stub strings until RS-3.1 is done.
   - Touch:
     - `src/bin/execution_engine.rs`
   - Verify:
@@ -196,6 +204,9 @@ Build/test environment note:
 - [ ] **RS-7.1 – Support SELL intents (Pump.fun)**
   - Acceptance:
     - Real signature + confirmation for sell path.
+  - Pre-work already landed (dry-run safe, no send yet):
+    - SELL token balance preflight (ATA derivation + RPC balance read)
+    - SELL token capital locking to prevent overlapping exits
 
 - [ ] **RS-7.2 – Raydium: remove placeholder user accounts in `build_swap_ix`**
   - Scope:

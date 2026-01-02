@@ -120,6 +120,43 @@ Legacy/Monolith (nur wenn explizit gewollt):
 ./deploy.sh --legacy
 ```
 
+## Server Test Recipes (Dry-Run / No-Send)
+
+Ziel: End-to-end testen (Strategy → NATS → execution-engine → DecisionRecord), ohne On-Chain Send.
+
+### Publish a test SELL intent into NATS
+
+Server hat häufig PEP 668 (externally managed Python) ⇒ **immer venv verwenden**.
+
+1) Venv anlegen + NATS client installieren (einmalig):
+```bash
+ssh ironcrab-prod "mkdir -p ~/nats_tools; python3 -m venv ~/nats_tools/venv; ~/nats_tools/venv/bin/python -m pip install -q nats-py"
+```
+
+2) Publisher Script kopieren:
+```bash
+scp tools/nats_publish_sell_intent.py ironcrab-prod:~/nats_tools/nats_publish_sell_intent.py
+```
+
+3) Intent publishen (prints intent_id):
+```bash
+ssh ironcrab-prod "EXPECTED_ROI_BPS=2000 MAX_SLIPPAGE_BPS=100 ~/nats_tools/venv/bin/python ~/nats_tools/nats_publish_sell_intent.py"
+```
+
+### Validate processing without sudo/journalctl
+
+Wenn `sudo journalctl` nicht möglich ist (no TTY), nutze DecisionRecord JSONL:
+
+```bash
+ssh ironcrab-prod "cd ~/Iron_crab; ls -1t trade_logs/decisions | head -n 3"
+ssh ironcrab-prod "cd ~/Iron_crab; grep -n '<intent_id>' trade_logs/decisions/decision_records-$(date +%Y%m%d).jsonl | tail -n 1"
+```
+
+Erwartung (SELL dry-run Pipeline):
+- `sell_token_balance` check erscheint (ATA + available/required)
+- `capital_lock` zeigt `token:<mint>`
+- Outcome endet bei `send_enabled=false` (oder später bei `send_not_implemented`, je nach Config)
+
 ### UI/Dashboard (lokal, via SSH Port Forwarding)
 
 Prerequisite: Tunnel zum server-side Control Plane (läuft serverseitig auf `127.0.0.1:8080`):

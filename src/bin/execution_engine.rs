@@ -25,9 +25,7 @@
 use anyhow::Result;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{read_keypair_file, Keypair, Signer};
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -51,10 +49,12 @@ use ironcrab::metrics::{
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_TRADE_INTENTS};
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
+use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::storage::{
     locks::{LockHolder, LockManager, LockResult, ResourceType},
     JsonlWriter, JsonlWriterConfig,
 };
+use ironcrab::wallet::Treasury;
 
 /// NATS topic for config reload commands from control-plane
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
@@ -337,8 +337,8 @@ struct ExecutionContext {
     // === Cross-DEX Arbitrage Handler ===
     /// Handler for cross-DEX arb intents (optional, requires RPC)
     cross_dex_handler: Option<parking_lot::RwLock<CrossDexHandler>>,
-    /// RPC client for simulations and queries
-    rpc_client: Option<Arc<RpcClient>>,
+    /// RPC wrapper for read-only queries and (future) sim/send
+    rpc: Arc<SolanaRpc>,
 
     // Metrics
     intents_received: std::sync::atomic::AtomicU64,
@@ -432,9 +432,7 @@ impl ExecutionContext {
                 "send_enabled" => {
                     if let Some(v) = value.as_bool() {
                         // Only allow enabling if keys are configured
-                        let has_keys = std::env::var("IRONCRAB_KEYPAIR_JSON").is_ok()
-                            || std::env::var("IRONCRAB_KEYPAIR_B64").is_ok()
-                            || std::env::var("IRONCRAB_KEYPAIR_PATH").is_ok();
+                        let has_keys = Treasury::load_from_env().is_ok();
 
                         if v && !has_keys {
                             rejected.push((
@@ -558,87 +556,6 @@ impl ExecutionContext {
     }
 }
 
-/// Convert raw bytes to 32-byte seed array for Keypair
-/// Supports both 32-byte seed and 64-byte full keypair formats (takes first 32)
-fn bytes_to_secret_array(bytes: &[u8]) -> Option<[u8; 32]> {
-    match bytes.len() {
-        32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(bytes);
-            Some(arr)
-        }
-        64 => {
-            // 64 bytes = full keypair (secret + public), take first 32
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes[..32]);
-            Some(arr)
-        }
-        _ => None,
-    }
-}
-
-/// Load wallet keypair from environment variables
-/// Priority: IRONCRAB_KEYPAIR_PATH > IRONCRAB_KEYPAIR_JSON > IRONCRAB_KEYPAIR_B64
-fn load_wallet_keypair() -> Option<Keypair> {
-    // Try IRONCRAB_KEYPAIR_PATH first (file path)
-    if let Ok(path) = std::env::var("IRONCRAB_KEYPAIR_PATH") {
-        match read_keypair_file(&path) {
-            Ok(kp) => {
-                tracing::info!(path = %path, "Loaded keypair from file");
-                return Some(kp);
-            }
-            Err(e) => {
-                tracing::error!(path = %path, error = %e, "Failed to load keypair from file");
-            }
-        }
-    }
-
-    // Try IRONCRAB_KEYPAIR_JSON (JSON array string)
-    if let Ok(json) = std::env::var("IRONCRAB_KEYPAIR_JSON") {
-        match serde_json::from_str::<Vec<u8>>(&json) {
-            Ok(bytes) => {
-                if let Some(secret) = bytes_to_secret_array(&bytes) {
-                    let kp = Keypair::new_from_array(secret);
-                    tracing::info!("Loaded keypair from JSON env var");
-                    return Some(kp);
-                } else {
-                    tracing::error!(
-                        "IRONCRAB_KEYPAIR_JSON must be 32 or 64 bytes, got {}",
-                        bytes.len()
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to parse IRONCRAB_KEYPAIR_JSON");
-            }
-        }
-    }
-
-    // Try IRONCRAB_KEYPAIR_B64 (base64 encoded)
-    if let Ok(b64) = std::env::var("IRONCRAB_KEYPAIR_B64") {
-        use base64::Engine;
-        match base64::engine::general_purpose::STANDARD.decode(&b64) {
-            Ok(bytes) => {
-                if let Some(secret) = bytes_to_secret_array(&bytes) {
-                    let kp = Keypair::new_from_array(secret);
-                    tracing::info!("Loaded keypair from B64 env var");
-                    return Some(kp);
-                } else {
-                    tracing::error!(
-                        "IRONCRAB_KEYPAIR_B64 must decode to 32 or 64 bytes, got {}",
-                        bytes.len()
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to decode IRONCRAB_KEYPAIR_B64");
-            }
-        }
-    }
-
-    None
-}
-
 fn sdk_to_spl(pk: &Pubkey) -> spl_token::solana_program::pubkey::Pubkey {
     spl_token::solana_program::pubkey::Pubkey::new_from_array(pk.to_bytes())
 }
@@ -695,17 +612,29 @@ async fn main() -> Result<()> {
         "Metrics server started at /metrics"
     );
 
-    // === This is the ONLY binary that should load keys ===
-    // In production, load keys here. For MVP, we just acknowledge the pattern.
-    let has_keys = std::env::var("IRONCRAB_KEYPAIR_JSON").is_ok()
-        || std::env::var("IRONCRAB_KEYPAIR_B64").is_ok()
-        || std::env::var("IRONCRAB_KEYPAIR_PATH").is_ok();
+    // RPC wrapper (nonblocking; limiter/retry lives inside SolanaRpc)
+    let rpc = Arc::new(SolanaRpc::new(&args.rpc_url));
 
-    if has_keys {
-        info!("Wallet key environment variables detected (execution-engine is the single signer)");
-    } else if !args.dry_run {
-        warn!("No wallet keys configured. Running in simulation-only mode.");
+    // RS-1.1 acceptance: prove basic RPC works through SolanaRpc
+    match rpc.rpc.get_latest_blockhash().await {
+        Ok(_bh) => info!("Fetched latest blockhash via SolanaRpc"),
+        Err(e) => warn!(error = %e, "Failed to fetch latest blockhash via SolanaRpc"),
     }
+
+    // === This is the ONLY binary that should load keys ===
+    let treasury = match Treasury::load_from_env() {
+        Ok(t) => {
+            info!(wallet = %t.pubkey(), "Wallet keys loaded (execution-engine is the single signer)");
+            Some(t)
+        }
+        Err(e) => {
+            if !args.dry_run {
+                warn!(error = %e, "No wallet keys configured or loadable; running without signer");
+            }
+            None
+        }
+    };
+    let has_keys = treasury.is_some();
 
     // Setup config
     let mut exec_config = ExecutionConfig::default();
@@ -762,32 +691,21 @@ async fn main() -> Result<()> {
 
     info!(log_dir = %log_base.display(), "JSONL writers initialized");
 
-    // Load wallet keypair and fetch real balance
+    // Load wallet keys and fetch real balance
     // NOTE: In `--dry-run`, we still allow key loading and balance reads.
     // `--dry-run` means: do not submit transactions, not: keyless.
-    let (wallet_pubkey, initial_balance) = if has_keys {
-        let keypair = load_wallet_keypair();
-        match keypair {
-            Some(kp) => {
-                let pubkey = kp.pubkey();
-                info!(wallet = %pubkey, "Wallet keypair loaded");
+    let (wallet_pubkey, initial_balance) = if let Some(ref t) = treasury {
+        let pubkey = t.pubkey();
 
-                // Fetch real balance from RPC (read-only)
-                let rpc = RpcClient::new(args.rpc_url.clone());
-                match rpc.get_balance(&pubkey) {
-                    Ok(balance) => {
-                        info!(wallet = %pubkey, balance_sol = balance as f64 / 1e9, "Real wallet balance fetched");
-                        (Some(pubkey), balance)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to fetch wallet balance, using default");
-                        (Some(pubkey), args.initial_sol_lamports)
-                    }
-                }
+        // RS-1.1 acceptance: getBalance through SolanaRpc
+        match rpc.rpc.get_balance(&pubkey).await {
+            Ok(balance) => {
+                info!(wallet = %pubkey, balance_sol = balance as f64 / 1e9, "Real wallet balance fetched");
+                (Some(pubkey), balance)
             }
-            None => {
-                warn!("Failed to load wallet keypair");
-                (None, args.initial_sol_lamports)
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch wallet balance, using default");
+                (Some(pubkey), args.initial_sol_lamports)
             }
         }
     } else {
@@ -897,7 +815,7 @@ async fn main() -> Result<()> {
         bundles_confirmed: std::sync::atomic::AtomicU64::new(0),
         // Cross-DEX handler (initialized below)
         cross_dex_handler: None,
-        rpc_client: Some(Arc::new(RpcClient::new(args.rpc_url.clone()))),
+        rpc: Arc::clone(&rpc),
         // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
@@ -1326,29 +1244,19 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             }
         };
 
-        let rpc = match ctx.rpc_client.clone() {
-            Some(r) => r,
-            None => {
-                let reason = RejectReason::InternalError;
-                checks.push(CheckResult {
-                    check_name: "sell_token_balance".to_string(),
-                    passed: false,
-                    reason_code: Some(reason.to_string()),
-                    details: Some("rpc_client_unavailable".to_string()),
-                });
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-            }
-        };
+        let rpc = Arc::clone(&ctx.rpc);
 
         let mint_str = intent.resources.input_mint.clone();
         let required_raw = intent.required_capital.raw;
 
-        let balance_check = tokio::task::spawn_blocking(move || -> Result<(u64, Pubkey)> {
+        let balance_check: Result<(u64, Pubkey)> = async {
             let mint = Pubkey::from_str(&mint_str)
                 .map_err(|_| anyhow::anyhow!("invalid input_mint: {}", mint_str))?;
 
             let mint_acct = rpc
+                .rpc
                 .get_account(&mint)
+                .await
                 .map_err(|e| anyhow::anyhow!("failed to fetch mint account: {}", e))?;
             let token_program =
                 token_program_for_mint_owner(&mint_acct.owner).ok_or_else(|| {
@@ -1363,7 +1271,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             let ata = spl_to_sdk(&ata_spl);
 
             // If ATA doesn't exist yet, treat as 0 balance.
-            let available_raw = match rpc.get_token_account_balance(&ata) {
+            let available_raw = match rpc.rpc.get_token_account_balance(&ata).await {
                 Ok(ui) => ui
                     .amount
                     .parse::<u64>()
@@ -1372,8 +1280,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             };
 
             Ok((available_raw, ata))
-        })
-        .await?;
+        }
+        .await;
 
         match balance_check {
             Ok((available_raw, ata)) => {
@@ -1414,7 +1322,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     check_name: "sell_token_balance".to_string(),
                     passed: false,
                     reason_code: Some(reason.to_string()),
-                    details: Some(e.to_string()),
+                    details: Some(format!("rpc_error: {}", e)),
                 });
                 return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
             }
