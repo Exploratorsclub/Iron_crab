@@ -120,7 +120,7 @@ Status snapshot (2026-01-02):
 
 ## RS-3 — Simulation Gate: real `simulateTransaction`
 
-- [ ] **RS-3.1 – Replace stub simulation with real RPC simulate**
+- [x] **RS-3.1 – Replace stub simulation with real RPC simulate**
   - Scope:
     - Build tx from intent (using RS-2 builder), set recent blockhash, then call `simulateTransaction`.
     - Record `err`, log preview, and `units_consumed` into `SimulationResult`.
@@ -132,6 +132,10 @@ Status snapshot (2026-01-02):
     - `src/ipc/schema.rs` only if SimulationResult needs small extensions (prefer not)
   - Verify:
     - `cargo test -q --test ipc_schema_roundtrip` (WSL2/Linux)
+  - Notes (current):
+    - execution-engine now builds a TxPlan first, then calls `simulateTransaction` via nonblocking RPC.
+    - Simulation is unsigned (`sig_verify=false`) and uses `replace_recent_blockhash=true`.
+    - Pump.fun BUY planning requires `metadata.creator` and `metadata.min_out_raw`.
 
 ---
 
