@@ -28,9 +28,8 @@ use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, MarketEvent, MarketEventKind,
 };
 use ironcrab::metrics::{
-    serve_metrics, GEYSER_ERRORS_TOTAL, GEYSER_RECONNECTS_TOTAL, MARKET_EVENTS_PUBLISHED_TOTAL,
-    MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    POOLS_DISCOVERED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
 use ironcrab::solana::dex_parser::{

@@ -26,6 +26,7 @@ use anyhow::Result;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
+use solana_commitment_config::CommitmentLevel;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::signer::Signer;
@@ -46,10 +47,9 @@ use ironcrab::ipc::{
 };
 use ironcrab::metrics::{
     serve_metrics, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS,
-    INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL, NATS_ERRORS_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, REJECT_CAPITAL_LOCK,
-    REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_RISK_LIMIT, REJECT_SIMULATION_FAIL,
-    REJECT_TTL_EXPIRED, SIMULATION_FAILURES_TOTAL, REJECT_SEND_FAILED, TX_CONFIRMED_TOTAL,
+    INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, REJECT_CAPITAL_LOCK,
+    REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_SIMULATION_FAIL,
+    SIMULATION_FAILURES_TOTAL, REJECT_SEND_FAILED, TX_CONFIRMED_TOTAL,
     TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_SUCCESS_TOTAL,
     JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL,
     JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL,
@@ -1784,6 +1784,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // === P1: Check if bundle required for atomic execution ===
     let requires_bundle = intent.requires_bundle();
 
+    let wallet_pubkey = ctx
+        .wallet_pubkey
+        .expect("wallet_pubkey must be present after successful planning");
+
     if requires_bundle && config.send_enabled && ctx.jito_client.is_none() {
         // Intent requires bundle but Jito not configured
         let reason = RejectReason::BundleNotConfigured;
@@ -1837,10 +1841,6 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
     // === Simulate (P0: simulate-gated) ===
     info!(intent_id = %intent.intent_id, "Running simulation");
-
-    let wallet_pubkey = ctx
-        .wallet_pubkey
-        .expect("wallet_pubkey must be present after successful planning");
 
     let sim_result = simulate_transaction(ctx, wallet_pubkey, &tx_plan_for_sim).await;
 
@@ -1989,7 +1989,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 wallet_pubkey,
                 &tx_plan,
                 config.send_skip_preflight,
-                config.send_preflight_commitment.clone(),
+                parse_commitment_level_opt(config.send_preflight_commitment.as_deref()),
             )
             .await {
                 Ok(sig_str) => {
@@ -2438,7 +2438,7 @@ async fn send_transaction_rpc(
     wallet_pubkey: Pubkey,
     plan: &tx_builder::TxPlan,
     skip_preflight: bool,
-    preflight_commitment: Option<String>,
+    preflight_commitment: Option<CommitmentLevel>,
 ) -> std::result::Result<String, String> {
     TX_SEND_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let treasury = ctx
@@ -2474,6 +2474,19 @@ async fn send_transaction_rpc(
         .await
         .map(|sig| sig.to_string())
         .map_err(|e| format!("rpc_error:{e}"))
+}
+
+fn parse_commitment_level_opt(value: Option<&str>) -> Option<CommitmentLevel> {
+    let v = value?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    match v.to_ascii_lowercase().as_str() {
+        "processed" => Some(CommitmentLevel::Processed),
+        "confirmed" => Some(CommitmentLevel::Confirmed),
+        "finalized" => Some(CommitmentLevel::Finalized),
+        _ => None,
+    }
 }
 
 enum ConfirmOutcome {

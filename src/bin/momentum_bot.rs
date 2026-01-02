@@ -1880,7 +1880,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
         MarketEventKind::PoolCreated {
             pool_address,
             base_mint,
-            quote_mint,
+            quote_mint: _quote_mint,
             dex,
             initial_liquidity_sol,
         } => {

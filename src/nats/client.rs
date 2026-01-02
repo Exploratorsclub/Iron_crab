@@ -10,7 +10,7 @@
 
 use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::warn;
 
 #[cfg(feature = "nats")]
 use tracing::{error, info};
