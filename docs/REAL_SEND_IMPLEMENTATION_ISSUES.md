@@ -173,7 +173,7 @@ Status snapshot (2026-01-02):
 
 ## RS-5 — Metrics + Operator Truth
 
-- [ ] **RS-5.1 – Align metrics with real states**
+- [x] **RS-5.1 – Align metrics with real states**
   - Scope:
     - Add minimal counters:
       - `tx_send_attempts_total`

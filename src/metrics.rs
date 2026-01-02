@@ -168,6 +168,11 @@ pub static INTENTS_RECEIVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new
 pub static INTENTS_EXECUTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static INTENTS_REJECTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static SIMULATION_FAILURES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// RS-5.1: Real-send lifecycle counters (operator truth)
+pub static TX_SEND_ATTEMPTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_SEND_SUCCESS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_CONFIRMED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_CONFIRM_TIMEOUT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static AVAILABLE_SOL_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ACTIVE_CAPITAL_LOCKS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ACTIVE_RESOURCE_LOCKS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -178,6 +183,7 @@ pub static REJECT_CAPITAL_LOCK: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0)
 pub static REJECT_RESOURCE_LOCK: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static REJECT_RISK_LIMIT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static REJECT_SIMULATION_FAIL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static REJECT_SEND_FAILED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 // --- NATS messaging metrics ---
 pub static NATS_MESSAGES_PUBLISHED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -711,6 +717,22 @@ async fn metrics_response() -> Response<Body> {
         INTENTS_REJECTED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
+        "tx_send_attempts_total",
+        TX_SEND_ATTEMPTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "tx_send_success_total",
+        TX_SEND_SUCCESS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "tx_confirmed_total",
+        TX_CONFIRMED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "tx_confirm_timeout_total",
+        TX_CONFIRM_TIMEOUT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
         "simulation_failures_total",
         SIMULATION_FAILURES_TOTAL.load(Ordering::Relaxed)
     );
@@ -744,6 +766,9 @@ async fn metrics_response() -> Response<Body> {
     out.push('\n');
     out.push_str("intent_rejection_by_reason{reason=\"simulation_fail\"} ");
     out.push_str(&REJECT_SIMULATION_FAIL.load(Ordering::Relaxed).to_string());
+    out.push('\n');
+    out.push_str("intent_rejection_by_reason{reason=\"send_failed\"} ");
+    out.push_str(&REJECT_SEND_FAILED.load(Ordering::Relaxed).to_string());
     out.push('\n');
 
     // --- NATS messaging ---

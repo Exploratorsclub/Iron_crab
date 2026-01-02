@@ -49,7 +49,8 @@ use ironcrab::metrics::{
     INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL, NATS_ERRORS_TOTAL,
     NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, REJECT_CAPITAL_LOCK,
     REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_RISK_LIMIT, REJECT_SIMULATION_FAIL,
-    REJECT_TTL_EXPIRED, SIMULATION_FAILURES_TOTAL,
+    REJECT_TTL_EXPIRED, SIMULATION_FAILURES_TOTAL, REJECT_SEND_FAILED, TX_CONFIRMED_TOTAL,
+    TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_SUCCESS_TOTAL,
 };
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_TRADE_INTENTS};
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
@@ -1809,6 +1810,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         } else {
             match send_transaction_rpc(ctx, wallet_pubkey, &tx_plan).await {
                 Ok(sig_str) => {
+                    TX_SEND_SUCCESS_TOTAL.fetch_add(1, Ordering::Relaxed);
                     sent_anything = true;
                     send_signature = Some(sig_str.clone());
                     checks.push(CheckResult {
@@ -1822,6 +1824,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 Err(err_msg) => {
                     send_failed = true;
                     let reason = RejectReason::SendFailed;
+                    REJECT_SEND_FAILED.fetch_add(1, Ordering::Relaxed);
                     checks.push(CheckResult {
                         check_name: "send".to_string(),
                         passed: false,
@@ -2190,6 +2193,7 @@ async fn send_transaction_rpc(
     wallet_pubkey: Pubkey,
     plan: &tx_builder::TxPlan,
 ) -> std::result::Result<String, String> {
+    TX_SEND_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let treasury = ctx
         .treasury
         .as_ref()
@@ -2251,6 +2255,7 @@ async fn confirm_signature_status(
 
     loop {
         if start.elapsed() >= deadline {
+            TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
             return Ok(ConfirmOutcome::TimeoutSent {
                 details: format!("timeout_ms={timeout_ms} elapsed_ms={} signature={signature_base58}", start.elapsed().as_millis()),
             });
@@ -2292,6 +2297,7 @@ async fn confirm_signature_status(
             };
 
             if is_confirmed {
+                TX_CONFIRMED_TOTAL.fetch_add(1, Ordering::Relaxed);
                 return Ok(ConfirmOutcome::Confirmed {
                     details: format!(
                         "confirmations={:?} confirmation_status={:?} elapsed_ms={}",
