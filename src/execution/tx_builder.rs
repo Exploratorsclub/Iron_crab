@@ -3,6 +3,7 @@ use crate::solana::dex::Dex;
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::orca_whirlpool_layout;
 use crate::solana::dex::pumpfun::PumpFunDex;
+use crate::solana::dex::raydium::Raydium;
 use crate::solana::rpc::SolanaRpc;
 use solana_sdk::hash::hash;
 use solana_sdk::instruction::Instruction;
@@ -48,6 +49,42 @@ pub enum TxPlanOutcome {
 
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DexHint {
+    Raydium,
+    Orca,
+    Pumpfun,
+}
+
+fn dex_hint_from_intent(intent: &TradeIntent) -> Result<DexHint, UnsupportedTxPlan> {
+    match intent.metadata.get("dex").map(|s| s.as_str()) {
+        Some("raydium") => Ok(DexHint::Raydium),
+        Some("orca") => Ok(DexHint::Orca),
+        Some("pumpfun") => Ok(DexHint::Pumpfun),
+        Some(other) => Err(UnsupportedTxPlan {
+            reason: RejectReason::UnsupportedIntent,
+            details: format!("unsupported metadata.dex={other}"),
+        }),
+        None => {
+            // Back-compat behavior: if producer didn't provide a dex hint but *did* provide a
+            // Pump.fun creator, treat it as pumpfun. Otherwise we must not guess (misroutes are
+            // worse than rejects).
+            let has_creator = intent
+                .metadata
+                .get("creator")
+                .is_some_and(|v| !v.trim().is_empty());
+            if has_creator {
+                Ok(DexHint::Pumpfun)
+            } else {
+                Err(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: "missing metadata.dex (required for tx build routing)".to_string(),
+                })
+            }
+        }
+    }
+}
+
 fn min_out_raw_from_intent(intent: &TradeIntent) -> Result<u64, UnsupportedTxPlan> {
     if let Some(execution) = intent.execution.as_ref() {
         if let Some(min_out) = execution.min_out.as_ref() {
@@ -82,7 +119,10 @@ pub async fn build_tx_plan(
     wallet_pubkey: Pubkey,
     rpc: Arc<SolanaRpc>,
 ) -> TxPlanOutcome {
-    let dex_hint = intent.metadata.get("dex").map(|s| s.as_str());
+    let dex_hint = match dex_hint_from_intent(intent) {
+        Ok(h) => h,
+        Err(e) => return TxPlanOutcome::Unsupported(e),
+    };
 
     match intent.side {
         TradeSide::Buy => {
@@ -134,7 +174,7 @@ pub async fn build_tx_plan(
         }
     };
 
-    if dex_hint == Some("orca") {
+    if dex_hint == DexHint::Orca {
         // Orca planning requires a whirlpool pubkey in `resources.pools[0]`.
         let pool_id_str = &intent.resources.pools[0];
         let pool_id = match Pubkey::from_str(pool_id_str) {
@@ -217,6 +257,58 @@ pub async fn build_tx_plan(
         return TxPlanOutcome::Planned(TxPlan { instructions: ixs });
     }
 
+    if dex_hint == DexHint::Raydium {
+        // Raydium planning requires an AMM pool pubkey in `resources.pools[0]`.
+        let pool_id_str = &intent.resources.pools[0];
+        let pool_id = match Pubkey::from_str(pool_id_str) {
+            Ok(pk) => pk,
+            Err(e) => {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::InvalidIntent,
+                    details: format!("invalid resources.pools[0] pubkey for raydium: {e}"),
+                })
+            }
+        };
+
+        let mut raydium = Raydium::new(Arc::clone(&rpc));
+        raydium.set_user_authority(wallet_pubkey);
+
+        // Load the specific pool snapshot into the Raydium adapter.
+        if let Err(e) = raydium.load_pool_from_geyser(&pool_id).await {
+            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: format!("raydium load_pool_from_geyser failed: {e}"),
+            });
+        }
+
+        // Raydium tx building needs Serum/OpenBook market accounts.
+        if let Err(e) = raydium.fetch_and_populate_serum_accounts(&pool_id).await {
+            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: format!("raydium fetch_serum_accounts failed: {e}"),
+            });
+        }
+
+        let ixs = match raydium.build_swap_ix(
+            &intent.resources.input_mint,
+            &intent.resources.output_mint,
+            intent.required_capital.raw,
+            min_out,
+        ) {
+            Ok(ixs) => ixs,
+            Err(e) => {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!("raydium build failed: {e}"),
+                })
+            }
+        };
+
+        return TxPlanOutcome::Planned(TxPlan { instructions: ixs });
+    }
+
+    debug_assert_eq!(dex_hint, DexHint::Pumpfun);
+
     // For Pump.fun, creator MUST be provided by the strategy (typically from a Geyser event).
     // We intentionally do not attempt to parse it from the bonding curve state.
     let creator_str = match intent.metadata.get("creator") {
@@ -279,9 +371,8 @@ mod tests {
     use super::*;
     use crate::ipc::{ExplicitAmount, IntentOrigin, IntentTier, TradeExecutionConstraints, TradeResources, TradingRegime};
 
-    #[test]
-    fn min_out_prefers_typed_execution_field() {
-        let mut intent = TradeIntent::new(
+    fn base_intent() -> TradeIntent {
+        TradeIntent::new(
             "test",
             "build",
             "run",
@@ -300,7 +391,44 @@ mod tests {
             0,
             TradeSide::Sell,
             TradingRegime::Early,
+        )
+    }
+
+    #[test]
+    fn dex_hint_routing_is_explicit_and_safe() {
+        // Regression: previously any non-Orca intent fell through to Pump.fun and
+        // would fail with "missing metadata.creator" even when dex=raydium.
+
+        let mut ray = base_intent();
+        ray.metadata.insert("dex".to_string(), "raydium".to_string());
+        assert_eq!(super::dex_hint_from_intent(&ray).unwrap(), super::DexHint::Raydium);
+
+        let mut orca = base_intent();
+        orca.metadata.insert("dex".to_string(), "orca".to_string());
+        assert_eq!(super::dex_hint_from_intent(&orca).unwrap(), super::DexHint::Orca);
+
+        let mut pump = base_intent();
+        pump.metadata.insert("dex".to_string(), "pumpfun".to_string());
+        assert_eq!(super::dex_hint_from_intent(&pump).unwrap(), super::DexHint::Pumpfun);
+
+        let mut legacy = base_intent();
+        legacy
+            .metadata
+            .insert("creator".to_string(), "11111111111111111111111111111111".to_string());
+        assert_eq!(
+            super::dex_hint_from_intent(&legacy).unwrap(),
+            super::DexHint::Pumpfun
         );
+
+        let missing = base_intent();
+        let err = super::dex_hint_from_intent(&missing).unwrap_err();
+        assert_eq!(err.reason, RejectReason::UnsupportedIntent);
+        assert!(err.details.contains("missing metadata.dex"));
+    }
+
+    #[test]
+    fn min_out_prefers_typed_execution_field() {
+        let mut intent = base_intent();
 
         intent.metadata.insert("min_out_raw".to_string(), "123".to_string());
         intent.execution = Some(TradeExecutionConstraints {
@@ -314,26 +442,7 @@ mod tests {
 
     #[test]
     fn min_out_falls_back_to_legacy_metadata() {
-        let mut intent = TradeIntent::new(
-            "test",
-            "build",
-            "run",
-            "intent-2".to_string(),
-            "test",
-            IntentTier::Tier1,
-            IntentOrigin::StrategyA,
-            ExplicitAmount::new(1, 9),
-            TradeResources {
-                input_mint: "in".to_string(),
-                output_mint: "out".to_string(),
-                pools: vec!["pool".to_string()],
-                accounts: vec![],
-            },
-            0,
-            0,
-            TradeSide::Sell,
-            TradingRegime::Early,
-        );
+        let mut intent = base_intent();
 
         intent.metadata.insert("min_out_raw".to_string(), "456".to_string());
 
