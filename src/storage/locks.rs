@@ -363,7 +363,10 @@ impl LockManager {
     /// opportunistically (e.g., from a SELL preflight check) without having a
     /// complete wallet token snapshot.
     pub fn set_available_token_balance(&self, mint: String, amount_raw: u64) {
-        self.available_tokens.write().insert(mint, amount_raw);
+        self.available_tokens
+            .write()
+            .entry(mint)
+            .or_insert(amount_raw);
     }
 
     /// Check if an intent has already been processed (idempotency)
