@@ -36,6 +36,13 @@ async def main() -> None:
     quote_mint = os.environ.get("QUOTE_MINT", SOL_MINT)
     initial_liquidity_sol = os.environ.get("INITIAL_LIQUIDITY_SOL", "50.0")
 
+    # Pump.fun intents require a creator/dev wallet. Momentum-bot learns this via DevWalletIdentified.
+    publish_dev_wallet_identified = os.environ.get(
+        "PUBLISH_DEV_WALLET_IDENTIFIED", "1" if dex == "pumpfun" else "0"
+    ) not in ("0", "false", "False")
+    dev_wallet = os.environ.get("DEV_WALLET", "11111111111111111111111111111111")
+    dev_supply_pct = float(os.environ.get("DEV_SUPPLY_PCT", "10.0"))
+
     # Optional: set a synthetic slot for all events.
     slot_env = os.environ.get("SLOT")
     slot_value = int(slot_env) if slot_env not in (None, "") else None
@@ -70,6 +77,24 @@ async def main() -> None:
             "dex": dex,
             # rust_decimal serde expects a string
             "initial_liquidity_sol": initial_liquidity_sol,
+        }
+        await nc.publish(TOPIC_MARKET_EVENTS, json.dumps(evt).encode("utf-8"))
+        await asyncio.sleep(0.05)
+
+    if publish_dev_wallet_identified:
+        evt = {
+            "schema_version": 1,
+            "ts_unix_ms": now_ms(),
+            "component": "manual-test",
+            "build": build,
+            "run_id": run_id,
+            "event_id": f"evt-{run_id[:8]}-devwallet",
+            "source": "manual-test",
+            "slot": slot_value,
+            "kind": "DevWalletIdentified",
+            "mint": mint,
+            "dev_wallet": dev_wallet,
+            "supply_percentage": dev_supply_pct,
         }
         await nc.publish(TOPIC_MARKET_EVENTS, json.dumps(evt).encode("utf-8"))
         await asyncio.sleep(0.05)
