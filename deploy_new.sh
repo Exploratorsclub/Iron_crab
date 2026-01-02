@@ -17,6 +17,25 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+ensure_cargo() {
+    if command -v cargo >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Non-interactive shells often don't load Rust env. Try to load it.
+    if [ -f "$HOME/.cargo/env" ]; then
+        # shellcheck disable=SC1090
+        source "$HOME/.cargo/env"
+    fi
+
+    export PATH="$HOME/.cargo/bin:$PATH"
+
+    if ! command -v cargo >/dev/null 2>&1; then
+        log_error "cargo not found in PATH. Install Rust or source ~/.cargo/env"
+        exit 1
+    fi
+}
+
 SKIP_BUILD=false
 COMPONENT=""
 
@@ -43,6 +62,8 @@ git pull origin architecture-rebuild
 # -----------------------------------------------------------------------------
 if [ "$SKIP_BUILD" = false ]; then
     log_info "Building release binaries (this may take a few minutes)..."
+
+    ensure_cargo
     
     # Build all binaries with nats feature
     cargo build --release --features nats \
