@@ -225,7 +225,7 @@ Status snapshot (2026-01-02):
   - Acceptance:
     - No Pubkey::default placeholders remain in production tx building.
 
-- [ ] **RS-7.3 – Orca support**
+- [x] **RS-7.3 – Orca support**
 
 - [ ] **RS-7.4 – Jito bundle path for `require_bundle=true` intents**
 

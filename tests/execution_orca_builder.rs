@@ -21,22 +21,17 @@ async fn test_orca_build_swap_ix_pure_derivation_with_inserted_whirlpool() {
     let mint_b = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
 
     // Any syntactically valid token accounts are fine for this pure-derivation test.
-    let user_ata_a = Pubkey::from_str("7YxQ2Qv2m9VvSxg4pU2t3kHhZ2zKqQGd8mGkqk9mP7dU")
-        .expect("ata a");
-    let user_ata_b = Pubkey::from_str("9pCw8k7k3yQkQW5t7zT6qV7oCwq8jY3h3Ck8b7m4q2pV")
-        .expect("ata b");
+    let user_ata_a = Pubkey::new_unique();
+    let user_ata_b = Pubkey::new_unique();
     orca.set_user_token_account(mint_a, user_ata_a);
     orca.set_user_token_account(mint_b, user_ata_b);
 
-    let whirlpool_id = Pubkey::from_str("2uZ7F4b8m8m7DqgkP2hRrWQdJc6y6sQq3z5xv5aQ8p1K")
-        .expect("whirlpool id");
+    let whirlpool_id = Pubkey::new_unique();
     let parsed = WhirlpoolParsed {
         token_mint_a: mint_a,
         token_mint_b: mint_b,
-        token_vault_a: Pubkey::from_str("6u6KQm8qKq3Dqk2gqk3Dqk2gqk3Dqk2gqk3Dqk2gqk3D")
-            .expect("vault a"),
-        token_vault_b: Pubkey::from_str("5v5KQm8qKq3Dqk2gqk3Dqk2gqk3Dqk2gqk3Dqk2gqk3D")
-            .expect("vault b"),
+        token_vault_a: Pubkey::new_unique(),
+        token_vault_b: Pubkey::new_unique(),
         fee_rate: 300,
         protocol_fee_rate: 0,
         tick_spacing: 64,
