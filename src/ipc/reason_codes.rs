@@ -66,6 +66,8 @@ pub enum RejectReason {
     KillSwitchActive,
     /// Internal error
     InternalError,
+    /// Transaction submission (sendTransaction) failed
+    SendFailed,
     /// Unknown reason (should not happen)
     Unknown,
 
@@ -130,6 +132,7 @@ impl RejectReason {
             Self::UnsupportedIntent => "UNSUPPORTED_INTENT",
             Self::KillSwitchActive => "KILL_SWITCH_ACTIVE",
             Self::InternalError => "INTERNAL_ERROR",
+            Self::SendFailed => "SEND_FAILED",
             Self::Unknown => "UNKNOWN",
             Self::BundleFailed => "BUNDLE_FAILED",
             Self::BundleTimeout => "BUNDLE_TIMEOUT",
@@ -172,6 +175,7 @@ impl RejectReason {
             "UNSUPPORTED_INTENT" => Self::UnsupportedIntent,
             "KILL_SWITCH_ACTIVE" => Self::KillSwitchActive,
             "INTERNAL_ERROR" => Self::InternalError,
+            "SEND_FAILED" => Self::SendFailed,
             "BUNDLE_FAILED" => Self::BundleFailed,
             "BUNDLE_TIMEOUT" => Self::BundleTimeout,
             "BUNDLE_NOT_CONFIGURED" => Self::BundleNotConfigured,

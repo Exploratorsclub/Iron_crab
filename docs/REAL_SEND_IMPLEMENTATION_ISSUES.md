@@ -141,7 +141,7 @@ Status snapshot (2026-01-02):
 
 ## RS-4 — Real Send + Confirm (RPC path)
 
-- [ ] **RS-4.1 – Implement real sendTransaction (RPC) and capture real signature**
+- [x] **RS-4.1 – Implement real sendTransaction (RPC) and capture real signature**
   - Scope:
     - After successful simulation: send tx via RPC.
     - Record returned signature into `SendResult.signature`.
@@ -153,7 +153,7 @@ Status snapshot (2026-01-02):
   - Verify:
     - `cargo test -q --test ipc_schema_roundtrip` (WSL2/Linux)
 
-- [ ] **RS-4.2 – Confirmation: `getSignatureStatuses` polling + outcome mapping**
+- [x] **RS-4.2 – Confirmation: `getSignatureStatuses` polling + outcome mapping**
   - Scope:
     - Poll for confirmation with timeout.
     - Map to `DecisionOutcome`:

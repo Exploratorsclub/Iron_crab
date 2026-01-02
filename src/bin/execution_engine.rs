@@ -25,14 +25,17 @@
 use anyhow::Result;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use solana_client::rpc_config::RpcSimulateTransactionConfig;
+use solana_client::rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
+use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -133,6 +136,9 @@ struct ExecutionConfig {
     /// Simulation timeout (ms)
     simulation_timeout_ms: u64,
 
+    /// Confirmation timeout (ms) for RPC send path
+    confirmation_timeout_ms: u64,
+
     /// Whether to actually send transactions
     send_enabled: bool,
 
@@ -168,6 +174,7 @@ impl Default for ExecutionConfig {
             max_slippage_bps: 500,                   // max 5% slippage allowed
             // Operational
             simulation_timeout_ms: 2000,
+            confirmation_timeout_ms: 30_000,
             send_enabled: false, // Default: simulate only
             // P1: Jito Bundle defaults
             jito_enabled: false,
@@ -310,6 +317,8 @@ impl StateSnapshot {
 struct ExecutionContext {
     run_id: String,
     wallet_pubkey: Option<Pubkey>,
+    /// The ONLY signer (Single-Signer rule). None means keyless mode.
+    treasury: Option<Treasury>,
     /// Hot-reloadable configuration (RwLock for runtime updates via NATS)
     config: parking_lot::RwLock<ExecutionConfig>,
     config_snapshot_id: parking_lot::RwLock<String>,
@@ -427,6 +436,19 @@ impl ExecutionContext {
                             info!(key = %key, new_value = %v, "Config updated");
                         } else {
                             rejected.push((key.clone(), "Must be 100-30000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "confirmation_timeout_ms" => {
+                    if let Some(v) = value.as_u64() {
+                        if v >= 500 && v <= 300_000 {
+                            config.confirmation_timeout_ms = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 500-300000".to_string()));
                         }
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
@@ -799,6 +821,7 @@ async fn main() -> Result<()> {
     let ctx = Arc::new(ExecutionContext {
         run_id: run_id.clone(),
         wallet_pubkey,
+        treasury,
         config_snapshot_id: parking_lot::RwLock::new(exec_config.snapshot_id()),
         config: parking_lot::RwLock::new(exec_config),
         nats,
@@ -1764,36 +1787,64 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     let mut bundle_id: Option<String> = None;
     let mut send_signature: Option<String> = None;
     let mut sent_anything = false;
+    let mut send_failed = false;
 
     // === Send (if enabled) ===
     if config.send_enabled {
-        // NOTE: As of now, the send path is still an MVP stub.
-        // We must not emit fake signatures or claim "Sent".
-        checks.push(CheckResult {
-            check_name: "send".to_string(),
-            passed: false,
-            reason_code: Some("send_not_implemented".to_string()),
-            details: Some(
-                "execution-engine send path is MVP stub (no on-chain submission); configure/implement real tx build+send before enabling".to_string(),
-            ),
-        });
-
-        // This is a policy rejection: simulation succeeded, but execution is not available.
-        ctx.record_intent_rejected();
-        INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-
-        // Keep a small hint for future implementation paths.
         if requires_bundle {
-            info!(intent_id = %intent.intent_id, "Send requested via Jito bundle, but not implemented");
+            // RS-4.1 scope is the RPC path; keep bundle submission explicit until Jito path is implemented.
+            checks.push(CheckResult {
+                check_name: "send".to_string(),
+                passed: false,
+                reason_code: Some("bundle_send_not_implemented".to_string()),
+                details: Some(
+                    "Intent requires atomic bundle; RPC send path implemented, bundle path not yet implemented".to_string(),
+                ),
+            });
+
+            // Policy rejection: simulation succeeded, but execution is not available.
+            ctx.record_intent_rejected();
+            INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            info!(intent_id = %intent.intent_id, "Bundle send requested, but not implemented");
         } else {
-            info!(intent_id = %intent.intent_id, "Send requested, but not implemented");
+            match send_transaction_rpc(ctx, wallet_pubkey, &tx_plan).await {
+                Ok(sig_str) => {
+                    sent_anything = true;
+                    send_signature = Some(sig_str.clone());
+                    checks.push(CheckResult {
+                        check_name: "send".to_string(),
+                        passed: true,
+                        reason_code: None,
+                        details: Some(format!("signature={sig_str}")),
+                    });
+                    info!(intent_id = %intent.intent_id, signature = %sig_str, "Transaction submitted via RPC");
+                }
+                Err(err_msg) => {
+                    send_failed = true;
+                    let reason = RejectReason::SendFailed;
+                    checks.push(CheckResult {
+                        check_name: "send".to_string(),
+                        passed: false,
+                        reason_code: Some(reason.to_string()),
+                        details: Some(err_msg.clone()),
+                    });
+
+                    // Reject: do NOT claim Sent without a real signature.
+                    ctx.record_intent_rejected();
+                    INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    warn!(intent_id = %intent.intent_id, error = %err_msg, "sendTransaction failed");
+                }
+            }
         }
     } else {
         debug!(intent_id = %intent.intent_id, "Transaction sending disabled");
     }
 
     // Mark as processed
-    ctx.lock_manager.mark_processed(&intent.intent_id);
+    // If sendTransaction failed, do NOT mark processed (allow retry).
+    if !(config.send_enabled && send_failed) {
+        ctx.lock_manager.mark_processed(&intent.intent_id);
+    }
 
     // Build SendResult if we sent something
     let send_result = if sent_anything && (bundle_id.is_some() || send_signature.is_some()) {
@@ -1805,6 +1856,60 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     } else {
         None
     };
+
+    // === Confirm (RS-4.2) ===
+    // Only for the RPC send path (non-bundle) when we have a real signature.
+    let mut final_outcome = if config.send_enabled && sent_anything {
+        DecisionOutcome::Sent
+    } else {
+        DecisionOutcome::Rejected
+    };
+
+    if config.send_enabled && sent_anything {
+        if let Some(ref sr) = send_result {
+            if let Some(ref sig_str) = sr.signature {
+                match confirm_signature_status(ctx, sig_str, config.confirmation_timeout_ms).await {
+                    Ok(ConfirmOutcome::Confirmed { details }) => {
+                        checks.push(CheckResult {
+                            check_name: "confirm".to_string(),
+                            passed: true,
+                            reason_code: None,
+                            details: Some(details),
+                        });
+                        final_outcome = DecisionOutcome::Confirmed;
+                    }
+                    Ok(ConfirmOutcome::FailedConfirmed { details }) => {
+                        checks.push(CheckResult {
+                            check_name: "confirm".to_string(),
+                            passed: false,
+                            reason_code: Some("confirmed_err".to_string()),
+                            details: Some(details),
+                        });
+                        final_outcome = DecisionOutcome::FailedConfirmed;
+                    }
+                    Ok(ConfirmOutcome::TimeoutSent { details }) => {
+                        checks.push(CheckResult {
+                            check_name: "confirm".to_string(),
+                            passed: false,
+                            reason_code: Some("confirm_timeout".to_string()),
+                            details: Some(details),
+                        });
+                        final_outcome = DecisionOutcome::Sent;
+                    }
+                    Err(e) => {
+                        // Ambiguous confirmation: keep outcome at Sent, but record details.
+                        checks.push(CheckResult {
+                            check_name: "confirm".to_string(),
+                            passed: false,
+                            reason_code: Some("confirm_rpc_error".to_string()),
+                            details: Some(e),
+                        });
+                        final_outcome = DecisionOutcome::Sent;
+                    }
+                }
+            }
+        }
+    }
 
     // Emit decision record
     let decision = if config.send_enabled && sent_anything {
@@ -1824,7 +1929,28 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             plan_hash,
             simulate: Some(sim_result),
             send: send_result,
-            outcome: DecisionOutcome::Sent,
+            outcome: final_outcome,
+            config_snapshot_id: None,
+            input_snapshots: std::collections::HashMap::new(),
+        }
+    } else if config.send_enabled && send_failed {
+        DecisionRecord {
+            header: ironcrab::ipc::RecordHeader::new(
+                "execution-engine",
+                BUILD_VERSION,
+                &ctx.run_id,
+            ),
+            decision_id: decision_id.clone(),
+            intent_id: intent.intent_id.clone(),
+            source: intent.source.clone(),
+            origin_type: intent.origin_type,
+            regime: intent.regime,
+            checks,
+            primary_reject_reason: Some(RejectReason::SendFailed.to_string()),
+            plan_hash,
+            simulate: Some(sim_result),
+            send: None,
+            outcome: DecisionOutcome::Rejected,
             config_snapshot_id: None,
             input_snapshots: std::collections::HashMap::new(),
         }
@@ -2050,5 +2176,136 @@ async fn simulate_transaction(
             logs_preview: None,
             compute_units_consumed: None,
         },
+    }
+}
+
+/// Real RPC send (RS-4.1).
+///
+/// Notes:
+/// - Only called after successful simulation (simulate-gated).
+/// - Builds and SIGNS using the single-signer `Treasury`.
+/// - Uses `skip_preflight=true` (we already simulated).
+async fn send_transaction_rpc(
+    ctx: &ExecutionContext,
+    wallet_pubkey: Pubkey,
+    plan: &tx_builder::TxPlan,
+) -> std::result::Result<String, String> {
+    let treasury = ctx
+        .treasury
+        .as_ref()
+        .ok_or_else(|| "no_signer_configured".to_string())?;
+
+    let signer: &dyn Signer = treasury.signer_ref();
+    let blockhash = ctx
+        .rpc
+        .get_latest_blockhash_retry()
+        .await
+        .map_err(|e| format!("rpc_error:{e}"))?;
+
+    let tx = Transaction::new_signed_with_payer(
+        &plan.instructions,
+        Some(&wallet_pubkey),
+        &[signer],
+        blockhash,
+    );
+
+    let config = RpcSendTransactionConfig {
+        skip_preflight: true,
+        preflight_commitment: None,
+        encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+        max_retries: None,
+        min_context_slot: None,
+    };
+
+    ctx.rpc
+        .rpc
+        .send_transaction_with_config(&tx, config)
+        .await
+        .map(|sig| sig.to_string())
+        .map_err(|e| format!("rpc_error:{e}"))
+}
+
+enum ConfirmOutcome {
+    Confirmed { details: String },
+    FailedConfirmed { details: String },
+    TimeoutSent { details: String },
+}
+
+/// Confirmation polling (RS-4.2).
+///
+/// Maps outcome per roadmap:
+/// - confirmed => Confirmed
+/// - status err => FailedConfirmed
+/// - timeout/ambiguous => Sent (TimeoutSent)
+async fn confirm_signature_status(
+    ctx: &ExecutionContext,
+    signature_base58: &str,
+    timeout_ms: u64,
+) -> std::result::Result<ConfirmOutcome, String> {
+    let signature = Signature::from_str(signature_base58)
+        .map_err(|e| format!("invalid_signature:{e}"))?;
+
+    let start = std::time::Instant::now();
+    let deadline = Duration::from_millis(timeout_ms.max(1));
+    let mut attempt: u32 = 0;
+
+    loop {
+        if start.elapsed() >= deadline {
+            return Ok(ConfirmOutcome::TimeoutSent {
+                details: format!("timeout_ms={timeout_ms} elapsed_ms={} signature={signature_base58}", start.elapsed().as_millis()),
+            });
+        }
+
+        // Poll signature status
+        let res = ctx
+            .rpc
+            .rpc
+            .get_signature_statuses(&[signature])
+            .await
+            .map_err(|e| format!("rpc_error:{e}"))?;
+
+        let status_opt = res
+            .value
+            .get(0)
+            .cloned()
+            .unwrap_or(None);
+
+        if let Some(st) = status_opt {
+            if let Some(err) = st.err {
+                return Ok(ConfirmOutcome::FailedConfirmed {
+                    details: format!(
+                        "err={err:?} confirmations={:?} confirmation_status={:?} elapsed_ms={}",
+                        st.confirmations,
+                        st.confirmation_status,
+                        start.elapsed().as_millis()
+                    ),
+                });
+            }
+
+            // Treat Confirmed or Finalized as confirmed.
+            // Some RPCs return confirmations=None when rooted/finalized.
+            let is_confirmed = match st.confirmation_status {
+                Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed)
+                | Some(solana_transaction_status::TransactionConfirmationStatus::Finalized) => true,
+                Some(solana_transaction_status::TransactionConfirmationStatus::Processed) => false,
+                None => st.confirmations.is_none(),
+            };
+
+            if is_confirmed {
+                return Ok(ConfirmOutcome::Confirmed {
+                    details: format!(
+                        "confirmations={:?} confirmation_status={:?} elapsed_ms={}",
+                        st.confirmations,
+                        st.confirmation_status,
+                        start.elapsed().as_millis()
+                    ),
+                });
+            }
+        }
+
+        // Backoff: small, bounded.
+        attempt = attempt.saturating_add(1);
+        let sleep_ms = (50u64 * attempt.min(20) as u64).min(1_000);
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
     }
 }
