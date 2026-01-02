@@ -49,21 +49,36 @@ pub async fn build_tx_plan(
     wallet_pubkey: Pubkey,
     rpc: Arc<SolanaRpc>,
 ) -> TxPlanOutcome {
-    if intent.side != TradeSide::Buy {
-        return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-            reason: RejectReason::UnsupportedIntent,
-            details: format!("side={:?} (only Buy supported)", intent.side),
-        });
-    }
+    match intent.side {
+        TradeSide::Buy => {
+            if intent.resources.input_mint != SOL_MINT {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!(
+                        "input_mint={} (only SOL mint supported for Buy)",
+                        intent.resources.input_mint
+                    ),
+                });
+            }
+        }
+        TradeSide::Sell => {
+            if intent.resources.output_mint != SOL_MINT {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!(
+                        "output_mint={} (only SOL mint supported for Sell)",
+                        intent.resources.output_mint
+                    ),
+                });
+            }
 
-    if intent.resources.input_mint != SOL_MINT {
-        return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-            reason: RejectReason::UnsupportedIntent,
-            details: format!(
-                "input_mint={} (only SOL mint supported)",
-                intent.resources.input_mint
-            ),
-        });
+            if intent.resources.input_mint == SOL_MINT {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: "input_mint=SOL (Sell expects token->SOL)".to_string(),
+                });
+            }
+        }
     }
 
     if intent.resources.pools.len() != 1 {
@@ -95,8 +110,9 @@ pub async fn build_tx_plan(
         }
     };
 
-    // For BUY, pump.fun expects `min_out` = desired token amount.
-    // Strategy must provide it (raw base units of output mint).
+    // For BUY, pump.fun expects `min_out` = desired token amount (raw base units of output mint).
+    // For SELL, pump.fun expects `min_out` = minimum SOL output (lamports).
+    // Strategy must provide it via `metadata.min_out_raw` for deterministic planning.
     let min_out_raw = match intent.metadata.get("min_out_raw") {
         Some(v) => v,
         None => {
@@ -118,7 +134,7 @@ pub async fn build_tx_plan(
         }
     };
 
-    // Currently we only implement a Pump.fun BUY plan (single pool SOL->token).
+    // Currently we implement Pump.fun BUY (SOL->token) and SELL (token->SOL) plans.
     let mut pumpfun = match PumpFunDex::new(rpc) {
         Ok(d) => d,
         Err(e) => {

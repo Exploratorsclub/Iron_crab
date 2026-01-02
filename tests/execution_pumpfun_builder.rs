@@ -1,5 +1,6 @@
 use ironcrab::solana::dex::pumpfun::PumpFunDex;
 use ironcrab::solana::rpc::SolanaRpc;
+use ironcrab::{execution::tx_builder, ipc};
 use solana_sdk::instruction::AccountMeta;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
@@ -61,4 +62,72 @@ async fn test_pumpfun_build_buy_ix_pure_derivation() {
 
     // Keep AccountMeta imported to avoid unused import warning changes across Solana versions.
     let _ = AccountMeta::new_readonly(Pubkey::default(), false);
+}
+
+#[tokio::test]
+async fn test_tx_builder_supports_pumpfun_sell_pure_derivation() {
+    // This test asserts the deterministic TxBuilder supports Pump.fun SELL intents.
+    // It must be pure-derivation (no network required), relying only on PDA + ATA derivations.
+
+    let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:8899"));
+
+    let wallet = Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM")
+        .expect("wallet pubkey");
+
+    let creator = "2tFqgkJX6kqz8q6o9tFv3oJ9nQx7n1m3fHk2m8f3oKpZ";
+    let token_mint = "9xQeWvG816bUx9EPfKJb9N9dKz5wW7Yy2hBzXv4mQ4kG";
+    let sol_mint = "So11111111111111111111111111111111111111112";
+
+    let mut intent = ipc::TradeIntent::new(
+        "test",
+        "test",
+        "test",
+        "intent-sell-derivation".to_string(),
+        "test",
+        ipc::IntentTier::Tier1,
+        ipc::IntentOrigin::StrategyA,
+        ipc::ExplicitAmount::new(1_000_000, 6), // 1.0 token (arbitrary decimals)
+        ipc::TradeResources {
+            input_mint: token_mint.to_string(),
+            output_mint: sol_mint.to_string(),
+            pools: vec!["pumpfun".to_string()],
+            accounts: vec![],
+        },
+        0,
+        500,
+        ipc::TradeSide::Sell,
+        ipc::TradingRegime::NotApplicable,
+    );
+
+    intent
+        .metadata
+        .insert("creator".to_string(), creator.to_string());
+    intent
+        .metadata
+        .insert("min_out_raw".to_string(), "1".to_string()); // 1 lamport min SOL out
+
+    let plan = match tx_builder::build_tx_plan(&intent, wallet, Arc::clone(&rpc)).await {
+        tx_builder::TxPlanOutcome::Planned(p) => p,
+        tx_builder::TxPlanOutcome::Unsupported(u) => {
+            panic!("unexpected unsupported plan: {:?} - {}", u.reason, u.details)
+        }
+    };
+
+    assert_eq!(plan.instructions.len(), 1, "expected exactly one instruction");
+
+    let ix = &plan.instructions[0];
+    assert_eq!(
+        ix.program_id,
+        Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+            .expect("pumpfun program id"),
+        "program_id must be pump.fun"
+    );
+
+    // The SELL ix uses AccountMeta::new(user, true) at index 6.
+    let user_meta = ix.accounts.get(6).expect("user meta index 6");
+    assert_eq!(user_meta.pubkey, wallet);
+    assert!(user_meta.is_signer);
+    assert!(user_meta.is_writable);
+
+    assert!(!ix.data.is_empty(), "instruction data must not be empty");
 }

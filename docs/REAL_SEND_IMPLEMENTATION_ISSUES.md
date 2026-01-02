@@ -212,7 +212,7 @@ Status snapshot (2026-01-02):
 
 ## RS-7 — Post-MVP extensions (only after RS-4 is proven)
 
-- [ ] **RS-7.1 – Support SELL intents (Pump.fun)**
+- [x] **RS-7.1 – Support SELL intents (Pump.fun)**
   - Acceptance:
     - Real signature + confirmation for sell path.
   - Pre-work already landed (dry-run safe, no send yet):
