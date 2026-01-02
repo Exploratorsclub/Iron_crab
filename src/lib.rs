@@ -3,6 +3,7 @@ pub mod backtest;
 pub mod config;
 pub mod config_reload;
 pub mod engine;
+pub mod execution;
 pub mod ipc;
 pub mod log_manager;
 pub mod metrics;

@@ -55,6 +55,7 @@ use ironcrab::storage::{
     JsonlWriter, JsonlWriterConfig,
 };
 use ironcrab::wallet::Treasury;
+use ironcrab::execution::tx_builder;
 
 /// NATS topic for config reload commands from control-plane
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
@@ -1574,6 +1575,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     let is_cross_dex_arb = CrossDexHandler::is_cross_dex_arb_intent(&intent);
     let mut cross_dex_validation = None;
 
+    // Planned tx (RS-2.1): deterministic tx plan + plan_hash
+    let mut plan_hash: Option<String> = None;
+
     if is_cross_dex_arb {
         info!(intent_id = %intent.intent_id, "Processing as Cross-DEX arbitrage intent");
 
@@ -1646,6 +1650,57 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             ctx.lock_manager.release_locks(&intent.intent_id);
             return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
         }
+    }
+
+    // === Plan (RS-2.1) ===
+    // Important: to avoid breaking current dry-run/dev workflows, we only *enforce* planning
+    // when send is enabled. Once real simulation+send is implemented, planning will become
+    // mandatory for all paths.
+    if config.send_enabled {
+        info!(intent_id = %intent.intent_id, "Building tx plan");
+        let wallet_pubkey = match ctx.wallet_pubkey {
+            Some(pk) => pk,
+            None => {
+                let reason = RejectReason::InternalError;
+                checks.push(CheckResult {
+                    check_name: "tx_plan".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some("wallet_pubkey_unavailable (keys not loaded)".to_string()),
+                });
+                ctx.lock_manager.release_locks(&intent.intent_id);
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+        };
+
+        match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc)).await {
+            tx_builder::TxPlanOutcome::Planned(plan) => {
+                plan_hash = Some(plan.hash_string());
+                checks.push(CheckResult {
+                    check_name: "tx_plan".to_string(),
+                    passed: true,
+                    reason_code: None,
+                    details: Some(format!("ix_count={} plan_hash={}", plan.instructions.len(), plan_hash.as_deref().unwrap_or(""))),
+                });
+            }
+            tx_builder::TxPlanOutcome::Unsupported(u) => {
+                checks.push(CheckResult {
+                    check_name: "tx_plan".to_string(),
+                    passed: false,
+                    reason_code: Some(u.reason.to_string()),
+                    details: Some(u.details),
+                });
+                ctx.lock_manager.release_locks(&intent.intent_id);
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, u.reason).await;
+            }
+        }
+    } else {
+        checks.push(CheckResult {
+            check_name: "tx_plan".to_string(),
+            passed: true,
+            reason_code: None,
+            details: Some("skipped (send_enabled=false)".to_string()),
+        });
     }
 
     // === Simulate (P0: simulate-gated) ===
@@ -1755,7 +1810,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             regime: intent.regime,
             checks,
             primary_reject_reason: None,
-            plan_hash: Some(format!("plan-{}", Uuid::new_v4())),
+            plan_hash,
             simulate: Some(sim_result),
             send: send_result,
             outcome: DecisionOutcome::Sent,
@@ -1778,7 +1833,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             regime: intent.regime,
             checks,
             primary_reject_reason: Some("send_not_implemented".to_string()),
-            plan_hash: Some(format!("plan-{}", Uuid::new_v4())),
+            plan_hash,
             simulate: Some(sim_result),
             send: None,
             outcome: DecisionOutcome::Rejected,
@@ -1813,7 +1868,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             regime: intent.regime,
             checks,
             primary_reject_reason: Some("send_disabled".to_string()),
-            plan_hash: Some(format!("plan-{}", Uuid::new_v4())),
+            plan_hash,
             simulate: Some(sim_result),
             send: None,
             outcome: DecisionOutcome::Rejected,

@@ -29,6 +29,9 @@ Status snapshot (2026-01-02):
   - Scope: make sure the developer workflow can compile + run tests reliably.
   - Acceptance:
     - `cargo test --test ipc_schema_roundtrip` runs successfully in WSL2.
+  - Notes (current):
+    - ✅ Verified on Linux server: `source ~/.cargo/env; cargo test --test ipc_schema_roundtrip`.
+    - ⏳ WSL2 loop still pending (Windows-native remains unsupported).
   - How:
     - Follow `docs/LOCAL_SETUP.md` section “Recommended: Build via WSL2”.
 
@@ -49,7 +52,7 @@ Status snapshot (2026-01-02):
 
 ## RS-1 — Plumbing: RPC + Signer integration (no send yet)
 
-- [ ] **RS-1.1 – Use `SolanaRpc` inside execution-engine**
+- [x] **RS-1.1 – Use `SolanaRpc` inside execution-engine**
   - Scope:
     - Replace blocking `solana_client::rpc_client::RpcClient` usage with `crate::solana::rpc::SolanaRpc` (nonblocking, retry/limiter).
     - Keep config-driven `rpc_url/ws_url`.
@@ -62,7 +65,7 @@ Status snapshot (2026-01-02):
   - Verify:
     - `cargo test -q --test ipc_schema_roundtrip` (WSL2/Linux)
 
-- [ ] **RS-1.2 – Centralize key loading via `Treasury` (single-signer hardening)**
+- [x] **RS-1.2 – Centralize key loading via `Treasury` (single-signer hardening)**
   - Scope:
     - Replace local key loader in execution-engine with the canonical wallet loader (`src/wallet.rs` / `Treasury::load_from_env()` if available).
     - Preserve current env var names and server unit configuration.
@@ -96,6 +99,10 @@ Status snapshot (2026-01-02):
     - `src/bin/execution_engine.rs`
   - Verify:
     - `cargo test -q --test ipc_schema_roundtrip` (WSL2/Linux)
+  - Notes (current):
+    - Implemented `ironcrab::execution::tx_builder` and wired a `tx_plan` check into execution-engine.
+    - Planning is currently enforced only when `send_enabled=true` to avoid breaking dry-run workflows.
+    - Pump.fun BUY planning currently requires `metadata.creator` and `metadata.min_out_raw` (raw u64).
 
 - [ ] **RS-2.2 – Pump.fun adapter: build BUY ix for a provided user authority**
   - Scope:

@@ -58,6 +58,9 @@ pub enum RejectReason {
     /// Invalid intent fields
     InvalidIntent,
 
+    /// Intent is syntactically valid, but not supported by the current execution planner
+    UnsupportedIntent,
+
     // === System ===
     /// Kill switch activated
     KillSwitchActive,
@@ -124,6 +127,7 @@ impl RejectReason {
             Self::PoolNotFound => "POOL_NOT_FOUND",
             Self::QuoteUnavailable => "QUOTE_UNAVAILABLE",
             Self::InvalidIntent => "INVALID_INTENT",
+            Self::UnsupportedIntent => "UNSUPPORTED_INTENT",
             Self::KillSwitchActive => "KILL_SWITCH_ACTIVE",
             Self::InternalError => "INTERNAL_ERROR",
             Self::Unknown => "UNKNOWN",
@@ -165,6 +169,7 @@ impl RejectReason {
             "POOL_NOT_FOUND" => Self::PoolNotFound,
             "QUOTE_UNAVAILABLE" => Self::QuoteUnavailable,
             "INVALID_INTENT" => Self::InvalidIntent,
+            "UNSUPPORTED_INTENT" => Self::UnsupportedIntent,
             "KILL_SWITCH_ACTIVE" => Self::KillSwitchActive,
             "INTERNAL_ERROR" => Self::InternalError,
             "BUNDLE_FAILED" => Self::BundleFailed,
