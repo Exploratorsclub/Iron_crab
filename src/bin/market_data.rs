@@ -33,7 +33,7 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
 use ironcrab::solana::dex_parser::{
-    parse_account_update, parse_transaction_update, ParsedDexEvent,
+    parse_account_update, parse_transaction_update, DexType, ParsedDexEvent,
 };
 use ironcrab::solana::wallet_tracker::WalletTracker;
 
