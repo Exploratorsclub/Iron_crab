@@ -2296,20 +2296,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             DecisionOutcome::Confirmed => ExecutionStatus::Confirmed,
             DecisionOutcome::FailedConfirmed => ExecutionStatus::Failed,
             DecisionOutcome::Sent => ExecutionStatus::Sent,
-            DecisionOutcome::Rejected => {
-                // If we tried to send and it failed, treat as failed; otherwise omit.
-                if send_failed {
-                    ExecutionStatus::Failed
-                } else {
-                    // No on-chain attempt => not an execution result.
-                    // (Strategy plane will time out pending intents.)
-                    // We skip emitting.
-                    // NOTE: keep below block in sync with early returns.
-                    //
-                    // Return early by using a sentinel.
-                    ExecutionStatus::Failed
-                }
-            }
+            // These outcomes imply there was no successful on-chain confirmation.
+            // Whether we emit is controlled by `should_emit` below.
+            DecisionOutcome::Rejected | DecisionOutcome::SimFailed => ExecutionStatus::Failed,
+            DecisionOutcome::Expired => ExecutionStatus::Timeout,
         };
 
         let should_emit = sent_anything || send_failed;

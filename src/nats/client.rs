@@ -14,7 +14,6 @@ use tracing::warn;
 
 #[cfg(feature = "nats")]
 use tracing::{error, info};
-use tracing::debug;
 
 #[cfg(feature = "nats")]
 use async_nats;
@@ -239,7 +238,7 @@ impl NatsClient {
         let json = serde_json::to_vec(msg)?;
 
         // Stub: just log and count
-        debug!(topic, bytes = json.len(), "NATS publish (stub)");
+        tracing::debug!(topic, bytes = json.len(), "NATS publish (stub)");
 
         self.messages_published
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -266,7 +265,7 @@ impl NatsClient {
             anyhow::bail!("NATS not connected");
         }
 
-        debug!(topic, "NATS subscribe (stub)");
+        tracing::debug!(topic, "NATS subscribe (stub)");
         Ok(NatsSubscription {
             topic: topic.to_string(),
         })
