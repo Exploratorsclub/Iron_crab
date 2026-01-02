@@ -7,16 +7,19 @@ use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::wallet::Treasury;
 use solana_client::rpc_request::TokenAccountsFilter;
+use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_sdk::bs58;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::Transaction;
 use solana_sdk::transaction::VersionedTransaction;
+use solana_transaction_status::UiTransactionEncoding;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{info, warn};
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -252,23 +255,55 @@ async fn try_sell_jupiter(
         }
     };
 
-    let wire = match bincode::serialize(&signed) {
-        Ok(w) => w,
+    let config = RpcSendTransactionConfig {
+        skip_preflight: true,
+        preflight_commitment: None,
+        encoding: Some(UiTransactionEncoding::Base64),
+        max_retries: None,
+        min_context_slot: None,
+    };
+
+    let sig = match rpc.rpc.send_transaction_with_config(&signed, config).await {
+        Ok(sig) => sig,
         Err(e) => {
-            warn!("Jupiter tx bincode serialize failed for {}: {:?}", mint, e);
+            warn!("Jupiter TX send failed for {}: {:?}", mint, e);
             return false;
         }
     };
 
-    match rpc.rpc.send_and_confirm_raw_transaction(&wire).await {
-        Ok(sig) => {
-            info!("✅ Sold {} via Jupiter! Sig: {}", mint, sig);
-            true
+    // Confirm via signature statuses (best-effort, bounded wait).
+    let start = Instant::now();
+    loop {
+        if start.elapsed().as_secs() > 45 {
+            warn!("Jupiter TX confirmation timeout for {}: {}", mint, sig);
+            return false;
         }
-        Err(e) => {
-            warn!("Jupiter TX failed for {}: {:?}", mint, e);
-            false
+
+        match rpc.get_signature_statuses_retry(&[sig]).await {
+            Ok(resp) => {
+                if let Some(st) = resp.value.get(0).and_then(|v| v.as_ref()) {
+                    if st.err.is_some() {
+                        warn!("Jupiter TX confirmed with error for {}: {}", mint, sig);
+                        return false;
+                    }
+                    if matches!(
+                        st.confirmation_status,
+                        Some(
+                            solana_transaction_status::TransactionConfirmationStatus::Confirmed
+                                | solana_transaction_status::TransactionConfirmationStatus::Finalized
+                        )
+                    ) {
+                        info!("✅ Sold {} via Jupiter! Sig: {}", mint, sig);
+                        return true;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Jupiter TX status check failed for {}: {:?}", mint, e);
+            }
         }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 
