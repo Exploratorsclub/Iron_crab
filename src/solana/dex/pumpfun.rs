@@ -15,6 +15,26 @@ use tracing::{debug, info, warn};
 use super::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 
+fn prog_pubkey_to_sdk(pk: spl_token::solana_program::pubkey::Pubkey) -> Pubkey {
+    Pubkey::new_from_array(pk.to_bytes())
+}
+
+fn prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> Instruction {
+    Instruction {
+        program_id: prog_pubkey_to_sdk(ix.program_id),
+        accounts: ix
+            .accounts
+            .into_iter()
+            .map(|m| AccountMeta {
+                pubkey: prog_pubkey_to_sdk(m.pubkey),
+                is_signer: m.is_signer,
+                is_writable: m.is_writable,
+            })
+            .collect(),
+        data: ix.data,
+    }
+}
+
 /// System Program ID
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 
@@ -938,7 +958,19 @@ impl PumpFunDex {
             )?
         };
 
-        Ok(vec![ix])
+        // Pump.fun program expects the user's ATA ("associated_user") to be initialized.
+        // Without this, simulation fails with AnchorError AccountNotInitialized (3012).
+        // We prepend an idempotent ATA creation instruction; it's safe if ATA already exists.
+        let create_ata_ix_prog =
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &user_spl,      // payer
+                &user_spl,      // owner
+                &token_mint_spl,
+                &token_program, // Pump.fun uses standard SPL Token program
+            );
+        let create_ata_ix = prog_ix_to_sdk(create_ata_ix_prog);
+
+        Ok(vec![create_ata_ix, ix])
     }
 }
 
