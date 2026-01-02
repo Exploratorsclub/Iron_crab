@@ -42,19 +42,22 @@ use uuid::Uuid;
 
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
-    DecisionRecord, FairnessPolicy, FeePolicy, IntentOrigin, RejectReason, SimulationResult,
-    TradeIntent, TradeSide, TradingRegime,
+    DecisionRecord, ExecutionResult, ExecutionStatus, FairnessPolicy, FeePolicy, IntentOrigin,
+    RejectReason, SimulationResult, TradeIntent, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    serve_metrics, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS,
-    INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, REJECT_CAPITAL_LOCK,
-    REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_SIMULATION_FAIL,
-    SIMULATION_FAILURES_TOTAL, REJECT_SEND_FAILED, TX_CONFIRMED_TOTAL,
+    record_recent_trade, serve_metrics, RecentTrade, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS,
+    AVAILABLE_SOL_LAMPORTS, INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
+    NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE,
+    REJECT_RESOURCE_LOCK, REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, REJECT_SEND_FAILED,
+    TX_CONFIRMED_TOTAL,
     TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_SUCCESS_TOTAL,
     JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL,
     JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL,
 };
-use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_TRADE_INTENTS};
+use ironcrab::nats::{
+    NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS,
+};
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
 use ironcrab::solana::rpc::SolanaRpc;
@@ -626,8 +629,25 @@ impl ExecutionContext {
 
     /// Decrement open positions
     fn decrement_open_positions(&self) {
-        self.open_positions
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        // Saturating decrement to avoid underflow.
+        let mut current = self
+            .open_positions
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        loop {
+            if current == 0 {
+                return;
+            }
+            match self.open_positions.compare_exchange_weak(
+                current,
+                current - 1,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Get current open positions count
@@ -1057,6 +1077,7 @@ async fn main() -> Result<()> {
                     INTENTS_RECEIVED_TOTAL.store(received, Ordering::Relaxed);
                     INTENTS_REJECTED_TOTAL.store(rejected, Ordering::Relaxed);
                     SIMULATION_FAILURES_TOTAL.store(sim_fail, Ordering::Relaxed);
+                    OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
                     ACTIVE_CAPITAL_LOCKS.store(cap_locks as u64, Ordering::Relaxed);
                     ACTIVE_RESOURCE_LOCKS.store(res_locks as u64, Ordering::Relaxed);
                     AVAILABLE_SOL_LAMPORTS.store(available_sol, Ordering::Relaxed);
@@ -2266,6 +2287,117 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
     if let Some(ref nats) = ctx.nats {
         nats.publish(TOPIC_DECISION_RECORDS, &decision).await?;
+    }
+
+    // Emit an ExecutionResult so strategy-plane components (e.g. momentum-bot) can
+    // manage positions and exits (stop-loss / take-profit) based on confirmed outcomes.
+    if config.send_enabled {
+        let status = match decision.outcome {
+            DecisionOutcome::Confirmed => ExecutionStatus::Confirmed,
+            DecisionOutcome::FailedConfirmed => ExecutionStatus::Failed,
+            DecisionOutcome::Sent => ExecutionStatus::Sent,
+            DecisionOutcome::Rejected => {
+                // If we tried to send and it failed, treat as failed; otherwise omit.
+                if send_failed {
+                    ExecutionStatus::Failed
+                } else {
+                    // No on-chain attempt => not an execution result.
+                    // (Strategy plane will time out pending intents.)
+                    // We skip emitting.
+                    // NOTE: keep below block in sync with early returns.
+                    //
+                    // Return early by using a sentinel.
+                    ExecutionStatus::Failed
+                }
+            }
+        };
+
+        let should_emit = sent_anything || send_failed;
+        if should_emit {
+            let exec_id = ctx.next_execution_id();
+
+            let (signature, bundle_id) = if let Some(ref sr) = send_result {
+                (sr.signature.clone(), sr.bundle_id.clone())
+            } else {
+                (None, bundle_id.clone())
+            };
+
+            let mut exec = ExecutionResult::new_sent(
+                "execution-engine",
+                BUILD_VERSION,
+                &ctx.run_id,
+                exec_id,
+                decision_id.clone(),
+                intent.intent_id.clone(),
+                intent.source.clone(),
+                signature,
+                bundle_id,
+            );
+
+            exec.status = status;
+            if matches!(exec.status, ExecutionStatus::Failed) {
+                exec.error_message = Some("execution_failed".to_string());
+            }
+
+            ctx.execution_writer.write(&exec)?;
+            if let Some(ref nats) = ctx.nats {
+                nats.publish(TOPIC_EXECUTION_RESULTS, &exec).await?;
+            }
+        }
+    }
+
+    // Dashboard alignment: count executions only when we have a confirmed on-chain outcome.
+    if matches!(decision.outcome, DecisionOutcome::Confirmed) {
+        INTENTS_EXECUTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        match intent.side {
+            TradeSide::Buy => ctx.increment_open_positions(),
+            TradeSide::Sell => ctx.decrement_open_positions(),
+        }
+        OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
+
+        // Best-effort recent trade record for Grafana (/trades via Infinity datasource).
+        // NOTE: execution-engine does not know exact fills; token amount and price are placeholders.
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let (mint, action, amount_tokens, price_sol) = match intent.side {
+            TradeSide::Buy => {
+                let sol = (intent.required_capital.raw as f64)
+                    / 10f64.powi(intent.required_capital.decimals as i32);
+                (
+                    intent.resources.output_mint.clone(),
+                    "BUY".to_string(),
+                    0.0,
+                    sol,
+                )
+            }
+            TradeSide::Sell => {
+                let tokens = (intent.required_capital.raw as f64)
+                    / 10f64.powi(intent.required_capital.decimals as i32);
+                (
+                    intent.resources.input_mint.clone(),
+                    "SELL".to_string(),
+                    tokens,
+                    0.0,
+                )
+            }
+        };
+
+        let tx_hash = send_result
+            .as_ref()
+            .and_then(|sr| sr.signature.clone())
+            .or_else(|| send_signature.clone())
+            .unwrap_or_default();
+
+        record_recent_trade(RecentTrade {
+            timestamp_ms: now_ms,
+            mint,
+            action,
+            tx_hash,
+            amount_tokens,
+            price_sol,
+            pnl_sol: None,
+            pnl_pct: None,
+            latency_ms: None,
+        });
     }
 
     // Release lock (in production: would release after confirmation)

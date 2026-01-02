@@ -273,10 +273,17 @@
       "gridPos": {"h":4,"w":4,"x":20,"y":29}
     },
     {
+      "type": "stat",
+      "title": "Open Positions",
+      "targets": [{ "expr": "open_positions{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
+      "gridPos": {"h":4,"w":4,"x":0,"y":33},
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } } }
+    },
+    {
       "type": "piechart",
       "title": "Intent Rejection Reasons",
       "targets": [{ "expr": "intent_rejection_by_reason{job=\"ironcrab-execution-engine\"}", "refId": "A", "legendFormat": "{{reason}}" }],
-      "gridPos": {"h":6,"w":8,"x":0,"y":33},
+      "gridPos": {"h":6,"w":8,"x":0,"y":37},
       "options": { "legend": { "displayMode": "table", "placement": "right" } }
     },
     {
@@ -286,20 +293,159 @@
         { "expr": "rate(intents_executed_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "A", "legendFormat": "executed/min" },
         { "expr": "rate(intents_rejected_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "B", "legendFormat": "rejected/min" }
       ],
-      "gridPos": {"h":6,"w":8,"x":8,"y":33},
+      "gridPos": {"h":6,"w":8,"x":8,"y":37},
       "fieldConfig": { "defaults": { "unit": "short" } }
     },
     {
       "type": "timeseries",
       "title": "Simulation Failure Rate",
       "targets": [{ "expr": "rate(simulation_failures_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "A", "legendFormat": "sim failures/min" }],
-      "gridPos": {"h":6,"w":8,"x":16,"y":33},
+      "gridPos": {"h":6,"w":8,"x":16,"y":37},
       "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "type": "table",
+      "title": "📋 Recent Trades (Last 20)",
+      "gridPos": {"h":12,"w":24,"x":0,"y":43},
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "bf7ze18vokflsf"
+      },
+      "targets": [{
+        "refId": "A",
+        "type": "json",
+        "source": "url",
+        "format": "table",
+        "url": "/trades",
+        "url_options": {
+          "method": "GET",
+          "data": ""
+        },
+        "root_selector": "",
+        "columns": [
+          { "selector": "timestamp_ms", "text": "Time", "type": "timestamp_epoch" },
+          { "selector": "action", "text": "Action", "type": "string" },
+          { "selector": "mint", "text": "Token (Mint)", "type": "string" },
+          { "selector": "tx_hash", "text": "TX Hash", "type": "string" },
+          { "selector": "amount_tokens", "text": "Amount", "type": "number" },
+          { "selector": "price_sol", "text": "Price (SOL)", "type": "number" },
+          { "selector": "pnl_sol", "text": "PnL (SOL)", "type": "number" },
+          { "selector": "pnl_pct", "text": "PnL %", "type": "number" }
+        ]
+      }],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Time" },
+            "properties": [{ "id": "unit", "value": "dateTimeFromNow" }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Action" },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  { "type": "value", "options": { "BUY": { "color": "green", "text": "🟢 BUY" } } },
+                  { "type": "value", "options": { "SELL": { "color": "orange", "text": "🟠 SELL" } } }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Token (Mint)" },
+            "properties": [
+              { "id": "custom.width", "value": 120 },
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "View on Solscan",
+                    "url": "https://solscan.io/token/${__value.text}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "TX Hash" },
+            "properties": [
+              { "id": "custom.width", "value": 100 },
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "View TX on Solscan",
+                    "url": "https://solscan.io/tx/${__value.text}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Price (SOL)" },
+            "properties": [{ "id": "decimals", "value": 12 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "PnL (SOL)" },
+            "properties": [
+              { "id": "decimals", "value": 6 },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "green", "value": 0 }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-text" }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "PnL %" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "decimals", "value": 2 },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "green", "value": 0 }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-text" }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "Time", "desc": true }]
+      }
     },
     {
       "type": "row",
       "title": "🔗 NATS Message Flow",
-      "gridPos": {"h":1,"w":24,"x":0,"y":39},
+      "gridPos": {"h":1,"w":24,"x":0,"y":55},
       "collapsed": false
     },
     {
@@ -311,28 +457,28 @@
         { "expr": "rate(nats_messages_published_total{job=\"ironcrab-arb-strategy\"}[1m])", "refId": "D", "legendFormat": "arb-strategy pub" },
         { "expr": "rate(nats_messages_received_total{job=\"ironcrab-execution-engine\"}[1m])", "refId": "C", "legendFormat": "exec-engine recv" }
       ],
-      "gridPos": {"h":6,"w":12,"x":0,"y":40},
+      "gridPos": {"h":6,"w":12,"x":0,"y":56},
       "fieldConfig": { "defaults": { "unit": "ops" } }
     },
     {
       "type": "stat",
       "title": "NATS Reconnects",
       "targets": [{ "expr": "sum(nats_reconnects_total)", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":12,"y":40},
+      "gridPos": {"h":3,"w":4,"x":12,"y":56},
       "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } } }
     },
     {
       "type": "stat",
       "title": "NATS Errors",
       "targets": [{ "expr": "sum(nats_errors_total)", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":16,"y":40},
+      "gridPos": {"h":3,"w":4,"x":16,"y":56},
       "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } } }
     },
     {
       "type": "stat",
       "title": "Total Published",
       "targets": [{ "expr": "sum(nats_messages_published_total)", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":20,"y":40}
+      "gridPos": {"h":3,"w":4,"x":20,"y":56}
     }
   ]
 }
