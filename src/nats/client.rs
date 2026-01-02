@@ -14,6 +14,7 @@ use tracing::warn;
 
 #[cfg(feature = "nats")]
 use tracing::{error, info};
+use tracing::debug;
 
 #[cfg(feature = "nats")]
 use async_nats;
