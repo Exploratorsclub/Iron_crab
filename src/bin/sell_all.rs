@@ -756,35 +756,37 @@ async fn main() -> anyhow::Result<()> {
             solana_account_decoder::UiAccountData::LegacyBinary(b) => decode_raw_token_account(b),
             solana_account_decoder::UiAccountData::Json(parsed) => {
                 if let serde_json::Value::Object(info) = parsed.parsed {
-                    let Some(info_obj) = info.get("info") else {
-                        return None;
-                    };
+                    match info.get("info") {
+                        Some(info_obj) => {
+                            let is_frozen = info_obj
+                                .get("state")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.eq_ignore_ascii_case("frozen"))
+                                .unwrap_or(false);
 
-                    let is_frozen = info_obj
-                        .get("state")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.eq_ignore_ascii_case("frozen"))
-                        .unwrap_or(false);
+                            if is_frozen {
+                                None
+                            } else {
+                                if let Some(mint_str) = info_obj.get("mint").and_then(|v| v.as_str()) {
+                                    let amount_str = info_obj
+                                        .get("tokenAmount")
+                                        .and_then(|v| v.get("amount"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("0");
 
-                    if is_frozen {
-                        None
-                    } else {
-                        let Some(mint_str) = info_obj.get("mint").and_then(|v| v.as_str()) else {
-                            return None;
-                        };
-
-                        let amount_str = info_obj
-                            .get("tokenAmount")
-                            .and_then(|v| v.get("amount"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("0");
-
-                        let Ok(mint) = Pubkey::from_str(mint_str) else {
-                            return None;
-                        };
-
-                        let amount = u64::from_str(amount_str).unwrap_or(0);
-                        Some((mint, amount))
+                                    match Pubkey::from_str(mint_str) {
+                                        Ok(mint) => {
+                                            let amount = u64::from_str(amount_str).unwrap_or(0);
+                                            Some((mint, amount))
+                                        }
+                                        Err(_) => None,
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                        None => None,
                     }
                 } else {
                     None
