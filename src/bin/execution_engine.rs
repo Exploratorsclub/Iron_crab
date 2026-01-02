@@ -1982,6 +1982,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     JITO_BUNDLES_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     warn!(intent_id = %intent.intent_id, error = %err_msg, "Jito bundle submission failed");
                 }
+            }
         } else {
             match send_transaction_rpc(
                 ctx,

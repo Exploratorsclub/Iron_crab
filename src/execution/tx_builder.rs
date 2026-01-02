@@ -1,4 +1,5 @@
 use crate::ipc::{RejectReason, TradeIntent, TradeSide};
+use crate::solana::dex::Dex;
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::orca_whirlpool_layout;
 use crate::solana::dex::pumpfun::PumpFunDex;
@@ -6,7 +7,7 @@ use crate::solana::rpc::SolanaRpc;
 use solana_sdk::hash::hash;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
-use solana_program::pubkey::Pubkey as ProgramPubkey;
+use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -155,9 +156,12 @@ pub async fn build_tx_plan(
         orca.set_user_authority(wallet_pubkey);
 
         // Register ATAs for both mints (Orca build_swap_ix requires these mappings).
-        let owner_spl = ProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
+        let owner_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
         let token_program_spl = spl_token::id();
-        for mint in [intent.resources.input_mint.as_str(), intent.resources.output_mint.as_str()] {
+        for mint in [
+            intent.resources.input_mint.as_str(),
+            intent.resources.output_mint.as_str(),
+        ] {
             let mint_sdk = match Pubkey::from_str(mint) {
                 Ok(m) => m,
                 Err(e) => {
@@ -167,7 +171,7 @@ pub async fn build_tx_plan(
                     })
                 }
             };
-            let mint_spl = ProgramPubkey::new_from_array(mint_sdk.to_bytes());
+            let mint_spl = SplProgramPubkey::new_from_array(mint_sdk.to_bytes());
             let ata_spl =
                 spl_associated_token_account::get_associated_token_address_with_program_id(
                     &owner_spl,

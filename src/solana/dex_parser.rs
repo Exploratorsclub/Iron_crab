@@ -10,7 +10,7 @@ use crate::solana::geyser_listener::{GeyserAccountUpdate, GeyserTransactionUpdat
 use rust_decimal::Decimal;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 // ============================================================================
 // Program IDs

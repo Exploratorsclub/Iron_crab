@@ -415,7 +415,7 @@ impl CrossDexHandler {
         // Simple heuristic: check if pool exists in our connectors
         // This is a placeholder - real implementation would query chain
 
-        let pubkey = Pubkey::from_str(pool_address)
+        let _pubkey = Pubkey::from_str(pool_address)
             .map_err(|_| anyhow!("Invalid pool address: {}", pool_address))?;
 
         // Try to identify by checking pool data (simplified)
