@@ -25,7 +25,9 @@
 use anyhow::Result;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use solana_client::rpc_config::RpcSimulateTransactionConfig;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::transaction::Transaction;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -1576,6 +1578,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     let mut cross_dex_validation = None;
 
     // Planned tx (RS-2.1): deterministic tx plan + plan_hash
+    let mut tx_plan: Option<tx_builder::TxPlan> = None;
     let mut plan_hash: Option<String> = None;
 
     if is_cross_dex_arb {
@@ -1653,60 +1656,63 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     }
 
     // === Plan (RS-2.1) ===
-    // Important: to avoid breaking current dry-run/dev workflows, we only *enforce* planning
-    // when send is enabled. Once real simulation+send is implemented, planning will become
-    // mandatory for all paths.
-    if config.send_enabled {
-        info!(intent_id = %intent.intent_id, "Building tx plan");
-        let wallet_pubkey = match ctx.wallet_pubkey {
-            Some(pk) => pk,
-            None => {
-                let reason = RejectReason::InternalError;
-                checks.push(CheckResult {
-                    check_name: "tx_plan".to_string(),
-                    passed: false,
-                    reason_code: Some(reason.to_string()),
-                    details: Some("wallet_pubkey_unavailable (keys not loaded)".to_string()),
-                });
-                ctx.lock_manager.release_locks(&intent.intent_id);
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-            }
-        };
-
-        match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc)).await {
-            tx_builder::TxPlanOutcome::Planned(plan) => {
-                plan_hash = Some(plan.hash_string());
-                checks.push(CheckResult {
-                    check_name: "tx_plan".to_string(),
-                    passed: true,
-                    reason_code: None,
-                    details: Some(format!("ix_count={} plan_hash={}", plan.instructions.len(), plan_hash.as_deref().unwrap_or(""))),
-                });
-            }
-            tx_builder::TxPlanOutcome::Unsupported(u) => {
-                checks.push(CheckResult {
-                    check_name: "tx_plan".to_string(),
-                    passed: false,
-                    reason_code: Some(u.reason.to_string()),
-                    details: Some(u.details),
-                });
-                ctx.lock_manager.release_locks(&intent.intent_id);
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, u.reason).await;
-            }
+    // RS-3.1 requires real simulation, which depends on a deterministic tx plan.
+    // Therefore planning is now mandatory (unsupported intents are rejected explicitly).
+    info!(intent_id = %intent.intent_id, "Building tx plan");
+    let wallet_pubkey = match ctx.wallet_pubkey {
+        Some(pk) => pk,
+        None => {
+            let reason = RejectReason::InternalError;
+            checks.push(CheckResult {
+                check_name: "tx_plan".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some("wallet_pubkey_unavailable (keys not loaded)".to_string()),
+            });
+            ctx.lock_manager.release_locks(&intent.intent_id);
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
         }
-    } else {
-        checks.push(CheckResult {
-            check_name: "tx_plan".to_string(),
-            passed: true,
-            reason_code: None,
-            details: Some("skipped (send_enabled=false)".to_string()),
-        });
+    };
+
+    match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc)).await {
+        tx_builder::TxPlanOutcome::Planned(plan) => {
+            plan_hash = Some(plan.hash_string());
+            checks.push(CheckResult {
+                check_name: "tx_plan".to_string(),
+                passed: true,
+                reason_code: None,
+                details: Some(format!(
+                    "ix_count={} plan_hash={}",
+                    plan.instructions.len(),
+                    plan_hash.as_deref().unwrap_or("")
+                )),
+            });
+            tx_plan = Some(plan);
+        }
+        tx_builder::TxPlanOutcome::Unsupported(u) => {
+            checks.push(CheckResult {
+                check_name: "tx_plan".to_string(),
+                passed: false,
+                reason_code: Some(u.reason.to_string()),
+                details: Some(u.details),
+            });
+            ctx.lock_manager.release_locks(&intent.intent_id);
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, u.reason).await;
+        }
     }
 
     // === Simulate (P0: simulate-gated) ===
     info!(intent_id = %intent.intent_id, "Running simulation");
 
-    let sim_result = simulate_transaction(&intent).await;
+    let plan = tx_plan
+        .as_ref()
+        .expect("tx_plan must be present after successful planning");
+    let plan_hash_str = plan_hash
+        .as_deref()
+        .unwrap_or("plan_hash_unavailable")
+        .to_string();
+
+    let sim_result = simulate_transaction(ctx, wallet_pubkey, plan).await;
 
     if !sim_result.success {
         let reason = RejectReason::SimFailed;
@@ -1720,7 +1726,15 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         // Release lock on failure
         ctx.lock_manager.release_locks(&intent.intent_id);
 
-        return emit_sim_failed_decision(ctx, decision_id, &intent, checks, sim_result).await;
+        return emit_sim_failed_decision(
+            ctx,
+            decision_id,
+            &intent,
+            checks,
+            plan_hash_str,
+            sim_result,
+        )
+        .await;
     }
 
     checks.push(CheckResult {
@@ -1944,6 +1958,7 @@ async fn emit_sim_failed_decision(
     decision_id: String,
     intent: &TradeIntent,
     checks: Vec<CheckResult>,
+    plan_hash: String,
     sim_result: SimulationResult,
 ) -> Result<()> {
     // Simulation failures are rejections and should show up both in totals and by-reason.
@@ -1962,7 +1977,7 @@ async fn emit_sim_failed_decision(
         intent.origin_type,
         intent.regime,
         checks,
-        format!("plan-{}", Uuid::new_v4()),
+        plan_hash,
         sim_result,
     );
 
@@ -1981,16 +1996,62 @@ async fn emit_sim_failed_decision(
     Ok(())
 }
 
-/// Simulate a transaction (MVP: always succeeds)
-async fn simulate_transaction(_intent: &TradeIntent) -> SimulationResult {
-    // In production: call RPC simulateTransaction
-    // For MVP: return success
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+/// Real RPC simulation (RS-3.1).
+///
+/// Notes:
+/// - Uses `sig_verify=false` (unsigned tx is fine for simulation).
+/// - Uses `replace_recent_blockhash=true` so simulation does not depend on blockhash freshness.
+async fn simulate_transaction(
+    ctx: &ExecutionContext,
+    wallet_pubkey: Pubkey,
+    plan: &tx_builder::TxPlan,
+) -> SimulationResult {
+    let message = solana_sdk::message::Message::new(&plan.instructions, Some(&wallet_pubkey));
+    let tx = Transaction::new_unsigned(message);
 
-    SimulationResult {
-        success: true,
-        error_code: None,
-        logs_preview: Some("Simulation successful (MVP stub)".to_string()),
-        compute_units_consumed: Some(150_000),
+    let cfg = RpcSimulateTransactionConfig {
+        sig_verify: false,
+        replace_recent_blockhash: true,
+        ..RpcSimulateTransactionConfig::default()
+    };
+
+    match ctx.rpc.rpc.simulate_transaction_with_config(&tx, cfg).await {
+        Ok(res) => {
+            let value = res.value;
+
+            let logs_preview = value
+                .logs
+                .as_ref()
+                .map(|lines| {
+                    // Keep this small: decision records should be lightweight.
+                    let mut s = lines.join("\n");
+                    const MAX: usize = 8_000;
+                    if s.len() > MAX {
+                        s.truncate(MAX);
+                    }
+                    s
+                });
+
+            match value.err {
+                None => SimulationResult {
+                    success: true,
+                    error_code: None,
+                    logs_preview,
+                    compute_units_consumed: value.units_consumed,
+                },
+                Some(err) => SimulationResult {
+                    success: false,
+                    error_code: Some(format!("{err:?}")),
+                    logs_preview,
+                    compute_units_consumed: value.units_consumed,
+                },
+            }
+        }
+        Err(e) => SimulationResult {
+            success: false,
+            error_code: Some(format!("rpc_error:{e}")),
+            logs_preview: None,
+            compute_units_consumed: None,
+        },
     }
 }
