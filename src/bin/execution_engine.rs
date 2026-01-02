@@ -994,13 +994,19 @@ async fn main() -> Result<()> {
 
     // P1: Determine initial values from snapshot (DoD K)
     // Best-effort wallet discovery so open_positions reflects actual holdings after restart.
-    let discovered_positions = match discover_wallet_open_positions(&rpc, wallet_pubkey).await {
-        Ok(n) => {
-            info!(wallet_open_positions = n, "Discovered open positions from wallet token accounts");
-            Some(n)
-        }
-        Err(e) => {
-            warn!(error = %e, "Failed to discover wallet open positions; falling back to snapshot");
+    let discovered_positions = match wallet_pubkey {
+        Some(owner) => match discover_wallet_open_positions(&rpc, owner).await {
+            Ok(n) => {
+                info!(wallet_open_positions = n, "Discovered open positions from wallet token accounts");
+                Some(n)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to discover wallet open positions; falling back to snapshot");
+                None
+            }
+        },
+        None => {
+            warn!("No wallet pubkey available; skipping wallet open-position discovery");
             None
         }
     };
