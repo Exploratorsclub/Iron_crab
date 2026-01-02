@@ -1578,8 +1578,55 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     let mut cross_dex_validation = None;
 
     // Planned tx (RS-2.1): deterministic tx plan + plan_hash
-    let mut tx_plan: Option<tx_builder::TxPlan> = None;
-    let mut plan_hash: Option<String> = None;
+    let (tx_plan, plan_hash_str) = {
+        // === Plan (RS-2.1) ===
+        // RS-3.1 requires real simulation, which depends on a deterministic tx plan.
+        // Therefore planning is now mandatory (unsupported intents are rejected explicitly).
+        info!(intent_id = %intent.intent_id, "Building tx plan");
+        let wallet_pubkey = match ctx.wallet_pubkey {
+            Some(pk) => pk,
+            None => {
+                let reason = RejectReason::InternalError;
+                checks.push(CheckResult {
+                    check_name: "tx_plan".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some("wallet_pubkey_unavailable (keys not loaded)".to_string()),
+                });
+                ctx.lock_manager.release_locks(&intent.intent_id);
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+        };
+
+        match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc)).await {
+            tx_builder::TxPlanOutcome::Planned(plan) => {
+                let plan_hash_str = plan.hash_string();
+                checks.push(CheckResult {
+                    check_name: "tx_plan".to_string(),
+                    passed: true,
+                    reason_code: None,
+                    details: Some(format!(
+                        "ix_count={} plan_hash={}",
+                        plan.instructions.len(),
+                        plan_hash_str
+                    )),
+                });
+                (plan, plan_hash_str)
+            }
+            tx_builder::TxPlanOutcome::Unsupported(u) => {
+                checks.push(CheckResult {
+                    check_name: "tx_plan".to_string(),
+                    passed: false,
+                    reason_code: Some(u.reason.to_string()),
+                    details: Some(u.details),
+                });
+                ctx.lock_manager.release_locks(&intent.intent_id);
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, u.reason).await;
+            }
+        }
+    };
+
+    let plan_hash: Option<String> = Some(plan_hash_str.clone());
 
     if is_cross_dex_arb {
         info!(intent_id = %intent.intent_id, "Processing as Cross-DEX arbitrage intent");
@@ -1655,64 +1702,14 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         }
     }
 
-    // === Plan (RS-2.1) ===
-    // RS-3.1 requires real simulation, which depends on a deterministic tx plan.
-    // Therefore planning is now mandatory (unsupported intents are rejected explicitly).
-    info!(intent_id = %intent.intent_id, "Building tx plan");
-    let wallet_pubkey = match ctx.wallet_pubkey {
-        Some(pk) => pk,
-        None => {
-            let reason = RejectReason::InternalError;
-            checks.push(CheckResult {
-                check_name: "tx_plan".to_string(),
-                passed: false,
-                reason_code: Some(reason.to_string()),
-                details: Some("wallet_pubkey_unavailable (keys not loaded)".to_string()),
-            });
-            ctx.lock_manager.release_locks(&intent.intent_id);
-            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-        }
-    };
-
-    match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc)).await {
-        tx_builder::TxPlanOutcome::Planned(plan) => {
-            plan_hash = Some(plan.hash_string());
-            checks.push(CheckResult {
-                check_name: "tx_plan".to_string(),
-                passed: true,
-                reason_code: None,
-                details: Some(format!(
-                    "ix_count={} plan_hash={}",
-                    plan.instructions.len(),
-                    plan_hash.as_deref().unwrap_or("")
-                )),
-            });
-            tx_plan = Some(plan);
-        }
-        tx_builder::TxPlanOutcome::Unsupported(u) => {
-            checks.push(CheckResult {
-                check_name: "tx_plan".to_string(),
-                passed: false,
-                reason_code: Some(u.reason.to_string()),
-                details: Some(u.details),
-            });
-            ctx.lock_manager.release_locks(&intent.intent_id);
-            return emit_rejected_decision(ctx, decision_id, &intent, checks, u.reason).await;
-        }
-    }
-
     // === Simulate (P0: simulate-gated) ===
     info!(intent_id = %intent.intent_id, "Running simulation");
 
-    let plan = tx_plan
-        .as_ref()
-        .expect("tx_plan must be present after successful planning");
-    let plan_hash_str = plan_hash
-        .as_deref()
-        .unwrap_or("plan_hash_unavailable")
-        .to_string();
+    let wallet_pubkey = ctx
+        .wallet_pubkey
+        .expect("wallet_pubkey must be present after successful planning");
 
-    let sim_result = simulate_transaction(ctx, wallet_pubkey, plan).await;
+    let sim_result = simulate_transaction(ctx, wallet_pubkey, &tx_plan).await;
 
     if !sim_result.success {
         let reason = RejectReason::SimFailed;
