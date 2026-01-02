@@ -3,6 +3,7 @@
 name = "ironcrab"
 version = "0.3.1-dev"
 edition = "2021"
+autobins = false
 
 [dependencies]
 anyhow = "1"
@@ -86,6 +87,8 @@ python_ipc = []
 jito = []
 notify_watch = ["notify"]
 nats = ["async-nats"]
+legacy_sniper = []
+legacy_monolith = ["legacy_sniper"]
 
 [dependencies.pyo3]
 version = "0.24.2"
@@ -116,3 +119,28 @@ path = "src/bin/execution_engine.rs"
 [[bin]]
 name = "arb-strategy"
 path = "src/bin/arb_strategy.rs"
+
+[[bin]]
+name = "backtest-driver"
+path = "src/bin/backtest_driver.rs"
+
+[[bin]]
+name = "recorder"
+path = "src/bin/recorder.rs"
+
+[[bin]]
+name = "raydium-pools"
+path = "src/bin/raydium_pools.rs"
+
+[[bin]]
+name = "sell-all"
+path = "src/bin/sell_all.rs"
+
+[[bin]]
+name = "latency-stress"
+path = "src/bin/latency_stress.rs"
+
+[[bin]]
+name = "ironcrab-monolith"
+path = "src/main.rs"
+required-features = ["legacy_monolith"]
