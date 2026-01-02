@@ -799,6 +799,9 @@ struct MomentumContext {
     intent_counter: std::sync::atomic::AtomicU64,
     /// Track known pools (pool_address -> first_seen_slot)
     pool_first_seen: parking_lot::RwLock<std::collections::HashMap<String, u64>>,
+    /// Pump.fun dev wallet info can arrive before PoolCreated.
+    /// Store it by mint and apply once the TokenTracker exists.
+    pending_dev_info: parking_lot::RwLock<HashMap<String, (String, f64)>>,
     /// Token trackers for strategy filters (mint -> tracker)
     token_trackers: parking_lot::RwLock<HashMap<String, TokenTracker>>,
     /// Position trackers for exit strategy (mint -> position)
@@ -853,6 +856,7 @@ impl MomentumContext {
         slot: u64,
         liquidity: u64,
     ) -> bool {
+        let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
         if trackers.contains_key(mint) {
             false // Already exists
@@ -861,6 +865,24 @@ impl MomentumContext {
                 mint.to_string(),
                 TokenTracker::new(mint, pool, dex, slot, liquidity),
             );
+
+            // Apply any dev wallet info that arrived before the tracker existed.
+            if let Some((dev_wallet, supply_pct)) = self
+                .pending_dev_info
+                .read()
+                .get(mint)
+                .cloned()
+            {
+                if let Some(tracker) = trackers.get_mut(mint) {
+                    let was_blacklisted = tracker.blacklisted;
+                    tracker.set_dev_info(&dev_wallet, supply_pct, &config);
+                    if !was_blacklisted && tracker.blacklisted {
+                        self.tokens_blacklisted
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+
             self.tokens_tracked
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true // New tracker created
@@ -892,6 +914,11 @@ impl MomentumContext {
     /// Record dev info for a token
     fn record_dev_info(&self, mint: &str, dev_wallet: &str, supply_pct: f64) {
         let config = self.config.read().clone();
+        {
+            let mut pending = self.pending_dev_info.write();
+            pending.insert(mint.to_string(), (dev_wallet.to_string(), supply_pct));
+        }
+
         let mut trackers = self.token_trackers.write();
         if let Some(tracker) = trackers.get_mut(mint) {
             let was_blacklisted = tracker.blacklisted;
@@ -1443,6 +1470,7 @@ async fn main() -> Result<()> {
         jsonl_writer,
         intent_counter: std::sync::atomic::AtomicU64::new(0),
         pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
         token_trackers: parking_lot::RwLock::new(HashMap::new()),
         positions: parking_lot::RwLock::new(HashMap::new()),
         pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -2149,26 +2177,15 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             drop(config);
 
             if *supply_percentage > max_dev_pct {
-                // Blacklist token with high dev supply
-                let mut trackers = ctx.token_trackers.write();
-                if let Some(tracker) = trackers.get_mut(mint) {
-                    if !tracker.blacklisted {
-                        tracker.blacklisted = true;
-                        tracker.blacklist_reason = Some(format!(
-                            "Dev supply too high: {:.1}% > {:.1}%",
-                            supply_percentage, max_dev_pct
-                        ));
-                        ctx.tokens_blacklisted
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                        warn!(
-                            mint = %mint,
-                            dev_supply = supply_percentage,
-                            max_allowed = max_dev_pct,
-                            "🚫 Token blacklisted - dev supply too high"
-                        );
-                    }
-                }
+                // Blacklisting is applied inside TokenTracker::set_dev_info.
+                // We still log here even if the tracker doesn't exist yet.
+                warn!(
+                    mint = %mint,
+                    dev_wallet = %dev_wallet,
+                    supply_pct = supply_percentage,
+                    max_allowed = max_dev_pct,
+                    "🚫 Dev wallet identified - supply too high (will be blacklisted)"
+                );
             } else {
                 info!(
                     mint = %mint,
