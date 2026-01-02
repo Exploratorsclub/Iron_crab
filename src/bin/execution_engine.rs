@@ -24,14 +24,19 @@
 
 use anyhow::Result;
 use clap::Parser;
+use solana_account_decoder::UiAccountData;
+use solana_account_decoder::UiAccountEncoding;
+use solana_client::rpc_request::TokenAccountsFilter;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
 use solana_sdk::pubkey::Pubkey;
 use solana_commitment_config::CommitmentLevel;
+use solana_sdk::bs58;
 use solana_sdk::signature::Signature;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -67,6 +72,142 @@ use ironcrab::storage::{
 };
 use ironcrab::wallet::Treasury;
 use ironcrab::execution::tx_builder;
+
+async fn discover_wallet_open_positions(rpc: &SolanaRpc, owner: Pubkey) -> anyhow::Result<usize> {
+    let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")?;
+    let token_2022_program_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
+    let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;
+
+    let mut token_accounts = rpc
+        .rpc
+        .get_token_accounts_by_owner(&owner, TokenAccountsFilter::ProgramId(token_program_id))
+        .await?;
+
+    if let Ok(mut accounts_2022) = rpc
+        .rpc
+        .get_token_accounts_by_owner(
+            &owner,
+            TokenAccountsFilter::ProgramId(token_2022_program_id),
+        )
+        .await
+    {
+        token_accounts.append(&mut accounts_2022);
+    }
+
+    // Count non-zero token accounts excluding SOL/WSOL mint.
+    // NOTE: This is a best-effort “wallet holdings” view; it does not reconstruct cost basis.
+    let mut seen_accounts = HashSet::new();
+    let mut count = 0usize;
+
+    for ta in token_accounts {
+        // Defensive: avoid double-counting if RPC returns duplicates.
+        if !seen_accounts.insert(ta.pubkey.clone()) {
+            continue;
+        }
+
+        let parsed = match ta.account.data {
+            UiAccountData::Json(parsed) => parsed,
+            UiAccountData::Binary(data, enc) => {
+                let bytes = match enc {
+                    UiAccountEncoding::Base58 => bs58::decode(data).into_vec().ok(),
+                    UiAccountEncoding::Base64 => base64::decode(data).ok(),
+                    _ => None,
+                };
+                let Some(bytes) = bytes else { continue };
+                if bytes.len() < 72 {
+                    continue;
+                }
+                // Check frozen (SPL token account state at byte 108)
+                if bytes.len() >= 109 && bytes[108] == 2 {
+                    continue;
+                }
+                let mint_bytes: [u8; 32] = match bytes.get(0..32).and_then(|s| s.try_into().ok()) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let mint = Pubkey::new_from_array(mint_bytes);
+                let amount_bytes: [u8; 8] = match bytes.get(64..72).and_then(|s| s.try_into().ok()) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let amount = u64::from_le_bytes(amount_bytes);
+                if mint == sol_mint || amount == 0 {
+                    continue;
+                }
+                count += 1;
+                continue;
+            }
+            UiAccountData::LegacyBinary(data) => {
+                let bytes = bs58::decode(data).into_vec().ok();
+                let Some(bytes) = bytes else { continue };
+                if bytes.len() < 72 {
+                    continue;
+                }
+                if bytes.len() >= 109 && bytes[108] == 2 {
+                    continue;
+                }
+                let mint_bytes: [u8; 32] = match bytes.get(0..32).and_then(|s| s.try_into().ok()) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let mint = Pubkey::new_from_array(mint_bytes);
+                let amount_bytes: [u8; 8] = match bytes.get(64..72).and_then(|s| s.try_into().ok()) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let amount = u64::from_le_bytes(amount_bytes);
+                if mint == sol_mint || amount == 0 {
+                    continue;
+                }
+                count += 1;
+                continue;
+            }
+        };
+
+        // JsonParsed
+        let serde_json::Value::Object(root) = parsed.parsed else {
+            continue;
+        };
+        let Some(info) = root.get("info") else {
+            continue;
+        };
+
+        let is_frozen = info
+            .get("state")
+            .and_then(|s| s.as_str())
+            .map(|s| s.eq_ignore_ascii_case("frozen"))
+            .unwrap_or(false);
+        if is_frozen {
+            continue;
+        }
+
+        let mint_str = match info.get("mint").and_then(|v| v.as_str()) {
+            Some(m) => m,
+            None => continue,
+        };
+        let mint = match Pubkey::from_str(mint_str) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if mint == sol_mint {
+            continue;
+        }
+
+        let amount_str = info
+            .get("tokenAmount")
+            .and_then(|v| v.get("amount"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
+        let amount = amount_str.parse::<u64>().unwrap_or(0);
+        if amount == 0 {
+            continue;
+        }
+
+        count += 1;
+    }
+
+    Ok(count)
+}
 
 /// NATS topic for config reload commands from control-plane
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
@@ -852,6 +993,18 @@ async fn main() -> Result<()> {
     };
 
     // P1: Determine initial values from snapshot (DoD K)
+    // Best-effort wallet discovery so open_positions reflects actual holdings after restart.
+    let discovered_positions = match discover_wallet_open_positions(&rpc, wallet_pubkey).await {
+        Ok(n) => {
+            info!(wallet_open_positions = n, "Discovered open positions from wallet token accounts");
+            Some(n)
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to discover wallet open positions; falling back to snapshot");
+            None
+        }
+    };
+
     let (
         initial_day,
         initial_daily_loss,
@@ -867,11 +1020,12 @@ async fn main() -> Result<()> {
                 decision_counter = snap.decision_counter,
                 "Restored same-day state from snapshot"
             );
+            let positions = discovered_positions.unwrap_or(snap.open_positions);
             (
                 chrono::NaiveDate::parse_from_str(&snap.day, "%Y-%m-%d")
                     .unwrap_or_else(|_| chrono::Utc::now().date_naive()),
                 snap.daily_loss_lamports,
-                snap.open_positions,
+                positions,
                 snap.decision_counter,
                 snap.execution_counter,
             )
@@ -881,17 +1035,25 @@ async fn main() -> Result<()> {
                 old_day = %snap.day,
                 "New day detected, resetting daily loss but keeping ID counters"
             );
+            // New day: daily loss resets, but wallet holdings may persist.
+            let positions = discovered_positions.unwrap_or(0);
             (
                 chrono::Utc::now().date_naive(),
                 0,                     // Reset daily loss
-                0,                     // Reset positions (they would have been closed or expired)
+                positions,
                 snap.decision_counter, // Keep for unique IDs across restarts
                 snap.execution_counter,
             )
         }
     } else {
         // Fresh start
-        (chrono::Utc::now().date_naive(), 0, 0, 0, 0)
+        (
+            chrono::Utc::now().date_naive(),
+            0,
+            discovered_positions.unwrap_or(0),
+            0,
+            0,
+        )
     };
 
     let ctx = Arc::new(ExecutionContext {
@@ -926,6 +1088,9 @@ async fn main() -> Result<()> {
         arb_validated: std::sync::atomic::AtomicU64::new(0),
         arb_executed: std::sync::atomic::AtomicU64::new(0),
     });
+
+    // Publish initial gauge values immediately (before the first 30s heartbeat).
+    OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
 
     // === Main Loop: Process TradeIntents ===
     info!("Entering main execution loop");
