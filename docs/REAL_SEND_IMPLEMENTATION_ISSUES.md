@@ -219,7 +219,7 @@ Status snapshot (2026-01-02):
     - SELL token balance preflight (ATA derivation + RPC balance read)
     - SELL token capital locking to prevent overlapping exits
 
-- [ ] **RS-7.2 – Raydium: remove placeholder user accounts in `build_swap_ix`**
+- [x] **RS-7.2 – Raydium: remove placeholder user accounts in `build_swap_ix`**
   - Scope:
     - Refactor Raydium adapter to accept real `(user_authority, user_source, user_destination)`.
   - Acceptance:

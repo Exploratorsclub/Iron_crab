@@ -97,6 +97,37 @@ impl Orca {
         self.user_token_accounts.insert(mint, ata);
     }
 
+    /// Insert a single Whirlpool into the in-memory cache from a parsed on-chain account.
+    ///
+    /// This is useful for targeted tx planning (e.g., execution-engine) without performing a
+    /// full `refresh_pools()` scan.
+    pub fn insert_whirlpool_parsed(&self, id: Pubkey, parsed: layout::WhirlpoolParsed) {
+        self.pools.insert(
+            id,
+            OrcaPool {
+                base_mint: parsed.token_mint_a,
+                quote_mint: parsed.token_mint_b,
+                reserve_base: 0,
+                reserve_quote: 0,
+                fee_bps: parsed.fee_rate as u32,
+                fee_tier: None,
+                tick_spacing: Some(parsed.tick_spacing),
+                vault_a: parsed.token_vault_a,
+                vault_b: parsed.token_vault_b,
+                tick_current_index: Some(parsed.tick_current_index),
+                cached_reserves: None,
+                last_reserve_fetch: None,
+            },
+        );
+
+        for m in [parsed.token_mint_a, parsed.token_mint_b] {
+            self.mint_index
+                .entry(m)
+                .or_insert_with(|| Vec::with_capacity(2))
+                .push(id);
+        }
+    }
+
     fn find_pool(&self, input: &Pubkey, output: &Pubkey) -> Option<(Pubkey, bool, OrcaPool)> {
         for p in self.pools.iter() {
             let forward = p.base_mint == *input && p.quote_mint == *output;
