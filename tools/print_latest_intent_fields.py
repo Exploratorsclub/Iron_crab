@@ -33,9 +33,16 @@ def main() -> int:
 
     metadata = obj.get("metadata") if isinstance(obj, dict) else None
     execution = obj.get("execution") if isinstance(obj, dict) else None
+    resources = obj.get("resources") if isinstance(obj, dict) else None
 
     print("intent_id:", _get(obj, "intent_id"))
     print("side:", _get(obj, "side"))
+    if isinstance(resources, dict):
+        pools = resources.get("pools")
+        pool0 = pools[0] if isinstance(pools, list) and pools else None
+        print("input_mint:", resources.get("input_mint"))
+        print("output_mint:", resources.get("output_mint"))
+        print("pool0:", pool0)
     print("dex:", _get(metadata, "dex"))
     print("creator:", _get(metadata, "creator"))
     print("min_out_raw:", _get(metadata, "min_out_raw"))

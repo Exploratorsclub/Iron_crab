@@ -261,7 +261,7 @@ base_tokens = [
 # LIQUIDITÄTS-FILTER - Muss groß genug sein für 0.1 SOL Trades ohne extreme Slippage
 min_liquidity_sol = 5.0   # 5 SOL = ~$700 (genug für 0.1 SOL Trade mit <2% impact)
 min_liquidity_usd = 500.0  # $500 minimum (fängt auch kleinere USD-Pairs)
-default_ui_amount = 0.1   # 0.1 SOL scan size (matches max_position, realistische Größe)
+default_ui_amount = 0.005   # 0.005 SOL scan size (klein für erste Live-Tests)
 top_n_per_base = 100      # 100 pairs per base = 300 total pairs (mehr Opportunities)
 interval_secs = 180       # 3 Minuten zwischen Pool-Discovery-Scans (spart RPC)
 enable_raydium = true
