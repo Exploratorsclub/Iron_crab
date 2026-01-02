@@ -436,6 +436,47 @@ async fn run_geyser_loop(
                 // Try to parse as DEX event (PoolCreated, Trade)
                 let parsed_event = parse_transaction_update(&tx_update);
 
+                // Pump.fun: propagate creator/dev wallet so strategy can build deterministic intents.
+                // The PoolCreated MarketEventKind intentionally does not carry creator today, so emit
+                // a separate DevWalletIdentified event when available.
+                if let Some(ParsedDexEvent::PoolCreated {
+                    base_mint,
+                    dex: DexType::PumpFun,
+                    creator: Some(creator),
+                    ..
+                }) = parsed_event.as_ref()
+                {
+                    let dev_event = MarketEvent::new(
+                        "market-data",
+                        BUILD_VERSION,
+                        run_id,
+                        ctx.next_event_id(),
+                        "geyser",
+                        Some(tx_update.slot),
+                        MarketEventKind::DevWalletIdentified {
+                            mint: base_mint.to_string(),
+                            dev_wallet: creator.to_string(),
+                            // Supply percentage is not computed here yet (would require extra on-chain reads).
+                            // Momentum-bot treats this as an input for dev-risk filters; keep deterministic.
+                            supply_percentage: 0.0,
+                        },
+                    );
+
+                    if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
+                        error!(error = %e, "Failed to write dev wallet event to JSONL");
+                    }
+
+                    if let Some(ref nats) = ctx.nats {
+                        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &dev_event).await {
+                            warn!(error = %e, "Failed to publish dev wallet event to NATS");
+                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+
                 // P1: Process wallet tracking events
                 let wallet_events = if let Some(ref parsed) = parsed_event {
                     match parsed {
