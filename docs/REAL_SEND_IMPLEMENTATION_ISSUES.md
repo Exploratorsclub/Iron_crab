@@ -227,5 +227,5 @@ Status snapshot (2026-01-02):
 
 - [x] **RS-7.3 – Orca support**
 
-- [ ] **RS-7.4 – Jito bundle path for `require_bundle=true` intents**
+- [x] **RS-7.4 – Jito bundle path for `require_bundle=true` intents**
 

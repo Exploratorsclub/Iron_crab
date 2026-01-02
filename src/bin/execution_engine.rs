@@ -51,6 +51,8 @@ use ironcrab::metrics::{
     REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_RISK_LIMIT, REJECT_SIMULATION_FAIL,
     REJECT_TTL_EXPIRED, SIMULATION_FAILURES_TOTAL, REJECT_SEND_FAILED, TX_CONFIRMED_TOTAL,
     TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_SUCCESS_TOTAL,
+    JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL,
+    JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL,
 };
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_TRADE_INTENTS};
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
@@ -1779,6 +1781,60 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         }
     }
 
+    // === P1: Check if bundle required for atomic execution ===
+    let requires_bundle = intent.requires_bundle();
+
+    if requires_bundle && config.send_enabled && ctx.jito_client.is_none() {
+        // Intent requires bundle but Jito not configured
+        let reason = RejectReason::BundleNotConfigured;
+        checks.push(CheckResult {
+            check_name: "bundle_config".to_string(),
+            passed: false,
+            reason_code: Some(reason.to_string()),
+            details: Some("Intent requires atomic bundle but Jito not configured".to_string()),
+        });
+        ctx.lock_manager.release_locks(&intent.intent_id);
+        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    }
+
+    // If bundle execution is required, include the tip instruction in both simulation and send.
+    // This preserves simulate-gated correctness (we simulate exactly what we will send).
+    let mut bundle_tip_ix: Option<solana_sdk::instruction::Instruction> = None;
+    let mut bundle_tip_lamports: Option<u64> = None;
+    if requires_bundle && config.send_enabled {
+        let tip_lamports = intent.bundle_tip_lamports.unwrap_or(config.jito_tip_lamports);
+        let jito_client = ctx
+            .jito_client
+            .as_ref()
+            .expect("bundle_config gate ensures jito_client is present");
+
+        match jito_client.build_tip_instruction(&wallet_pubkey, tip_lamports) {
+            Ok(ix) => {
+                bundle_tip_ix = Some(ix);
+                bundle_tip_lamports = Some(tip_lamports);
+            }
+            Err(e) => {
+                let reason = RejectReason::InternalError;
+                checks.push(CheckResult {
+                    check_name: "bundle_tip_ix".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some(format!("failed to build tip instruction: {e}")),
+                });
+                ctx.lock_manager.release_locks(&intent.intent_id);
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+        }
+    }
+
+    let tx_plan_for_sim = if let Some(ref ix) = bundle_tip_ix {
+        let mut ixs = tx_plan.instructions.clone();
+        ixs.push(ix.clone());
+        tx_builder::TxPlan { instructions: ixs }
+    } else {
+        tx_plan.clone()
+    };
+
     // === Simulate (P0: simulate-gated) ===
     info!(intent_id = %intent.intent_id, "Running simulation");
 
@@ -1786,7 +1842,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         .wallet_pubkey
         .expect("wallet_pubkey must be present after successful planning");
 
-    let sim_result = simulate_transaction(ctx, wallet_pubkey, &tx_plan).await;
+    let sim_result = simulate_transaction(ctx, wallet_pubkey, &tx_plan_for_sim).await;
 
     if !sim_result.success {
         let reason = RejectReason::SimFailed;
@@ -1821,22 +1877,6 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         )),
     });
 
-    // === P1: Check if bundle required for atomic execution ===
-    let requires_bundle = intent.requires_bundle();
-
-    if requires_bundle && ctx.jito_client.is_none() {
-        // Intent requires bundle but Jito not configured
-        let reason = RejectReason::BundleNotConfigured;
-        checks.push(CheckResult {
-            check_name: "bundle_config".to_string(),
-            passed: false,
-            reason_code: Some(reason.to_string()),
-            details: Some("Intent requires atomic bundle but Jito not configured".to_string()),
-        });
-        ctx.lock_manager.release_locks(&intent.intent_id);
-        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-    }
-
     // Track bundle result for decision record
     let mut bundle_id: Option<String> = None;
     let mut send_signature: Option<String> = None;
@@ -1846,20 +1886,102 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // === Send (if enabled) ===
     if config.send_enabled {
         if requires_bundle {
-            // RS-4.1 scope is the RPC path; keep bundle submission explicit until Jito path is implemented.
-            checks.push(CheckResult {
-                check_name: "send".to_string(),
-                passed: false,
-                reason_code: Some("bundle_send_not_implemented".to_string()),
-                details: Some(
-                    "Intent requires atomic bundle; RPC send path implemented, bundle path not yet implemented".to_string(),
-                ),
-            });
+            TX_SEND_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
 
-            // Policy rejection: simulation succeeded, but execution is not available.
-            ctx.record_intent_rejected();
-            INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            info!(intent_id = %intent.intent_id, "Bundle send requested, but not implemented");
+            let treasury = match ctx.treasury.as_ref() {
+                Some(t) => t,
+                None => {
+                    send_failed = true;
+                    let reason = RejectReason::InternalError;
+                    checks.push(CheckResult {
+                        check_name: "send".to_string(),
+                        passed: false,
+                        reason_code: Some(reason.to_string()),
+                        details: Some("no_signer_configured".to_string()),
+                    });
+                    ctx.record_intent_rejected();
+                    INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    ctx.lock_manager.release_locks(&intent.intent_id);
+                    return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+                }
+            };
+
+            let jito_client = ctx
+                .jito_client
+                .as_ref()
+                .expect("bundle_config gate ensures jito_client is present");
+
+            let signer: &dyn Signer = treasury.signer_ref();
+            let blockhash = match ctx.rpc.get_latest_blockhash_retry().await {
+                Ok(bh) => bh,
+                Err(e) => {
+                    send_failed = true;
+                    let reason = RejectReason::BundleFailed;
+                    checks.push(CheckResult {
+                        check_name: "send".to_string(),
+                        passed: false,
+                        reason_code: Some(reason.to_string()),
+                        details: Some(format!("rpc_error:{e}")),
+                    });
+                    ctx.record_intent_rejected();
+                    INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    warn!(intent_id = %intent.intent_id, error = %e, "Failed to fetch blockhash for bundle send");
+                    // Allow retry
+                    ctx.lock_manager.release_locks(&intent.intent_id);
+                    return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+                }
+            };
+
+            let mut ixs = tx_plan.instructions.clone();
+            if let Some(ref ix) = bundle_tip_ix {
+                ixs.push(ix.clone());
+            }
+
+            let tx = Transaction::new_signed_with_payer(
+                &ixs,
+                Some(&wallet_pubkey),
+                &[signer],
+                blockhash,
+            );
+
+            if let Some(tip_lamports) = bundle_tip_lamports {
+                JITO_TIP_LAMPORTS_TOTAL.fetch_add(tip_lamports, Ordering::Relaxed);
+            }
+            JITO_BUNDLES_SUBMITTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+            match jito_client.send_bundle(&[tx]).await {
+                Ok(bid) => {
+                    TX_SEND_SUCCESS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    sent_anything = true;
+                    bundle_id = Some(bid.clone());
+                    checks.push(CheckResult {
+                        check_name: "send".to_string(),
+                        passed: true,
+                        reason_code: None,
+                        details: Some(format!(
+                            "bundle_id={bid} tip_lamports={}",
+                            bundle_tip_lamports.unwrap_or(config.jito_tip_lamports)
+                        )),
+                    });
+                    info!(intent_id = %intent.intent_id, bundle_id = %bid, "Bundle submitted via Jito");
+                }
+                Err(e) => {
+                    send_failed = true;
+                    let reason = RejectReason::BundleFailed;
+                    let err_msg = format!("{e:?}");
+                    checks.push(CheckResult {
+                        check_name: "send".to_string(),
+                        passed: false,
+                        reason_code: Some(reason.to_string()),
+                        details: Some(err_msg.clone()),
+                    });
+
+                    // Reject: atomic guarantee cannot be met.
+                    ctx.record_intent_rejected();
+                    INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    JITO_BUNDLES_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    warn!(intent_id = %intent.intent_id, error = %err_msg, "Jito bundle submission failed");
+                }
         } else {
             match send_transaction_rpc(
                 ctx,
@@ -1910,7 +2032,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     }
 
     // Build SendResult if we sent something
-    let send_result = if sent_anything && (bundle_id.is_some() || send_signature.is_some()) {
+    let mut send_result = if sent_anything && (bundle_id.is_some() || send_signature.is_some()) {
         Some(ironcrab::ipc::SendResult {
             signature: send_signature,
             bundle_id,
@@ -1920,8 +2042,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         None
     };
 
-    // === Confirm (RS-4.2) ===
-    // Only for the RPC send path (non-bundle) when we have a real signature.
+    // === Confirm (RS-4.2 / RS-7.4) ===
+    // - RPC path (non-bundle): confirm signature via getSignatureStatuses.
+    // - Bundle path: wait for bundle landing via Jito block engine.
     let mut final_outcome = if config.send_enabled && sent_anything {
         DecisionOutcome::Sent
     } else {
@@ -1929,7 +2052,68 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     };
 
     if config.send_enabled && sent_anything {
-        if let Some(ref sr) = send_result {
+        if requires_bundle {
+            if let Some(ref mut sr) = send_result {
+                if let Some(ref bid) = sr.bundle_id {
+                    let jito_client = ctx
+                        .jito_client
+                        .as_ref()
+                        .expect("bundle_config gate ensures jito_client is present");
+
+                    match jito_client.wait_for_bundle(bid, config.jito_timeout_secs).await {
+                        Ok(status) => {
+                            // Bundle landed successfully
+                            JITO_BUNDLES_LANDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            TX_CONFIRMED_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+                            // If Jito returned tx signatures, record the first as a convenience.
+                            if let Some(sig0) = status.transactions.get(0).cloned() {
+                                sr.signature = Some(sig0.clone());
+                            }
+
+                            checks.push(CheckResult {
+                                check_name: "confirm".to_string(),
+                                passed: true,
+                                reason_code: None,
+                                details: Some(format!(
+                                    "bundle_id={bid} slot={} confirmation_status={} txs={}",
+                                    status.slot,
+                                    status.confirmation_status,
+                                    status.transactions.len()
+                                )),
+                            });
+                            final_outcome = DecisionOutcome::Confirmed;
+                        }
+                        Err(e) => {
+                            let error_msg = format!("{e:?}");
+                            let is_timeout =
+                                error_msg.contains("timeout") || error_msg.contains("Timeout");
+
+                            if is_timeout {
+                                JITO_BUNDLES_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                checks.push(CheckResult {
+                                    check_name: "confirm".to_string(),
+                                    passed: false,
+                                    reason_code: Some(RejectReason::BundleTimeout.to_string()),
+                                    details: Some(error_msg),
+                                });
+                                final_outcome = DecisionOutcome::Sent;
+                            } else {
+                                JITO_BUNDLES_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                checks.push(CheckResult {
+                                    check_name: "confirm".to_string(),
+                                    passed: false,
+                                    reason_code: Some(RejectReason::BundleFailed.to_string()),
+                                    details: Some(error_msg),
+                                });
+                                final_outcome = DecisionOutcome::FailedConfirmed;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(ref sr) = send_result {
             if let Some(ref sig_str) = sr.signature {
                 match confirm_signature_status(ctx, sig_str, config.confirmation_timeout_ms).await {
                     Ok(ConfirmOutcome::Confirmed { details }) => {
