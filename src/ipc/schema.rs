@@ -404,12 +404,10 @@ impl FeePolicy {
         let scaled_fee = (base_fee as f64 * multiplier) as u64;
 
         // Override with hint if provided (but cap at max)
-        let effective = intent
+        intent
             .hint_priority_fee_micro_lamports
             .unwrap_or(scaled_fee)
-            .min(self.max_priority_fee_micro_lamports);
-
-        effective
+            .min(self.max_priority_fee_micro_lamports)
     }
 
     /// Estimate total transaction cost (base fee + priority fee)
@@ -791,6 +789,7 @@ pub struct DecisionRecord {
 }
 
 impl DecisionRecord {
+    #[allow(clippy::too_many_arguments)]
     pub fn new_rejected(
         component: &str,
         build: &str,
@@ -821,6 +820,7 @@ impl DecisionRecord {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_sim_failed(
         component: &str,
         build: &str,
@@ -931,6 +931,7 @@ pub struct ExecutionResult {
 }
 
 impl ExecutionResult {
+    #[allow(clippy::too_many_arguments)]
     pub fn new_sent(
         component: &str,
         build: &str,

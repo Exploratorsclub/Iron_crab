@@ -245,7 +245,7 @@ impl GeyserPoolDiscovery {
                 // [7]: User (creator, fee payer) ← THIS IS THE CREATOR
 
                 // Get the mint (account index 0)
-                let token_mint = *tx_update.instruction_accounts.get(0)?;
+                let token_mint = *tx_update.instruction_accounts.first()?;
 
                 // CALCULATE Bonding Curve PDA deterministically
                 // Seeds: ["bonding-curve", mint_pubkey]

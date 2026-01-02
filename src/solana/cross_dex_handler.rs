@@ -400,11 +400,6 @@ impl CrossDexHandler {
 
     /// Identify which DEX a pool belongs to based on address pattern
     fn identify_dex(&self, pool_address: &str) -> Result<(String, String)> {
-        // Known program IDs
-        const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
-        const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-        const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
-
         // For now, use simple heuristics based on pool address length and pattern
         // In production: query on-chain owner or use cached pool registry
 

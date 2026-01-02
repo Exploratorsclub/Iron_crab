@@ -45,6 +45,7 @@ pub struct WalletTracker {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct EarlyBuyerInfo {
     wallet: String,
     slot: u64,
@@ -80,6 +81,7 @@ impl WalletTracker {
     }
 
     /// Create with default config
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> Self {
         Self::new(WalletTrackerCfg::default())
     }
@@ -116,6 +118,7 @@ impl WalletTracker {
 
     /// Process a trade and check if it involves a tracked wallet
     /// Returns events to emit (if any)
+    #[allow(clippy::too_many_arguments)]
     pub fn process_trade(
         &self,
         mint: &str,
@@ -247,6 +250,7 @@ impl WalletTracker {
     }
 
     /// Check if this is an early buyer and record if so
+    #[allow(clippy::too_many_arguments)]
     fn check_early_buyer(
         &self,
         mint: &str,
@@ -318,6 +322,7 @@ impl WalletTracker {
     }
 
     /// Check if this activity should trigger an insider alert
+    #[allow(clippy::too_many_arguments)]
     fn check_insider_alert(
         &self,
         wallet_type: &WalletType,
