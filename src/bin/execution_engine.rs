@@ -2056,8 +2056,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // Build SendResult if we sent something
     let mut send_result = if sent_anything && (bundle_id.is_some() || send_signature.is_some()) {
         Some(ironcrab::ipc::SendResult {
-            signature: send_signature,
-            bundle_id,
+            signature: send_signature.clone(),
+            bundle_id: bundle_id.clone(),
             sent_at_ms: chrono::Utc::now().timestamp_millis() as u64,
         })
     } else {
@@ -2197,7 +2197,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             primary_reject_reason: None,
             plan_hash,
             simulate: Some(sim_result),
-            send: send_result,
+            send: send_result.clone(),
             outcome: final_outcome,
             config_snapshot_id: None,
             input_snapshots: std::collections::HashMap::new(),
