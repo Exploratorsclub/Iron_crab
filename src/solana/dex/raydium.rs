@@ -14,6 +14,7 @@ use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_client::rpc_filter::RpcFilterType;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey; // SDK Pubkey (not Address wrapper)
+use solana_program::pubkey::Pubkey as ProgramPubkey;
 
 pub const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"; // verify
 pub const OPENBOOK_V3: &str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
@@ -59,6 +60,7 @@ pub struct Raydium {
     rpc: Arc<SolanaRpc>,
     pools: Arc<DashMap<Pubkey, SimplePool>>, // in-memory pool snapshot
     mint_index: Arc<DashMap<Pubkey, Vec<Pubkey>>>, // mint -> pools containing it
+    user_authority: Option<Pubkey>,
 }
 
 /// Planned swap including the constructed instruction list plus metadata for future TX assembly.
@@ -135,7 +137,15 @@ impl Raydium {
             rpc,
             pools: Arc::new(DashMap::new()),
             mint_index: Arc::new(DashMap::new()),
+            user_authority: None,
         }
+    }
+
+    /// Set the user authority (fee payer / signer) used for building swap instructions.
+    ///
+    /// RS-7.2: Raydium tx building must not use placeholder Pubkeys.
+    pub fn set_user_authority(&mut self, authority: Pubkey) {
+        self.user_authority = Some(authority);
     }
 
     /// Get total liquidity in SOL for a given mint across all tracked pools.
@@ -912,10 +922,31 @@ impl Dex for Raydium {
             quote_vault: pool.serum_quote_vault.unwrap(),
         };
 
-        // Use placeholder user accounts (will be replaced by actual caller)
-        let user_authority = Pubkey::default();
-        let user_source = Pubkey::default();
-        let user_destination = Pubkey::default();
+        let user_authority = self
+            .user_authority
+            .ok_or_else(|| anyhow!("raydium user_authority not set (required for tx building)"))?;
+
+        // Derive ATA addresses for input/output mints (Raydium uses SPL Token, not Token-2022).
+        let owner_spl = ProgramPubkey::new_from_array(user_authority.to_bytes());
+        let in_mint_spl = ProgramPubkey::new_from_array(in_pk.to_bytes());
+        let out_mint_spl = ProgramPubkey::new_from_array(out_pk.to_bytes());
+        let token_program_spl = spl_token::id();
+
+        let user_source_spl =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &owner_spl,
+                &in_mint_spl,
+                &token_program_spl,
+            );
+        let user_destination_spl =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &owner_spl,
+                &out_mint_spl,
+                &token_program_spl,
+            );
+
+        let user_source = Pubkey::new_from_array(user_source_spl.to_bytes());
+        let user_destination = Pubkey::new_from_array(user_destination_spl.to_bytes());
         // Use the actual market program ID from the pool snapshot, not hardcoded OpenBook V3
         let serum_program = pool
             .market_program_id

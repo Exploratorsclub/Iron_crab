@@ -80,7 +80,10 @@ impl CrossDexHandler {
     /// Initialize DEX connectors
     pub async fn init_dexes(&mut self) -> Result<()> {
         // Initialize Raydium
-        let raydium = Raydium::new(Arc::clone(&self.rpc));
+        let mut raydium = Raydium::new(Arc::clone(&self.rpc));
+        if let Some(w) = self.wallet.as_ref() {
+            raydium.set_user_authority(w.pubkey());
+        }
         self.dexes.insert("raydium".to_string(), Arc::new(raydium));
         info!("Initialized Raydium DEX connector");
 

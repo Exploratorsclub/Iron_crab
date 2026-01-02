@@ -54,7 +54,11 @@ impl Engine {
         });
 
         // Initialize DEX connectors for router
-        let raydium = Arc::new(Raydium::new(rpc.clone()));
+        let mut raydium = Raydium::new(rpc.clone());
+        raydium.set_user_authority(solana_sdk::pubkey::Pubkey::new_from_array(
+            treasury.pubkey().to_bytes(),
+        ));
+        let raydium = Arc::new(raydium);
 
         // Initialize Pump.fun connector
         let pumpfun = match PumpFunDex::new(rpc.clone()) {
@@ -441,7 +445,11 @@ impl Engine {
                 // Event-driven arbitrage scanning task with WebSocket pool updates
                 tracing::info!("arbitrage_task: starting EVENT-DRIVEN arbitrage engine");
 
-                let ray = Arc::new(Raydium::new(rpc.clone()));
+                let mut ray = Raydium::new(rpc.clone());
+                ray.set_user_authority(solana_sdk::pubkey::Pubkey::new_from_array(
+                    ctx_arb.treasury.pubkey().to_bytes(),
+                ));
+                let ray = Arc::new(ray);
                 let orc = Arc::new(Orca::new(rpc.clone()));
 
                 // CRITICAL: Warm up pools by forcing initial refresh
@@ -924,7 +932,11 @@ impl Engine {
         if let Some(sn_cfg) = self.ctx.cfg.sniper.clone() {
             let rpc_clone = self.ctx.rpc.clone();
             // Instantiate shared DEX connectors for sniper (lightweight additional instances)
-            let raydium_ref = Arc::new(Raydium::new(rpc_clone.clone()));
+            let mut raydium = Raydium::new(rpc_clone.clone());
+            raydium.set_user_authority(solana_sdk::pubkey::Pubkey::new_from_array(
+                self.ctx.treasury.pubkey().to_bytes(),
+            ));
+            let raydium_ref = Arc::new(raydium);
             let orca_ref = Arc::new(Orca::new(rpc_clone.clone()));
             let treasury_arc = Arc::new(self.ctx.treasury.clone());
             // Read diagnostic flag outside the task to avoid capturing &self

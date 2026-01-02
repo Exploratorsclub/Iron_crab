@@ -418,7 +418,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Wallet: {}", treasury.pubkey());
 
-    let raydium = Arc::new(Raydium::new(rpc.clone()));
+    let mut raydium = Raydium::new(rpc.clone());
+    raydium.set_user_authority(treasury.pubkey());
+    let raydium = Arc::new(raydium);
 
     // Initialize Pump.fun with user authority for selling
     let mut pumpfun = PumpFunDex::new(rpc.clone()).expect("Failed to create PumpFunDex");
