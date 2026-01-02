@@ -6,8 +6,8 @@ use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::wallet::Treasury;
-use solana_client::rpc_request::TokenAccountsFilter;
 use solana_client::rpc_config::RpcSendTransactionConfig;
+use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::bs58;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
@@ -176,7 +176,10 @@ async fn try_sell_jupiter(
         let quote_resp = match client.get(&quote_url).send().await {
             Ok(r) => r,
             Err(e) => {
-                warn!("Jupiter quote request failed for {} via {}: {:?}", mint, base, e);
+                warn!(
+                    "Jupiter quote request failed for {} via {}: {:?}",
+                    mint, base, e
+                );
                 continue;
             }
         };
@@ -184,14 +187,20 @@ async fn try_sell_jupiter(
         if !quote_resp.status().is_success() {
             let status = quote_resp.status();
             let body = quote_resp.text().await.unwrap_or_default();
-            warn!("Jupiter quote HTTP {} for {} via {}: {}", status, mint, base, body);
+            warn!(
+                "Jupiter quote HTTP {} for {} via {}: {}",
+                status, mint, base, body
+            );
             continue;
         }
 
         let quote_json: serde_json::Value = match quote_resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                warn!("Jupiter quote parse failed for {} via {}: {:?}", mint, base, e);
+                warn!(
+                    "Jupiter quote parse failed for {} via {}: {:?}",
+                    mint, base, e
+                );
                 continue;
             }
         };
@@ -214,7 +223,10 @@ async fn try_sell_jupiter(
             .unwrap_or(false);
 
         if !out_amount_ok {
-            warn!("Jupiter route outAmount is zero/missing for {} via {}", mint, base);
+            warn!(
+                "Jupiter route outAmount is zero/missing for {} via {}",
+                mint, base
+            );
             continue;
         }
 
@@ -230,7 +242,10 @@ async fn try_sell_jupiter(
         let swap_resp = match client.post(&swap_url).json(&swap_body).send().await {
             Ok(r) => r,
             Err(e) => {
-                warn!("Jupiter swap request failed for {} via {}: {:?}", mint, base, e);
+                warn!(
+                    "Jupiter swap request failed for {} via {}: {:?}",
+                    mint, base, e
+                );
                 continue;
             }
         };
@@ -238,14 +253,20 @@ async fn try_sell_jupiter(
         if !swap_resp.status().is_success() {
             let status = swap_resp.status();
             let body = swap_resp.text().await.unwrap_or_default();
-            warn!("Jupiter swap HTTP {} for {} via {}: {}", status, mint, base, body);
+            warn!(
+                "Jupiter swap HTTP {} for {} via {}: {}",
+                status, mint, base, body
+            );
             continue;
         }
 
         let parsed: JupiterSwapResponse = match swap_resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                warn!("Jupiter swap parse failed for {} via {}: {:?}", mint, base, e);
+                warn!(
+                    "Jupiter swap parse failed for {} via {}: {:?}",
+                    mint, base, e
+                );
                 continue;
             }
         };
@@ -262,7 +283,10 @@ async fn try_sell_jupiter(
     let tx_bytes = match B64.decode(swap_json.swap_transaction) {
         Ok(b) => b,
         Err(e) => {
-            warn!("Jupiter swapTransaction base64 decode failed for {}: {:?}", mint, e);
+            warn!(
+                "Jupiter swapTransaction base64 decode failed for {}: {:?}",
+                mint, e
+            );
             return false;
         }
     };
@@ -665,7 +689,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut raydium = Raydium::new(rpc.clone());
     raydium.set_user_authority(treasury.pubkey());
-        jupiter_base_url: Option<String>,
+    let raydium = Arc::new(raydium);
 
     // Initialize Pump.fun with user authority for selling
     let mut pumpfun = PumpFunDex::new(rpc.clone()).expect("Failed to create PumpFunDex");
@@ -700,78 +724,59 @@ async fn main() -> anyhow::Result<()> {
     info!("Found {} token accounts total.", token_accounts.len());
 
     let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-            if try_sell_jupiter(rpc.clone(), treasury.clone(), &task, jupiter_base_url.as_deref().unwrap_or("https://quote-api.jup.ag")).await {
+    let mut tasks: Vec<SellTask> = Vec::new();
 
     for ta in token_accounts {
         let data = ta.account.data;
-        let ta_pubkey = Pubkey::from_str(&ta.pubkey).unwrap();
+        let ta_pubkey = match Pubkey::from_str(&ta.pubkey) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
 
-        let result = match data {
-            solana_account_decoder::UiAccountData::Binary(b, _) => {
-                let bytes = bs58::decode(b).into_vec().unwrap_or_default();
-                if bytes.len() < 72 {
-                    None
-                } else {
-                    // Check frozen
-                    if bytes.len() >= 109 && bytes[108] == 2 {
-                        None
-                    } else {
-                        let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
-                        let mint = Pubkey::new_from_array(mint_bytes);
-                        let amount_bytes: [u8; 8] = bytes[64..72].try_into().unwrap();
-                        let amount = u64::from_le_bytes(amount_bytes);
-                        Some((mint, amount))
-                    }
-                }
+        let decode_raw_token_account = |b: String| -> Option<(Pubkey, u64)> {
+            let bytes = bs58::decode(b).into_vec().ok()?;
+            if bytes.len() < 72 {
+                return None;
             }
-            solana_account_decoder::UiAccountData::LegacyBinary(b) => {
-                let bytes = bs58::decode(b).into_vec().unwrap_or_default();
-                if bytes.len() < 72 {
-                    None
-            if try_sell_jupiter(rpc.clone(), treasury.clone(), &task, jupiter_base_url.as_deref().unwrap_or("https://quote-api.jup.ag")).await {
-                    // Check frozen
-                    if bytes.len() >= 109 && bytes[108] == 2 {
-                        None
-                    } else {
-                        let mint_bytes: [u8; 32] = bytes[0..32].try_into().unwrap();
-                        let mint = Pubkey::new_from_array(mint_bytes);
-                        let amount_bytes: [u8; 8] = bytes[64..72].try_into().unwrap();
-                        let amount = u64::from_le_bytes(amount_bytes);
-                        Some((mint, amount))
-                    }
-                }
+
+            // SPL Token account layout: freeze state at offset 108 (if present)
+            if bytes.len() >= 109 && bytes[108] == 2 {
+                return None;
             }
+
+            let mint_bytes: [u8; 32] = bytes[0..32].try_into().ok()?;
+            let mint = Pubkey::new_from_array(mint_bytes);
+            let amount_bytes: [u8; 8] = bytes[64..72].try_into().ok()?;
+            let amount = u64::from_le_bytes(amount_bytes);
+            Some((mint, amount))
+        };
+
+        let result: Option<(Pubkey, u64)> = match data {
+            solana_account_decoder::UiAccountData::Binary(b, _) => decode_raw_token_account(b),
+            solana_account_decoder::UiAccountData::LegacyBinary(b) => decode_raw_token_account(b),
             solana_account_decoder::UiAccountData::Json(parsed) => {
-                // Handle JSON parsed accounts
                 if let serde_json::Value::Object(info) = parsed.parsed {
-                    if let Some(info_obj) = info.get("info") {
-                        // Check frozen state
-                        let is_frozen = info_obj
-                            .get("state")
-        jupiter_base_url: &str,
-                            .map(|s| s.eq_ignore_ascii_case("frozen"))
-                            .unwrap_or(false);
+                    let info_obj = info.get("info")?;
 
-                        if is_frozen {
-                            None
-                        } else {
-                            let mint_str =
-                                info_obj.get("mint").and_then(|v| v.as_str()).unwrap_or("");
-                            let amount_str = info_obj
-                                .get("tokenAmount")
-                                .and_then(|v| v.get("amount"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("0");
+                    let is_frozen = info_obj
+                        .get("state")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.eq_ignore_ascii_case("frozen"))
+                        .unwrap_or(false);
 
-                            if let Ok(mint) = Pubkey::from_str(mint_str) {
-                                let amount = u64::from_str(amount_str).unwrap_or(0);
-                                Some((mint, amount))
-                            } else {
-                                None
-                            }
-                        }
-                    } else {
+                    if is_frozen {
                         None
+                    } else {
+                        let mint_str = info_obj.get("mint").and_then(|v| v.as_str())?;
+                        let amount_str = info_obj
+                            .get("tokenAmount")
+                            .and_then(|v| v.get("amount"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("0");
+
+                        let mint = Pubkey::from_str(mint_str).ok()?;
+                        let amount = u64::from_str(amount_str).unwrap_or(0);
+                        Some((mint, amount))
                     }
                 } else {
                     None
