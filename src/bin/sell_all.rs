@@ -180,8 +180,17 @@ async fn try_sell_jupiter(
         }
     };
 
+    // Jupiter v6 quote returns { data: [route...] }. Pick the best route (first).
+    let route = match quote_json.get("data").and_then(|v| v.as_array()) {
+        Some(arr) if !arr.is_empty() => arr[0].clone(),
+        _ => {
+            warn!("Jupiter quote returned no routes for {}", mint);
+            return false;
+        }
+    };
+
     // If outAmount is missing/zero, treat as no liquidity.
-    let out_amount_ok = quote_json
+    let out_amount_ok = route
         .get("outAmount")
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<u128>().ok())
@@ -189,12 +198,13 @@ async fn try_sell_jupiter(
         .unwrap_or(false);
 
     if !out_amount_ok {
-        warn!("Jupiter returned no outAmount for {}", mint);
+        warn!("Jupiter route outAmount is zero/missing for {}", mint);
         return false;
     }
 
     let swap_body = json!({
-        "quoteResponse": quote_json,
+        // IMPORTANT: /v6/swap expects a single route object from /v6/quote, not the whole response.
+        "quoteResponse": route,
         "userPublicKey": treasury.pubkey().to_string(),
         "wrapAndUnwrapSol": true,
         "dynamicComputeUnitLimit": true,
@@ -214,11 +224,9 @@ async fn try_sell_jupiter(
     };
 
     if !swap_resp.status().is_success() {
-        warn!(
-            "Jupiter swap HTTP {} for {}",
-            swap_resp.status(),
-            mint
-        );
+        let status = swap_resp.status();
+        let body = swap_resp.text().await.unwrap_or_default();
+        warn!("Jupiter swap HTTP {} for {}: {}", status, mint, body);
         return false;
     }
 
