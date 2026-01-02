@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Keypair, Signer};
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -93,7 +94,7 @@ struct Args {
     #[arg(long)]
     simulate_only: bool,
 
-    /// Dry run: don't connect to Solana or send transactions
+    /// Dry run: never send on-chain transactions (may still do read-only RPC for checks)
     #[arg(long)]
     dry_run: bool,
 
@@ -305,6 +306,7 @@ impl StateSnapshot {
 /// Runtime context for execution-engine
 struct ExecutionContext {
     run_id: String,
+    wallet_pubkey: Option<Pubkey>,
     /// Hot-reloadable configuration (RwLock for runtime updates via NATS)
     config: parking_lot::RwLock<ExecutionConfig>,
     config_snapshot_id: parking_lot::RwLock<String>,
@@ -637,6 +639,27 @@ fn load_wallet_keypair() -> Option<Keypair> {
     None
 }
 
+fn sdk_to_spl(pk: &Pubkey) -> spl_token::solana_program::pubkey::Pubkey {
+    spl_token::solana_program::pubkey::Pubkey::new_from_array(pk.to_bytes())
+}
+
+fn spl_to_sdk(pk: &spl_token::solana_program::pubkey::Pubkey) -> Pubkey {
+    Pubkey::new_from_array(pk.to_bytes())
+}
+
+fn token_program_for_mint_owner(owner: &Pubkey) -> Option<Pubkey> {
+    let spl_token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+    let spl_token_2022_program = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+
+    if *owner == spl_token_program {
+        Some(spl_token_program)
+    } else if *owner == spl_token_2022_program {
+        Some(spl_token_2022_program)
+    } else {
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -740,14 +763,16 @@ async fn main() -> Result<()> {
     info!(log_dir = %log_base.display(), "JSONL writers initialized");
 
     // Load wallet keypair and fetch real balance
-    let (_wallet_pubkey, initial_balance) = if has_keys && !args.dry_run {
+    // NOTE: In `--dry-run`, we still allow key loading and balance reads.
+    // `--dry-run` means: do not submit transactions, not: keyless.
+    let (wallet_pubkey, initial_balance) = if has_keys {
         let keypair = load_wallet_keypair();
         match keypair {
             Some(kp) => {
                 let pubkey = kp.pubkey();
                 info!(wallet = %pubkey, "Wallet keypair loaded");
 
-                // Fetch real balance from RPC
+                // Fetch real balance from RPC (read-only)
                 let rpc = RpcClient::new(args.rpc_url.clone());
                 match rpc.get_balance(&pubkey) {
                     Ok(balance) => {
@@ -852,6 +877,7 @@ async fn main() -> Result<()> {
 
     let ctx = Arc::new(ExecutionContext {
         run_id: run_id.clone(),
+        wallet_pubkey,
         config_snapshot_id: parking_lot::RwLock::new(exec_config.snapshot_id()),
         config: parking_lot::RwLock::new(exec_config),
         nats,
@@ -871,7 +897,7 @@ async fn main() -> Result<()> {
         bundles_confirmed: std::sync::atomic::AtomicU64::new(0),
         // Cross-DEX handler (initialized below)
         cross_dex_handler: None,
-        rpc_client: None,
+        rpc_client: Some(Arc::new(RpcClient::new(args.rpc_url.clone()))),
         // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
@@ -1284,6 +1310,110 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         });
     }
 
+    // Check 3e: SELL token balance preflight (avoid emitting SELL intents we cannot fulfill)
+    if intent.side == TradeSide::Sell {
+        let wallet = match ctx.wallet_pubkey {
+            Some(pk) => pk,
+            None => {
+                let reason = RejectReason::InternalError;
+                checks.push(CheckResult {
+                    check_name: "sell_token_balance".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some("wallet_pubkey_unavailable (no keys loaded)".to_string()),
+                });
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+        };
+
+        let rpc = match ctx.rpc_client.clone() {
+            Some(r) => r,
+            None => {
+                let reason = RejectReason::InternalError;
+                checks.push(CheckResult {
+                    check_name: "sell_token_balance".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some("rpc_client_unavailable".to_string()),
+                });
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+        };
+
+        let mint_str = intent.resources.input_mint.clone();
+        let required_raw = intent.required_capital.raw;
+
+        let balance_check = tokio::task::spawn_blocking(move || -> Result<(u64, Pubkey)> {
+            let mint = Pubkey::from_str(&mint_str)
+                .map_err(|_| anyhow::anyhow!("invalid input_mint: {}", mint_str))?;
+
+            let mint_acct = rpc
+                .get_account(&mint)
+                .map_err(|e| anyhow::anyhow!("failed to fetch mint account: {}", e))?;
+            let token_program =
+                token_program_for_mint_owner(&mint_acct.owner).ok_or_else(|| {
+                    anyhow::anyhow!("unsupported mint owner program: {}", mint_acct.owner)
+                })?;
+
+            let ata_spl = get_associated_token_address_with_program_id(
+                &sdk_to_spl(&wallet),
+                &sdk_to_spl(&mint),
+                &sdk_to_spl(&token_program),
+            );
+            let ata = spl_to_sdk(&ata_spl);
+
+            // If ATA doesn't exist yet, treat as 0 balance.
+            let available_raw = match rpc.get_token_account_balance(&ata) {
+                Ok(ui) => ui
+                    .amount
+                    .parse::<u64>()
+                    .map_err(|e| anyhow::anyhow!("invalid token amount: {}", e))?,
+                Err(_) => 0,
+            };
+
+            Ok((available_raw, ata))
+        })
+        .await?;
+
+        match balance_check {
+            Ok((available_raw, ata)) => {
+                if available_raw < required_raw {
+                    let reason = RejectReason::SimInsufficientBalance;
+                    checks.push(CheckResult {
+                        check_name: "sell_token_balance".to_string(),
+                        passed: false,
+                        reason_code: Some(reason.to_string()),
+                        details: Some(format!(
+                            "available={} < required={} (mint={}, ata={})",
+                            available_raw, required_raw, intent.resources.input_mint, ata
+                        )),
+                    });
+                    return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+                }
+
+                checks.push(CheckResult {
+                    check_name: "sell_token_balance".to_string(),
+                    passed: true,
+                    reason_code: None,
+                    details: Some(format!(
+                        "available={} >= required={} (ata={})",
+                        available_raw, required_raw, ata
+                    )),
+                });
+            }
+            Err(e) => {
+                let reason = RejectReason::InternalError;
+                checks.push(CheckResult {
+                    check_name: "sell_token_balance".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some(e.to_string()),
+                });
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+        }
+    }
+
     // === P1: Fee/Compute Policy Checks ===
     let fee_policy = &config.fee_policy;
 
@@ -1405,6 +1535,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     reason_code: Some(reason.to_string()),
                     details: Some(format!("pool locked by {}", existing.intent_id)),
                 });
+                ctx.lock_manager.release_locks(&intent.intent_id);
                 return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
             }
             LockResult::InsufficientCapital { .. } => {
@@ -1433,6 +1564,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     reason_code: Some(reason.to_string()),
                     details: Some(format!("mint locked by {}", existing.intent_id)),
                 });
+                ctx.lock_manager.release_locks(&intent.intent_id);
                 return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
             }
             LockResult::InsufficientCapital { .. } => {
@@ -1494,6 +1626,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         available, requested
                     )),
                 });
+                ctx.lock_manager.release_locks(&intent.intent_id);
                 return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
             }
             LockResult::Conflict { holder } => {
@@ -1505,6 +1638,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     reason_code: Some(reason.to_string()),
                     details: Some(format!("Lock held by: {}", holder.intent_id)),
                 });
+                ctx.lock_manager.release_locks(&intent.intent_id);
                 return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
             }
         }
