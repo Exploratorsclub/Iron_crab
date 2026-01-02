@@ -1377,6 +1377,13 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
         match balance_check {
             Ok((available_raw, ata)) => {
+                // Seed lock-manager token availability so we can lock against it.
+                // This prevents overlapping SELLs on the same mint from overbooking.
+                ctx.lock_manager.set_available_token_balance(
+                    intent.resources.input_mint.clone(),
+                    available_raw,
+                );
+
                 if available_raw < required_raw {
                     let reason = RejectReason::SimInsufficientBalance;
                     checks.push(CheckResult {
@@ -1580,75 +1587,79 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         details: Some(format!("locked={}", locked_resources)),
     });
 
-    // === Check 5: Capital lock (BUY only for now) ===
-    if intent.side == TradeSide::Buy {
-        let lock_result = ctx.lock_manager.try_lock_capital(
+    // === Check 5: Capital lock (BUY: SOL, SELL: tokens) ===
+    let lock_result = if intent.side == TradeSide::Buy {
+        ctx.lock_manager.try_lock_capital(
             holder,
             intent.required_capital.raw,
             std::collections::HashMap::new(),
-        );
-
-        match lock_result {
-            LockResult::Acquired => {
-                checks.push(CheckResult {
-                    check_name: "capital_lock".to_string(),
-                    passed: true,
-                    reason_code: None,
-                    details: None,
-                });
-            }
-            LockResult::AcquiredByPreemption { preempted } => {
-                // DoD L) P0: Higher-priority intent preempted lower-priority lock
-                info!(
-                    intent_id = %intent.intent_id,
-                    preempted_intent = %preempted.intent_id,
-                    "Capital lock acquired by preemption (DoD L)"
-                );
-                checks.push(CheckResult {
-                    check_name: "capital_lock".to_string(),
-                    passed: true,
-                    reason_code: None,
-                    details: Some(format!("Preempted: {}", preempted.intent_id)),
-                });
-            }
-            LockResult::InsufficientCapital {
-                available,
-                requested,
-            } => {
-                let reason = RejectReason::LockCapitalConflict;
-                REJECT_CAPITAL_LOCK.fetch_add(1, Ordering::Relaxed);
-                checks.push(CheckResult {
-                    check_name: "capital_lock".to_string(),
-                    passed: false,
-                    reason_code: Some(reason.to_string()),
-                    details: Some(format!(
-                        "Insufficient capital: available={}, requested={}",
-                        available, requested
-                    )),
-                });
-                ctx.lock_manager.release_locks(&intent.intent_id);
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-            }
-            LockResult::Conflict { holder } => {
-                let reason = RejectReason::LockCapitalConflict;
-                REJECT_CAPITAL_LOCK.fetch_add(1, Ordering::Relaxed);
-                checks.push(CheckResult {
-                    check_name: "capital_lock".to_string(),
-                    passed: false,
-                    reason_code: Some(reason.to_string()),
-                    details: Some(format!("Lock held by: {}", holder.intent_id)),
-                });
-                ctx.lock_manager.release_locks(&intent.intent_id);
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-            }
-        }
+        )
     } else {
-        checks.push(CheckResult {
-            check_name: "capital_lock".to_string(),
-            passed: true,
-            reason_code: None,
-            details: Some("skipped_for_sell".to_string()),
-        });
+        let mut tokens = std::collections::HashMap::new();
+        tokens.insert(
+            intent.resources.input_mint.clone(),
+            intent.required_capital.raw,
+        );
+        ctx.lock_manager.try_lock_capital(holder, 0, tokens)
+    };
+
+    match lock_result {
+        LockResult::Acquired => {
+            checks.push(CheckResult {
+                check_name: "capital_lock".to_string(),
+                passed: true,
+                reason_code: None,
+                details: Some(if intent.side == TradeSide::Buy {
+                    "sol".to_string()
+                } else {
+                    format!("token:{}", intent.resources.input_mint)
+                }),
+            });
+        }
+        LockResult::AcquiredByPreemption { preempted } => {
+            // DoD L) P0: Higher-priority intent preempted lower-priority lock
+            info!(
+                intent_id = %intent.intent_id,
+                preempted_intent = %preempted.intent_id,
+                "Capital lock acquired by preemption (DoD L)"
+            );
+            checks.push(CheckResult {
+                check_name: "capital_lock".to_string(),
+                passed: true,
+                reason_code: None,
+                details: Some(format!("Preempted: {}", preempted.intent_id)),
+            });
+        }
+        LockResult::InsufficientCapital {
+            available,
+            requested,
+        } => {
+            let reason = RejectReason::LockCapitalConflict;
+            REJECT_CAPITAL_LOCK.fetch_add(1, Ordering::Relaxed);
+            checks.push(CheckResult {
+                check_name: "capital_lock".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some(format!(
+                    "Insufficient capital: available={}, requested={}",
+                    available, requested
+                )),
+            });
+            ctx.lock_manager.release_locks(&intent.intent_id);
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+        }
+        LockResult::Conflict { holder } => {
+            let reason = RejectReason::LockCapitalConflict;
+            REJECT_CAPITAL_LOCK.fetch_add(1, Ordering::Relaxed);
+            checks.push(CheckResult {
+                check_name: "capital_lock".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some(format!("Lock held by: {}", holder.intent_id)),
+            });
+            ctx.lock_manager.release_locks(&intent.intent_id);
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+        }
     }
 
     // === Cross-DEX Arbitrage Validation (if applicable) ===

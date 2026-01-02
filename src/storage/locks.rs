@@ -357,6 +357,15 @@ impl LockManager {
         *self.available_tokens.write() = tokens;
     }
 
+    /// Update a single mint's available token balance.
+    ///
+    /// This is intentionally narrow: execution-engine may learn token balances
+    /// opportunistically (e.g., from a SELL preflight check) without having a
+    /// complete wallet token snapshot.
+    pub fn set_available_token_balance(&self, mint: String, amount_raw: u64) {
+        self.available_tokens.write().insert(mint, amount_raw);
+    }
+
     /// Check if an intent has already been processed (idempotency)
     pub fn is_duplicate(&self, intent_id: &str) -> bool {
         self.processed_intents.read().contains(intent_id)
