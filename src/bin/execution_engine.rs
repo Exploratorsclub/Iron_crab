@@ -877,7 +877,51 @@ async fn run_liquidation_job(
         }
 
         let Some(min_out) = min_out_sol else {
-            warn!(mint = %mint, amount_in, "No supported route for liquidation; skipping");
+            warn!(mint = %mint, amount_in, token_account = %ta_pubkey, "No supported route for liquidation; skipping");
+
+            // Emit a rejected DecisionRecord so the reason is forensically visible even
+            // when we cannot generate a sell intent (no quote / no supported route).
+            // This is especially important for “why was token X not liquidated?” cases.
+            let skip_intent_id = format!("liquidation-skip-{}", Uuid::new_v4());
+            let mut skip_intent = TradeIntent::new_sell(
+                "execution-engine",
+                BUILD_VERSION,
+                &ctx.run_id,
+                skip_intent_id,
+                "execution-engine",
+                IntentTier::Tier0,
+                IntentOrigin::ExecutionMevB,
+                mint.to_string(),
+                decimals,
+                sol_mint.to_string(),
+                amount_in,
+                0,
+                max_slippage_bps,
+                TradingRegime::NotApplicable,
+            );
+            skip_intent.ttl_ms = Some(ttl_ms);
+            skip_intent.resources = resources;
+            skip_intent.metadata.extend(metadata);
+
+            let decision_id = ctx.next_decision_id();
+            let checks = vec![CheckResult {
+                check_name: "liquidation_quote".to_string(),
+                passed: false,
+                reason_code: Some(RejectReason::QuoteUnavailable.to_string()),
+                details: Some(format!(
+                    "no_quote_from_supported_dexes mint={} amount_in={} token_account={}",
+                    mint, amount_in, ta_pubkey
+                )),
+            }];
+
+            let _ = emit_rejected_decision(
+                ctx.as_ref(),
+                decision_id,
+                &skip_intent,
+                checks,
+                RejectReason::QuoteUnavailable,
+            )
+            .await;
             continue;
         };
 
@@ -918,7 +962,195 @@ async fn run_liquidation_job(
         }
     }
 
+    // Post-liquidation cleanup:
+    // - Unwrap WSOL by closing WSOL ATA
+    // - Close empty token accounts to avoid leaving rent-funded accounts open
+    // Best-effort: failures are logged but do not fail the liquidation job.
+    #[cfg(unix)]
+    maybe_ping_watchdog();
+    if let Err(e) = cleanup_wallet_after_liquidation(ctx.as_ref(), owner).await {
+        warn!(error = %e, "Liquidation cleanup failed (best-effort)");
+    }
+
     info!("Liquidation job completed");
+}
+
+async fn cleanup_wallet_after_liquidation(ctx: &ExecutionContext, wallet: Pubkey) -> Result<()> {
+    let token_program_id = Pubkey::new_from_array(spl_token::id().to_bytes());
+    let token_2022_program_id = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+    let wsol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+        .expect("valid WSOL mint");
+
+    // Refresh list of token accounts so we operate on up-to-date balances.
+    let mut token_accounts = ctx
+        .rpc
+        .rpc
+        .get_token_accounts_by_owner(&wallet, TokenAccountsFilter::ProgramId(token_program_id))
+        .await
+        .unwrap_or_default();
+
+    if let Ok(mut accounts_2022) = ctx
+        .rpc
+        .rpc
+        .get_token_accounts_by_owner(&wallet, TokenAccountsFilter::ProgramId(token_2022_program_id))
+        .await
+    {
+        token_accounts.append(&mut accounts_2022);
+    }
+
+    // 1) Unwrap WSOL: close WSOL ATA (classic spl-token only)
+    let wsol_ata = ExecutionContext::ata_for_owner_mint(&wallet, &wsol_mint, &token_program_id);
+    if let Ok(acc) = ctx.rpc.rpc.get_account(&wsol_ata).await {
+        if acc.owner == token_program_id {
+            let close_ix = ExecutionContext::prog_ix_to_sdk(spl_ix::close_account(
+                &spl_token::id(),
+                &ExecutionContext::sdk_to_spl(&wsol_ata),
+                &ExecutionContext::sdk_to_spl(&wallet),
+                &ExecutionContext::sdk_to_spl(&wallet),
+                &[],
+            )?);
+
+            let plan = tx_builder::TxPlan {
+                instructions: vec![close_ix],
+            };
+            let sim = simulate_transaction(ctx, wallet, &plan).await;
+            if sim.success {
+                let config = ctx.get_config();
+                if config.send_enabled {
+                    match send_transaction_rpc(
+                        ctx,
+                        wallet,
+                        &plan,
+                        config.send_skip_preflight,
+                        parse_commitment_level_opt(config.send_preflight_commitment.as_deref()),
+                    )
+                    .await
+                    {
+                        Ok(sig) => info!(wallet = %wallet, wsol_ata = %wsol_ata, signature = %sig, "Unwrapped WSOL (closed ATA)"),
+                        Err(e) => warn!(wallet = %wallet, wsol_ata = %wsol_ata, error = %e, "Failed to unwrap WSOL (close ATA send failed)"),
+                    }
+                } else {
+                    info!(wallet = %wallet, wsol_ata = %wsol_ata, "send_enabled=false; would unwrap WSOL by closing ATA");
+                }
+            } else {
+                warn!(wallet = %wallet, wsol_ata = %wsol_ata, error = ?sim.error_code, "WSOL unwrap simulation failed; not sending");
+            }
+        }
+    }
+
+    // 2) Close empty token accounts (best-effort)
+    let mut close_candidates: Vec<(Pubkey, Pubkey, Pubkey, u64)> = Vec::new();
+    for ta in token_accounts {
+        let ta_pubkey = match Pubkey::from_str(&ta.pubkey) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Skip WSOL ATA here (handled above)
+        if ta_pubkey == wsol_ata {
+            continue;
+        }
+
+        // Extract mint+amount from JsonParsed only.
+        let parsed = match ta.account.data {
+            UiAccountData::Json(parsed) => parsed,
+            _ => continue,
+        };
+        let serde_json::Value::Object(root) = parsed.parsed else { continue };
+        let info = match root.get("info") {
+            Some(v) => v,
+            None => continue,
+        };
+        let mint_str = match info.get("mint").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let amount_str = info
+            .get("tokenAmount")
+            .and_then(|v| v.get("amount"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
+
+        let mint = match Pubkey::from_str(mint_str) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let amount_raw: u64 = match amount_str.parse() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+
+        // Only close empty accounts.
+        if amount_raw != 0 {
+            continue;
+        }
+        if mint == wsol_mint {
+            continue;
+        }
+
+        let token_program = Pubkey::from_str(&ta.account.owner).unwrap_or(token_program_id);
+        if token_program != token_program_id && token_program != token_2022_program_id {
+            continue;
+        }
+
+        close_candidates.push((ta_pubkey, mint, token_program, amount_raw));
+    }
+
+    if close_candidates.is_empty() {
+        return Ok(());
+    }
+
+    info!(count = close_candidates.len(), "Closing empty token accounts (best-effort)");
+    for (token_account, mint, token_program, _amount_raw) in close_candidates {
+        let close_ix = if token_program == token_program_id {
+            ExecutionContext::prog_ix_to_sdk(spl_ix::close_account(
+                &spl_token::id(),
+                &ExecutionContext::sdk_to_spl(&token_account),
+                &ExecutionContext::sdk_to_spl(&wallet),
+                &ExecutionContext::sdk_to_spl(&wallet),
+                &[],
+            )?)
+        } else {
+            ExecutionContext::prog_ix_to_sdk(spl22_ix::close_account(
+                &spl_token_2022::id(),
+                &ExecutionContext::sdk_to_spl(&token_account),
+                &ExecutionContext::sdk_to_spl(&wallet),
+                &ExecutionContext::sdk_to_spl(&wallet),
+                &[],
+            )?)
+        };
+
+        let plan = tx_builder::TxPlan {
+            instructions: vec![close_ix],
+        };
+
+        let sim = simulate_transaction(ctx, wallet, &plan).await;
+        if !sim.success {
+            warn!(token_account = %token_account, mint = %mint, token_program = %token_program, error = ?sim.error_code, "Close empty token account simulation failed; not sending");
+            continue;
+        }
+
+        let config = ctx.get_config();
+        if !config.send_enabled {
+            info!(token_account = %token_account, mint = %mint, token_program = %token_program, "send_enabled=false; would close empty token account");
+            continue;
+        }
+
+        match send_transaction_rpc(
+            ctx,
+            wallet,
+            &plan,
+            config.send_skip_preflight,
+            parse_commitment_level_opt(config.send_preflight_commitment.as_deref()),
+        )
+        .await
+        {
+            Ok(sig) => info!(token_account = %token_account, mint = %mint, token_program = %token_program, signature = %sig, "Closed empty token account"),
+            Err(e) => warn!(token_account = %token_account, mint = %mint, token_program = %token_program, error = %e, "Close empty token account send failed"),
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_manual_burn_job(
