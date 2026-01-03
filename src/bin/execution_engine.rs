@@ -399,6 +399,12 @@ struct StateSnapshot {
     saved_at: String,
     /// Run ID that created this snapshot
     run_id: String,
+
+    /// Operational kill switch state. When true: reject new BUY intents.
+    ///
+    /// `serde(default)` keeps backward compatibility with older snapshots.
+    #[serde(default)]
+    kill_switch_active: bool,
 }
 
 impl StateSnapshot {
@@ -425,6 +431,7 @@ impl StateSnapshot {
             processed_intents: ctx.lock_manager.get_processed_intents(),
             saved_at: chrono::Utc::now().to_rfc3339(),
             run_id: ctx.run_id.clone(),
+            kill_switch_active: ctx.kill_switch_active.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -462,6 +469,7 @@ impl StateSnapshot {
                         saved_at = %snapshot.saved_at,
                         prev_run_id = %snapshot.run_id,
                         processed_intents = snapshot.processed_intents.len(),
+                        kill_switch_active = snapshot.kill_switch_active,
                         "Loaded state snapshot"
                     );
                     Some(snapshot)
@@ -1852,6 +1860,12 @@ async fn main() -> Result<()> {
         )
     };
 
+    // Kill-switch persistence: survives restarts and is independent of day.
+    let initial_kill_switch_active = snapshot
+        .as_ref()
+        .map(|s| s.kill_switch_active)
+        .unwrap_or(false);
+
     let ctx = Arc::new(ExecutionContext {
         run_id: run_id.clone(),
         wallet_pubkey,
@@ -1870,7 +1884,7 @@ async fn main() -> Result<()> {
         current_day: parking_lot::RwLock::new(initial_day),
         daily_loss_lamports: std::sync::atomic::AtomicI64::new(initial_daily_loss),
         open_positions: std::sync::atomic::AtomicUsize::new(initial_positions),
-        kill_switch_active: AtomicBool::new(false),
+        kill_switch_active: AtomicBool::new(initial_kill_switch_active),
         liquidation_in_progress: AtomicBool::new(false),
         burn_in_progress: AtomicBool::new(false),
         // P1: Jito bundle support
@@ -1905,6 +1919,20 @@ async fn main() -> Result<()> {
 
     // Keep readiness fresh even when idle.
     ironcrab::metrics::record_activity();
+
+    // P1 Crash Isolation: systemd watchdog should continue to be pinged even when the
+    // main loop is busy (e.g. liquidation/burn jobs can do long RPC calls).
+    // This runs independently of the select-loop tick.
+    #[cfg(unix)]
+    {
+        tokio::spawn(async {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+            }
+        });
+    }
 
     // Subscribe to TradeIntents if NATS connected
     let intent_subscription = if let Some(ref nats) = ctx.nats {
@@ -2045,6 +2073,11 @@ async fn main() -> Result<()> {
                                     ctx.kill_switch_active.store(active, Ordering::Relaxed);
                                     info!(active, liquidate_positions, reason = ?reason, "Kill switch updated");
 
+                                    // Persist immediately so restarts don't silently drop the kill switch.
+                                    if let Err(e) = ctx.save_state() {
+                                        warn!(error = %e, "Failed to persist state after kill switch update");
+                                    }
+
                                     if active && liquidate_positions {
                                         let slippage = max_slippage_bps.unwrap_or(9900);
                                         let ttl = ttl_ms.unwrap_or(60_000);
@@ -2060,6 +2093,11 @@ async fn main() -> Result<()> {
                                 ControlRequestKind::ResetKillSwitch => {
                                     ctx.kill_switch_active.store(false, Ordering::Relaxed);
                                     info!("Kill switch reset");
+
+                                    // Persist immediately so restarts don't re-enable a previously active kill switch.
+                                    if let Err(e) = ctx.save_state() {
+                                        warn!(error = %e, "Failed to persist state after kill switch reset");
+                                    }
                                 }
                                 ControlRequestKind::BurnTokenAccounts { owner_pubkey, token_accounts, close_accounts, reason } => {
                                     ExecutionContext::run_manual_burn_job(
