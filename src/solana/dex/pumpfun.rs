@@ -891,23 +891,26 @@ impl PumpFunDex {
             &token_program_sdk,
         );
 
-        // CRITICAL: Creator MUST come from Geyser event (trusted source).
-        // The bonding curve layout changed (81 -> 154 bytes) and creator field is at wrong offset.
-        // DO NOT attempt to parse creator from bonding curve - it will fail!
+        // Prefer creator from a trusted Geyser event (strategy-provided).
+        // Fallback: parse creator from the on-chain bonding curve state.
         let creator = match fallback_creator {
             Some(c) => {
                 info!(
                     token_mint = %token_mint_str,
                     creator = %c,
-                    "pump.fun: using creator from Geyser event"
+                    "pump.fun: using creator from producer"
                 );
                 c
             }
             None => {
-                return Err(anyhow!(
-                    "Cannot build Pump.fun swap: creator not provided. \
-                    Bonding curve parsing is disabled due to layout change."
-                ));
+                let acct = self.rpc.get_account_retry(&bonding_curve).await?;
+                let state = BondingCurveState::parse(&acct.data)?;
+                info!(
+                    token_mint = %token_mint_str,
+                    creator = %state.creator,
+                    "pump.fun: parsed creator from bonding curve state"
+                );
+                state.creator
             }
         };
 

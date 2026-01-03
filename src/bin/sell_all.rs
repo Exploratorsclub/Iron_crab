@@ -1,30 +1,45 @@
+//! Deprecated legacy implementation.
+//!
+//! The architecture-aligned, keyless liquidation tool lives in `sell_all_keyless.rs`
+//! and publishes `TradeIntent`s to NATS (execution-engine is the only signer).
+
+fn main() {
+    eprintln!(
+        "Deprecated: this legacy sell-all implementation is no longer used. \
+Run the `sell-all` binary (wired to src/bin/sell_all_keyless.rs)."
+    );
+    std::process::exit(1);
+}
+
+/*
+
 use clap::Parser;
-use futures::stream::{self, StreamExt};
 use ironcrab::config::Config;
+use ironcrab::ipc::{
+    DecisionOutcome, DecisionRecord, ExplicitAmount, IntentOrigin, IntentTier, TradeExecutionConstraints,
+    TradeIntent, TradeResources, TradeSide, TradingRegime,
+};
+use ironcrab::nats::{
+    NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS,
+};
 use ironcrab::solana::dex::pumpfun::PumpFunDex;
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
-use ironcrab::wallet::Treasury;
-use solana_client::rpc_config::RpcSendTransactionConfig;
+use ironcrab::solana::token_utils::get_token_decimals_or_default;
+use ironcrab::storage::jsonl_writer::{JsonlWriter, JsonlWriterConfig};
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::bs58;
-use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::transaction::Transaction;
-use solana_sdk::transaction::VersionedTransaction;
-use solana_transaction_status::UiTransactionEncoding;
-use std::fs;
-use std::io::{self, Write};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
-use tracing::{info, warn};
+use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
-use serde_json::json;
+use spl_token::solana_program::pubkey::Pubkey as SplProgPubkey;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -84,304 +99,114 @@ async fn burn_and_close_account(
         program_id: token_program_id,
         accounts: vec![
             AccountMeta::new(task.ta_pubkey, false), // token account (writable)
-            AccountMeta::new(task.mint, false),      // mint (writable)
-            AccountMeta::new_readonly(treasury.pubkey(), true), // owner (signer)
-        ],
-        data: burn_data,
-    };
 
-    // Build close account instruction manually (SPL Token instruction index 9 = CloseAccount)
-    // Accounts: [account_to_close (writable), destination (writable), owner (signer)]
-    let close_ix = Instruction {
-        program_id: token_program_id,
+        /// Wallet owner pubkey to liquidate (required; keyless tool).
+        #[arg(long)]
+        owner_pubkey: String,
+
+        /// NATS URL (default: $NATS_URL or nats://localhost:4222)
+        #[arg(long, default_value = "")]
+        nats_url: String,
+
+        /// Max slippage for liquidation intents (bps). Default: 9900 (panic sell)
+        #[arg(long, default_value_t = 9900)]
+        max_slippage_bps: u32,
+
+        /// TTL for intents (ms). Default: 60000
+        #[arg(long, default_value_t = 60_000)]
+        ttl_ms: u64,
+
+        /// Optional: wait for DecisionRecords/ExecutionResults and print a final summary.
+        #[arg(long, default_value_t = true)]
+        wait: bool,
+
+        /// Wait timeout (seconds) if --wait
+        #[arg(long, default_value_t = 180)]
+        wait_timeout_secs: u64,
+
+        /// JSONL log dir (default: trade_logs/liquidations)
+        #[arg(long)]
+        log_dir: Option<PathBuf>,
         accounts: vec![
-            AccountMeta::new(task.ta_pubkey, false), // account to close (writable)
-            AccountMeta::new(treasury.pubkey(), false), // destination for rent (writable)
-            AccountMeta::new_readonly(treasury.pubkey(), true), // owner (signer)
-        ],
-        data: vec![9u8], // CloseAccount instruction index
-    };
 
-    let latest_blockhash = rpc.get_latest_blockhash_retry().await?;
-    let mut tx = Transaction::new_with_payer(&[burn_ix, close_ix], Some(&treasury.pubkey()));
-
-    if let Err(e) = tx.try_sign(&[treasury.signer_ref()], latest_blockhash) {
-        warn!("Failed to sign burn+close for {}: {:?}", task.mint, e);
-        return Err(anyhow::anyhow!("Failed to sign"));
+    #[derive(Debug, Clone)]
+    struct SellTask {
+        mint: Pubkey,
+        amount_raw: u64,
+        token_account: Pubkey,
+        token_program: Pubkey,
+        mint_decimals: u8,
     }
 
-    match rpc.rpc.send_and_confirm_transaction(&tx).await {
-        Ok(sig) => {
-            info!(
-                "Burned {} tokens and closed account for {}! Recovered rent. Sig: {}",
-                task.amount, task.mint, sig
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LiquidationOutcome {
+        Pending,
+        Rejected,
+        SimFailed,
+        Sent,
+        Confirmed,
+        Failed,
+        Timeout,
+    }
+
+    const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+    #[inline]
+    fn sdk_to_spl(pk: &Pubkey) -> SplProgPubkey {
+        SplProgPubkey::new_from_array(pk.to_bytes())
+    }
+
+    #[inline]
+    fn spl_to_sdk(pk: &SplProgPubkey) -> Pubkey {
+        Pubkey::new_from_array(pk.to_bytes())
+    }
+
+    fn apply_slippage_min_out(quoted_out: u64, slippage_bps: u32) -> u64 {
+        let keep_bps = 10_000u64.saturating_sub(slippage_bps as u64);
+        ((quoted_out as u128) * (keep_bps as u128) / 10_000u128) as u64
+    }
+
+    fn ensure_keyless_or_exit() {
+        let key_vars = [
+            "IRONCRAB_KEYPAIR_JSON",
+            "IRONCRAB_KEYPAIR_B64",
+            "IRONCRAB_KEYPAIR_PATH",
+            "IRONCRAB_KEYPAIR_BASE58",
+        ];
+        if key_vars.iter().any(|v| std::env::var(v).is_ok()) {
+            error!(
+                "ERROR: Wallet key environment variables detected! sell-all is KEYLESS per architecture."
             );
-            Ok(())
-        }
-        Err(e) => {
-            warn!("Failed to burn+close {}: {:?}", task.mint, e);
-            Err(anyhow::anyhow!("TX failed: {:?}", e))
+            error!("Only execution-engine should have access to wallet keys.");
+            std::process::exit(1);
         }
     }
-}
 
-/// Result of sell attempt - either sold or needs burn
-#[derive(Debug)]
-enum SellResult {
-    Sold,
-    NeedsConfirmation(SellTask, String), // task + reason why it failed
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct JupiterSwapResponse {
-    #[serde(rename = "swapTransaction")]
-    swap_transaction: String,
-}
-
-async fn try_sell_jupiter(
-    rpc: Arc<SolanaRpc>,
-    treasury: Arc<Treasury>,
-    task: &SellTask,
-    jupiter_base_url: &str,
-) -> bool {
-    // Jupiter fallback is useful for migrated Pump.fun tokens (e.g. PumpSwap liquidity)
-    // and for any token where our native DEX connectors don't have coverage.
-    let mint = task.mint;
-    let amount = task.amount;
-    let sol_mint = "So11111111111111111111111111111111111111112";
-    let slippage_bps = 9900u16; // panic sell
-
-    info!("Trying Jupiter for {} ({} tokens)...", mint, amount);
-
-    let client = reqwest::Client::new();
-    let primary_base = jupiter_base_url.trim_end_matches('/');
-    let mut bases = vec![primary_base.to_string()];
-
-    // Safe fallback: try api.jup.ag with the same v6 paths if the default quote-api host
-    // is broken/unresolvable in the environment.
-    if primary_base == "https://quote-api.jup.ag" {
-        bases.push("https://api.jup.ag".to_string());
+    async fn token_program_for_mint(rpc: &SolanaRpc, mint: &Pubkey) -> anyhow::Result<Pubkey> {
+        let acct = rpc.rpc.get_account(mint).await?;
+        let owner = acct.owner;
+        let spl = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let spl22 = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+        if owner == spl {
+            Ok(spl)
+        } else if owner == spl22 {
+            Ok(spl22)
+        } else {
+            anyhow::bail!("Mint owner is neither spl-token nor spl-token-2022: {}", owner);
+        }
     }
 
-    let mut swap_json: Option<JupiterSwapResponse> = None;
-
-    for base in bases {
-        info!("Jupiter base URL: {}", base);
-
-        let quote_url = format!(
-            "{}/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
-            base, mint, sol_mint, amount, slippage_bps
+    fn ata_for_owner_mint(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
+        let owner_spl = sdk_to_spl(owner);
+        let mint_spl = sdk_to_spl(mint);
+        let token_prog_spl = sdk_to_spl(token_program);
+        let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_spl,
+            &mint_spl,
+            &token_prog_spl,
         );
-
-        let quote_resp = match client.get(&quote_url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    "Jupiter quote request failed for {} via {}: {:?}",
-                    mint, base, e
-                );
-                continue;
-            }
-        };
-
-        if !quote_resp.status().is_success() {
-            let status = quote_resp.status();
-            let body = quote_resp.text().await.unwrap_or_default();
-            warn!(
-                "Jupiter quote HTTP {} for {} via {}: {}",
-                status, mint, base, body
-            );
-            continue;
-        }
-
-        let quote_json: serde_json::Value = match quote_resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    "Jupiter quote parse failed for {} via {}: {:?}",
-                    mint, base, e
-                );
-                continue;
-            }
-        };
-
-        // Jupiter v6 quote returns { data: [route...] }. Pick the best route (first).
-        let route = match quote_json.get("data").and_then(|v| v.as_array()) {
-            Some(arr) if !arr.is_empty() => arr[0].clone(),
-            _ => {
-                warn!("Jupiter quote returned no routes for {} via {}", mint, base);
-                continue;
-            }
-        };
-
-        // If outAmount is missing/zero, treat as no liquidity.
-        let out_amount_ok = route
-            .get("outAmount")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<u128>().ok())
-            .map(|n| n > 0)
-            .unwrap_or(false);
-
-        if !out_amount_ok {
-            warn!(
-                "Jupiter route outAmount is zero/missing for {} via {}",
-                mint, base
-            );
-            continue;
-        }
-
-        let swap_body = json!({
-            // IMPORTANT: /v6/swap expects a single route object from /v6/quote, not the whole response.
-            "quoteResponse": route,
-            "userPublicKey": treasury.pubkey().to_string(),
-            "wrapAndUnwrapSol": true,
-            "dynamicComputeUnitLimit": true,
-        });
-
-        let swap_url = format!("{}/v6/swap", base);
-        let swap_resp = match client.post(&swap_url).json(&swap_body).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    "Jupiter swap request failed for {} via {}: {:?}",
-                    mint, base, e
-                );
-                continue;
-            }
-        };
-
-        if !swap_resp.status().is_success() {
-            let status = swap_resp.status();
-            let body = swap_resp.text().await.unwrap_or_default();
-            warn!(
-                "Jupiter swap HTTP {} for {} via {}: {}",
-                status, mint, base, body
-            );
-            continue;
-        }
-
-        let parsed: JupiterSwapResponse = match swap_resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    "Jupiter swap parse failed for {} via {}: {:?}",
-                    mint, base, e
-                );
-                continue;
-            }
-        };
-
-        swap_json = Some(parsed);
-        break;
+        spl_to_sdk(&ata_spl)
     }
-
-    let swap_json = match swap_json {
-        Some(v) => v,
-        None => return false,
-    };
-
-    let tx_bytes = match B64.decode(swap_json.swap_transaction) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                "Jupiter swapTransaction base64 decode failed for {}: {:?}",
-                mint, e
-            );
-            return false;
-        }
-    };
-
-    let decoded: VersionedTransaction = match bincode::deserialize(&tx_bytes) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("Jupiter tx deserialize failed for {}: {:?}", mint, e);
-            return false;
-        }
-    };
-
-    // Re-sign with our key (drop any placeholder signatures from API)
-    let signed = match VersionedTransaction::try_new(decoded.message, &[treasury.signer_ref()]) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("Jupiter tx signing failed for {}: {:?}", mint, e);
-            return false;
-        }
-    };
-
-    let config = RpcSendTransactionConfig {
-        skip_preflight: true,
-        preflight_commitment: None,
-        encoding: Some(UiTransactionEncoding::Base64),
-        max_retries: None,
-        min_context_slot: None,
-    };
-
-    let sig = match rpc.rpc.send_transaction_with_config(&signed, config).await {
-        Ok(sig) => sig,
-        Err(e) => {
-            warn!("Jupiter TX send failed for {}: {:?}", mint, e);
-            return false;
-        }
-    };
-
-    // Confirm via signature statuses (best-effort, bounded wait).
-    let start = Instant::now();
-    loop {
-        if start.elapsed().as_secs() > 45 {
-            warn!("Jupiter TX confirmation timeout for {}: {}", mint, sig);
-            return false;
-        }
-
-        match rpc.get_signature_statuses_retry(&[sig]).await {
-            Ok(resp) => {
-                if let Some(st) = resp.value.get(0).and_then(|v| v.as_ref()) {
-                    if st.err.is_some() {
-                        warn!("Jupiter TX confirmed with error for {}: {}", mint, sig);
-                        return false;
-                    }
-                    if matches!(
-                        st.confirmation_status,
-                        Some(
-                            solana_transaction_status::TransactionConfirmationStatus::Confirmed
-                                | solana_transaction_status::TransactionConfirmationStatus::Finalized
-                        )
-                    ) {
-                        info!("✅ Sold {} via Jupiter! Sig: {}", mint, sig);
-                        return true;
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Jupiter TX status check failed for {}: {:?}", mint, e);
-            }
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-}
-
-/// Try to sell on Raydium - returns true if successful
-async fn try_sell_raydium(
-    rpc: Arc<SolanaRpc>,
-    raydium: Arc<Raydium>,
-    treasury: Arc<Treasury>,
-    task: &SellTask,
-    wsol_ata: Pubkey,
-) -> bool {
-    let mint = task.mint;
-    let amount = task.amount;
-    let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
-    let slippage_bps = 9900; // 99% slippage for panic sell
-
-    info!("Trying Raydium for {} ({} tokens)...", mint, amount);
-
-    // Fetch pool from Raydium API
-    let url = format!(
-        "https://api-v3.raydium.io/pools/info/mint?mint1={}&mint2={}&poolType=all&poolSortField=liquidity&sortType=desc&pageSize=10&page=1",
-        mint, sol_mint
-    );
-
-    let output = std::process::Command::new("curl")
         .arg("-s")
         .arg(&url)
         .output();
@@ -671,30 +496,56 @@ async fn sell_token(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("sell_all=info".parse()?)
+                .add_directive("ironcrab=info".parse()?),
+        )
+        .init();
+
     let args = Args::parse();
     let mut cfg = Config::load(&args.config)?;
+
+    ensure_keyless_or_exit();
+
+    let run_id = Uuid::new_v4().to_string();
+    let build = env!("CARGO_PKG_VERSION");
 
     if let Some(url) = args.rpc_url {
         info!("Overriding RPC URL: {}", url);
         cfg.solana.rpc_url = url;
     }
 
-    info!("Loading wallet and RPC...");
+    let owner = Pubkey::from_str(&args.owner_pubkey)
+        .map_err(|e| anyhow::anyhow!("invalid --owner-pubkey: {e}"))?;
+
+    info!(run_id = %run_id, owner = %owner, rpc_url = %cfg.solana.rpc_url, "Starting keyless sell-all liquidation");
+
     let rpc = Arc::new(SolanaRpc::from_cfg(&cfg.solana));
-    let treasury =
-        Treasury::load_from_env().or_else(|_| Treasury::load(&cfg.solana.keypair_path))?;
 
-    info!("Wallet: {}", treasury.pubkey());
+    let log_dir = args
+        .log_dir
+        .unwrap_or_else(|| PathBuf::from("trade_logs/liquidations"));
+    let jsonl = JsonlWriter::new(JsonlWriterConfig::new("liquidations").with_log_dir(&log_dir))?;
 
-    let mut raydium = Raydium::new(rpc.clone());
-    raydium.set_user_authority(treasury.pubkey());
-    let raydium = Arc::new(raydium);
+    // Setup NATS
+    let nats_url = if args.nats_url.trim().is_empty() {
+        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string())
+    } else {
+        args.nats_url.clone()
+    };
+    let mut nats = NatsClient::new(NatsConfig::new(&nats_url, "sell-all"));
+    nats.connect().await?;
+    info!(nats_url = %nats_url, "Connected to NATS");
 
-    // Initialize Pump.fun with user authority for selling
-    let mut pumpfun = PumpFunDex::new(rpc.clone()).expect("Failed to create PumpFunDex");
-    pumpfun.set_user_authority(treasury.pubkey());
-    let pumpfun = Arc::new(pumpfun);
+    // Initialize DEX connectors (keyless) for route discovery only
+    let raydium = Raydium::new(Arc::clone(&rpc));
+    let pumpfun = PumpFunDex::new(Arc::clone(&rpc))?;
+
+    // Raydium requires pool snapshots to quote + provide pool id
+    info!("Refreshing Raydium pools (for route discovery)...");
+    raydium.refresh_pools().await?;
 
     // Fetch all token accounts (Token Program AND Token-2022)
     let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
@@ -704,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
     let mut token_accounts = rpc
         .rpc
         .get_token_accounts_by_owner(
-            &treasury.pubkey(),
+            &owner,
             TokenAccountsFilter::ProgramId(token_program_id),
         )
         .await?;
@@ -713,7 +564,7 @@ async fn main() -> anyhow::Result<()> {
     if let Ok(mut accounts_2022) = rpc
         .rpc
         .get_token_accounts_by_owner(
-            &treasury.pubkey(),
+            &owner,
             TokenAccountsFilter::ProgramId(token_2022_program_id),
         )
         .await
@@ -724,6 +575,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Found {} token accounts total.", token_accounts.len());
 
     let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+
     let mut tasks: Vec<SellTask> = Vec::new();
 
     for ta in token_accounts {
@@ -806,19 +658,217 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        info!("Queuing sell for {} of mint {}", amount, mint);
+        // Determine mint decimals + token program, and only act on the ATA (engine executes from ATA)
+        let token_program = match token_program_for_mint(&rpc, &mint).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(mint = %mint, error = %e, "Skipping mint: cannot determine token program");
+                continue;
+            }
+        };
+
+        let ata = ata_for_owner_mint(&owner, &mint, &token_program);
+        if ta_pubkey != ata {
+            // Avoid false-positive liquidation: engine will sell from ATA only.
+            warn!(mint = %mint, token_account = %ta_pubkey, ata = %ata, "Skipping non-ATA token account (engine sells from ATA)");
+            continue;
+        }
+
+        let decimals = get_token_decimals_or_default(&rpc, &mint).await;
+
+        info!(mint = %mint, amount_raw = amount, decimals, ata = %ata, "Queuing liquidation");
         tasks.push(SellTask {
             mint,
-            amount,
-            ta_pubkey,
+            amount_raw: amount,
+            token_account: ta_pubkey,
+            token_program,
+            mint_decimals: decimals,
         });
     }
 
     if tasks.is_empty() {
-        info!("No sellable tokens found.");
-        update_risk_state()?;
+        info!("No sellable ATA balances found.");
         return Ok(());
     }
+
+    // Publish liquidation intents
+    let mut intent_to_mint: HashMap<String, Pubkey> = HashMap::new();
+    let mut published = 0usize;
+    let mut skipped = 0usize;
+
+    for task in &tasks {
+        let mint = task.mint;
+        let amount_in = task.amount_raw;
+
+        // Discover route + min_out
+        let mut metadata: HashMap<String, String> = HashMap::new();
+        metadata.insert("purpose".to_string(), "liquidation".to_string());
+        metadata.insert("sell_all".to_string(), "true".to_string());
+        metadata.insert("mint_decimals".to_string(), task.mint_decimals.to_string());
+        metadata.insert("token_account".to_string(), task.token_account.to_string());
+        metadata.insert("token_program".to_string(), task.token_program.to_string());
+
+        let mut resources = TradeResources {
+            input_mint: mint.to_string(),
+            output_mint: SOL_MINT.to_string(),
+            pools: vec![],
+            accounts: vec![task.token_account.to_string()],
+        };
+
+        // Prefer Pump.fun for non-migrated curve tokens.
+        // If migrated, Pump.fun quote returns None and we try Raydium.
+        let mut dex: Option<&'static str> = None;
+        let mut min_out_sol: Option<u64> = None;
+
+        if let Ok(Some(q)) = pumpfun
+            .quote_exact_in(&mint.to_string(), SOL_MINT, amount_in)
+            .await
+        {
+            // We need creator for Pump.fun tx build (execution-engine requires metadata.creator).
+            // The quote route includes the bonding curve account, from which we can parse creator.
+            if let Some(bc) = q.route.first().and_then(|s| Pubkey::from_str(s).ok()) {
+                if let Ok(acct) = rpc.rpc.get_account(&bc).await {
+                    if let Ok(state) = ironcrab::solana::dex::pumpfun::BondingCurveState::parse(&acct.data) {
+                        metadata.insert("creator".to_string(), state.creator.to_string());
+                    }
+                }
+            }
+
+            if metadata.get("creator").is_some() {
+                dex = Some("pumpfun");
+                let quoted_out = q.amount_out;
+                let min_out = apply_slippage_min_out(quoted_out, args.max_slippage_bps);
+                min_out_sol = Some(min_out);
+                metadata.insert("dex".to_string(), "pumpfun".to_string());
+            }
+        }
+
+        if dex.is_none() {
+            if let Ok(Some(q)) = raydium
+                .quote_exact_in(&mint.to_string(), SOL_MINT, amount_in)
+                .await
+            {
+                if let Some(pool_id) = q.route.first().cloned() {
+                    dex = Some("raydium");
+                    metadata.insert("dex".to_string(), "raydium".to_string());
+                    resources.pools = vec![pool_id];
+                    let quoted_out = q.amount_out;
+                    let min_out = apply_slippage_min_out(quoted_out, args.max_slippage_bps);
+                    min_out_sol = Some(min_out);
+                }
+            }
+        }
+
+        let Some(min_out) = min_out_sol else {
+            skipped += 1;
+            warn!(mint = %mint, "No supported liquidation route found; skipping intent publish");
+            continue;
+        };
+
+        let intent_id = format!("liquidation-{}", Uuid::new_v4());
+        let mut intent = TradeIntent::new(
+            "sell-all",
+            build,
+            &run_id,
+            intent_id.clone(),
+            "sell-all",
+            IntentTier::Tier0,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(amount_in, task.mint_decimals),
+            resources,
+            0,
+            args.max_slippage_bps,
+            TradeSide::Sell,
+            TradingRegime::NotApplicable,
+        );
+        intent.ttl_ms = Some(args.ttl_ms);
+        intent.metadata.extend(metadata);
+        intent.execution = Some(TradeExecutionConstraints {
+            min_out: Some(ExplicitAmount::new(min_out, 9)),
+        });
+
+        jsonl.write(&serde_json::json!({
+            "kind": "trade_intent",
+            "intent": intent,
+        }))?;
+
+        let ok = nats.publish(TOPIC_TRADE_INTENTS, &intent).await?;
+        if !ok {
+            anyhow::bail!("NATS publish dropped/failed topic={}", TOPIC_TRADE_INTENTS);
+        }
+
+        intent_to_mint.insert(intent_id, mint);
+        published += 1;
+    }
+
+    info!(published, skipped, "Liquidation intents published");
+    if !args.wait || intent_to_mint.is_empty() {
+        return Ok(());
+    }
+
+    // Wait for results
+    let mut pending: HashSet<String> = intent_to_mint.keys().cloned().collect();
+    let mut outcomes: HashMap<String, LiquidationOutcome> = pending
+        .iter()
+        .map(|id| (id.clone(), LiquidationOutcome::Pending))
+        .collect();
+
+    let mut exec_sub = nats.subscribe(TOPIC_EXECUTION_RESULTS).await?;
+    let mut dec_sub = nats.subscribe(TOPIC_DECISION_RECORDS).await?;
+
+    let deadline = Instant::now() + Duration::from_secs(args.wait_timeout_secs);
+    while !pending.is_empty() && Instant::now() < deadline {
+        tokio::select! {
+            msg = exec_sub.next() => {
+                let Some(msg) = msg else { continue; };
+                if let Ok(exec) = serde_json::from_slice::<ironcrab::ipc::ExecutionResult>(&msg.payload) {
+                    if !pending.contains(&exec.intent_id) {
+                        continue;
+                    }
+                    let o = match exec.status {
+                        ironcrab::ipc::ExecutionStatus::Sent => LiquidationOutcome::Sent,
+                        ironcrab::ipc::ExecutionStatus::Confirmed => LiquidationOutcome::Confirmed,
+                        ironcrab::ipc::ExecutionStatus::Failed => LiquidationOutcome::Failed,
+                        ironcrab::ipc::ExecutionStatus::Timeout => LiquidationOutcome::Timeout,
+                    };
+                    outcomes.insert(exec.intent_id.clone(), o);
+                    if matches!(o, LiquidationOutcome::Confirmed | LiquidationOutcome::Failed | LiquidationOutcome::Timeout) {
+                        pending.remove(&exec.intent_id);
+                    }
+                    jsonl.write(&serde_json::json!({"kind":"execution_result","exec":exec}))?;
+                }
+            }
+            msg = dec_sub.next() => {
+                let Some(msg) = msg else { continue; };
+                if let Ok(dec) = serde_json::from_slice::<DecisionRecord>(&msg.payload) {
+                    if !pending.contains(&dec.intent_id) {
+                        continue;
+                    }
+                    match dec.outcome {
+                        DecisionOutcome::Rejected | DecisionOutcome::Expired => {
+                            outcomes.insert(dec.intent_id.clone(), LiquidationOutcome::Rejected);
+                            pending.remove(&dec.intent_id);
+                        }
+                        DecisionOutcome::SimFailed => {
+                            outcomes.insert(dec.intent_id.clone(), LiquidationOutcome::SimFailed);
+                            pending.remove(&dec.intent_id);
+                        }
+                        _ => {}
+                    }
+                    jsonl.write(&serde_json::json!({"kind":"decision_record","decision":dec}))?;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
+
+    // Final summary
+    for (intent_id, mint) in intent_to_mint {
+        let outcome = outcomes.get(&intent_id).copied().unwrap_or(LiquidationOutcome::Pending);
+        info!(intent_id = %intent_id, mint = %mint, outcome = ?outcome, "Liquidation outcome");
+    }
+
+    Ok(())
 
     // Ensure WSOL ATA exists
     info!("Ensuring WSOL ATA exists...");
@@ -958,3 +1008,5 @@ fn update_risk_state() -> anyhow::Result<()> {
     info!("Risk state updated successfully.");
     Ok(())
 }
+
+*/

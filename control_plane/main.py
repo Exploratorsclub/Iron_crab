@@ -38,6 +38,7 @@ import os
 import json
 import logging
 from datetime import datetime, timezone
+import uuid
 from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 import shlex
@@ -91,6 +92,9 @@ class Config:
     TOPIC_COMMANDS: str = "ironcrab.control.commands"
     TOPIC_KILL_SWITCH: str = "ironcrab.control.kill"
     TOPIC_CONFIG_RELOAD: str = "ironcrab.control.config.reload"
+
+    # Versioned control plane requests (preferred)
+    TOPIC_CONTROL_REQUESTS: str = "ironcrab.v1.control_requests"
     
     # RBAC: API Keys (in production, load from secure storage)
     # Format: {"hashed_key": {"role": "admin|viewer", "name": "description"}}
@@ -102,6 +106,24 @@ class Config:
     REQUIRE_AUTH: bool = os.getenv("CONTROL_PLANE_REQUIRE_AUTH", "false").lower() == "true"
 
 config = Config()
+
+CONTROL_PLANE_COMPONENT = "control-plane"
+CONTROL_PLANE_BUILD = os.getenv("IRONCRAB_BUILD", "control-plane")
+CONTROL_PLANE_RUN_ID = os.getenv("IRONCRAB_RUN_ID", str(uuid.uuid4()))
+
+
+def _now_unix_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _control_request_header() -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "ts_unix_ms": _now_unix_ms(),
+        "component": CONTROL_PLANE_COMPONENT,
+        "build": CONTROL_PLANE_BUILD,
+        "run_id": CONTROL_PLANE_RUN_ID,
+    }
 
 SYSTEMD_COMPONENTS: Dict[str, str] = {
     "market-data": "market-data.service",
@@ -811,8 +833,22 @@ async def trigger_kill_switch(
         "liquidate": request.liquidate_positions,
         "timestamp": state.kill_switch_time.isoformat(),
     }
-    
-    published = await state.publish(config.TOPIC_KILL_SWITCH, kill_msg)
+
+    # Preferred: versioned control request
+    control_req = {
+        **_control_request_header(),
+        "request_id": str(uuid.uuid4()),
+        "target": "execution-engine",
+        "kind": "kill_switch",
+        "active": True,
+        "reason": request.reason,
+        "liquidate_positions": request.liquidate_positions,
+    }
+
+    published = await state.publish(config.TOPIC_CONTROL_REQUESTS, control_req)
+
+    # Legacy topic (kept for compatibility)
+    await state.publish(config.TOPIC_KILL_SWITCH, kill_msg)
     
     return {
         "status": "kill_switch_activated",
@@ -831,12 +867,24 @@ async def reset_kill_switch(user: User = Depends(require_admin)):
     logger.info(f"Kill switch reset requested by {user.name}")
     audit_logger.info(f"KILL_SWITCH_RESET: user={user.name}, previous_reason='{state.kill_switch_reason}'")
     state.kill_switch_active = False
-    
-    # Publish reset command
-    await state.publish(config.TOPIC_KILL_SWITCH, {
-        "command": "reset",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
+
+    # Preferred: versioned control request
+    reset_req = {
+        **_control_request_header(),
+        "request_id": str(uuid.uuid4()),
+        "target": "execution-engine",
+        "kind": "reset_kill_switch",
+    }
+    await state.publish(config.TOPIC_CONTROL_REQUESTS, reset_req)
+
+    # Legacy topic (kept for compatibility)
+    await state.publish(
+        config.TOPIC_KILL_SWITCH,
+        {
+            "command": "reset",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
     
     return {
         "status": "kill_switch_reset",

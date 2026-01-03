@@ -36,7 +36,7 @@ use solana_sdk::signature::Signature;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -47,8 +47,9 @@ use uuid::Uuid;
 
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
-    DecisionRecord, ExecutionResult, ExecutionStatus, FairnessPolicy, FeePolicy, IntentOrigin,
-    RejectReason, SimulationResult, TradeIntent, TradeSide, TradingRegime,
+    DecisionRecord, ExecutionResult, ExecutionStatus, ExplicitAmount, FairnessPolicy, FeePolicy,
+    IntentOrigin, IntentTier, RejectReason, SimulationResult, TradeExecutionConstraints,
+    TradeIntent, TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
     record_recent_trade, serve_metrics, RecentTrade, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS,
@@ -61,17 +62,26 @@ use ironcrab::metrics::{
     JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL,
 };
 use ironcrab::nats::{
-    NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS,
+    NatsClient, NatsConfig, TOPIC_CONTROL_REQUESTS, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS,
+    TOPIC_TRADE_INTENTS,
 };
+use ironcrab::ipc::{ControlRequest, ControlRequestKind};
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
 use ironcrab::solana::rpc::SolanaRpc;
+use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
+use ironcrab::solana::dex::raydium::Raydium;
+use ironcrab::solana::dex::Dex;
+use ironcrab::solana::token_utils::get_token_decimals_or_default;
 use ironcrab::storage::{
     locks::{LockHolder, LockManager, LockResult, ResourceType},
     JsonlWriter, JsonlWriterConfig,
 };
 use ironcrab::wallet::Treasury;
 use ironcrab::execution::tx_builder;
+use spl_associated_token_account;
+use spl_token::solana_program::pubkey::Pubkey as SplProgPubkey;
+use std::sync::atomic::AtomicBool;
 
 async fn discover_wallet_open_positions(rpc: &SolanaRpc, owner: Pubkey) -> anyhow::Result<usize> {
     let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")?;
@@ -493,6 +503,12 @@ struct ExecutionContext {
     /// Currently open positions count
     open_positions: std::sync::atomic::AtomicUsize,
 
+    // === Operational Kill Switch ===
+    /// When active: reject new BUY intents.
+    kill_switch_active: AtomicBool,
+    /// Prevent concurrent liquidation jobs.
+    liquidation_in_progress: AtomicBool,
+
     // === P1: Jito Bundle Support ===
     /// Jito client for atomic bundle execution (None if disabled)
     jito_client: Option<JitoClient>,
@@ -522,6 +538,281 @@ impl ExecutionContext {
         self.config.read().clone()
     }
 
+    fn is_kill_switch_active(&self) -> bool {
+        self.kill_switch_active.load(Ordering::Relaxed)
+    }
+
+
+
+#[inline]
+fn sdk_to_spl(pk: &Pubkey) -> SplProgPubkey {
+    SplProgPubkey::new_from_array(pk.to_bytes())
+}
+
+#[inline]
+fn spl_to_sdk(pk: &SplProgPubkey) -> Pubkey {
+    Pubkey::new_from_array(pk.to_bytes())
+}
+
+fn ata_for_owner_mint(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
+    let owner_spl = Self::sdk_to_spl(owner);
+    let mint_spl = Self::sdk_to_spl(mint);
+    let token_prog_spl = Self::sdk_to_spl(token_program);
+    let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+        &owner_spl,
+        &mint_spl,
+        &token_prog_spl,
+    );
+    Self::spl_to_sdk(&ata_spl)
+}
+
+async fn token_program_for_mint(rpc: &SolanaRpc, mint: &Pubkey) -> anyhow::Result<Pubkey> {
+    let acct = rpc.rpc.get_account(mint).await?;
+    let owner = acct.owner;
+
+    let spl = Pubkey::new_from_array(spl_token::id().to_bytes());
+    let spl22 = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+
+    if owner == spl {
+        Ok(spl)
+    } else if owner == spl22 {
+        Ok(spl22)
+    } else {
+        anyhow::bail!("Mint owner is neither spl-token nor spl-token-2022: {}", owner);
+    }
+}
+
+fn apply_slippage_min_out(quoted_out: u64, slippage_bps: u32) -> u64 {
+    let keep_bps = 10_000u64.saturating_sub(slippage_bps as u64);
+    ((quoted_out as u128) * (keep_bps as u128) / 10_000u128) as u64
+}
+
+async fn run_liquidation_job(
+    ctx: Arc<ExecutionContext>,
+    max_slippage_bps: u32,
+    ttl_ms: u64,
+    reason: Option<String>,
+) {
+    if ctx
+        .liquidation_in_progress
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        warn!("Liquidation already in progress; ignoring new request");
+        return;
+    }
+    let _guard = scopeguard::guard((), |_| {
+        ctx.liquidation_in_progress.store(false, Ordering::SeqCst);
+    });
+
+    let Some(owner) = ctx.wallet_pubkey else {
+        warn!("Liquidation requested but wallet_pubkey is None");
+        return;
+    };
+    if ctx.treasury.is_none() {
+        warn!("Liquidation requested but treasury (signer) is None");
+        return;
+    }
+
+    info!(wallet = %owner, max_slippage_bps, ttl_ms, "Starting liquidation job");
+
+    // Initialize DEX connectors for quote discovery.
+    let raydium = Raydium::new(Arc::clone(&ctx.rpc));
+    let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc)) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            warn!(error = %e, "Failed to init PumpFunDex; continuing with Raydium only");
+            None
+        }
+    };
+
+    if let Err(e) = raydium.refresh_pools().await {
+        warn!(error = %e, "Raydium refresh_pools failed; liquidation may miss routes");
+    }
+
+    let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+    let token_2022_program_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+    let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+
+    let mut token_accounts = match ctx
+        .rpc
+        .rpc
+        .get_token_accounts_by_owner(&owner, TokenAccountsFilter::ProgramId(token_program_id))
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "Failed to list token accounts (spl-token)");
+            Vec::new()
+        }
+    };
+
+    if let Ok(mut accounts_2022) = ctx
+        .rpc
+        .rpc
+        .get_token_accounts_by_owner(&owner, TokenAccountsFilter::ProgramId(token_2022_program_id))
+        .await
+    {
+        token_accounts.append(&mut accounts_2022);
+    }
+
+    let mut seen_accounts = HashSet::new();
+    let mut liquidation_intents: Vec<TradeIntent> = Vec::new();
+
+    for ta in token_accounts {
+        if !seen_accounts.insert(ta.pubkey.clone()) {
+            continue;
+        }
+
+        let ta_pubkey = match Pubkey::from_str(&ta.pubkey) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Extract mint+amount from JsonParsed only (safe/fast for liquidation).
+        let parsed = match ta.account.data {
+            UiAccountData::Json(parsed) => parsed,
+            _ => continue,
+        };
+        let serde_json::Value::Object(root) = parsed.parsed else { continue };
+        let info = match root.get("info") {
+            Some(v) => v,
+            None => continue,
+        };
+        let mint_str = match info.get("mint").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let amount_str = info
+            .get("tokenAmount")
+            .and_then(|v| v.get("amount"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
+
+        let mint = match Pubkey::from_str(mint_str) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if mint == sol_mint {
+            continue;
+        }
+        let amount_in: u64 = match amount_str.parse() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        if amount_in == 0 {
+            continue;
+        }
+
+        let token_program = match Self::token_program_for_mint(ctx.rpc.as_ref(), &mint).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(mint = %mint, error = %e, "Skipping mint: cannot determine token program");
+                continue;
+            }
+        };
+        let ata = Self::ata_for_owner_mint(&owner, &mint, &token_program);
+        if ta_pubkey != ata {
+            continue;
+        }
+
+        let decimals = get_token_decimals_or_default(ctx.rpc.as_ref(), &mint).await;
+
+        // Build metadata/resources similar to sell-all.
+        let mut metadata: HashMap<String, String> = HashMap::new();
+        metadata.insert("purpose".to_string(), "liquidation".to_string());
+        metadata.insert("kill_switch".to_string(), "true".to_string());
+        metadata.insert("mint_decimals".to_string(), decimals.to_string());
+        metadata.insert("token_account".to_string(), ta_pubkey.to_string());
+        metadata.insert("token_program".to_string(), token_program.to_string());
+        if let Some(r) = &reason {
+            metadata.insert("kill_reason".to_string(), r.clone());
+        }
+
+        let mut resources = TradeResources {
+            input_mint: mint.to_string(),
+            output_mint: sol_mint.to_string(),
+            pools: vec![],
+            accounts: vec![ta_pubkey.to_string()],
+        };
+
+        let mut min_out_sol: Option<u64> = None;
+
+        // Prefer Pump.fun if quote exists.
+        if let Some(ref pumpfun) = pumpfun {
+            if let Ok(Some(q)) = pumpfun
+                .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
+                .await
+            {
+                if let Some(bc) = q.route.first().and_then(|s| Pubkey::from_str(s).ok()) {
+                    if let Ok(acct) = ctx.rpc.rpc.get_account(&bc).await {
+                        if let Ok(state) = BondingCurveState::parse(&acct.data) {
+                            metadata.insert("creator".to_string(), state.creator.to_string());
+                        }
+                    }
+                }
+                if metadata.get("creator").is_some() {
+                    metadata.insert("dex".to_string(), "pumpfun".to_string());
+                    min_out_sol = Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
+                }
+            }
+        }
+
+        // Fallback to Raydium.
+        if min_out_sol.is_none() {
+            if let Ok(Some(q)) = raydium
+                .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
+                .await
+            {
+                if let Some(pool_id) = q.route.first().cloned() {
+                    metadata.insert("dex".to_string(), "raydium".to_string());
+                    resources.pools = vec![pool_id];
+                    min_out_sol = Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
+                }
+            }
+        }
+
+        let Some(min_out) = min_out_sol else {
+            warn!(mint = %mint, amount_in, "No supported route for liquidation; skipping");
+            continue;
+        };
+
+        let intent_id = format!("liquidation-{}", Uuid::new_v4());
+        let mut intent = TradeIntent::new_sell(
+            "execution-engine",
+            BUILD_VERSION,
+            &ctx.run_id,
+            intent_id,
+            "execution-engine",
+            IntentTier::Tier0,
+            IntentOrigin::ExecutionMevB,
+            mint.to_string(),
+            decimals,
+            sol_mint.to_string(),
+            amount_in,
+            0,
+            max_slippage_bps,
+            TradingRegime::NotApplicable,
+        );
+        intent.ttl_ms = Some(ttl_ms);
+        intent.resources = resources;
+        intent.execution = Some(TradeExecutionConstraints {
+            min_out: Some(ExplicitAmount::new(min_out, 9)),
+        });
+        intent.metadata.extend(metadata);
+
+        liquidation_intents.push(intent);
+    }
+
+    info!(count = liquidation_intents.len(), "Liquidation intents prepared");
+    for intent in liquidation_intents {
+        if let Err(e) = process_intent(&ctx, intent).await {
+            warn!(error = %e, "Liquidation intent processing failed");
+        }
+    }
+
+    info!("Liquidation job completed");
+}
     /// Update config and return response (P1: Runtime Configuration via UI)
     fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
         let mut config = self.config.write();
@@ -1079,6 +1370,8 @@ async fn main() -> Result<()> {
         current_day: parking_lot::RwLock::new(initial_day),
         daily_loss_lamports: std::sync::atomic::AtomicI64::new(initial_daily_loss),
         open_positions: std::sync::atomic::AtomicUsize::new(initial_positions),
+        kill_switch_active: AtomicBool::new(false),
+        liquidation_in_progress: AtomicBool::new(false),
         // P1: Jito bundle support
         jito_client,
         bundles_submitted: std::sync::atomic::AtomicU64::new(0),
@@ -1158,6 +1451,23 @@ async fn main() -> Result<()> {
     let mut intent_sub_opt = intent_subscription;
     let mut config_sub_opt = config_subscription;
 
+    // Subscribe to ControlRequests (KillSwitch + liquidation)
+    let control_subscription = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_CONTROL_REQUESTS).await {
+            Ok(sub) => {
+                info!(topic = TOPIC_CONTROL_REQUESTS, "Subscribed to ControlRequests");
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to ControlRequests");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut control_sub_opt = control_subscription;
+
     loop {
         tokio::select! {
             // NATS subscription: receive TradeIntents
@@ -1211,6 +1521,49 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         warn!(error = %e, "Failed to deserialize ConfigUpdate");
+                    }
+                }
+            }
+
+            // NATS subscription: receive ControlRequests
+            Some(msg) = async {
+                if let Some(ref mut sub) = control_sub_opt {
+                    sub.next().await
+                } else {
+                    None
+                }
+            } => {
+                match msg.deserialize::<ControlRequest>() {
+                    Ok(req) => {
+                        if req.target != "execution-engine" && req.target != "all" {
+                            debug!(target = %req.target, "Ignoring ControlRequest for other target");
+                        } else {
+                            match req.kind {
+                                ControlRequestKind::KillSwitch { active, reason, liquidate_positions, max_slippage_bps, ttl_ms } => {
+                                    ctx.kill_switch_active.store(active, Ordering::Relaxed);
+                                    info!(active, liquidate_positions, reason = ?reason, "Kill switch updated");
+
+                                    if active && liquidate_positions {
+                                        let slippage = max_slippage_bps.unwrap_or(9900);
+                                        let ttl = ttl_ms.unwrap_or(60_000);
+                                        ExecutionContext::run_liquidation_job(
+                                            Arc::clone(&ctx),
+                                            slippage,
+                                            ttl,
+                                            reason,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                ControlRequestKind::ResetKillSwitch => {
+                                    ctx.kill_switch_active.store(false, Ordering::Relaxed);
+                                    info!("Kill switch reset");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to deserialize ControlRequest");
                     }
                 }
             }
@@ -1385,6 +1738,33 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
     // Reset daily counters if new day
     ctx.maybe_reset_daily();
+
+    // Check 3: Kill switch (BUY only)
+    if intent.side == TradeSide::Buy {
+        if ctx.is_kill_switch_active() {
+            let reason = RejectReason::KillSwitchActive;
+            checks.push(CheckResult {
+                check_name: "kill_switch".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some("kill_switch_active: buy blocked".to_string()),
+            });
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+        }
+        checks.push(CheckResult {
+            check_name: "kill_switch".to_string(),
+            passed: true,
+            reason_code: None,
+            details: Some("inactive (buy_only)".to_string()),
+        });
+    } else {
+        checks.push(CheckResult {
+            check_name: "kill_switch".to_string(),
+            passed: true,
+            reason_code: None,
+            details: Some("skipped_for_sell".to_string()),
+        });
+    }
 
     // Check 3a: Max position size (applies to BUY only)
     if intent.side == TradeSide::Buy {
@@ -1675,30 +2055,40 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         )),
     });
 
-    // Check: Trade profitable after fees
-    let (is_profitable, profit_after_fees_bps) = fee_policy.is_profitable_after_fees(&intent);
-    if !is_profitable {
-        let reason = RejectReason::FeeUnprofitable;
+    // Check: Trade profitable after fees (BUY only)
+    // For SELL exits (incl. liquidations), the intent is not expected to be profitable-after-fees.
+    if intent.side == TradeSide::Buy {
+        let (is_profitable, profit_after_fees_bps) = fee_policy.is_profitable_after_fees(&intent);
+        if !is_profitable {
+            let reason = RejectReason::FeeUnprofitable;
+            checks.push(CheckResult {
+                check_name: "fee_profitability".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some(format!(
+                    "profit_after_fees={}bps < min={}bps",
+                    profit_after_fees_bps, fee_policy.min_profit_after_fees_bps
+                )),
+            });
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+        }
         checks.push(CheckResult {
             check_name: "fee_profitability".to_string(),
-            passed: false,
-            reason_code: Some(reason.to_string()),
+            passed: true,
+            reason_code: None,
             details: Some(format!(
-                "profit_after_fees={}bps < min={}bps",
+                "profit_after_fees={}bps >= min={}bps",
                 profit_after_fees_bps, fee_policy.min_profit_after_fees_bps
             )),
         });
-        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    } else {
+        checks.push(CheckResult {
+            check_name: "fee_profitability".to_string(),
+            passed: true,
+            reason_code: None,
+            details: Some("skipped_for_sell".to_string()),
+        });
     }
-    checks.push(CheckResult {
-        check_name: "fee_profitability".to_string(),
-        passed: true,
-        reason_code: None,
-        details: Some(format!(
-            "profit_after_fees={}bps >= min={}bps",
-            profit_after_fees_bps, fee_policy.min_profit_after_fees_bps
-        )),
-    });
 
     // === Check 4: Resource locks (pools + mints) ===
     let holder = LockHolder::new(&intent.intent_id)

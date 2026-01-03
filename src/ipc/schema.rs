@@ -548,7 +548,16 @@ pub struct TradeIntent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u64>,
 
-    /// Capital required (SOL, explicit units)
+    /// Amount-in for this trade, with explicit units.
+    ///
+    /// Semantics:
+    /// - For `side=Buy`: `resources.input_mint` is SOL ("So111...") and this is the SOL amount-in
+    ///   in lamports (`decimals=9`).
+    /// - For `side=Sell`: `resources.input_mint` is the token mint and this is the token amount-in
+    ///   in raw units (`decimals=token_decimals`).
+    ///
+    /// This field is intentionally *not* named `amount_in` for historical reasons, but execution
+    /// treats it as the amount-in.
     pub required_capital: ExplicitAmount,
 
     /// Resources: mints/pools/accounts involved
@@ -620,6 +629,65 @@ pub struct TradeResources {
     pub accounts: Vec<String>,
 }
 
+// ============================================================================
+// Control Plane Requests (control-plane -> execution-engine)
+// ============================================================================
+
+/// Versioned control request kind.
+///
+/// Published on `ironcrab.v1.control_requests`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ControlRequestKind {
+    /// Toggle kill switch.
+    ///
+    /// Semantics:
+    /// - When `active=true`, execution-engine must reject new BUY intents.
+    /// - If `liquidate_positions=true`, execution-engine should attempt to sell all token balances.
+    KillSwitch {
+        active: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default)]
+        liquidate_positions: bool,
+        /// Optional liquidation parameters.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_slippage_bps: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ttl_ms: Option<u64>,
+    },
+
+    /// Reset kill switch (reactivate BUY processing).
+    ResetKillSwitch,
+}
+
+/// Control request wrapper with required storage header.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControlRequest {
+    #[serde(flatten)]
+    pub header: RecordHeader,
+
+    /// Unique request ID for correlation.
+    pub request_id: String,
+
+    /// Target component (e.g., "execution-engine").
+    pub target: String,
+
+    #[serde(flatten)]
+    pub kind: ControlRequestKind,
+}
+
+impl ControlRequest {
+    pub fn new(component: &str, build: &str, run_id: &str, request_id: String, target: &str, kind: ControlRequestKind) -> Self {
+        Self {
+            header: RecordHeader::new(component, build, run_id),
+            request_id,
+            target: target.to_string(),
+            kind,
+        }
+    }
+}
+
 impl TradeIntent {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -660,6 +728,48 @@ impl TradeIntent {
             metadata: std::collections::HashMap::new(),
             execution: None,
         }
+    }
+
+    /// Helper constructor for SELL intents.
+    ///
+    /// This matches execution-engine semantics: `required_capital` is the amount-in of
+    /// `resources.input_mint`.
+    pub fn new_sell(
+        component: &str,
+        build: &str,
+        run_id: &str,
+        intent_id: String,
+        source: &str,
+        tier: IntentTier,
+        origin_type: IntentOrigin,
+        input_mint: String,
+        input_decimals: u8,
+        output_mint: String,
+        amount_in_raw: u64,
+        expected_roi_bps: i32,
+        max_slippage_bps: u32,
+        regime: TradingRegime,
+    ) -> Self {
+        Self::new(
+            component,
+            build,
+            run_id,
+            intent_id,
+            source,
+            tier,
+            origin_type,
+            ExplicitAmount::new(amount_in_raw, input_decimals),
+            TradeResources {
+                input_mint,
+                output_mint,
+                pools: vec![],
+                accounts: vec![],
+            },
+            expected_roi_bps,
+            max_slippage_bps,
+            TradeSide::Sell,
+            regime,
+        )
     }
 
     pub fn with_deadline_slot(mut self, slot: u64) -> Self {

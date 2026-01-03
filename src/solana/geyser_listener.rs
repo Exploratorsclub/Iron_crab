@@ -2,13 +2,22 @@
 //! Uses Agave 3.0's native Geyser integration for <10ms latency
 
 use anyhow::{anyhow, Result};
-use futures::StreamExt;
-use solana_sdk::{bs58, pubkey::Pubkey};
-use std::collections::HashMap;
+use solana_sdk::pubkey::Pubkey;
 use tokio::sync::broadcast;
+
+#[cfg(not(windows))]
+use futures::StreamExt;
+#[cfg(not(windows))]
+use solana_sdk::bs58;
+#[cfg(not(windows))]
+use std::collections::HashMap;
+#[cfg(not(windows))]
 use tracing::debug;
+#[cfg(not(windows))]
 use tracing::{error, info, warn};
+#[cfg(not(windows))]
 use yellowstone_grpc_client::GeyserGrpcClient;
+#[cfg(not(windows))]
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
     SubscribeRequestFilterAccounts, SubscribeRequestFilterTransactions,
@@ -39,7 +48,9 @@ pub struct GeyserTransactionUpdate {
 pub struct GeyserListener {
     endpoint: String,
     program_ids: Vec<Pubkey>,
+    #[cfg_attr(windows, allow(dead_code))]
     account_tx: broadcast::Sender<GeyserAccountUpdate>,
+    #[cfg_attr(windows, allow(dead_code))]
     transaction_tx: broadcast::Sender<GeyserTransactionUpdate>,
 }
 
@@ -74,6 +85,23 @@ impl GeyserListener {
 
     /// Start listening to Geyser stream
     pub async fn start(self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            let _ = (self.endpoint, self.program_ids);
+            return Err(anyhow!(
+                "Geyser gRPC is not supported on Windows in this repo build. \
+                 Build on Linux/macOS for Geyser support."
+            ));
+        }
+
+        #[cfg(not(windows))]
+        {
+            return self.start_impl().await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn start_impl(self) -> Result<()> {
         info!(
             endpoint = %self.endpoint,
             programs = self.program_ids.len(),

@@ -5,6 +5,10 @@ pub mod dex_parser;
 pub mod execution;
 pub mod geyser_listener;
 pub mod geyser_pool_discovery;
+#[cfg(not(windows))]
+pub mod geyser_tx_confirm;
+#[cfg(windows)]
+#[path = "geyser_tx_confirm_windows.rs"]
 pub mod geyser_tx_confirm;
 pub mod jito;
 pub mod kill_switch;
