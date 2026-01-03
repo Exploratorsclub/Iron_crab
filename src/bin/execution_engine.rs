@@ -2246,6 +2246,18 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // P1: Get config snapshot for this decision (hot-reloadable)
     let config = ctx.get_config();
 
+    let is_liquidation_sell = intent.side == TradeSide::Sell
+        && (intent
+            .metadata
+            .get("purpose")
+            .map(|v| v == "liquidation")
+            .unwrap_or(false)
+            || intent
+                .metadata
+                .get("kill_switch")
+                .map(|v| v == "true")
+                .unwrap_or(false));
+
     info!(
         intent_id = %intent.intent_id,
         decision_id = %decision_id,
@@ -2351,25 +2363,34 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     }
 
     // Check 3b: Max slippage
-    if intent.max_slippage_bps > config.max_slippage_bps {
-        let reason = RejectReason::SimSlippageExceeded;
+    if is_liquidation_sell {
         checks.push(CheckResult {
             check_name: "max_slippage".to_string(),
-            passed: false,
-            reason_code: Some(reason.to_string()),
-            details: Some(format!(
-                "intent_slippage={}bps > max={}bps",
-                intent.max_slippage_bps, config.max_slippage_bps
-            )),
+            passed: true,
+            reason_code: None,
+            details: Some("skipped_for_liquidation_sell".to_string()),
         });
-        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+    } else {
+        if intent.max_slippage_bps > config.max_slippage_bps {
+            let reason = RejectReason::SimSlippageExceeded;
+            checks.push(CheckResult {
+                check_name: "max_slippage".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some(format!(
+                    "intent_slippage={}bps > max={}bps",
+                    intent.max_slippage_bps, config.max_slippage_bps
+                )),
+            });
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+        }
+        checks.push(CheckResult {
+            check_name: "max_slippage".to_string(),
+            passed: true,
+            reason_code: None,
+            details: None,
+        });
     }
-    checks.push(CheckResult {
-        check_name: "max_slippage".to_string(),
-        passed: true,
-        reason_code: None,
-        details: None,
-    });
 
     // Check 3c: Max open positions (applies to BUY only; SELL exits should remain possible)
     if intent.side == TradeSide::Buy {
