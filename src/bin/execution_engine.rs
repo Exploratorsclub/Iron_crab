@@ -840,22 +840,6 @@ async fn run_liquidation_job(
 
         let mut min_out_sol: Option<u64> = None;
 
-        // Prefer Pump.fun AMM (PumpSwap) if available. This is required for migrated tokens
-        // where the bonding curve is complete.
-        if let Ok(Some(q)) = pump_amm
-            .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
-            .await
-        {
-            #[cfg(unix)]
-            maybe_ping_watchdog();
-
-            if let Some(pool_id) = q.route.first().cloned() {
-                metadata.insert("dex".to_string(), "pump_amm".to_string());
-                resources.pools = vec![pool_id];
-                min_out_sol = Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
-            }
-        }
-
         // Prefer Pump.fun if quote exists.
         if min_out_sol.is_none() {
             if let Some(ref pumpfun) = pumpfun {
@@ -888,6 +872,25 @@ async fn run_liquidation_job(
                     min_out_sol = Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
                 }
             }
+            }
+        }
+
+        // Fallback to Pump.fun AMM (PumpSwap). This covers migrated tokens where the bonding
+        // curve is complete and returns no quote.
+        if min_out_sol.is_none() {
+            if let Ok(Some(q)) = pump_amm
+                .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
+                .await
+            {
+                #[cfg(unix)]
+                maybe_ping_watchdog();
+
+                if let Some(pool_id) = q.route.first().cloned() {
+                    metadata.insert("dex".to_string(), "pump_amm".to_string());
+                    resources.pools = vec![pool_id];
+                    min_out_sol =
+                        Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
+                }
             }
         }
 
