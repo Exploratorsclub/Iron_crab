@@ -95,6 +95,11 @@ class Config:
 
     # Versioned control plane requests (preferred)
     TOPIC_CONTROL_REQUESTS: str = "ironcrab.v1.control_requests"
+
+    # Legacy topic compatibility (can be disabled once all consumers are migrated)
+    PUBLISH_LEGACY_KILL_TOPIC: bool = os.getenv(
+        "CONTROL_PLANE_PUBLISH_LEGACY_KILL_TOPIC", "true"
+    ).lower() in ("1", "true", "yes", "y")
     
     # RBAC: API Keys (in production, load from secure storage)
     # Format: {"hashed_key": {"role": "admin|viewer", "name": "description"}}
@@ -847,8 +852,9 @@ async def trigger_kill_switch(
 
     published = await state.publish(config.TOPIC_CONTROL_REQUESTS, control_req)
 
-    # Legacy topic (kept for compatibility)
-    await state.publish(config.TOPIC_KILL_SWITCH, kill_msg)
+    # Legacy topic (kept for compatibility, optional)
+    if config.PUBLISH_LEGACY_KILL_TOPIC:
+        await state.publish(config.TOPIC_KILL_SWITCH, kill_msg)
     
     return {
         "status": "kill_switch_activated",
@@ -877,14 +883,15 @@ async def reset_kill_switch(user: User = Depends(require_admin)):
     }
     await state.publish(config.TOPIC_CONTROL_REQUESTS, reset_req)
 
-    # Legacy topic (kept for compatibility)
-    await state.publish(
-        config.TOPIC_KILL_SWITCH,
-        {
-            "command": "reset",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+    # Legacy topic (kept for compatibility, optional)
+    if config.PUBLISH_LEGACY_KILL_TOPIC:
+        await state.publish(
+            config.TOPIC_KILL_SWITCH,
+            {
+                "command": "reset",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
     
     return {
         "status": "kill_switch_reset",

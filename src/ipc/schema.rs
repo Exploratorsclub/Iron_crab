@@ -659,6 +659,28 @@ pub enum ControlRequestKind {
 
     /// Reset kill switch (reactivate BUY processing).
     ResetKillSwitch,
+
+    /// MANUAL operator action: burn tokens from specific token accounts and (optionally) close them.
+    ///
+    /// Safety semantics:
+    /// - This must never be triggered by UI liquidation flows.
+    /// - execution-engine must re-validate that no sell route exists before burning.
+    BurnTokenAccounts {
+        /// Wallet owner pubkey (engine must verify it matches configured wallet).
+        owner_pubkey: String,
+        /// Token account pubkeys to burn/close.
+        token_accounts: Vec<String>,
+        /// Close token accounts after burn to recover rent (default: true).
+        #[serde(default = "default_true")]
+        close_accounts: bool,
+        /// Optional operator reason for audit logs.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Control request wrapper with required storage header.

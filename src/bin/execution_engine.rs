@@ -48,8 +48,8 @@ use uuid::Uuid;
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, ExecutionResult, ExecutionStatus, ExplicitAmount, FairnessPolicy, FeePolicy,
-    IntentOrigin, IntentTier, RejectReason, SimulationResult, TradeExecutionConstraints,
-    TradeIntent, TradeResources, TradeSide, TradingRegime,
+    IntentOrigin, IntentTier, RecordHeader, RejectReason, SimulationResult,
+    TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
     record_recent_trade, serve_metrics, RecentTrade, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS,
@@ -81,6 +81,13 @@ use ironcrab::wallet::Treasury;
 use ironcrab::execution::tx_builder;
 use spl_associated_token_account;
 use spl_token::solana_program::pubkey::Pubkey as SplProgPubkey;
+use spl_token::solana_program::program_pack::Pack;
+use spl_token::instruction as spl_ix;
+use spl_token_2022::instruction as spl22_ix;
+use spl_token_2022::{
+    extension::StateWithExtensions as Spl22StateWithExtensions,
+    state::Account as Spl22TokenAccount,
+};
 use std::sync::atomic::AtomicBool;
 
 async fn discover_wallet_open_positions(rpc: &SolanaRpc, owner: Pubkey) -> anyhow::Result<usize> {
@@ -490,6 +497,7 @@ struct ExecutionContext {
     nats: Option<NatsClient>,
     decision_writer: JsonlWriter,
     execution_writer: JsonlWriter,
+    burn_writer: JsonlWriter,
     lock_manager: LockManager,
     log_base: PathBuf, // P1: For state persistence
     decision_counter: std::sync::atomic::AtomicU64,
@@ -508,6 +516,9 @@ struct ExecutionContext {
     kill_switch_active: AtomicBool,
     /// Prevent concurrent liquidation jobs.
     liquidation_in_progress: AtomicBool,
+
+    /// Prevent concurrent manual burn jobs.
+    burn_in_progress: AtomicBool,
 
     // === P1: Jito Bundle Support ===
     /// Jito client for atomic bundle execution (None if disabled)
@@ -532,6 +543,26 @@ struct ExecutionContext {
     arb_executed: std::sync::atomic::AtomicU64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct BurnOpRecord {
+    #[serde(flatten)]
+    header: RecordHeader,
+    request_id: String,
+    wallet: String,
+    token_account: String,
+    mint: String,
+    token_program: String,
+    amount_raw: u64,
+    close_accounts: bool,
+    outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
 impl ExecutionContext {
     /// Get current config (read lock)
     fn get_config(&self) -> ExecutionConfig {
@@ -552,6 +583,22 @@ fn sdk_to_spl(pk: &Pubkey) -> SplProgPubkey {
 #[inline]
 fn spl_to_sdk(pk: &SplProgPubkey) -> Pubkey {
     Pubkey::new_from_array(pk.to_bytes())
+}
+
+fn prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> solana_sdk::instruction::Instruction {
+    solana_sdk::instruction::Instruction {
+        program_id: Pubkey::new_from_array(ix.program_id.to_bytes()),
+        accounts: ix
+            .accounts
+            .into_iter()
+            .map(|a| solana_sdk::instruction::AccountMeta {
+                pubkey: Pubkey::new_from_array(a.pubkey.to_bytes()),
+                is_signer: a.is_signer,
+                is_writable: a.is_writable,
+            })
+            .collect(),
+        data: ix.data,
+    }
 }
 
 fn ata_for_owner_mint(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
@@ -593,6 +640,16 @@ async fn run_liquidation_job(
     ttl_ms: u64,
     reason: Option<String>,
 ) {
+    #[cfg(unix)]
+    let mut last_watchdog_ping = std::time::Instant::now();
+    #[cfg(unix)]
+    let mut maybe_ping_watchdog = || {
+        if last_watchdog_ping.elapsed() >= Duration::from_secs(5) {
+            let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+            last_watchdog_ping = std::time::Instant::now();
+        }
+    };
+
     if ctx
         .liquidation_in_progress
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -601,9 +658,17 @@ async fn run_liquidation_job(
         warn!("Liquidation already in progress; ignoring new request");
         return;
     }
-    let _guard = scopeguard::guard((), |_| {
-        ctx.liquidation_in_progress.store(false, Ordering::SeqCst);
-    });
+    struct LiquidationInProgressGuard {
+        ctx: Arc<ExecutionContext>,
+    }
+    impl Drop for LiquidationInProgressGuard {
+        fn drop(&mut self) {
+            self.ctx
+                .liquidation_in_progress
+                .store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = LiquidationInProgressGuard { ctx: Arc::clone(&ctx) };
 
     let Some(owner) = ctx.wallet_pubkey else {
         warn!("Liquidation requested but wallet_pubkey is None");
@@ -615,6 +680,8 @@ async fn run_liquidation_job(
     }
 
     info!(wallet = %owner, max_slippage_bps, ttl_ms, "Starting liquidation job");
+    #[cfg(unix)]
+    maybe_ping_watchdog();
 
     // Initialize DEX connectors for quote discovery.
     let raydium = Raydium::new(Arc::clone(&ctx.rpc));
@@ -629,6 +696,8 @@ async fn run_liquidation_job(
     if let Err(e) = raydium.refresh_pools().await {
         warn!(error = %e, "Raydium refresh_pools failed; liquidation may miss routes");
     }
+    #[cfg(unix)]
+    maybe_ping_watchdog();
 
     let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
     let token_2022_program_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
@@ -646,6 +715,8 @@ async fn run_liquidation_job(
             Vec::new()
         }
     };
+    #[cfg(unix)]
+    maybe_ping_watchdog();
 
     if let Ok(mut accounts_2022) = ctx
         .rpc
@@ -655,11 +726,16 @@ async fn run_liquidation_job(
     {
         token_accounts.append(&mut accounts_2022);
     }
+    #[cfg(unix)]
+    maybe_ping_watchdog();
 
     let mut seen_accounts = HashSet::new();
     let mut liquidation_intents: Vec<TradeIntent> = Vec::new();
 
     for ta in token_accounts {
+        #[cfg(unix)]
+        maybe_ping_watchdog();
+
         if !seen_accounts.insert(ta.pubkey.clone()) {
             continue;
         }
@@ -711,12 +787,16 @@ async fn run_liquidation_job(
                 continue;
             }
         };
+        #[cfg(unix)]
+        maybe_ping_watchdog();
         let ata = Self::ata_for_owner_mint(&owner, &mint, &token_program);
         if ta_pubkey != ata {
             continue;
         }
 
         let decimals = get_token_decimals_or_default(ctx.rpc.as_ref(), &mint).await;
+        #[cfg(unix)]
+        maybe_ping_watchdog();
 
         // Build metadata/resources similar to sell-all.
         let mut metadata: HashMap<String, String> = HashMap::new();
@@ -744,6 +824,9 @@ async fn run_liquidation_job(
                 .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
                 .await
             {
+                #[cfg(unix)]
+                maybe_ping_watchdog();
+
                 if let Some(bc) = q.route.first().and_then(|s| Pubkey::from_str(s).ok()) {
                     if let Ok(acct) = ctx.rpc.rpc.get_account(&bc).await {
                         if let Ok(state) = BondingCurveState::parse(&acct.data) {
@@ -751,6 +834,9 @@ async fn run_liquidation_job(
                         }
                     }
                 }
+                #[cfg(unix)]
+                maybe_ping_watchdog();
+
                 if metadata.get("creator").is_some() {
                     metadata.insert("dex".to_string(), "pumpfun".to_string());
                     min_out_sol = Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
@@ -764,6 +850,9 @@ async fn run_liquidation_job(
                 .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
                 .await
             {
+                #[cfg(unix)]
+                maybe_ping_watchdog();
+
                 if let Some(pool_id) = q.route.first().cloned() {
                     metadata.insert("dex".to_string(), "raydium".to_string());
                     resources.pools = vec![pool_id];
@@ -806,12 +895,419 @@ async fn run_liquidation_job(
 
     info!(count = liquidation_intents.len(), "Liquidation intents prepared");
     for intent in liquidation_intents {
+        #[cfg(unix)]
+        maybe_ping_watchdog();
+
         if let Err(e) = process_intent(&ctx, intent).await {
             warn!(error = %e, "Liquidation intent processing failed");
         }
     }
 
     info!("Liquidation job completed");
+}
+
+async fn run_manual_burn_job(
+    ctx: Arc<ExecutionContext>,
+    request_id: String,
+    owner_pubkey: String,
+    token_accounts: Vec<String>,
+    close_accounts: bool,
+    reason: Option<String>,
+) {
+    #[cfg(unix)]
+    let mut last_watchdog_ping = std::time::Instant::now();
+    #[cfg(unix)]
+    let mut maybe_ping_watchdog = || {
+        if last_watchdog_ping.elapsed() >= Duration::from_secs(5) {
+            let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+            last_watchdog_ping = std::time::Instant::now();
+        }
+    };
+
+    if ctx
+        .burn_in_progress
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        warn!(request_id = %request_id, "Manual burn already in progress; ignoring new request");
+        return;
+    }
+
+    struct BurnInProgressGuard {
+        ctx: Arc<ExecutionContext>,
+    }
+    impl Drop for BurnInProgressGuard {
+        fn drop(&mut self) {
+            self.ctx.burn_in_progress.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = BurnInProgressGuard { ctx: Arc::clone(&ctx) };
+
+    let Some(wallet) = ctx.wallet_pubkey else {
+        warn!(request_id = %request_id, "Manual burn requested but wallet_pubkey is None");
+        return;
+    };
+    if ctx.treasury.is_none() {
+        warn!(request_id = %request_id, "Manual burn requested but treasury (signer) is None");
+        return;
+    }
+
+    if owner_pubkey != wallet.to_string() {
+        warn!(request_id = %request_id, expected_wallet = %wallet, provided_wallet = %owner_pubkey, "Manual burn owner_pubkey mismatch; refusing");
+        return;
+    }
+
+    info!(request_id = %request_id, wallet = %wallet, count = token_accounts.len(), close_accounts, reason = ?reason, "Starting manual burn job");
+    #[cfg(unix)]
+    maybe_ping_watchdog();
+
+    // Initialize DEX connectors for route validation.
+    let raydium = Raydium::new(Arc::clone(&ctx.rpc));
+    let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc)) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            warn!(error = %e, "Failed to init PumpFunDex in burn job; continuing with Raydium only");
+            None
+        }
+    };
+    if let Err(e) = raydium.refresh_pools().await {
+        warn!(error = %e, "Raydium refresh_pools failed in burn job; route validation may miss routes");
+    }
+    #[cfg(unix)]
+    maybe_ping_watchdog();
+
+    let spl = Pubkey::new_from_array(spl_token::id().to_bytes());
+    let spl22 = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+    let sol_mint =
+        Pubkey::from_str("So11111111111111111111111111111111111111112").expect("valid SOL mint");
+
+    for ta_str in token_accounts {
+        #[cfg(unix)]
+        maybe_ping_watchdog();
+
+        let token_account_pk = match Pubkey::from_str(&ta_str) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(request_id = %request_id, token_account = %ta_str, error = %e, "Invalid token account pubkey; skipping");
+                continue;
+            }
+        };
+
+        let acct = match ctx.rpc.rpc.get_account(&token_account_pk).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(request_id = %request_id, token_account = %token_account_pk, error = %e, "Failed to fetch token account; skipping");
+                continue;
+            }
+        };
+
+        let token_program = acct.owner;
+        if token_program != spl && token_program != spl22 {
+            warn!(request_id = %request_id, token_account = %token_account_pk, token_program = %token_program, "Token account is not owned by SPL Token or Token-2022; skipping");
+            continue;
+        }
+
+        let (mint, owner, amount_raw) = if token_program == spl {
+            match spl_token::state::Account::unpack(&acct.data) {
+                Ok(a) => (
+                    Self::spl_to_sdk(&a.mint),
+                    Self::spl_to_sdk(&a.owner),
+                    a.amount,
+                ),
+                Err(e) => {
+                    warn!(request_id = %request_id, token_account = %token_account_pk, error = %e, "Failed to unpack SPL token account; skipping");
+                    continue;
+                }
+            }
+        } else {
+            match Spl22StateWithExtensions::<Spl22TokenAccount>::unpack(&acct.data) {
+                Ok(a) => {
+                    let base = a.base;
+                    (
+                        Self::spl_to_sdk(&base.mint),
+                        Self::spl_to_sdk(&base.owner),
+                        base.amount,
+                    )
+                }
+                Err(e) => {
+                    warn!(request_id = %request_id, token_account = %token_account_pk, error = %e, "Failed to unpack token-2022 account; skipping");
+                    continue;
+                }
+            }
+        };
+
+        if owner != wallet {
+            warn!(request_id = %request_id, token_account = %token_account_pk, owner = %owner, expected_owner = %wallet, "Token account owner mismatch; skipping");
+            continue;
+        }
+        if mint == sol_mint {
+            warn!(request_id = %request_id, token_account = %token_account_pk, "Refusing to burn SOL/WSOL mint");
+            continue;
+        }
+
+        // Re-validate: if a supported sell route exists, refuse to burn.
+        let decimals = get_token_decimals_or_default(ctx.rpc.as_ref(), &mint).await;
+        let unit_u64 = 10u128
+            .checked_pow(decimals as u32)
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(1);
+        let quote_amount = std::cmp::min(std::cmp::max(1, unit_u64), std::cmp::max(1, amount_raw));
+
+        let mut route_exists = false;
+
+        if let Some(ref pumpfun) = pumpfun {
+            if let Ok(Some(q)) = pumpfun
+                .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), quote_amount)
+                .await
+            {
+                #[cfg(unix)]
+                maybe_ping_watchdog();
+
+                // Only treat as a real Pump.fun route if we can parse creator from the bonding curve.
+                if let Some(bc) = q.route.first().and_then(|s| Pubkey::from_str(s).ok()) {
+                    if let Ok(acct) = ctx.rpc.rpc.get_account(&bc).await {
+                        if BondingCurveState::parse(&acct.data).is_ok() {
+                            route_exists = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !route_exists {
+            if let Ok(Some(_q)) = raydium
+                .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), quote_amount)
+                .await
+            {
+                route_exists = true;
+            }
+        }
+
+        if route_exists {
+            warn!(request_id = %request_id, token_account = %token_account_pk, mint = %mint, amount_raw, "Sell route exists; refusing to burn");
+            let rec = BurnOpRecord {
+                header: RecordHeader::new("execution-engine", BUILD_VERSION, &ctx.run_id),
+                request_id: request_id.clone(),
+                wallet: wallet.to_string(),
+                token_account: token_account_pk.to_string(),
+                mint: mint.to_string(),
+                token_program: token_program.to_string(),
+                amount_raw,
+                close_accounts,
+                outcome: "refused_route_exists".to_string(),
+                signature: None,
+                error: None,
+                reason: reason.clone(),
+            };
+            let _ = ctx.burn_writer.write(&rec);
+            continue;
+        }
+
+        // Build burn (if amount>0) + close instructions.
+        let mut ixs: Vec<solana_sdk::instruction::Instruction> = Vec::new();
+
+        if amount_raw > 0 {
+            let burn_ix_prog = if token_program == spl {
+                spl_ix::burn(
+                    &spl_token::id(),
+                    &Self::sdk_to_spl(&token_account_pk),
+                    &Self::sdk_to_spl(&mint),
+                    &Self::sdk_to_spl(&wallet),
+                    &[],
+                    amount_raw,
+                )
+            } else {
+                spl22_ix::burn(
+                    &spl_token_2022::id(),
+                    &Self::sdk_to_spl(&token_account_pk),
+                    &Self::sdk_to_spl(&mint),
+                    &Self::sdk_to_spl(&wallet),
+                    &[],
+                    amount_raw,
+                )
+            };
+
+            match burn_ix_prog {
+                Ok(ix) => ixs.push(Self::prog_ix_to_sdk(ix)),
+                Err(e) => {
+                    warn!(request_id = %request_id, token_account = %token_account_pk, mint = %mint, error = %e, "Failed to build burn instruction; skipping");
+                    let rec = BurnOpRecord {
+                        header: RecordHeader::new("execution-engine", BUILD_VERSION, &ctx.run_id),
+                        request_id: request_id.clone(),
+                        wallet: wallet.to_string(),
+                        token_account: token_account_pk.to_string(),
+                        mint: mint.to_string(),
+                        token_program: token_program.to_string(),
+                        amount_raw,
+                        close_accounts,
+                        outcome: "failed_build_burn_ix".to_string(),
+                        signature: None,
+                        error: Some(format!("{e}")),
+                        reason: reason.clone(),
+                    };
+                    let _ = ctx.burn_writer.write(&rec);
+                    continue;
+                }
+            }
+        }
+
+        if close_accounts {
+            let close_ix_prog = if token_program == spl {
+                spl_ix::close_account(
+                    &spl_token::id(),
+                    &Self::sdk_to_spl(&token_account_pk),
+                    &Self::sdk_to_spl(&wallet),
+                    &Self::sdk_to_spl(&wallet),
+                    &[],
+                )
+            } else {
+                spl22_ix::close_account(
+                    &spl_token_2022::id(),
+                    &Self::sdk_to_spl(&token_account_pk),
+                    &Self::sdk_to_spl(&wallet),
+                    &Self::sdk_to_spl(&wallet),
+                    &[],
+                )
+            };
+
+            match close_ix_prog {
+                Ok(ix) => ixs.push(Self::prog_ix_to_sdk(ix)),
+                Err(e) => {
+                    warn!(request_id = %request_id, token_account = %token_account_pk, mint = %mint, error = %e, "Failed to build close instruction; skipping");
+                    let rec = BurnOpRecord {
+                        header: RecordHeader::new("execution-engine", BUILD_VERSION, &ctx.run_id),
+                        request_id: request_id.clone(),
+                        wallet: wallet.to_string(),
+                        token_account: token_account_pk.to_string(),
+                        mint: mint.to_string(),
+                        token_program: token_program.to_string(),
+                        amount_raw,
+                        close_accounts,
+                        outcome: "failed_build_close_ix".to_string(),
+                        signature: None,
+                        error: Some(format!("{e}")),
+                        reason: reason.clone(),
+                    };
+                    let _ = ctx.burn_writer.write(&rec);
+                    continue;
+                }
+            }
+        }
+
+        if ixs.is_empty() {
+            let rec = BurnOpRecord {
+                header: RecordHeader::new("execution-engine", BUILD_VERSION, &ctx.run_id),
+                request_id: request_id.clone(),
+                wallet: wallet.to_string(),
+                token_account: token_account_pk.to_string(),
+                mint: mint.to_string(),
+                token_program: token_program.to_string(),
+                amount_raw,
+                close_accounts,
+                outcome: "no_op".to_string(),
+                signature: None,
+                error: None,
+                reason: reason.clone(),
+            };
+            let _ = ctx.burn_writer.write(&rec);
+            continue;
+        }
+
+        let plan = tx_builder::TxPlan { instructions: ixs };
+        let sim = simulate_transaction(&ctx, wallet, &plan).await;
+        if !sim.success {
+            warn!(request_id = %request_id, token_account = %token_account_pk, mint = %mint, error = ?sim.error_code, "Burn simulation failed; not sending");
+            let rec = BurnOpRecord {
+                header: RecordHeader::new("execution-engine", BUILD_VERSION, &ctx.run_id),
+                request_id: request_id.clone(),
+                wallet: wallet.to_string(),
+                token_account: token_account_pk.to_string(),
+                mint: mint.to_string(),
+                token_program: token_program.to_string(),
+                amount_raw,
+                close_accounts,
+                outcome: "sim_failed".to_string(),
+                signature: None,
+                error: sim.error_code,
+                reason: reason.clone(),
+            };
+            let _ = ctx.burn_writer.write(&rec);
+            continue;
+        }
+
+        let config = ctx.get_config();
+        if !config.send_enabled {
+            info!(request_id = %request_id, token_account = %token_account_pk, mint = %mint, "send_enabled=false; burn simulated ok but not sending");
+            let rec = BurnOpRecord {
+                header: RecordHeader::new("execution-engine", BUILD_VERSION, &ctx.run_id),
+                request_id: request_id.clone(),
+                wallet: wallet.to_string(),
+                token_account: token_account_pk.to_string(),
+                mint: mint.to_string(),
+                token_program: token_program.to_string(),
+                amount_raw,
+                close_accounts,
+                outcome: "send_disabled".to_string(),
+                signature: None,
+                error: None,
+                reason: reason.clone(),
+            };
+            let _ = ctx.burn_writer.write(&rec);
+            continue;
+        }
+
+        #[cfg(unix)]
+        maybe_ping_watchdog();
+
+        match send_transaction_rpc(
+            &ctx,
+            wallet,
+            &plan,
+            config.send_skip_preflight,
+            parse_commitment_level_opt(config.send_preflight_commitment.as_deref()),
+        )
+        .await
+        {
+            Ok(sig) => {
+                info!(request_id = %request_id, token_account = %token_account_pk, mint = %mint, signature = %sig, "Burn transaction sent");
+                let rec = BurnOpRecord {
+                    header: RecordHeader::new("execution-engine", BUILD_VERSION, &ctx.run_id),
+                    request_id: request_id.clone(),
+                    wallet: wallet.to_string(),
+                    token_account: token_account_pk.to_string(),
+                    mint: mint.to_string(),
+                    token_program: token_program.to_string(),
+                    amount_raw,
+                    close_accounts,
+                    outcome: "sent".to_string(),
+                    signature: Some(sig),
+                    error: None,
+                    reason: reason.clone(),
+                };
+                let _ = ctx.burn_writer.write(&rec);
+            }
+            Err(e) => {
+                warn!(request_id = %request_id, token_account = %token_account_pk, mint = %mint, error = %e, "Burn send failed");
+                let rec = BurnOpRecord {
+                    header: RecordHeader::new("execution-engine", BUILD_VERSION, &ctx.run_id),
+                    request_id: request_id.clone(),
+                    wallet: wallet.to_string(),
+                    token_account: token_account_pk.to_string(),
+                    mint: mint.to_string(),
+                    token_program: token_program.to_string(),
+                    amount_raw,
+                    close_accounts,
+                    outcome: "send_failed".to_string(),
+                    signature: None,
+                    error: Some(e),
+                    reason: reason.clone(),
+                };
+                let _ = ctx.burn_writer.write(&rec);
+            }
+        }
+    }
+
+    info!(request_id = %request_id, "Manual burn job finished");
 }
     /// Update config and return response (P1: Runtime Configuration via UI)
     fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
@@ -1222,6 +1718,9 @@ async fn main() -> Result<()> {
         JsonlWriterConfig::new("execution_results").with_log_dir(log_base.join("executions"));
     let execution_writer = JsonlWriter::new(execution_config)?;
 
+    let burn_config = JsonlWriterConfig::new("burn_ops").with_log_dir(log_base.join("burns"));
+    let burn_writer = JsonlWriter::new(burn_config)?;
+
     info!(log_dir = %log_base.display(), "JSONL writers initialized");
 
     // Load wallet keys and fetch real balance
@@ -1362,6 +1861,7 @@ async fn main() -> Result<()> {
         nats,
         decision_writer,
         execution_writer,
+        burn_writer,
         lock_manager,
         log_base: log_base.clone(),
         decision_counter: std::sync::atomic::AtomicU64::new(initial_decision_counter),
@@ -1372,6 +1872,7 @@ async fn main() -> Result<()> {
         open_positions: std::sync::atomic::AtomicUsize::new(initial_positions),
         kill_switch_active: AtomicBool::new(false),
         liquidation_in_progress: AtomicBool::new(false),
+        burn_in_progress: AtomicBool::new(false),
         // P1: Jito bundle support
         jito_client,
         bundles_submitted: std::sync::atomic::AtomicU64::new(0),
@@ -1538,6 +2039,7 @@ async fn main() -> Result<()> {
                         if req.target != "execution-engine" && req.target != "all" {
                             debug!(target = %req.target, "Ignoring ControlRequest for other target");
                         } else {
+                            let request_id = req.request_id.clone();
                             match req.kind {
                                 ControlRequestKind::KillSwitch { active, reason, liquidate_positions, max_slippage_bps, ttl_ms } => {
                                     ctx.kill_switch_active.store(active, Ordering::Relaxed);
@@ -1558,6 +2060,17 @@ async fn main() -> Result<()> {
                                 ControlRequestKind::ResetKillSwitch => {
                                     ctx.kill_switch_active.store(false, Ordering::Relaxed);
                                     info!("Kill switch reset");
+                                }
+                                ControlRequestKind::BurnTokenAccounts { owner_pubkey, token_accounts, close_accounts, reason } => {
+                                    ExecutionContext::run_manual_burn_job(
+                                        Arc::clone(&ctx),
+                                        request_id,
+                                        owner_pubkey,
+                                        token_accounts,
+                                        close_accounts,
+                                        reason,
+                                    )
+                                    .await;
                                 }
                             }
                         }
