@@ -3,6 +3,7 @@ use crate::solana::dex::Dex;
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::orca_whirlpool_layout;
 use crate::solana::dex::pumpfun::PumpFunDex;
+use crate::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use crate::solana::dex::raydium::Raydium;
 use crate::solana::rpc::SolanaRpc;
 use solana_sdk::hash::hash;
@@ -54,6 +55,7 @@ enum DexHint {
     Raydium,
     Orca,
     Pumpfun,
+    PumpAmm,
 }
 
 fn dex_hint_from_intent(intent: &TradeIntent) -> Result<DexHint, UnsupportedTxPlan> {
@@ -61,6 +63,7 @@ fn dex_hint_from_intent(intent: &TradeIntent) -> Result<DexHint, UnsupportedTxPl
         Some("raydium") => Ok(DexHint::Raydium),
         Some("orca") => Ok(DexHint::Orca),
         Some("pumpfun") => Ok(DexHint::Pumpfun),
+        Some("pump_amm") => Ok(DexHint::PumpAmm),
         Some(other) => Err(UnsupportedTxPlan {
             reason: RejectReason::UnsupportedIntent,
             details: format!("unsupported metadata.dex={other}"),
@@ -118,6 +121,8 @@ pub async fn build_tx_plan(
     intent: &TradeIntent,
     wallet_pubkey: Pubkey,
     rpc: Arc<SolanaRpc>,
+    rpc_url: &str,
+    helius_rpc_url: Option<&str>,
 ) -> TxPlanOutcome {
     let dex_hint = match dex_hint_from_intent(intent) {
         Ok(h) => h,
@@ -300,6 +305,67 @@ pub async fn build_tx_plan(
                 return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                     reason: RejectReason::UnsupportedIntent,
                     details: format!("raydium build failed: {e}"),
+                })
+            }
+        };
+
+        return TxPlanOutcome::Planned(TxPlan { instructions: ixs });
+    }
+
+    if dex_hint == DexHint::PumpAmm {
+        // Pump.fun AMM (PumpSwap) planning uses the pool/market pubkey in `resources.pools[0]`.
+        // We still discover auxiliary accounts from chain for safety and determinism.
+        let pool_id_str = &intent.resources.pools[0];
+        let _pool_id = match Pubkey::from_str(pool_id_str) {
+            Ok(pk) => pk,
+            Err(e) => {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::InvalidIntent,
+                    details: format!("invalid resources.pools[0] pubkey for pump_amm: {e}"),
+                })
+            }
+        };
+
+        let base_mint = match intent.side {
+            TradeSide::Buy => Pubkey::from_str(&intent.resources.output_mint),
+            TradeSide::Sell => Pubkey::from_str(&intent.resources.input_mint),
+        };
+        let base_mint = match base_mint {
+            Ok(m) => m,
+            Err(e) => {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::InvalidIntent,
+                    details: format!("invalid base mint pubkey: {e}"),
+                })
+            }
+        };
+
+        let mut pump_amm = PumpFunAmmDex::new(
+            Arc::clone(&rpc),
+            rpc_url.to_string(),
+            helius_rpc_url.map(|s| s.to_string()),
+        );
+        pump_amm.set_user_authority(wallet_pubkey);
+
+        // Prime caches so build_swap_ix can run synchronously.
+        if let Err(e) = pump_amm.ensure_discovered_for_user(base_mint, wallet_pubkey).await {
+            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                reason: RejectReason::QuoteUnavailable,
+                details: format!("pump_amm discovery failed: {e}"),
+            });
+        }
+
+        let ixs = match pump_amm.build_swap_ix(
+            &intent.resources.input_mint,
+            &intent.resources.output_mint,
+            intent.required_capital.raw,
+            min_out,
+        ) {
+            Ok(ixs) => ixs,
+            Err(e) => {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!("pump_amm build failed: {e}"),
                 })
             }
         };

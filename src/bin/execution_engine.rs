@@ -23,6 +23,7 @@
 //! - Daily loss tracking persisted
 
 use anyhow::Result;
+use base64::Engine as _;
 use clap::Parser;
 use solana_account_decoder::UiAccountData;
 use solana_account_decoder::UiAccountEncoding;
@@ -69,6 +70,7 @@ use ironcrab::ipc::{ControlRequest, ControlRequestKind};
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
 use ironcrab::solana::rpc::SolanaRpc;
+use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::Dex;
@@ -127,7 +129,9 @@ async fn discover_wallet_open_positions(rpc: &SolanaRpc, owner: Pubkey) -> anyho
             UiAccountData::Binary(data, enc) => {
                 let bytes = match enc {
                     UiAccountEncoding::Base58 => bs58::decode(data).into_vec().ok(),
-                    UiAccountEncoding::Base64 => base64::decode(data).ok(),
+                    UiAccountEncoding::Base64 => {
+                        base64::engine::general_purpose::STANDARD.decode(data).ok()
+                    }
                     _ => None,
                 };
                 let Some(bytes) = bytes else { continue };
@@ -542,6 +546,11 @@ struct ExecutionContext {
     /// RPC wrapper for read-only queries and (future) sim/send
     rpc: Arc<SolanaRpc>,
 
+    /// Primary RPC URL used for tx planning/discovery in helper modules.
+    rpc_url: String,
+    /// Optional full-index RPC URL (Helius) used for discovery.
+    helius_rpc_url: Option<String>,
+
     // Metrics
     intents_received: std::sync::atomic::AtomicU64,
     intents_rejected: std::sync::atomic::AtomicU64,
@@ -693,6 +702,11 @@ async fn run_liquidation_job(
 
     // Initialize DEX connectors for quote discovery.
     let raydium = Raydium::new(Arc::clone(&ctx.rpc));
+    let pump_amm = PumpFunAmmDex::new(
+        Arc::clone(&ctx.rpc),
+        ctx.rpc_url.clone(),
+        ctx.helius_rpc_url.clone(),
+    );
     let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc)) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -826,8 +840,25 @@ async fn run_liquidation_job(
 
         let mut min_out_sol: Option<u64> = None;
 
+        // Prefer Pump.fun AMM (PumpSwap) if available. This is required for migrated tokens
+        // where the bonding curve is complete.
+        if let Ok(Some(q)) = pump_amm
+            .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
+            .await
+        {
+            #[cfg(unix)]
+            maybe_ping_watchdog();
+
+            if let Some(pool_id) = q.route.first().cloned() {
+                metadata.insert("dex".to_string(), "pump_amm".to_string());
+                resources.pools = vec![pool_id];
+                min_out_sol = Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
+            }
+        }
+
         // Prefer Pump.fun if quote exists.
-        if let Some(ref pumpfun) = pumpfun {
+        if min_out_sol.is_none() {
+            if let Some(ref pumpfun) = pumpfun {
             if let Ok(Some(q)) = pumpfun
                 .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
                 .await
@@ -856,6 +887,7 @@ async fn run_liquidation_job(
                     metadata.insert("dex".to_string(), "pumpfun".to_string());
                     min_out_sol = Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
                 }
+            }
             }
         }
 
@@ -2133,6 +2165,8 @@ async fn main() -> Result<()> {
         // Cross-DEX handler (initialized below)
         cross_dex_handler: None,
         rpc: Arc::clone(&rpc),
+        rpc_url: args.rpc_url.clone(),
+        helius_rpc_url: None,
         // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
@@ -3070,7 +3104,15 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             }
         };
 
-        match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc)).await {
+        match tx_builder::build_tx_plan(
+            &intent,
+            wallet_pubkey,
+            Arc::clone(&ctx.rpc),
+            &ctx.rpc_url,
+            ctx.helius_rpc_url.as_deref(),
+        )
+        .await
+        {
             tx_builder::TxPlanOutcome::Planned(plan) => {
                 let plan_hash_str = plan.hash_string();
                 checks.push(CheckResult {

@@ -6,6 +6,7 @@ pub mod orca;
 pub mod orca_reserve_cache;
 pub mod orca_whirlpool_layout;
 pub mod pumpfun;
+pub mod pumpfun_amm;
 pub mod raydium;
 pub mod router; // layout + heuristics
 

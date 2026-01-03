@@ -144,3 +144,7 @@ path = "src/bin/sell_all_keyless.rs"
 [[bin]]
 name = "latency-stress"
 path = "src/bin/latency_stress.rs"
+
+[[bin]]
+name = "pump-amm-tx-probe"
+path = "src/bin/pump_amm_tx_probe.rs"
