@@ -70,7 +70,6 @@ use ironcrab::ipc::{ControlRequest, ControlRequestKind};
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
 use ironcrab::solana::rpc::SolanaRpc;
-use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::Dex;
@@ -546,11 +545,6 @@ struct ExecutionContext {
     /// RPC wrapper for read-only queries and (future) sim/send
     rpc: Arc<SolanaRpc>,
 
-    /// Primary RPC URL used for tx planning/discovery in helper modules.
-    rpc_url: String,
-    /// Optional full-index RPC URL (Helius) used for discovery.
-    helius_rpc_url: Option<String>,
-
     // Metrics
     intents_received: std::sync::atomic::AtomicU64,
     intents_rejected: std::sync::atomic::AtomicU64,
@@ -702,11 +696,6 @@ async fn run_liquidation_job(
 
     // Initialize DEX connectors for quote discovery.
     let raydium = Raydium::new(Arc::clone(&ctx.rpc));
-    let pump_amm = PumpFunAmmDex::new(
-        Arc::clone(&ctx.rpc),
-        ctx.rpc_url.clone(),
-        ctx.helius_rpc_url.clone(),
-    );
     let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc)) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -872,25 +861,6 @@ async fn run_liquidation_job(
                     min_out_sol = Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
                 }
             }
-            }
-        }
-
-        // Fallback to Pump.fun AMM (PumpSwap). This covers migrated tokens where the bonding
-        // curve is complete and returns no quote.
-        if min_out_sol.is_none() {
-            if let Ok(Some(q)) = pump_amm
-                .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
-                .await
-            {
-                #[cfg(unix)]
-                maybe_ping_watchdog();
-
-                if let Some(pool_id) = q.route.first().cloned() {
-                    metadata.insert("dex".to_string(), "pump_amm".to_string());
-                    resources.pools = vec![pool_id];
-                    min_out_sol =
-                        Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
-                }
             }
         }
 
@@ -2168,8 +2138,6 @@ async fn main() -> Result<()> {
         // Cross-DEX handler (initialized below)
         cross_dex_handler: None,
         rpc: Arc::clone(&rpc),
-        rpc_url: args.rpc_url.clone(),
-        helius_rpc_url: None,
         // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
@@ -3107,15 +3075,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             }
         };
 
-        match tx_builder::build_tx_plan(
-            &intent,
-            wallet_pubkey,
-            Arc::clone(&ctx.rpc),
-            &ctx.rpc_url,
-            ctx.helius_rpc_url.as_deref(),
-        )
-        .await
-        {
+        match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc)).await {
             tx_builder::TxPlanOutcome::Planned(plan) => {
                 let plan_hash_str = plan.hash_string();
                 checks.push(CheckResult {

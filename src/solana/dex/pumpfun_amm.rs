@@ -535,12 +535,7 @@ impl Dex for PumpFunAmmDex {
         let user_vol = user_acc
             .as_ref()
             .map(|u| u.user_volume_accumulator)
-            .unwrap_or(Pubkey::default());
-        if user_vol == Pubkey::default() {
-            return Err(anyhow!(
-                "pump_amm missing user_volume_accumulator (no prior tx found for user/pool)"
-            ));
-        }
+            .unwrap_or_else(|| Self::derive_user_volume_accumulator(program_id, pool.pool_market, user));
 
         let disc = if is_buy {
             anchor_disc("buy_exact_quote_in")
@@ -600,6 +595,133 @@ impl Dex for PumpFunAmmDex {
 }
 
 impl PumpFunAmmDex {
+    /// Build a Pump.fun AMM (PumpSwap) swap instruction purely from static pool accounts.
+    ///
+    /// This is the intent-driven path: execution-engine can plan/simulate without any
+    /// on-chain discovery (no tx-history scans, no Helius).
+    ///
+    /// `pool_accounts` must be the v1 ordered list produced by market-data
+    /// (MarketEventKind::DexPoolAccounts):
+    /// [0] pool_market
+    /// [1] global_config
+    /// [2] base_mint
+    /// [3] quote_mint
+    /// [4] pool_base_vault
+    /// [5] pool_quote_vault
+    /// [6] protocol_fee_recipient
+    /// [7] protocol_fee_recipient_ta
+    /// [8] event_authority
+    /// [9] coin_creator_vault_ata
+    /// [10] coin_creator_vault_authority
+    /// [11] global_volume_accumulator
+    /// [12] fee_config
+    /// [13] fee_program
+    pub fn build_swap_ix_from_pool_accounts(
+        input_mint: &str,
+        output_mint: &str,
+        amount_in: u64,
+        min_out: u64,
+        user: Pubkey,
+        pool_accounts: &[Pubkey],
+    ) -> Result<Vec<Instruction>> {
+        if pool_accounts.len() != 14 {
+            return Err(anyhow!(
+                "pump_amm expected 14 pool_accounts (v1), got {}",
+                pool_accounts.len()
+            ));
+        }
+
+        let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
+
+        let pool_market = pool_accounts[0];
+        let global_config = pool_accounts[1];
+        let base_mint = pool_accounts[2];
+        let quote_mint = pool_accounts[3];
+        let pool_base_vault = pool_accounts[4];
+        let pool_quote_vault = pool_accounts[5];
+        let protocol_fee_recipient = pool_accounts[6];
+        let protocol_fee_recipient_ta = pool_accounts[7];
+        let event_authority = pool_accounts[8];
+        let coin_creator_vault_ata = pool_accounts[9];
+        let coin_creator_vault_authority = pool_accounts[10];
+        let global_volume_accumulator = pool_accounts[11];
+        let fee_config = pool_accounts[12];
+        let fee_program = pool_accounts[13];
+
+        let (expected_base, is_buy) = if input_mint == WSOL_MINT {
+            (output_mint, true)
+        } else if output_mint == WSOL_MINT {
+            (input_mint, false)
+        } else {
+            return Err(anyhow!("pump_amm only supports WSOL pairs"));
+        };
+
+        let expected_base = Pubkey::from_str(expected_base)?;
+        if expected_base != base_mint {
+            return Err(anyhow!(
+                "pump_amm base_mint mismatch: intent expects {expected_base}, pool_accounts has {base_mint}"
+            ));
+        }
+
+        // User token accounts are deterministic ATAs.
+        let user_base_ta = Self::derive_ata(user, base_mint);
+        let user_quote_ta = Self::derive_ata(user, quote_mint);
+
+        // User volume accumulator is a PDA; derive deterministically.
+        let user_vol = Self::derive_user_volume_accumulator(program_id, pool_market, user);
+
+        let disc = if is_buy {
+            anchor_disc("buy_exact_quote_in")
+        } else {
+            anchor_disc("sell")
+        };
+        let data = Self::build_ix_data(disc, amount_in, min_out);
+
+        // Account ordering is taken from an observed on-chain Pump.fun AMM swap transaction.
+        let mut metas = Vec::with_capacity(23);
+        metas.push(AccountMeta::new(pool_market, false));
+        metas.push(AccountMeta::new(user, true));
+        metas.push(AccountMeta::new_readonly(global_config, false));
+        metas.push(AccountMeta::new_readonly(base_mint, false));
+        metas.push(AccountMeta::new_readonly(quote_mint, false));
+        metas.push(AccountMeta::new(user_base_ta, false));
+        metas.push(AccountMeta::new(user_quote_ta, false));
+        metas.push(AccountMeta::new(pool_base_vault, false));
+        metas.push(AccountMeta::new(pool_quote_vault, false));
+        metas.push(AccountMeta::new_readonly(protocol_fee_recipient, false));
+        metas.push(AccountMeta::new(protocol_fee_recipient_ta, false));
+        metas.push(AccountMeta::new_readonly(
+            Pubkey::new_from_array(spl_token::id().to_bytes()),
+            false,
+        ));
+        metas.push(AccountMeta::new_readonly(
+            Pubkey::new_from_array(spl_token::id().to_bytes()),
+            false,
+        ));
+        metas.push(AccountMeta::new_readonly(
+            Pubkey::new_from_array(solana_system_program::id().to_bytes()),
+            false,
+        ));
+        metas.push(AccountMeta::new_readonly(
+            Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
+            false,
+        ));
+        metas.push(AccountMeta::new_readonly(event_authority, false));
+        metas.push(AccountMeta::new_readonly(program_id, false));
+        metas.push(AccountMeta::new(coin_creator_vault_ata, false));
+        metas.push(AccountMeta::new_readonly(coin_creator_vault_authority, false));
+        metas.push(AccountMeta::new(global_volume_accumulator, false));
+        metas.push(AccountMeta::new(user_vol, false));
+        metas.push(AccountMeta::new_readonly(fee_config, false));
+        metas.push(AccountMeta::new_readonly(fee_program, false));
+
+        Ok(vec![Instruction {
+            program_id,
+            accounts: metas,
+            data,
+        }])
+    }
+
     /// Prime discovery caches for a base mint (static pool) and a user (user-specific accounts).
     pub async fn ensure_discovered_for_user(&self, base_mint: Pubkey, user: Pubkey) -> Result<()> {
         let pool = self

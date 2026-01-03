@@ -121,8 +121,6 @@ pub async fn build_tx_plan(
     intent: &TradeIntent,
     wallet_pubkey: Pubkey,
     rpc: Arc<SolanaRpc>,
-    rpc_url: &str,
-    helius_rpc_url: Option<&str>,
 ) -> TxPlanOutcome {
     let dex_hint = match dex_hint_from_intent(intent) {
         Ok(h) => h,
@@ -314,9 +312,9 @@ pub async fn build_tx_plan(
 
     if dex_hint == DexHint::PumpAmm {
         // Pump.fun AMM (PumpSwap) planning uses the pool/market pubkey in `resources.pools[0]`.
-        // We still discover auxiliary accounts from chain for safety and determinism.
+        // This path is intent-driven and does not perform any on-chain discovery.
         let pool_id_str = &intent.resources.pools[0];
-        let _pool_id = match Pubkey::from_str(pool_id_str) {
+        let pool_id = match Pubkey::from_str(pool_id_str) {
             Ok(pk) => pk,
             Err(e) => {
                 return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
@@ -326,40 +324,46 @@ pub async fn build_tx_plan(
             }
         };
 
-        let base_mint = match intent.side {
-            TradeSide::Buy => Pubkey::from_str(&intent.resources.output_mint),
-            TradeSide::Sell => Pubkey::from_str(&intent.resources.input_mint),
-        };
-        let base_mint = match base_mint {
-            Ok(m) => m,
-            Err(e) => {
-                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                    reason: RejectReason::InvalidIntent,
-                    details: format!("invalid base mint pubkey: {e}"),
-                })
-            }
-        };
-
-        let mut pump_amm = PumpFunAmmDex::new(
-            Arc::clone(&rpc),
-            rpc_url.to_string(),
-            helius_rpc_url.map(|s| s.to_string()),
-        );
-        pump_amm.set_user_authority(wallet_pubkey);
-
-        // Prime caches so build_swap_ix can run synchronously.
-        if let Err(e) = pump_amm.ensure_discovered_for_user(base_mint, wallet_pubkey).await {
+        if intent.resources.accounts.len() != 14 {
             return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                reason: RejectReason::QuoteUnavailable,
-                details: format!("pump_amm discovery failed: {e}"),
+                reason: RejectReason::UnsupportedIntent,
+                details: format!(
+                    "pump_amm requires resources.accounts (DexPoolAccounts v1, len=14), got len={}",
+                    intent.resources.accounts.len()
+                ),
             });
         }
 
-        let ixs = match pump_amm.build_swap_ix(
+        let mut pool_accounts: Vec<Pubkey> = Vec::with_capacity(14);
+        for (idx, a) in intent.resources.accounts.iter().enumerate() {
+            match Pubkey::from_str(a) {
+                Ok(pk) => pool_accounts.push(pk),
+                Err(e) => {
+                    return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                        reason: RejectReason::InvalidIntent,
+                        details: format!("invalid resources.accounts[{idx}] pubkey for pump_amm: {e}"),
+                    })
+                }
+            }
+        }
+
+        if pool_accounts[0] != pool_id {
+            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                reason: RejectReason::InvalidIntent,
+                details: format!(
+                    "pump_amm pool mismatch: resources.pools[0]={pool_id} but resources.accounts[0]={}",
+                    pool_accounts[0]
+                ),
+            });
+        }
+
+        let ixs = match PumpFunAmmDex::build_swap_ix_from_pool_accounts(
             &intent.resources.input_mint,
             &intent.resources.output_mint,
             intent.required_capital.raw,
             min_out,
+            wallet_pubkey,
+            &pool_accounts,
         ) {
             Ok(ixs) => ixs,
             Err(e) => {

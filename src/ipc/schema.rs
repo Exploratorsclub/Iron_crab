@@ -131,6 +131,30 @@ pub enum MarketEventKind {
         dex: String,
         initial_liquidity_sol: Option<Decimal>,
     },
+    /// DEX-specific static pool accounts needed for deterministic intent building.
+    ///
+    /// For Pump.fun AMM (PumpSwap), `accounts` is a v1 ordered list:
+    /// [0] pool_market
+    /// [1] global_config
+    /// [2] base_mint
+    /// [3] quote_mint
+    /// [4] pool_base_vault
+    /// [5] pool_quote_vault
+    /// [6] protocol_fee_recipient
+    /// [7] protocol_fee_recipient_ta
+    /// [8] event_authority
+    /// [9] coin_creator_vault_ata
+    /// [10] coin_creator_vault_authority
+    /// [11] global_volume_accumulator
+    /// [12] fee_config
+    /// [13] fee_program
+    DexPoolAccounts {
+        dex: String,
+        pool_address: String,
+        base_mint: String,
+        quote_mint: String,
+        accounts: Vec<String>,
+    },
     /// Trade/swap observed on-chain (detailed for 4-filter strategy)
     Trade {
         pool_address: String,

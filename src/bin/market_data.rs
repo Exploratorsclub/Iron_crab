@@ -53,6 +53,7 @@ const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
 /// Market data configuration (hot-reloadable via NATS)
 #[derive(Debug, Clone)]
@@ -348,6 +349,7 @@ async fn run_geyser_loop(
         Pubkey::from_str(RAYDIUM_AMM_V4).expect("valid raydium pubkey"),
         Pubkey::from_str(ORCA_WHIRLPOOL).expect("valid orca pubkey"),
         Pubkey::from_str(PUMPFUN_PROGRAM).expect("valid pumpfun pubkey"),
+        Pubkey::from_str(PUMPFUN_AMM_PROGRAM).expect("valid pumpfun amm pubkey"),
     ];
 
     let (listener, mut account_rx, mut transaction_rx) =
@@ -515,6 +517,49 @@ async fn run_geyser_loop(
                     if let Some(ref nats) = ctx.nats {
                         if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &wallet_event).await {
                             warn!(error = %e, "Failed to publish wallet event to NATS");
+                        }
+                    }
+                }
+
+                // Pump.fun AMM: emit static pool account metadata for intent-driven execution.
+                if let Some(ParsedDexEvent::Trade {
+                    pool_address,
+                    dex: DexType::PumpFunAmm,
+                    pool_accounts: Some(pool_accounts),
+                    ..
+                }) = parsed_event.as_ref()
+                {
+                    // v1 order (see MarketEventKind::DexPoolAccounts docs): base_mint at [2], quote_mint at [3]
+                    let base_mint = pool_accounts.get(2).map(|p| p.to_string()).unwrap_or_default();
+                    let quote_mint = pool_accounts.get(3).map(|p| p.to_string()).unwrap_or_default();
+
+                    let accounts_event = MarketEvent::new(
+                        "market-data",
+                        BUILD_VERSION,
+                        run_id,
+                        ctx.next_event_id(),
+                        "geyser",
+                        Some(tx_update.slot),
+                        MarketEventKind::DexPoolAccounts {
+                            dex: DexType::PumpFunAmm.to_string(),
+                            pool_address: pool_address.to_string(),
+                            base_mint,
+                            quote_mint,
+                            accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
+                        },
+                    );
+
+                    if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
+                        error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
+                    }
+
+                    if let Some(ref nats) = ctx.nats {
+                        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &accounts_event).await {
+                            warn!(error = %e, "Failed to publish DexPoolAccounts event to NATS");
+                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }

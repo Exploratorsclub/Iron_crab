@@ -8,6 +8,7 @@
 
 use crate::solana::geyser_listener::{GeyserAccountUpdate, GeyserTransactionUpdate};
 use rust_decimal::Decimal;
+use solana_sdk::hash::hash;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use tracing::{debug, info, trace};
@@ -19,6 +20,7 @@ use tracing::{debug, info, trace};
 pub const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 pub const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 pub const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+pub const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 // ============================================================================
@@ -36,17 +38,24 @@ pub enum ParsedDexEvent {
         initial_liquidity_lamports: u64,
         slot: u64,
         creator: Option<Pubkey>,
+        /// Optional static pool account list for deterministic intent building.
+        /// Order is DEX-specific.
+        pool_accounts: Option<Vec<Pubkey>>,
     },
     /// Trade/Swap observed
     Trade {
         pool_address: Pubkey,
         mint: Pubkey,
         trader: Pubkey,
+        dex: DexType,
         is_buy: bool,
         sol_amount: u64,
         token_amount: u64,
         signature: String,
         slot: u64,
+        /// Optional static pool account list for deterministic intent building.
+        /// Order is DEX-specific.
+        pool_accounts: Option<Vec<Pubkey>>,
     },
     /// Liquidity removed (potential rug)
     LiquidityRemoved {
@@ -64,6 +73,7 @@ pub enum DexType {
     RaydiumAmmV4,
     OrcaWhirlpool,
     PumpFun,
+    PumpFunAmm,
 }
 
 impl std::fmt::Display for DexType {
@@ -72,8 +82,16 @@ impl std::fmt::Display for DexType {
             DexType::RaydiumAmmV4 => write!(f, "raydium"),
             DexType::OrcaWhirlpool => write!(f, "orca"),
             DexType::PumpFun => write!(f, "pumpfun"),
+            DexType::PumpFunAmm => write!(f, "pump_amm"),
         }
     }
+}
+
+fn anchor_disc(ix_name: &str) -> [u8; 8] {
+    let out = hash(format!("global:{ix_name}").as_bytes());
+    let mut disc = [0u8; 8];
+    disc.copy_from_slice(&out.as_ref()[..8]);
+    disc
 }
 
 // ============================================================================
@@ -118,7 +136,11 @@ pub fn parse_transaction_update(update: &GeyserTransactionUpdate) -> Option<Pars
     let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).ok()?;
     let orca = Pubkey::from_str(ORCA_WHIRLPOOL).ok()?;
     let pumpfun = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
+    let pumpfun_amm = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).ok()?;
 
+    if update.account_keys.contains(&pumpfun_amm) {
+        return parse_pumpfun_amm_transaction(update);
+    }
     if update.account_keys.contains(&pumpfun) {
         return parse_pumpfun_transaction(update);
     }
@@ -180,6 +202,7 @@ fn parse_raydium_account(update: &GeyserAccountUpdate) -> Option<ParsedDexEvent>
         initial_liquidity_lamports: liquidity_lamports,
         slot: update.slot,
         creator: None,
+        pool_accounts: None,
     })
 }
 
@@ -262,11 +285,13 @@ fn parse_raydium_swap(
         pool_address,
         mint,
         trader,
+        dex: DexType::RaydiumAmmV4,
         is_buy,
         sol_amount: if is_buy { amount_in } else { 0 },
         token_amount: if !is_buy { amount_in } else { 0 },
         signature: update.signature.clone(),
         slot: update.slot,
+        pool_accounts: None,
     })
 }
 
@@ -299,6 +324,7 @@ fn parse_orca_account(update: &GeyserAccountUpdate) -> Option<ParsedDexEvent> {
         initial_liquidity_lamports: liquidity_lamports,
         slot: update.slot,
         creator: None,
+        pool_accounts: None,
     })
 }
 
@@ -354,11 +380,13 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
         pool_address,
         mint: Pubkey::default(),
         trader,
+        dex: DexType::OrcaWhirlpool,
         is_buy,
         sol_amount: if is_buy { amount } else { 0 },
         token_amount: if !is_buy { amount } else { 0 },
         signature: update.signature.clone(),
         slot: update.slot,
+        pool_accounts: None,
     })
 }
 
@@ -428,6 +456,7 @@ fn parse_pumpfun_create(update: &GeyserTransactionUpdate) -> Option<ParsedDexEve
         initial_liquidity_lamports: 30_000_000_000, // 30 SOL default
         slot: update.slot,
         creator: Some(creator),
+        pool_accounts: None,
     })
 }
 
@@ -479,11 +508,100 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
         pool_address: bonding_curve,
         mint,
         trader,
+        dex: DexType::PumpFun,
         is_buy,
         sol_amount,
         token_amount,
         signature: update.signature.clone(),
         slot: update.slot,
+        pool_accounts: None,
+    })
+}
+
+// ============================================================================
+// Pump.fun AMM (PumpSwap) Parsing
+// ============================================================================
+
+fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
+    if update.instruction_data.len() < 24 {
+        return None;
+    }
+    if update.instruction_accounts.len() != 23 {
+        return None;
+    }
+
+    let disc = &update.instruction_data[0..8];
+    let buy_disc = anchor_disc("buy_exact_quote_in");
+    let sell_disc = anchor_disc("sell");
+
+    let is_buy = if disc == buy_disc {
+        true
+    } else if disc == sell_disc {
+        false
+    } else {
+        return None;
+    };
+
+    // Observed account order (see src/solana/dex/pumpfun_amm.rs)
+    let pool_market = update.instruction_accounts[0];
+    let user = update.instruction_accounts[1];
+    let global_config = update.instruction_accounts[2];
+    let base_mint = update.instruction_accounts[3];
+    let quote_mint = update.instruction_accounts[4];
+    let pool_base_vault = update.instruction_accounts[7];
+    let pool_quote_vault = update.instruction_accounts[8];
+    let protocol_fee_recipient = update.instruction_accounts[9];
+    let protocol_fee_recipient_ta = update.instruction_accounts[10];
+    let event_authority = update.instruction_accounts[15];
+    let coin_creator_vault_ata = update.instruction_accounts[17];
+    let coin_creator_vault_authority = update.instruction_accounts[18];
+    let global_volume_accumulator = update.instruction_accounts[19];
+    let fee_config = update.instruction_accounts[21];
+    let fee_program = update.instruction_accounts[22];
+
+    let amount_in = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
+    let min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
+
+    // Pool static accounts order (v1) for intent resources.accounts
+    let pool_accounts = vec![
+        pool_market,
+        global_config,
+        base_mint,
+        quote_mint,
+        pool_base_vault,
+        pool_quote_vault,
+        protocol_fee_recipient,
+        protocol_fee_recipient_ta,
+        event_authority,
+        coin_creator_vault_ata,
+        coin_creator_vault_authority,
+        global_volume_accumulator,
+        fee_config,
+        fee_program,
+    ];
+
+    debug!(
+        pool = %pool_market,
+        mint = %base_mint,
+        trader = %user,
+        is_buy = is_buy,
+        amount_in = amount_in,
+        min_out = min_out,
+        sig = %update.signature,
+        "Pump.fun AMM swap detected"
+    );
+
+    Some(ParsedDexEvent::Trade {
+        pool_address: pool_market,
+        mint: base_mint,
+        trader: user,
+        dex: DexType::PumpFunAmm,
+        is_buy,
+        sol_amount: if is_buy { amount_in } else { min_out },
+        token_amount: if is_buy { 0 } else { amount_in },
+        signature: update.signature.clone(),
+        slot: update.slot,
+        pool_accounts: Some(pool_accounts),
     })
 }
 
@@ -505,14 +623,19 @@ impl ParsedDexEvent {
                 initial_liquidity_lamports,
                 ..
             } => {
-                let liq_sol =
-                    Decimal::from(*initial_liquidity_lamports) / Decimal::from(1_000_000_000u64);
                 MarketEventKind::PoolCreated {
                     pool_address: pool_address.to_string(),
                     base_mint: base_mint.to_string(),
                     quote_mint: quote_mint.to_string(),
                     dex: dex.to_string(),
-                    initial_liquidity_sol: Some(liq_sol),
+                    initial_liquidity_sol: if *initial_liquidity_lamports > 0 {
+                        Some(
+                            Decimal::from(*initial_liquidity_lamports)
+                                / Decimal::from(1_000_000_000u64),
+                        )
+                    } else {
+                        None
+                    },
                 }
             }
             ParsedDexEvent::Trade {
@@ -569,5 +692,6 @@ mod tests {
         assert_eq!(DexType::RaydiumAmmV4.to_string(), "raydium");
         assert_eq!(DexType::OrcaWhirlpool.to_string(), "orca");
         assert_eq!(DexType::PumpFun.to_string(), "pumpfun");
+        assert_eq!(DexType::PumpFunAmm.to_string(), "pump_amm");
     }
 }
