@@ -1,14 +1,8 @@
 pub mod audit;
 pub mod backtest;
 pub mod config;
-#[cfg(feature = "legacy_sniper")]
-pub mod config_reload;
-#[cfg(feature = "legacy_monolith")]
-pub mod engine;
 pub mod execution;
 pub mod ipc;
-#[cfg(feature = "legacy_monolith")]
-pub mod log_manager;
 pub mod metrics;
 pub mod nats;
 pub mod quantile_impact;

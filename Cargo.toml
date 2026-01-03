@@ -94,8 +94,6 @@ python_ipc = []
 jito = []
 notify_watch = ["notify"]
 nats = ["async-nats"]
-legacy_sniper = []
-legacy_monolith = ["legacy_sniper"]
 
 [dependencies.pyo3]
 version = "0.24.2"
@@ -146,8 +144,3 @@ path = "src/bin/sell_all_keyless.rs"
 [[bin]]
 name = "latency-stress"
 path = "src/bin/latency_stress.rs"
-
-[[bin]]
-name = "ironcrab-monolith"
-path = "src/main.rs"
-required-features = ["legacy_monolith"]
