@@ -835,17 +835,24 @@ async fn run_liquidation_job(
                 #[cfg(unix)]
                 maybe_ping_watchdog();
 
-                if let Some(bc) = q.route.first().and_then(|s| Pubkey::from_str(s).ok()) {
-                    if let Ok(acct) = ctx.rpc.rpc.get_account(&bc).await {
-                        if let Ok(state) = BondingCurveState::parse(&acct.data) {
-                            metadata.insert("creator".to_string(), state.creator.to_string());
+                // For Pump.fun, we include the bonding-curve account pubkey as
+                // `resources.pools[0]` to keep tx planning deterministic and to satisfy the
+                // tx_builder invariant that exactly one pool id is provided.
+                if let Some(bc_str) = q.route.first() {
+                    resources.pools = vec![bc_str.clone()];
+
+                    if let Ok(bc) = Pubkey::from_str(bc_str) {
+                        if let Ok(acct) = ctx.rpc.rpc.get_account(&bc).await {
+                            if let Ok(state) = BondingCurveState::parse(&acct.data) {
+                                metadata.insert("creator".to_string(), state.creator.to_string());
+                            }
                         }
                     }
                 }
                 #[cfg(unix)]
                 maybe_ping_watchdog();
 
-                if metadata.get("creator").is_some() {
+                if metadata.get("creator").is_some() && resources.pools.len() == 1 {
                     metadata.insert("dex".to_string(), "pumpfun".to_string());
                     min_out_sol = Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
                 }
