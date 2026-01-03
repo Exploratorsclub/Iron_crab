@@ -968,7 +968,7 @@ async fn run_liquidation_job(
     // Best-effort: failures are logged but do not fail the liquidation job.
     #[cfg(unix)]
     maybe_ping_watchdog();
-    if let Err(e) = cleanup_wallet_after_liquidation(ctx.as_ref(), owner).await {
+    if let Err(e) = Self::cleanup_wallet_after_liquidation(ctx.as_ref(), owner).await {
         warn!(error = %e, "Liquidation cleanup failed (best-effort)");
     }
 
