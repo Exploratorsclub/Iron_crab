@@ -401,6 +401,24 @@ impl PositionTracker {
         }
     }
 
+    fn add_investment(&mut self, additional_sol: u64) {
+        if additional_sol == 0 {
+            return;
+        }
+
+        // Heuristic: weighted-average entry price based on SOL invested.
+        // Exact fill price/token amount is not available from ExecutionResult today.
+        let old_sol = self.sol_invested.max(1);
+        let new_sol = old_sol.saturating_add(additional_sol).max(1);
+        let new_entry = ((self.entry_price * (old_sol as f64))
+            + (self.current_price * (additional_sol as f64)))
+            / (new_sol as f64);
+
+        self.sol_invested = self.sol_invested.saturating_add(additional_sol);
+        self.entry_price = new_entry;
+        self.highest_price = self.highest_price.max(self.current_price);
+    }
+
     /// Record a trade for momentum tracking
     fn record_trade(&mut self, trade: TradeEvent) {
         self.recent_trades.push(trade);
@@ -556,7 +574,13 @@ struct TokenTracker {
     lp_removal_time: Option<Instant>,
 
     // State
-    intent_generated: bool, // Already generated an intent for this token
+    /// Entry lifecycle: probe then optional scale-in.
+    probe_sent_at: Option<Instant>,
+    probe_filled_at: Option<Instant>,
+    scale_sent_at: Option<Instant>,
+    scale_filled_at: Option<Instant>,
+    /// Terminal flag: entry complete (scale-in done or abandoned) and no further entry intents.
+    intent_generated: bool,
     blacklisted: bool,      // Failed filters, don't trade
     blacklist_reason: Option<String>,
 }
@@ -593,6 +617,10 @@ impl TokenTracker {
             dev_rebought: false,
             lp_removed: false,
             lp_removal_time: None,
+            probe_sent_at: None,
+            probe_filled_at: None,
+            scale_sent_at: None,
+            scale_filled_at: None,
             intent_generated: false,
             blacklisted: false,
             blacklist_reason: None,
@@ -1080,9 +1108,27 @@ struct PendingIntent {
     pool: String,
     dex: String,
     side: TradeSide,
+    /// For BUY intents, indicates probe vs scale-in.
+    entry_kind: Option<EntryKind>,
     sol_amount: u64,   // For BUY: SOL invested
     token_amount: u64, // For SELL: tokens to sell
     created_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Probe,
+    ScaleIn,
+}
+
+#[derive(Debug, Clone)]
+struct EntrySignal {
+    mint: String,
+    pool: String,
+    dex: String,
+    sol_amount: u64,
+    kind: EntryKind,
+    reason: String,
 }
 
 /// Runtime context for momentum-bot
@@ -1259,33 +1305,87 @@ impl MomentumContext {
     }
 
     /// Check if any tracked token should generate an intent
-    fn check_for_signals(&self) -> Vec<(String, String, String, String)> {
-        // Returns: Vec<(mint, pool, dex, reason)>
+    fn check_for_signals(&self) -> Vec<EntrySignal> {
+        // Returns entry intents (probe + optional scale-in)
         let config = self.config.read().clone();
         let mint_infos = self.mint_infos.read();
         let mut trackers = self.token_trackers.write();
         let mut signals = Vec::new();
 
+        let probe_sol = ((config.default_position_lamports as f64) * config.probe_buy_pct)
+            .round()
+            .clamp(0.0, config.default_position_lamports as f64) as u64;
+        let scale_sol = config.default_position_lamports.saturating_sub(probe_sol);
+
         for (mint, tracker) in trackers.iter_mut() {
-            if tracker.intent_generated || tracker.blacklisted {
+            if tracker.blacklisted || tracker.intent_generated {
                 continue;
             }
 
             let mint_info = mint_infos.get(mint);
-            let was_blacklisted = tracker.blacklisted;
-            let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
-            if !was_blacklisted && tracker.blacklisted {
-                self.tokens_blacklisted
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // 1) Probe-buy stage
+            if tracker.probe_sent_at.is_none() {
+                let was_blacklisted = tracker.blacklisted;
+                let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
+                if !was_blacklisted && tracker.blacklisted {
+                    self.tokens_blacklisted
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                if should_trade {
+                    if probe_sol == 0 {
+                        tracker.intent_generated = true;
+                        continue;
+                    }
+                    tracker.probe_sent_at = Some(Instant::now());
+                    signals.push(EntrySignal {
+                        mint: mint.clone(),
+                        pool: tracker.pool.clone(),
+                        dex: tracker.dex.clone(),
+                        sol_amount: probe_sol,
+                        kind: EntryKind::Probe,
+                        reason: format!("ENTER_PROBE_BUY: {reason}"),
+                    });
+                }
+                continue;
             }
-            if should_trade {
-                tracker.intent_generated = true;
-                signals.push((
-                    mint.clone(),
-                    tracker.pool.clone(),
-                    tracker.dex.clone(),
-                    reason,
-                ));
+
+            // 2) Scale-in stage (only after probe fill, within confirm window)
+            if tracker.probe_filled_at.is_some()
+                && tracker.scale_sent_at.is_none()
+                && tracker.scale_filled_at.is_none()
+            {
+                let now = Instant::now();
+                let probe_filled_at = tracker.probe_filled_at.unwrap_or(now);
+                if now.duration_since(probe_filled_at).as_secs() > config.scale_in_confirm_window_secs {
+                    // Confirmation window expired: keep probe position only.
+                    tracker.intent_generated = true;
+                    continue;
+                }
+
+                let was_blacklisted = tracker.blacklisted;
+                let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
+                if !was_blacklisted && tracker.blacklisted {
+                    self.tokens_blacklisted
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                if should_trade {
+                    if scale_sol == 0 {
+                        tracker.intent_generated = true;
+                        continue;
+                    }
+                    tracker.scale_sent_at = Some(now);
+                    signals.push(EntrySignal {
+                        mint: mint.clone(),
+                        pool: tracker.pool.clone(),
+                        dex: tracker.dex.clone(),
+                        sol_amount: scale_sol,
+                        kind: EntryKind::ScaleIn,
+                        reason: format!("ENTER_SCALE_IN: {reason}"),
+                    });
+                }
             }
         }
 
@@ -1316,8 +1416,9 @@ impl MomentumContext {
         sol_invested: u64,
     ) {
         let mut positions = self.positions.write();
-        if positions.contains_key(mint) {
-            warn!(mint = %mint, "Position already exists, not opening duplicate");
+        if let Some(pos) = positions.get_mut(mint) {
+            pos.add_investment(sol_invested);
+            info!(mint = %mint, additional_sol = sol_invested, total_sol = pos.sol_invested, "📈 Position scaled in");
             return;
         }
         positions.insert(
@@ -1408,6 +1509,7 @@ impl MomentumContext {
         pool: &str,
         dex: &str,
         sol_amount: u64,
+        entry_kind: Option<EntryKind>,
     ) {
         let mut pending = self.pending_intents.write();
         pending.insert(
@@ -1418,6 +1520,7 @@ impl MomentumContext {
                 pool: pool.to_string(),
                 dex: dex.to_string(),
                 side: TradeSide::Buy,
+                entry_kind,
                 sol_amount,
                 token_amount: 0,
                 created_at: Instant::now(),
@@ -1444,6 +1547,7 @@ impl MomentumContext {
                 pool: pool.to_string(),
                 dex: dex.to_string(),
                 side: TradeSide::Sell,
+                entry_kind: None,
                 sol_amount: 0,
                 token_amount,
                 created_at: Instant::now(),
@@ -1493,6 +1597,23 @@ impl MomentumContext {
                             "✅ BUY CONFIRMED - Opening position"
                         );
 
+                        // Mark entry stage fill.
+                        {
+                            let mut trackers = self.token_trackers.write();
+                            if let Some(tr) = trackers.get_mut(&pending.mint) {
+                                match pending.entry_kind {
+                                    Some(EntryKind::Probe) => {
+                                        tr.probe_filled_at = Some(Instant::now());
+                                    }
+                                    Some(EntryKind::ScaleIn) => {
+                                        tr.scale_filled_at = Some(Instant::now());
+                                        tr.intent_generated = true;
+                                    }
+                                    None => {}
+                                }
+                            }
+                        }
+
                         self.open_position(
                             &pending.mint,
                             &pending.pool,
@@ -1525,7 +1646,17 @@ impl MomentumContext {
                     error = ?result.error_message,
                     "❌ Execution FAILED"
                 );
-                // Don't open position on failure
+                // Don't open position on failure. For entry intents, stop retry-spam.
+                if pending.side == TradeSide::Buy {
+                    let mut trackers = self.token_trackers.write();
+                    if let Some(tr) = trackers.get_mut(&pending.mint) {
+                        tr.blacklisted = true;
+                        tr.blacklist_reason = Some(format!(
+                            "Entry execution failed ({:?})",
+                            pending.entry_kind.unwrap_or(EntryKind::Probe)
+                        ));
+                    }
+                }
             }
             ExecutionStatus::Timeout => {
                 warn!(
@@ -1534,6 +1665,16 @@ impl MomentumContext {
                     side = ?pending.side,
                     "⏱️ Execution TIMEOUT"
                 );
+                if pending.side == TradeSide::Buy {
+                    let mut trackers = self.token_trackers.write();
+                    if let Some(tr) = trackers.get_mut(&pending.mint) {
+                        tr.blacklisted = true;
+                        tr.blacklist_reason = Some(format!(
+                            "Entry execution timeout ({:?})",
+                            pending.entry_kind.unwrap_or(EntryKind::Probe)
+                        ));
+                    }
+                }
             }
             ExecutionStatus::Sent => {
                 // Still in flight, shouldn't see this as final result
@@ -2108,6 +2249,7 @@ async fn main() -> Result<()> {
 
     // Heartbeat and stats tracking
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut strategy_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     let mut events_received: u64 = 0;
     let mut last_slot: u64 = 0;
@@ -2226,6 +2368,50 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Strategy evaluation tick (entry + exits) - frequent enough for probe/scale windows.
+            _ = strategy_interval.tick() => {
+                ironcrab::metrics::record_activity();
+
+                // === Check for ENTRY signals ===
+                let signals = ctx.check_for_signals();
+                for s in signals {
+                    info!(
+                        mint = %s.mint,
+                        pool = %s.pool,
+                        dex = %s.dex,
+                        kind = ?s.kind,
+                        sol_amount = s.sol_amount,
+                        reason = %s.reason,
+                        "🎯 ENTRY SIGNAL DETECTED"
+                    );
+
+                    if let Err(e) = generate_and_publish_buy_intent(&ctx, &s).await {
+                        error!(error = %e, mint = %s.mint, "Failed to generate/publish buy intent");
+                    } else {
+                        ctx.intents_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+
+                // === Check for EXIT signals ===
+                let exits = ctx.check_for_exits();
+                for (mint, pool, dex, exit_type, reason, token_amount) in exits {
+                    info!(
+                        mint = %mint,
+                        pool = %pool,
+                        exit_type = %exit_type,
+                        reason = %reason,
+                        token_amount = token_amount,
+                        "🚨 EXIT SIGNAL DETECTED"
+                    );
+
+                    if let Err(e) = generate_and_publish_exit_intent(&ctx, &mint, &pool, &dex, &exit_type, &reason, token_amount).await {
+                        error!(error = %e, mint = %mint, "Failed to generate/publish sell intent");
+                    } else {
+                        ctx.exits_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+
             // Periodic heartbeat
             _ = heartbeat_interval.tick() => {
                 ironcrab::metrics::record_activity();
@@ -2262,46 +2448,6 @@ async fn main() -> Result<()> {
                 // Cleanup old trackers and stale pending intents
                 ctx.cleanup_old_trackers();
                 ctx.cleanup_stale_pending();
-
-                // === Check for ENTRY signals ===
-                let signals = ctx.check_for_signals();
-                for (mint, pool, dex, reason) in signals {
-                    info!(
-                        mint = %mint,
-                        pool = %pool,
-                        dex = %dex,
-                        reason = %reason,
-                        "🎯 ENTRY SIGNAL DETECTED"
-                    );
-
-                    // Generate and publish BUY intent
-                    if let Err(e) = generate_and_publish_intent(&ctx, &mint, &pool, &dex, &reason).await {
-                        error!(error = %e, mint = %mint, "Failed to generate/publish buy intent");
-                    } else {
-                        ctx.intents_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-
-                // === Check for EXIT signals ===
-                let exits = ctx.check_for_exits();
-                for (mint, pool, dex, exit_type, reason, token_amount) in exits {
-                    info!(
-                        mint = %mint,
-                        pool = %pool,
-                        exit_type = %exit_type,
-                        reason = %reason,
-                        token_amount = token_amount,
-                        "🚨 EXIT SIGNAL DETECTED"
-                    );
-
-                    // Generate and publish SELL intent
-                    if let Err(e) = generate_and_publish_exit_intent(&ctx, &mint, &pool, &dex, &exit_type, &reason, token_amount).await {
-                        error!(error = %e, mint = %mint, "Failed to generate/publish sell intent");
-                    } else {
-                        ctx.exits_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-
             }
 
             _ = &mut shutdown => {
@@ -2318,16 +2464,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Generate and publish a TradeIntent based on a trading signal
-async fn generate_and_publish_intent(
-    ctx: &MomentumContext,
-    mint: &str,
-    pool: &str,
-    dex: &str,
-    reason: &str,
-) -> Result<()> {
+/// Generate and publish a BUY TradeIntent based on an entry signal.
+async fn generate_and_publish_buy_intent(ctx: &MomentumContext, signal: &EntrySignal) -> Result<()> {
     let config = ctx.config.read();
-    let position_lamports = config.default_position_lamports;
     let max_slippage = config.early_max_slippage_bps;
     drop(config);
 
@@ -2338,7 +2477,7 @@ async fn generate_and_publish_intent(
 
     let (creator_opt, last_trade_ratio_opt) = {
         let trackers = ctx.token_trackers.read();
-        let tracker = trackers.get(mint);
+        let tracker = trackers.get(&signal.mint);
         (
             tracker.and_then(|t| t.dev_wallet.clone()),
             tracker.and_then(|t| t.last_trade_ratio()),
@@ -2348,11 +2487,21 @@ async fn generate_and_publish_intent(
     let (last_sol_lamports, last_token_amount) = match last_trade_ratio_opt {
         Some(v) => v,
         None => {
+            // Roll back stage markers so we can try again when a usable trade ratio arrives.
+            {
+                let mut trackers = ctx.token_trackers.write();
+                if let Some(tr) = trackers.get_mut(&signal.mint) {
+                    match signal.kind {
+                        EntryKind::Probe => tr.probe_sent_at = None,
+                        EntryKind::ScaleIn => tr.scale_sent_at = None,
+                    }
+                }
+            }
             warn!(
-                mint = %mint,
-                pool = %pool,
-                dex = %dex,
-                reason = %reason,
+                mint = %signal.mint,
+                pool = %signal.pool,
+                dex = %signal.dex,
+                reason = %signal.reason,
                 "Skipping BUY intent: no usable trade ratio yet (need sol_amount+token_amount)"
             );
             anyhow::bail!(
@@ -2362,8 +2511,8 @@ async fn generate_and_publish_intent(
     };
 
     // Estimate expected token output using last observed ratio.
-    // expected_out_raw = position_lamports * last_token_amount / last_sol_lamports
-    let expected_out_raw: u64 = ((position_lamports as u128)
+    // expected_out_raw = sol_amount * last_token_amount / last_sol_lamports
+    let expected_out_raw: u64 = ((signal.sol_amount as u128)
         .saturating_mul(last_token_amount as u128)
         / (last_sol_lamports as u128))
         .min(u64::MAX as u128) as u64;
@@ -2378,14 +2527,14 @@ async fn generate_and_publish_intent(
         BUILD_VERSION,
         &ctx.run_id,
         intent_id.clone(),
-        &format!("4filter:{}", reason),
+        &format!("4filter:{}", signal.reason),
         IntentTier::Tier1,
         IntentOrigin::StrategyA,
-        ExplicitAmount::new(position_lamports, 9),
+        ExplicitAmount::new(signal.sol_amount, 9),
         TradeResources {
             input_mint: sol_mint.to_string(),
-            output_mint: mint.to_string(),
-            pools: vec![pool.to_string()],
+            output_mint: signal.mint.to_string(),
+            pools: vec![signal.pool.to_string()],
             accounts: vec![],
         },
         50, // Expected ROI: 0.5%
@@ -2405,25 +2554,41 @@ async fn generate_and_publish_intent(
     intent
         .metadata
         .insert("min_out_raw".to_string(), min_out_raw.to_string());
-    intent.metadata.insert("dex".to_string(), dex.to_string());
+    intent.metadata.insert("dex".to_string(), signal.dex.to_string());
+    intent.metadata.insert(
+        "entry_kind".to_string(),
+        match signal.kind {
+            EntryKind::Probe => "probe".to_string(),
+            EntryKind::ScaleIn => "scale_in".to_string(),
+        },
+    );
 
     // Pump.fun tx building requires the creator/dev wallet.
-    if dex == "pumpfun" {
+    if signal.dex == "pumpfun" {
         let creator = creator_opt
             .ok_or_else(|| anyhow::anyhow!("cannot generate pumpfun intent: missing dev_wallet/creator"))?;
         intent.metadata.insert("creator".to_string(), creator);
     }
 
     // Register pending intent BEFORE publishing
-    ctx.register_buy_intent(&intent_id, mint, pool, dex, position_lamports);
+    ctx.register_buy_intent(
+        &intent_id,
+        &signal.mint,
+        &signal.pool,
+        &signal.dex,
+        signal.sol_amount,
+        Some(signal.kind),
+    );
 
     info!(
         intent_id = %intent.intent_id,
-        pool = %pool,
-        mint = %mint,
-        dex = %dex,
-        reason = %reason,
-        "🚀 Generated 4-Filter TradeIntent"
+        pool = %signal.pool,
+        mint = %signal.mint,
+        dex = %signal.dex,
+        kind = ?signal.kind,
+        sol_amount = signal.sol_amount,
+        reason = %signal.reason,
+        "🚀 Generated BUY TradeIntent"
     );
 
     // Write to JSONL (P0 requirement)
@@ -2452,6 +2617,7 @@ async fn generate_and_publish_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn buyer_quality_stats_top1_top3_and_repeat_ratio() {
@@ -2567,6 +2733,88 @@ mod tests {
         let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
         assert!(!should_trade);
         assert!(reason.contains("REJECT_MICRO_BUY_SPAM"));
+    }
+
+    #[test]
+    fn probe_then_scale_signal_flow() {
+        let mut cfg = MomentumConfig::default();
+
+        // Make the entry sizing deterministic.
+        cfg.default_position_lamports = 1_000;
+        cfg.probe_buy_pct = 0.25;
+        cfg.scale_in_confirm_window_secs = 30;
+
+        // Disable other gates to isolate probe/scale state machine.
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 0;
+        cfg.min_trades_per_sec = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = MomentumContext {
+            run_id: "12345678".to_string(),
+            config: parking_lot::RwLock::new(cfg),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        // Insert a fresh tracker.
+        {
+            let mut trackers = ctx.token_trackers.write();
+            trackers.insert(
+                "mint".to_string(),
+                TokenTracker::new("mint", "pool", "dex", 1, 0),
+            );
+        }
+
+        // First pass should emit a probe signal.
+        let signals = ctx.check_for_signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].mint, "mint");
+        assert_eq!(signals[0].kind, EntryKind::Probe);
+        assert_eq!(signals[0].sol_amount, 250);
+
+        // Mark probe as filled.
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let t = trackers.get_mut("mint").unwrap();
+            assert!(t.probe_sent_at.is_some());
+            t.probe_filled_at = Some(Instant::now());
+        }
+
+        // Second pass should emit scale-in signal.
+        let signals = ctx.check_for_signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].kind, EntryKind::ScaleIn);
+        assert_eq!(signals[0].sol_amount, 750);
+
+        {
+            let trackers = ctx.token_trackers.read();
+            let t = trackers.get("mint").unwrap();
+            assert!(t.scale_sent_at.is_some());
+        }
     }
 }
 
