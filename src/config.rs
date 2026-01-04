@@ -167,6 +167,17 @@ pub struct MomentumCfg {
     #[serde(default = "default_position_lamports")]
     pub default_position_lamports: u64,
 
+    // === Momentum v2 Entry: Probe-Buy + Scale-In ===
+    /// Probe-buy size as fraction of `default_position_lamports` (0.0..=1.0).
+    /// Example: 0.25 means probe uses 25% of the default position size.
+    /// Default: 0.25.
+    #[serde(default = "default_probe_buy_pct")]
+    pub probe_buy_pct: f64,
+    /// Time window (seconds) after probe fill to allow scale-in confirmation.
+    /// Default: 30s.
+    #[serde(default = "default_scale_in_confirm_window_secs")]
+    pub scale_in_confirm_window_secs: u64,
+
     // === Filter 1: Liquidity Check ===
     /// Max dev supply percentage (e.g., 90.0 = 90%). Default: 90%
     #[serde(default = "default_max_dev_supply_pct")]
@@ -243,6 +254,76 @@ pub struct MomentumCfg {
     /// Min trades in momentum window to evaluate exit. Default: 5
     #[serde(default = "default_momentum_exit_min_trades")]
     pub momentum_exit_min_trades: u32,
+
+    // === Buyer Quality (anti-bot / concentration) ===
+    /// Cap for top-1 buyer share (0.0..=1.0) within the buyer window.
+    /// Default: 0.35.
+    #[serde(default = "default_top1_buyer_share_cap")]
+    pub top1_buyer_share_cap: f64,
+    /// Cap for top-3 buyers combined share (0.0..=1.0) within the buyer window.
+    /// Default: 0.60.
+    #[serde(default = "default_top3_buyer_share_cap")]
+    pub top3_buyer_share_cap: f64,
+    /// Minimum ratio of repeat buyers (0.0..=1.0) within the buyer window.
+    /// Interpretation is strategy-defined; intended as an anti-spoof heuristic.
+    /// Default: 0.05.
+    #[serde(default = "default_repeat_buyer_min_ratio")]
+    pub repeat_buyer_min_ratio: f64,
+
+    // === Trade Size Distribution (micro-buy spam) ===
+    /// Minimum SOL trade size (lamports) used to classify "small buys".
+    /// Default: 0.01 SOL.
+    #[serde(default = "default_min_trade_size_lamports")]
+    pub min_trade_size_lamports: u64,
+    /// Maximum allowed ratio (0.0..=1.0) of buys below `min_trade_size_lamports`.
+    /// Default: 0.85.
+    #[serde(default = "default_small_buy_ratio_cap")]
+    pub small_buy_ratio_cap: f64,
+
+    // === Dump-Recovery Gate (anti-rug) ===
+    /// Recovery evaluation window (seconds) after a detected dump.
+    /// Default: 30s.
+    #[serde(default = "default_dump_recovery_window_secs")]
+    pub dump_recovery_window_secs: u64,
+    /// Minimum buy dominance (0.0..=1.0) required during recovery.
+    /// Default: 0.55.
+    #[serde(default = "default_dump_recovery_min_buy_dominance")]
+    pub dump_recovery_min_buy_dominance: f64,
+    /// Minimum net SOL inflow (lamports) required during recovery.
+    /// Default: 1 SOL.
+    #[serde(default = "default_dump_recovery_min_net_inflow_lamports")]
+    pub dump_recovery_min_net_inflow_lamports: u64,
+    /// Minimum continuous recovery time (seconds) before allowing entry.
+    /// Default: 10s.
+    #[serde(default = "default_dump_recovery_min_recovery_secs")]
+    pub dump_recovery_min_recovery_secs: u64,
+
+    // === CTO Mode (pre-entry dev sell handling) ===
+    /// If true, a pre-entry dev sell transitions into CTO candidate state (wait-for-recovery)
+    /// instead of hard reject.
+    /// Default: false.
+    #[serde(default = "default_cto_enabled")]
+    pub cto_enabled: bool,
+    /// Minimum delay (seconds) after pre-entry dev sell before CTO recovery evaluation.
+    /// Default: 30s.
+    #[serde(default = "default_cto_entry_delay_secs")]
+    pub cto_entry_delay_secs: u64,
+    /// Confirmation window (seconds) used to evaluate CTO recovery.
+    /// Default: 30s.
+    #[serde(default = "default_cto_confirm_window_secs")]
+    pub cto_confirm_window_secs: u64,
+    /// Minimum unique buyers required during CTO recovery.
+    /// Default: 5.
+    #[serde(default = "default_cto_min_unique_buyers")]
+    pub cto_min_unique_buyers: u32,
+    /// Minimum buy dominance required during CTO recovery.
+    /// Default: 0.55.
+    #[serde(default = "default_cto_min_buy_dominance")]
+    pub cto_min_buy_dominance: f64,
+    /// Minimum net SOL inflow (lamports) required during CTO recovery.
+    /// Default: 1 SOL.
+    #[serde(default = "default_cto_min_net_inflow_lamports")]
+    pub cto_min_net_inflow_lamports: u64,
 }
 
 // Momentum config defaults - tuned to be less strict than original hardcoded values
@@ -264,6 +345,12 @@ fn default_established_slippage() -> u32 {
 fn default_position_lamports() -> u64 {
     100_000_000
 } // 0.1 SOL
+fn default_probe_buy_pct() -> f64 {
+    0.25
+}
+fn default_scale_in_confirm_window_secs() -> u64 {
+    30
+}
 fn default_max_dev_supply_pct() -> f64 {
     90.0
 }
@@ -328,6 +415,55 @@ fn default_momentum_exit_min_trades() -> u32 {
     5
 }
 
+fn default_top1_buyer_share_cap() -> f64 {
+    0.35
+}
+fn default_top3_buyer_share_cap() -> f64 {
+    0.60
+}
+fn default_repeat_buyer_min_ratio() -> f64 {
+    0.05
+}
+
+fn default_min_trade_size_lamports() -> u64 {
+    10_000_000
+} // 0.01 SOL
+fn default_small_buy_ratio_cap() -> f64 {
+    0.85
+}
+
+fn default_dump_recovery_window_secs() -> u64 {
+    30
+}
+fn default_dump_recovery_min_buy_dominance() -> f64 {
+    0.55
+}
+fn default_dump_recovery_min_net_inflow_lamports() -> u64 {
+    1_000_000_000
+} // 1 SOL
+fn default_dump_recovery_min_recovery_secs() -> u64 {
+    10
+}
+
+fn default_cto_enabled() -> bool {
+    false
+}
+fn default_cto_entry_delay_secs() -> u64 {
+    30
+}
+fn default_cto_confirm_window_secs() -> u64 {
+    30
+}
+fn default_cto_min_unique_buyers() -> u32 {
+    5
+}
+fn default_cto_min_buy_dominance() -> f64 {
+    0.55
+}
+fn default_cto_min_net_inflow_lamports() -> u64 {
+    1_000_000_000
+} // 1 SOL
+
 impl Default for MomentumCfg {
     fn default() -> Self {
         Self {
@@ -337,6 +473,8 @@ impl Default for MomentumCfg {
             early_max_slippage_bps: default_early_slippage(),
             established_max_slippage_bps: default_established_slippage(),
             default_position_lamports: default_position_lamports(),
+            probe_buy_pct: default_probe_buy_pct(),
+            scale_in_confirm_window_secs: default_scale_in_confirm_window_secs(),
             max_dev_supply_pct: default_max_dev_supply_pct(),
             lp_removal_window_secs: default_lp_removal_window(),
             min_unique_buyers: default_min_unique_buyers(),
@@ -358,6 +496,21 @@ impl Default for MomentumCfg {
             momentum_exit_buy_ratio: default_momentum_exit_ratio(),
             momentum_exit_window_secs: default_momentum_exit_window(),
             momentum_exit_min_trades: default_momentum_exit_min_trades(),
+            top1_buyer_share_cap: default_top1_buyer_share_cap(),
+            top3_buyer_share_cap: default_top3_buyer_share_cap(),
+            repeat_buyer_min_ratio: default_repeat_buyer_min_ratio(),
+            min_trade_size_lamports: default_min_trade_size_lamports(),
+            small_buy_ratio_cap: default_small_buy_ratio_cap(),
+            dump_recovery_window_secs: default_dump_recovery_window_secs(),
+            dump_recovery_min_buy_dominance: default_dump_recovery_min_buy_dominance(),
+            dump_recovery_min_net_inflow_lamports: default_dump_recovery_min_net_inflow_lamports(),
+            dump_recovery_min_recovery_secs: default_dump_recovery_min_recovery_secs(),
+            cto_enabled: default_cto_enabled(),
+            cto_entry_delay_secs: default_cto_entry_delay_secs(),
+            cto_confirm_window_secs: default_cto_confirm_window_secs(),
+            cto_min_unique_buyers: default_cto_min_unique_buyers(),
+            cto_min_buy_dominance: default_cto_min_buy_dominance(),
+            cto_min_net_inflow_lamports: default_cto_min_net_inflow_lamports(),
         }
     }
 }
