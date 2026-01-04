@@ -159,6 +159,7 @@ pub static FILTER_PASSED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0)
 pub static FILTER_REJECTED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static FILTER_REJECTED_LIQUIDITY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static FILTER_REJECTED_VELOCITY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static FILTER_REJECTED_BUYER_QUALITY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static FILTER_REJECTED_INFLOW: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static FILTER_REJECTED_DEV_BEHAVIOR: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_EVENTS_CONSUMED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -687,6 +688,13 @@ async fn metrics_response() -> Response<Body> {
     out.push('\n');
     out.push_str("filter_rejection_by_reason{reason=\"velocity\"} ");
     out.push_str(&FILTER_REJECTED_VELOCITY.load(Ordering::Relaxed).to_string());
+    out.push('\n');
+    out.push_str("filter_rejection_by_reason{reason=\"buyer_quality\"} ");
+    out.push_str(
+        &FILTER_REJECTED_BUYER_QUALITY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
     out.push('\n');
     out.push_str("filter_rejection_by_reason{reason=\"inflow\"} ");
     out.push_str(&FILTER_REJECTED_INFLOW.load(Ordering::Relaxed).to_string());

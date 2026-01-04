@@ -37,8 +37,9 @@ use ironcrab::ipc::{
     TradeIntent, TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    serve_metrics, FILTER_PASSED_TOTAL, FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_INFLOW,
-    FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOTAL, FILTER_REJECTED_VELOCITY,
+    serve_metrics, FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY, FILTER_REJECTED_DEV_BEHAVIOR,
+    FILTER_REJECTED_INFLOW, FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOTAL,
+    FILTER_REJECTED_VELOCITY,
     INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL,
     NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
     TOKENS_TRACKED_GAUGE,
@@ -560,6 +561,15 @@ struct TokenTracker {
     blacklist_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BuyerQualityStats {
+    total_buy_volume_lamports: u64,
+    unique_buyers: u32,
+    top1_share: f64,
+    top3_share: f64,
+    repeat_buyer_ratio: f64,
+}
+
 impl TokenTracker {
     fn new(mint: &str, pool: &str, dex: &str, slot: u64, initial_liquidity: u64) -> Self {
         Self {
@@ -661,6 +671,81 @@ impl TokenTracker {
             .map(|t| (t.sol_amount, t.token_amount))
     }
 
+    fn buyer_quality_stats(&self, config: &MomentumConfig) -> BuyerQualityStats {
+        self.buyer_quality_stats_at(config, Instant::now())
+    }
+
+    fn micro_buy_stats_at(&self, config: &MomentumConfig, now: Instant) -> (u32, u32, f64) {
+        let buyer_window = Duration::from_secs(config.buyer_window_secs);
+
+        let mut total_buys: u32 = 0;
+        let mut small_buys: u32 = 0;
+
+        for trade in self
+            .trades
+            .iter()
+            .filter(|t| t.is_buy && now.duration_since(t.timestamp) < buyer_window)
+        {
+            total_buys = total_buys.saturating_add(1);
+            if trade.sol_amount < config.min_trade_size_lamports {
+                small_buys = small_buys.saturating_add(1);
+            }
+        }
+
+        let ratio = if total_buys == 0 {
+            0.0
+        } else {
+            (small_buys as f64) / (total_buys as f64)
+        };
+
+        (total_buys, small_buys, ratio)
+    }
+
+    fn buyer_quality_stats_at(&self, config: &MomentumConfig, now: Instant) -> BuyerQualityStats {
+        let buyer_window = Duration::from_secs(config.buyer_window_secs);
+
+        let mut per_wallet: HashMap<String, (u64, u32)> = HashMap::new();
+        let mut total_buy_volume_lamports: u64 = 0;
+
+        for trade in self
+            .trades
+            .iter()
+            .filter(|t| t.is_buy && now.duration_since(t.timestamp) < buyer_window)
+        {
+            let entry = per_wallet.entry(trade.trader.clone()).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(trade.sol_amount);
+            entry.1 = entry.1.saturating_add(1);
+            total_buy_volume_lamports = total_buy_volume_lamports.saturating_add(trade.sol_amount);
+        }
+
+        let unique_buyers = per_wallet.len() as u32;
+        if total_buy_volume_lamports == 0 || unique_buyers == 0 {
+            return BuyerQualityStats {
+                total_buy_volume_lamports,
+                unique_buyers,
+                top1_share: 0.0,
+                top3_share: 0.0,
+                repeat_buyer_ratio: 0.0,
+            };
+        }
+
+        let mut volumes: Vec<u64> = per_wallet.values().map(|(v, _)| *v).collect();
+        volumes.sort_unstable_by(|a, b| b.cmp(a));
+
+        let top1 = volumes.first().copied().unwrap_or(0);
+        let top3 = volumes.iter().take(3).copied().sum::<u64>();
+
+        let repeat_buyers = per_wallet.values().filter(|(_, c)| *c >= 2).count() as u32;
+
+        BuyerQualityStats {
+            total_buy_volume_lamports,
+            unique_buyers,
+            top1_share: (top1 as f64) / (total_buy_volume_lamports as f64),
+            top3_share: (top3 as f64) / (total_buy_volume_lamports as f64),
+            repeat_buyer_ratio: (repeat_buyers as f64) / (unique_buyers as f64),
+        }
+    }
+
     /// Record LP removal
     fn record_lp_removal(&mut self) {
         self.lp_removed = true;
@@ -740,7 +825,7 @@ impl TokenTracker {
 
     /// Check all 4 filters and return if we should trade
     fn should_generate_intent(
-        &self,
+        &mut self,
         config: &MomentumConfig,
         mint_info: Option<&MintInfo>,
     ) -> (bool, String) {
@@ -832,6 +917,93 @@ impl TokenTracker {
             );
         }
 
+        // Filter 2c: Micro-buy spam (anti-bot)
+        let (total_buys, small_buys, small_buy_ratio) =
+            self.micro_buy_stats_at(config, Instant::now());
+        let min_samples = config.min_unique_buyers.max(5);
+        if total_buys >= min_samples && small_buy_ratio > config.small_buy_ratio_cap {
+            FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
+            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            self.blacklisted = true;
+            self.blacklist_reason = Some(format!(
+                "REJECT_MICRO_BUY_SPAM: small-buy ratio {:.0}% > {:.0}% (small={}, total={}, min_trade={:.4} SOL)",
+                small_buy_ratio * 100.0,
+                config.small_buy_ratio_cap * 100.0,
+                small_buys,
+                total_buys,
+                config.min_trade_size_lamports as f64 / 1_000_000_000.0
+            ));
+            return (
+                false,
+                self.blacklist_reason
+                    .clone()
+                    .unwrap_or_else(|| "REJECT_MICRO_BUY_SPAM".to_string()),
+            );
+        }
+
+        // Filter 2b: Buyer Quality (anti-bot / concentration)
+        let bq = self.buyer_quality_stats(config);
+
+        if bq.top1_share > config.top1_buyer_share_cap {
+            FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
+            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            self.blacklisted = true;
+            self.blacklist_reason = Some(format!(
+                "Buyer concentration too high (top1 share {:.0}% > {:.0}%; buyers={}, buy_vol={:.2} SOL)",
+                bq.top1_share * 100.0,
+                config.top1_buyer_share_cap * 100.0
+                ,
+                bq.unique_buyers,
+                bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
+            ));
+            return (
+                false,
+                self.blacklist_reason
+                    .clone()
+                    .unwrap_or_else(|| "Buyer concentration too high".to_string()),
+            );
+        }
+
+        if bq.top3_share > config.top3_buyer_share_cap {
+            FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
+            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            self.blacklisted = true;
+            self.blacklist_reason = Some(format!(
+                "Buyer concentration too high (top3 share {:.0}% > {:.0}%; buyers={}, buy_vol={:.2} SOL)",
+                bq.top3_share * 100.0,
+                config.top3_buyer_share_cap * 100.0
+                ,
+                bq.unique_buyers,
+                bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
+            ));
+            return (
+                false,
+                self.blacklist_reason
+                    .clone()
+                    .unwrap_or_else(|| "Buyer concentration too high".to_string()),
+            );
+        }
+
+        if bq.repeat_buyer_ratio < config.repeat_buyer_min_ratio {
+            FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
+            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            self.blacklisted = true;
+            self.blacklist_reason = Some(format!(
+                "Repeat buyer ratio too low ({:.1}% < {:.1}%; buyers={}, buy_vol={:.2} SOL)",
+                bq.repeat_buyer_ratio * 100.0,
+                config.repeat_buyer_min_ratio * 100.0
+                ,
+                bq.unique_buyers,
+                bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
+            ));
+            return (
+                false,
+                self.blacklist_reason
+                    .clone()
+                    .unwrap_or_else(|| "Repeat buyer ratio too low".to_string()),
+            );
+        }
+
         // Filter 3: SOL Inflow
         if metrics.net_sol_inflow < config.min_sol_inflow_lamports {
             FILTER_REJECTED_INFLOW.fetch_add(1, Ordering::Relaxed);
@@ -856,12 +1028,16 @@ impl TokenTracker {
         // All filters passed!
         FILTER_PASSED_TOTAL.fetch_add(1, Ordering::Relaxed);
         let reason = format!(
-            "All filters passed: liq={:.1}SOL, buyers={}, vel={:.2}/s, dom={:.0}%, inflow={:.1}SOL",
+            "All filters passed: liq={:.1}SOL, buyers={}, vel={:.2}/s, dom={:.0}%, inflow={:.1}SOL, bq(top1={:.0}%,top3={:.0}%,repeat={:.0}%,vol={:.2}SOL)",
             metrics.initial_liquidity_sol,
             metrics.unique_buyers_in_window,
             metrics.trades_per_sec,
             metrics.buy_dominance * 100.0,
-            metrics.net_sol_inflow as f64 / 1_000_000_000.0
+            metrics.net_sol_inflow as f64 / 1_000_000_000.0,
+            bq.top1_share * 100.0,
+            bq.top3_share * 100.0,
+            bq.repeat_buyer_ratio * 100.0,
+            bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
         );
 
         (true, reason)
@@ -1096,7 +1272,12 @@ impl MomentumContext {
             }
 
             let mint_info = mint_infos.get(mint);
+            let was_blacklisted = tracker.blacklisted;
             let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
+            if !was_blacklisted && tracker.blacklisted {
+                self.tokens_blacklisted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if should_trade {
                 tracker.intent_generated = true;
                 signals.push((
@@ -2266,6 +2447,127 @@ async fn generate_and_publish_intent(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buyer_quality_stats_top1_top3_and_repeat_ratio() {
+        let mut cfg = MomentumConfig::default();
+        cfg.buyer_window_secs = 20;
+
+        let now = Instant::now();
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
+
+        tracker.trades = vec![
+            // Wallet A: 3 buys totaling 100
+            TradeEvent {
+                timestamp: now - Duration::from_secs(1),
+                trader: "A".to_string(),
+                is_buy: true,
+                sol_amount: 50,
+                token_amount: 1,
+                signature: "s1".to_string(),
+            },
+            TradeEvent {
+                timestamp: now - Duration::from_secs(2),
+                trader: "A".to_string(),
+                is_buy: true,
+                sol_amount: 30,
+                token_amount: 1,
+                signature: "s2".to_string(),
+            },
+            TradeEvent {
+                timestamp: now - Duration::from_secs(3),
+                trader: "A".to_string(),
+                is_buy: true,
+                sol_amount: 20,
+                token_amount: 1,
+                signature: "s3".to_string(),
+            },
+            // Wallet B: 1 buy 50
+            TradeEvent {
+                timestamp: now - Duration::from_secs(4),
+                trader: "B".to_string(),
+                is_buy: true,
+                sol_amount: 50,
+                token_amount: 1,
+                signature: "s4".to_string(),
+            },
+            // Wallet C: 1 buy 50
+            TradeEvent {
+                timestamp: now - Duration::from_secs(5),
+                trader: "C".to_string(),
+                is_buy: true,
+                sol_amount: 50,
+                token_amount: 1,
+                signature: "s5".to_string(),
+            },
+            // Wallet D: 1 sell (ignored)
+            TradeEvent {
+                timestamp: now - Duration::from_secs(6),
+                trader: "D".to_string(),
+                is_buy: false,
+                sol_amount: 999,
+                token_amount: 1,
+                signature: "s6".to_string(),
+            },
+        ];
+
+        let bq = tracker.buyer_quality_stats_at(&cfg, now);
+        assert_eq!(bq.unique_buyers, 3);
+        assert_eq!(bq.total_buy_volume_lamports, 200);
+
+        // A=100, B=50, C=50 => top1=50%, top3=100%
+        assert!((bq.top1_share - 0.5).abs() < 1e-9);
+        assert!((bq.top3_share - 1.0).abs() < 1e-9);
+
+        // Repeat buyers: A only => 1/3
+        assert!((bq.repeat_buyer_ratio - (1.0 / 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn micro_buy_spam_rejects_when_ratio_too_high() {
+        let mut cfg = MomentumConfig::default();
+        cfg.buyer_window_secs = 60;
+        cfg.inflow_window_secs = 60;
+
+        // Disable other gates to isolate micro-buy behavior.
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 0;
+        cfg.min_trades_per_sec = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+
+        // Micro-buy gate params
+        cfg.min_trade_size_lamports = 100;
+        cfg.small_buy_ratio_cap = 0.60;
+
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
+
+        // 10 buys: 7 are micro (<100), 3 are normal => ratio 0.7 > 0.6
+        for i in 0..7 {
+            let trader = format!("w{i}");
+            let sig = format!("s{i}");
+            tracker.record_trade(trader.as_str(), true, 50, 1, sig.as_str(), &cfg);
+        }
+        for i in 7..10 {
+            let trader = format!("w{i}");
+            let sig = format!("s{i}");
+            tracker.record_trade(trader.as_str(), true, 200, 1, sig.as_str(), &cfg);
+        }
+
+        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
+        assert!(!should_trade);
+        assert!(reason.contains("REJECT_MICRO_BUY_SPAM"));
+    }
 }
 
 /// Generate and publish a SELL intent for position exit
