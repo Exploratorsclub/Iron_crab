@@ -1709,12 +1709,100 @@ impl MomentumContext {
     fn check_for_exits(&self) -> Vec<(String, String, String, String, String, u64)> {
         // Returns: Vec<(mint, pool, dex, exit_type, reason, token_amount)>
         let config = self.config.read().clone();
+
+        // Snapshot tracker-derived hard-exit signals BEFORE locking positions,
+        // to avoid lock-order deadlocks (market event handling locks trackers then positions).
+        #[derive(Clone, Debug)]
+        struct TrackerExitSignals {
+            lp_removed_at: Option<Instant>,
+            dev_sold_at: Option<Instant>,
+            dev_sold_sig: Option<String>,
+            dev_sold_sol: Option<u64>,
+        }
+
+        let tracker_signals: HashMap<String, TrackerExitSignals> = {
+            let trackers = self.token_trackers.read();
+            trackers
+                .iter()
+                .map(|(mint, t)| {
+                    let mut dev_sold_at: Option<Instant> = None;
+                    let mut dev_sold_sig: Option<String> = None;
+                    let mut dev_sold_sol: Option<u64> = None;
+
+                    if let Some(dev) = t.dev_wallet.as_ref() {
+                        if let Some(last) = t
+                            .trades
+                            .iter()
+                            .rev()
+                            .find(|tr| !tr.is_buy && tr.trader == *dev)
+                        {
+                            dev_sold_at = Some(last.timestamp);
+                            dev_sold_sig = Some(last.signature.clone());
+                            dev_sold_sol = Some(last.sol_amount);
+                        }
+                    }
+
+                    (
+                        mint.clone(),
+                        TrackerExitSignals {
+                            lp_removed_at: t.lp_removal_time,
+                            dev_sold_at,
+                            dev_sold_sig,
+                            dev_sold_sol,
+                        },
+                    )
+                })
+                .collect()
+        };
+
         let mut positions = self.positions.write();
         let mut exits = Vec::new();
 
         for (mint, pos) in positions.iter_mut() {
             if pos.exit_generated {
                 continue;
+            }
+
+            // Hard exits (post-entry): dev sells, LP removed.
+            if let Some(sig) = tracker_signals.get(mint) {
+                if let Some(lp_at) = sig.lp_removed_at {
+                    if lp_at > pos.entry_time {
+                        pos.exit_generated = true;
+                        exits.push((
+                            mint.clone(),
+                            pos.pool.clone(),
+                            pos.dex.clone(),
+                            "LP_REMOVAL".to_string(),
+                            "LP removed post-entry".to_string(),
+                            pos.token_amount,
+                        ));
+                        continue;
+                    }
+                }
+
+                if let Some(dev_at) = sig.dev_sold_at {
+                    if dev_at > pos.entry_time {
+                        let sig_s = sig
+                            .dev_sold_sig
+                            .as_deref()
+                            .unwrap_or("<unknown>");
+                        let sol = sig.dev_sold_sol.unwrap_or(0);
+                        pos.exit_generated = true;
+                        exits.push((
+                            mint.clone(),
+                            pos.pool.clone(),
+                            pos.dex.clone(),
+                            "DEV_SELL".to_string(),
+                            format!(
+                                "Dev sold post-entry (sig={}, sol={:.4})",
+                                sig_s,
+                                sol as f64 / 1_000_000_000.0
+                            ),
+                            pos.token_amount,
+                        ));
+                        continue;
+                    }
+                }
             }
 
             if let Some((exit_type, reason)) = pos.should_exit(&config) {
@@ -3323,6 +3411,129 @@ mod tests {
             Some("ENTER_PROBE_BUY: test")
         );
     }
+
+    #[test]
+    fn post_entry_dev_sell_triggers_hard_exit() {
+        let mut cfg = MomentumConfig::default();
+
+        // Make sure normal exits don't trigger during the test.
+        cfg.hard_stop_loss_pct = 1_000.0;
+        cfg.take_profit_pct = 1_000.0;
+        cfg.trailing_stop_pct = 1_000.0;
+        cfg.trailing_activation_pct = 1_000.0;
+        cfg.max_hold_time_secs = 999_999;
+        cfg.momentum_exit_buy_ratio = 0.0;
+        cfg.momentum_exit_window_secs = 30;
+        cfg.momentum_exit_min_trades = 999_999;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = MomentumContext {
+            run_id: "run-test".to_string(),
+            config: parking_lot::RwLock::new(cfg.clone()),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        // Open a position.
+        {
+            let mut positions = ctx.positions.write();
+            let mut pos = PositionTracker::new("mint", "pool", "dex", 1.0, 123, 1_000);
+            pos.entry_time = Instant::now() - Duration::from_secs(10);
+            positions.insert("mint".to_string(), pos);
+        }
+
+        // Record a dev sell after entry.
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
+            tracker.dev_wallet = Some("dev".to_string());
+            tracker.record_trade("dev", false, 2_000_000_000, 1, "devsig", &cfg);
+            if let Some(last) = tracker.trades.last_mut() {
+                last.timestamp = Instant::now() - Duration::from_secs(1);
+            }
+            trackers.insert("mint".to_string(), tracker);
+        }
+
+        let exits = ctx.check_for_exits();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].0, "mint");
+        assert_eq!(exits[0].3, "DEV_SELL");
+        assert!(exits[0].4.contains("Dev sold post-entry"));
+    }
+
+    #[test]
+    fn post_entry_lp_removal_triggers_hard_exit() {
+        let mut cfg = MomentumConfig::default();
+
+        // Make sure normal exits don't trigger during the test.
+        cfg.hard_stop_loss_pct = 1_000.0;
+        cfg.take_profit_pct = 1_000.0;
+        cfg.trailing_stop_pct = 1_000.0;
+        cfg.trailing_activation_pct = 1_000.0;
+        cfg.max_hold_time_secs = 999_999;
+        cfg.momentum_exit_buy_ratio = 0.0;
+        cfg.momentum_exit_window_secs = 30;
+        cfg.momentum_exit_min_trades = 999_999;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = MomentumContext {
+            run_id: "run-test".to_string(),
+            config: parking_lot::RwLock::new(cfg.clone()),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        // Open a position.
+        {
+            let mut positions = ctx.positions.write();
+            let mut pos = PositionTracker::new("mint", "pool", "dex", 1.0, 123, 1_000);
+            pos.entry_time = Instant::now() - Duration::from_secs(10);
+            positions.insert("mint".to_string(), pos);
+        }
+
+        // Record LP removal after entry.
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
+            tracker.record_lp_removal();
+            tracker.lp_removal_time = Some(Instant::now() - Duration::from_secs(1));
+            trackers.insert("mint".to_string(), tracker);
+        }
+
+        let exits = ctx.check_for_exits();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].0, "mint");
+        assert_eq!(exits[0].3, "LP_REMOVAL");
+        assert_eq!(exits[0].4, "LP removed post-entry");
+    }
 }
 
 /// Generate and publish a SELL intent for position exit
@@ -3387,6 +3598,8 @@ async fn generate_and_publish_exit_intent(
         .min(u64::MAX as u128) as u64;
 
     let reason_code = match exit_type {
+        "DEV_SELL" => "EXIT_DEV_SELL",
+        "LP_REMOVAL" => "EXIT_LP_REMOVAL",
         "STOP_LOSS" => "EXIT_HARD_STOP",
         "TRAILING_STOP" => "EXIT_TRAILING_STOP",
         "TIME_EXIT" => "EXIT_MAX_HOLD_TIME",
