@@ -143,6 +143,40 @@ struct MomentumConfig {
     /// Require freeze authority to be none before entering.
     require_freeze_authority_none: bool,
 
+    // === Momentum v2 Entry: Probe-Buy + Scale-In ===
+    /// Probe-buy size as fraction of `default_position_lamports` (0.0..=1.0)
+    probe_buy_pct: f64,
+    /// Time window (seconds) after probe fill to allow scale-in confirmation
+    scale_in_confirm_window_secs: u64,
+
+    // === Buyer Quality (anti-bot / concentration) ===
+    /// Cap for top-1 buyer share (0.0..=1.0)
+    top1_buyer_share_cap: f64,
+    /// Cap for top-3 buyers combined share (0.0..=1.0)
+    top3_buyer_share_cap: f64,
+    /// Minimum ratio of repeat buyers (0.0..=1.0)
+    repeat_buyer_min_ratio: f64,
+
+    // === Trade Size Distribution (micro-buy spam) ===
+    /// Minimum SOL trade size (lamports) used to classify "small buys"
+    min_trade_size_lamports: u64,
+    /// Maximum allowed ratio (0.0..=1.0) of buys below `min_trade_size_lamports`
+    small_buy_ratio_cap: f64,
+
+    // === Dump-Recovery Gate (anti-rug) ===
+    dump_recovery_window_secs: u64,
+    dump_recovery_min_buy_dominance: f64,
+    dump_recovery_min_net_inflow_lamports: u64,
+    dump_recovery_min_recovery_secs: u64,
+
+    // === CTO Mode (pre-entry dev sell handling) ===
+    cto_enabled: bool,
+    cto_entry_delay_secs: u64,
+    cto_confirm_window_secs: u64,
+    cto_min_unique_buyers: u32,
+    cto_min_buy_dominance: f64,
+    cto_min_net_inflow_lamports: u64,
+
     // === Exit Strategy ===
     /// Hard stop-loss percentage from entry (e.g., 15 = -15%). Default: 15%
     hard_stop_loss_pct: f64,
@@ -196,6 +230,33 @@ impl Default for MomentumConfig {
             require_mint_authority_renounced: false,
             require_freeze_authority_none: false,
 
+            // Momentum v2 Entry
+            probe_buy_pct: 0.25,
+            scale_in_confirm_window_secs: 30,
+
+            // Buyer Quality
+            top1_buyer_share_cap: 0.35,
+            top3_buyer_share_cap: 0.60,
+            repeat_buyer_min_ratio: 0.05,
+
+            // Trade Size Distribution
+            min_trade_size_lamports: 10_000_000, // 0.01 SOL
+            small_buy_ratio_cap: 0.85,
+
+            // Dump-Recovery
+            dump_recovery_window_secs: 30,
+            dump_recovery_min_buy_dominance: 0.55,
+            dump_recovery_min_net_inflow_lamports: 1_000_000_000, // 1 SOL
+            dump_recovery_min_recovery_secs: 10,
+
+            // CTO Mode
+            cto_enabled: false,
+            cto_entry_delay_secs: 30,
+            cto_confirm_window_secs: 30,
+            cto_min_unique_buyers: 5,
+            cto_min_buy_dominance: 0.55,
+            cto_min_net_inflow_lamports: 1_000_000_000, // 1 SOL
+
             // Exit Strategy
             hard_stop_loss_pct: 15.0,      // -15% hard stop
             trailing_stop_pct: 20.0,       // -20% from ATH
@@ -219,6 +280,8 @@ impl MomentumConfig {
             early_max_slippage_bps: cfg.early_max_slippage_bps,
             established_max_slippage_bps: cfg.established_max_slippage_bps,
             default_position_lamports: cfg.default_position_lamports,
+            probe_buy_pct: cfg.probe_buy_pct,
+            scale_in_confirm_window_secs: cfg.scale_in_confirm_window_secs,
             test_allowlist: HashSet::new(), // Not in TOML config
             max_dev_supply_pct: cfg.max_dev_supply_pct,
             lp_removal_window_secs: cfg.lp_removal_window_secs,
@@ -233,6 +296,21 @@ impl MomentumConfig {
             dev_rebuy_positive: cfg.dev_rebuy_positive,
             require_mint_authority_renounced: cfg.require_mint_authority_renounced,
             require_freeze_authority_none: cfg.require_freeze_authority_none,
+            top1_buyer_share_cap: cfg.top1_buyer_share_cap,
+            top3_buyer_share_cap: cfg.top3_buyer_share_cap,
+            repeat_buyer_min_ratio: cfg.repeat_buyer_min_ratio,
+            min_trade_size_lamports: cfg.min_trade_size_lamports,
+            small_buy_ratio_cap: cfg.small_buy_ratio_cap,
+            dump_recovery_window_secs: cfg.dump_recovery_window_secs,
+            dump_recovery_min_buy_dominance: cfg.dump_recovery_min_buy_dominance,
+            dump_recovery_min_net_inflow_lamports: cfg.dump_recovery_min_net_inflow_lamports,
+            dump_recovery_min_recovery_secs: cfg.dump_recovery_min_recovery_secs,
+            cto_enabled: cfg.cto_enabled,
+            cto_entry_delay_secs: cfg.cto_entry_delay_secs,
+            cto_confirm_window_secs: cfg.cto_confirm_window_secs,
+            cto_min_unique_buyers: cfg.cto_min_unique_buyers,
+            cto_min_buy_dominance: cfg.cto_min_buy_dominance,
+            cto_min_net_inflow_lamports: cfg.cto_min_net_inflow_lamports,
             hard_stop_loss_pct: cfg.hard_stop_loss_pct,
             trailing_stop_pct: cfg.trailing_stop_pct,
             trailing_activation_pct: cfg.trailing_activation_pct,
@@ -1377,6 +1455,225 @@ impl MomentumContext {
                         } else {
                             rejected.push((key.clone(), "Must be > 0".to_string()));
                         }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+
+                // === Momentum v2 Entry ===
+                "probe_buy_pct" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=1.0).contains(&v) {
+                            config.probe_buy_pct = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 1.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "scale_in_confirm_window_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.scale_in_confirm_window_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+
+                // === Buyer Quality ===
+                "top1_buyer_share_cap" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=1.0).contains(&v) {
+                            config.top1_buyer_share_cap = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 1.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "top3_buyer_share_cap" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=1.0).contains(&v) {
+                            config.top3_buyer_share_cap = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 1.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "repeat_buyer_min_ratio" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=1.0).contains(&v) {
+                            config.repeat_buyer_min_ratio = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 1.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+
+                // === Trade Size Distribution ===
+                "min_trade_size_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.min_trade_size_lamports = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "small_buy_ratio_cap" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=1.0).contains(&v) {
+                            config.small_buy_ratio_cap = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 1.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+
+                // === Dump-Recovery ===
+                "dump_recovery_window_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.dump_recovery_window_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "dump_recovery_min_buy_dominance" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=1.0).contains(&v) {
+                            config.dump_recovery_min_buy_dominance = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 1.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "dump_recovery_min_net_inflow_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        config.dump_recovery_min_net_inflow_lamports = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "dump_recovery_min_recovery_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.dump_recovery_min_recovery_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+
+                // === CTO Mode ===
+                "cto_enabled" => {
+                    if let Some(v) = value.as_bool() {
+                        config.cto_enabled = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "cto_entry_delay_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.cto_entry_delay_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "cto_confirm_window_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.cto_confirm_window_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "cto_min_unique_buyers" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.cto_min_unique_buyers = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "cto_min_buy_dominance" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=1.0).contains(&v) {
+                            config.cto_min_buy_dominance = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 1.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "cto_min_net_inflow_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        config.cto_min_net_inflow_lamports = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
