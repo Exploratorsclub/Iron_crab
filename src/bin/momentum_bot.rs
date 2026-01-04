@@ -1024,7 +1024,7 @@ impl TokenTracker {
         if supply_pct > config.max_dev_supply_pct {
             self.blacklisted = true;
             self.blacklist_reason = Some(format!(
-                "Dev supply too high: {:.1}% (max {:.1}%)",
+                "REJECT_DEV_SUPPLY_TOO_HIGH: {:.1}% > {:.1}%",
                 supply_pct, config.max_dev_supply_pct
             ));
             warn!(mint = %self.mint, supply_pct, "Dev supply too high - blacklisting");
