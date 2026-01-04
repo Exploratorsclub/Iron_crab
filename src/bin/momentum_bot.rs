@@ -1012,7 +1012,7 @@ impl TokenTracker {
         self.lp_removed = true;
         self.lp_removal_time = Some(Instant::now());
         self.blacklisted = true;
-        self.blacklist_reason = Some("LP removed".to_string());
+        self.blacklist_reason = Some("REJECT_LP_REMOVED".to_string());
         warn!(mint = %self.mint, "LP removed - blacklisting");
     }
 
@@ -1106,15 +1106,19 @@ impl TokenTracker {
         // Token safety gates: if enabled, we must have mint info and authorities must be safe.
         if config.require_mint_authority_renounced || config.require_freeze_authority_none {
             let Some(info) = mint_info else {
-                return (false, "Awaiting mint safety info".to_string());
+                return (false, "WAIT_MINT_INFO".to_string());
             };
 
             if config.require_mint_authority_renounced && info.mint_authority.is_some() {
-                return (false, "Mint authority not renounced".to_string());
+                self.blacklisted = true;
+                self.blacklist_reason = Some("REJECT_MINT_AUTHORITY_NOT_RENOUNCED".to_string());
+                return (false, "REJECT_MINT_AUTHORITY_NOT_RENOUNCED".to_string());
             }
 
             if config.require_freeze_authority_none && info.freeze_authority.is_some() {
-                return (false, "Freeze authority still set".to_string());
+                self.blacklisted = true;
+                self.blacklist_reason = Some("REJECT_FREEZE_AUTHORITY_SET".to_string());
+                return (false, "REJECT_FREEZE_AUTHORITY_SET".to_string());
             }
         }
 
@@ -1127,7 +1131,7 @@ impl TokenTracker {
             return (
                 false,
                 format!(
-                    "Liquidity too low: {:.2} SOL (min {:.2})",
+                    "WAIT_INSUFFICIENT_LIQUIDITY: liq {:.2} SOL < {:.2} SOL",
                     metrics.initial_liquidity_sol, config.early_min_liquidity_sol
                 ),
             );
@@ -1137,7 +1141,9 @@ impl TokenTracker {
         if metrics.lp_removed {
             FILTER_REJECTED_LIQUIDITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return (false, "LP removed".to_string());
+            self.blacklisted = true;
+            self.blacklist_reason = Some("REJECT_LP_REMOVED".to_string());
+            return (false, "REJECT_LP_REMOVED".to_string());
         }
 
         // Filter 2: Buyer Velocity
@@ -1147,7 +1153,7 @@ impl TokenTracker {
             return (
                 false,
                 format!(
-                    "Not enough buyers: {} (min {})",
+                    "WAIT_BUYER_WINDOW: buyers {} < {}",
                     metrics.unique_buyers_in_window, config.min_unique_buyers
                 ),
             );
@@ -1159,7 +1165,7 @@ impl TokenTracker {
             return (
                 false,
                 format!(
-                    "Trade velocity too low: {:.2}/s (min {:.2})",
+                    "WAIT_BUYER_WINDOW: trades_per_sec {:.2} < {:.2}",
                     metrics.trades_per_sec, config.min_trades_per_sec
                 ),
             );
@@ -1171,7 +1177,7 @@ impl TokenTracker {
             return (
                 false,
                 format!(
-                    "Buy dominance too low: {:.1}% (min {:.1}%)",
+                    "WAIT_BUYER_WINDOW: buy dominance {:.0}% < {:.0}%",
                     metrics.buy_dominance * 100.0,
                     config.min_buy_dominance * 100.0
                 ),
@@ -1210,7 +1216,7 @@ impl TokenTracker {
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             self.blacklisted = true;
             self.blacklist_reason = Some(format!(
-                "Buyer concentration too high (top1 share {:.0}% > {:.0}%; buyers={}, buy_vol={:.2} SOL)",
+                "REJECT_BOT_CONCENTRATION: top1 share {:.0}% > {:.0}% (buyers={}, buy_vol={:.2} SOL)",
                 bq.top1_share * 100.0,
                 config.top1_buyer_share_cap * 100.0
                 ,
@@ -1230,7 +1236,7 @@ impl TokenTracker {
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             self.blacklisted = true;
             self.blacklist_reason = Some(format!(
-                "Buyer concentration too high (top3 share {:.0}% > {:.0}%; buyers={}, buy_vol={:.2} SOL)",
+                "REJECT_BOT_CONCENTRATION: top3 share {:.0}% > {:.0}% (buyers={}, buy_vol={:.2} SOL)",
                 bq.top3_share * 100.0,
                 config.top3_buyer_share_cap * 100.0
                 ,
@@ -1250,7 +1256,7 @@ impl TokenTracker {
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             self.blacklisted = true;
             self.blacklist_reason = Some(format!(
-                "Repeat buyer ratio too low ({:.1}% < {:.1}%; buyers={}, buy_vol={:.2} SOL)",
+                "REJECT_BOT_CONCENTRATION: repeat buyer ratio {:.0}% < {:.0}% (buyers={}, buy_vol={:.2} SOL)",
                 bq.repeat_buyer_ratio * 100.0,
                 config.repeat_buyer_min_ratio * 100.0
                 ,
@@ -1272,7 +1278,7 @@ impl TokenTracker {
             return (
                 false,
                 format!(
-                    "SOL inflow too low: {:.2} SOL (min {:.2})",
+                    "WAIT_BUYER_WINDOW: net inflow {:.2} SOL < {:.2} SOL",
                     metrics.net_sol_inflow as f64 / 1_000_000_000.0,
                     config.min_sol_inflow_lamports as f64 / 1_000_000_000.0
                 ),
