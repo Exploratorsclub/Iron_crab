@@ -178,6 +178,7 @@ Reason codes are uppercase snake case. A decision must include exactly one **pri
 - `EXIT_DEV_SELL`
 - `EXIT_LP_REMOVAL`
 - `EXIT_HARD_STOP`
+- `EXIT_TAKE_PROFIT`
 - `EXIT_TRAILING_STOP`
 - `EXIT_MOMENTUM_FADE`
 - `EXIT_MAX_HOLD_TIME`

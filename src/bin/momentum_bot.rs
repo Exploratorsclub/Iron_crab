@@ -1804,16 +1804,7 @@ impl MomentumContext {
 
     /// Handle execution result from execution-engine
     fn handle_execution_result(&self, result: &ExecutionResult) {
-        // Only process results from our own intents
-        if result.source != "momentum-bot"
-            && !result.source.starts_with("4filter:")
-            && !result.source.starts_with("exit:")
-        {
-            trace!(source = %result.source, "Ignoring execution result from other source");
-            return;
-        }
-
-        // Find the pending intent
+        // Find the pending intent by id (source is not authoritative).
         let pending_opt = {
             let mut pending = self.pending_intents.write();
             pending.remove(&result.intent_id)
@@ -1823,6 +1814,17 @@ impl MomentumContext {
             debug!(intent_id = %result.intent_id, "No pending intent found for execution result");
             return;
         };
+
+        if result.source != "momentum-bot"
+            && !result.source.starts_with("4filter:")
+            && !result.source.starts_with("exit:")
+        {
+            debug!(
+                intent_id = %result.intent_id,
+                source = %result.source,
+                "ExecutionResult source mismatch, but intent_id matches pending intent"
+            );
+        }
 
         match result.status {
             ExecutionStatus::Confirmed => {
@@ -2768,12 +2770,17 @@ async fn generate_and_publish_buy_intent(ctx: &MomentumContext, signal: &EntrySi
         / 10_000u128)
         .min(u64::MAX as u128) as u64;
 
+    let reason_code = match signal.kind {
+        EntryKind::Probe => "ENTER_PROBE_BUY",
+        EntryKind::ScaleIn => "ENTER_SCALE_IN",
+    };
+
     let mut intent = TradeIntent::new(
         "momentum-bot",
         BUILD_VERSION,
         &ctx.run_id,
         intent_id.clone(),
-        &format!("4filter:{}", signal.reason),
+        "momentum-bot",
         IntentTier::Tier1,
         IntentOrigin::StrategyA,
         ExplicitAmount::new(signal.sol_amount, 9),
@@ -2801,6 +2808,12 @@ async fn generate_and_publish_buy_intent(ctx: &MomentumContext, signal: &EntrySi
         .metadata
         .insert("min_out_raw".to_string(), min_out_raw.to_string());
     intent.metadata.insert("dex".to_string(), signal.dex.to_string());
+    intent
+        .metadata
+        .insert("reason_code".to_string(), reason_code.to_string());
+    intent
+        .metadata
+        .insert("reason_detail".to_string(), signal.reason.clone());
     intent.metadata.insert(
         "entry_kind".to_string(),
         match signal.kind {
@@ -3225,6 +3238,91 @@ mod tests {
         assert!(should_trade);
         assert!(tracker.cto_recovery_confirmed);
     }
+
+    #[test]
+    fn emitted_buy_intent_includes_reason_metadata_and_stable_source() {
+        let mut cfg = MomentumConfig::default();
+
+        // Disable all entry gates so we can emit an intent deterministically.
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 0;
+        cfg.min_trades_per_sec = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+
+        cfg.default_position_lamports = 1_000;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = MomentumContext {
+            run_id: "run-test".to_string(),
+            config: parking_lot::RwLock::new(cfg.clone()),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        // Seed tracker with a last_trade_ratio so intent generation can compute min_out.
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
+            tracker.record_trade("w", true, 1_000_000_000, 1_000_000, "sig", &cfg);
+            trackers.insert("mint".to_string(), tracker);
+        }
+
+        let signal = EntrySignal {
+            mint: "mint".to_string(),
+            pool: "pool".to_string(),
+            dex: "dex".to_string(),
+            sol_amount: 250,
+            kind: EntryKind::Probe,
+            reason: "ENTER_PROBE_BUY: test".to_string(),
+        };
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            generate_and_publish_buy_intent(&ctx, &signal)
+                .await
+                .expect("buy intent");
+        });
+
+        let path = ctx
+            .jsonl_writer
+            .current_path()
+            .expect("jsonl path should exist after write");
+        let content = std::fs::read_to_string(path).expect("read jsonl");
+        let line = content.lines().last().expect("at least one line");
+        let intent: TradeIntent = serde_json::from_str(line).expect("parse TradeIntent");
+
+        assert_eq!(intent.source, "momentum-bot");
+        assert_eq!(
+            intent.metadata.get("reason_code").map(|s| s.as_str()),
+            Some("ENTER_PROBE_BUY")
+        );
+        assert_eq!(
+            intent.metadata.get("reason_detail").map(|s| s.as_str()),
+            Some("ENTER_PROBE_BUY: test")
+        );
+    }
 }
 
 /// Generate and publish a SELL intent for position exit
@@ -3288,12 +3386,21 @@ async fn generate_and_publish_exit_intent(
         / 10_000u128)
         .min(u64::MAX as u128) as u64;
 
+    let reason_code = match exit_type {
+        "STOP_LOSS" => "EXIT_HARD_STOP",
+        "TRAILING_STOP" => "EXIT_TRAILING_STOP",
+        "TIME_EXIT" => "EXIT_MAX_HOLD_TIME",
+        "MOMENTUM_EXIT" => "EXIT_MOMENTUM_FADE",
+        "TAKE_PROFIT" => "EXIT_TAKE_PROFIT",
+        _ => "EXIT_UNKNOWN",
+    };
+
     let mut intent = TradeIntent::new(
         "momentum-bot",
         BUILD_VERSION,
         &ctx.run_id,
         intent_id.clone(),
-        &format!("exit:{}:{}", exit_type, reason),
+        "momentum-bot",
         IntentTier::Tier1,
         IntentOrigin::StrategyA,
         ExplicitAmount::new(token_amount, token_decimals),
@@ -3320,6 +3427,15 @@ async fn generate_and_publish_exit_intent(
         .metadata
         .insert("min_out_raw".to_string(), min_out_raw.to_string());
     intent.metadata.insert("dex".to_string(), dex.to_string());
+    intent
+        .metadata
+        .insert("reason_code".to_string(), reason_code.to_string());
+    intent
+        .metadata
+        .insert("reason_detail".to_string(), reason.to_string());
+    intent
+        .metadata
+        .insert("exit_type".to_string(), exit_type.to_string());
 
     // Pump.fun sell tx building requires the creator/dev wallet.
     if dex == "pumpfun" {
