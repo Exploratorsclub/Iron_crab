@@ -133,7 +133,7 @@ Conditional exits:
 ### Required MarketEvents
 - `Trade { mint, trader, is_buy, sol_amount, token_amount, signature? }`
 - `LiquidityRemoved { mint, sol_amount, token_amount, signature? }`
-- `DevWalletIdentified { mint, dev_wallet, supply_percentage }` (pumpfun creator)
+- `DevWalletIdentified { mint, dev_wallet, supply_percentage }` (used as pump.fun `metadata.creator` when trading bonding-curve pumpfun)
 - `TokenMintInfo { mint, token_program, decimals, supply, mint_authority, freeze_authority }`
 
 ### Data-source constraints
@@ -165,6 +165,7 @@ Reason codes are uppercase snake case. A decision must include exactly one **pri
 - `REJECT_LOW_SOL_INFLOW`
 - `REJECT_BOT_CONCENTRATION` (top buyer share too high)
 - `REJECT_MICRO_BUY_SPAM` (small-buy ratio too high)
+- `REJECT_UNSUPPORTED_TOKEN_PROGRAM` (token program not supported by current execution path)
 
 ### CTO Mode
 - `CTO_WAIT_RECOVERY`
@@ -190,3 +191,253 @@ Reason codes are uppercase snake case. A decision must include exactly one **pri
 - Keep the strategy logic side-effect-free except for emitting intents and writing JSONL.
 - Every time an intent is emitted, store a local `PendingIntent` so execution results can be correlated.
 - The strategy should prefer returning WAIT (with reason) rather than rejecting when missing data is expected to arrive soon (e.g., `TokenMintInfo`).
+
+---
+
+## 8) End-to-End IPC Contracts (Normative)
+
+This section is the integration “source of truth” across:
+- Upstream: `market-data` → `MarketEvent`
+- Strategy plane: `momentum-bot` → `TradeIntent`
+- Downstream: `execution-engine` → `DecisionRecord` + `ExecutionResult`
+
+If anything in this spec conflicts with code contracts in `src/ipc/schema.rs`, this spec must be updated to match.
+
+### Topics
+- `ironcrab.v1.market_events`
+- `ironcrab.v1.trade_intents`
+- `ironcrab.v1.decision_records`
+- `ironcrab.v1.execution_results`
+
+Note: hot-reload config currently uses the legacy topic `ironcrab.control.config.reload`.
+
+### Correlation keys
+- `run_id` scopes a process run.
+- `intent_id` is the primary correlation key across intents/decisions/execution.
+- `decision_id` connects a `DecisionRecord` to a later `ExecutionResult`.
+
+---
+
+## 9) Upstream Requirements: `market-data` (Normative)
+
+Momentum v2 relies on `market-data` producing deterministic, replayable events.
+
+### Required MarketEvents
+
+#### 9.1 `TokenMintInfo` (mint safety + decimals)
+- Must be produced from Geyser account updates for tracked mints.
+- Strategy behavior:
+  - If mint is not yet tracked / mint info not yet observed: `WAIT_MINT_INFO`.
+  - Once observed, strategy must treat the values as authoritative for:
+    - `decimals` (position accounting, `ExplicitAmount` units)
+    - mint/freeze authority gates.
+    - token program gating: if `token_program` is not supported by the intended DEX execution path, strategy must `REJECT_UNSUPPORTED_TOKEN_PROGRAM`.
+
+#### 9.2 `DexPoolAccounts` (deterministic PumpSwap/Pump AMM execution)
+- For `dex="PumpFunAmm"`, `market-data` must emit:
+  - `pool_address` (this is the pool id to be used in intents)
+  - `base_mint`, `quote_mint`
+  - `accounts` as the *v1 ordered list* (length must be exactly 14):
+    - `[0] pool_market`
+    - `[1] global_config`
+    - `[2] base_mint`
+    - `[3] quote_mint`
+    - `[4] pool_base_vault`
+    - `[5] pool_quote_vault`
+    - `[6] protocol_fee_recipient`
+    - `[7] protocol_fee_recipient_ta`
+    - `[8] event_authority`
+    - `[9] coin_creator_vault_ata`
+    - `[10] coin_creator_vault_authority`
+    - `[11] global_volume_accumulator`
+    - `[12] fee_config`
+    - `[13] fee_program`
+
+Strategy behavior:
+- If strategy wants to trade PumpFunAmm and does not have `DexPoolAccounts` yet: `WAIT_BUYER_WINDOW` (or a more specific WAIT) rather than emitting an intent that will be rejected for non-determinism.
+
+#### 9.3 `Trade` + `LiquidityRemoved` (core signals)
+- These events power the buyer-quality, micro-buy, dump-recovery, dev-sell, and LP removal gates.
+
+---
+
+## 10) Strategy → Engine Contract: `TradeIntent` (Normative)
+
+### 10.1 Required invariant fields
+- `source` MUST be a stable producer identity (for Momentum v2: `"momentum-bot"`).
+- `intent_id` MUST be globally unique.
+- `required_capital` is the **amount-in** (see `src/ipc/schema.rs`).
+- `resources.input_mint` / `resources.output_mint` MUST match the trade side semantics:
+  - BUY: input = SOL, output = token
+  - SELL: input = token, output = SOL
+
+### 10.2 Deterministic routing resources (DEX-specific)
+
+#### Pump.fun bonding curve ("pumpfun")
+Goal: allow `execution-engine` to plan deterministically.
+
+- `resources.pools` MUST contain exactly one pool id:
+  - `resources.pools[0] = bonding_curve_pubkey`
+- `metadata` MUST include:
+  - `creator = <creator_pubkey>` (required for pump.fun tx build; engine rejects if missing)
+
+Source for `creator`:
+- Momentum-bot should populate `metadata.creator` from the latest `MarketEventKind::DevWalletIdentified.dev_wallet` for that mint.
+- `metadata` SHOULD include:
+  - `dex = "pumpfun"`
+
+#### PumpSwap / Pump AMM ("pump_amm" / `PumpFunAmm`)
+Goal: **no RPC account discovery** during tx build.
+
+Current constraints (implementation-derived):
+- Only WSOL pairs are supported (SOL ↔ token). Token ↔ token is unsupported.
+- Current tx build path assumes SPL Token (Tokenkeg) for token transfers/ATAs.
+  - If `TokenMintInfo.token_program` indicates Token-2022, strategy must reject until engine supports Token-2022 for this DEX path.
+
+- `resources.pools` MUST contain exactly one pool id:
+  - `resources.pools[0] = pool_address`
+- `resources.accounts` MUST contain exactly 14 pubkeys and MUST be the v1 ordered list from `MarketEventKind::DexPoolAccounts.accounts`.
+- `resources.accounts[0]` MUST equal `resources.pools[0]` (pool id must match).
+
+If any of the above is violated, the intent is expected to be rejected by the engine.
+
+#### Raydium / Orca
+- `resources.pools` should include the pool id.
+- `resources.accounts` may be omitted; engine can fetch if needed.
+
+### 10.3 Execution constraints (min_out)
+
+To be simulate-gated and deterministic, momentum intents MUST set `execution.min_out`:
+- BUY (SOL → token): `min_out` is token raw units with token decimals.
+- SELL (token → SOL): `min_out` is lamports (decimals=9).
+
+`max_slippage_bps` is the strategy’s tolerance; engine may enforce a stricter policy.
+
+### 10.4 Canonical reason metadata
+
+Momentum must emit:
+- `metadata["reason_code"] = <canonical_code>`
+- `metadata["reason_detail"] = <freeform detail>`
+
+Optional but recommended:
+- `metadata["entry_kind"] = "probe"|"scale_in"` for BUY intents
+- `metadata["exit_type"] = <string>` for SELL intents
+- `metadata["dex"] = "pumpfun"|"pump_amm"|"raydium"|"orca"` when known
+
+---
+
+## 11) Engine → Strategy Contract (Normative)
+
+### 11.1 `DecisionRecord` (audit trail)
+
+Momentum-bot should treat DecisionRecords as the forensics source for:
+- why an intent was rejected (incl. simulate failures)
+- whether send is disabled (`send_enabled=false`)
+
+### 11.2 `ExecutionResult` (position state transitions)
+
+Momentum-bot must only transition state based on `ExecutionResult.status`:
+- `Confirmed`: trade is considered executed.
+- `Failed`/`Timeout`: trade is considered not executed (unless an eventual confirm arrives later).
+
+#### The real missing piece: fill accounting
+
+For Momentum v2 to be *complete and correct* (position sizing, exits, PnL), strategy must know the actual fill amounts.
+
+Current `ExecutionResult` does **not** carry fill amounts. Therefore, the spec requires one of the following (backward compatible):
+
+Option A (preferred): extend `ExecutionResult` with optional fill fields:
+- `fill_in: ExplicitAmount` (actual amount-in)
+- `fill_out: ExplicitAmount` (actual amount-out)
+- `post_balances: { "<mint>": ExplicitAmount, ... }` (optional)
+
+Option B: emit a companion record on the existing topic `ironcrab.v1.execution_results`:
+- `ExecutionFill` (new IPC type) keyed by `intent_id` and `signature`, containing `fill_in`, `fill_out`, and optional post-balances.
+
+Until fill accounting exists, Momentum v2 can run, but position management will be approximate and exits can mis-size.
+
+---
+
+## 12) Position Accounting & Exit Sizing (Normative)
+
+### 12.1 Position model
+Momentum-bot must maintain a per-mint position record that includes:
+- `entry_intent_id` (probe) and optional `scale_in_intent_id`
+- `token_decimals` (from `TokenMintInfo`)
+- `token_amount_raw` (from confirmed fills)
+- `sol_spent_lamports` and `sol_received_lamports` (from confirmed fills)
+
+### 12.2 Exit sell amount
+- SELL intents must use `required_capital.raw = token_amount_to_sell_raw`.
+- Default: sell 100% of `token_amount_raw` for hard exits.
+- If partial exits are added later, they must be expressed as deterministic raw token amounts (never “percent only”).
+
+### 12.3 Pending intent handling
+- A token may have at most one pending entry intent (probe or scale-in) and at most one pending exit intent.
+- If an entry intent `Timeout`s, strategy must not assume it executed.
+- If an exit intent `Timeout`s, strategy must keep monitoring and may re-issue with a new intent id after a cooldown (cooldown policy is config-driven).
+
+---
+
+## 13) Runtime Config Keys (Normative inventory)
+
+The following keys must be supported for Momentum v2 tuning via the config-reload mechanism:
+
+Entry & regime:
+- `early_min_liquidity_sol`
+- `established_min_liquidity_sol`
+- `early_slot_threshold`
+- `early_max_slippage_bps`
+- `established_max_slippage_bps`
+- `default_position_lamports`
+- `probe_buy_pct`
+- `scale_in_confirm_window_secs`
+
+Buyer quality / anti-bot:
+- `top1_buyer_share_cap`
+- `top3_buyer_share_cap`
+- `repeat_buyer_min_ratio`
+- `min_trade_size_lamports`
+- `small_buy_ratio_cap`
+
+Dump recovery:
+- `dump_recovery_window_secs`
+- `dump_recovery_min_buy_dominance`
+- `dump_recovery_min_net_inflow_lamports`
+- `dump_recovery_min_recovery_secs`
+
+CTO mode:
+- `cto_enabled`
+- `cto_entry_delay_secs`
+- `cto_confirm_window_secs`
+- `cto_min_unique_buyers`
+- `cto_min_buy_dominance`
+- `cto_min_net_inflow_lamports`
+
+Mint safety:
+- `require_mint_authority_renounced`
+- `require_freeze_authority_none`
+
+Note: [docs/CONFIG_SCHEMA.md](docs/CONFIG_SCHEMA.md) should be updated to include the full Momentum v2 key inventory.
+
+---
+
+## 14) Definition of “Momentum Works Completely” (Acceptance Criteria)
+
+Momentum v2 is considered complete when the following end-to-end properties hold:
+
+1) Deterministic execution
+- For PumpFunAmm, intents include `resources.pools[0]` and the 14 pool accounts from `DexPoolAccounts`.
+- Engine can build without ad-hoc RPC discovery for PumpFunAmm.
+
+2) Simulate-gated safety
+- Engine produces a `DecisionRecord` for each processed intent with checks + outcome.
+- If simulation fails, the intent is never sent.
+
+3) Correct position accounting
+- On `ExecutionResult::Confirmed`, momentum-bot updates position using actual fills (via `ExecutionResult` fill extension or `ExecutionFill`).
+- Exits sell the actual held token amount.
+
+4) Forensic explainability
+- Every emitted intent includes `metadata.reason_code` and `metadata.reason_detail`.
+- Strategy state transitions can be reconstructed from JSONL + NATS streams by `intent_id`.

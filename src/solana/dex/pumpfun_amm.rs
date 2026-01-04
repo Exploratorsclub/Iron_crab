@@ -545,42 +545,37 @@ impl Dex for PumpFunAmmDex {
         let data = Self::build_ix_data(disc, amount_in, min_out);
 
         // Account ordering is taken from an observed on-chain Pump.fun AMM swap transaction.
-        let mut metas = Vec::with_capacity(23);
-        metas.push(AccountMeta::new(pool.pool_market, false));
-        metas.push(AccountMeta::new(user, true));
-        metas.push(AccountMeta::new_readonly(pool.global_config, false));
-        metas.push(AccountMeta::new_readonly(pool.base_mint, false));
-        metas.push(AccountMeta::new_readonly(pool.quote_mint, false));
-        metas.push(AccountMeta::new(user_base_ta, false));
-        metas.push(AccountMeta::new(user_quote_ta, false));
-        metas.push(AccountMeta::new(pool.pool_base_vault, false));
-        metas.push(AccountMeta::new(pool.pool_quote_vault, false));
-        metas.push(AccountMeta::new_readonly(pool.protocol_fee_recipient, false));
-        metas.push(AccountMeta::new(pool.protocol_fee_recipient_ta, false));
-        metas.push(AccountMeta::new_readonly(
-            Pubkey::new_from_array(spl_token::id().to_bytes()),
-            false,
-        ));
-        metas.push(AccountMeta::new_readonly(
-            Pubkey::new_from_array(spl_token::id().to_bytes()),
-            false,
-        ));
-        metas.push(AccountMeta::new_readonly(
-            Pubkey::new_from_array(solana_system_program::id().to_bytes()),
-            false,
-        ));
-        metas.push(AccountMeta::new_readonly(
-            Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
-            false,
-        ));
-        metas.push(AccountMeta::new_readonly(pool.event_authority, false));
-        metas.push(AccountMeta::new_readonly(program_id, false));
-        metas.push(AccountMeta::new(pool.coin_creator_vault_ata, false));
-        metas.push(AccountMeta::new_readonly(pool.coin_creator_vault_authority, false));
-        metas.push(AccountMeta::new(pool.global_volume_accumulator, false));
-        metas.push(AccountMeta::new(user_vol, false));
-        metas.push(AccountMeta::new_readonly(pool.fee_config, false));
-        metas.push(AccountMeta::new_readonly(pool.fee_program, false));
+        let metas = vec![
+            AccountMeta::new(pool.pool_market, false),
+            AccountMeta::new(user, true),
+            AccountMeta::new_readonly(pool.global_config, false),
+            AccountMeta::new_readonly(pool.base_mint, false),
+            AccountMeta::new_readonly(pool.quote_mint, false),
+            AccountMeta::new(user_base_ta, false),
+            AccountMeta::new(user_quote_ta, false),
+            AccountMeta::new(pool.pool_base_vault, false),
+            AccountMeta::new(pool.pool_quote_vault, false),
+            AccountMeta::new_readonly(pool.protocol_fee_recipient, false),
+            AccountMeta::new(pool.protocol_fee_recipient_ta, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
+            AccountMeta::new_readonly(
+                Pubkey::new_from_array(solana_system_program::id().to_bytes()),
+                false,
+            ),
+            AccountMeta::new_readonly(
+                Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
+                false,
+            ),
+            AccountMeta::new_readonly(pool.event_authority, false),
+            AccountMeta::new_readonly(program_id, false),
+            AccountMeta::new(pool.coin_creator_vault_ata, false),
+            AccountMeta::new_readonly(pool.coin_creator_vault_authority, false),
+            AccountMeta::new(pool.global_volume_accumulator, false),
+            AccountMeta::new(user_vol, false),
+            AccountMeta::new_readonly(pool.fee_config, false),
+            AccountMeta::new_readonly(pool.fee_program, false),
+        ];
 
         Ok(vec![Instruction {
             program_id,
@@ -678,42 +673,37 @@ impl PumpFunAmmDex {
         let data = Self::build_ix_data(disc, amount_in, min_out);
 
         // Account ordering is taken from an observed on-chain Pump.fun AMM swap transaction.
-        let mut metas = Vec::with_capacity(23);
-        metas.push(AccountMeta::new(pool_market, false));
-        metas.push(AccountMeta::new(user, true));
-        metas.push(AccountMeta::new_readonly(global_config, false));
-        metas.push(AccountMeta::new_readonly(base_mint, false));
-        metas.push(AccountMeta::new_readonly(quote_mint, false));
-        metas.push(AccountMeta::new(user_base_ta, false));
-        metas.push(AccountMeta::new(user_quote_ta, false));
-        metas.push(AccountMeta::new(pool_base_vault, false));
-        metas.push(AccountMeta::new(pool_quote_vault, false));
-        metas.push(AccountMeta::new_readonly(protocol_fee_recipient, false));
-        metas.push(AccountMeta::new(protocol_fee_recipient_ta, false));
-        metas.push(AccountMeta::new_readonly(
-            Pubkey::new_from_array(spl_token::id().to_bytes()),
-            false,
-        ));
-        metas.push(AccountMeta::new_readonly(
-            Pubkey::new_from_array(spl_token::id().to_bytes()),
-            false,
-        ));
-        metas.push(AccountMeta::new_readonly(
-            Pubkey::new_from_array(solana_system_program::id().to_bytes()),
-            false,
-        ));
-        metas.push(AccountMeta::new_readonly(
-            Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
-            false,
-        ));
-        metas.push(AccountMeta::new_readonly(event_authority, false));
-        metas.push(AccountMeta::new_readonly(program_id, false));
-        metas.push(AccountMeta::new(coin_creator_vault_ata, false));
-        metas.push(AccountMeta::new_readonly(coin_creator_vault_authority, false));
-        metas.push(AccountMeta::new(global_volume_accumulator, false));
-        metas.push(AccountMeta::new(user_vol, false));
-        metas.push(AccountMeta::new_readonly(fee_config, false));
-        metas.push(AccountMeta::new_readonly(fee_program, false));
+        let metas = vec![
+            AccountMeta::new(pool_market, false),
+            AccountMeta::new(user, true),
+            AccountMeta::new_readonly(global_config, false),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new(user_base_ta, false),
+            AccountMeta::new(user_quote_ta, false),
+            AccountMeta::new(pool_base_vault, false),
+            AccountMeta::new(pool_quote_vault, false),
+            AccountMeta::new_readonly(protocol_fee_recipient, false),
+            AccountMeta::new(protocol_fee_recipient_ta, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
+            AccountMeta::new_readonly(
+                Pubkey::new_from_array(solana_system_program::id().to_bytes()),
+                false,
+            ),
+            AccountMeta::new_readonly(
+                Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
+                false,
+            ),
+            AccountMeta::new_readonly(event_authority, false),
+            AccountMeta::new_readonly(program_id, false),
+            AccountMeta::new(coin_creator_vault_ata, false),
+            AccountMeta::new_readonly(coin_creator_vault_authority, false),
+            AccountMeta::new(global_volume_accumulator, false),
+            AccountMeta::new(user_vol, false),
+            AccountMeta::new_readonly(fee_config, false),
+            AccountMeta::new_readonly(fee_program, false),
+        ];
 
         Ok(vec![Instruction {
             program_id,

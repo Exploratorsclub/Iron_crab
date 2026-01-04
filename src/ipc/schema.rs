@@ -795,6 +795,7 @@ impl TradeIntent {
     ///
     /// This matches execution-engine semantics: `required_capital` is the amount-in of
     /// `resources.input_mint`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_sell(
         component: &str,
         build: &str,
@@ -1102,6 +1103,15 @@ pub struct ExecutionResult {
 
     pub status: ExecutionStatus,
 
+    /// Actual fills computed from confirmed transaction meta (best-effort).
+    ///
+    /// `fill_in` is the actual amount-in for the intent (positive raw units).
+    /// `fill_out` is the actual amount-out for the intent (positive raw units).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_in: Option<ExplicitAmount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_out: Option<ExplicitAmount>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirmed_slot: Option<u64>,
 
@@ -1141,12 +1151,20 @@ impl ExecutionResult {
             signature,
             bundle_id,
             status: ExecutionStatus::Sent,
+            fill_in: None,
+            fill_out: None,
             confirmed_slot: None,
             fees: None,
             pnl: None,
             error_message: None,
             latency_ms: None,
         }
+    }
+
+    pub fn with_fills(mut self, fill_in: Option<ExplicitAmount>, fill_out: Option<ExplicitAmount>) -> Self {
+        self.fill_in = fill_in;
+        self.fill_out = fill_out;
+        self
     }
 
     pub fn mark_confirmed(

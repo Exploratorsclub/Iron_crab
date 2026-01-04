@@ -113,15 +113,15 @@ impl GeyserListener {
         #[cfg(windows)]
         {
             let _ = (self.endpoint, self.program_ids, self.tracked_accounts_rx);
-            return Err(anyhow!(
+            Err(anyhow!(
                 "Geyser gRPC is not supported on Windows in this repo build. \
                  Build on Linux/macOS for Geyser support."
-            ));
+            ))
         }
 
         #[cfg(not(windows))]
         {
-            return self.start_impl().await;
+            self.start_impl().await
         }
     }
 

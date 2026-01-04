@@ -392,7 +392,8 @@ fn test_execution_result_required_fields() {
             decimals: 9,
         },
         250,
-    );
+    )
+    .with_fills(Some(ExplicitAmount::sol_from_lamports(100_000_000)), Some(ExplicitAmount::new(42_000, 6)));
 
     let json = serde_json::to_string(&result).unwrap();
 
@@ -419,6 +420,8 @@ fn test_execution_result_required_fields() {
     assert_eq!(parsed.status, ExecutionStatus::Confirmed);
     assert!(parsed.fees.is_some());
     assert!(parsed.pnl.is_some());
+    assert!(parsed.fill_in.is_some());
+    assert!(parsed.fill_out.is_some());
 }
 
 /// Test RejectReason serialization and categorization

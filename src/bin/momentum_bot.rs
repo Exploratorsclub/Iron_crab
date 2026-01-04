@@ -1669,8 +1669,16 @@ impl MomentumContext {
     ) {
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(mint) {
+            pos.token_amount = pos.token_amount.saturating_add(token_amount);
             pos.add_investment(sol_invested);
-            info!(mint = %mint, additional_sol = sol_invested, total_sol = pos.sol_invested, "📈 Position scaled in");
+            info!(
+                mint = %mint,
+                additional_sol = sol_invested,
+                additional_tokens_raw = token_amount,
+                total_sol = pos.sol_invested,
+                total_tokens_raw = pos.token_amount,
+                "📈 Position scaled in"
+            );
             return;
         }
         positions.insert(
@@ -1925,16 +1933,32 @@ impl MomentumContext {
                 match pending.side {
                     TradeSide::Buy => {
                         // BUY confirmed - open position
-                        // Estimate entry price: we don't have exact token amount from ExecutionResult
-                        // For now, use a placeholder and update from market data
-                        let estimated_price = 1.0; // Will be updated from market trades
-                        let estimated_tokens = pending.sol_amount; // Placeholder
+                        // Prefer exact fills if available; otherwise fall back to placeholders.
+                        let (sol_invested, token_amount, entry_price) =
+                            match (result.fill_in.as_ref(), result.fill_out.as_ref()) {
+                                (Some(fill_in), Some(fill_out)) => {
+                                    let sol_ui = fill_in.as_f64().max(0.0);
+                                    let tok_ui = fill_out.as_f64().max(0.0);
+                                    let price = if sol_ui > 0.0 {
+                                        // token per SOL
+                                        tok_ui / sol_ui
+                                    } else {
+                                        1.0
+                                    };
+                                    (fill_in.raw, fill_out.raw, price)
+                                }
+                                _ => {
+                                    // Placeholder; will be updated from market trades.
+                                    (pending.sol_amount, pending.sol_amount, 1.0)
+                                }
+                            };
 
                         info!(
                             intent_id = %result.intent_id,
                             mint = %pending.mint,
                             pool = %pending.pool,
-                            sol_invested = pending.sol_amount,
+                            sol_invested = sol_invested,
+                            token_amount_raw = token_amount,
                             signature = ?result.signature,
                             "✅ BUY CONFIRMED - Opening position"
                         );
@@ -1960,9 +1984,9 @@ impl MomentumContext {
                             &pending.mint,
                             &pending.pool,
                             &pending.dex,
-                            estimated_price,
-                            estimated_tokens,
-                            pending.sol_amount,
+                            entry_price,
+                            token_amount,
+                            sol_invested,
                         );
                     }
                     TradeSide::Sell => {

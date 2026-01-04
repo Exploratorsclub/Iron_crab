@@ -108,11 +108,62 @@ Component name: `momentum-bot`
 |-----|------|---------|-------|-------------|
 | `default_position_lamports` | u64 | 100_000_000 | > 0 | Default position size (0.1 SOL) |
 
+### Momentum v2 Entry
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `probe_buy_pct` | f64 | 0.25 | 0.0-1.0 | Fraction of `default_position_lamports` used for probe buy |
+| `scale_in_confirm_window_secs` | u64 | 30 | > 0 | Time window to confirm post-probe before scale-in |
+
+### Buyer Quality (Concentration / Repeat Buyers)
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `top1_buyer_share_cap` | f64 | 0.35 | 0.0-1.0 | Reject if top buyer share exceeds cap |
+| `top3_buyer_share_cap` | f64 | 0.60 | 0.0-1.0 | Reject if top3 buyers share exceeds cap |
+| `repeat_buyer_min_ratio` | f64 | 0.05 | 0.0-1.0 | Minimum ratio of repeat buyers in window |
+
+### Micro-buy Spam Filter (Trade Size Distribution)
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `min_trade_size_lamports` | u64 | 10_000_000 | > 0 | Trades below this SOL size are considered "small" |
+| `small_buy_ratio_cap` | f64 | 0.85 | 0.0-1.0 | Reject if too many buys are small (spam) |
+
+### Dump Recovery Gate
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `dump_recovery_window_secs` | u64 | 30 | > 0 | Window size for recovery stats |
+| `dump_recovery_min_buy_dominance` | f64 | 0.55 | 0.0-1.0 | Minimum buy dominance to consider recovered |
+| `dump_recovery_min_net_inflow_lamports` | u64 | 1_000_000_000 | >= 0 | Minimum net SOL inflow for recovery |
+| `dump_recovery_min_recovery_secs` | u64 | 10 | > 0 | Minimum time after dump before allowing entry |
+
+### CTO Candidate Mode
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `cto_enabled` | bool | false | true/false | If true, pre-entry dev sell transitions to CTO_Candidate instead of reject |
+| `cto_entry_delay_secs` | u64 | 30 | > 0 | Delay after dev sell before evaluating recovery |
+| `cto_confirm_window_secs` | u64 | 30 | > 0 | Confirmation window for CTO recovery |
+| `cto_min_unique_buyers` | u64 | 5 | > 0 | Minimum unique buyers for CTO recovery |
+| `cto_min_buy_dominance` | f64 | 0.55 | 0.0-1.0 | Minimum buy dominance for CTO recovery |
+| `cto_min_net_inflow_lamports` | u64 | 1_000_000_000 | >= 0 | Minimum net inflow for CTO recovery |
+
+### Mint Safety Gates
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `require_mint_authority_renounced` | bool | false | true/false | Require TokenMintInfo.mint_authority == None |
+| `require_freeze_authority_none` | bool | false | true/false | Require TokenMintInfo.freeze_authority == None |
+
 ### Validation Rules
 - Liquidity values must be >= 0 (0 means disabled)
 - `early_slot_threshold` must be > 0
 - Slippage BPS must be between 1 and 10000
 - `default_position_lamports` must be > 0
+- Percent-like values (`*_pct`, `*_cap`, `*_ratio`, `*_dominance`) must be in [0.0, 1.0]
+- `*_window_secs`, `*_delay_secs`, `*_recovery_secs` must be > 0
 
 ---
 

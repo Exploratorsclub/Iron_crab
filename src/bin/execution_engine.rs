@@ -29,7 +29,8 @@ use solana_account_decoder::UiAccountData;
 use solana_account_decoder::UiAccountEncoding;
 use solana_client::rpc_request::TokenAccountsFilter;
 use serde::{Deserialize, Serialize};
-use solana_client::rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
+use solana_client::rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig, RpcTransactionConfig};
+use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding, UiTransactionTokenBalance};
 use solana_sdk::pubkey::Pubkey;
 use solana_commitment_config::CommitmentLevel;
 use solana_sdk::bs58;
@@ -73,6 +74,7 @@ use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::Dex;
+use ironcrab::solana::dex_parser::SOL_MINT;
 use ironcrab::solana::token_utils::get_token_decimals_or_default;
 use ironcrab::storage::{
     locks::{LockHolder, LockManager, LockResult, ResourceType},
@@ -80,7 +82,6 @@ use ironcrab::storage::{
 };
 use ironcrab::wallet::Treasury;
 use ironcrab::execution::tx_builder;
-use spl_associated_token_account;
 use spl_token::solana_program::pubkey::Pubkey as SplProgPubkey;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::instruction as spl_ix;
@@ -90,6 +91,135 @@ use spl_token_2022::{
     state::Account as Spl22TokenAccount,
 };
 use std::sync::atomic::AtomicBool;
+
+fn extract_owner_mint_delta_raw(
+    tx: &EncodedConfirmedTransactionWithStatusMeta,
+    owner: &Pubkey,
+    mint: &str,
+) -> Option<(u8, i128)> {
+    let meta = tx.transaction.meta.as_ref()?;
+
+    let pre_balances_opt = Option::<Vec<UiTransactionTokenBalance>>::from(meta.pre_token_balances.clone());
+    let post_balances_opt = Option::<Vec<UiTransactionTokenBalance>>::from(meta.post_token_balances.clone());
+    let (pre_balances, post_balances) = (pre_balances_opt?, post_balances_opt?);
+
+    let owner_str = owner.to_string();
+
+    let mut pre_sum: u128 = 0;
+    let mut post_sum: u128 = 0;
+    let mut decimals_opt: Option<u8> = None;
+
+    for b in pre_balances.iter() {
+        let b_owner = Option::<String>::from(b.owner.clone());
+        if b.mint == mint && b_owner.as_deref() == Some(&owner_str) {
+            decimals_opt = Some(b.ui_token_amount.decimals);
+            if let Ok(v) = u128::from_str(&b.ui_token_amount.amount) {
+                pre_sum = pre_sum.saturating_add(v);
+            }
+        }
+    }
+
+    for b in post_balances.iter() {
+        let b_owner = Option::<String>::from(b.owner.clone());
+        if b.mint == mint && b_owner.as_deref() == Some(&owner_str) {
+            decimals_opt = Some(b.ui_token_amount.decimals);
+            if let Ok(v) = u128::from_str(&b.ui_token_amount.amount) {
+                post_sum = post_sum.saturating_add(v);
+            }
+        }
+    }
+
+    let decimals = decimals_opt?;
+    let delta = post_sum as i128 - pre_sum as i128;
+    Some((decimals, delta))
+}
+
+async fn compute_intent_fills_best_effort(
+    ctx: &ExecutionContext,
+    wallet: Pubkey,
+    signature: &Signature,
+    intent: &TradeIntent,
+) -> (Option<ExplicitAmount>, Option<ExplicitAmount>) {
+    let cfg = RpcTransactionConfig {
+        encoding: Some(UiTransactionEncoding::JsonParsed),
+        commitment: Some(solana_commitment_config::CommitmentConfig {
+            commitment: CommitmentLevel::Confirmed,
+        }),
+        max_supported_transaction_version: Some(0),
+    };
+
+    let tx = match ctx
+        .rpc
+        .get_transaction_with_config_retry(signature, cfg)
+        .await
+    {
+        Ok(tx) => tx,
+        Err(e) => {
+            debug!(sig = %signature, error = %e, "Failed to fetch tx meta for fills (best-effort)");
+            return (None, None);
+        }
+    };
+
+    let input_mint = intent.resources.input_mint.as_str();
+    let output_mint = intent.resources.output_mint.as_str();
+
+    // Primary path: use token-balance deltas (works for most SPL tokens, including WSOL if used).
+    let input_token_delta = extract_owner_mint_delta_raw(&tx, &wallet, input_mint);
+    let output_token_delta = extract_owner_mint_delta_raw(&tx, &wallet, output_mint);
+
+    // Fallback path (best-effort): if SOL is represented as So111.. but token balances are absent
+    // (e.g. native SOL transfers), approximate fills using fee payer lamport delta.
+    let (payer_delta_lamports, fee_lamports) = tx
+        .transaction
+        .meta
+        .as_ref()
+        .and_then(|m| {
+            let pre = m.pre_balances.get(0).copied()?;
+            let post = m.post_balances.get(0).copied()?;
+            Some((post as i128 - pre as i128, m.fee))
+        })
+        .unwrap_or((0, 0));
+
+    let fill_in = if let Some((decimals, delta)) = input_token_delta {
+        if delta < 0 {
+            Some(ExplicitAmount::new((-delta) as u64, decimals))
+        } else {
+            None
+        }
+    } else if input_mint == SOL_MINT && payer_delta_lamports < 0 {
+        // Approximate: amount spent excluding network fee.
+        let spent_total = (-payer_delta_lamports) as u64;
+        let spent_ex_fee = spent_total.saturating_sub(fee_lamports);
+        if spent_ex_fee > 0 {
+            Some(ExplicitAmount::new(spent_ex_fee, 9))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let fill_out = if let Some((decimals, delta)) = output_token_delta {
+        if delta > 0 {
+            Some(ExplicitAmount::new(delta as u64, decimals))
+        } else {
+            None
+        }
+    } else if output_mint == SOL_MINT && payer_delta_lamports > 0 {
+        // Approximate: amount received before fees (add back network fee).
+        let received_total = payer_delta_lamports as u64;
+        let received_plus_fee = received_total.saturating_add(fee_lamports);
+        if received_plus_fee > 0 {
+            Some(ExplicitAmount::new(received_plus_fee, 9))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    (fill_in, fill_out)
+}
 
 async fn discover_wallet_open_positions(rpc: &SolanaRpc, owner: Pubkey) -> anyhow::Result<usize> {
     let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")?;
@@ -334,6 +464,7 @@ struct ExecutionConfig {
 
     // === P1: Fairness/Starvation Policy ===
     /// Fairness policy to prevent strategy starvation
+    #[allow(dead_code)]
     fairness_policy: FairnessPolicy,
 }
 
@@ -535,8 +666,10 @@ struct ExecutionContext {
     /// Jito client for atomic bundle execution (None if disabled)
     jito_client: Option<JitoClient>,
     /// Bundle submissions counter
+    #[allow(dead_code)]
     bundles_submitted: std::sync::atomic::AtomicU64,
     /// Bundle confirmations counter
+    #[allow(dead_code)]
     bundles_confirmed: std::sync::atomic::AtomicU64,
 
     // === Cross-DEX Arbitrage Handler ===
@@ -549,8 +682,10 @@ struct ExecutionContext {
     intents_received: std::sync::atomic::AtomicU64,
     intents_rejected: std::sync::atomic::AtomicU64,
     sim_failures: std::sync::atomic::AtomicU64,
+    #[allow(dead_code)]
     tx_sent: std::sync::atomic::AtomicU64,
     arb_validated: std::sync::atomic::AtomicU64,
+    #[allow(dead_code)]
     arb_executed: std::sync::atomic::AtomicU64,
 }
 
@@ -1789,6 +1924,7 @@ async fn run_manual_burn_job(
     }
 
     /// Record a loss (positive = loss, negative = profit)
+    #[allow(dead_code)]
     fn record_pnl_lamports(&self, pnl: i64) {
         // Positive pnl = loss, negative = profit
         self.daily_loss_lamports
@@ -3052,7 +3188,6 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
     // === Cross-DEX Arbitrage Validation (if applicable) ===
     let is_cross_dex_arb = CrossDexHandler::is_cross_dex_arb_intent(&intent);
-    let mut cross_dex_validation = None;
 
     // Planned tx (RS-2.1): deterministic tx plan + plan_hash
     let (tx_plan, plan_hash_str) = {
@@ -3147,8 +3282,6 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                             validation.actual_spread_bps, validation.estimated_profit_lamports
                         )),
                     });
-
-                    cross_dex_validation = Some(validation);
                 }
                 Err(e) => {
                     warn!(error = %e, "Cross-DEX validation failed");
@@ -3289,7 +3422,6 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             let treasury = match ctx.treasury.as_ref() {
                 Some(t) => t,
                 None => {
-                    send_failed = true;
                     let reason = RejectReason::InternalError;
                     checks.push(CheckResult {
                         check_name: "send".to_string(),
@@ -3313,7 +3445,6 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             let blockhash = match ctx.rpc.get_latest_blockhash_retry().await {
                 Ok(bh) => bh,
                 Err(e) => {
-                    send_failed = true;
                     let reason = RejectReason::BundleFailed;
                     checks.push(CheckResult {
                         check_name: "send".to_string(),
@@ -3701,6 +3832,18 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 bundle_id,
             );
 
+            // Best-effort fill accounting: attach fills only when we have a signature and wallet.
+            // This is used downstream for correct position accounting/exit sizing.
+            if matches!(status, ExecutionStatus::Confirmed) {
+                if let (Some(wallet), Some(sig_str)) = (ctx.wallet_pubkey, exec.signature.as_deref()) {
+                    if let Ok(sig) = Signature::from_str(sig_str) {
+                        let (fill_in, fill_out) =
+                            compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await;
+                        exec = exec.with_fills(fill_in, fill_out);
+                    }
+                }
+            }
+
             exec.status = status;
             if matches!(exec.status, ExecutionStatus::Failed) {
                 exec.error_message = Some("execution_failed".to_string());
@@ -3723,36 +3866,35 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
 
         // Best-effort recent trade record for Grafana (/trades via Infinity datasource).
-        // NOTE: execution-engine does not know exact fills; token amount and price are placeholders.
+        // NOTE: If fill accounting is available, use it; otherwise fall back to placeholders.
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-        let (mint, action, amount_tokens, price_sol) = match intent.side {
-            TradeSide::Buy => {
-                let sol = (intent.required_capital.raw as f64)
-                    / 10f64.powi(intent.required_capital.decimals as i32);
-                (
-                    intent.resources.output_mint.clone(),
-                    "BUY".to_string(),
-                    0.0,
-                    sol,
-                )
-            }
-            TradeSide::Sell => {
-                let tokens = (intent.required_capital.raw as f64)
-                    / 10f64.powi(intent.required_capital.decimals as i32);
-                (
-                    intent.resources.input_mint.clone(),
-                    "SELL".to_string(),
-                    tokens,
-                    0.0,
-                )
-            }
-        };
 
         let tx_hash = send_result
             .as_ref()
             .and_then(|sr| sr.signature.clone())
             .or_else(|| send_signature.clone())
             .unwrap_or_default();
+
+        let (fill_in, fill_out) = if let (Some(wallet), Ok(sig)) = (ctx.wallet_pubkey, Signature::from_str(&tx_hash)) {
+            compute_intent_fills_best_effort(&ctx, wallet, &sig, &intent).await
+        } else {
+            (None, None)
+        };
+
+        let (mint, action, amount_tokens, price_sol) = match intent.side {
+            TradeSide::Buy => {
+                let sol_ui_fallback = intent.required_capital.as_f64();
+                let sol_ui = fill_in.as_ref().map(|a| a.as_f64()).unwrap_or(sol_ui_fallback);
+                let tok_ui = fill_out.as_ref().map(|a| a.as_f64()).unwrap_or(0.0);
+                (intent.resources.output_mint.clone(), "BUY".to_string(), tok_ui, sol_ui)
+            }
+            TradeSide::Sell => {
+                let tok_ui_fallback = intent.required_capital.as_f64();
+                let tok_ui = fill_in.as_ref().map(|a| a.as_f64()).unwrap_or(tok_ui_fallback);
+                let sol_ui = fill_out.as_ref().map(|a| a.as_f64()).unwrap_or(0.0);
+                (intent.resources.input_mint.clone(), "SELL".to_string(), tok_ui, sol_ui)
+            }
+        };
 
         record_recent_trade(RecentTrade {
             timestamp_ms: now_ms,
