@@ -577,6 +577,10 @@ struct TokenTracker {
     dump_observed_at: Option<Instant>,
     recovery_started_at: Option<Instant>,
 
+    // CTO mode (pre-entry dev-sell handling)
+    cto_started_at: Option<Instant>,
+    cto_recovery_confirmed: bool,
+
     // State
     /// Entry lifecycle: probe then optional scale-in.
     probe_sent_at: Option<Instant>,
@@ -623,6 +627,8 @@ impl TokenTracker {
             lp_removal_time: None,
             dump_observed_at: None,
             recovery_started_at: None,
+            cto_started_at: None,
+            cto_recovery_confirmed: false,
             probe_sent_at: None,
             probe_filled_at: None,
             scale_sent_at: None,
@@ -737,6 +743,109 @@ impl TokenTracker {
         None
     }
 
+    fn cto_confirm_stats_at(
+        &self,
+        config: &MomentumConfig,
+        now: Instant,
+    ) -> Option<(u32, f64, i128, u32)> {
+        if config.cto_confirm_window_secs == 0 {
+            return None;
+        }
+
+        let window = Duration::from_secs(config.cto_confirm_window_secs);
+        let mut unique_buyers: HashSet<&str> = HashSet::new();
+        let mut buy_count: u32 = 0;
+        let mut sell_count: u32 = 0;
+        let mut buy_vol: u64 = 0;
+        let mut sell_vol: u64 = 0;
+
+        for t in self
+            .trades
+            .iter()
+            .filter(|t| now.duration_since(t.timestamp) < window)
+        {
+            if t.is_buy {
+                buy_count = buy_count.saturating_add(1);
+                buy_vol = buy_vol.saturating_add(t.sol_amount);
+                unique_buyers.insert(t.trader.as_str());
+            } else {
+                sell_count = sell_count.saturating_add(1);
+                sell_vol = sell_vol.saturating_add(t.sol_amount);
+            }
+        }
+
+        let total = buy_count.saturating_add(sell_count);
+        if total == 0 {
+            return None;
+        }
+
+        let buy_dominance = buy_count as f64 / total as f64;
+        let net_inflow = buy_vol as i128 - sell_vol as i128;
+        Some((unique_buyers.len() as u32, buy_dominance, net_inflow, total))
+    }
+
+    fn cto_wait_reason(&mut self, config: &MomentumConfig, now: Instant) -> Option<String> {
+        if !config.cto_enabled {
+            return None;
+        }
+        if self.cto_recovery_confirmed {
+            return None;
+        }
+
+        let started = self.cto_started_at.get_or_insert(now);
+        let since = now.duration_since(*started).as_secs();
+        if since < config.cto_entry_delay_secs {
+            return Some(format!(
+                "CTO_WAIT_RECOVERY: entry delay {}/{}s",
+                since, config.cto_entry_delay_secs
+            ));
+        }
+
+        let Some((buyers, dom, net_inflow, samples)) = self.cto_confirm_stats_at(config, now) else {
+            return Some("CTO_WAIT_RECOVERY: awaiting confirmation window data".to_string());
+        };
+
+        // Use configured threshold (separate from early min_unique_buyers) and a small sample guard.
+        if samples < config.cto_min_unique_buyers.max(5) {
+            return Some(format!(
+                "CTO_WAIT_RECOVERY: not enough samples in confirm window ({} < {})",
+                samples,
+                config.cto_min_unique_buyers.max(5)
+            ));
+        }
+
+        if buyers < config.cto_min_unique_buyers {
+            return Some(format!(
+                "CTO_WAIT_RECOVERY: not enough buyers in confirm window ({} < {})",
+                buyers, config.cto_min_unique_buyers
+            ));
+        }
+
+        if dom < config.cto_min_buy_dominance {
+            return Some(format!(
+                "CTO_WAIT_RECOVERY: buy dominance {:.0}% < {:.0}%",
+                dom * 100.0,
+                config.cto_min_buy_dominance * 100.0
+            ));
+        }
+
+        if net_inflow < config.cto_min_net_inflow_lamports as i128 {
+            return Some(format!(
+                "CTO_WAIT_RECOVERY: net inflow {:.2} SOL < {:.2} SOL",
+                net_inflow as f64 / 1_000_000_000.0,
+                config.cto_min_net_inflow_lamports as f64 / 1_000_000_000.0
+            ));
+        }
+
+        // Optional positive signal (non-gating): read config so it isn't dead, and enrich reason in logs.
+        if config.dev_rebuy_positive && self.dev_rebought {
+            debug!(mint = %self.mint, "CTO recovery has dev rebuy positive signal");
+        }
+
+        self.cto_recovery_confirmed = true;
+        None
+    }
+
     /// Record a trade event
     fn record_trade(
         &mut self,
@@ -786,12 +895,26 @@ impl TokenTracker {
                     let age = self.first_seen.elapsed();
                     if age.as_secs() < config.dev_early_sell_window_secs {
                         self.dev_sold_early = true;
-                        self.blacklisted = true;
-                        self.blacklist_reason = Some(format!(
-                            "Dev sold early ({}s after creation)",
-                            age.as_secs()
-                        ));
-                        warn!(mint = %self.mint, age_secs = age.as_secs(), "Dev sold early - blacklisting");
+
+                        if config.cto_enabled {
+                            // CTO mode: do not hard-reject pre-entry dev sells.
+                            // Instead, mark CTO candidate and wait for recovery confirmation.
+                            self.cto_started_at.get_or_insert_with(Instant::now);
+                            warn!(
+                                mint = %self.mint,
+                                age_secs = age.as_secs(),
+                                "Dev sold early - CTO candidate"
+                            );
+                        } else {
+                            // No CTO mode: hard reject.
+                            self.blacklisted = true;
+                            self.blacklist_reason = Some("REJECT_DEV_SELL_EARLY".to_string());
+                            warn!(
+                                mint = %self.mint,
+                                age_secs = age.as_secs(),
+                                "Dev sold early - blacklisting"
+                            );
+                        }
                     }
                 }
             }
@@ -1161,11 +1284,19 @@ impl TokenTracker {
             return (false, wait_reason);
         }
 
-        // Filter 4: Dev Behavior
+        // Filter 4: Dev Behavior (pre-entry)
         if metrics.dev_sold_early {
-            FILTER_REJECTED_DEV_BEHAVIOR.fetch_add(1, Ordering::Relaxed);
-            FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return (false, "Dev sold early".to_string());
+            if config.cto_enabled {
+                if let Some(wait) = self.cto_wait_reason(config, Instant::now()) {
+                    return (false, wait);
+                }
+            } else {
+                FILTER_REJECTED_DEV_BEHAVIOR.fetch_add(1, Ordering::Relaxed);
+                FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                self.blacklisted = true;
+                self.blacklist_reason = Some("REJECT_DEV_SELL_EARLY".to_string());
+                return (false, "REJECT_DEV_SELL_EARLY".to_string());
+            }
         }
 
         // All filters passed!
@@ -2990,6 +3121,109 @@ mod tests {
         tracker.recovery_started_at = Some(now - Duration::from_secs(11));
         let (should_trade, _reason) = tracker.should_generate_intent(&cfg, None);
         assert!(should_trade);
+    }
+
+    #[test]
+    fn cto_disabled_rejects_dev_sell_early() {
+        let mut cfg = MomentumConfig::default();
+
+        // Disable other gates to isolate CTO behavior.
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 0;
+        cfg.min_trades_per_sec = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+
+        cfg.cto_enabled = false;
+        cfg.dev_early_sell_window_secs = 999;
+
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
+        tracker.dev_wallet = Some("dev".to_string());
+
+        // Dev sells early.
+        tracker.record_trade("dev", false, 1_000, 1, "sig", &cfg);
+        assert!(tracker.dev_sold_early);
+
+        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
+        assert!(!should_trade);
+        assert_eq!(reason, "REJECT_DEV_SELL_EARLY");
+        assert!(tracker.blacklisted);
+    }
+
+    #[test]
+    fn cto_enabled_waits_then_allows_after_recovery_confirm() {
+        let mut cfg = MomentumConfig::default();
+
+        // Disable other gates to isolate CTO behavior.
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 0;
+        cfg.min_trades_per_sec = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+
+        cfg.cto_enabled = true;
+        cfg.cto_entry_delay_secs = 10;
+        cfg.cto_confirm_window_secs = 30;
+        cfg.cto_min_unique_buyers = 2;
+        cfg.cto_min_buy_dominance = 0.60;
+        cfg.cto_min_net_inflow_lamports = 100;
+        cfg.dev_early_sell_window_secs = 999;
+
+        // Disable dump-recovery gate to isolate CTO behavior.
+        cfg.dump_recovery_window_secs = 0;
+
+        let now = Instant::now();
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
+        tracker.dev_wallet = Some("dev".to_string());
+
+        // Dev sells early -> CTO candidate.
+        tracker.record_trade("dev", false, 200, 1, "sd", &cfg);
+        assert!(tracker.dev_sold_early);
+
+        // Before delay: WAIT.
+        tracker.cto_started_at = Some(now);
+        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
+        assert!(!should_trade);
+        assert!(reason.contains("CTO_WAIT_RECOVERY"));
+
+        // After delay, but without confirmation trades: still WAIT.
+        tracker.cto_started_at = Some(now - Duration::from_secs(11));
+        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
+        assert!(!should_trade);
+        assert!(reason.contains("CTO_WAIT_RECOVERY"));
+
+        // Add recovery trades in confirm window: include the initial dev sell as well.
+        // With 6 sells total (dev + 5), we need >=9 buys to hit >=60% buy dominance.
+        for i in 0..5 {
+            tracker.record_trade("w", false, 50, 1, &format!("s{i}"), &cfg);
+        }
+        for i in 0..9 {
+            let buyer = format!("b{i}");
+            tracker.record_trade(&buyer, true, 120, 1, &format!("b{i}"), &cfg);
+        }
+
+        // Force all trades into confirm window.
+        for (i, t) in tracker.trades.iter_mut().enumerate() {
+            t.timestamp = now - Duration::from_secs(1 + (i as u64 % 10));
+        }
+
+        let (should_trade, _reason) = tracker.should_generate_intent(&cfg, None);
+        assert!(should_trade);
+        assert!(tracker.cto_recovery_confirmed);
     }
 }
 
