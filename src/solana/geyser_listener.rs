@@ -4,6 +4,7 @@
 use anyhow::{anyhow, Result};
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 
 #[cfg(not(windows))]
 use futures::StreamExt;
@@ -48,6 +49,11 @@ pub struct GeyserTransactionUpdate {
 pub struct GeyserListener {
     endpoint: String,
     program_ids: Vec<Pubkey>,
+    /// Optional dynamic list of additional accounts (e.g. SPL mint pubkeys) to subscribe to.
+    ///
+    /// This is implemented via explicit `account` filters (not owner-wide token program
+    /// subscriptions), so it scales with tracked tokens rather than chain-wide token activity.
+    tracked_accounts_rx: Option<watch::Receiver<Vec<Pubkey>>>,
     #[cfg_attr(windows, allow(dead_code))]
     account_tx: broadcast::Sender<GeyserAccountUpdate>,
     #[cfg_attr(windows, allow(dead_code))]
@@ -75,6 +81,7 @@ impl GeyserListener {
             Self {
                 endpoint,
                 program_ids,
+                tracked_accounts_rx: None,
                 account_tx,
                 transaction_tx,
             },
@@ -83,11 +90,29 @@ impl GeyserListener {
         )
     }
 
+    /// Create a new Geyser listener with an additional dynamic tracked-account subscription.
+    ///
+    /// When the provided watch channel updates, the listener will resubscribe to include the
+    /// new account list.
+    pub fn new_with_tracked_accounts(
+        endpoint: String,
+        program_ids: Vec<Pubkey>,
+        tracked_accounts_rx: watch::Receiver<Vec<Pubkey>>,
+    ) -> (
+        Self,
+        broadcast::Receiver<GeyserAccountUpdate>,
+        broadcast::Receiver<GeyserTransactionUpdate>,
+    ) {
+        let (mut listener, account_rx, transaction_rx) = Self::new(endpoint, program_ids);
+        listener.tracked_accounts_rx = Some(tracked_accounts_rx);
+        (listener, account_rx, transaction_rx)
+    }
+
     /// Start listening to Geyser stream
     pub async fn start(self) -> Result<()> {
         #[cfg(windows)]
         {
-            let _ = (self.endpoint, self.program_ids);
+            let _ = (self.endpoint, self.program_ids, self.tracked_accounts_rx);
             return Err(anyhow!(
                 "Geyser gRPC is not supported on Windows in this repo build. \
                  Build on Linux/macOS for Geyser support."
@@ -117,79 +142,124 @@ impl GeyserListener {
 
         info!("geyser_listener: connected successfully");
 
-        // Build subscription request
-        let mut accounts_filter = HashMap::new();
-        let mut transactions_filter = HashMap::new();
+        const TRACKED_ACCOUNTS_CHUNK: usize = 1000;
 
-        for (idx, program_id) in self.program_ids.iter().enumerate() {
-            // Account updates for pool state changes
-            accounts_filter.insert(
-                format!("dex_accounts_{}", idx),
-                SubscribeRequestFilterAccounts {
-                    account: vec![],
-                    owner: vec![program_id.to_string()],
-                    filters: vec![],
-                    nonempty_txn_signature: None,
-                },
-            );
-
-            // Transactions for pool creation (token mint in instruction accounts)
-            transactions_filter.insert(
-                format!("dex_transactions_{}", idx),
-                SubscribeRequestFilterTransactions {
-                    vote: Some(false),
-                    failed: Some(false),
-                    signature: None,
-                    account_include: vec![program_id.to_string()],
-                    account_exclude: vec![],
-                    account_required: vec![],
-                },
-            );
-        }
-
-        let request = SubscribeRequest {
-            accounts: accounts_filter,
-            slots: HashMap::new(),
-            transactions: transactions_filter,
-            transactions_status: HashMap::new(),
-            blocks: HashMap::new(),
-            blocks_meta: HashMap::new(),
-            entry: HashMap::new(),
-            commitment: Some(CommitmentLevel::Confirmed as i32),
-            accounts_data_slice: vec![],
-            ping: None,
-            from_slot: None,
-        };
-
-        // Subscribe and process stream
-        let mut stream = client
-            .subscribe_once(request)
-            .await
-            .map_err(|e| anyhow!("Failed to subscribe: {}", e))?;
-
-        info!(
-            programs = ?self.program_ids,
-            "geyser_listener: subscribed to accounts and transactions"
-        );
+        let mut tracked_accounts_rx = self.tracked_accounts_rx;
+        let mut tracked_accounts_current: Vec<Pubkey> = tracked_accounts_rx
+            .as_ref()
+            .map(|rx| rx.borrow().clone())
+            .unwrap_or_default();
 
         let mut account_update_count = 0u64;
         let mut transaction_count = 0u64;
-
-        // Process incoming updates
         let mut last_log = std::time::Instant::now();
-        while let Some(message) = stream.next().await {
-            if last_log.elapsed().as_secs() >= 60 {
-                info!(
-                    accounts = account_update_count,
-                    transactions = transaction_count,
-                    "geyser_listener: heartbeat - still receiving updates"
+
+        loop {
+            // Build subscription request
+            let mut accounts_filter = HashMap::new();
+            let mut transactions_filter = HashMap::new();
+
+            for (idx, program_id) in self.program_ids.iter().enumerate() {
+                // Account updates for pool state changes
+                accounts_filter.insert(
+                    format!("dex_accounts_{}", idx),
+                    SubscribeRequestFilterAccounts {
+                        account: vec![],
+                        owner: vec![program_id.to_string()],
+                        filters: vec![],
+                        nonempty_txn_signature: None,
+                    },
                 );
-                last_log = std::time::Instant::now();
+
+                // Transactions for swaps / pool creation
+                transactions_filter.insert(
+                    format!("dex_transactions_{}", idx),
+                    SubscribeRequestFilterTransactions {
+                        vote: Some(false),
+                        failed: Some(false),
+                        signature: None,
+                        account_include: vec![program_id.to_string()],
+                        account_exclude: vec![],
+                        account_required: vec![],
+                    },
+                );
             }
-            match message {
-                Ok(msg) => {
-                    if let Some(update) = msg.update_oneof {
-                        match update {
+
+            // Additional explicit account subscriptions, chunked.
+            if !tracked_accounts_current.is_empty() {
+                for (chunk_idx, chunk) in tracked_accounts_current
+                    .chunks(TRACKED_ACCOUNTS_CHUNK)
+                    .enumerate()
+                {
+                    accounts_filter.insert(
+                        format!("tracked_accounts_{}", chunk_idx),
+                        SubscribeRequestFilterAccounts {
+                            account: chunk.iter().map(|p| p.to_string()).collect(),
+                            owner: vec![],
+                            filters: vec![],
+                            nonempty_txn_signature: None,
+                        },
+                    );
+                }
+            }
+
+            let request = SubscribeRequest {
+                accounts: accounts_filter,
+                slots: HashMap::new(),
+                transactions: transactions_filter,
+                transactions_status: HashMap::new(),
+                blocks: HashMap::new(),
+                blocks_meta: HashMap::new(),
+                entry: HashMap::new(),
+                commitment: Some(CommitmentLevel::Confirmed as i32),
+                accounts_data_slice: vec![],
+                ping: None,
+                from_slot: None,
+            };
+
+            // Subscribe and process stream
+            let mut stream = client
+                .subscribe_once(request)
+                .await
+                .map_err(|e| anyhow!("Failed to subscribe: {}", e))?;
+
+            info!(
+                programs = ?self.program_ids,
+                tracked_accounts = tracked_accounts_current.len(),
+                "geyser_listener: subscribed"
+            );
+
+            loop {
+                if last_log.elapsed().as_secs() >= 60 {
+                    info!(
+                        accounts = account_update_count,
+                        transactions = transaction_count,
+                        tracked_accounts = tracked_accounts_current.len(),
+                        "geyser_listener: heartbeat - still receiving updates"
+                    );
+                    last_log = std::time::Instant::now();
+                }
+
+                let tracked_changed_fut = async {
+                    if let Some(rx) = &mut tracked_accounts_rx {
+                        let _ = rx.changed().await;
+                        Some(rx.borrow().clone())
+                    } else {
+                        std::future::pending::<Option<Vec<Pubkey>>>().await
+                    }
+                };
+
+                tokio::select! {
+                    maybe_message = stream.next() => {
+                        let Some(message) = maybe_message else {
+                            warn!("geyser_listener: stream ended; resubscribing");
+                            break;
+                        };
+
+                        match message {
+                            Ok(msg) => {
+                                if let Some(update) = msg.update_oneof {
+                                    match update {
                             UpdateOneof::Account(account_update) => {
                                 account_update_count += 1;
 
@@ -408,17 +478,26 @@ impl GeyserListener {
                             _ => {
                                 // Slots, etc. - ignore
                             }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(error = %e, "geyser_listener: stream error");
+                                return Err(anyhow!("Geyser stream error: {}", e));
+                            }
+                        }
+                    }
+                    maybe_new = tracked_changed_fut => {
+                        if let Some(new_list) = maybe_new {
+                            if new_list != tracked_accounts_current {
+                                tracked_accounts_current = new_list;
+                                info!(tracked_accounts = tracked_accounts_current.len(), "geyser_listener: tracked accounts changed; resubscribing");
+                                break;
+                            }
                         }
                     }
                 }
-                Err(e) => {
-                    error!(error = %e, "geyser_listener: stream error");
-                    return Err(anyhow!("Geyser stream error: {}", e));
-                }
             }
         }
-
-        warn!("geyser_listener: stream ended");
-        Ok(())
     }
 }

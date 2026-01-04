@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -36,6 +37,9 @@ use ironcrab::solana::dex_parser::{
     parse_account_update, parse_transaction_update, DexType, ParsedDexEvent,
 };
 use ironcrab::solana::wallet_tracker::WalletTracker;
+use spl_token_2022::extension::StateWithExtensions;
+use spl_token::solana_program::program_option::COption;
+use spl_token::solana_program::program_pack::Pack;
 
 /// NATS topic for config reload (P1: Runtime Configuration via UI)
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
@@ -122,6 +126,10 @@ struct MarketDataContext {
     event_counter: std::sync::atomic::AtomicU64,
     /// P1: Wallet tracker for smart money / early buyer detection
     wallet_tracker: WalletTracker,
+
+    /// Tracked token mints for mint-authority/freeze-authority metadata.
+    tracked_mints: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+    tracked_mints_tx: watch::Sender<Vec<Pubkey>>,
 }
 
 impl MarketDataContext {
@@ -200,6 +208,38 @@ impl MarketDataContext {
             rejected_keys: rejected,
             new_snapshot_id: None,
         }
+    }
+}
+
+fn try_parse_mint_account(
+    owner: &Pubkey,
+    data: &[u8],
+) -> Option<(u8, u64, Option<String>, Option<String>)> {
+    if owner.to_bytes() == spl_token::ID.to_bytes() {
+        let mint = spl_token::state::Mint::unpack(data).ok()?;
+        let mint_authority = match mint.mint_authority {
+            COption::Some(p) => Some(p.to_string()),
+            COption::None => None,
+        };
+        let freeze_authority = match mint.freeze_authority {
+            COption::Some(p) => Some(p.to_string()),
+            COption::None => None,
+        };
+        Some((mint.decimals, mint.supply, mint_authority, freeze_authority))
+    } else if owner.to_bytes() == spl_token_2022::ID.to_bytes() {
+        let mint = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(data).ok()?;
+        let base = mint.base;
+        let mint_authority = match base.mint_authority {
+            COption::Some(p) => Some(p.to_string()),
+            COption::None => None,
+        };
+        let freeze_authority = match base.freeze_authority {
+            COption::Some(p) => Some(p.to_string()),
+            COption::None => None,
+        };
+        Some((base.decimals, base.supply, mint_authority, freeze_authority))
+    } else {
+        None
     }
 }
 
@@ -284,6 +324,8 @@ async fn main() -> Result<()> {
         "WalletTracker initialized"
     );
 
+    let (tracked_mints_tx, tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
+
     let ctx = Arc::new(MarketDataContext {
         run_id: run_id.clone(),
         config: parking_lot::RwLock::new(MarketDataConfig::default()),
@@ -291,6 +333,8 @@ async fn main() -> Result<()> {
         jsonl_writer,
         event_counter: std::sync::atomic::AtomicU64::new(0),
         wallet_tracker,
+        tracked_mints: parking_lot::RwLock::new(std::collections::HashSet::new()),
+        tracked_mints_tx,
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -327,7 +371,14 @@ async fn main() -> Result<()> {
         run_simulation_loop(ctx.clone(), &run_id, config_subscription).await?;
     } else {
         info!(geyser_url = %args.geyser_url, "Starting Geyser integration");
-        run_geyser_loop(ctx.clone(), &run_id, &args.geyser_url, config_subscription).await?;
+        run_geyser_loop(
+            ctx.clone(),
+            &run_id,
+            &args.geyser_url,
+            config_subscription,
+            tracked_mints_rx,
+        )
+        .await?;
     }
 
     // Flush JSONL on shutdown
@@ -343,6 +394,7 @@ async fn run_geyser_loop(
     run_id: &str,
     geyser_url: &str,
     mut config_subscription: Option<ironcrab::nats::NatsSubscription>,
+    tracked_mints_rx: watch::Receiver<Vec<Pubkey>>,
 ) -> Result<()> {
     // DEX program IDs to monitor
     let program_ids = vec![
@@ -352,8 +404,11 @@ async fn run_geyser_loop(
         Pubkey::from_str(PUMPFUN_AMM_PROGRAM).expect("valid pumpfun amm pubkey"),
     ];
 
-    let (listener, mut account_rx, mut transaction_rx) =
-        GeyserListener::new(geyser_url.to_string(), program_ids);
+    let (listener, mut account_rx, mut transaction_rx) = GeyserListener::new_with_tracked_accounts(
+        geyser_url.to_string(),
+        program_ids,
+        tracked_mints_rx,
+    );
 
     // Spawn Geyser listener task
     let listener_handle = tokio::spawn(async move {
@@ -386,6 +441,47 @@ async fn run_geyser_loop(
             Ok(account_update) = account_rx.recv() => {
                 account_count += 1;
                 ironcrab::metrics::record_activity();
+
+                // Tracked mint updates (Token mint authority/freeze info)
+                if (account_update.owner.to_bytes() == spl_token::ID.to_bytes()
+                    || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes())
+                    && ctx.tracked_mints.read().contains(&account_update.pubkey)
+                {
+                    if let Some((decimals, supply, mint_authority, freeze_authority)) =
+                        try_parse_mint_account(&account_update.owner, &account_update.data)
+                    {
+                        let mint_event = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            ctx.next_event_id(),
+                            "geyser",
+                            Some(account_update.slot),
+                            MarketEventKind::TokenMintInfo {
+                                mint: account_update.pubkey.to_string(),
+                                token_program: account_update.owner.to_string(),
+                                decimals,
+                                supply,
+                                mint_authority,
+                                freeze_authority,
+                            },
+                        );
+
+                        if let Err(e) = ctx.jsonl_writer.write(&mint_event) {
+                            error!(error = %e, "Failed to write TokenMintInfo event to JSONL");
+                        }
+
+                        if let Some(ref nats) = ctx.nats {
+                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &mint_event).await {
+                                warn!(error = %e, "Failed to publish TokenMintInfo event to NATS");
+                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
 
                 // Try to parse as DEX pool event
                 let event_kind = if let Some(parsed) = parse_account_update(&account_update) {
@@ -437,6 +533,23 @@ async fn run_geyser_loop(
 
                 // Try to parse as DEX event (PoolCreated, Trade)
                 let parsed_event = parse_transaction_update(&tx_update);
+
+                // Track mint pubkeys for mint-authority/freeze metadata.
+                if let Some(parsed) = parsed_event.as_ref() {
+                    let mint_opt: Option<Pubkey> = match parsed {
+                        ParsedDexEvent::PoolCreated { base_mint, .. } => Some(*base_mint),
+                        ParsedDexEvent::Trade { mint, .. } => Some(*mint),
+                        ParsedDexEvent::LiquidityRemoved { mint, .. } => Some(*mint),
+                    };
+                    if let Some(mint) = mint_opt {
+                        let mut tracked = ctx.tracked_mints.write();
+                        if tracked.insert(mint) {
+                            // push updated list to geyser listener (resubscribe)
+                            let updated: Vec<Pubkey> = tracked.iter().copied().collect();
+                            let _ = ctx.tracked_mints_tx.send(updated);
+                        }
+                    }
+                }
 
                 // Pump.fun: propagate creator/dev wallet so strategy can build deterministic intents.
                 // The PoolCreated MarketEventKind intentionally does not carry creator today, so emit

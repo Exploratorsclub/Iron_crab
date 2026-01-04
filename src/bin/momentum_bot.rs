@@ -137,6 +137,12 @@ struct MomentumConfig {
     /// Dev rebuy is positive signal. Default: true
     dev_rebuy_positive: bool,
 
+    // === Token Safety: Mint/Freeze Authority ===
+    /// Require mint authority to be renounced (mint_authority == None) before entering.
+    require_mint_authority_renounced: bool,
+    /// Require freeze authority to be none before entering.
+    require_freeze_authority_none: bool,
+
     // === Exit Strategy ===
     /// Hard stop-loss percentage from entry (e.g., 15 = -15%). Default: 15%
     hard_stop_loss_pct: f64,
@@ -186,6 +192,10 @@ impl Default for MomentumConfig {
             dev_early_sell_window_secs: 60, // Dev sells in first 60s = bad
             dev_rebuy_positive: true,       // Dev rebuy = positive signal
 
+            // Token Safety
+            require_mint_authority_renounced: false,
+            require_freeze_authority_none: false,
+
             // Exit Strategy
             hard_stop_loss_pct: 15.0,      // -15% hard stop
             trailing_stop_pct: 20.0,       // -20% from ATH
@@ -221,6 +231,8 @@ impl MomentumConfig {
             max_single_dump_lamports: cfg.max_single_dump_lamports,
             dev_early_sell_window_secs: cfg.dev_early_sell_window_secs,
             dev_rebuy_positive: cfg.dev_rebuy_positive,
+            require_mint_authority_renounced: cfg.require_mint_authority_renounced,
+            require_freeze_authority_none: cfg.require_freeze_authority_none,
             hard_stop_loss_pct: cfg.hard_stop_loss_pct,
             trailing_stop_pct: cfg.trailing_stop_pct,
             trailing_activation_pct: cfg.trailing_activation_pct,
@@ -649,7 +661,11 @@ impl TokenTracker {
     }
 
     /// Check all 4 filters and return if we should trade
-    fn should_generate_intent(&self, config: &MomentumConfig) -> (bool, String) {
+    fn should_generate_intent(
+        &self,
+        config: &MomentumConfig,
+        mint_info: Option<&MintInfo>,
+    ) -> (bool, String) {
         // Already generated or blacklisted
         if self.intent_generated {
             return (false, "Already generated intent".to_string());
@@ -661,6 +677,21 @@ impl TokenTracker {
                     .clone()
                     .unwrap_or("Blacklisted".to_string()),
             );
+        }
+
+        // Token safety gates: if enabled, we must have mint info and authorities must be safe.
+        if config.require_mint_authority_renounced || config.require_freeze_authority_none {
+            let Some(info) = mint_info else {
+                return (false, "Awaiting mint safety info".to_string());
+            };
+
+            if config.require_mint_authority_renounced && info.mint_authority.is_some() {
+                return (false, "Mint authority not renounced".to_string());
+            }
+
+            if config.require_freeze_authority_none && info.freeze_authority.is_some() {
+                return (false, "Freeze authority still set".to_string());
+            }
         }
 
         let metrics = self.calculate_metrics(config);
@@ -776,6 +807,17 @@ struct TokenMetrics {
     initial_liquidity_sol: f64,
 }
 
+/// Cached mint metadata for risk gating.
+#[derive(Debug, Clone)]
+struct MintInfo {
+    token_program: String,
+    decimals: u8,
+    supply: u64,
+    mint_authority: Option<String>,
+    freeze_authority: Option<String>,
+    last_updated: Instant,
+}
+
 /// Cached info about a pending intent (awaiting execution result)
 #[derive(Debug, Clone)]
 struct PendingIntent {
@@ -802,6 +844,8 @@ struct MomentumContext {
     /// Pump.fun dev wallet info can arrive before PoolCreated.
     /// Store it by mint and apply once the TokenTracker exists.
     pending_dev_info: parking_lot::RwLock<HashMap<String, (String, f64)>>,
+    /// Mint metadata (authority/supply/decimals) can arrive independently of pool creation.
+    mint_infos: parking_lot::RwLock<HashMap<String, MintInfo>>,
     /// Token trackers for strategy filters (mint -> tracker)
     token_trackers: parking_lot::RwLock<HashMap<String, TokenTracker>>,
     /// Position trackers for exit strategy (mint -> position)
@@ -845,6 +889,23 @@ impl MomentumContext {
     fn record_pool_seen(&self, pool_address: &str, slot: u64) {
         let mut pools = self.pool_first_seen.write();
         pools.entry(pool_address.to_string()).or_insert(slot);
+    }
+
+    fn record_mint_info(&self, mint: &str, info: MintInfo) {
+        // Intentionally log/read all fields: they are part of the cached snapshot and used
+        // for future strategy extensions (and avoids dead_code warnings under clippy -D warnings).
+        let _ = info.last_updated;
+        debug!(
+            mint = %mint,
+            token_program = %info.token_program,
+            decimals = info.decimals,
+            supply = info.supply,
+            mint_authority_set = info.mint_authority.is_some(),
+            freeze_authority_set = info.freeze_authority.is_some(),
+            "Mint info cached"
+        );
+        let mut infos = self.mint_infos.write();
+        infos.insert(mint.to_string(), info);
     }
 
     /// Get or create a token tracker
@@ -947,6 +1008,7 @@ impl MomentumContext {
     fn check_for_signals(&self) -> Vec<(String, String, String, String)> {
         // Returns: Vec<(mint, pool, dex, reason)>
         let config = self.config.read().clone();
+        let mint_infos = self.mint_infos.read();
         let mut trackers = self.token_trackers.write();
         let mut signals = Vec::new();
 
@@ -955,7 +1017,8 @@ impl MomentumContext {
                 continue;
             }
 
-            let (should_trade, reason) = tracker.should_generate_intent(&config);
+            let mint_info = mint_infos.get(mint);
+            let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
             if should_trade {
                 tracker.intent_generated = true;
                 signals.push((
@@ -1318,6 +1381,24 @@ impl MomentumContext {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
+                "require_mint_authority_renounced" => {
+                    if let Some(v) = value.as_bool() {
+                        config.require_mint_authority_renounced = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "require_freeze_authority_none" => {
+                    if let Some(v) = value.as_bool() {
+                        config.require_freeze_authority_none = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
                 _ => {
                     rejected.push((key.clone(), format!("Unknown config key: {}", key)));
                 }
@@ -1471,6 +1552,7 @@ async fn main() -> Result<()> {
         intent_counter: std::sync::atomic::AtomicU64::new(0),
         pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+        mint_infos: parking_lot::RwLock::new(HashMap::new()),
         token_trackers: parking_lot::RwLock::new(HashMap::new()),
         positions: parking_lot::RwLock::new(HashMap::new()),
         pending_intents: parking_lot::RwLock::new(HashMap::new()),
@@ -2194,6 +2276,27 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     "✅ Dev wallet identified - supply within limits"
                 );
             }
+        }
+
+        MarketEventKind::TokenMintInfo {
+            mint,
+            token_program,
+            decimals,
+            supply,
+            mint_authority,
+            freeze_authority,
+        } => {
+            ctx.record_mint_info(
+                mint,
+                MintInfo {
+                    token_program: token_program.clone(),
+                    decimals: *decimals,
+                    supply: *supply,
+                    mint_authority: mint_authority.clone(),
+                    freeze_authority: freeze_authority.clone(),
+                    last_updated: Instant::now(),
+                },
+            );
         }
 
         MarketEventKind::SlotUpdate { current_slot } => {

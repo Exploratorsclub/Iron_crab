@@ -195,6 +195,21 @@ pub enum MarketEventKind {
         dev_wallet: String,
         supply_percentage: f64,
     },
+    /// Token mint account metadata (authority/decimals/supply) for risk filtering.
+    ///
+    /// Produced by market-data from Geyser account updates for tracked mints.
+    /// This is intentionally a *state snapshot* (not TX-history dependent).
+    TokenMintInfo {
+        mint: String,
+        /// SPL Token program owner of the mint account (Tokenkeg... or TokenzQd...)
+        token_program: String,
+        decimals: u8,
+        supply: u64,
+        /// Present if mint authority is still set (NOT renounced)
+        mint_authority: Option<String>,
+        /// Present if freeze authority is still set
+        freeze_authority: Option<String>,
+    },
     /// Slot progression (heartbeat)
     SlotUpdate { current_slot: u64 },
     /// Raw account update from Geyser

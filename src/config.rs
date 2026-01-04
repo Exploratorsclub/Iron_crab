@@ -208,6 +208,16 @@ pub struct MomentumCfg {
     #[serde(default = "default_dev_rebuy_positive")]
     pub dev_rebuy_positive: bool,
 
+    // === Token Safety: Mint/Freeze Authority (via TokenMintInfo MarketEvents) ===
+    /// Require mint authority to be renounced (mint_authority == None) before entering.
+    /// Default: false (configurable; some legit early tokens keep it briefly).
+    #[serde(default = "default_require_mint_authority_renounced")]
+    pub require_mint_authority_renounced: bool,
+    /// Require freeze authority to be none before entering.
+    /// Default: false.
+    #[serde(default = "default_require_freeze_authority_none")]
+    pub require_freeze_authority_none: bool,
+
     // === Exit Strategy ===
     /// Hard stop-loss percentage from entry (e.g., 15 = -15%). Default: 15%
     #[serde(default = "default_hard_stop_loss")]
@@ -287,6 +297,12 @@ fn default_dev_early_sell_window() -> u64 {
 fn default_dev_rebuy_positive() -> bool {
     true
 }
+fn default_require_mint_authority_renounced() -> bool {
+    false
+}
+fn default_require_freeze_authority_none() -> bool {
+    false
+}
 fn default_hard_stop_loss() -> f64 {
     15.0
 }
@@ -332,6 +348,8 @@ impl Default for MomentumCfg {
             max_single_dump_lamports: default_max_single_dump(),
             dev_early_sell_window_secs: default_dev_early_sell_window(),
             dev_rebuy_positive: default_dev_rebuy_positive(),
+            require_mint_authority_renounced: default_require_mint_authority_renounced(),
+            require_freeze_authority_none: default_require_freeze_authority_none(),
             hard_stop_loss_pct: default_hard_stop_loss(),
             trailing_stop_pct: default_trailing_stop(),
             trailing_activation_pct: default_trailing_activation(),

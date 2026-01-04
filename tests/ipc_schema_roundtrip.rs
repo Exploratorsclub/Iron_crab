@@ -102,6 +102,66 @@ fn test_market_event_required_fields() {
     assert_eq!(parsed.slot, Some(12345));
 }
 
+#[test]
+fn test_market_event_token_mint_info_roundtrip() {
+    let event = MarketEvent::new(
+        "market-data",
+        "v0.1.0",
+        "run-abc",
+        "evt-mint-001".to_string(),
+        "geyser",
+        Some(555),
+        MarketEventKind::TokenMintInfo {
+            mint: "So11111111111111111111111111111111111111112".to_string(),
+            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            decimals: 9,
+            supply: 1_000_000_000,
+            mint_authority: None,
+            freeze_authority: Some("FreezeAuth1111111111111111111111111111111".to_string()),
+        },
+    );
+
+    let json = serde_json::to_string(&event).unwrap();
+    assert!(json.contains("\"kind\""));
+    assert!(json.contains("TokenMintInfo"));
+    assert!(json.contains("\"mint\""));
+    assert!(json.contains("\"token_program\""));
+    assert!(json.contains("\"decimals\""));
+    assert!(json.contains("\"supply\""));
+    assert!(json.contains("\"mint_authority\""));
+    assert!(json.contains("\"freeze_authority\""));
+
+    let parsed: MarketEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.event_id, "evt-mint-001");
+    assert_eq!(parsed.source, "geyser");
+    assert_eq!(parsed.slot, Some(555));
+
+    match parsed.kind {
+        MarketEventKind::TokenMintInfo {
+            mint,
+            token_program,
+            decimals,
+            supply,
+            mint_authority,
+            freeze_authority,
+        } => {
+            assert_eq!(mint, "So11111111111111111111111111111111111111112");
+            assert_eq!(
+                token_program,
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            );
+            assert_eq!(decimals, 9);
+            assert_eq!(supply, 1_000_000_000);
+            assert_eq!(mint_authority, None);
+            assert_eq!(
+                freeze_authority,
+                Some("FreezeAuth1111111111111111111111111111111".to_string())
+            );
+        }
+        other => panic!("expected TokenMintInfo, got: {other:?}"),
+    }
+}
+
 /// Test TradeIntent has all required fields per DoD §B and STORAGE_CONVENTIONS.md §4.2
 #[test]
 fn test_trade_intent_required_fields() {
