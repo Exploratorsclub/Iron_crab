@@ -573,6 +573,10 @@ struct TokenTracker {
     lp_removed: bool,
     lp_removal_time: Option<Instant>,
 
+    // Dump-recovery gating (pre-entry)
+    dump_observed_at: Option<Instant>,
+    recovery_started_at: Option<Instant>,
+
     // State
     /// Entry lifecycle: probe then optional scale-in.
     probe_sent_at: Option<Instant>,
@@ -617,6 +621,8 @@ impl TokenTracker {
             dev_rebought: false,
             lp_removed: false,
             lp_removal_time: None,
+            dump_observed_at: None,
+            recovery_started_at: None,
             probe_sent_at: None,
             probe_filled_at: None,
             scale_sent_at: None,
@@ -625,6 +631,110 @@ impl TokenTracker {
             blacklisted: false,
             blacklist_reason: None,
         }
+    }
+
+    fn dump_recovery_window_stats_at(
+        &self,
+        config: &MomentumConfig,
+        now: Instant,
+    ) -> Option<(f64, i128, u32)> {
+        if config.dump_recovery_window_secs == 0 {
+            return None;
+        }
+
+        let window = Duration::from_secs(config.dump_recovery_window_secs);
+        let mut buy_count: u32 = 0;
+        let mut sell_count: u32 = 0;
+        let mut buy_vol: u64 = 0;
+        let mut sell_vol: u64 = 0;
+
+        for t in self
+            .trades
+            .iter()
+            .filter(|t| now.duration_since(t.timestamp) < window)
+        {
+            if t.is_buy {
+                buy_count = buy_count.saturating_add(1);
+                buy_vol = buy_vol.saturating_add(t.sol_amount);
+            } else {
+                sell_count = sell_count.saturating_add(1);
+                sell_vol = sell_vol.saturating_add(t.sol_amount);
+            }
+        }
+
+        let total = buy_count.saturating_add(sell_count);
+        if total == 0 {
+            return None;
+        }
+
+        let buy_dominance = buy_count as f64 / total as f64;
+        let net_inflow = buy_vol as i128 - sell_vol as i128;
+        Some((buy_dominance, net_inflow, total))
+    }
+
+    fn dump_recovery_wait_reason(&mut self, config: &MomentumConfig, now: Instant) -> Option<String> {
+        let (buy_dominance, net_inflow, samples) =
+            self.dump_recovery_window_stats_at(config, now)?;
+
+        // Require a minimum sample size to avoid flapping on tiny windows.
+        let min_samples = config.min_unique_buyers.max(5);
+        if samples < min_samples {
+            return None;
+        }
+
+        let window = Duration::from_secs(config.dump_recovery_window_secs);
+
+        // Expire old dump flags once the window rolls over.
+        if let Some(dump_at) = self.dump_observed_at {
+            if now.duration_since(dump_at) > window {
+                self.dump_observed_at = None;
+                self.recovery_started_at = None;
+            }
+        }
+
+        // Dump detected = net outflow in the recovery window.
+        if net_inflow < 0 {
+            self.dump_observed_at = Some(now);
+            self.recovery_started_at = None;
+            return Some(format!(
+                "WAIT_CONFIRMATION: dump detected (net_inflow={:.2} SOL over {}s)",
+                net_inflow as f64 / 1_000_000_000.0,
+                config.dump_recovery_window_secs
+            ));
+        }
+
+        // If we haven't observed a dump, don't gate on recovery.
+        if self.dump_observed_at.is_none() {
+            return None;
+        }
+
+        let recovery_ok = buy_dominance >= config.dump_recovery_min_buy_dominance
+            && net_inflow >= config.dump_recovery_min_net_inflow_lamports as i128;
+
+        if !recovery_ok {
+            self.recovery_started_at = None;
+            return Some(format!(
+                "WAIT_CONFIRMATION: dump recovery not confirmed yet (dom={:.0}% < {:.0}%, inflow={:.2} SOL < {:.2} SOL)",
+                buy_dominance * 100.0,
+                config.dump_recovery_min_buy_dominance * 100.0,
+                net_inflow as f64 / 1_000_000_000.0,
+                config.dump_recovery_min_net_inflow_lamports as f64 / 1_000_000_000.0
+            ));
+        }
+
+        let start = self.recovery_started_at.get_or_insert(now);
+        if now.duration_since(*start).as_secs() < config.dump_recovery_min_recovery_secs {
+            return Some(format!(
+                "WAIT_CONFIRMATION: dump recovery stabilizing ({}/{}s)",
+                now.duration_since(*start).as_secs(),
+                config.dump_recovery_min_recovery_secs
+            ));
+        }
+
+        // Recovery confirmed.
+        self.dump_observed_at = None;
+        self.recovery_started_at = None;
+        None
     }
 
     /// Record a trade event
@@ -1044,6 +1154,11 @@ impl TokenTracker {
                     config.min_sol_inflow_lamports as f64 / 1_000_000_000.0
                 ),
             );
+        }
+
+        // Filter 3b: Dump-recovery gating (WAIT until recovery confirms after a dump)
+        if let Some(wait_reason) = self.dump_recovery_wait_reason(config, Instant::now()) {
+            return (false, wait_reason);
         }
 
         // Filter 4: Dev Behavior
@@ -2815,6 +2930,66 @@ mod tests {
             let t = trackers.get("mint").unwrap();
             assert!(t.scale_sent_at.is_some());
         }
+    }
+
+    #[test]
+    fn dump_recovery_waits_then_allows_after_stabilization() {
+        let mut cfg = MomentumConfig::default();
+
+        // Disable other gates to isolate dump recovery.
+        cfg.early_min_liquidity_sol = 0.0;
+        cfg.min_unique_buyers = 0;
+        cfg.min_trades_per_sec = 0.0;
+        cfg.min_buy_dominance = 0.0;
+        cfg.min_sol_inflow_lamports = 0;
+        cfg.require_mint_authority_renounced = false;
+        cfg.require_freeze_authority_none = false;
+        cfg.top1_buyer_share_cap = 1.0;
+        cfg.top3_buyer_share_cap = 1.0;
+        cfg.repeat_buyer_min_ratio = 0.0;
+        cfg.min_trade_size_lamports = 0;
+        cfg.small_buy_ratio_cap = 1.0;
+
+        // Dump recovery params
+        cfg.dump_recovery_window_secs = 30;
+        cfg.dump_recovery_min_buy_dominance = 0.60;
+        cfg.dump_recovery_min_net_inflow_lamports = 100;
+        cfg.dump_recovery_min_recovery_secs = 10;
+
+        let now = Instant::now();
+        let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
+
+        // Create a dump: mostly sells in the window.
+        for i in 0..5 {
+            tracker.record_trade("w", false, 200, 1, &format!("sd{i}"), &cfg);
+        }
+        for (i, t) in tracker.trades.iter_mut().enumerate() {
+            t.timestamp = now - Duration::from_secs(5 + i as u64);
+        }
+
+        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
+        assert!(!should_trade);
+        assert!(reason.contains("WAIT_CONFIRMATION"));
+
+        // Add recovery: net inflow positive + buy dominance above threshold.
+        // 8 buys vs 5 sells => dominance ~61.5%.
+        for i in 0..8 {
+            tracker.record_trade("w", true, 300, 1, &format!("rb{i}"), &cfg);
+        }
+        // Make recovery trades within the window.
+        for (i, t) in tracker.trades.iter_mut().enumerate() {
+            t.timestamp = now - Duration::from_secs(1 + (i as u64 % 10));
+        }
+
+        // First evaluation should still WAIT because min_recovery_secs hasn't elapsed.
+        let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
+        assert!(!should_trade);
+        assert!(reason.contains("WAIT_CONFIRMATION"));
+
+        // Force stabilization window to be satisfied.
+        tracker.recovery_started_at = Some(now - Duration::from_secs(11));
+        let (should_trade, _reason) = tracker.should_generate_intent(&cfg, None);
+        assert!(should_trade);
     }
 }
 
