@@ -14,6 +14,16 @@ use std::sync::Arc;
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PUMPFUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+// Observed on-chain in PumpSwap/Pump.fun AMM swaps: Anchor expects `fee_config` to be owned by
+// this program.
+const PUMPFUN_AMM_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
+
+// Best-effort: observed Pump.fun AMM "market" account layout contains
+// - base_mint at byte offset 43
+// - quote_mint at byte offset 75
+// Using `getProgramAccounts` with memcmp filters avoids reliance on tx-history on pruned RPC.
+const PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET: u64 = 43;
+const PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET: u64 = 75;
 
 // Observed on-chain: buy_exact_quote_in fee fields sum to 125 bps (lp 2 + protocol 93 + creator 30).
 // We use that as a conservative default for quoting.
@@ -199,156 +209,212 @@ impl PumpFunAmmDex {
         Ok(Some((Pubkey::from_str(owner)?, executable)))
     }
 
+    async fn discover_pool_market_via_program_accounts(
+        &self,
+        base_mint: Pubkey,
+    ) -> Result<Option<Pubkey>> {
+        let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
+
+        let v = self
+            .rpc_call(
+                "getProgramAccounts",
+                json!([
+                    program_id.to_string(),
+                    {
+                        "encoding": "base64",
+                        "commitment": "confirmed",
+                        "dataSlice": {"offset": 0, "length": 0},
+                        "filters": [
+                            {"memcmp": {"offset": PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET, "bytes": base_mint.to_string()}},
+                            {"memcmp": {"offset": PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET, "bytes": WSOL_MINT}},
+                        ]
+                    }
+                ]),
+            )
+            .await?;
+
+        let arr = match v.get("result").and_then(|r| r.as_array()) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // Prefer exactly one match; if multiple appear, treat as ambiguous.
+        if arr.len() != 1 {
+            return Ok(None);
+        }
+        let pk = match arr[0].get("pubkey").and_then(|v| v.as_str()) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        Ok(Some(Pubkey::from_str(pk)?))
+    }
+
     async fn discover_pool_static(&self, base_mint: Pubkey) -> Result<Option<PumpAmmPoolStatic>> {
         if let Some(v) = self.pools_by_base.get(&base_mint) {
             return Ok(Some(v.clone()));
         }
 
-        // TX-based discovery: scan transactions touching the mint.
-        // We scan deeper than the default 50 because the newest signatures can be dominated
-        // by failed liquidation attempts (which we intentionally skip).
-        let sigs_v = self
-            .rpc_call(
-                "getSignaturesForAddress",
-                json!([base_mint.to_string(), {"limit": 500}]),
-            )
-            .await?;
-        let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
+        // TX-based discovery: prefer scanning the pool market (stable) over the mint address.
+        // On pruned RPC, mint-address history can be missing; program-accounts lookup + market
+        // history tends to be reliable for newly created PumpSwap markets.
+        let mut scan_addresses = vec![base_mint.to_string()];
+        if let Some(market) = self
+            .discover_pool_market_via_program_accounts(base_mint)
+            .await?
+        {
+            scan_addresses.push(market.to_string());
+        }
 
-        for s in sigs.iter() {
-            // Avoid poisoning discovery with failed transactions (e.g., our own earlier
-            // liquidation attempts that used wrong accounts and therefore failed).
-            if let Some(err) = s.get("err") {
-                if !err.is_null() {
-                    continue;
-                }
-            }
-            let sig = match s.get("signature").and_then(|v| v.as_str()) {
+        for addr in scan_addresses {
+            // We scan deeper than the default 50 because the newest signatures can be dominated
+            // by failed liquidation attempts (which we intentionally skip).
+            let sigs_v = self
+                .rpc_call("getSignaturesForAddress", json!([addr, {"limit": 500}]))
+                .await?;
+            let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
                 Some(v) => v,
                 None => continue,
             };
 
-            let tx_v = match self
-                .rpc_call(
-                    "getTransaction",
-                    json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}]),
-                )
-                .await
-            {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let msg = match tx_v
-                .get("result")
-                .and_then(|r| r.get("transaction"))
-                .and_then(|t| t.get("message"))
-            {
-                Some(v) => v,
-                None => continue,
-            };
-
-            let meta = tx_v
-                .get("result")
-                .and_then(|r| r.get("meta"))
-                .unwrap_or(&Value::Null);
-
-            let mut account_keys = match Self::parse_account_keys(msg) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            Self::extend_with_loaded_addresses(&mut account_keys, meta);
-
-            for ix in Self::collect_all_instructions(msg, meta) {
-                let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
-                    Some(v) => v as usize,
-                    None => continue,
-                };
-                let program_id = match account_keys.get(program_id_index) {
-                    Some(v) => v,
-                    None => continue,
-                };
-                if program_id != PUMPFUN_AMM_PROGRAM_ID {
-                    continue;
+            for s in sigs.iter() {
+                // Avoid poisoning discovery with failed transactions (e.g., our own earlier
+                // liquidation attempts that used wrong accounts and therefore failed).
+                if let Some(err) = s.get("err") {
+                    if !err.is_null() {
+                        continue;
+                    }
                 }
-
-                let accounts: Vec<usize> = match ix.get("accounts").and_then(|v| v.as_array()) {
-                    Some(a) => a
-                        .iter()
-                        .filter_map(|v| v.as_u64().map(|x| x as usize))
-                        .collect(),
-                    None => continue,
-                };
-                if accounts.len() != 23 {
-                    continue;
-                }
-
-                let base_mint_ix = match account_keys.get(accounts[3]) {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let quote_mint_ix = match account_keys.get(accounts[4]) {
-                    Some(v) => v,
-                    None => continue,
-                };
-                if base_mint_ix != base_mint.to_string().as_str() {
-                    continue;
-                }
-                if quote_mint_ix != WSOL_MINT {
-                    continue;
-                }
-
-                let pool = PumpAmmPoolStatic {
-                    pool_market: Pubkey::from_str(&account_keys[accounts[0]])?,
-                    global_config: Pubkey::from_str(&account_keys[accounts[2]])?,
-                    base_mint,
-                    quote_mint: Pubkey::from_str(WSOL_MINT)?,
-                    pool_base_vault: Pubkey::from_str(&account_keys[accounts[7]])?,
-                    pool_quote_vault: Pubkey::from_str(&account_keys[accounts[8]])?,
-                    protocol_fee_recipient: Pubkey::from_str(&account_keys[accounts[9]])?,
-                    protocol_fee_recipient_ta: Pubkey::from_str(&account_keys[accounts[10]])?,
-                    event_authority: Pubkey::from_str(&account_keys[accounts[15]])?,
-                    coin_creator_vault_ata: Pubkey::from_str(&account_keys[accounts[17]])?,
-                    coin_creator_vault_authority: Pubkey::from_str(&account_keys[accounts[18]])?,
-                    global_volume_accumulator: Pubkey::from_str(&account_keys[accounts[19]])?,
-                    // These last two accounts have shown variants across tx layouts.
-                    // We resolve them below by checking which one is executable.
-                    fee_config: Pubkey::default(),
-                    fee_program: Pubkey::default(),
-                };
-
-                // Robustly resolve (fee_config, fee_program) from the final two accounts.
-                // `fee_program` must be executable; `fee_config.owner` must equal `fee_program`.
-                let a = Pubkey::from_str(&account_keys[accounts[21]])?;
-                let b = Pubkey::from_str(&account_keys[accounts[22]])?;
-
-                let (a_owner, a_exec) = match self.rpc_get_account_owner_and_executable(a).await? {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let (b_owner, b_exec) = match self.rpc_get_account_owner_and_executable(b).await? {
+                let sig = match s.get("signature").and_then(|v| v.as_str()) {
                     Some(v) => v,
                     None => continue,
                 };
 
-                let (fee_program, fee_config, fee_config_owner) = match (a_exec, b_exec) {
-                    (true, false) => (a, b, b_owner),
-                    (false, true) => (b, a, a_owner),
-                    _ => continue,
+                let tx_v = match self
+                    .rpc_call(
+                        "getTransaction",
+                        json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}]),
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(_) => continue,
                 };
-                if fee_config_owner != fee_program {
-                    continue;
+
+                let msg = match tx_v
+                    .get("result")
+                    .and_then(|r| r.get("transaction"))
+                    .and_then(|t| t.get("message"))
+                {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let meta = tx_v
+                    .get("result")
+                    .and_then(|r| r.get("meta"))
+                    .unwrap_or(&Value::Null);
+
+                let mut account_keys = match Self::parse_account_keys(msg) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                Self::extend_with_loaded_addresses(&mut account_keys, meta);
+
+                for ix in Self::collect_all_instructions(msg, meta) {
+                    let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
+                        Some(v) => v as usize,
+                        None => continue,
+                    };
+                    let program_id = match account_keys.get(program_id_index) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    if program_id != PUMPFUN_AMM_PROGRAM_ID {
+                        continue;
+                    }
+
+                    let accounts: Vec<usize> = match ix.get("accounts").and_then(|v| v.as_array()) {
+                        Some(a) => a
+                            .iter()
+                            .filter_map(|v| v.as_u64().map(|x| x as usize))
+                            .collect(),
+                        None => continue,
+                    };
+                    if accounts.len() != 23 {
+                        continue;
+                    }
+
+                    let base_mint_ix = match account_keys.get(accounts[3]) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let quote_mint_ix = match account_keys.get(accounts[4]) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    if base_mint_ix != base_mint.to_string().as_str() {
+                        continue;
+                    }
+                    if quote_mint_ix != WSOL_MINT {
+                        continue;
+                    }
+
+                    let pool = PumpAmmPoolStatic {
+                        pool_market: Pubkey::from_str(&account_keys[accounts[0]])?,
+                        global_config: Pubkey::from_str(&account_keys[accounts[2]])?,
+                        base_mint,
+                        quote_mint: Pubkey::from_str(WSOL_MINT)?,
+                        pool_base_vault: Pubkey::from_str(&account_keys[accounts[7]])?,
+                        pool_quote_vault: Pubkey::from_str(&account_keys[accounts[8]])?,
+                        protocol_fee_recipient: Pubkey::from_str(&account_keys[accounts[9]])?,
+                        protocol_fee_recipient_ta: Pubkey::from_str(&account_keys[accounts[10]])?,
+                        event_authority: Pubkey::from_str(&account_keys[accounts[15]])?,
+                        coin_creator_vault_ata: Pubkey::from_str(&account_keys[accounts[17]])?,
+                        coin_creator_vault_authority: Pubkey::from_str(
+                            &account_keys[accounts[18]],
+                        )?,
+                        global_volume_accumulator: Pubkey::from_str(&account_keys[accounts[19]])?,
+                        fee_config: Pubkey::default(),
+                        fee_program: Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?,
+                    };
+
+                    // Resolve `fee_config` robustly: it must be a non-executable account owned by the
+                    // known fee program. We only scan the tail of the ix account list because the
+                    // layout is stable there and it keeps RPC calls bounded.
+                    let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
+                    let mut fee_config = None;
+                    let search_start = accounts.len().saturating_sub(8);
+                    for acc_idx in accounts[search_start..].iter().rev() {
+                        let pk = match account_keys.get(*acc_idx) {
+                            Some(v) => Pubkey::from_str(v)?,
+                            None => continue,
+                        };
+                        if pk == fee_program {
+                            continue;
+                        }
+                        let Some((owner, executable)) =
+                            self.rpc_get_account_owner_and_executable(pk).await?
+                        else {
+                            continue;
+                        };
+                        if !executable && owner == fee_program {
+                            fee_config = Some(pk);
+                            break;
+                        }
+                    }
+
+                    let fee_config = match fee_config {
+                        Some(v) => v,
+                        None => continue,
+                    };
+
+                    let mut pool = pool;
+                    pool.fee_program = fee_program;
+                    pool.fee_config = fee_config;
+
+                    self.pools_by_base.insert(base_mint, pool.clone());
+                    return Ok(Some(pool));
                 }
-
-                let mut pool = pool;
-                pool.fee_program = fee_program;
-                pool.fee_config = fee_config;
-
-                self.pools_by_base.insert(base_mint, pool.clone());
-                return Ok(Some(pool));
             }
         }
 
