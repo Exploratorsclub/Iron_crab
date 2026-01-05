@@ -220,6 +220,13 @@ impl PumpFunAmmDex {
         };
 
         for s in sigs.iter().take(50) {
+            // Avoid poisoning discovery with failed transactions (e.g., our own earlier
+            // liquidation attempts that used wrong accounts and therefore failed).
+            if let Some(err) = s.get("err") {
+                if !err.is_null() {
+                    continue;
+                }
+            }
             let sig = match s.get("signature").and_then(|v| v.as_str()) {
                 Some(v) => v,
                 None => continue,
@@ -370,6 +377,12 @@ impl PumpFunAmmDex {
         };
 
         for s in sigs.iter().take(100) {
+            // Prefer successful transactions; failed ones can contain partial/invalid account sets.
+            if let Some(err) = s.get("err") {
+                if !err.is_null() {
+                    continue;
+                }
+            }
             let sig = match s.get("signature").and_then(|v| v.as_str()) {
                 Some(v) => v,
                 None => continue,
