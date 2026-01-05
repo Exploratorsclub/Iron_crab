@@ -296,7 +296,7 @@ impl PumpFunDex {
         bonding_curve: &Pubkey,
         associated_bonding_curve: &Pubkey,
         user_token_account: &Pubkey,
-        creator: &Pubkey,  // NEW: Creator pubkey for creator_vault derivation
+        creator: &Pubkey, // NEW: Creator pubkey for creator_vault derivation
         token_program: &Pubkey,
         amount_in: u64,    // SOL lamports
         max_sol_cost: u64, // Slippage protection
@@ -385,7 +385,7 @@ impl PumpFunDex {
         bonding_curve: &Pubkey,
         associated_bonding_curve: &Pubkey,
         user_token_account: &Pubkey,
-        creator: &Pubkey,    // NEW: Creator pubkey for creator_vault derivation
+        creator: &Pubkey, // NEW: Creator pubkey for creator_vault derivation
         token_program: &Pubkey,
         amount_in: u64,      // Token amount
         min_sol_output: u64, // Slippage protection
@@ -885,11 +885,8 @@ impl PumpFunDex {
         let token_mint = Pubkey::from_str(token_mint_str)?;
         let token_program_sdk = self.token_program_for_mint(&token_mint).await?;
         let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
-        let (associated_bonding_curve, _bump2) = self.derive_associated_bonding_curve(
-            &bonding_curve,
-            &token_mint,
-            &token_program_sdk,
-        );
+        let (associated_bonding_curve, _bump2) =
+            self.derive_associated_bonding_curve(&bonding_curve, &token_mint, &token_program_sdk);
 
         // Prefer creator from a trusted Geyser event (strategy-provided).
         // Fallback: parse creator from the on-chain bonding curve state.
@@ -981,8 +978,8 @@ impl PumpFunDex {
         // We prepend an idempotent ATA creation instruction; it's safe if ATA already exists.
         let create_ata_ix_prog =
             spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                &user_spl,      // payer
-                &user_spl,      // owner
+                &user_spl, // payer
+                &user_spl, // owner
                 &token_mint_spl,
                 &token_program_spl,
             );

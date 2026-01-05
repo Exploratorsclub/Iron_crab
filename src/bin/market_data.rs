@@ -37,9 +37,9 @@ use ironcrab::solana::dex_parser::{
     parse_account_update, parse_transaction_update, DexType, ParsedDexEvent,
 };
 use ironcrab::solana::wallet_tracker::WalletTracker;
-use spl_token_2022::extension::StateWithExtensions;
 use spl_token::solana_program::program_option::COption;
 use spl_token::solana_program::program_pack::Pack;
+use spl_token_2022::extension::StateWithExtensions;
 
 /// NATS topic for config reload (P1: Runtime Configuration via UI)
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";

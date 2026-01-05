@@ -1,14 +1,14 @@
 use crate::ipc::{RejectReason, TradeIntent, TradeSide};
-use crate::solana::dex::Dex;
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::orca_whirlpool_layout;
 use crate::solana::dex::pumpfun::PumpFunDex;
 use crate::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use crate::solana::dex::raydium::Raydium;
+use crate::solana::dex::Dex;
 use crate::solana::rpc::SolanaRpc;
 use solana_sdk::hash::hash;
-use solana_sdk::instruction::Instruction;
 use solana_sdk::instruction::AccountMeta;
+use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
 use std::str::FromStr;
@@ -179,7 +179,10 @@ pub async fn build_tx_plan(
     if intent.resources.pools.len() != 1 {
         return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
             reason: RejectReason::UnsupportedIntent,
-            details: format!("pools_len={} (expected exactly 1)", intent.resources.pools.len()),
+            details: format!(
+                "pools_len={} (expected exactly 1)",
+                intent.resources.pools.len()
+            ),
         });
     }
 
@@ -358,7 +361,9 @@ pub async fn build_tx_plan(
                 Err(e) => {
                     return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                         reason: RejectReason::InvalidIntent,
-                        details: format!("invalid resources.accounts[{idx}] pubkey for pump_amm: {e}"),
+                        details: format!(
+                            "invalid resources.accounts[{idx}] pubkey for pump_amm: {e}"
+                        ),
                     })
                 }
             }
@@ -481,7 +486,10 @@ pub async fn build_tx_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{ExplicitAmount, IntentOrigin, IntentTier, TradeExecutionConstraints, TradeResources, TradingRegime};
+    use crate::ipc::{
+        ExplicitAmount, IntentOrigin, IntentTier, TradeExecutionConstraints, TradeResources,
+        TradingRegime,
+    };
 
     fn base_intent() -> TradeIntent {
         TradeIntent::new(
@@ -512,21 +520,33 @@ mod tests {
         // would fail with "missing metadata.creator" even when dex=raydium.
 
         let mut ray = base_intent();
-        ray.metadata.insert("dex".to_string(), "raydium".to_string());
-        assert_eq!(super::dex_hint_from_intent(&ray).unwrap(), super::DexHint::Raydium);
+        ray.metadata
+            .insert("dex".to_string(), "raydium".to_string());
+        assert_eq!(
+            super::dex_hint_from_intent(&ray).unwrap(),
+            super::DexHint::Raydium
+        );
 
         let mut orca = base_intent();
         orca.metadata.insert("dex".to_string(), "orca".to_string());
-        assert_eq!(super::dex_hint_from_intent(&orca).unwrap(), super::DexHint::Orca);
+        assert_eq!(
+            super::dex_hint_from_intent(&orca).unwrap(),
+            super::DexHint::Orca
+        );
 
         let mut pump = base_intent();
-        pump.metadata.insert("dex".to_string(), "pumpfun".to_string());
-        assert_eq!(super::dex_hint_from_intent(&pump).unwrap(), super::DexHint::Pumpfun);
+        pump.metadata
+            .insert("dex".to_string(), "pumpfun".to_string());
+        assert_eq!(
+            super::dex_hint_from_intent(&pump).unwrap(),
+            super::DexHint::Pumpfun
+        );
 
         let mut legacy = base_intent();
-        legacy
-            .metadata
-            .insert("creator".to_string(), "11111111111111111111111111111111".to_string());
+        legacy.metadata.insert(
+            "creator".to_string(),
+            "11111111111111111111111111111111".to_string(),
+        );
         assert_eq!(
             super::dex_hint_from_intent(&legacy).unwrap(),
             super::DexHint::Pumpfun
@@ -542,7 +562,9 @@ mod tests {
     fn min_out_prefers_typed_execution_field() {
         let mut intent = base_intent();
 
-        intent.metadata.insert("min_out_raw".to_string(), "123".to_string());
+        intent
+            .metadata
+            .insert("min_out_raw".to_string(), "123".to_string());
         intent.execution = Some(TradeExecutionConstraints {
             min_out: Some(ExplicitAmount::new(999, 9)),
         });
@@ -556,7 +578,9 @@ mod tests {
     fn min_out_falls_back_to_legacy_metadata() {
         let mut intent = base_intent();
 
-        intent.metadata.insert("min_out_raw".to_string(), "456".to_string());
+        intent
+            .metadata
+            .insert("min_out_raw".to_string(), "456".to_string());
 
         let parsed = super::min_out_raw_from_intent(&intent).unwrap();
 

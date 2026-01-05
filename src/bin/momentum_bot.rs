@@ -33,16 +33,15 @@ use uuid::Uuid;
 use ironcrab::config::MomentumCfg;
 use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult, ExecutionStatus,
-    ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind, TradeExecutionConstraints,
-    TradeIntent, TradeResources, TradeSide, TradingRegime,
+    ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind,
+    TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    serve_metrics, FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY, FILTER_REJECTED_DEV_BEHAVIOR,
-    FILTER_REJECTED_INFLOW, FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOTAL,
-    FILTER_REJECTED_VELOCITY,
-    INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
-    TOKENS_TRACKED_GAUGE,
+    serve_metrics, FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY,
+    FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_INFLOW, FILTER_REJECTED_LIQUIDITY,
+    FILTER_REJECTED_TOTAL, FILTER_REJECTED_VELOCITY, INTENTS_GENERATED_TOTAL,
+    MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     NatsClient, NatsConfig, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS,
@@ -334,7 +333,7 @@ struct TradeEvent {
     timestamp: Instant,
     trader: String,
     is_buy: bool,
-    sol_amount: u64, // in lamports
+    sol_amount: u64,   // in lamports
     token_amount: u64, // raw token units
     signature: String,
 }
@@ -597,7 +596,7 @@ struct TokenTracker {
     scale_filled_at: Option<Instant>,
     /// Terminal flag: entry complete (scale-in done or abandoned) and no further entry intents.
     intent_generated: bool,
-    blacklisted: bool,      // Failed filters, don't trade
+    blacklisted: bool, // Failed filters, don't trade
     blacklist_reason: Option<String>,
 }
 
@@ -687,7 +686,11 @@ impl TokenTracker {
         Some((buy_dominance, net_inflow, total))
     }
 
-    fn dump_recovery_wait_reason(&mut self, config: &MomentumConfig, now: Instant) -> Option<String> {
+    fn dump_recovery_wait_reason(
+        &mut self,
+        config: &MomentumConfig,
+        now: Instant,
+    ) -> Option<String> {
         let (buy_dominance, net_inflow, samples) =
             self.dump_recovery_window_stats_at(config, now)?;
 
@@ -808,7 +811,8 @@ impl TokenTracker {
             ));
         }
 
-        let Some((buyers, dom, net_inflow, samples)) = self.cto_confirm_stats_at(config, now) else {
+        let Some((buyers, dom, net_inflow, samples)) = self.cto_confirm_stats_at(config, now)
+        else {
             return Some("CTO_WAIT_RECOVERY: awaiting confirmation window data".to_string());
         };
 
@@ -1506,7 +1510,11 @@ impl MomentumContext {
 
         // Identify the traded token mint (non-WSOL side for SOL pairs).
         let wsol = "So11111111111111111111111111111111111111112";
-        let token_mint = if base_mint == wsol { quote_mint } else { base_mint };
+        let token_mint = if base_mint == wsol {
+            quote_mint
+        } else {
+            base_mint
+        };
 
         {
             let mut pending = self.pending_pool_accounts.write();
@@ -1558,11 +1566,7 @@ impl MomentumContext {
             );
 
             // Apply any dev wallet info that arrived before the tracker existed.
-            if let Some((dev_wallet, supply_pct)) = self
-                .pending_dev_info
-                .read()
-                .get(mint)
-                .cloned()
+            if let Some((dev_wallet, supply_pct)) = self.pending_dev_info.read().get(mint).cloned()
             {
                 if let Some(tracker) = trackers.get_mut(mint) {
                     let was_blacklisted = tracker.blacklisted;
@@ -1575,11 +1579,8 @@ impl MomentumContext {
             }
 
             // Apply any DexPoolAccounts that arrived before the tracker existed.
-            if let Some((dex_name, pool_addr, accounts)) = self
-                .pending_pool_accounts
-                .read()
-                .get(mint)
-                .cloned()
+            if let Some((dex_name, pool_addr, accounts)) =
+                self.pending_pool_accounts.read().get(mint).cloned()
             {
                 if let Some(tracker) = trackers.get_mut(mint) {
                     if tracker.pool == pool_addr {
@@ -1703,7 +1704,9 @@ impl MomentumContext {
             {
                 let now = Instant::now();
                 let probe_filled_at = tracker.probe_filled_at.unwrap_or(now);
-                if now.duration_since(probe_filled_at).as_secs() > config.scale_in_confirm_window_secs {
+                if now.duration_since(probe_filled_at).as_secs()
+                    > config.scale_in_confirm_window_secs
+                {
                     // Confirmation window expired: keep probe position only.
                     tracker.intent_generated = true;
                     continue;
@@ -1898,10 +1901,7 @@ impl MomentumContext {
 
                 if let Some(dev_at) = sig.dev_sold_at {
                     if dev_at > pos.entry_time {
-                        let sig_s = sig
-                            .dev_sold_sig
-                            .as_deref()
-                            .unwrap_or("<unknown>");
+                        let sig_s = sig.dev_sold_sig.as_deref().unwrap_or("<unknown>");
                         let sol = sig.dev_sold_sol.unwrap_or(0);
                         pos.exit_generated = true;
                         exits.push((
@@ -2057,9 +2057,8 @@ impl MomentumContext {
                                     }
                                     _ => {
                                         tr.blacklisted = true;
-                                        tr.blacklist_reason = Some(
-                                            "buy_confirmed_missing_fill_out".to_string(),
-                                        );
+                                        tr.blacklist_reason =
+                                            Some("buy_confirmed_missing_fill_out".to_string());
                                     }
                                 }
                             }
@@ -2975,7 +2974,10 @@ async fn main() -> Result<()> {
 }
 
 /// Generate and publish a BUY TradeIntent based on an entry signal.
-async fn generate_and_publish_buy_intent(ctx: &MomentumContext, signal: &EntrySignal) -> Result<()> {
+async fn generate_and_publish_buy_intent(
+    ctx: &MomentumContext,
+    signal: &EntrySignal,
+) -> Result<()> {
     let max_slippage = { ctx.config.read().early_max_slippage_bps };
 
     // Assume SOL (So11111...) as quote mint for PumpFun/meme tokens
@@ -3043,7 +3045,9 @@ async fn generate_and_publish_buy_intent(ctx: &MomentumContext, signal: &EntrySi
             );
             anyhow::bail!("cannot generate intent: missing DexPoolAccounts")
         };
-        if accounts.len() != 14 || accounts.first().map(|s| s.as_str()) != Some(signal.pool.as_str()) {
+        if accounts.len() != 14
+            || accounts.first().map(|s| s.as_str()) != Some(signal.pool.as_str())
+        {
             warn!(
                 mint = %signal.mint,
                 pool = %signal.pool,
@@ -3133,7 +3137,9 @@ async fn generate_and_publish_buy_intent(ctx: &MomentumContext, signal: &EntrySi
     intent
         .metadata
         .insert("min_out_raw".to_string(), min_out_raw.to_string());
-    intent.metadata.insert("dex".to_string(), signal.dex.to_string());
+    intent
+        .metadata
+        .insert("dex".to_string(), signal.dex.to_string());
     intent
         .metadata
         .insert("reason_code".to_string(), reason_code.to_string());
@@ -3150,8 +3156,9 @@ async fn generate_and_publish_buy_intent(ctx: &MomentumContext, signal: &EntrySi
 
     // Pump.fun tx building requires the creator/dev wallet.
     if signal.dex == "pumpfun" {
-        let creator = creator_opt
-            .ok_or_else(|| anyhow::anyhow!("cannot generate pumpfun intent: missing dev_wallet/creator"))?;
+        let creator = creator_opt.ok_or_else(|| {
+            anyhow::anyhow!("cannot generate pumpfun intent: missing dev_wallet/creator")
+        })?;
         intent.metadata.insert("creator".to_string(), creator);
     }
 
@@ -3821,7 +3828,9 @@ async fn generate_and_publish_exit_intent(
                 let mint_infos = ctx.mint_infos.read();
                 mint_infos.get(mint).map(|m| m.decimals)
             })
-            .ok_or_else(|| anyhow::anyhow!("cannot generate exit intent: missing TokenMintInfo.decimals"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("cannot generate exit intent: missing TokenMintInfo.decimals")
+            })?
     };
 
     let intent_id = ctx.next_intent_id();
@@ -3891,9 +3900,13 @@ async fn generate_and_publish_exit_intent(
             accounts: {
                 let requires = MomentumContext::dex_requires_pool_accounts(dex);
                 if requires {
-                    let accounts = ctx
-                        .try_get_dex_pool_accounts_for_mint(mint)
-                        .ok_or_else(|| anyhow::anyhow!("cannot generate exit intent: missing DexPoolAccounts"))?;
+                    let accounts =
+                        ctx.try_get_dex_pool_accounts_for_mint(mint)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "cannot generate exit intent: missing DexPoolAccounts"
+                                )
+                            })?;
                     if accounts.len() != 14 || accounts.first().map(|s| s.as_str()) != Some(pool) {
                         anyhow::bail!("cannot generate exit intent: invalid DexPoolAccounts")
                     }
@@ -3932,8 +3945,9 @@ async fn generate_and_publish_exit_intent(
 
     // Pump.fun sell tx building requires the creator/dev wallet.
     if dex == "pumpfun" {
-        let creator = creator_opt
-            .ok_or_else(|| anyhow::anyhow!("cannot generate pumpfun exit: missing dev_wallet/creator"))?;
+        let creator = creator_opt.ok_or_else(|| {
+            anyhow::anyhow!("cannot generate pumpfun exit: missing dev_wallet/creator")
+        })?;
         intent.metadata.insert("creator".to_string(), creator);
     }
 

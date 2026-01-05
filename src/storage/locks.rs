@@ -161,9 +161,7 @@ impl FairnessTracker {
         let cutoff = now - self.window_duration;
 
         let mut counts = self.preemption_counts.write();
-        let events = counts
-            .entry(preempted_source.to_string())
-            .or_default();
+        let events = counts.entry(preempted_source.to_string()).or_default();
 
         // Remove old events outside the window
         while events.front().map(|t| *t < cutoff).unwrap_or(false) {

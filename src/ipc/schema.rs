@@ -739,7 +739,14 @@ pub struct ControlRequest {
 }
 
 impl ControlRequest {
-    pub fn new(component: &str, build: &str, run_id: &str, request_id: String, target: &str, kind: ControlRequestKind) -> Self {
+    pub fn new(
+        component: &str,
+        build: &str,
+        run_id: &str,
+        request_id: String,
+        target: &str,
+        kind: ControlRequestKind,
+    ) -> Self {
         Self {
             header: RecordHeader::new(component, build, run_id),
             request_id,
@@ -1197,7 +1204,11 @@ impl ExecutionResult {
         }
     }
 
-    pub fn with_fills(mut self, fill_in: Option<ExplicitAmount>, fill_out: Option<ExplicitAmount>) -> Self {
+    pub fn with_fills(
+        mut self,
+        fill_in: Option<ExplicitAmount>,
+        fill_out: Option<ExplicitAmount>,
+    ) -> Self {
         self.fill_in = fill_in;
         self.fill_out = fill_out;
         self

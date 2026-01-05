@@ -926,9 +926,8 @@ impl Dex for Raydium {
             .ok_or_else(|| anyhow!("raydium user_authority not set (required for tx building)"))?;
 
         // Derive ATA addresses for input/output mints (Raydium uses SPL Token, not Token-2022).
-        let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
-            user_authority.to_bytes(),
-        );
+        let owner_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(user_authority.to_bytes());
         let in_mint_spl =
             spl_token::solana_program::pubkey::Pubkey::new_from_array(in_pk.to_bytes());
         let out_mint_spl =

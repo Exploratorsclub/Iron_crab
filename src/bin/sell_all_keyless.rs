@@ -2,8 +2,8 @@ use base64::Engine;
 use clap::Parser;
 use ironcrab::config::Config;
 use ironcrab::ipc::{
-    DecisionOutcome, DecisionRecord, ExplicitAmount, IntentOrigin, IntentTier, TradeExecutionConstraints,
-    TradeIntent, TradeResources, TradingRegime,
+    DecisionOutcome, DecisionRecord, ExplicitAmount, IntentOrigin, IntentTier,
+    TradeExecutionConstraints, TradeIntent, TradeResources, TradingRegime,
 };
 use ironcrab::nats::{
     NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS,
@@ -28,7 +28,11 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Keyless liquidation tool (publishes SELL TradeIntents to NATS)")]
+#[command(
+    author,
+    version,
+    about = "Keyless liquidation tool (publishes SELL TradeIntents to NATS)"
+)]
 struct Args {
     #[arg(short, long, default_value = "my_config.server.toml")]
     config: PathBuf,
@@ -132,7 +136,10 @@ async fn token_program_for_mint(rpc: &SolanaRpc, mint: &Pubkey) -> anyhow::Resul
     } else if owner == spl22 {
         Ok(spl22)
     } else {
-        anyhow::bail!("Mint owner is neither spl-token nor spl-token-2022: {}", owner);
+        anyhow::bail!(
+            "Mint owner is neither spl-token nor spl-token-2022: {}",
+            owner
+        );
     }
 }
 
@@ -178,7 +185,9 @@ fn decode_token_account_mint_amount(data: UiAccountData) -> Option<(Pubkey, u64)
     // Token account layout: mint[0..32], amount at [64..72]
     let bytes = match data {
         UiAccountData::Binary(b, _) => base64::engine::general_purpose::STANDARD.decode(b).ok()?,
-        UiAccountData::LegacyBinary(b) => base64::engine::general_purpose::STANDARD.decode(b).ok()?,
+        UiAccountData::LegacyBinary(b) => {
+            base64::engine::general_purpose::STANDARD.decode(b).ok()?
+        }
         _ => return None,
     };
 
@@ -272,7 +281,10 @@ async fn main() -> anyhow::Result<()> {
 
     if let Ok(mut accounts_2022) = rpc
         .rpc
-        .get_token_accounts_by_owner(&owner, TokenAccountsFilter::ProgramId(token_2022_program_id))
+        .get_token_accounts_by_owner(
+            &owner,
+            TokenAccountsFilter::ProgramId(token_2022_program_id),
+        )
         .await
     {
         token_accounts.append(&mut accounts_2022);
@@ -392,10 +404,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(pool_id) = q.route.first().cloned() {
                         metadata.insert("dex".to_string(), "pump_amm".to_string());
                         resources.pools = vec![pool_id];
-                        resources.accounts = pool_accounts
-                            .iter()
-                            .map(|p| p.to_string())
-                            .collect();
+                        resources.accounts = pool_accounts.iter().map(|p| p.to_string()).collect();
                         min_out_sol =
                             Some(apply_slippage_min_out(q.amount_out, args.max_slippage_bps));
                     }
@@ -520,7 +529,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     for (intent_id, mint) in intent_to_mint {
-        let outcome = outcomes.get(&intent_id).copied().unwrap_or(LiquidationOutcome::Pending);
+        let outcome = outcomes
+            .get(&intent_id)
+            .copied()
+            .unwrap_or(LiquidationOutcome::Pending);
         info!(intent_id = %intent_id, mint = %mint, outcome = ?outcome, "Liquidation outcome");
     }
 

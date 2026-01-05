@@ -112,7 +112,11 @@ impl PumpFunAmmDex {
         ]))
     }
 
-    fn derive_user_volume_accumulator(program_id: Pubkey, pool_market: Pubkey, user: Pubkey) -> Pubkey {
+    fn derive_user_volume_accumulator(
+        program_id: Pubkey,
+        pool_market: Pubkey,
+        user: Pubkey,
+    ) -> Pubkey {
         // Best-effort PDA derivation.
         // Observed accounts suggest this is a user-specific PDA; we default to a common Anchor seed
         // pattern: ("user_volume_accumulator", pool_market, user).
@@ -159,6 +163,40 @@ impl PumpFunAmmDex {
             return Err(anyhow!("pump_amm rpc error: {v}"));
         }
         Ok(v)
+    }
+
+    async fn rpc_get_account_owner_and_executable(
+        &self,
+        address: Pubkey,
+    ) -> Result<Option<(Pubkey, bool)>> {
+        let v = self
+            .rpc_call(
+                "getAccountInfo",
+                json!([
+                    address.to_string(),
+                    {"encoding": "base64", "commitment": "confirmed"}
+                ]),
+            )
+            .await?;
+
+        let value = match v.get("result").and_then(|r| r.get("value")) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+
+        let owner = value
+            .get("owner")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("getAccountInfo missing owner"))?;
+        let executable = value
+            .get("executable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        Ok(Some((Pubkey::from_str(owner)?, executable)))
     }
 
     async fn discover_pool_static(&self, base_mint: Pubkey) -> Result<Option<PumpAmmPoolStatic>> {
@@ -227,7 +265,10 @@ impl PumpFunAmmDex {
                 }
 
                 let accounts: Vec<usize> = match ix.get("accounts").and_then(|v| v.as_array()) {
-                    Some(a) => a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect(),
+                    Some(a) => a
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|x| x as usize))
+                        .collect(),
                     None => continue,
                 };
                 if accounts.len() != 23 {
@@ -262,20 +303,38 @@ impl PumpFunAmmDex {
                     coin_creator_vault_ata: Pubkey::from_str(&account_keys[accounts[17]])?,
                     coin_creator_vault_authority: Pubkey::from_str(&account_keys[accounts[18]])?,
                     global_volume_accumulator: Pubkey::from_str(&account_keys[accounts[19]])?,
-                    fee_config: Pubkey::from_str(&account_keys[accounts[21]])?,
-                    fee_program: Pubkey::from_str(&account_keys[accounts[22]])?,
+                    // These last two accounts have shown variants across tx layouts.
+                    // We resolve them below by checking which one is executable.
+                    fee_config: Pubkey::default(),
+                    fee_program: Pubkey::default(),
                 };
 
-                // Validate the fee-config relationship. Recent PumpSwap versions use a separate
-                // fee program (pfee...) which owns the fee_config account. If we mis-map indices
-                // from a transaction variant, simulation fails with AccountOwnedByWrongProgram.
-                if let Ok(acct) = self.rpc.rpc.get_account(&pool.fee_config).await {
-                    if acct.owner != pool.fee_program {
-                        continue;
-                    }
-                } else {
+                // Robustly resolve (fee_config, fee_program) from the final two accounts.
+                // `fee_program` must be executable; `fee_config.owner` must equal `fee_program`.
+                let a = Pubkey::from_str(&account_keys[accounts[21]])?;
+                let b = Pubkey::from_str(&account_keys[accounts[22]])?;
+
+                let (a_owner, a_exec) = match self.rpc_get_account_owner_and_executable(a).await? {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let (b_owner, b_exec) = match self.rpc_get_account_owner_and_executable(b).await? {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let (fee_program, fee_config, fee_config_owner) = match (a_exec, b_exec) {
+                    (true, false) => (a, b, b_owner),
+                    (false, true) => (b, a, a_owner),
+                    _ => continue,
+                };
+                if fee_config_owner != fee_program {
                     continue;
                 }
+
+                let mut pool = pool;
+                pool.fee_program = fee_program;
+                pool.fee_config = fee_config;
 
                 self.pools_by_base.insert(base_mint, pool.clone());
                 return Ok(Some(pool));
@@ -356,7 +415,10 @@ impl PumpFunAmmDex {
                 }
 
                 let accounts: Vec<usize> = match ix.get("accounts").and_then(|v| v.as_array()) {
-                    Some(a) => a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect(),
+                    Some(a) => a
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|x| x as usize))
+                        .collect(),
                     None => continue,
                 };
                 if accounts.len() != 23 {
@@ -389,7 +451,11 @@ impl PumpFunAmmDex {
         let ua = PumpAmmUserAccounts {
             user_base_ta: Self::derive_ata(user, base_mint),
             user_quote_ta: Self::derive_ata(user, Pubkey::from_str(WSOL_MINT)?),
-            user_volume_accumulator: Self::derive_user_volume_accumulator(program_id, pool_market, user),
+            user_volume_accumulator: Self::derive_user_volume_accumulator(
+                program_id,
+                pool_market,
+                user,
+            ),
         };
         self.user_accounts.insert((pool_market, user), ua.clone());
         Ok(Some(ua))
@@ -562,10 +628,15 @@ impl Dex for PumpFunAmmDex {
             .pools_by_base
             .get(&base_mint)
             .map(|v| v.clone())
-            .ok_or_else(|| anyhow!("pump_amm pool not discovered/cached for base_mint={base_mint}"))?;
+            .ok_or_else(|| {
+                anyhow!("pump_amm pool not discovered/cached for base_mint={base_mint}")
+            })?;
 
         // Prefer discovered user accounts if available; fallback to ATAs for token accounts.
-        let user_acc = self.user_accounts.get(&(pool.pool_market, user)).map(|v| v.clone());
+        let user_acc = self
+            .user_accounts
+            .get(&(pool.pool_market, user))
+            .map(|v| v.clone());
         let user_base_ta = user_acc
             .as_ref()
             .map(|u| u.user_base_ta)
@@ -577,7 +648,9 @@ impl Dex for PumpFunAmmDex {
         let user_vol = user_acc
             .as_ref()
             .map(|u| u.user_volume_accumulator)
-            .unwrap_or_else(|| Self::derive_user_volume_accumulator(program_id, pool.pool_market, user));
+            .unwrap_or_else(|| {
+                Self::derive_user_volume_accumulator(program_id, pool.pool_market, user)
+            });
 
         let disc = if is_buy {
             anchor_disc("buy_exact_quote_in")
@@ -764,7 +837,9 @@ impl PumpFunAmmDex {
         let _ua = self
             .discover_user_accounts(pool.pool_market, base_mint, user)
             .await?
-            .ok_or_else(|| anyhow!("pump_amm: no user accounts found for user={user} base_mint={base_mint}"))?;
+            .ok_or_else(|| {
+                anyhow!("pump_amm: no user accounts found for user={user} base_mint={base_mint}")
+            })?;
         Ok(())
     }
 }

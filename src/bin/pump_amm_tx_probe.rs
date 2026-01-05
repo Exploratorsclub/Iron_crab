@@ -29,7 +29,10 @@ fn anchor_discriminator(ix_name: &str) -> [u8; 8] {
 }
 
 fn fmt_disc(d: [u8; 8]) -> String {
-    d.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("")
+    d.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 async fn rpc_call(client: &Client, rpc_url: &str, method: &str, params: Value) -> Result<Value> {
@@ -140,10 +143,10 @@ async fn main() -> Result<()> {
     let mut candidate: Option<(usize, String, Vec<usize>, Vec<u8>)> = None;
 
     for (ix_idx, ix) in instructions.iter().enumerate() {
-        let program_id_index = ix
-            .get("programIdIndex")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow!("ix missing programIdIndex"))? as usize;
+        let program_id_index =
+            ix.get("programIdIndex")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow!("ix missing programIdIndex"))? as usize;
         let program = account_keys
             .get(program_id_index)
             .cloned()
@@ -175,7 +178,8 @@ async fn main() -> Result<()> {
             let better = match &candidate {
                 None => true,
                 Some((_, _, best_accs, best_data)) => {
-                    accs.len() > best_accs.len() || (accs.len() == best_accs.len() && data.len() > best_data.len())
+                    accs.len() > best_accs.len()
+                        || (accs.len() == best_accs.len() && data.len() > best_data.len())
                 }
             };
 
@@ -186,7 +190,7 @@ async fn main() -> Result<()> {
     }
 
     let (ix_idx, program_id_str, ix_accounts, ix_data) = candidate
-        .ok_or_else(|| anyhow!("No suitable instruction candidate found (need Json encoding)") )?;
+        .ok_or_else(|| anyhow!("No suitable instruction candidate found (need Json encoding)"))?;
 
     let disc_bytes: [u8; 8] = ix_data[0..8].try_into().unwrap();
     let disc_hex = fmt_disc(disc_bytes);
@@ -276,7 +280,10 @@ async fn main() -> Result<()> {
                 Some(v) => v as usize,
                 None => continue,
             };
-            let program = account_keys.get(program_id_index).cloned().unwrap_or_default();
+            let program = account_keys
+                .get(program_id_index)
+                .cloned()
+                .unwrap_or_default();
             if program != program_id_str {
                 continue;
             }

@@ -8,9 +8,9 @@
 
 use ironcrab::ipc::{
     CheckResult, DecisionOutcome, DecisionRecord, ExecutionFees, ExecutionPnl, ExecutionResult,
-    ExecutionStatus, ExplicitAmount, FeePolicy, FillStatus, FillUnavailableReason, IntentOrigin, IntentTier, MarketEvent,
-    MarketEventKind, RecordHeader, RejectReason, SimulationResult, TradeIntent, TradeResources,
-    TradeSide, TradingRegime, SCHEMA_VERSION,
+    ExecutionStatus, ExplicitAmount, FeePolicy, FillStatus, FillUnavailableReason, IntentOrigin,
+    IntentTier, MarketEvent, MarketEventKind, RecordHeader, RejectReason, SimulationResult,
+    TradeIntent, TradeResources, TradeSide, TradingRegime, SCHEMA_VERSION,
 };
 use rust_decimal::Decimal;
 
@@ -145,10 +145,7 @@ fn test_market_event_token_mint_info_roundtrip() {
             freeze_authority,
         } => {
             assert_eq!(mint, "So11111111111111111111111111111111111111112");
-            assert_eq!(
-                token_program,
-                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-            );
+            assert_eq!(token_program, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
             assert_eq!(decimals, 9);
             assert_eq!(supply, 1_000_000_000);
             assert_eq!(mint_authority, None);

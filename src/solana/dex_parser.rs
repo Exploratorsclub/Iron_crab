@@ -622,22 +622,20 @@ impl ParsedDexEvent {
                 dex,
                 initial_liquidity_lamports,
                 ..
-            } => {
-                MarketEventKind::PoolCreated {
-                    pool_address: pool_address.to_string(),
-                    base_mint: base_mint.to_string(),
-                    quote_mint: quote_mint.to_string(),
-                    dex: dex.to_string(),
-                    initial_liquidity_sol: if *initial_liquidity_lamports > 0 {
-                        Some(
-                            Decimal::from(*initial_liquidity_lamports)
-                                / Decimal::from(1_000_000_000u64),
-                        )
-                    } else {
-                        None
-                    },
-                }
-            }
+            } => MarketEventKind::PoolCreated {
+                pool_address: pool_address.to_string(),
+                base_mint: base_mint.to_string(),
+                quote_mint: quote_mint.to_string(),
+                dex: dex.to_string(),
+                initial_liquidity_sol: if *initial_liquidity_lamports > 0 {
+                    Some(
+                        Decimal::from(*initial_liquidity_lamports)
+                            / Decimal::from(1_000_000_000u64),
+                    )
+                } else {
+                    None
+                },
+            },
             ParsedDexEvent::Trade {
                 pool_address,
                 mint,

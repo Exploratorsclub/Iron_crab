@@ -14,13 +14,13 @@ async fn test_pumpfun_build_buy_ix_pure_derivation() {
     let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:8899"));
     let mut dex = PumpFunDex::new(rpc).expect("PumpFunDex::new");
 
-    let wallet = Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM")
-        .expect("wallet pubkey");
+    let wallet =
+        Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM").expect("wallet pubkey");
     dex.set_user_authority(wallet);
 
     // Any syntactically valid pubkeys are fine for this pure-derivation test.
-    let creator = Pubkey::from_str("2tFqgkJX6kqz8q6o9tFv3oJ9nQx7n1m3fHk2m8f3oKpZ")
-        .expect("creator pubkey");
+    let creator =
+        Pubkey::from_str("2tFqgkJX6kqz8q6o9tFv3oJ9nQx7n1m3fHk2m8f3oKpZ").expect("creator pubkey");
     let token_mint = "9xQeWvG816bUx9EPfKJb9N9dKz5wW7Yy2hBzXv4mQ4kG"; // arbitrary valid pubkey string
 
     let ixs = dex
@@ -53,7 +53,9 @@ async fn test_pumpfun_build_buy_ix_pure_derivation() {
 
     // Sanity: at least one other account is writable (fee recipient).
     assert!(
-        ix.accounts.iter().any(|m| m.is_writable && m.pubkey != wallet),
+        ix.accounts
+            .iter()
+            .any(|m| m.is_writable && m.pubkey != wallet),
         "expected at least one writable non-user account"
     );
 
@@ -71,8 +73,8 @@ async fn test_tx_builder_supports_pumpfun_sell_pure_derivation() {
 
     let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:8899"));
 
-    let wallet = Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM")
-        .expect("wallet pubkey");
+    let wallet =
+        Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM").expect("wallet pubkey");
 
     let creator = "2tFqgkJX6kqz8q6o9tFv3oJ9nQx7n1m3fHk2m8f3oKpZ";
     let token_mint = "9xQeWvG816bUx9EPfKJb9N9dKz5wW7Yy2hBzXv4mQ4kG";
@@ -109,11 +111,18 @@ async fn test_tx_builder_supports_pumpfun_sell_pure_derivation() {
     let plan = match tx_builder::build_tx_plan(&intent, wallet, Arc::clone(&rpc)).await {
         tx_builder::TxPlanOutcome::Planned(p) => p,
         tx_builder::TxPlanOutcome::Unsupported(u) => {
-            panic!("unexpected unsupported plan: {:?} - {}", u.reason, u.details)
+            panic!(
+                "unexpected unsupported plan: {:?} - {}",
+                u.reason, u.details
+            )
         }
     };
 
-    assert_eq!(plan.instructions.len(), 1, "expected exactly one instruction");
+    assert_eq!(
+        plan.instructions.len(),
+        1,
+        "expected exactly one instruction"
+    );
 
     let ix = &plan.instructions[0];
     assert_eq!(
