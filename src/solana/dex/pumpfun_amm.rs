@@ -207,11 +207,13 @@ impl PumpFunAmmDex {
         let pump_amm_program_id =
             Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).context("invalid PUMPFUN_AMM_PROGRAM_ID")?;
 
-        // TX-based discovery: scan recent transactions touching the mint.
+        // TX-based discovery: scan transactions touching the mint.
+        // We scan deeper than the default 50 because the newest signatures can be dominated
+        // by failed liquidation attempts (which we intentionally skip).
         let sigs_v = self
             .rpc_call(
                 "getSignaturesForAddress",
-                json!([base_mint.to_string(), {"limit": 50}]),
+                json!([base_mint.to_string(), {"limit": 500}]),
             )
             .await?;
         let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
@@ -219,7 +221,7 @@ impl PumpFunAmmDex {
             None => return Ok(None),
         };
 
-        for s in sigs.iter().take(50) {
+        for s in sigs.iter() {
             // Avoid poisoning discovery with failed transactions (e.g., our own earlier
             // liquidation attempts that used wrong accounts and therefore failed).
             if let Some(err) = s.get("err") {
@@ -364,11 +366,12 @@ impl PumpFunAmmDex {
             return Ok(Some(v.clone()));
         }
 
-        // Scan recent transactions of the user for a Pump.fun AMM ix on this pool.
+        // Scan transactions of the user for a Pump.fun AMM ix on this pool.
+        // Scan deeper because recent txs may be unrelated (or failed).
         let sigs_v = self
             .rpc_call(
                 "getSignaturesForAddress",
-                json!([user.to_string(), {"limit": 100}]),
+                json!([user.to_string(), {"limit": 500}]),
             )
             .await?;
         let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
@@ -376,7 +379,7 @@ impl PumpFunAmmDex {
             None => return Ok(None),
         };
 
-        for s in sigs.iter().take(100) {
+        for s in sigs.iter() {
             // Prefer successful transactions; failed ones can contain partial/invalid account sets.
             if let Some(err) = s.get("err") {
                 if !err.is_null() {
