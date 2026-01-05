@@ -220,23 +220,23 @@ fn test_trade_intent_required_fields() {
 fn test_trade_intent_typed_execution_min_out_roundtrip() {
     // Minimal JSON resembling a producer that sets typed execution constraints.
     let json = r#"{
-        \"schema_version\":1,
-        \"ts_unix_ms\":1700000000000,
-        \"component\":\"test\",
-        \"build\":\"test\",
-        \"run_id\":\"run\",
-        \"intent_id\":\"intent-typed-1\",
-        \"source\":\"test\",
-        \"tier\":\"Tier1\",
-        \"origin_type\":\"StrategyA\",
-        \"ttl_ms\":5000,
-        \"required_capital\":{\"raw\":1,\"decimals\":9},
-        \"resources\":{\"input_mint\":\"in\",\"output_mint\":\"out\",\"pools\":[\"pool\"],\"accounts\":[]},
-        \"expected_roi_bps\":0,
-        \"max_slippage_bps\":0,
-        \"side\":\"Sell\",
-        \"regime\":\"Early\",
-        \"execution\":{\"min_out\":{\"raw\":42,\"decimals\":9}}
+        "schema_version":1,
+        "ts_unix_ms":1700000000000,
+        "component":"test",
+        "build":"test",
+        "run_id":"run",
+        "intent_id":"intent-typed-1",
+        "source":"test",
+        "tier":"Tier1",
+        "origin_type":"StrategyA",
+        "ttl_ms":5000,
+        "required_capital":{"raw":1,"decimals":9},
+        "resources":{"input_mint":"in","output_mint":"out","pools":["pool"],"accounts":[]},
+        "expected_roi_bps":0,
+        "max_slippage_bps":0,
+        "side":"Sell",
+        "regime":"Early",
+        "execution":{"min_out":{"raw":42,"decimals":9}}
     }"#;
 
     let parsed: TradeIntent = serde_json::from_str(json).unwrap();
