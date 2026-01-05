@@ -134,6 +134,64 @@ fn extract_owner_mint_delta_raw(
     Some((decimals, delta))
 }
 
+fn find_message_account_index(tx: &EncodedConfirmedTransactionWithStatusMeta, pubkey: &Pubkey) -> Option<usize> {
+    let needle = pubkey.to_string();
+
+    // We intentionally use a serde_json traversal here to avoid tight coupling to
+    // `UiMessage` / `UiParsedMessage` struct variants.
+    let v = serde_json::to_value(&tx.transaction.transaction).ok()?;
+    let account_keys = v.get("message")?.get("accountKeys")?.as_array()?;
+    for (i, ak) in account_keys.iter().enumerate() {
+        if let Some(s) = ak.as_str() {
+            if s == needle {
+                return Some(i);
+            }
+        } else if let Some(pk) = ak.get("pubkey").and_then(|x| x.as_str()) {
+            if pk == needle {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn compute_wallet_lamport_delta_best_effort(
+    tx: &EncodedConfirmedTransactionWithStatusMeta,
+    wallet: &Pubkey,
+) -> Option<(i128, u64, bool)> {
+    let meta = tx.transaction.meta.as_ref()?;
+    let wallet_index = find_message_account_index(tx, wallet)?;
+
+    let pre = *meta.pre_balances.get(wallet_index)?;
+    let post = *meta.post_balances.get(wallet_index)?;
+    let delta = post as i128 - pre as i128;
+
+    // Heuristic: if the tx funds a brand new account or zeroes an account in the message,
+    // payer lamport delta is likely polluted by rent / account lifecycle noise.
+    let mut has_account_lifecycle_noise = false;
+    for (i, (pre_i, post_i)) in meta
+        .pre_balances
+        .iter()
+        .copied()
+        .zip(meta.post_balances.iter().copied())
+        .enumerate()
+    {
+        if i == wallet_index {
+            continue;
+        }
+        if pre_i == 0 && post_i > 0 {
+            has_account_lifecycle_noise = true;
+            break;
+        }
+        if pre_i > 0 && post_i == 0 {
+            has_account_lifecycle_noise = true;
+            break;
+        }
+    }
+
+    Some((delta, meta.fee, has_account_lifecycle_noise))
+}
+
 async fn compute_intent_fills_best_effort(
     ctx: &ExecutionContext,
     wallet: Pubkey,
@@ -169,16 +227,8 @@ async fn compute_intent_fills_best_effort(
 
     // Fallback path (best-effort): if SOL is represented as So111.. but token balances are absent
     // (e.g. native SOL transfers), approximate fills using fee payer lamport delta.
-    let (payer_delta_lamports, fee_lamports) = tx
-        .transaction
-        .meta
-        .as_ref()
-        .and_then(|m| {
-            let pre = m.pre_balances.get(0).copied()?;
-            let post = m.post_balances.get(0).copied()?;
-            Some((post as i128 - pre as i128, m.fee))
-        })
-        .unwrap_or((0, 0));
+    let (payer_delta_lamports, fee_lamports, lamport_noise) =
+        compute_wallet_lamport_delta_best_effort(&tx, &wallet).unwrap_or((0, 0, true));
 
     let fill_in = if let Some((decimals, delta)) = input_token_delta {
         if delta < 0 {
@@ -186,7 +236,7 @@ async fn compute_intent_fills_best_effort(
         } else {
             None
         }
-    } else if input_mint == SOL_MINT && payer_delta_lamports < 0 {
+    } else if input_mint == SOL_MINT && !lamport_noise && payer_delta_lamports < 0 {
         // Approximate: amount spent excluding network fee.
         let spent_total = (-payer_delta_lamports) as u64;
         let spent_ex_fee = spent_total.saturating_sub(fee_lamports);
@@ -205,7 +255,7 @@ async fn compute_intent_fills_best_effort(
         } else {
             None
         }
-    } else if output_mint == SOL_MINT && payer_delta_lamports > 0 {
+    } else if output_mint == SOL_MINT && !lamport_noise && payer_delta_lamports > 0 {
         // Approximate: amount received before fees (add back network fee).
         let received_total = payer_delta_lamports as u64;
         let received_plus_fee = received_total.saturating_add(fee_lamports);
@@ -3875,8 +3925,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             .or_else(|| send_signature.clone())
             .unwrap_or_default();
 
-        let (fill_in, fill_out) = if let (Some(wallet), Ok(sig)) = (ctx.wallet_pubkey, Signature::from_str(&tx_hash)) {
-            compute_intent_fills_best_effort(&ctx, wallet, &sig, &intent).await
+        let (fill_in, fill_out) =
+            if let (Some(wallet), Ok(sig)) = (ctx.wallet_pubkey, Signature::from_str(&tx_hash)) {
+                compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await
         } else {
             (None, None)
         };
