@@ -1,4 +1,5 @@
 use ironcrab::solana::dex::orca::Orca;
+use ironcrab::solana::dex::Dex;
 use ironcrab::solana::dex::orca_whirlpool_layout::WhirlpoolParsed;
 use ironcrab::solana::rpc::SolanaRpc;
 use solana_sdk::pubkey::Pubkey;
