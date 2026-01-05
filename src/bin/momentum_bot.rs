@@ -344,6 +344,8 @@ struct TradeEvent {
 struct PositionTracker {
     /// Token mint address
     mint: String,
+    /// Token decimals (from MarketEventKind::TokenMintInfo)
+    token_decimals: u8,
     /// Pool address for selling
     pool: String,
     /// DEX name
@@ -374,11 +376,13 @@ impl PositionTracker {
         pool: &str,
         dex: &str,
         entry_price: f64,
+        token_decimals: u8,
         token_amount: u64,
         sol_invested: u64,
     ) -> Self {
         Self {
             mint: mint.to_string(),
+            token_decimals,
             pool: pool.to_string(),
             dex: dex.to_string(),
             entry_time: Instant::now(),
@@ -1664,6 +1668,7 @@ impl MomentumContext {
         pool: &str,
         dex: &str,
         entry_price: f64,
+        token_decimals: u8,
         token_amount: u64,
         sol_invested: u64,
     ) {
@@ -1671,6 +1676,10 @@ impl MomentumContext {
         if let Some(pos) = positions.get_mut(mint) {
             pos.token_amount = pos.token_amount.saturating_add(token_amount);
             pos.add_investment(sol_invested);
+            // Keep the best-known decimals (prefer non-zero).
+            if pos.token_decimals == 0 && token_decimals != 0 {
+                pos.token_decimals = token_decimals;
+            }
             info!(
                 mint = %mint,
                 additional_sol = sol_invested,
@@ -1683,7 +1692,15 @@ impl MomentumContext {
         }
         positions.insert(
             mint.to_string(),
-            PositionTracker::new(mint, pool, dex, entry_price, token_amount, sol_invested),
+            PositionTracker::new(
+                mint,
+                pool,
+                dex,
+                entry_price,
+                token_decimals,
+                token_amount,
+                sol_invested,
+            ),
         );
         info!(
             mint = %mint,
@@ -1973,6 +1990,14 @@ impl MomentumContext {
                             .map(|a| a.raw)
                             .unwrap_or(pending.sol_amount);
 
+                        // Prefer decimals from market-data TokenMintInfo (Geyser), fall back to fill_out decimals.
+                        let token_decimals = self
+                            .mint_infos
+                            .read()
+                            .get(&pending.mint)
+                            .map(|m| m.decimals)
+                            .unwrap_or(fill_out.decimals);
+
                         let sol_ui = result
                             .fill_in
                             .as_ref()
@@ -2017,6 +2042,7 @@ impl MomentumContext {
                             &pending.pool,
                             &pending.dex,
                             entry_price,
+                            token_decimals,
                             token_amount,
                             sol_invested,
                         );
@@ -2882,6 +2908,35 @@ async fn generate_and_publish_buy_intent(ctx: &MomentumContext, signal: &EntrySi
         )
     };
 
+    let token_decimals_opt = {
+        let mint_infos = ctx.mint_infos.read();
+        mint_infos.get(&signal.mint).map(|m| m.decimals)
+    };
+
+    let token_decimals = match token_decimals_opt {
+        Some(d) => d,
+        None => {
+            // Roll back stage markers so we can try again when mint decimals arrive.
+            {
+                let mut trackers = ctx.token_trackers.write();
+                if let Some(tr) = trackers.get_mut(&signal.mint) {
+                    match signal.kind {
+                        EntryKind::Probe => tr.probe_sent_at = None,
+                        EntryKind::ScaleIn => tr.scale_sent_at = None,
+                    }
+                }
+            }
+            warn!(
+                mint = %signal.mint,
+                pool = %signal.pool,
+                dex = %signal.dex,
+                reason = %signal.reason,
+                "Skipping BUY intent: missing TokenMintInfo.decimals"
+            );
+            anyhow::bail!("cannot generate intent: missing TokenMintInfo.decimals")
+        }
+    };
+
     let (last_sol_lamports, last_token_amount) = match last_trade_ratio_opt {
         Some(v) => v,
         None => {
@@ -2948,9 +3003,8 @@ async fn generate_and_publish_buy_intent(ctx: &MomentumContext, signal: &EntrySi
     .with_ttl_ms(5000);
 
     // Provide deterministic execution constraints required by the execution-engine.
-    // Use 6 as common default decimals for Pump.fun tokens.
     intent.execution = Some(TradeExecutionConstraints {
-        min_out: Some(ExplicitAmount::new(min_out_raw, 6)),
+        min_out: Some(ExplicitAmount::new(min_out_raw, token_decimals)),
     });
 
     // Keep legacy metadata for backward compatibility, and provide routing hints.
@@ -3513,7 +3567,7 @@ mod tests {
         // Open a position.
         {
             let mut positions = ctx.positions.write();
-            let mut pos = PositionTracker::new("mint", "pool", "dex", 1.0, 123, 1_000);
+            let mut pos = PositionTracker::new("mint", "pool", "dex", 1.0, 6, 123, 1_000);
             pos.entry_time = Instant::now() - Duration::from_secs(10);
             positions.insert("mint".to_string(), pos);
         }
@@ -3576,7 +3630,7 @@ mod tests {
         // Open a position.
         {
             let mut positions = ctx.positions.write();
-            let mut pos = PositionTracker::new("mint", "pool", "dex", 1.0, 123, 1_000);
+            let mut pos = PositionTracker::new("mint", "pool", "dex", 1.0, 6, 123, 1_000);
             pos.entry_time = Instant::now() - Duration::from_secs(10);
             positions.insert("mint".to_string(), pos);
         }
@@ -3615,9 +3669,20 @@ async fn generate_and_publish_exit_intent(
     // SOL as output (selling tokens for SOL)
     let sol_mint = "So11111111111111111111111111111111111111112";
 
-    // Decimals depend on token, usually 6 or 9 for meme tokens
-    // Use 6 as common default for PumpFun tokens
-    let token_decimals = 6u8;
+    // Decimals depend on the token. Prefer decimals from the open position (which was seeded
+    // from MarketEventKind::TokenMintInfo), fall back to mint_infos cache.
+    let token_decimals = {
+        let positions = ctx.positions.read();
+        positions
+            .get(mint)
+            .map(|p| p.token_decimals)
+            .filter(|d| *d != 0)
+            .or_else(|| {
+                let mint_infos = ctx.mint_infos.read();
+                mint_infos.get(mint).map(|m| m.decimals)
+            })
+            .ok_or_else(|| anyhow::anyhow!("cannot generate exit intent: missing TokenMintInfo.decimals"))?
+    };
 
     let intent_id = ctx.next_intent_id();
 
