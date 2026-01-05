@@ -204,6 +204,9 @@ impl PumpFunAmmDex {
             return Ok(Some(v.clone()));
         }
 
+        let pump_amm_program_id =
+            Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).context("invalid PUMPFUN_AMM_PROGRAM_ID")?;
+
         // TX-based discovery: scan recent transactions touching the mint.
         let sigs_v = self
             .rpc_call(
@@ -310,7 +313,7 @@ impl PumpFunAmmDex {
                 };
 
                 // Robustly resolve (fee_config, fee_program) from the final two accounts.
-                // `fee_program` must be executable; `fee_config.owner` must equal `fee_program`.
+                // `fee_program` must be executable; `fee_config` must be owned by the pump_amm program.
                 let a = Pubkey::from_str(&account_keys[accounts[21]])?;
                 let b = Pubkey::from_str(&account_keys[accounts[22]])?;
 
@@ -328,7 +331,7 @@ impl PumpFunAmmDex {
                     (false, true) => (b, a, a_owner),
                     _ => continue,
                 };
-                if fee_config_owner != fee_program {
+                if fee_config_owner != pump_amm_program_id {
                     continue;
                 }
 
