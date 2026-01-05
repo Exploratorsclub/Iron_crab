@@ -374,39 +374,31 @@ impl PumpFunAmmDex {
                         )?,
                         global_volume_accumulator: Pubkey::from_str(&account_keys[accounts[19]])?,
                         fee_config: Pubkey::default(),
-                        fee_program: Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?,
+                        fee_program: Pubkey::default(),
                     };
 
-                    // Resolve `fee_config` robustly: it must be a non-executable account owned by
-                    // the Pump.fun AMM program. We only scan the tail of the ix account list because the
-                    // layout is stable there and it keeps RPC calls bounded.
-                    let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
+                    // Deterministic mapping: our Geyser parser and observed on-chain swaps agree that
+                    // PumpSwap v1 uses fixed indices.
+                    // - fee_config: accounts[21]
+                    // - fee_program: accounts[22]
+                    let fee_config = Pubkey::from_str(&account_keys[accounts[21]])?;
+                    let fee_program = Pubkey::from_str(&account_keys[accounts[22]])?;
+
+                    // Guardrails: fee_config must be owned by pump_amm (Anchor constraint), and the
+                    // fee program is expected to be pfee.
                     let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
-                    let mut fee_config = None;
-                    let search_start = accounts.len().saturating_sub(8);
-                    for acc_idx in accounts[search_start..].iter().rev() {
-                        let pk = match account_keys.get(*acc_idx) {
-                            Some(v) => Pubkey::from_str(v)?,
-                            None => continue,
-                        };
-                        if pk == fee_program || pk == pump_amm_program {
-                            continue;
-                        }
-                        let Some((owner, executable)) =
-                            self.rpc_get_account_owner_and_executable(pk).await?
-                        else {
-                            continue;
-                        };
-                        if !executable && owner == pump_amm_program {
-                            fee_config = Some(pk);
-                            break;
-                        }
+                    let expected_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
+                    if fee_program != expected_fee_program {
+                        continue;
                     }
-
-                    let fee_config = match fee_config {
-                        Some(v) => v,
-                        None => continue,
+                    let Some((fee_owner, fee_executable)) =
+                        self.rpc_get_account_owner_and_executable(fee_config).await?
+                    else {
+                        continue;
                     };
+                    if fee_executable || fee_owner != pump_amm_program {
+                        continue;
+                    }
 
                     let mut pool = pool;
                     pool.fee_program = fee_program;
@@ -864,6 +856,7 @@ impl PumpFunAmmDex {
         }
 
         let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
+        let expected_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
 
         let pool_market = pool_accounts[0];
         let global_config = pool_accounts[1];
@@ -879,6 +872,27 @@ impl PumpFunAmmDex {
         let global_volume_accumulator = pool_accounts[11];
         let fee_config = pool_accounts[12];
         let fee_program = pool_accounts[13];
+
+        // Intent-driven guardrails (no RPC calls): reject obviously wrong pool_accounts early.
+        // This prevents ambiguous/incorrect fee_config mapping from reaching simulation.
+        if fee_program != expected_fee_program {
+            return Err(anyhow!(
+                "pump_amm pool_accounts fee_program mismatch: expected {expected_fee_program}, got {fee_program}"
+            ));
+        }
+        if fee_config == Pubkey::default() {
+            return Err(anyhow!("pump_amm pool_accounts fee_config is default"));
+        }
+        if fee_config == fee_program {
+            return Err(anyhow!(
+                "pump_amm pool_accounts fee_config equals fee_program (invalid)"
+            ));
+        }
+        if fee_config == program_id {
+            return Err(anyhow!(
+                "pump_amm pool_accounts fee_config equals pump_amm program id (invalid)"
+            ));
+        }
 
         let (expected_base, is_buy) = if input_mint == WSOL_MINT {
             (output_mint, true)
