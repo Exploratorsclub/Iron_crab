@@ -557,6 +557,10 @@ struct TokenTracker {
     /// Dev supply percentage at creation
     dev_supply_pct: Option<f64>,
 
+    /// DEX-specific static accounts needed for deterministic tx building (e.g. PumpFunAmm).
+    /// Expected to be the v1 ordered list (len=14) from MarketEventKind::DexPoolAccounts.
+    dex_pool_accounts: Option<Vec<String>>,
+
     // Trade tracking
     trades: Vec<TradeEvent>,
     unique_buyers: HashSet<String>,
@@ -617,6 +621,7 @@ impl TokenTracker {
             dev_wallet: None,
             initial_liquidity,
             dev_supply_pct: None,
+            dex_pool_accounts: None,
             trades: Vec::new(),
             unique_buyers: HashSet::new(),
             unique_sellers: HashSet::new(),
@@ -1400,6 +1405,9 @@ struct MomentumContext {
     /// Pump.fun dev wallet info can arrive before PoolCreated.
     /// Store it by mint and apply once the TokenTracker exists.
     pending_dev_info: parking_lot::RwLock<HashMap<String, (String, f64)>>,
+    /// DEX pool accounts can arrive before PoolCreated.
+    /// Store by token mint and apply once the TokenTracker exists.
+    pending_pool_accounts: parking_lot::RwLock<HashMap<String, (String, String, Vec<String>)>>,
     /// Mint metadata (authority/supply/decimals) can arrive independently of pool creation.
     mint_infos: parking_lot::RwLock<HashMap<String, MintInfo>>,
     /// Token trackers for strategy filters (mint -> tracker)
@@ -1464,6 +1472,88 @@ impl MomentumContext {
         infos.insert(mint.to_string(), info);
     }
 
+    fn dex_requires_pool_accounts(dex: &str) -> bool {
+        dex.eq_ignore_ascii_case("PumpFunAmm")
+            || dex.eq_ignore_ascii_case("pump_amm")
+            || dex.eq_ignore_ascii_case("PumpSwap")
+            || dex.eq_ignore_ascii_case("pumpswap")
+    }
+
+    fn try_get_dex_pool_accounts_for_mint(&self, mint: &str) -> Option<Vec<String>> {
+        let trackers = self.token_trackers.read();
+        trackers
+            .get(mint)
+            .and_then(|t| t.dex_pool_accounts.clone())
+            .or_else(|| {
+                let pending = self.pending_pool_accounts.read();
+                pending.get(mint).map(|(_, _, a)| a.clone())
+            })
+    }
+
+    fn record_dex_pool_accounts(
+        &self,
+        dex: &str,
+        pool_address: &str,
+        base_mint: &str,
+        quote_mint: &str,
+        accounts: &[String],
+    ) {
+        // For PumpFunAmm this must be deterministic: 14 accounts, and accounts[0] must match pool_address.
+        if accounts.len() != 14 {
+            warn!(
+                dex = %dex,
+                pool = %pool_address,
+                base = %base_mint,
+                quote = %quote_mint,
+                accounts_len = accounts.len(),
+                "DexPoolAccounts ignored: expected 14 accounts"
+            );
+            return;
+        }
+        if accounts.first().map(|s| s.as_str()) != Some(pool_address) {
+            warn!(
+                dex = %dex,
+                pool = %pool_address,
+                first = ?accounts.first(),
+                "DexPoolAccounts ignored: accounts[0] must equal pool_address"
+            );
+            return;
+        }
+
+        // Identify the traded token mint (non-WSOL side for SOL pairs).
+        let wsol = "So11111111111111111111111111111111111111112";
+        let token_mint = if base_mint == wsol { quote_mint } else { base_mint };
+
+        {
+            let mut pending = self.pending_pool_accounts.write();
+            pending.insert(
+                token_mint.to_string(),
+                (dex.to_string(), pool_address.to_string(), accounts.to_vec()),
+            );
+        }
+
+        // Apply immediately if tracker exists.
+        let mut trackers = self.token_trackers.write();
+        if let Some(tracker) = trackers.get_mut(token_mint) {
+            if tracker.pool != pool_address {
+                debug!(
+                    mint = %token_mint,
+                    tracker_pool = %tracker.pool,
+                    event_pool = %pool_address,
+                    "DexPoolAccounts pool mismatch; keeping pending copy"
+                );
+                return;
+            }
+            tracker.dex_pool_accounts = Some(accounts.to_vec());
+            debug!(
+                mint = %token_mint,
+                pool = %pool_address,
+                dex = %dex,
+                "DexPoolAccounts applied to tracker"
+            );
+        }
+    }
+
     /// Get or create a token tracker
     fn get_or_create_tracker(
         &self,
@@ -1496,6 +1586,21 @@ impl MomentumContext {
                     if !was_blacklisted && tracker.blacklisted {
                         self.tokens_blacklisted
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+
+            // Apply any DexPoolAccounts that arrived before the tracker existed.
+            if let Some((dex_name, pool_addr, accounts)) = self
+                .pending_pool_accounts
+                .read()
+                .get(mint)
+                .cloned()
+            {
+                if let Some(tracker) = trackers.get_mut(mint) {
+                    if tracker.pool == pool_addr {
+                        tracker.dex = dex_name;
+                        tracker.dex_pool_accounts = Some(accounts);
                     }
                 }
             }
@@ -1958,6 +2063,8 @@ impl MomentumContext {
                                 mint = %pending.mint,
                                 entry_kind = ?pending.entry_kind,
                                 signature = ?result.signature,
+                                fill_status = ?result.fill_status,
+                                fill_unavailable_reason = ?result.fill_unavailable_reason,
                                 "BUY confirmed but fill_out missing; skipping position update"
                             );
 
@@ -2595,6 +2702,7 @@ async fn main() -> Result<()> {
         intent_counter: std::sync::atomic::AtomicU64::new(0),
         pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+        pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
         mint_infos: parking_lot::RwLock::new(HashMap::new()),
         token_trackers: parking_lot::RwLock::new(HashMap::new()),
         positions: parking_lot::RwLock::new(HashMap::new()),
@@ -2937,6 +3045,44 @@ async fn generate_and_publish_buy_intent(ctx: &MomentumContext, signal: &EntrySi
         }
     };
 
+    let dex_pool_accounts_opt = ctx.try_get_dex_pool_accounts_for_mint(&signal.mint);
+    let dex_requires_accounts = MomentumContext::dex_requires_pool_accounts(&signal.dex);
+    let dex_accounts: Vec<String> = if dex_requires_accounts {
+        let Some(accounts) = dex_pool_accounts_opt else {
+            // Roll back stage markers so we can try again when DexPoolAccounts arrives.
+            {
+                let mut trackers = ctx.token_trackers.write();
+                if let Some(tr) = trackers.get_mut(&signal.mint) {
+                    match signal.kind {
+                        EntryKind::Probe => tr.probe_sent_at = None,
+                        EntryKind::ScaleIn => tr.scale_sent_at = None,
+                    }
+                }
+            }
+            warn!(
+                mint = %signal.mint,
+                pool = %signal.pool,
+                dex = %signal.dex,
+                "Skipping BUY intent: missing DexPoolAccounts for deterministic build"
+            );
+            anyhow::bail!("cannot generate intent: missing DexPoolAccounts")
+        };
+        if accounts.len() != 14 || accounts.first().map(|s| s.as_str()) != Some(signal.pool.as_str()) {
+            warn!(
+                mint = %signal.mint,
+                pool = %signal.pool,
+                dex = %signal.dex,
+                accounts_len = accounts.len(),
+                first = ?accounts.first(),
+                "Skipping BUY intent: invalid DexPoolAccounts (expected len=14 and accounts[0]==pool)"
+            );
+            anyhow::bail!("cannot generate intent: invalid DexPoolAccounts")
+        }
+        accounts
+    } else {
+        Vec::new()
+    };
+
     let (last_sol_lamports, last_token_amount) = match last_trade_ratio_opt {
         Some(v) => v,
         None => {
@@ -2993,7 +3139,7 @@ async fn generate_and_publish_buy_intent(ctx: &MomentumContext, signal: &EntrySi
             input_mint: sol_mint.to_string(),
             output_mint: signal.mint.to_string(),
             pools: vec![signal.pool.to_string()],
-            accounts: vec![],
+            accounts: dex_accounts,
         },
         50, // Expected ROI: 0.5%
         max_slippage,
@@ -3233,6 +3379,7 @@ mod tests {
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
@@ -3475,6 +3622,7 @@ mod tests {
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
@@ -3491,6 +3639,22 @@ mod tests {
             let mut tracker = TokenTracker::new("mint", "pool", "dex", 1, 0);
             tracker.record_trade("w", true, 1_000_000_000, 1_000_000, "sig", &cfg);
             trackers.insert("mint".to_string(), tracker);
+        }
+
+        // Seed MintInfo so intent generation has decimals.
+        {
+            let mut infos = ctx.mint_infos.write();
+            infos.insert(
+                "mint".to_string(),
+                MintInfo {
+                    token_program: "spl-token".to_string(),
+                    decimals: 6,
+                    supply: 0,
+                    mint_authority: None,
+                    freeze_authority: None,
+                    last_updated: Instant::now(),
+                },
+            );
         }
 
         let signal = EntrySignal {
@@ -3554,6 +3718,7 @@ mod tests {
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
@@ -3617,6 +3782,7 @@ mod tests {
             intent_counter: std::sync::atomic::AtomicU64::new(0),
             pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
             mint_infos: parking_lot::RwLock::new(HashMap::new()),
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
@@ -3748,7 +3914,20 @@ async fn generate_and_publish_exit_intent(
             input_mint: mint.to_string(),      // Selling tokens
             output_mint: sol_mint.to_string(), // Receiving SOL
             pools: vec![pool.to_string()],
-            accounts: vec![],
+            accounts: {
+                let requires = MomentumContext::dex_requires_pool_accounts(dex);
+                if requires {
+                    let accounts = ctx
+                        .try_get_dex_pool_accounts_for_mint(mint)
+                        .ok_or_else(|| anyhow::anyhow!("cannot generate exit intent: missing DexPoolAccounts"))?;
+                    if accounts.len() != 14 || accounts.first().map(|s| s.as_str()) != Some(pool) {
+                        anyhow::bail!("cannot generate exit intent: invalid DexPoolAccounts")
+                    }
+                    accounts
+                } else {
+                    Vec::new()
+                }
+            },
         },
         0, // No expected ROI for exits
         max_slippage,
@@ -3875,6 +4054,17 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     "Skipping token - insufficient liquidity"
                 );
             }
+        }
+
+        MarketEventKind::DexPoolAccounts {
+            dex,
+            pool_address,
+            base_mint,
+            quote_mint,
+            accounts,
+        } => {
+            ctx.record_pool_seen(pool_address, event.slot.unwrap_or(0));
+            ctx.record_dex_pool_accounts(dex, pool_address, base_mint, quote_mint, accounts);
         }
 
         MarketEventKind::Trade {
