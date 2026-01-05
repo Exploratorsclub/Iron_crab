@@ -69,6 +69,7 @@ use ironcrab::nats::{
     TOPIC_TRADE_INTENTS,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind};
+use ironcrab::config::Config as AppConfig;
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
 use ironcrab::solana::rpc::SolanaRpc;
@@ -726,6 +727,7 @@ impl StateSnapshot {
 struct ExecutionContext {
     run_id: String,
     rpc_url: String,
+    helius_rpc_url: Option<String>,
     wallet_pubkey: Option<Pubkey>,
     /// The ONLY signer (Single-Signer rule). None means keyless mode.
     treasury: Option<Treasury>,
@@ -927,7 +929,11 @@ async fn run_liquidation_job(
 
     // Initialize DEX connectors for quote discovery.
     let raydium = Raydium::new(Arc::clone(&ctx.rpc));
-    let pump_amm = PumpFunAmmDex::new(Arc::clone(&ctx.rpc), ctx.rpc_url.clone(), None);
+    let pump_amm = PumpFunAmmDex::new(
+        Arc::clone(&ctx.rpc),
+        ctx.rpc_url.clone(),
+        ctx.helius_rpc_url.clone(),
+    );
     let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc)) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -2136,6 +2142,19 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let run_id = Uuid::new_v4().to_string();
 
+    // Optional app config: used for non-hot-path settings (e.g. Helius fallback endpoints).
+    let helius_rpc_url = match AppConfig::load(&args.config) {
+        Ok(c) => c.solana.helius_rpc_url,
+        Err(e) => {
+            warn!(
+                error = %e,
+                config = %args.config.display(),
+                "Failed to load config TOML; Helius fallback disabled"
+            );
+            None
+        }
+    };
+
     info!(
         run_id = %run_id,
         config = %args.config.display(),
@@ -2379,6 +2398,7 @@ async fn main() -> Result<()> {
     let ctx = Arc::new(ExecutionContext {
         run_id: run_id.clone(),
         rpc_url: args.rpc_url.clone(),
+        helius_rpc_url,
         wallet_pubkey,
         treasury,
         config_snapshot_id: parking_lot::RwLock::new(exec_config.snapshot_id()),
