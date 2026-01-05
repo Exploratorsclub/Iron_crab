@@ -439,8 +439,6 @@ impl CrossDexHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_is_cross_dex_arb_intent() {
         // Would need mock TradeIntent for proper testing

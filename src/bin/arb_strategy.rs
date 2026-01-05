@@ -38,9 +38,6 @@ use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
-/// NATS topic for config reload
-const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
-
 /// Build version for decision records
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -114,8 +111,6 @@ struct Args {
 struct PoolState {
     pool_address: String,
     dex: String,
-    base_mint: String,
-    quote_mint: String,
     /// Last known price (quote per base, e.g., SOL per token)
     last_price: Option<Decimal>,
     /// Liquidity in SOL
@@ -335,8 +330,6 @@ impl ArbContext {
         let pool_state = PoolState {
             pool_address: pool_address.to_string(),
             dex: dex.to_string(),
-            base_mint: base_mint.to_string(),
-            quote_mint: quote_mint.to_string(),
             last_price: None,
             liquidity_sol,
             last_update: Instant::now(),
@@ -566,7 +559,7 @@ async fn main() -> Result<()> {
         let mut client = NatsClient::new(config);
         if let Err(e) = client.connect().await {
             error!(error = %e, "Failed to connect to NATS");
-            return Err(e.into());
+            return Err(e);
         }
         info!(url = %args.nats_url, "Connected to NATS");
         Some(client)
@@ -594,7 +587,7 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 error!(error = %e, "Failed to subscribe to MarketEvents");
-                return Err(e.into());
+                return Err(e);
             }
         }
     } else {

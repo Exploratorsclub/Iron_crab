@@ -719,9 +719,7 @@ impl TokenTracker {
         }
 
         // If we haven't observed a dump, don't gate on recovery.
-        if self.dump_observed_at.is_none() {
-            return None;
-        }
+        self.dump_observed_at?;
 
         let recovery_ok = buy_dominance >= config.dump_recovery_min_buy_dominance
             && net_inflow >= config.dump_recovery_min_net_inflow_lamports as i128;
@@ -1045,6 +1043,9 @@ impl TokenTracker {
         let age = self.first_seen.elapsed();
         let age_secs = age.as_secs().max(1) as f64;
 
+        // Keep first_slot as a recorded attribute (useful for debugging/forensics).
+        let _first_slot = self.first_slot;
+
         // Filter recent trades within windows
         let now = Instant::now();
         let buyer_window = Duration::from_secs(config.buyer_window_secs);
@@ -1078,16 +1079,11 @@ impl TokenTracker {
         };
 
         TokenMetrics {
-            age_secs: age.as_secs(),
             unique_buyers_in_window: recent_buyers.len() as u32,
-            total_unique_buyers: self.unique_buyers.len() as u32,
             trades_per_sec,
             buy_dominance,
             net_sol_inflow: recent_buy_vol.saturating_sub(recent_sell_vol),
-            total_buy_volume: self.total_buy_volume,
-            total_sell_volume: self.total_sell_volume,
             dev_sold_early: self.dev_sold_early,
-            dev_rebought: self.dev_rebought,
             lp_removed: self.lp_removed,
             initial_liquidity_sol: self.initial_liquidity as f64 / 1_000_000_000.0,
         }
@@ -1336,16 +1332,11 @@ impl TokenTracker {
 /// Calculated metrics for logging/decisions
 #[derive(Debug)]
 struct TokenMetrics {
-    age_secs: u64,
     unique_buyers_in_window: u32,
-    total_unique_buyers: u32,
     trades_per_sec: f64,
     buy_dominance: f64,
     net_sol_inflow: u64,
-    total_buy_volume: u64,
-    total_sell_volume: u64,
     dev_sold_early: bool,
-    dev_rebought: bool,
     lp_removed: bool,
     initial_liquidity_sol: f64,
 }
@@ -1364,7 +1355,6 @@ struct MintInfo {
 /// Cached info about a pending intent (awaiting execution result)
 #[derive(Debug, Clone)]
 struct PendingIntent {
-    intent_id: String,
     mint: String,
     pool: String,
     dex: String,
@@ -1376,11 +1366,23 @@ struct PendingIntent {
     created_at: Instant,
 }
 
+struct OpenPositionParams<'a> {
+    mint: &'a str,
+    pool: &'a str,
+    dex: &'a str,
+    entry_price: f64,
+    token_decimals: u8,
+    token_amount: u64,
+    sol_invested: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
     Probe,
     ScaleIn,
 }
+
+type PendingPoolAccounts = (String, String, Vec<String>);
 
 #[derive(Debug, Clone)]
 struct EntrySignal {
@@ -1407,7 +1409,7 @@ struct MomentumContext {
     pending_dev_info: parking_lot::RwLock<HashMap<String, (String, f64)>>,
     /// DEX pool accounts can arrive before PoolCreated.
     /// Store by token mint and apply once the TokenTracker exists.
-    pending_pool_accounts: parking_lot::RwLock<HashMap<String, (String, String, Vec<String>)>>,
+    pending_pool_accounts: parking_lot::RwLock<HashMap<String, PendingPoolAccounts>>,
     /// Mint metadata (authority/supply/decimals) can arrive independently of pool creation.
     mint_infos: parking_lot::RwLock<HashMap<String, MintInfo>>,
     /// Token trackers for strategy filters (mint -> tracker)
@@ -1429,24 +1431,6 @@ impl MomentumContext {
             .intent_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!("int-{}-{:06}", &self.run_id[..8], n)
-    }
-
-    /// Classify trading regime for a pool
-    fn classify_regime(&self, pool_address: &str, current_slot: u64) -> TradingRegime {
-        let first_seen = self.pool_first_seen.read().get(pool_address).copied();
-        let config = self.config.read();
-
-        match first_seen {
-            Some(first_slot) => {
-                let age_slots = current_slot.saturating_sub(first_slot);
-                if age_slots < config.early_slot_threshold {
-                    TradingRegime::Early
-                } else {
-                    TradingRegime::Established
-                }
-            }
-            None => TradingRegime::Early, // New pool = EARLY
-        }
     }
 
     /// Record first-seen slot for a pool
@@ -1767,28 +1751,19 @@ impl MomentumContext {
     // =========================================================================
 
     /// Open a new position after buy intent is executed
-    fn open_position(
-        &self,
-        mint: &str,
-        pool: &str,
-        dex: &str,
-        entry_price: f64,
-        token_decimals: u8,
-        token_amount: u64,
-        sol_invested: u64,
-    ) {
+    fn open_position(&self, p: OpenPositionParams<'_>) {
         let mut positions = self.positions.write();
-        if let Some(pos) = positions.get_mut(mint) {
-            pos.token_amount = pos.token_amount.saturating_add(token_amount);
-            pos.add_investment(sol_invested);
+        if let Some(pos) = positions.get_mut(p.mint) {
+            pos.token_amount = pos.token_amount.saturating_add(p.token_amount);
+            pos.add_investment(p.sol_invested);
             // Keep the best-known decimals (prefer non-zero).
-            if pos.token_decimals == 0 && token_decimals != 0 {
-                pos.token_decimals = token_decimals;
+            if pos.token_decimals == 0 && p.token_decimals != 0 {
+                pos.token_decimals = p.token_decimals;
             }
             info!(
-                mint = %mint,
-                additional_sol = sol_invested,
-                additional_tokens_raw = token_amount,
+                mint = %p.mint,
+                additional_sol = p.sol_invested,
+                additional_tokens_raw = p.token_amount,
                 total_sol = pos.sol_invested,
                 total_tokens_raw = pos.token_amount,
                 "📈 Position scaled in"
@@ -1796,21 +1771,21 @@ impl MomentumContext {
             return;
         }
         positions.insert(
-            mint.to_string(),
+            p.mint.to_string(),
             PositionTracker::new(
-                mint,
-                pool,
-                dex,
-                entry_price,
-                token_decimals,
-                token_amount,
-                sol_invested,
+                p.mint,
+                p.pool,
+                p.dex,
+                p.entry_price,
+                p.token_decimals,
+                p.token_amount,
+                p.sol_invested,
             ),
         );
         info!(
-            mint = %mint,
-            entry_price = entry_price,
-            sol_invested = sol_invested,
+            mint = %p.mint,
+            entry_price = p.entry_price,
+            sol_invested = p.sol_invested,
             "📈 Position opened"
         );
     }
@@ -1833,7 +1808,7 @@ impl MomentumContext {
             let pnl = pos.pnl_pct();
             let hold_secs = pos.entry_time.elapsed().as_secs();
             info!(
-                mint = %mint,
+                mint = %pos.mint,
                 pnl_pct = pnl,
                 hold_time_secs = hold_secs,
                 "📉 Position closed"
@@ -1845,6 +1820,7 @@ impl MomentumContext {
     fn check_for_exits(&self) -> Vec<(String, String, String, String, String, u64)> {
         // Returns: Vec<(mint, pool, dex, exit_type, reason, token_amount)>
         let config = self.config.read().clone();
+        let now = Instant::now();
 
         // Snapshot tracker-derived hard-exit signals BEFORE locking positions,
         // to avoid lock-order deadlocks (market event handling locks trackers then positions).
@@ -1902,7 +1878,11 @@ impl MomentumContext {
             // Hard exits (post-entry): dev sells, LP removed.
             if let Some(sig) = tracker_signals.get(mint) {
                 if let Some(lp_at) = sig.lp_removed_at {
-                    if lp_at > pos.entry_time {
+                    let within_window = config.lp_removal_window_secs == 0
+                        || now.duration_since(lp_at)
+                            <= Duration::from_secs(config.lp_removal_window_secs);
+
+                    if lp_at > pos.entry_time && within_window {
                         pos.exit_generated = true;
                         exits.push((
                             mint.clone(),
@@ -1985,7 +1965,6 @@ impl MomentumContext {
         pending.insert(
             intent_id.to_string(),
             PendingIntent {
-                intent_id: intent_id.to_string(),
                 mint: mint.to_string(),
                 pool: pool.to_string(),
                 dex: dex.to_string(),
@@ -2012,7 +1991,6 @@ impl MomentumContext {
         pending.insert(
             intent_id.to_string(),
             PendingIntent {
-                intent_id: intent_id.to_string(),
                 mint: mint.to_string(),
                 pool: pool.to_string(),
                 dex: dex.to_string(),
@@ -2144,15 +2122,15 @@ impl MomentumContext {
                             }
                         }
 
-                        self.open_position(
-                            &pending.mint,
-                            &pending.pool,
-                            &pending.dex,
+                        self.open_position(OpenPositionParams {
+                            mint: &pending.mint,
+                            pool: &pending.pool,
+                            dex: &pending.dex,
                             entry_price,
                             token_decimals,
                             token_amount,
                             sol_invested,
-                        );
+                        });
                     }
                     TradeSide::Sell => {
                         // SELL confirmed - close position
@@ -2998,9 +2976,7 @@ async fn main() -> Result<()> {
 
 /// Generate and publish a BUY TradeIntent based on an entry signal.
 async fn generate_and_publish_buy_intent(ctx: &MomentumContext, signal: &EntrySignal) -> Result<()> {
-    let config = ctx.config.read();
-    let max_slippage = config.early_max_slippage_bps;
-    drop(config);
+    let max_slippage = { ctx.config.read().early_max_slippage_bps };
 
     // Assume SOL (So11111...) as quote mint for PumpFun/meme tokens
     let sol_mint = "So11111111111111111111111111111111111111112";
@@ -3828,9 +3804,7 @@ async fn generate_and_publish_exit_intent(
     reason: &str,
     token_amount: u64,
 ) -> Result<()> {
-    let config = ctx.config.read();
-    let max_slippage = config.early_max_slippage_bps; // Use higher slippage for exits
-    drop(config);
+    let max_slippage = { ctx.config.read().early_max_slippage_bps }; // Use higher slippage for exits
 
     // SOL as output (selling tokens for SOL)
     let sol_mint = "So11111111111111111111111111111111111111112";
@@ -4077,8 +4051,8 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             signature,
         } => {
             // Record the trade in the tracker
-            let sol_lamports = *sol_amount as u64;
-            let token_raw = *token_amount as u64;
+            let sol_lamports = *sol_amount;
+            let token_raw = *token_amount;
             let sig = signature.clone().unwrap_or_default();
 
             // Check if this trader is the dev wallet and record dev behavior
@@ -4138,7 +4112,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             ..
         } => {
             // LP removal - potential rug signal
-            let sol_lamports = *sol_amount as u64;
+            let sol_lamports = *sol_amount;
             ctx.record_lp_removal(mint);
 
             warn!(

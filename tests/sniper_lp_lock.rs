@@ -1,4 +1,4 @@
-#![cfg(feature = "test_helpers")]
+#![cfg(all(feature = "test_helpers", feature = "legacy_sniper"))]
 
 use ironcrab::solana::sniper::{test_compute_concentration, HolderClass};
 

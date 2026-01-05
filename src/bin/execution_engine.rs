@@ -39,7 +39,7 @@ use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -664,7 +664,7 @@ impl StateSnapshot {
     }
 
     /// Save snapshot to disk
-    fn save(&self, log_dir: &PathBuf) -> Result<()> {
+    fn save(&self, log_dir: &Path) -> Result<()> {
         let path = log_dir.join(Self::SNAPSHOT_FILE);
         std::fs::create_dir_all(log_dir)?;
         let json = serde_json::to_string_pretty(self)?;
@@ -674,7 +674,7 @@ impl StateSnapshot {
     }
 
     /// Load snapshot from disk (returns None if not found or invalid)
-    fn load(log_dir: &PathBuf) -> Option<Self> {
+    fn load(log_dir: &Path) -> Option<Self> {
         let path = log_dir.join(Self::SNAPSHOT_FILE);
         if !path.exists() {
             info!(path = %path.display(), "No state snapshot found, starting fresh");
@@ -768,7 +768,7 @@ struct ExecutionContext {
 
     // === Cross-DEX Arbitrage Handler ===
     /// Handler for cross-DEX arb intents (optional, requires RPC)
-    cross_dex_handler: Option<parking_lot::RwLock<CrossDexHandler>>,
+    cross_dex_handler: Option<Arc<CrossDexHandler>>,
     /// RPC wrapper for read-only queries and (future) sim/send
     rpc: Arc<SolanaRpc>,
 
@@ -1085,7 +1085,7 @@ async fn run_liquidation_job(
                 #[cfg(unix)]
                 maybe_ping_watchdog();
 
-                if metadata.get("creator").is_some() && resources.pools.len() == 1 {
+                if metadata.contains_key("creator") && resources.pools.len() == 1 {
                     metadata.insert("dex".to_string(), "pumpfun".to_string());
                     min_out_sol = Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
                 }
@@ -1853,7 +1853,7 @@ async fn run_manual_burn_job(
                 }
                 "simulation_timeout_ms" => {
                     if let Some(v) = value.as_u64() {
-                        if v >= 100 && v <= 30000 {
+                        if (100..=30000).contains(&v) {
                             config.simulation_timeout_ms = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -1866,7 +1866,7 @@ async fn run_manual_burn_job(
                 }
                 "confirmation_timeout_ms" => {
                     if let Some(v) = value.as_u64() {
-                        if v >= 500 && v <= 300_000 {
+                        if (500..=300_000).contains(&v) {
                             config.confirmation_timeout_ms = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -1879,7 +1879,7 @@ async fn run_manual_burn_job(
                 }
                 "confirm_timeout_ms" => {
                     if let Some(v) = value.as_u64() {
-                        if v >= 500 && v <= 300_000 {
+                        if (500..=300_000).contains(&v) {
                             config.confirmation_timeout_ms = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -1971,7 +1971,7 @@ async fn run_manual_burn_job(
     /// Save state snapshot for crash recovery (P1: DoD K)
     fn save_state(&self) -> Result<()> {
         let snapshot = StateSnapshot::from_context(self);
-        snapshot.save(&self.log_base)
+        snapshot.save(self.log_base.as_path())
     }
 
     fn next_decision_id(&self) -> String {
@@ -2148,8 +2148,10 @@ async fn main() -> Result<()> {
     let has_keys = treasury.is_some();
 
     // Setup config
-    let mut exec_config = ExecutionConfig::default();
-    exec_config.send_enabled = !args.simulate_only && !args.dry_run && has_keys;
+    let exec_config = ExecutionConfig {
+        send_enabled: !args.simulate_only && !args.dry_run && has_keys,
+        ..Default::default()
+    };
 
     if exec_config.send_enabled {
         info!("Transaction sending ENABLED");
@@ -2238,7 +2240,7 @@ async fn main() -> Result<()> {
     AVAILABLE_SOL_LAMPORTS.store(initial_balance, Ordering::Relaxed);
 
     // P1: Load state snapshot if available (DoD K)
-    let snapshot = StateSnapshot::load(&log_base);
+    let snapshot = StateSnapshot::load(log_base.as_path());
 
     // Restore processed intents (idempotency)
     if let Some(ref snap) = snapshot {
@@ -2886,7 +2888,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             check_name: "max_open_positions".to_string(),
             passed: true,
             reason_code: None,
-            details: Some(format!("current < max (buy_only)")),
+            details: Some("current < max (buy_only)".to_string()),
         });
     } else {
         checks.push(CheckResult {
@@ -3337,8 +3339,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     if is_cross_dex_arb {
         info!(intent_id = %intent.intent_id, "Processing as Cross-DEX arbitrage intent");
 
-        if let Some(ref handler_lock) = ctx.cross_dex_handler {
-            let handler = handler_lock.read();
+        if let Some(ref handler) = ctx.cross_dex_handler {
 
             // Estimate tx cost for profitability check
             let estimated_tx_cost = 50_000u64; // ~0.00005 SOL (TODO: use fee policy)
@@ -3691,7 +3692,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                             TX_CONFIRMED_TOTAL.fetch_add(1, Ordering::Relaxed);
 
                             // If Jito returned tx signatures, record the first as a convenience.
-                            if let Some(sig0) = status.transactions.get(0).cloned() {
+                            if let Some(sig0) = status.transactions.first().cloned() {
                                 sr.signature = Some(sig0.clone());
                             }
 
@@ -4268,11 +4269,7 @@ async fn confirm_signature_status(
             .await
             .map_err(|e| format!("rpc_error:{e}"))?;
 
-        let status_opt = res
-            .value
-            .get(0)
-            .cloned()
-            .unwrap_or(None);
+        let status_opt = res.value.first().cloned().unwrap_or(None);
 
         if let Some(st) = status_opt {
             if let Some(err) = st.err {

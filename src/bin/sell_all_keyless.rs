@@ -369,7 +369,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            if metadata.get("creator").is_some() {
+            if metadata.contains_key("creator") {
                 metadata.insert("dex".to_string(), "pumpfun".to_string());
                 min_out_sol = Some(apply_slippage_min_out(q.amount_out, args.max_slippage_bps));
             }

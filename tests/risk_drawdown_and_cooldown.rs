@@ -1,4 +1,4 @@
-#![cfg(feature = "test_helpers")]
+#![cfg(all(feature = "test_helpers", feature = "legacy_sniper"))]
 use ironcrab::metrics::{
     record_trade_return, reset_trade_return_metrics, TRADE_RETURN_BUCKET_COUNTS,
     TRADE_RETURN_COUNT, TRADE_RETURN_SUM_MICRO,

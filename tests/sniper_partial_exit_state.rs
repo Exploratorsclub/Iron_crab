@@ -1,4 +1,4 @@
-#![cfg(feature = "test_helpers")]
+#![cfg(all(feature = "test_helpers", feature = "legacy_sniper"))]
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::solana::sniper::{SniperCfg, SniperEngine};
 use ironcrab::wallet::Treasury;

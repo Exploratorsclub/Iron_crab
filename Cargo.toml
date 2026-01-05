@@ -95,6 +95,7 @@ jito = []
 notify_watch = ["notify"]
 nats = ["async-nats"]
 legacy_monolith = []
+legacy_sniper = []
 
 [dependencies.pyo3]
 version = "0.24.2"

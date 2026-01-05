@@ -53,7 +53,7 @@ async fn rpc_call(client: &Client, rpc_url: &str, method: &str, params: Value) -
     if !status.is_success() {
         return Err(anyhow!("RPC http status {status}: {v}"));
     }
-    if !v.get("error").is_none() {
+    if v.get("error").is_some() {
         return Err(anyhow!("RPC error: {v}"));
     }
     Ok(v)
