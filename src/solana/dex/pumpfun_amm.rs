@@ -9,8 +9,10 @@ use solana_sdk::hash::hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
+use std::time::Duration;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::time::sleep;
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PUMPFUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
@@ -265,17 +267,47 @@ impl PumpFunAmmDex {
         }
 
         for addr in scan_addresses {
-            // We scan deeper than the default 50 because the newest signatures can be dominated
-            // by failed liquidation attempts (which we intentionally skip).
-            let sigs_v = self
-                .rpc_call("getSignaturesForAddress", json!([addr, {"limit": 500}]))
-                .await?;
-            let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
-                Some(v) => v,
-                None => continue,
-            };
+            // We paginate because the newest signatures can be dominated by our own failed
+            // liquidation attempts (which we intentionally skip), and the first successful
+            // PumpSwap trades can be older than the initial page on busy pools.
+            const SIG_PAGE_SIZE: u32 = 1_000;
+            const SIG_MAX_PAGES: usize = 20; // up to ~20k signatures; exits early on first match
+            let mut before: Option<String> = None;
 
-            for s in sigs.iter() {
+            for _page in 0..SIG_MAX_PAGES {
+                let mut cfg = json!({"limit": SIG_PAGE_SIZE});
+                if let Some(b) = &before {
+                    cfg["before"] = json!(b);
+                }
+
+                let sigs_v = match self
+                    .rpc_call("getSignaturesForAddress", json!([addr, cfg]))
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Best-effort: if discovery endpoint is rate-limited or transiently fails,
+                        // don't fail liquidation outright; just stop scanning this address.
+                        break;
+                    }
+                };
+
+                let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
+                    Some(v) => v,
+                    None => break,
+                };
+                if sigs.is_empty() {
+                    break;
+                }
+
+                // Update pagination cursor (last signature in the page)
+                before = sigs
+                    .last()
+                    .and_then(|v| v.get("signature"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                for s in sigs.iter() {
                 // Avoid poisoning discovery with failed transactions (e.g., our own earlier
                 // liquidation attempts that used wrong accounts and therefore failed).
                 if let Some(err) = s.get("err") {
@@ -296,7 +328,10 @@ impl PumpFunAmmDex {
                     .await
                 {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(_) => {
+                        // Transient failures are common on public endpoints; keep scanning.
+                        continue;
+                    }
                 };
 
                 let msg = match tx_v
@@ -407,6 +442,10 @@ impl PumpFunAmmDex {
                     self.pools_by_base.insert(base_mint, pool.clone());
                     return Ok(Some(pool));
                 }
+                }
+
+                // Small delay between pages to reduce rate-limit pressure on discovery endpoints.
+                sleep(Duration::from_millis(50)).await;
             }
         }
 
