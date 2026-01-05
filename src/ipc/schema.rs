@@ -1065,6 +1065,32 @@ pub enum ExecutionStatus {
     Timeout,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FillStatus {
+    /// Both legs (fill_in and fill_out) are present.
+    Complete,
+    /// At least one of fill_in / fill_out is present, but not both.
+    Partial,
+    /// Neither fill_in nor fill_out could be determined.
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FillUnavailableReason {
+    /// RPC fetch of confirmed tx failed.
+    RpcTxFetchFailed,
+    /// Transaction meta missing.
+    TxMetaMissing,
+    /// Wallet pubkey not found in message account keys.
+    WalletAccountIndexMissing,
+    /// SOL lamport delta inference was gated because the tx showed account create/close noise.
+    LamportDeltaGatedAccountLifecycleNoise,
+    /// Token balance deltas were missing / insufficient to compute fills.
+    TokenBalanceDeltaMissing,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionFees {
     /// Network fee in lamports
@@ -1112,6 +1138,14 @@ pub struct ExecutionResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fill_out: Option<ExplicitAmount>,
 
+    /// Fill diagnostics for downstream consumers.
+    ///
+    /// Backward compatible: older producers omit these fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_status: Option<FillStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_unavailable_reason: Option<FillUnavailableReason>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirmed_slot: Option<u64>,
 
@@ -1153,6 +1187,8 @@ impl ExecutionResult {
             status: ExecutionStatus::Sent,
             fill_in: None,
             fill_out: None,
+            fill_status: None,
+            fill_unavailable_reason: None,
             confirmed_slot: None,
             fees: None,
             pnl: None,
@@ -1164,6 +1200,16 @@ impl ExecutionResult {
     pub fn with_fills(mut self, fill_in: Option<ExplicitAmount>, fill_out: Option<ExplicitAmount>) -> Self {
         self.fill_in = fill_in;
         self.fill_out = fill_out;
+        self
+    }
+
+    pub fn with_fill_diagnostics(
+        mut self,
+        fill_status: FillStatus,
+        fill_unavailable_reason: Option<FillUnavailableReason>,
+    ) -> Self {
+        self.fill_status = Some(fill_status);
+        self.fill_unavailable_reason = fill_unavailable_reason;
         self
     }
 

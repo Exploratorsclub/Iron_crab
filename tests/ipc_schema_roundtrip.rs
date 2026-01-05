@@ -8,12 +8,11 @@
 
 use ironcrab::ipc::{
     CheckResult, DecisionOutcome, DecisionRecord, ExecutionFees, ExecutionPnl, ExecutionResult,
-    ExecutionStatus, ExplicitAmount, FeePolicy, IntentOrigin, IntentTier, MarketEvent,
+    ExecutionStatus, ExplicitAmount, FeePolicy, FillStatus, FillUnavailableReason, IntentOrigin, IntentTier, MarketEvent,
     MarketEventKind, RecordHeader, RejectReason, SimulationResult, TradeIntent, TradeResources,
     TradeSide, TradingRegime, SCHEMA_VERSION,
 };
 use rust_decimal::Decimal;
-use std::collections::HashMap;
 
 /// Test that RecordHeader contains all required fields per STORAGE_CONVENTIONS.md §4
 #[test]
@@ -393,7 +392,11 @@ fn test_execution_result_required_fields() {
         },
         250,
     )
-    .with_fills(Some(ExplicitAmount::sol_from_lamports(100_000_000)), Some(ExplicitAmount::new(42_000, 6)));
+    .with_fills(
+        Some(ExplicitAmount::sol_from_lamports(100_000_000)),
+        Some(ExplicitAmount::new(42_000, 6)),
+    )
+    .with_fill_diagnostics(FillStatus::Complete, None);
 
     let json = serde_json::to_string(&result).unwrap();
 
@@ -414,6 +417,10 @@ fn test_execution_result_required_fields() {
     assert!(json.contains("pnl"));
     assert!(json.contains("latency_ms"));
 
+    // Fill diagnostics
+    assert!(json.contains("fill_status"));
+    assert!(json.contains("complete"));
+
     let parsed: ExecutionResult = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.execution_id, "exe-001");
     assert_eq!(parsed.source, "momentum-bot"); // P1: Source attribution
@@ -422,6 +429,50 @@ fn test_execution_result_required_fields() {
     assert!(parsed.pnl.is_some());
     assert!(parsed.fill_in.is_some());
     assert!(parsed.fill_out.is_some());
+    assert_eq!(parsed.fill_status, Some(FillStatus::Complete));
+    assert_eq!(parsed.fill_unavailable_reason, None);
+}
+
+#[test]
+fn test_execution_result_fill_unavailable_reason_roundtrip() {
+    let result = ExecutionResult::new_sent(
+        "execution-engine",
+        "v0.1.0",
+        "run-789",
+        "exe-002".to_string(),
+        "dec-002".to_string(),
+        "intent-002".to_string(),
+        "momentum-bot".to_string(),
+        Some("5abcdef123456...".to_string()),
+        None,
+    )
+    .mark_confirmed(
+        12345,
+        ExecutionFees {
+            network_fee_lamports: 5000,
+            tip_lamports: 0,
+            compute_units: 150000,
+        },
+        ExecutionPnl {
+            gross_lamports: 0,
+            net_lamports: -5000,
+            decimals: 9,
+        },
+        250,
+    )
+    .with_fills(None, None)
+    .with_fill_diagnostics(
+        FillStatus::Unavailable,
+        Some(FillUnavailableReason::RpcTxFetchFailed),
+    );
+
+    let json = serde_json::to_string(&result).unwrap();
+    let parsed: ExecutionResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.fill_status, Some(FillStatus::Unavailable));
+    assert_eq!(
+        parsed.fill_unavailable_reason,
+        Some(FillUnavailableReason::RpcTxFetchFailed)
+    );
 }
 
 /// Test RejectReason serialization and categorization

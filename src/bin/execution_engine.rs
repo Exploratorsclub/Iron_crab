@@ -50,7 +50,8 @@ use uuid::Uuid;
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, ExecutionResult, ExecutionStatus, ExplicitAmount, FairnessPolicy, FeePolicy,
-    IntentOrigin, IntentTier, RecordHeader, RejectReason, SimulationResult,
+    FillStatus, FillUnavailableReason, IntentOrigin, IntentTier, RecordHeader, RejectReason,
+    SimulationResult,
     TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
@@ -197,7 +198,7 @@ async fn compute_intent_fills_best_effort(
     wallet: Pubkey,
     signature: &Signature,
     intent: &TradeIntent,
-) -> (Option<ExplicitAmount>, Option<ExplicitAmount>) {
+) -> (Option<ExplicitAmount>, Option<ExplicitAmount>, FillStatus, Option<FillUnavailableReason>) {
     let cfg = RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::JsonParsed),
         commitment: Some(solana_commitment_config::CommitmentConfig {
@@ -214,9 +215,23 @@ async fn compute_intent_fills_best_effort(
         Ok(tx) => tx,
         Err(e) => {
             debug!(sig = %signature, error = %e, "Failed to fetch tx meta for fills (best-effort)");
-            return (None, None);
+            return (
+                None,
+                None,
+                FillStatus::Unavailable,
+                Some(FillUnavailableReason::RpcTxFetchFailed),
+            );
         }
     };
+
+    if tx.transaction.meta.is_none() {
+        return (
+            None,
+            None,
+            FillStatus::Unavailable,
+            Some(FillUnavailableReason::TxMetaMissing),
+        );
+    }
 
     let input_mint = intent.resources.input_mint.as_str();
     let output_mint = intent.resources.output_mint.as_str();
@@ -227,8 +242,20 @@ async fn compute_intent_fills_best_effort(
 
     // Fallback path (best-effort): if SOL is represented as So111.. but token balances are absent
     // (e.g. native SOL transfers), approximate fills using fee payer lamport delta.
+    let mut lamport_reason: Option<FillUnavailableReason> = None;
     let (payer_delta_lamports, fee_lamports, lamport_noise) =
-        compute_wallet_lamport_delta_best_effort(&tx, &wallet).unwrap_or((0, 0, true));
+        match compute_wallet_lamport_delta_best_effort(&tx, &wallet) {
+            Some((d, f, noise)) => {
+                if noise {
+                    lamport_reason = Some(FillUnavailableReason::LamportDeltaGatedAccountLifecycleNoise);
+                }
+                (d, f, noise)
+            }
+            None => {
+                lamport_reason = Some(FillUnavailableReason::WalletAccountIndexMissing);
+                (0, 0, true)
+            }
+        };
 
     let fill_in = if let Some((decimals, delta)) = input_token_delta {
         if delta < 0 {
@@ -268,7 +295,24 @@ async fn compute_intent_fills_best_effort(
         None
     };
 
-    (fill_in, fill_out)
+    let fill_status = match (fill_in.is_some(), fill_out.is_some()) {
+        (true, true) => FillStatus::Complete,
+        (true, false) | (false, true) => FillStatus::Partial,
+        (false, false) => FillStatus::Unavailable,
+    };
+
+    let sol_leg_missing = (input_mint == SOL_MINT && fill_in.is_none())
+        || (output_mint == SOL_MINT && fill_out.is_none());
+
+    let fill_unavailable_reason = if fill_status == FillStatus::Complete {
+        None
+    } else if (input_mint == SOL_MINT || output_mint == SOL_MINT) && sol_leg_missing {
+        lamport_reason.or(Some(FillUnavailableReason::TokenBalanceDeltaMissing))
+    } else {
+        Some(FillUnavailableReason::TokenBalanceDeltaMissing)
+    };
+
+    (fill_in, fill_out, fill_status, fill_unavailable_reason)
 }
 
 async fn discover_wallet_open_positions(rpc: &SolanaRpc, owner: Pubkey) -> anyhow::Result<usize> {
@@ -3887,9 +3931,11 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             if matches!(status, ExecutionStatus::Confirmed) {
                 if let (Some(wallet), Some(sig_str)) = (ctx.wallet_pubkey, exec.signature.as_deref()) {
                     if let Ok(sig) = Signature::from_str(sig_str) {
-                        let (fill_in, fill_out) =
+                        let (fill_in, fill_out, fill_status, fill_reason) =
                             compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await;
-                        exec = exec.with_fills(fill_in, fill_out);
+                        exec = exec
+                            .with_fills(fill_in, fill_out)
+                            .with_fill_diagnostics(fill_status, fill_reason);
                     }
                 }
             }
@@ -3925,11 +3971,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             .or_else(|| send_signature.clone())
             .unwrap_or_default();
 
-        let (fill_in, fill_out) =
-            if let (Some(wallet), Ok(sig)) = (ctx.wallet_pubkey, Signature::from_str(&tx_hash)) {
-                compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await
+        let (fill_in, fill_out, _fill_status, _fill_reason) = if let (Some(wallet), Ok(sig)) =
+            (ctx.wallet_pubkey, Signature::from_str(&tx_hash))
+        {
+            compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await
         } else {
-            (None, None)
+            (None, None, FillStatus::Unavailable, None)
         };
 
         let (mint, action, amount_tokens, price_sol) = match intent.side {
