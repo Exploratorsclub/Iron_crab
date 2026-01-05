@@ -266,6 +266,17 @@ impl PumpFunAmmDex {
                     fee_program: Pubkey::from_str(&account_keys[accounts[22]])?,
                 };
 
+                // Validate the fee-config relationship. Recent PumpSwap versions use a separate
+                // fee program (pfee...) which owns the fee_config account. If we mis-map indices
+                // from a transaction variant, simulation fails with AccountOwnedByWrongProgram.
+                if let Ok(acct) = self.rpc.rpc.get_account(&pool.fee_config).await {
+                    if acct.owner != pool.fee_program {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+
                 self.pools_by_base.insert(base_mint, pool.clone());
                 return Ok(Some(pool));
             }
