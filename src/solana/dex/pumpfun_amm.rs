@@ -14,8 +14,7 @@ use std::sync::Arc;
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PUMPFUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
-// Observed on-chain in PumpSwap/Pump.fun AMM swaps: Anchor expects `fee_config` to be owned by
-// this program.
+// Observed on-chain in PumpSwap/Pump.fun AMM swaps: `fee_program` is this program id.
 const PUMPFUN_AMM_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 
 // Best-effort: observed Pump.fun AMM "market" account layout contains
@@ -378,10 +377,11 @@ impl PumpFunAmmDex {
                         fee_program: Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?,
                     };
 
-                    // Resolve `fee_config` robustly: it must be a non-executable account owned by the
-                    // known fee program. We only scan the tail of the ix account list because the
+                    // Resolve `fee_config` robustly: it must be a non-executable account owned by
+                    // the Pump.fun AMM program. We only scan the tail of the ix account list because the
                     // layout is stable there and it keeps RPC calls bounded.
                     let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
+                    let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
                     let mut fee_config = None;
                     let search_start = accounts.len().saturating_sub(8);
                     for acc_idx in accounts[search_start..].iter().rev() {
@@ -389,7 +389,7 @@ impl PumpFunAmmDex {
                             Some(v) => Pubkey::from_str(v)?,
                             None => continue,
                         };
-                        if pk == fee_program {
+                        if pk == fee_program || pk == pump_amm_program {
                             continue;
                         }
                         let Some((owner, executable)) =
@@ -397,7 +397,7 @@ impl PumpFunAmmDex {
                         else {
                             continue;
                         };
-                        if !executable && owner == fee_program {
+                        if !executable && owner == pump_amm_program {
                             fee_config = Some(pk);
                             break;
                         }
