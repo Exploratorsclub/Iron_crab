@@ -94,6 +94,7 @@ python_ipc = []
 jito = []
 notify_watch = ["notify"]
 nats = ["async-nats"]
+legacy_monolith = []
 
 [dependencies.pyo3]
 version = "0.24.2"

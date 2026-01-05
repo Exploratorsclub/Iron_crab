@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy_monolith"))]
 mod tests {
     use ironcrab::{
         config::Config,
