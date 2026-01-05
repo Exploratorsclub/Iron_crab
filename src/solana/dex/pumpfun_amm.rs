@@ -251,16 +251,18 @@ impl PumpFunAmmDex {
                 None => continue,
             };
 
-            let account_keys = match Self::parse_account_keys(msg) {
+            let meta = tx_v
+                .get("result")
+                .and_then(|r| r.get("meta"))
+                .unwrap_or(&Value::Null);
+
+            let mut account_keys = match Self::parse_account_keys(msg) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let instructions = match msg.get("instructions").and_then(|v| v.as_array()) {
-                Some(v) => v,
-                None => continue,
-            };
+            Self::extend_with_loaded_addresses(&mut account_keys, meta);
 
-            for ix in instructions {
+            for ix in Self::collect_all_instructions(msg, meta) {
                 let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
                     Some(v) => v as usize,
                     None => continue,
@@ -408,16 +410,18 @@ impl PumpFunAmmDex {
                 None => continue,
             };
 
-            let account_keys = match Self::parse_account_keys(msg) {
+            let meta = tx_v
+                .get("result")
+                .and_then(|r| r.get("meta"))
+                .unwrap_or(&Value::Null);
+
+            let mut account_keys = match Self::parse_account_keys(msg) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let instructions = match msg.get("instructions").and_then(|v| v.as_array()) {
-                Some(v) => v,
-                None => continue,
-            };
+            Self::extend_with_loaded_addresses(&mut account_keys, meta);
 
-            for ix in instructions {
+            for ix in Self::collect_all_instructions(msg, meta) {
                 let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
                     Some(v) => v as usize,
                     None => continue,
@@ -497,6 +501,42 @@ impl PumpFunAmmDex {
             }
         }
         Ok(out)
+    }
+
+    fn extend_with_loaded_addresses(out: &mut Vec<String>, meta: &Value) {
+        let Some(loaded) = meta.get("loadedAddresses") else {
+            return;
+        };
+
+        if let Some(w) = loaded.get("writable").and_then(|v| v.as_array()) {
+            for k in w.iter().filter_map(|v| v.as_str()) {
+                out.push(k.to_string());
+            }
+        }
+
+        if let Some(r) = loaded.get("readonly").and_then(|v| v.as_array()) {
+            for k in r.iter().filter_map(|v| v.as_str()) {
+                out.push(k.to_string());
+            }
+        }
+    }
+
+    fn collect_all_instructions<'a>(msg: &'a Value, meta: &'a Value) -> Vec<&'a Value> {
+        let mut out: Vec<&'a Value> = Vec::new();
+
+        if let Some(ixs) = msg.get("instructions").and_then(|v| v.as_array()) {
+            out.extend(ixs.iter());
+        }
+
+        if let Some(inner) = meta.get("innerInstructions").and_then(|v| v.as_array()) {
+            for entry in inner {
+                if let Some(ixs) = entry.get("instructions").and_then(|v| v.as_array()) {
+                    out.extend(ixs.iter());
+                }
+            }
+        }
+
+        out
     }
 
     async fn get_vault_amount(&self, ta: Pubkey) -> Result<u64> {
