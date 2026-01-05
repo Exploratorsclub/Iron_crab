@@ -311,6 +311,10 @@ To be simulate-gated and deterministic, momentum intents MUST set `execution.min
 - BUY (SOL → token): `min_out` is token raw units with token decimals.
 - SELL (token → SOL): `min_out` is lamports (decimals=9).
 
+Decimals rule (non-negotiable):
+- Token decimals MUST come from `MarketEventKind::TokenMintInfo.decimals` (Geyser-derived).
+- The strategy MUST NOT hard-code token decimals (e.g. `6`) for position sizing, `required_capital`, or `execution.min_out`.
+
 `max_slippage_bps` is the strategy’s tolerance; engine may enforce a stricter policy.
 
 ### 10.4 Canonical reason metadata
@@ -344,17 +348,22 @@ Momentum-bot must only transition state based on `ExecutionResult.status`:
 
 For Momentum v2 to be *complete and correct* (position sizing, exits, PnL), strategy must know the actual fill amounts.
 
-Current `ExecutionResult` does **not** carry fill amounts. Therefore, the spec requires one of the following (backward compatible):
+Status: implemented via `ExecutionResult` optional fill fields.
 
-Option A (preferred): extend `ExecutionResult` with optional fill fields:
+`ExecutionResult` MAY include:
 - `fill_in: ExplicitAmount` (actual amount-in)
 - `fill_out: ExplicitAmount` (actual amount-out)
-- `post_balances: { "<mint>": ExplicitAmount, ... }` (optional)
 
-Option B: emit a companion record on the existing topic `ironcrab.v1.execution_results`:
-- `ExecutionFill` (new IPC type) keyed by `intent_id` and `signature`, containing `fill_in`, `fill_out`, and optional post-balances.
+Additionally, `ExecutionResult` MAY include explicit diagnostics:
+- `fill_status: FillStatus` (`Complete` | `Partial` | `Unavailable`)
+- `fill_unavailable_reason: FillUnavailableReason` (set when fills are unavailable)
 
-Until fill accounting exists, Momentum v2 can run, but position management will be approximate and exits can mis-size.
+Strategy requirements:
+- On `ExecutionStatus::Confirmed`, the strategy MUST update position sizing only from confirmed fills.
+- For BUY confirms, the strategy MUST treat missing `fill_out` as a correctness blocker (do not create/scale a position from placeholders).
+- The strategy SHOULD log/emit the diagnostics (`fill_status`, `fill_unavailable_reason`) for forensics.
+
+Note: A separate companion record type (e.g. `ExecutionFill`) is not required at the moment.
 
 ---
 
@@ -435,7 +444,7 @@ Momentum v2 is considered complete when the following end-to-end properties hold
 - If simulation fails, the intent is never sent.
 
 3) Correct position accounting
-- On `ExecutionResult::Confirmed`, momentum-bot updates position using actual fills (via `ExecutionResult` fill extension or `ExecutionFill`).
+- On `ExecutionResult::Confirmed`, momentum-bot updates position using actual fills via `ExecutionResult.fill_in`/`fill_out`.
 - Exits sell the actual held token amount.
 
 4) Forensic explainability
