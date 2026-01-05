@@ -9,6 +9,7 @@ use ironcrab::nats::{
     NatsClient, NatsConfig, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS,
 };
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
+use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
@@ -251,6 +252,11 @@ async fn main() -> anyhow::Result<()> {
     // Initialize DEX connectors (keyless) for route discovery only
     let raydium = Raydium::new(Arc::clone(&rpc));
     let pumpfun = PumpFunDex::new(Arc::clone(&rpc))?;
+    let pump_amm = PumpFunAmmDex::new(
+        Arc::clone(&rpc),
+        cfg.solana.rpc_url.clone(),
+        cfg.solana.helius_rpc_url.clone(),
+    );
 
     info!("Refreshing Raydium pools (for route discovery)...");
     raydium.refresh_pools().await?;
@@ -372,6 +378,28 @@ async fn main() -> anyhow::Result<()> {
             if metadata.contains_key("creator") {
                 metadata.insert("dex".to_string(), "pumpfun".to_string());
                 min_out_sol = Some(apply_slippage_min_out(q.amount_out, args.max_slippage_bps));
+            }
+        }
+
+        // PumpSwap / Pump.fun AMM (migrated tokens).
+        if min_out_sol.is_none() {
+            if let Ok(Some(q)) = pump_amm
+                .quote_exact_in(&mint.to_string(), SOL_MINT, amount_in)
+                .await
+            {
+                if let Ok(Some(pool_accounts)) = pump_amm.pool_accounts_v1_for_base_mint(mint).await
+                {
+                    if let Some(pool_id) = q.route.first().cloned() {
+                        metadata.insert("dex".to_string(), "pump_amm".to_string());
+                        resources.pools = vec![pool_id];
+                        resources.accounts = pool_accounts
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect();
+                        min_out_sol =
+                            Some(apply_slippage_min_out(q.amount_out, args.max_slippage_bps));
+                    }
+                }
             }
         }
 

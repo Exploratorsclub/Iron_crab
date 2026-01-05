@@ -73,6 +73,7 @@ use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
+use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::dex_parser::SOL_MINT;
@@ -724,6 +725,7 @@ impl StateSnapshot {
 /// Runtime context for execution-engine
 struct ExecutionContext {
     run_id: String,
+    rpc_url: String,
     wallet_pubkey: Option<Pubkey>,
     /// The ONLY signer (Single-Signer rule). None means keyless mode.
     treasury: Option<Treasury>,
@@ -925,6 +927,7 @@ async fn run_liquidation_job(
 
     // Initialize DEX connectors for quote discovery.
     let raydium = Raydium::new(Arc::clone(&ctx.rpc));
+    let pump_amm = PumpFunAmmDex::new(Arc::clone(&ctx.rpc), ctx.rpc_url.clone(), None);
     let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc)) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -1090,6 +1093,37 @@ async fn run_liquidation_job(
                     min_out_sol = Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
                 }
             }
+            }
+        }
+
+        // Fallback to Pump.fun AMM (PumpSwap).
+        if min_out_sol.is_none() {
+            if let Ok(Some(q)) = pump_amm
+                .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
+                .await
+            {
+                #[cfg(unix)]
+                maybe_ping_watchdog();
+
+                if let Some(pool_id) = q.route.first().cloned() {
+                    match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
+                        Ok(Some(accounts)) => {
+                            metadata.insert("dex".to_string(), "pump_amm".to_string());
+                            resources.pools = vec![pool_id];
+                            resources.accounts = accounts.into_iter().map(|p| p.to_string()).collect();
+                            min_out_sol = Some(Self::apply_slippage_min_out(
+                                q.amount_out,
+                                max_slippage_bps,
+                            ));
+                        }
+                        Ok(None) => {
+                            warn!(mint = %mint, "pump_amm quote returned route, but pool accounts not found; skipping pump_amm");
+                        }
+                        Err(e) => {
+                            warn!(mint = %mint, error = %e, "pump_amm pool account discovery failed; skipping pump_amm");
+                        }
+                    }
+                }
             }
         }
 
@@ -2344,6 +2378,7 @@ async fn main() -> Result<()> {
 
     let ctx = Arc::new(ExecutionContext {
         run_id: run_id.clone(),
+        rpc_url: args.rpc_url.clone(),
         wallet_pubkey,
         treasury,
         config_snapshot_id: parking_lot::RwLock::new(exec_config.snapshot_id()),

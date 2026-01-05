@@ -81,6 +81,37 @@ impl PumpFunAmmDex {
         self.user_authority = Some(user);
     }
 
+    /// Return the deterministic v1 pool-accounts list for a Pump.fun AMM pool.
+    ///
+    /// Ordering matches `MarketEventKind::DexPoolAccounts` (PumpSwap v1) and
+    /// `PumpFunAmmDex::build_swap_ix_from_pool_accounts`.
+    pub async fn pool_accounts_v1_for_base_mint(
+        &self,
+        base_mint: Pubkey,
+    ) -> Result<Option<Vec<Pubkey>>> {
+        let pool = match self.discover_pool_static(base_mint).await? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        Ok(Some(vec![
+            pool.pool_market,
+            pool.global_config,
+            pool.base_mint,
+            pool.quote_mint,
+            pool.pool_base_vault,
+            pool.pool_quote_vault,
+            pool.protocol_fee_recipient,
+            pool.protocol_fee_recipient_ta,
+            pool.event_authority,
+            pool.coin_creator_vault_ata,
+            pool.coin_creator_vault_authority,
+            pool.global_volume_accumulator,
+            pool.fee_config,
+            pool.fee_program,
+        ]))
+    }
+
     fn derive_user_volume_accumulator(program_id: Pubkey, pool_market: Pubkey, user: Pubkey) -> Pubkey {
         // Best-effort PDA derivation.
         // Observed accounts suggest this is a user-specific PDA; we default to a common Anchor seed
