@@ -1932,26 +1932,58 @@ impl MomentumContext {
             ExecutionStatus::Confirmed => {
                 match pending.side {
                     TradeSide::Buy => {
-                        // BUY confirmed - open position
-                        // Prefer exact fills if available; otherwise fall back to placeholders.
-                        let (sol_invested, token_amount, entry_price) =
-                            match (result.fill_in.as_ref(), result.fill_out.as_ref()) {
-                                (Some(fill_in), Some(fill_out)) => {
-                                    let sol_ui = fill_in.as_f64().max(0.0);
-                                    let tok_ui = fill_out.as_f64().max(0.0);
-                                    let price = if sol_ui > 0.0 {
-                                        // token per SOL
-                                        tok_ui / sol_ui
-                                    } else {
-                                        1.0
-                                    };
-                                    (fill_in.raw, fill_out.raw, price)
+                        // BUY confirmed - open/scale position.
+                        // Correctness invariant: never mutate position sizing without at least
+                        // knowing the output token fill (token_amount).
+                        let Some(fill_out) = result.fill_out.as_ref() else {
+                            warn!(
+                                intent_id = %result.intent_id,
+                                mint = %pending.mint,
+                                entry_kind = ?pending.entry_kind,
+                                signature = ?result.signature,
+                                "BUY confirmed but fill_out missing; skipping position update"
+                            );
+
+                            // For probe entry, this means we cannot establish a position safely.
+                            // For scale-in, keep the existing position but don't adjust sizing.
+                            let mut trackers = self.token_trackers.write();
+                            if let Some(tr) = trackers.get_mut(&pending.mint) {
+                                match pending.entry_kind {
+                                    Some(EntryKind::ScaleIn) => {
+                                        tr.scale_filled_at = Some(Instant::now());
+                                        tr.intent_generated = true;
+                                    }
+                                    _ => {
+                                        tr.blacklisted = true;
+                                        tr.blacklist_reason = Some(
+                                            "buy_confirmed_missing_fill_out".to_string(),
+                                        );
+                                    }
                                 }
-                                _ => {
-                                    // Placeholder; will be updated from market trades.
-                                    (pending.sol_amount, pending.sol_amount, 1.0)
-                                }
-                            };
+                            }
+
+                            return;
+                        };
+
+                        // Fill-in may be missing (e.g., SOL lamport delta gated due to rent noise).
+                        // Fall back to intended SOL spend from the pending intent.
+                        let sol_invested_raw = result
+                            .fill_in
+                            .as_ref()
+                            .map(|a| a.raw)
+                            .unwrap_or(pending.sol_amount);
+
+                        let sol_ui = result
+                            .fill_in
+                            .as_ref()
+                            .map(|a| a.as_f64())
+                            .unwrap_or(sol_invested_raw as f64 / 1_000_000_000.0)
+                            .max(0.0);
+                        let tok_ui = fill_out.as_f64().max(0.0);
+                        let entry_price = if sol_ui > 0.0 { tok_ui / sol_ui } else { 1.0 };
+
+                        let sol_invested = sol_invested_raw;
+                        let token_amount = fill_out.raw;
 
                         info!(
                             intent_id = %result.intent_id,
