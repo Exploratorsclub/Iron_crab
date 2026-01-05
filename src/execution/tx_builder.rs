@@ -8,10 +8,27 @@ use crate::solana::dex::raydium::Raydium;
 use crate::solana::rpc::SolanaRpc;
 use solana_sdk::hash::hash;
 use solana_sdk::instruction::Instruction;
+use solana_sdk::instruction::AccountMeta;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
 use std::str::FromStr;
 use std::sync::Arc;
+
+fn prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> Instruction {
+    Instruction {
+        program_id: Pubkey::new_from_array(ix.program_id.to_bytes()),
+        accounts: ix
+            .accounts
+            .into_iter()
+            .map(|a| AccountMeta {
+                pubkey: Pubkey::new_from_array(a.pubkey.to_bytes()),
+                is_signer: a.is_signer,
+                is_writable: a.is_writable,
+            })
+            .collect(),
+        data: ix.data,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TxPlan {
@@ -357,7 +374,7 @@ pub async fn build_tx_plan(
             });
         }
 
-        let ixs = match PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+        let mut ixs = match PumpFunAmmDex::build_swap_ix_from_pool_accounts(
             &intent.resources.input_mint,
             &intent.resources.output_mint,
             intent.required_capital.raw,
@@ -373,6 +390,31 @@ pub async fn build_tx_plan(
                 })
             }
         };
+
+        // PumpSwap uses WSOL token accounts for the quote side.
+        // Liquidation cleanup may close the WSOL ATA; ensure it exists idempotently.
+        let wsol_mint = match Pubkey::from_str(SOL_MINT) {
+            Ok(pk) => pk,
+            Err(e) => {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::InternalError,
+                    details: format!("invalid SOL_MINT constant: {e}"),
+                })
+            }
+        };
+        let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
+        let owner_spl = payer_spl;
+        let wsol_mint_spl = SplProgramPubkey::new_from_array(wsol_mint.to_bytes());
+        let token_program_spl = spl_token::id();
+        let ata_ix = prog_ix_to_sdk(
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &payer_spl,
+                &owner_spl,
+                &wsol_mint_spl,
+                &token_program_spl,
+            ),
+        );
+        ixs.insert(0, ata_ix);
 
         return TxPlanOutcome::Planned(TxPlan { instructions: ixs });
     }
