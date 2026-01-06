@@ -15,6 +15,7 @@ use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -91,6 +92,9 @@ pub struct PumpFunAmmDex {
     http: Client,
     user_authority: Option<Pubkey>,
 
+    // Prevent concurrent pool discovery storms (e.g. parallel exits) from hammering RPC.
+    discovery_lock: Arc<Mutex<()>>,
+
     // Cache by base mint (WSOL quote only for now)
     pools_by_base: DashMap<Pubkey, PumpAmmPoolStatic>,
     user_accounts: DashMap<(Pubkey, Pubkey), PumpAmmUserAccounts>, // (pool_market, user)
@@ -104,6 +108,7 @@ impl PumpFunAmmDex {
             helius_rpc_url,
             http: Client::new(),
             user_authority: None,
+            discovery_lock: Arc::new(Mutex::new(())),
             pools_by_base: DashMap::new(),
             user_accounts: DashMap::new(),
         }
@@ -534,13 +539,13 @@ impl PumpFunAmmDex {
 
         let mut base_token_accounts: Vec<TokenAccountMeta> = token_accounts
             .iter()
-            .cloned()
             .filter(|t| t.mint == base_mint)
+            .cloned()
             .collect();
         let mut quote_token_accounts: Vec<TokenAccountMeta> = token_accounts
             .iter()
-            .cloned()
             .filter(|t| t.mint == quote_mint)
+            .cloned()
             .collect();
 
         base_token_accounts.sort_by_key(|t| std::cmp::Reverse(t.balance));
@@ -564,7 +569,7 @@ impl PumpFunAmmDex {
             .iter()
             .find(|t| t.address == protocol_fee_recipient_ta)
             .map(|t| t.token_owner)
-            .unwrap_or(Pubkey::default());
+            .unwrap_or_default();
 
         let coin_creator_vault_ata = base_token_accounts
             .iter()
@@ -575,7 +580,7 @@ impl PumpFunAmmDex {
             .iter()
             .find(|t| t.address == coin_creator_vault_ata)
             .map(|t| t.token_owner)
-            .unwrap_or(Pubkey::default());
+            .unwrap_or_default();
 
         // Derive remaining PDAs with a small set of common seed patterns and validate existence.
         let event_authority = {
@@ -597,8 +602,8 @@ impl PumpFunAmmDex {
             // Heuristic: fee_config tends to be the smaller account; volume accumulator tends to be larger.
             let mut sorted = program_owned_accounts.clone();
             sorted.sort_by_key(|m| m.data_len);
-            let fee = sorted.first().map(|m| m.address).unwrap_or(Pubkey::default());
-            let vol = sorted.last().map(|m| m.address).unwrap_or(Pubkey::default());
+            let fee = sorted.first().map(|m| m.address).unwrap_or_default();
+            let vol = sorted.last().map(|m| m.address).unwrap_or_default();
             (fee, vol)
         } else {
             // Fallback: try deriving if the market doesn't embed these accounts.
@@ -614,8 +619,14 @@ impl PumpFunAmmDex {
                             b"global_volume_accumulator".to_vec(),
                             pool_market.to_bytes().to_vec(),
                         ],
-                        vec![b"volume_accumulator".to_vec(), global_config.to_bytes().to_vec()],
-                        vec![b"volume_accumulator".to_vec(), pool_market.to_bytes().to_vec()],
+                        vec![
+                            b"volume_accumulator".to_vec(),
+                            global_config.to_bytes().to_vec(),
+                        ],
+                        vec![
+                            b"volume_accumulator".to_vec(),
+                            pool_market.to_bytes().to_vec(),
+                        ],
                     ],
                 )
                 .await?
@@ -697,9 +708,11 @@ impl PumpFunAmmDex {
             .map(|a| a.is_empty())
             .unwrap_or(false);
         if is_empty && self.helius_rpc_url.is_some() {
-            if let Ok(v2) = self.rpc_call_tx_history("getProgramAccounts", params).await {
-                v = v2;
-            }
+            // IMPORTANT: don't silently swallow rate-limit errors here; upstream should record a
+            // concrete pump_amm error (instead of `none`) when the discovery endpoint is blocked.
+            v = self
+                .rpc_call_tx_history("getProgramAccounts", params)
+                .await?;
         }
 
         let arr = match v.get("result").and_then(|r| r.as_array()) {
@@ -729,21 +742,28 @@ impl PumpFunAmmDex {
             return Ok(Some(v.clone()));
         }
 
+        // Avoid concurrent discovery attempts for the same base mint.
+        // This significantly reduces RPC rate-limits when `parallel_exits` is enabled.
+        let _guard = self.discovery_lock.lock().await;
+        if let Some(v) = self.pools_by_base.get(&base_mint) {
+            return Ok(Some(v.clone()));
+        }
+
+        let markets = self
+            .discover_pool_markets_via_program_accounts(base_mint)
+            .await
+            .unwrap_or_default();
+
         // Fast path: if we can locate the pool market via program-accounts lookup, attempt to
         // build the full static account set by parsing on-chain state + deriving PDAs. This avoids
         // relying on tx-history (some pools can exist with no successful swaps yet).
-        if let Ok(markets) = self
-            .discover_pool_markets_via_program_accounts(base_mint)
-            .await
-        {
-            for m in markets {
-                if let Ok(Some(pool)) = self
-                    .try_parse_pool_static_from_market_account(m, base_mint)
-                    .await
-                {
-                    self.pools_by_base.insert(base_mint, pool.clone());
-                    return Ok(Some(pool));
-                }
+        for m in &markets {
+            if let Ok(Some(pool)) = self
+                .try_parse_pool_static_from_market_account(*m, base_mint)
+                .await
+            {
+                self.pools_by_base.insert(base_mint, pool.clone());
+                return Ok(Some(pool));
             }
         }
 
@@ -751,18 +771,8 @@ impl PumpFunAmmDex {
         // On pruned RPC, mint-address history can be missing; program-accounts lookup + market
         // history tends to be more reliable.
         let mut scan_addresses: Vec<String> = Vec::new();
-        match self
-            .discover_pool_markets_via_program_accounts(base_mint)
-            .await
-        {
-            Ok(markets) => {
-                for m in markets {
-                    scan_addresses.push(m.to_string());
-                }
-            }
-            Err(_) => {
-                // Best-effort: if program-accounts lookup fails, still try mint history.
-            }
+        for m in &markets {
+            scan_addresses.push(m.to_string());
         }
         scan_addresses.push(base_mint.to_string());
         scan_addresses.sort();

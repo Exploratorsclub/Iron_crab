@@ -307,8 +307,6 @@ pub mod py_strategy_adapter {
     use std::time::{Duration, Instant};
 
     pub struct PyProcStrategy {
-        cmd: String,
-        args: Vec<String>,
         timeout_ms: u64,
         worker: Arc<PyWorker>,
         breaker: Mutex<(u32, Option<Instant>)>, // (failures, open_until)
@@ -340,12 +338,14 @@ pub mod py_strategy_adapter {
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
                         .spawn()?;
-                    let stdin = child.stdin.take().ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::Other, "no stdin")
-                    })?;
-                    let stdout = child.stdout.take().ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::Other, "no stdout")
-                    })?;
+                    let stdin = child
+                        .stdin
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("no stdin"))?;
+                    let stdout = child
+                        .stdout
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("no stdout"))?;
                     Ok((child, stdin, BufReader::new(stdout)))
                 }
                 let mut child_opt: Option<(Child, ChildStdin, BufReader<ChildStdout>)> =
@@ -370,7 +370,7 @@ pub mod py_strategy_adapter {
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             let mut ok = false;
-                            if let Some((ref mut ch, ref mut stdin, ref mut stdout)) = child_opt {
+                            if let Some((ref mut _ch, ref mut stdin, ref mut stdout)) = child_opt {
                                 // write line
                                 if writeln!(stdin, "{}", json).is_ok() {
                                     let _ = stdin.flush();
@@ -452,8 +452,6 @@ pub mod py_strategy_adapter {
         pub fn new(cmd: impl Into<String>, args: Vec<String>) -> Self {
             let worker = PyWorker::spawn(cmd.into(), args.clone());
             Self {
-                cmd: "python".into(),
-                args,
                 timeout_ms: 500,
                 worker,
                 breaker: Mutex::new((0, None)),
@@ -464,8 +462,6 @@ pub mod py_strategy_adapter {
             let args = vec![script_path.into()];
             let worker = PyWorker::spawn("python".into(), args.clone());
             Self {
-                cmd: "python".into(),
-                args,
                 timeout_ms: 500,
                 worker,
                 breaker: Mutex::new((0, None)),
@@ -485,8 +481,6 @@ pub mod py_strategy_adapter {
             let cmd = python_exe.into();
             let worker = PyWorker::spawn(cmd.clone(), args.clone());
             Self {
-                cmd,
-                args,
                 timeout_ms: 500,
                 worker,
                 breaker: Mutex::new((0, None)),
