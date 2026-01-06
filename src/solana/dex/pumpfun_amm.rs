@@ -410,7 +410,7 @@ impl PumpFunAmmDex {
             // PumpSwap trades can be older than the initial page on busy pools.
             // IMPORTANT: tx-history calls are expensive; cap requests to avoid rate-limits.
             const SIG_PAGE_SIZE: u32 = 200;
-            const SIG_MAX_PAGES: usize = 30; // up to ~6k signatures
+            const SIG_MAX_PAGES: usize = 100; // up to ~20k signatures
             const SIG_TX_PER_PAGE: usize = 40; // cap getTransaction calls per page
             let mut before: Option<String> = None;
 
@@ -447,7 +447,19 @@ impl PumpFunAmmDex {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
-                for s in sigs.iter().take(SIG_TX_PER_PAGE) {
+                // Sample across the whole page (not just the newest N), so we don't miss the
+                // relevant swap when the address is busy.
+                let page_len = sigs.len();
+                let take_n = SIG_TX_PER_PAGE.min(page_len);
+                let step = if take_n <= 1 {
+                    1
+                } else {
+                    (page_len - 1) / (take_n - 1)
+                };
+
+                for i in 0..take_n {
+                    let idx = (i * step).min(page_len.saturating_sub(1));
+                    let s = &sigs[idx];
                 // Avoid poisoning discovery with failed transactions (e.g., our own earlier
                 // liquidation attempts that used wrong accounts and therefore failed).
                 if let Some(err) = s.get("err") {
