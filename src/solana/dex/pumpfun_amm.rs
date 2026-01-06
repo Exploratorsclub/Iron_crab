@@ -698,22 +698,14 @@ impl PumpFunAmmDex {
             }
         ]);
 
-        let mut v = self.rpc_call("getProgramAccounts", params.clone()).await?;
-
-        // If the multi-endpoint call fell back to a node that doesn't support/serve the filtered
-        // index well (returning empty), retry against the Helius endpoint with rate-limit backoff.
-        let is_empty = v
-            .get("result")
-            .and_then(|r| r.as_array())
-            .map(|a| a.is_empty())
-            .unwrap_or(false);
-        if is_empty && self.helius_rpc_url.is_some() {
-            // IMPORTANT: don't silently swallow rate-limit errors here; upstream should record a
-            // concrete pump_amm error (instead of `none`) when the discovery endpoint is blocked.
-            v = self
-                .rpc_call_tx_history("getProgramAccounts", params)
-                .await?;
-        }
+        // NOTE: On our local validator RPC, getProgramAccounts can be disabled for large programs
+        // ("excluded from account secondary indexes"). When Helius is configured, always use it
+        // for program-account discovery.
+        let v = if self.helius_rpc_url.is_some() {
+            self.rpc_call_tx_history("getProgramAccounts", params).await?
+        } else {
+            self.rpc_call("getProgramAccounts", params).await?
+        };
 
         let arr = match v.get("result").and_then(|r| r.as_array()) {
             Some(v) => v,
@@ -749,10 +741,14 @@ impl PumpFunAmmDex {
             return Ok(Some(v.clone()));
         }
 
-        let markets = self
-            .discover_pool_markets_via_program_accounts(base_mint)
-            .await
-            .unwrap_or_default();
+        let mut discovery_err: Option<anyhow::Error> = None;
+        let markets = match self.discover_pool_markets_via_program_accounts(base_mint).await {
+            Ok(v) => v,
+            Err(e) => {
+                discovery_err = Some(e);
+                Vec::new()
+            }
+        };
 
         // Fast path: if we can locate the pool market via program-accounts lookup, attempt to
         // build the full static account set by parsing on-chain state + deriving PDAs. This avoids
@@ -980,6 +976,10 @@ impl PumpFunAmmDex {
                 // Small delay between pages to reduce rate-limit pressure.
                 sleep(Duration::from_millis(200)).await;
             }
+        }
+
+        if let Some(e) = discovery_err {
+            return Err(anyhow!(e).context("pump_amm pool discovery failed"));
         }
 
         Ok(None)
