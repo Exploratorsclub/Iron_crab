@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine;
 use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use reqwest::Client;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -39,6 +40,30 @@ const PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET: usize = 11;
 // Observed on-chain: buy_exact_quote_in fee fields sum to 125 bps (lp 2 + protocol 93 + creator 30).
 // We use that as a conservative default for quoting.
 const DEFAULT_TOTAL_FEE_BPS: u32 = 125;
+
+// Helius can aggressively rate limit across the entire API key. Keep JSON-RPC calls serialized
+// and spaced out process-wide (not per `PumpFunAmmDex` instance).
+static HELIUS_THROTTLES: Lazy<DashMap<String, Arc<HeliusThrottle>>> =
+    Lazy::new(|| DashMap::new());
+
+#[derive(Debug)]
+struct HeliusThrottle {
+    permits: Arc<Semaphore>,
+    last_request: Arc<Mutex<Option<Instant>>>,
+}
+
+impl HeliusThrottle {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(1)),
+            last_request: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+fn normalize_rpc_url(u: &str) -> String {
+    u.trim().trim_end_matches('/').to_string()
+}
 
 fn anchor_disc(ix_name: &str) -> [u8; 8] {
     let out = hash(format!("global:{ix_name}").as_bytes());
@@ -94,10 +119,8 @@ pub struct PumpFunAmmDex {
     http: Client,
     user_authority: Option<Pubkey>,
 
-    // Helius can be aggressively rate limited. We keep Helius JSON-RPC calls
-    // serialized and spaced out; local RPC still handles cheap getAccountInfo.
-    helius_jsonrpc_permits: Arc<Semaphore>,
-    helius_last_request: Arc<Mutex<Option<Instant>>>,
+    // Optional, process-wide throttle for the configured Helius endpoint.
+    helius_throttle: Option<Arc<HeliusThrottle>>,
 
     // Prevent concurrent pool discovery storms (e.g. parallel exits) from hammering RPC.
     discovery_lock: Arc<Mutex<()>>,
@@ -109,14 +132,21 @@ pub struct PumpFunAmmDex {
 
 impl PumpFunAmmDex {
     pub fn new(rpc: Arc<SolanaRpc>, rpc_url: String, helius_rpc_url: Option<String>) -> Self {
+        let helius_throttle = helius_rpc_url.as_deref().map(|u| {
+            let key = normalize_rpc_url(u);
+            HELIUS_THROTTLES
+                .entry(key)
+                .or_insert_with(|| Arc::new(HeliusThrottle::new()))
+                .clone()
+        });
+
         Self {
             rpc,
             rpc_url,
             helius_rpc_url,
             http: Client::new(),
             user_authority: None,
-            helius_jsonrpc_permits: Arc::new(Semaphore::new(1)),
-            helius_last_request: Arc::new(Mutex::new(None)),
+            helius_throttle,
             discovery_lock: Arc::new(Mutex::new(())),
             pools_by_base: DashMap::new(),
             user_accounts: DashMap::new(),
@@ -124,10 +154,10 @@ impl PumpFunAmmDex {
     }
 
     fn is_helius_endpoint(&self, endpoint: &str) -> bool {
-        self.helius_rpc_url
-            .as_deref()
-            .map(|h| h == endpoint)
-            .unwrap_or(false)
+        let Some(h) = self.helius_rpc_url.as_deref() else {
+            return false;
+        };
+        normalize_rpc_url(h) == normalize_rpc_url(endpoint)
     }
 
     async fn helius_throttle_guard(&self, endpoint: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
@@ -135,20 +165,17 @@ impl PumpFunAmmDex {
             return None;
         }
 
+        let throttle = self.helius_throttle.as_ref()?.clone();
+
         // Serialize Helius calls.
-        let permit = self
-            .helius_jsonrpc_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .ok()?;
+        let permit = throttle.permits.clone().acquire_owned().await.ok()?;
 
         // Space out calls to reduce 429/-32429.
         // Keep this conservative; kill-switch correctness > speed.
-        const MIN_GAP_MS: u64 = 150;
+        const MIN_GAP_MS: u64 = 600;
         let min_gap = Duration::from_millis(MIN_GAP_MS);
 
-        let mut last = self.helius_last_request.lock().await;
+        let mut last = throttle.last_request.lock().await;
         if let Some(prev) = *last {
             let since = prev.elapsed();
             if since < min_gap {
@@ -326,7 +353,7 @@ impl PumpFunAmmDex {
         for endpoint in self.discovery_endpoints() {
             // Retry on rate-limits; fall back to the next endpoint if still blocked.
             let mut backoff_ms = 250u64;
-            let max_attempts = if self.is_helius_endpoint(endpoint) { 6usize } else { 2usize };
+            let max_attempts = if self.is_helius_endpoint(endpoint) { 10usize } else { 2usize };
             for attempt in 0..max_attempts {
                 let _helius_guard = self.helius_throttle_guard(endpoint).await;
                 let resp = match self.http.post(endpoint).json(&body).send().await {
@@ -377,7 +404,7 @@ impl PumpFunAmmDex {
                     ));
                     let wait_ms = retry_after_ms.unwrap_or(backoff_ms);
                     sleep(Duration::from_millis(wait_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(2000);
+                    backoff_ms = (backoff_ms * 2).min(10_000);
                     continue;
                 }
 
@@ -487,6 +514,18 @@ impl PumpFunAmmDex {
         Some((mint, owner))
     }
 
+    fn derive_ata_with_program(owner: Pubkey, mint: Pubkey, token_program: Pubkey) -> Pubkey {
+        let owner_spl = SplProgramPubkey::new_from_array(owner.to_bytes());
+        let mint_spl = SplProgramPubkey::new_from_array(mint.to_bytes());
+        let token_program_spl = SplProgramPubkey::new_from_array(token_program.to_bytes());
+        let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_spl,
+            &mint_spl,
+            &token_program_spl,
+        );
+        Pubkey::new_from_array(ata_spl.to_bytes())
+    }
+
     async fn derive_existing_pda(
         &self,
         program_id: Pubkey,
@@ -571,7 +610,8 @@ impl PumpFunAmmDex {
         }
 
         let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
-        let token_2022_program = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
+        let token_2022_program =
+            Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
         let associated_token_program = Pubkey::new_from_array(
             spl_associated_token_account::id().to_bytes(),
         );
@@ -604,6 +644,22 @@ impl PumpFunAmmDex {
                 }
             }
 
+            if acc_owner == token_2022_program {
+                // Token-2022 has the same first fields (mint/owner) for token accounts.
+                if let Some((mint, token_owner)) =
+                    Self::parse_spl_token_account_mint_and_owner(&acc_data)
+                {
+                    let balance = self.get_vault_amount(pk).await.unwrap_or(0);
+                    token_accounts.push(TokenAccountMeta {
+                        address: pk,
+                        mint,
+                        token_owner,
+                        balance,
+                    });
+                    continue;
+                }
+            }
+
             if acc_owner == pump_amm_program {
                 program_owned_accounts.push(ProgramOwnedAccountMeta {
                     address: pk,
@@ -616,24 +672,28 @@ impl PumpFunAmmDex {
         }
 
         // Helper: try to find an authority whose ATA for `mint` exists.
-        let find_authority_with_existing_ata = |candidates: Vec<Pubkey>, mint: Pubkey| async move {
+        let find_authority_with_existing_ata =
+            |candidates: Vec<Pubkey>, mint: Pubkey| async move {
             for cand in candidates {
-                let ata = Self::derive_ata(cand, mint);
-                let Some((ata_owner, ata_exec, ata_data)) =
-                    self.rpc_get_account_owner_executable_and_data(ata).await?
-                else {
-                    continue;
-                };
-                if ata_exec || ata_owner != token_program {
-                    continue;
-                }
-                let Some((ata_mint, ata_token_owner)) =
-                    Self::parse_spl_token_account_mint_and_owner(&ata_data)
-                else {
-                    continue;
-                };
-                if ata_mint == mint && ata_token_owner == cand {
-                    return Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(Some((cand, ata)));
+                for tp in [token_program, token_2022_program] {
+                    let ata = Self::derive_ata_with_program(cand, mint, tp);
+                    let Some((ata_owner, ata_exec, ata_data)) =
+                        self.rpc_get_account_owner_executable_and_data(ata).await?
+                    else {
+                        continue;
+                    };
+                    if ata_exec || (ata_owner != token_program && ata_owner != token_2022_program)
+                    {
+                        continue;
+                    }
+                    let Some((ata_mint, ata_token_owner)) =
+                        Self::parse_spl_token_account_mint_and_owner(&ata_data)
+                    else {
+                        continue;
+                    };
+                    if ata_mint == mint && ata_token_owner == cand {
+                        return Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(Some((cand, ata)));
+                    }
                 }
             }
             Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(None)
@@ -1061,7 +1121,7 @@ impl PumpFunAmmDex {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    market_parse_err = Some(e.context(format!(
+                    market_parse_err = Some(anyhow!("{e:#}").context(format!(
                         "pump_amm market parse failed market={m} base_mint={base_mint}"
                     )));
                 }
