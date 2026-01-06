@@ -77,6 +77,12 @@ struct TokenAccountMeta {
     balance: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ProgramOwnedAccountMeta {
+    address: Pubkey,
+    data_len: usize,
+}
+
 #[derive(Clone)]
 pub struct PumpFunAmmDex {
     rpc: Arc<SolanaRpc>,
@@ -489,6 +495,8 @@ impl PumpFunAmmDex {
         let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
         let mut token_accounts: Vec<TokenAccountMeta> = Vec::new();
         let mut non_token_pubkeys: Vec<Pubkey> = Vec::new();
+        let mut program_owned_accounts: Vec<ProgramOwnedAccountMeta> = Vec::new();
+
         for pk in rest_pubkeys.iter().copied() {
             let Some((acc_owner, _exec, acc_data)) =
                 self.rpc_get_account_owner_executable_and_data(pk).await?
@@ -511,6 +519,14 @@ impl PumpFunAmmDex {
                     });
                     continue;
                 }
+            }
+
+            if acc_owner == pump_amm_program {
+                program_owned_accounts.push(ProgramOwnedAccountMeta {
+                    address: pk,
+                    data_len: acc_data.len(),
+                });
+                continue;
             }
 
             non_token_pubkeys.push(pk);
@@ -574,63 +590,63 @@ impl PumpFunAmmDex {
             }
         };
 
-        let global_volume_accumulator = match self
-            .derive_existing_pda(
-                pump_amm_program,
-                &[
-                    vec![
-                        b"global_volume_accumulator".to_vec(),
-                        global_config.to_bytes().to_vec(),
+        // Prefer extracting pump_amm-owned accounts directly from the market account, instead of
+        // guessing PDA seeds. Most pools include both `global_volume_accumulator` and `fee_config`
+        // as concrete, program-owned accounts.
+        let (fee_config, global_volume_accumulator) = if program_owned_accounts.len() >= 2 {
+            // Heuristic: fee_config tends to be the smaller account; volume accumulator tends to be larger.
+            let mut sorted = program_owned_accounts.clone();
+            sorted.sort_by_key(|m| m.data_len);
+            let fee = sorted.first().map(|m| m.address).unwrap_or(Pubkey::default());
+            let vol = sorted.last().map(|m| m.address).unwrap_or(Pubkey::default());
+            (fee, vol)
+        } else {
+            // Fallback: try deriving if the market doesn't embed these accounts.
+            let vol = match self
+                .derive_existing_pda(
+                    pump_amm_program,
+                    &[
+                        vec![
+                            b"global_volume_accumulator".to_vec(),
+                            global_config.to_bytes().to_vec(),
+                        ],
+                        vec![
+                            b"global_volume_accumulator".to_vec(),
+                            pool_market.to_bytes().to_vec(),
+                        ],
+                        vec![b"volume_accumulator".to_vec(), global_config.to_bytes().to_vec()],
+                        vec![b"volume_accumulator".to_vec(), pool_market.to_bytes().to_vec()],
                     ],
-                    vec![
-                        b"global_volume_accumulator".to_vec(),
-                        pool_market.to_bytes().to_vec(),
+                )
+                .await?
+            {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+
+            let fee = match self
+                .derive_existing_pda(
+                    pump_amm_program,
+                    &[
+                        vec![b"fee_config".to_vec(), global_config.to_bytes().to_vec()],
+                        vec![b"fee_config".to_vec(), pool_market.to_bytes().to_vec()],
+                        vec![b"fee_config".to_vec()],
+                        vec![b"fees".to_vec(), global_config.to_bytes().to_vec()],
+                        vec![b"fees".to_vec(), pool_market.to_bytes().to_vec()],
                     ],
-                    vec![
-                        b"global_volume_accumulator".to_vec(),
-                        base_mint.to_bytes().to_vec(),
-                    ],
-                    vec![
-                        b"volume_accumulator".to_vec(),
-                        global_config.to_bytes().to_vec(),
-                    ],
-                    vec![
-                        b"volume_accumulator".to_vec(),
-                        pool_market.to_bytes().to_vec(),
-                    ],
-                    vec![
-                        b"volume_accumulator".to_vec(),
-                        base_mint.to_bytes().to_vec(),
-                    ],
-                ],
-            )
-            .await?
-        {
-            Some(v) => v,
-            None => return Ok(None),
+                )
+                .await?
+            {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+
+            (fee, vol)
         };
 
-        let fee_config = match self
-            .derive_existing_pda(
-                pump_amm_program,
-                &[
-                    vec![b"fee_config".to_vec(), global_config.to_bytes().to_vec()],
-                    vec![b"fee_config".to_vec(), pool_market.to_bytes().to_vec()],
-                    vec![b"fee_config".to_vec(), base_mint.to_bytes().to_vec()],
-                    vec![b"fee_config".to_vec()],
-                    vec![b"fees".to_vec(), global_config.to_bytes().to_vec()],
-                    vec![b"fees".to_vec(), pool_market.to_bytes().to_vec()],
-                    vec![b"fees".to_vec(), base_mint.to_bytes().to_vec()],
-                    vec![b"fee".to_vec(), global_config.to_bytes().to_vec()],
-                    vec![b"fee".to_vec(), pool_market.to_bytes().to_vec()],
-                    vec![b"fee".to_vec(), base_mint.to_bytes().to_vec()],
-                ],
-            )
-            .await?
-        {
-            Some(v) => v,
-            None => return Ok(None),
-        };
+        if fee_config == Pubkey::default() || global_volume_accumulator == Pubkey::default() {
+            return Ok(None);
+        }
 
         let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
 
