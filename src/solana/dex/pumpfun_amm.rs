@@ -543,6 +543,63 @@ impl PumpFunAmmDex {
         Pubkey::new_from_array(ata_spl.to_bytes())
     }
 
+    async fn find_token_account_by_owner_and_mint(
+        &self,
+        token_program: Pubkey,
+        token_owner: Pubkey,
+        mint: Pubkey,
+    ) -> Result<Option<Pubkey>> {
+        // Fallback for cases where the recipient token account is not an ATA.
+        // Use program-indexed lookup (ideally via Helius) with strict memcmp filters.
+        let params = json!([
+            token_program.to_string(),
+            {
+                "encoding": "base64",
+                "commitment": "confirmed",
+                "dataSlice": {"offset": 0, "length": 0},
+                "filters": [
+                    {"memcmp": {"offset": 0, "bytes": mint.to_string()}},
+                    {"memcmp": {"offset": 32, "bytes": token_owner.to_string()}},
+                ]
+            }
+        ]);
+
+        let v = self.rpc_call("getProgramAccounts", params).await?;
+        let arr = match v.get("result").and_then(|r| r.as_array()) {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+
+        for item in arr {
+            let pk = item.get("pubkey").and_then(|p| p.as_str());
+            if let Some(pk) = pk {
+                if let Ok(parsed) = Pubkey::from_str(pk) {
+                    return Ok(Some(parsed));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn find_any_token_account_for_owner_and_mint(
+        &self,
+        token_owner: Pubkey,
+        mint: Pubkey,
+        token_program: Pubkey,
+        token_2022_program: Pubkey,
+    ) -> Result<Option<Pubkey>> {
+        // Prefer the legacy SPL Token program first.
+        if let Some(ta) = self
+            .find_token_account_by_owner_and_mint(token_program, token_owner, mint)
+            .await?
+        {
+            return Ok(Some(ta));
+        }
+        self.find_token_account_by_owner_and_mint(token_2022_program, token_owner, mint)
+            .await
+    }
+
     async fn derive_existing_pda(
         &self,
         program_id: Pubkey,
@@ -709,9 +766,12 @@ impl PumpFunAmmDex {
             }
         }
 
-        // Helper: try to find an authority whose ATA for `mint` exists.
-        let find_authority_with_existing_ata = |candidates: Vec<Pubkey>, mint: Pubkey| async move {
+        // Helper: try to find an authority whose token account for `mint` exists.
+        // Prefer ATA; if none exists, fall back to an indexed getProgramAccounts lookup
+        // (covers non-ATA fee recipient accounts).
+        let find_authority_with_existing_token_account = |candidates: Vec<Pubkey>, mint: Pubkey| async move {
             for cand in candidates {
+                // 1) Fast path: ATA exists.
                 for tp in [token_program, token_2022_program] {
                     let ata = Self::derive_ata_with_program(cand, mint, tp);
                     let Some((ata_owner, ata_exec, ata_data)) =
@@ -730,6 +790,19 @@ impl PumpFunAmmDex {
                     if ata_mint == mint && ata_token_owner == cand {
                         return Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(Some((cand, ata)));
                     }
+                }
+
+                // 2) Slow path: find any token account owned by cand for mint (non-ATA).
+                if let Some(ta) = self
+                    .find_any_token_account_for_owner_and_mint(
+                        cand,
+                        mint,
+                        token_program,
+                        token_2022_program,
+                    )
+                    .await?
+                {
+                    return Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(Some((cand, ta)));
                 }
             }
             Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(None)
@@ -889,13 +962,13 @@ impl PumpFunAmmDex {
                 combined.sort();
                 combined.dedup();
 
-                if let Some((auth, ata)) =
-                    find_authority_with_existing_ata(combined, quote_mint).await?
+                if let Some((auth, ta)) =
+                    find_authority_with_existing_token_account(combined, quote_mint).await?
                 {
-                    (auth, ata)
+                    (auth, ta)
                 } else {
                     return Err(anyhow!(
-                        "pump_amm market parse: no protocol fee recipient token account (no embedded fee TA; no ATA found)"
+                        "pump_amm market parse: no protocol fee recipient token account (no embedded fee TA; no token account found)"
                     ));
                 }
             }
@@ -908,10 +981,11 @@ impl PumpFunAmmDex {
                 .find(|t| t.address != pool_base_vault)
         {
             (t.token_owner, t.address)
-        } else if let Some((auth, ata)) =
-            find_authority_with_existing_ata(authority_candidates.clone(), base_mint).await?
+        } else if let Some((auth, ta)) =
+            find_authority_with_existing_token_account(authority_candidates.clone(), base_mint)
+                .await?
         {
-            (auth, ata)
+            (auth, ta)
         } else {
             return Err(anyhow!(
                 "pump_amm market parse: no creator vault token account (no embedded creator ATA; no ATA found)"
