@@ -14,7 +14,9 @@ use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
@@ -92,6 +94,11 @@ pub struct PumpFunAmmDex {
     http: Client,
     user_authority: Option<Pubkey>,
 
+    // Helius can be aggressively rate limited. We keep Helius JSON-RPC calls
+    // serialized and spaced out; local RPC still handles cheap getAccountInfo.
+    helius_jsonrpc_permits: Arc<Semaphore>,
+    helius_last_request: Arc<Mutex<Option<Instant>>>,
+
     // Prevent concurrent pool discovery storms (e.g. parallel exits) from hammering RPC.
     discovery_lock: Arc<Mutex<()>>,
 
@@ -108,10 +115,56 @@ impl PumpFunAmmDex {
             helius_rpc_url,
             http: Client::new(),
             user_authority: None,
+            helius_jsonrpc_permits: Arc::new(Semaphore::new(1)),
+            helius_last_request: Arc::new(Mutex::new(None)),
             discovery_lock: Arc::new(Mutex::new(())),
             pools_by_base: DashMap::new(),
             user_accounts: DashMap::new(),
         }
+    }
+
+    fn is_helius_endpoint(&self, endpoint: &str) -> bool {
+        self.helius_rpc_url
+            .as_deref()
+            .map(|h| h == endpoint)
+            .unwrap_or(false)
+    }
+
+    async fn helius_throttle_guard(&self, endpoint: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if !self.is_helius_endpoint(endpoint) {
+            return None;
+        }
+
+        // Serialize Helius calls.
+        let permit = self
+            .helius_jsonrpc_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .ok()?;
+
+        // Space out calls to reduce 429/-32429.
+        // Keep this conservative; kill-switch correctness > speed.
+        const MIN_GAP_MS: u64 = 150;
+        let min_gap = Duration::from_millis(MIN_GAP_MS);
+
+        let mut last = self.helius_last_request.lock().await;
+        if let Some(prev) = *last {
+            let since = prev.elapsed();
+            if since < min_gap {
+                sleep(min_gap - since).await;
+            }
+        }
+        *last = Some(Instant::now());
+
+        Some(permit)
+    }
+
+    fn parse_retry_after_ms(resp: &reqwest::Response) -> Option<u64> {
+        // Retry-After can be seconds or an HTTP date. We only handle seconds.
+        let v = resp.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+        let secs: u64 = v.trim().parse().ok()?;
+        Some(secs.saturating_mul(1000))
     }
 
     pub fn set_user_authority(&mut self, user: Pubkey) {
@@ -170,10 +223,10 @@ impl PumpFunAmmDex {
 
     fn discovery_endpoints(&self) -> Vec<&str> {
         let mut endpoints: Vec<&str> = Vec::with_capacity(2);
+        endpoints.push(self.rpc_url.as_str());
         if let Some(h) = self.helius_rpc_url.as_deref() {
             endpoints.push(h);
         }
-        endpoints.push(self.rpc_url.as_str());
         endpoints.dedup();
         endpoints
     }
@@ -199,6 +252,7 @@ impl PumpFunAmmDex {
         let mut backoff_ms = 500u64;
 
         for attempt in 0..8usize {
+            let _helius_guard = self.helius_throttle_guard(endpoint).await;
             let resp = self
                 .http
                 .post(endpoint)
@@ -212,12 +266,17 @@ impl PumpFunAmmDex {
                 })?;
 
             let status = resp.status();
-            let v: Value = resp
-                .json()
-                .await
-                .map_err(|e| anyhow!(
-                    "pump_amm tx_history json decode error endpoint={endpoint} attempt={attempt}: {e}"
-                ))?;
+            let retry_after_ms = Self::parse_retry_after_ms(&resp);
+            let text = resp.text().await.map_err(|e| {
+                anyhow!(
+                    "pump_amm tx_history read body error endpoint={endpoint} attempt={attempt}: {e}"
+                )
+            })?;
+            let v: Value = serde_json::from_str(&text).map_err(|e| {
+                anyhow!(
+                    "pump_amm tx_history json decode error endpoint={endpoint} attempt={attempt}: {e} body={text}"
+                )
+            })?;
 
             let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS
                 || v.get("error")
@@ -231,7 +290,8 @@ impl PumpFunAmmDex {
                     .unwrap_or(false);
 
             if is_rate_limited {
-                sleep(Duration::from_millis(backoff_ms)).await;
+                let wait_ms = retry_after_ms.unwrap_or(backoff_ms);
+                sleep(Duration::from_millis(wait_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(8000);
                 continue;
             }
@@ -266,7 +326,9 @@ impl PumpFunAmmDex {
         for endpoint in self.discovery_endpoints() {
             // Retry on rate-limits; fall back to the next endpoint if still blocked.
             let mut backoff_ms = 250u64;
-            for attempt in 0..3usize {
+            let max_attempts = if self.is_helius_endpoint(endpoint) { 6usize } else { 2usize };
+            for attempt in 0..max_attempts {
+                let _helius_guard = self.helius_throttle_guard(endpoint).await;
                 let resp = match self.http.post(endpoint).json(&body).send().await {
                     Ok(r) => r,
                     Err(e) => {
@@ -278,11 +340,21 @@ impl PumpFunAmmDex {
                 };
 
                 let status = resp.status();
-                let v: Value = match resp.json().await {
+                let retry_after_ms = Self::parse_retry_after_ms(&resp);
+                let text = match resp.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        last_err = Some(anyhow!(
+                            "pump_amm rpc read body error endpoint={endpoint} attempt={attempt}: {e}"
+                        ));
+                        break;
+                    }
+                };
+                let v: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(e) => {
                         last_err = Some(anyhow!(
-                            "pump_amm rpc json decode error endpoint={endpoint} attempt={attempt}: {e}"
+                            "pump_amm rpc json decode error endpoint={endpoint} attempt={attempt}: {e} body={text}"
                         ));
                         break;
                     }
@@ -303,7 +375,8 @@ impl PumpFunAmmDex {
                     last_err = Some(anyhow!(
                         "pump_amm rpc http status {status} endpoint={endpoint}: {v}"
                     ));
-                    sleep(Duration::from_millis(backoff_ms)).await;
+                    let wait_ms = retry_after_ms.unwrap_or(backoff_ms);
+                    sleep(Duration::from_millis(wait_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(2000);
                     continue;
                 }
@@ -498,6 +571,11 @@ impl PumpFunAmmDex {
         }
 
         let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let token_2022_program = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
+        let associated_token_program = Pubkey::new_from_array(
+            spl_associated_token_account::id().to_bytes(),
+        );
+        let system_program = Pubkey::from_str("11111111111111111111111111111111")?;
         let mut token_accounts: Vec<TokenAccountMeta> = Vec::new();
         let mut non_token_pubkeys: Vec<Pubkey> = Vec::new();
         let mut program_owned_accounts: Vec<ProgramOwnedAccountMeta> = Vec::new();
@@ -537,6 +615,30 @@ impl PumpFunAmmDex {
             non_token_pubkeys.push(pk);
         }
 
+        // Helper: try to find an authority whose ATA for `mint` exists.
+        let find_authority_with_existing_ata = |candidates: Vec<Pubkey>, mint: Pubkey| async move {
+            for cand in candidates {
+                let ata = Self::derive_ata(cand, mint);
+                let Some((ata_owner, ata_exec, ata_data)) =
+                    self.rpc_get_account_owner_executable_and_data(ata).await?
+                else {
+                    continue;
+                };
+                if ata_exec || ata_owner != token_program {
+                    continue;
+                }
+                let Some((ata_mint, ata_token_owner)) =
+                    Self::parse_spl_token_account_mint_and_owner(&ata_data)
+                else {
+                    continue;
+                };
+                if ata_mint == mint && ata_token_owner == cand {
+                    return Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(Some((cand, ata)));
+                }
+            }
+            Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(None)
+        };
+
         let mut base_token_accounts: Vec<TokenAccountMeta> = token_accounts
             .iter()
             .filter(|t| t.mint == base_mint)
@@ -560,27 +662,67 @@ impl PumpFunAmmDex {
             .map(|t| t.address)
             .ok_or_else(|| anyhow!("pump_amm market parse: no quote vault token accounts"))?;
 
-        let protocol_fee_recipient_ta = quote_token_accounts
+        // Build a list of plausible authorities for fee/creator recipients.
+        // These can appear as plain Pubkeys in the market account even when the corresponding
+        // token accounts are not embedded.
+        let mut authority_candidates: Vec<Pubkey> = non_token_pubkeys
+            .iter()
+            .copied()
+            .filter(|pk| {
+                *pk != Pubkey::default()
+                    && *pk != pool_market
+                    && *pk != global_config
+                    && *pk != base_mint
+                    && *pk != quote_mint
+                    && *pk != pool_base_vault
+                    && *pk != pool_quote_vault
+                    && *pk != pump_amm_program
+                    && *pk != token_program
+                    && *pk != token_2022_program
+                    && *pk != associated_token_program
+                    && *pk != system_program
+            })
+            .collect();
+        authority_candidates.sort();
+        authority_candidates.dedup();
+
+        // Protocol fee recipient: prefer an embedded quote token account; otherwise derive ATA.
+        let (protocol_fee_recipient, protocol_fee_recipient_ta) = if let Some(t) = quote_token_accounts
             .iter()
             .find(|t| t.address != pool_quote_vault)
-            .map(|t| t.address)
-            .ok_or_else(|| anyhow!("pump_amm market parse: no protocol fee TA"))?;
-        let protocol_fee_recipient = quote_token_accounts
-            .iter()
-            .find(|t| t.address == protocol_fee_recipient_ta)
-            .map(|t| t.token_owner)
-            .unwrap_or_default();
+        {
+            (t.token_owner, t.address)
+        } else if let Some((auth, ata)) = find_authority_with_existing_ata(
+            authority_candidates.clone(),
+            quote_mint,
+        )
+        .await?
+        {
+            (auth, ata)
+        } else {
+            return Err(anyhow!(
+                "pump_amm market parse: no protocol fee recipient token account (no embedded fee TA; no ATA found)"
+            ));
+        };
 
-        let coin_creator_vault_ata = base_token_accounts
+        // Creator vault ATA: prefer an embedded base token account; otherwise derive ATA.
+        let (coin_creator_vault_authority, coin_creator_vault_ata) = if let Some(t) = base_token_accounts
             .iter()
             .find(|t| t.address != pool_base_vault)
-            .map(|t| t.address)
-            .ok_or_else(|| anyhow!("pump_amm market parse: no creator vault ATA"))?;
-        let coin_creator_vault_authority = base_token_accounts
-            .iter()
-            .find(|t| t.address == coin_creator_vault_ata)
-            .map(|t| t.token_owner)
-            .unwrap_or_default();
+        {
+            (t.token_owner, t.address)
+        } else if let Some((auth, ata)) = find_authority_with_existing_ata(
+            authority_candidates.clone(),
+            base_mint,
+        )
+        .await?
+        {
+            (auth, ata)
+        } else {
+            return Err(anyhow!(
+                "pump_amm market parse: no creator vault token account (no embedded creator ATA; no ATA found)"
+            ));
+        };
 
         // Derive remaining PDAs with a small set of common seed patterns and validate existence.
         let event_authority = {
