@@ -783,20 +783,122 @@ impl PumpFunAmmDex {
         authority_candidates.dedup();
 
         // Protocol fee recipient: prefer an embedded quote token account; otherwise derive ATA.
+        // Some PumpSwap markets do not embed the fee recipient TA in the market account.
+        // In that case, fall back to scanning the global_config account for either:
+        // - an embedded quote token account (best), or
+        // - additional authority pubkeys (then derive ATA and validate existence).
         let (protocol_fee_recipient, protocol_fee_recipient_ta) = if let Some(t) =
             quote_token_accounts
                 .iter()
                 .find(|t| t.address != pool_quote_vault)
         {
             (t.token_owner, t.address)
-        } else if let Some((auth, ata)) =
-            find_authority_with_existing_ata(authority_candidates.clone(), quote_mint).await?
-        {
-            (auth, ata)
         } else {
-            return Err(anyhow!(
-                "pump_amm market parse: no protocol fee recipient token account (no embedded fee TA; no ATA found)"
-            ));
+            let mut extra_authority_candidates: Vec<Pubkey> = Vec::new();
+            let mut embedded_fee_ta_from_global: Option<(Pubkey, Pubkey, u64)> = None;
+
+            if let Some((gc_owner, gc_exec, gc_data)) = self
+                .rpc_get_account_owner_executable_and_data(global_config)
+                .await?
+            {
+                if !gc_exec && gc_owner == pump_amm_program && gc_data.len() >= 32 {
+                    // Scan the global_config raw bytes for candidate pubkeys.
+                    let mut gc_pubkeys: Vec<Pubkey> = Vec::new();
+                    for i in 0..=(gc_data.len().saturating_sub(32)) {
+                        let pk = Pubkey::new_from_array(
+                            gc_data[i..i + 32]
+                                .try_into()
+                                .map_err(|_| anyhow!("global_config scan pubkey slice"))?,
+                        );
+                        gc_pubkeys.push(pk);
+                    }
+                    gc_pubkeys.sort();
+                    gc_pubkeys.dedup();
+
+                    for chunk in gc_pubkeys.chunks(MULTI_ACCOUNTS_CHUNK) {
+                        let accounts =
+                            self.rpc
+                                .rpc
+                                .get_multiple_accounts(chunk)
+                                .await
+                                .map_err(|e| {
+                                    anyhow!("get_multiple_accounts (global_config) failed: {e}")
+                                })?;
+
+                        for (pk, acc_opt) in chunk.iter().copied().zip(accounts.into_iter()) {
+                            let Some(acc) = acc_opt else {
+                                continue;
+                            };
+                            let acc_owner = acc.owner;
+                            let acc_data = acc.data;
+
+                            if acc_owner == token_program || acc_owner == token_2022_program {
+                                if let Some((mint, token_owner)) =
+                                    Self::parse_spl_token_account_mint_and_owner(&acc_data)
+                                {
+                                    if mint == quote_mint && pk != pool_quote_vault {
+                                        let bal = Self::parse_spl_token_account_amount(&acc_data)
+                                            .unwrap_or(0);
+                                        match embedded_fee_ta_from_global {
+                                            None => {
+                                                embedded_fee_ta_from_global =
+                                                    Some((token_owner, pk, bal));
+                                            }
+                                            Some((_prev_owner, _prev_ta, prev_bal)) => {
+                                                // Heuristic: prefer the smaller balance (fee TA
+                                                // tends to hold little vs pool vault).
+                                                if bal < prev_bal {
+                                                    embedded_fee_ta_from_global =
+                                                        Some((token_owner, pk, bal));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // Keep any existing, non-token pubkeys as additional authority candidates.
+                            if !acc.executable
+                                && pk != Pubkey::default()
+                                && pk != pool_market
+                                && pk != global_config
+                                && pk != base_mint
+                                && pk != quote_mint
+                                && pk != pool_base_vault
+                                && pk != pool_quote_vault
+                                && pk != pump_amm_program
+                                && pk != token_program
+                                && pk != token_2022_program
+                                && pk != associated_token_program
+                                && pk != system_program
+                            {
+                                extra_authority_candidates.push(pk);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some((owner, ta, _bal)) = embedded_fee_ta_from_global {
+                (owner, ta)
+            } else {
+                // Retry ATA derivation with any extra authorities found in global_config.
+                let mut combined = authority_candidates.clone();
+                combined.extend(extra_authority_candidates);
+                combined.sort();
+                combined.dedup();
+
+                if let Some((auth, ata)) =
+                    find_authority_with_existing_ata(combined, quote_mint).await?
+                {
+                    (auth, ata)
+                } else {
+                    return Err(anyhow!(
+                        "pump_amm market parse: no protocol fee recipient token account (no embedded fee TA; no ATA found)"
+                    ));
+                }
+            }
         };
 
         // Creator vault ATA: prefer an embedded base token account; otherwise derive ATA.
