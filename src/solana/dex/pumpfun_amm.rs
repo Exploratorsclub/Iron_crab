@@ -763,6 +763,15 @@ impl PumpFunAmmDex {
             }
         }
 
+        // If we found market accounts but couldn't parse a usable static account set, do not fall
+        // back to tx-history scanning. Tx-history is both expensive and the primary driver of 429s
+        // on public endpoints.
+        if !markets.is_empty() {
+            return Err(anyhow!(
+                "pump_amm market(s) found but market parsing failed base_mint={base_mint} markets={markets:?}"
+            ));
+        }
+
         // TX-based discovery: prefer scanning the pool market(s) (stable) over the mint address.
         // On pruned RPC, mint-address history can be missing; program-accounts lookup + market
         // history tends to be more reliable.
@@ -795,9 +804,8 @@ impl PumpFunAmmDex {
                     .await
                 {
                     Ok(v) => v,
-                    Err(_) => {
-                        // Best-effort: if discovery endpoint is rate-limited or transiently fails,
-                        // don't fail liquidation outright; just stop scanning this address.
+                    Err(e) => {
+                        discovery_err = Some(e);
                         break;
                     }
                 };
@@ -850,9 +858,9 @@ impl PumpFunAmmDex {
                         .await
                     {
                         Ok(v) => v,
-                        Err(_) => {
-                            // Transient failures are common on public endpoints; keep scanning.
-                            continue;
+                        Err(e) => {
+                            discovery_err = Some(e);
+                            break;
                         }
                     };
 
@@ -973,8 +981,20 @@ impl PumpFunAmmDex {
                     }
                 }
 
+                if discovery_err.is_some() {
+                    break;
+                }
+
                 // Small delay between pages to reduce rate-limit pressure.
                 sleep(Duration::from_millis(200)).await;
+
+                if discovery_err.is_some() {
+                    break;
+                }
+            }
+
+            if discovery_err.is_some() {
+                break;
             }
         }
 
