@@ -754,19 +754,14 @@ impl PumpFunAmmDex {
             return Ok(None);
         }
 
-        // Cap transaction fetches.
-        const SIG_TX_PER_PAGE: usize = 25;
-        let page_len = sigs.len();
-        let take_n = SIG_TX_PER_PAGE.min(page_len);
-        let step = if take_n <= 1 {
-            1
-        } else {
-            (page_len - 1) / (take_n - 1)
-        };
+        // Cap transaction fetches (sequential scan is more reliable than sampling for thin history).
+        const MAX_TX_FETCHES: usize = 60;
 
-        for i in 0..take_n {
-            let idx = (i * step).min(page_len.saturating_sub(1));
-            let s = &sigs[idx];
+        let mut fetched = 0usize;
+        for s in sigs.iter() {
+            if fetched >= MAX_TX_FETCHES {
+                break;
+            }
             if let Some(err) = s.get("err") {
                 if !err.is_null() {
                     continue;
@@ -776,6 +771,8 @@ impl PumpFunAmmDex {
                 Some(v) => v,
                 None => continue,
             };
+
+            fetched += 1;
 
             let tx_v = self
                 .rpc_call_tx_history(
@@ -824,6 +821,15 @@ impl PumpFunAmmDex {
                     None => continue,
                 };
                 if accounts.len() != 23 {
+                    continue;
+                }
+
+                // Ensure we're extracting accounts for the market we scanned.
+                let pool_market_ix = match account_keys.get(accounts[0]) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if Pubkey::from_str(pool_market_ix).ok() != Some(pool_market) {
                     continue;
                 }
 
@@ -913,7 +919,7 @@ impl PumpFunAmmDex {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    market_parse_err = Some(anyhow!(e).context(format!(
+                    market_parse_err = Some(e.context(format!(
                         "pump_amm market parse failed market={m} base_mint={base_mint}"
                     )));
                 }
