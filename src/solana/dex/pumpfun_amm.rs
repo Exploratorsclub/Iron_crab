@@ -15,10 +15,10 @@ use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use std::time::Instant;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -43,8 +43,7 @@ const DEFAULT_TOTAL_FEE_BPS: u32 = 125;
 
 // Helius can aggressively rate limit across the entire API key. Keep JSON-RPC calls serialized
 // and spaced out process-wide (not per `PumpFunAmmDex` instance).
-static HELIUS_THROTTLES: Lazy<DashMap<String, Arc<HeliusThrottle>>> =
-    Lazy::new(|| DashMap::new());
+static HELIUS_THROTTLES: Lazy<DashMap<String, Arc<HeliusThrottle>>> = Lazy::new(|| DashMap::new());
 
 #[derive(Debug)]
 struct HeliusThrottle {
@@ -160,7 +159,10 @@ impl PumpFunAmmDex {
         normalize_rpc_url(h) == normalize_rpc_url(endpoint)
     }
 
-    async fn helius_throttle_guard(&self, endpoint: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    async fn helius_throttle_guard(
+        &self,
+        endpoint: &str,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         if !self.is_helius_endpoint(endpoint) {
             return None;
         }
@@ -189,7 +191,11 @@ impl PumpFunAmmDex {
 
     fn parse_retry_after_ms(resp: &reqwest::Response) -> Option<u64> {
         // Retry-After can be seconds or an HTTP date. We only handle seconds.
-        let v = resp.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+        let v = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?;
         let secs: u64 = v.trim().parse().ok()?;
         Some(secs.saturating_mul(1000))
     }
@@ -353,7 +359,11 @@ impl PumpFunAmmDex {
         for endpoint in self.discovery_endpoints() {
             // Retry on rate-limits; fall back to the next endpoint if still blocked.
             let mut backoff_ms = 250u64;
-            let max_attempts = if self.is_helius_endpoint(endpoint) { 10usize } else { 2usize };
+            let max_attempts = if self.is_helius_endpoint(endpoint) {
+                10usize
+            } else {
+                2usize
+            };
             for attempt in 0..max_attempts {
                 let _helius_guard = self.helius_throttle_guard(endpoint).await;
                 let resp = match self.http.post(endpoint).json(&body).send().await {
@@ -610,11 +620,9 @@ impl PumpFunAmmDex {
         }
 
         let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
-        let token_2022_program =
-            Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
-        let associated_token_program = Pubkey::new_from_array(
-            spl_associated_token_account::id().to_bytes(),
-        );
+        let token_2022_program = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
+        let associated_token_program =
+            Pubkey::new_from_array(spl_associated_token_account::id().to_bytes());
         let system_program = Pubkey::from_str("11111111111111111111111111111111")?;
         let mut token_accounts: Vec<TokenAccountMeta> = Vec::new();
         let mut non_token_pubkeys: Vec<Pubkey> = Vec::new();
@@ -672,8 +680,7 @@ impl PumpFunAmmDex {
         }
 
         // Helper: try to find an authority whose ATA for `mint` exists.
-        let find_authority_with_existing_ata =
-            |candidates: Vec<Pubkey>, mint: Pubkey| async move {
+        let find_authority_with_existing_ata = |candidates: Vec<Pubkey>, mint: Pubkey| async move {
             for cand in candidates {
                 for tp in [token_program, token_2022_program] {
                     let ata = Self::derive_ata_with_program(cand, mint, tp);
@@ -682,8 +689,7 @@ impl PumpFunAmmDex {
                     else {
                         continue;
                     };
-                    if ata_exec || (ata_owner != token_program && ata_owner != token_2022_program)
-                    {
+                    if ata_exec || (ata_owner != token_program && ata_owner != token_2022_program) {
                         continue;
                     }
                     let Some((ata_mint, ata_token_owner)) =
@@ -747,16 +753,14 @@ impl PumpFunAmmDex {
         authority_candidates.dedup();
 
         // Protocol fee recipient: prefer an embedded quote token account; otherwise derive ATA.
-        let (protocol_fee_recipient, protocol_fee_recipient_ta) = if let Some(t) = quote_token_accounts
-            .iter()
-            .find(|t| t.address != pool_quote_vault)
+        let (protocol_fee_recipient, protocol_fee_recipient_ta) = if let Some(t) =
+            quote_token_accounts
+                .iter()
+                .find(|t| t.address != pool_quote_vault)
         {
             (t.token_owner, t.address)
-        } else if let Some((auth, ata)) = find_authority_with_existing_ata(
-            authority_candidates.clone(),
-            quote_mint,
-        )
-        .await?
+        } else if let Some((auth, ata)) =
+            find_authority_with_existing_ata(authority_candidates.clone(), quote_mint).await?
         {
             (auth, ata)
         } else {
@@ -766,16 +770,14 @@ impl PumpFunAmmDex {
         };
 
         // Creator vault ATA: prefer an embedded base token account; otherwise derive ATA.
-        let (coin_creator_vault_authority, coin_creator_vault_ata) = if let Some(t) = base_token_accounts
-            .iter()
-            .find(|t| t.address != pool_base_vault)
+        let (coin_creator_vault_authority, coin_creator_vault_ata) = if let Some(t) =
+            base_token_accounts
+                .iter()
+                .find(|t| t.address != pool_base_vault)
         {
             (t.token_owner, t.address)
-        } else if let Some((auth, ata)) = find_authority_with_existing_ata(
-            authority_candidates.clone(),
-            base_mint,
-        )
-        .await?
+        } else if let Some((auth, ata)) =
+            find_authority_with_existing_ata(authority_candidates.clone(), base_mint).await?
         {
             (auth, ata)
         } else {
@@ -904,7 +906,8 @@ impl PumpFunAmmDex {
         // ("excluded from account secondary indexes"). When Helius is configured, always use it
         // for program-account discovery.
         let v = if self.helius_rpc_url.is_some() {
-            self.rpc_call_tx_history("getProgramAccounts", params).await?
+            self.rpc_call_tx_history("getProgramAccounts", params)
+                .await?
         } else {
             self.rpc_call("getProgramAccounts", params).await?
         };
@@ -943,10 +946,7 @@ impl PumpFunAmmDex {
 
         let addr = pool_market.to_string();
         let sigs_v = self
-            .rpc_call_tx_history(
-                "getSignaturesForAddress",
-                json!([addr, {"limit": 200}]),
-            )
+            .rpc_call_tx_history("getSignaturesForAddress", json!([addr, {"limit": 200}]))
             .await?;
         let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
             Some(v) => v,
@@ -1098,7 +1098,10 @@ impl PumpFunAmmDex {
         }
 
         let mut discovery_err: Option<anyhow::Error> = None;
-        let markets = match self.discover_pool_markets_via_program_accounts(base_mint).await {
+        let markets = match self
+            .discover_pool_markets_via_program_accounts(base_mint)
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 discovery_err = Some(e);
