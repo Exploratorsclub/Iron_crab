@@ -1156,7 +1156,7 @@ impl ExecutionContext {
                             quote_attempts.push("pumpfun=none".to_string());
                         }
                         Err(e) => {
-                            quote_attempts.push(format!("pumpfun=err {e}"));
+                            quote_attempts.push(format!("pumpfun=err {e:#}"));
                         }
                     }
                 }
@@ -1212,7 +1212,7 @@ impl ExecutionContext {
                         quote_attempts.push("pump_amm=none".to_string());
                     }
                     Err(e) => {
-                        quote_attempts.push(format!("pump_amm=err {e}"));
+                        quote_attempts.push(format!("pump_amm=err {e:#}"));
                     }
                 }
             }
@@ -1242,7 +1242,7 @@ impl ExecutionContext {
                         quote_attempts.push("raydium=none".to_string());
                     }
                     Err(e) => {
-                        quote_attempts.push(format!("raydium=err {e}"));
+                        quote_attempts.push(format!("raydium=err {e:#}"));
                     }
                 }
             }
