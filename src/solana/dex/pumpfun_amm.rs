@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use reqwest::Client;
+use reqwest::StatusCode;
 use serde_json::{json, Value};
 use solana_sdk::hash::hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
@@ -142,10 +143,14 @@ impl PumpFunAmmDex {
         Pubkey::find_program_address(&seeds, &program_id).0
     }
 
-    fn rpc_endpoint_for_discovery(&self) -> &str {
-        self.helius_rpc_url
-            .as_deref()
-            .unwrap_or(self.rpc_url.as_str())
+    fn discovery_endpoints(&self) -> Vec<&str> {
+        let mut endpoints: Vec<&str> = Vec::with_capacity(2);
+        if let Some(h) = self.helius_rpc_url.as_deref() {
+            endpoints.push(h);
+        }
+        endpoints.push(self.rpc_url.as_str());
+        endpoints.dedup();
+        endpoints
     }
 
     async fn rpc_call(&self, method: &str, params: Value) -> Result<Value> {
@@ -155,25 +160,70 @@ impl PumpFunAmmDex {
             "method": method,
             "params": params,
         });
-        let resp = self
-            .http
-            .post(self.rpc_endpoint_for_discovery())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow!("pump_amm rpc http error: {e}"))?;
-        let status = resp.status();
-        let v: Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow!("pump_amm rpc json decode error: {e}"))?;
-        if !status.is_success() {
-            return Err(anyhow!("pump_amm rpc http status {status}: {v}"));
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for endpoint in self.discovery_endpoints() {
+            // Retry on rate-limits; fall back to the next endpoint if still blocked.
+            let mut backoff_ms = 250u64;
+            for attempt in 0..3usize {
+                let resp = match self.http.post(endpoint).json(&body).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last_err = Some(anyhow!(
+                            "pump_amm rpc http error endpoint={endpoint} attempt={attempt}: {e}"
+                        ));
+                        break;
+                    }
+                };
+
+                let status = resp.status();
+                let v: Value = match resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        last_err = Some(anyhow!(
+                            "pump_amm rpc json decode error endpoint={endpoint} attempt={attempt}: {e}"
+                        ));
+                        break;
+                    }
+                };
+
+                let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS
+                    || v.get("error")
+                        .and_then(|e| e.get("code"))
+                        .and_then(|c| c.as_i64())
+                        == Some(-32429)
+                    || v.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(|m| m.to_ascii_lowercase().contains("rate"))
+                        .unwrap_or(false);
+
+                if is_rate_limited {
+                    last_err = Some(anyhow!(
+                        "pump_amm rpc http status {status} endpoint={endpoint}: {v}"
+                    ));
+                    sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(2000);
+                    continue;
+                }
+
+                if !status.is_success() {
+                    last_err = Some(anyhow!(
+                        "pump_amm rpc http status {status} endpoint={endpoint}: {v}"
+                    ));
+                    break;
+                }
+                if v.get("error").is_some() {
+                    last_err = Some(anyhow!("pump_amm rpc error endpoint={endpoint}: {v}"));
+                    break;
+                }
+                return Ok(v);
+            }
         }
-        if v.get("error").is_some() {
-            return Err(anyhow!("pump_amm rpc error: {v}"));
-        }
-        Ok(v)
+
+        Err(last_err.unwrap_or_else(|| anyhow!(
+            "pump_amm rpc call failed method={method} (no endpoints)"
+        )))
     }
 
     async fn rpc_get_account_owner_and_executable(
