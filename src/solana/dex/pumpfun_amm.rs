@@ -153,6 +153,78 @@ impl PumpFunAmmDex {
         endpoints
     }
 
+    fn tx_history_endpoint(&self) -> &str {
+        // Tx-history discovery is the highest RPC load in this module; prefer the full-index
+        // endpoint (Helius) when available. Local validators are often pruned and will return
+        // empty signature pages.
+        self.helius_rpc_url
+            .as_deref()
+            .unwrap_or(self.rpc_url.as_str())
+    }
+
+    async fn rpc_call_tx_history(&self, method: &str, params: Value) -> Result<Value> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+
+        let endpoint = self.tx_history_endpoint();
+        let mut backoff_ms = 500u64;
+
+        for attempt in 0..8usize {
+            let resp = self
+                .http
+                .post(endpoint)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow!("pump_amm tx_history http error endpoint={endpoint} attempt={attempt}: {e}"))?;
+
+            let status = resp.status();
+            let v: Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!(
+                    "pump_amm tx_history json decode error endpoint={endpoint} attempt={attempt}: {e}"
+                ))?;
+
+            let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS
+                || v.get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(|c| c.as_i64())
+                    == Some(-32429)
+                || v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|m| m.to_ascii_lowercase().contains("rate"))
+                    .unwrap_or(false);
+
+            if is_rate_limited {
+                sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(8000);
+                continue;
+            }
+
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "pump_amm tx_history http status {status} endpoint={endpoint}: {v}"
+                ));
+            }
+            if v.get("error").is_some() {
+                return Err(anyhow!(
+                    "pump_amm tx_history rpc error endpoint={endpoint}: {v}"
+                ));
+            }
+            return Ok(v);
+        }
+
+        Err(anyhow!(
+            "pump_amm tx_history rate-limited endpoint={endpoint} method={method}"
+        ))
+    }
+
     async fn rpc_call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({
             "jsonrpc": "2.0",
@@ -336,8 +408,10 @@ impl PumpFunAmmDex {
             // We paginate because the newest signatures can be dominated by our own failed
             // liquidation attempts (which we intentionally skip), and the first successful
             // PumpSwap trades can be older than the initial page on busy pools.
-            const SIG_PAGE_SIZE: u32 = 1_000;
-            const SIG_MAX_PAGES: usize = 20; // up to ~20k signatures; exits early on first match
+            // IMPORTANT: tx-history calls are expensive; cap requests to avoid rate-limits.
+            const SIG_PAGE_SIZE: u32 = 200;
+            const SIG_MAX_PAGES: usize = 30; // up to ~6k signatures
+            const SIG_TX_PER_PAGE: usize = 40; // cap getTransaction calls per page
             let mut before: Option<String> = None;
 
             for _page in 0..SIG_MAX_PAGES {
@@ -347,7 +421,7 @@ impl PumpFunAmmDex {
                 }
 
                 let sigs_v = match self
-                    .rpc_call("getSignaturesForAddress", json!([addr, cfg]))
+                    .rpc_call_tx_history("getSignaturesForAddress", json!([addr, cfg]))
                     .await
                 {
                     Ok(v) => v,
@@ -373,7 +447,7 @@ impl PumpFunAmmDex {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
-                for s in sigs.iter() {
+                for s in sigs.iter().take(SIG_TX_PER_PAGE) {
                 // Avoid poisoning discovery with failed transactions (e.g., our own earlier
                 // liquidation attempts that used wrong accounts and therefore failed).
                 if let Some(err) = s.get("err") {
@@ -387,7 +461,7 @@ impl PumpFunAmmDex {
                 };
 
                 let tx_v = match self
-                    .rpc_call(
+                    .rpc_call_tx_history(
                         "getTransaction",
                         json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}]),
                     )
@@ -510,8 +584,8 @@ impl PumpFunAmmDex {
                 }
                 }
 
-                // Small delay between pages to reduce rate-limit pressure on discovery endpoints.
-                sleep(Duration::from_millis(50)).await;
+                // Small delay between pages to reduce rate-limit pressure.
+                sleep(Duration::from_millis(200)).await;
             }
         }
 
