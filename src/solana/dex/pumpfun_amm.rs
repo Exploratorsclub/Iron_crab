@@ -210,10 +210,10 @@ impl PumpFunAmmDex {
         Ok(Some((Pubkey::from_str(owner)?, executable)))
     }
 
-    async fn discover_pool_market_via_program_accounts(
+    async fn discover_pool_markets_via_program_accounts(
         &self,
         base_mint: Pubkey,
-    ) -> Result<Option<Pubkey>> {
+    ) -> Result<Vec<Pubkey>> {
         let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
 
         let v = self
@@ -236,18 +236,24 @@ impl PumpFunAmmDex {
 
         let arr = match v.get("result").and_then(|r| r.as_array()) {
             Some(v) => v,
-            None => return Ok(None),
+            None => return Ok(Vec::new()),
         };
 
-        // Prefer exactly one match; if multiple appear, treat as ambiguous.
-        if arr.len() != 1 {
-            return Ok(None);
+        // Some mints can have multiple matching market accounts (re-created markets,
+        // migrations, etc). We return all matches and let tx-history scanning pick
+        // the first one that yields a valid swap account set.
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            let Some(pk) = item.get("pubkey").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if let Ok(p) = Pubkey::from_str(pk) {
+                out.push(p);
+            }
         }
-        let pk = match arr[0].get("pubkey").and_then(|v| v.as_str()) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        Ok(Some(Pubkey::from_str(pk)?))
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     async fn discover_pool_static(&self, base_mint: Pubkey) -> Result<Option<PumpAmmPoolStatic>> {
@@ -255,16 +261,26 @@ impl PumpFunAmmDex {
             return Ok(Some(v.clone()));
         }
 
-        // TX-based discovery: prefer scanning the pool market (stable) over the mint address.
+        // TX-based discovery: prefer scanning the pool market(s) (stable) over the mint address.
         // On pruned RPC, mint-address history can be missing; program-accounts lookup + market
-        // history tends to be reliable for newly created PumpSwap markets.
-        let mut scan_addresses = vec![base_mint.to_string()];
-        if let Some(market) = self
-            .discover_pool_market_via_program_accounts(base_mint)
-            .await?
+        // history tends to be more reliable.
+        let mut scan_addresses: Vec<String> = Vec::new();
+        match self
+            .discover_pool_markets_via_program_accounts(base_mint)
+            .await
         {
-            scan_addresses.push(market.to_string());
+            Ok(markets) => {
+                for m in markets {
+                    scan_addresses.push(m.to_string());
+                }
+            }
+            Err(_) => {
+                // Best-effort: if program-accounts lookup fails, still try mint history.
+            }
         }
+        scan_addresses.push(base_mint.to_string());
+        scan_addresses.sort();
+        scan_addresses.dedup();
 
         for addr in scan_addresses {
             // We paginate because the newest signatures can be dominated by our own failed

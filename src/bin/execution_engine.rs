@@ -1095,14 +1095,16 @@ impl ExecutionContext {
             };
 
             let mut min_out_sol: Option<u64> = None;
+            let mut quote_attempts: Vec<String> = Vec::new();
 
             // Prefer Pump.fun if quote exists.
             if min_out_sol.is_none() {
                 if let Some(ref pumpfun) = pumpfun {
-                    if let Ok(Some(q)) = pumpfun
+                    match pumpfun
                         .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
                         .await
                     {
+                        Ok(Some(q)) => {
                         #[cfg(unix)]
                         maybe_ping_watchdog();
 
@@ -1126,10 +1128,35 @@ impl ExecutionContext {
                         #[cfg(unix)]
                         maybe_ping_watchdog();
 
-                        if metadata.contains_key("creator") && resources.pools.len() == 1 {
-                            metadata.insert("dex".to_string(), "pumpfun".to_string());
-                            min_out_sol =
-                                Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
+                            if metadata.contains_key("creator") && resources.pools.len() == 1 {
+                                metadata.insert("dex".to_string(), "pumpfun".to_string());
+                                min_out_sol = Some(Self::apply_slippage_min_out(
+                                    q.amount_out,
+                                    max_slippage_bps,
+                                ));
+                                quote_attempts.push(format!(
+                                    "pumpfun=ok amount_out={} route={}",
+                                    q.amount_out,
+                                    resources
+                                        .pools
+                                        .first()
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("<none>")
+                                ));
+                            } else {
+                                quote_attempts.push(format!(
+                                    "pumpfun=skip missing_creator_or_pool creator_present={} pools_len={}"
+                                    ,
+                                    metadata.contains_key("creator"),
+                                    resources.pools.len()
+                                ));
+                            }
+                        }
+                        Ok(None) => {
+                            quote_attempts.push("pumpfun=none".to_string());
+                        }
+                        Err(e) => {
+                            quote_attempts.push(format!("pumpfun=err {e}"));
                         }
                     }
                 }
@@ -1137,10 +1164,11 @@ impl ExecutionContext {
 
             // Fallback to Pump.fun AMM (PumpSwap).
             if min_out_sol.is_none() {
-                if let Ok(Some(q)) = pump_amm
+                match pump_amm
                     .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
                     .await
                 {
+                    Ok(Some(q)) => {
                     #[cfg(unix)]
                     maybe_ping_watchdog();
 
@@ -1148,39 +1176,75 @@ impl ExecutionContext {
                         match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
                             Ok(Some(accounts)) => {
                                 metadata.insert("dex".to_string(), "pump_amm".to_string());
-                                resources.pools = vec![pool_id];
+                                resources.pools = vec![pool_id.clone()];
                                 resources.accounts =
                                     accounts.into_iter().map(|p| p.to_string()).collect();
                                 min_out_sol = Some(Self::apply_slippage_min_out(
                                     q.amount_out,
                                     max_slippage_bps,
                                 ));
+                                quote_attempts.push(format!(
+                                    "pump_amm=ok amount_out={} pool={} accounts_len={}"
+                                    ,
+                                    q.amount_out,
+                                    resources
+                                        .pools
+                                        .first()
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("<none>"),
+                                    resources.accounts.len()
+                                ));
                             }
                             Ok(None) => {
                                 warn!(mint = %mint, "pump_amm quote returned route, but pool accounts not found; skipping pump_amm");
+                                quote_attempts.push(format!(
+                                    "pump_amm=skip no_pool_accounts amount_out={} pool={}",
+                                    q.amount_out,
+                                    pool_id
+                                ));
                             }
                             Err(e) => {
                                 warn!(mint = %mint, error = %e, "pump_amm pool account discovery failed; skipping pump_amm");
+                                quote_attempts.push(format!("pump_amm=err_discovery {e}"));
                             }
                         }
+                    }
+                    }
+                    Ok(None) => {
+                        quote_attempts.push("pump_amm=none".to_string());
+                    }
+                    Err(e) => {
+                        quote_attempts.push(format!("pump_amm=err {e}"));
                     }
                 }
             }
 
             // Fallback to Raydium.
             if min_out_sol.is_none() {
-                if let Ok(Some(q)) = raydium
+                match raydium
                     .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
                     .await
                 {
+                    Ok(Some(q)) => {
                     #[cfg(unix)]
                     maybe_ping_watchdog();
 
                     if let Some(pool_id) = q.route.first().cloned() {
                         metadata.insert("dex".to_string(), "raydium".to_string());
-                        resources.pools = vec![pool_id];
+                        resources.pools = vec![pool_id.clone()];
                         min_out_sol =
                             Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
+                        quote_attempts.push(format!(
+                            "raydium=ok amount_out={} pool={}",
+                            q.amount_out, pool_id
+                        ));
+                    }
+                    }
+                    Ok(None) => {
+                        quote_attempts.push("raydium=none".to_string());
+                    }
+                    Err(e) => {
+                        quote_attempts.push(format!("raydium=err {e}"));
                     }
                 }
             }
@@ -1218,8 +1282,11 @@ impl ExecutionContext {
                     passed: false,
                     reason_code: Some(RejectReason::QuoteUnavailable.to_string()),
                     details: Some(format!(
-                        "no_quote_from_supported_dexes mint={} amount_in={} token_account={}",
-                        mint, amount_in, ta_pubkey
+                        "no_quote_from_supported_dexes mint={} amount_in={} token_account={} attempts=[{}]",
+                        mint,
+                        amount_in,
+                        ta_pubkey,
+                        quote_attempts.join(" | ")
                     )),
                 }];
 
