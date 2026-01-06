@@ -729,6 +729,154 @@ impl PumpFunAmmDex {
         Ok(out)
     }
 
+    async fn discover_pool_static_via_tx_history_market_only(
+        &self,
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+    ) -> Result<Option<PumpAmmPoolStatic>> {
+        // Minimal, bounded tx-history fallback.
+        // Some Pump AMM market accounts do not embed the fee/creator token accounts we need to
+        // build a full swap ix. In that case, scan only the market's txs to find a successful
+        // swap and extract the canonical account set from the on-chain transaction.
+
+        let addr = pool_market.to_string();
+        let sigs_v = self
+            .rpc_call_tx_history(
+                "getSignaturesForAddress",
+                json!([addr, {"limit": 200}]),
+            )
+            .await?;
+        let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if sigs.is_empty() {
+            return Ok(None);
+        }
+
+        // Cap transaction fetches.
+        const SIG_TX_PER_PAGE: usize = 25;
+        let page_len = sigs.len();
+        let take_n = SIG_TX_PER_PAGE.min(page_len);
+        let step = if take_n <= 1 {
+            1
+        } else {
+            (page_len - 1) / (take_n - 1)
+        };
+
+        for i in 0..take_n {
+            let idx = (i * step).min(page_len.saturating_sub(1));
+            let s = &sigs[idx];
+            if let Some(err) = s.get("err") {
+                if !err.is_null() {
+                    continue;
+                }
+            }
+            let sig = match s.get("signature").and_then(|v| v.as_str()) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let tx_v = self
+                .rpc_call_tx_history(
+                    "getTransaction",
+                    json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}]),
+                )
+                .await?;
+
+            let msg = match tx_v
+                .get("result")
+                .and_then(|r| r.get("transaction"))
+                .and_then(|t| t.get("message"))
+            {
+                Some(v) => v,
+                None => continue,
+            };
+            let meta = tx_v
+                .get("result")
+                .and_then(|r| r.get("meta"))
+                .unwrap_or(&Value::Null);
+
+            let mut account_keys = match Self::parse_account_keys(msg) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            Self::extend_with_loaded_addresses(&mut account_keys, meta);
+
+            for ix in Self::collect_all_instructions(msg, meta) {
+                let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
+                    Some(v) => v as usize,
+                    None => continue,
+                };
+                let program_id = match account_keys.get(program_id_index) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if program_id != PUMPFUN_AMM_PROGRAM_ID {
+                    continue;
+                }
+
+                let accounts: Vec<usize> = match ix.get("accounts").and_then(|v| v.as_array()) {
+                    Some(a) => a
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|x| x as usize))
+                        .collect(),
+                    None => continue,
+                };
+                if accounts.len() != 23 {
+                    continue;
+                }
+
+                // Base mint is accounts[3] for pump_amm v1.
+                let base_mint_ix = match account_keys.get(accounts[3]) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if Pubkey::from_str(base_mint_ix).ok() != Some(base_mint) {
+                    continue;
+                }
+
+                // Build the subset we store as pool static.
+                let pool = PumpAmmPoolStatic {
+                    pool_market: Pubkey::from_str(&account_keys[accounts[0]])?,
+                    global_config: Pubkey::from_str(&account_keys[accounts[1]])?,
+                    base_mint: Pubkey::from_str(&account_keys[accounts[3]])?,
+                    quote_mint: Pubkey::from_str(&account_keys[accounts[4]])?,
+                    pool_base_vault: Pubkey::from_str(&account_keys[accounts[5]])?,
+                    pool_quote_vault: Pubkey::from_str(&account_keys[accounts[6]])?,
+                    protocol_fee_recipient: Pubkey::from_str(&account_keys[accounts[7]])?,
+                    protocol_fee_recipient_ta: Pubkey::from_str(&account_keys[accounts[8]])?,
+                    event_authority: Pubkey::from_str(&account_keys[accounts[9]])?,
+                    coin_creator_vault_ata: Pubkey::from_str(&account_keys[accounts[10]])?,
+                    coin_creator_vault_authority: Pubkey::from_str(&account_keys[accounts[11]])?,
+                    global_volume_accumulator: Pubkey::from_str(&account_keys[accounts[12]])?,
+                    fee_config: Pubkey::from_str(&account_keys[accounts[21]])?,
+                    fee_program: Pubkey::from_str(&account_keys[accounts[22]])?,
+                };
+
+                // Fee guardrails (same as the broader scanner).
+                let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
+                let expected_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
+                if pool.fee_program != expected_fee_program {
+                    continue;
+                }
+                let Some((fee_owner, fee_executable)) = self
+                    .rpc_get_account_owner_and_executable(pool.fee_config)
+                    .await?
+                else {
+                    continue;
+                };
+                if fee_executable || fee_owner != pump_amm_program {
+                    continue;
+                }
+
+                return Ok(Some(pool));
+            }
+        }
+
+        Ok(None)
+    }
+
     async fn discover_pool_static(&self, base_mint: Pubkey) -> Result<Option<PumpAmmPoolStatic>> {
         if let Some(v) = self.pools_by_base.get(&base_mint) {
             return Ok(Some(v.clone()));
@@ -753,22 +901,43 @@ impl PumpFunAmmDex {
         // Fast path: if we can locate the pool market via program-accounts lookup, attempt to
         // build the full static account set by parsing on-chain state + deriving PDAs. This avoids
         // relying on tx-history (some pools can exist with no successful swaps yet).
+        let mut market_parse_err: Option<anyhow::Error> = None;
         for m in &markets {
-            if let Ok(Some(pool)) = self
+            match self
                 .try_parse_pool_static_from_market_account(*m, base_mint)
                 .await
+            {
+                Ok(Some(pool)) => {
+                    self.pools_by_base.insert(base_mint, pool.clone());
+                    return Ok(Some(pool));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    market_parse_err = Some(anyhow!(e).context(format!(
+                        "pump_amm market parse failed market={m} base_mint={base_mint}"
+                    )));
+                }
+            }
+        }
+
+        // If we found market accounts but couldn't parse a usable static account set, do a narrow
+        // tx-history fallback by scanning only the market address. This is far cheaper than the
+        // legacy scan across multiple addresses/pages.
+        if let Some(m) = markets.first().copied() {
+            if let Some(pool) = self
+                .discover_pool_static_via_tx_history_market_only(m, base_mint)
+                .await?
             {
                 self.pools_by_base.insert(base_mint, pool.clone());
                 return Ok(Some(pool));
             }
-        }
 
-        // If we found market accounts but couldn't parse a usable static account set, do not fall
-        // back to tx-history scanning. Tx-history is both expensive and the primary driver of 429s
-        // on public endpoints.
-        if !markets.is_empty() {
+            if let Some(e) = market_parse_err {
+                return Err(e);
+            }
+
             return Err(anyhow!(
-                "pump_amm market(s) found but market parsing failed base_mint={base_mint} markets={markets:?}"
+                "pump_amm market(s) found but could not build pool static base_mint={base_mint} markets={markets:?}"
             ));
         }
 
