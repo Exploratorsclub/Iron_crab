@@ -13,6 +13,7 @@ use solana_sdk::hash::hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -524,6 +525,12 @@ impl PumpFunAmmDex {
         Some((mint, owner))
     }
 
+    fn parse_spl_token_account_amount(data: &[u8]) -> Option<u64> {
+        // SPL token account layout: amount @ 64..72 (little-endian u64).
+        let amt_bytes: [u8; 8] = data.get(64..72)?.try_into().ok()?;
+        Some(u64::from_le_bytes(amt_bytes))
+    }
+
     fn derive_ata_with_program(owner: Pubkey, mint: Pubkey, token_program: Pubkey) -> Pubkey {
         let owner_spl = SplProgramPubkey::new_from_array(owner.to_bytes());
         let mint_spl = SplProgramPubkey::new_from_array(mint.to_bytes());
@@ -619,6 +626,29 @@ impl PumpFunAmmDex {
             off += 32;
         }
 
+        // The observed market layout is not 32-byte aligned (base_mint starts at offset 43), so
+        // vault/accounts can appear at non-32-byte boundaries. Scan raw bytes for candidate
+        // Pubkeys and resolve them in batches.
+        let embedded_pubkeys: HashSet<Pubkey> = rest_pubkeys.iter().copied().collect();
+        let mut scanned_pubkeys: Vec<Pubkey> = Vec::new();
+        if data.len() >= 32 {
+            for i in 0..=(data.len() - 32) {
+                let pk = Pubkey::new_from_array(
+                    data[i..i + 32]
+                        .try_into()
+                        .map_err(|_| anyhow!("market scan pubkey slice"))?,
+                );
+                scanned_pubkeys.push(pk);
+            }
+        }
+        scanned_pubkeys.sort();
+        scanned_pubkeys.dedup();
+
+        let mut all_candidates = rest_pubkeys.clone();
+        all_candidates.extend(scanned_pubkeys);
+        all_candidates.sort();
+        all_candidates.dedup();
+
         let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
         let token_2022_program = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
         let associated_token_program =
@@ -628,55 +658,55 @@ impl PumpFunAmmDex {
         let mut non_token_pubkeys: Vec<Pubkey> = Vec::new();
         let mut program_owned_accounts: Vec<ProgramOwnedAccountMeta> = Vec::new();
 
-        for pk in rest_pubkeys.iter().copied() {
-            let Some((acc_owner, _exec, acc_data)) =
-                self.rpc_get_account_owner_executable_and_data(pk).await?
-            else {
-                // Some readonly authority PDAs may not have an allocated account; keep as candidate.
-                non_token_pubkeys.push(pk);
-                continue;
-            };
+        const MULTI_ACCOUNTS_CHUNK: usize = 100;
+        for chunk in all_candidates.chunks(MULTI_ACCOUNTS_CHUNK) {
+            let accounts = self
+                .rpc
+                .rpc
+                .get_multiple_accounts(chunk)
+                .await
+                .map_err(|e| anyhow!("get_multiple_accounts failed: {e}"))?;
 
-            if acc_owner == token_program {
-                if let Some((mint, token_owner)) =
-                    Self::parse_spl_token_account_mint_and_owner(&acc_data)
-                {
-                    let balance = self.get_vault_amount(pk).await.unwrap_or(0);
-                    token_accounts.push(TokenAccountMeta {
+            for (pk, acc_opt) in chunk.iter().copied().zip(accounts.into_iter()) {
+                let Some(acc) = acc_opt else {
+                    // Only keep non-existent pubkeys if they were embedded explicitly; scanned
+                    // pubkeys would otherwise pollute authority candidate selection.
+                    if embedded_pubkeys.contains(&pk) {
+                        non_token_pubkeys.push(pk);
+                    }
+                    continue;
+                };
+
+                let acc_owner = acc.owner;
+                let acc_data = acc.data;
+
+                if acc_owner == token_program || acc_owner == token_2022_program {
+                    if let Some((mint, token_owner)) =
+                        Self::parse_spl_token_account_mint_and_owner(&acc_data)
+                    {
+                        let balance = Self::parse_spl_token_account_amount(&acc_data).unwrap_or(0);
+                        token_accounts.push(TokenAccountMeta {
+                            address: pk,
+                            mint,
+                            token_owner,
+                            balance,
+                        });
+                        continue;
+                    }
+                }
+
+                if acc_owner == pump_amm_program {
+                    program_owned_accounts.push(ProgramOwnedAccountMeta {
                         address: pk,
-                        mint,
-                        token_owner,
-                        balance,
+                        data_len: acc_data.len(),
                     });
                     continue;
                 }
-            }
 
-            if acc_owner == token_2022_program {
-                // Token-2022 has the same first fields (mint/owner) for token accounts.
-                if let Some((mint, token_owner)) =
-                    Self::parse_spl_token_account_mint_and_owner(&acc_data)
-                {
-                    let balance = self.get_vault_amount(pk).await.unwrap_or(0);
-                    token_accounts.push(TokenAccountMeta {
-                        address: pk,
-                        mint,
-                        token_owner,
-                        balance,
-                    });
-                    continue;
+                if pk != Pubkey::default() {
+                    non_token_pubkeys.push(pk);
                 }
             }
-
-            if acc_owner == pump_amm_program {
-                program_owned_accounts.push(ProgramOwnedAccountMeta {
-                    address: pk,
-                    data_len: acc_data.len(),
-                });
-                continue;
-            }
-
-            non_token_pubkeys.push(pk);
         }
 
         // Helper: try to find an authority whose ATA for `mint` exists.
