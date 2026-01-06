@@ -2,6 +2,8 @@ use crate::solana::dex::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use base64::Engine;
 use dashmap::DashMap;
 use reqwest::Client;
 use reqwest::StatusCode;
@@ -10,9 +12,9 @@ use solana_sdk::hash::hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
-use std::time::Duration;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::time::sleep;
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -26,6 +28,10 @@ const PUMPFUN_AMM_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6
 // Using `getProgramAccounts` with memcmp filters avoids reliance on tx-history on pruned RPC.
 const PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET: u64 = 43;
 const PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET: u64 = 75;
+
+// Observed on-chain for at least one PumpSwap market account:
+// global_config appears to be a Pubkey at offset 11, followed by base/quote mints.
+const PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET: usize = 11;
 
 // Observed on-chain: buy_exact_quote_in fee fields sum to 125 bps (lp 2 + protocol 93 + creator 30).
 // We use that as a conservative default for quoting.
@@ -61,6 +67,14 @@ struct PumpAmmUserAccounts {
     user_base_ta: Pubkey,
     user_quote_ta: Pubkey,
     user_volume_accumulator: Pubkey,
+}
+
+#[derive(Debug, Clone)]
+struct TokenAccountMeta {
+    address: Pubkey,
+    mint: Pubkey,
+    token_owner: Pubkey,
+    balance: u64,
 }
 
 #[derive(Clone)]
@@ -180,7 +194,11 @@ impl PumpFunAmmDex {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| anyhow!("pump_amm tx_history http error endpoint={endpoint} attempt={attempt}: {e}"))?;
+                .map_err(|e| {
+                    anyhow!(
+                        "pump_amm tx_history http error endpoint={endpoint} attempt={attempt}: {e}"
+                    )
+                })?;
 
             let status = resp.status();
             let v: Value = resp
@@ -293,9 +311,8 @@ impl PumpFunAmmDex {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow!(
-            "pump_amm rpc call failed method={method} (no endpoints)"
-        )))
+        Err(last_err
+            .unwrap_or_else(|| anyhow!("pump_amm rpc call failed method={method} (no endpoints)")))
     }
 
     async fn rpc_get_account_owner_and_executable(
@@ -332,29 +349,342 @@ impl PumpFunAmmDex {
         Ok(Some((Pubkey::from_str(owner)?, executable)))
     }
 
+    async fn rpc_get_account_owner_executable_and_data(
+        &self,
+        address: Pubkey,
+    ) -> Result<Option<(Pubkey, bool, Vec<u8>)>> {
+        let v = self
+            .rpc_call(
+                "getAccountInfo",
+                json!([
+                    address.to_string(),
+                    {"encoding": "base64", "commitment": "confirmed"}
+                ]),
+            )
+            .await?;
+
+        let value = match v.get("result").and_then(|r| r.get("value")) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+
+        let owner = value
+            .get("owner")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("getAccountInfo missing owner"))?;
+        let executable = value
+            .get("executable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let data_b64 = value
+            .get("data")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("getAccountInfo missing data"))?;
+
+        let data = BASE64_STD
+            .decode(data_b64)
+            .map_err(|e| anyhow!("base64 decode getAccountInfo data: {e}"))?;
+
+        Ok(Some((Pubkey::from_str(owner)?, executable, data)))
+    }
+
+    fn parse_spl_token_account_mint_and_owner(data: &[u8]) -> Option<(Pubkey, Pubkey)> {
+        // SPL token account layout: mint @ 0..32, owner @ 32..64
+        if data.len() < 64 {
+            return None;
+        }
+        let mint = Pubkey::new_from_array(data.get(0..32)?.try_into().ok()?);
+        let owner = Pubkey::new_from_array(data.get(32..64)?.try_into().ok()?);
+        Some((mint, owner))
+    }
+
+    async fn derive_existing_pda(
+        &self,
+        program_id: Pubkey,
+        seed_sets: &[Vec<Vec<u8>>],
+    ) -> Result<Option<Pubkey>> {
+        for seed_set in seed_sets {
+            let seed_slices: Vec<&[u8]> = seed_set.iter().map(|s| s.as_slice()).collect();
+            let candidate = Pubkey::find_program_address(&seed_slices, &program_id).0;
+            let Some((owner, executable)) =
+                self.rpc_get_account_owner_and_executable(candidate).await?
+            else {
+                continue;
+            };
+            if !executable && owner == program_id {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn try_parse_pool_static_from_market_account(
+        &self,
+        pool_market: Pubkey,
+        expected_base_mint: Pubkey,
+    ) -> Result<Option<PumpAmmPoolStatic>> {
+        let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
+        let expected_quote_mint = Pubkey::from_str(WSOL_MINT)?;
+
+        let Some((owner, executable, data)) = self
+            .rpc_get_account_owner_executable_and_data(pool_market)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if executable || owner != pump_amm_program {
+            return Ok(None);
+        }
+
+        // Require at least the global_config + base + quote mints.
+        let min_len = PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET + (32 * 3);
+        if data.len() < min_len {
+            return Ok(None);
+        }
+
+        let global_config = Pubkey::new_from_array(
+            data[PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET
+                ..PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET + 32]
+                .try_into()
+                .map_err(|_| anyhow!("market global_config slice"))?,
+        );
+        let base_mint = Pubkey::new_from_array(
+            data[PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET as usize
+                ..(PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET as usize + 32)]
+                .try_into()
+                .map_err(|_| anyhow!("market base_mint slice"))?,
+        );
+        let quote_mint = Pubkey::new_from_array(
+            data[PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET as usize
+                ..(PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET as usize + 32)]
+                .try_into()
+                .map_err(|_| anyhow!("market quote_mint slice"))?,
+        );
+
+        // This fallback is only used for WSOL pairs and assumes the program's swap semantics
+        // (buy uses quote-in, sell uses base-in).
+        if base_mint != expected_base_mint || quote_mint != expected_quote_mint {
+            return Ok(None);
+        }
+
+        // Parse the remaining 32-byte fields after quote_mint; these typically include the
+        // pool vaults + fee/creator accounts.
+        let mut rest_pubkeys: Vec<Pubkey> = Vec::new();
+        let mut off = (PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET as usize) + 32;
+        while off + 32 <= data.len() {
+            let pk = Pubkey::new_from_array(
+                data[off..off + 32]
+                    .try_into()
+                    .map_err(|_| anyhow!("market rest pubkey slice"))?,
+            );
+            rest_pubkeys.push(pk);
+            off += 32;
+        }
+
+        let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let mut token_accounts: Vec<TokenAccountMeta> = Vec::new();
+        let mut non_token_pubkeys: Vec<Pubkey> = Vec::new();
+        for pk in rest_pubkeys.iter().copied() {
+            let Some((acc_owner, _exec, acc_data)) =
+                self.rpc_get_account_owner_executable_and_data(pk).await?
+            else {
+                // Some readonly authority PDAs may not have an allocated account; keep as candidate.
+                non_token_pubkeys.push(pk);
+                continue;
+            };
+
+            if acc_owner == token_program {
+                if let Some((mint, token_owner)) =
+                    Self::parse_spl_token_account_mint_and_owner(&acc_data)
+                {
+                    let balance = self.get_vault_amount(pk).await.unwrap_or(0);
+                    token_accounts.push(TokenAccountMeta {
+                        address: pk,
+                        mint,
+                        token_owner,
+                        balance,
+                    });
+                    continue;
+                }
+            }
+
+            non_token_pubkeys.push(pk);
+        }
+
+        let mut base_token_accounts: Vec<TokenAccountMeta> = token_accounts
+            .iter()
+            .cloned()
+            .filter(|t| t.mint == base_mint)
+            .collect();
+        let mut quote_token_accounts: Vec<TokenAccountMeta> = token_accounts
+            .iter()
+            .cloned()
+            .filter(|t| t.mint == quote_mint)
+            .collect();
+
+        base_token_accounts.sort_by_key(|t| std::cmp::Reverse(t.balance));
+        quote_token_accounts.sort_by_key(|t| std::cmp::Reverse(t.balance));
+
+        let pool_base_vault = base_token_accounts
+            .first()
+            .map(|t| t.address)
+            .ok_or_else(|| anyhow!("pump_amm market parse: no base vault token accounts"))?;
+        let pool_quote_vault = quote_token_accounts
+            .first()
+            .map(|t| t.address)
+            .ok_or_else(|| anyhow!("pump_amm market parse: no quote vault token accounts"))?;
+
+        let protocol_fee_recipient_ta = quote_token_accounts
+            .iter()
+            .find(|t| t.address != pool_quote_vault)
+            .map(|t| t.address)
+            .ok_or_else(|| anyhow!("pump_amm market parse: no protocol fee TA"))?;
+        let protocol_fee_recipient = quote_token_accounts
+            .iter()
+            .find(|t| t.address == protocol_fee_recipient_ta)
+            .map(|t| t.token_owner)
+            .unwrap_or(Pubkey::default());
+
+        let coin_creator_vault_ata = base_token_accounts
+            .iter()
+            .find(|t| t.address != pool_base_vault)
+            .map(|t| t.address)
+            .ok_or_else(|| anyhow!("pump_amm market parse: no creator vault ATA"))?;
+        let coin_creator_vault_authority = base_token_accounts
+            .iter()
+            .find(|t| t.address == coin_creator_vault_ata)
+            .map(|t| t.token_owner)
+            .unwrap_or(Pubkey::default());
+
+        // Derive remaining PDAs with a small set of common seed patterns and validate existence.
+        let event_authority = {
+            // Prefer the canonical Anchor seed "__event_authority".
+            let candidate =
+                Pubkey::find_program_address(&[b"__event_authority"], &pump_amm_program).0;
+            if non_token_pubkeys.contains(&candidate) {
+                candidate
+            } else {
+                // Fallback to the common seed without leading underscores.
+                Pubkey::find_program_address(&[b"event_authority"], &pump_amm_program).0
+            }
+        };
+
+        let global_volume_accumulator = match self
+            .derive_existing_pda(
+                pump_amm_program,
+                &[
+                    vec![
+                        b"global_volume_accumulator".to_vec(),
+                        global_config.to_bytes().to_vec(),
+                    ],
+                    vec![
+                        b"global_volume_accumulator".to_vec(),
+                        pool_market.to_bytes().to_vec(),
+                    ],
+                    vec![
+                        b"global_volume_accumulator".to_vec(),
+                        base_mint.to_bytes().to_vec(),
+                    ],
+                    vec![
+                        b"volume_accumulator".to_vec(),
+                        global_config.to_bytes().to_vec(),
+                    ],
+                    vec![
+                        b"volume_accumulator".to_vec(),
+                        pool_market.to_bytes().to_vec(),
+                    ],
+                    vec![
+                        b"volume_accumulator".to_vec(),
+                        base_mint.to_bytes().to_vec(),
+                    ],
+                ],
+            )
+            .await?
+        {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let fee_config = match self
+            .derive_existing_pda(
+                pump_amm_program,
+                &[
+                    vec![b"fee_config".to_vec(), global_config.to_bytes().to_vec()],
+                    vec![b"fee_config".to_vec(), pool_market.to_bytes().to_vec()],
+                    vec![b"fee_config".to_vec(), base_mint.to_bytes().to_vec()],
+                    vec![b"fee_config".to_vec()],
+                    vec![b"fees".to_vec(), global_config.to_bytes().to_vec()],
+                    vec![b"fees".to_vec(), pool_market.to_bytes().to_vec()],
+                    vec![b"fees".to_vec(), base_mint.to_bytes().to_vec()],
+                    vec![b"fee".to_vec(), global_config.to_bytes().to_vec()],
+                    vec![b"fee".to_vec(), pool_market.to_bytes().to_vec()],
+                    vec![b"fee".to_vec(), base_mint.to_bytes().to_vec()],
+                ],
+            )
+            .await?
+        {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
+
+        Ok(Some(PumpAmmPoolStatic {
+            pool_market,
+            global_config,
+            base_mint,
+            quote_mint,
+            pool_base_vault,
+            pool_quote_vault,
+            protocol_fee_recipient,
+            protocol_fee_recipient_ta,
+            event_authority,
+            coin_creator_vault_ata,
+            coin_creator_vault_authority,
+            global_volume_accumulator,
+            fee_config,
+            fee_program,
+        }))
+    }
+
     async fn discover_pool_markets_via_program_accounts(
         &self,
         base_mint: Pubkey,
     ) -> Result<Vec<Pubkey>> {
         let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
 
-        let v = self
-            .rpc_call(
-                "getProgramAccounts",
-                json!([
-                    program_id.to_string(),
-                    {
-                        "encoding": "base64",
-                        "commitment": "confirmed",
-                        "dataSlice": {"offset": 0, "length": 0},
-                        "filters": [
-                            {"memcmp": {"offset": PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET, "bytes": base_mint.to_string()}},
-                            {"memcmp": {"offset": PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET, "bytes": WSOL_MINT}},
-                        ]
-                    }
-                ]),
-            )
-            .await?;
+        let params = json!([
+            program_id.to_string(),
+            {
+                "encoding": "base64",
+                "commitment": "confirmed",
+                "dataSlice": {"offset": 0, "length": 0},
+                "filters": [
+                    {"memcmp": {"offset": PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET, "bytes": base_mint.to_string()}},
+                    {"memcmp": {"offset": PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET, "bytes": WSOL_MINT}},
+                ]
+            }
+        ]);
+
+        let mut v = self.rpc_call("getProgramAccounts", params.clone()).await?;
+
+        // If the multi-endpoint call fell back to a node that doesn't support/serve the filtered
+        // index well (returning empty), retry against the Helius endpoint with rate-limit backoff.
+        let is_empty = v
+            .get("result")
+            .and_then(|r| r.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(false);
+        if is_empty && self.helius_rpc_url.is_some() {
+            if let Ok(v2) = self.rpc_call_tx_history("getProgramAccounts", params).await {
+                v = v2;
+            }
+        }
 
         let arr = match v.get("result").and_then(|r| r.as_array()) {
             Some(v) => v,
@@ -381,6 +711,24 @@ impl PumpFunAmmDex {
     async fn discover_pool_static(&self, base_mint: Pubkey) -> Result<Option<PumpAmmPoolStatic>> {
         if let Some(v) = self.pools_by_base.get(&base_mint) {
             return Ok(Some(v.clone()));
+        }
+
+        // Fast path: if we can locate the pool market via program-accounts lookup, attempt to
+        // build the full static account set by parsing on-chain state + deriving PDAs. This avoids
+        // relying on tx-history (some pools can exist with no successful swaps yet).
+        if let Ok(markets) = self
+            .discover_pool_markets_via_program_accounts(base_mint)
+            .await
+        {
+            for m in markets {
+                if let Ok(Some(pool)) = self
+                    .try_parse_pool_static_from_market_account(m, base_mint)
+                    .await
+                {
+                    self.pools_by_base.insert(base_mint, pool.clone());
+                    return Ok(Some(pool));
+                }
+            }
         }
 
         // TX-based discovery: prefer scanning the pool market(s) (stable) over the mint address.
@@ -460,140 +808,147 @@ impl PumpFunAmmDex {
                 for i in 0..take_n {
                     let idx = (i * step).min(page_len.saturating_sub(1));
                     let s = &sigs[idx];
-                // Avoid poisoning discovery with failed transactions (e.g., our own earlier
-                // liquidation attempts that used wrong accounts and therefore failed).
-                if let Some(err) = s.get("err") {
-                    if !err.is_null() {
-                        continue;
+                    // Avoid poisoning discovery with failed transactions (e.g., our own earlier
+                    // liquidation attempts that used wrong accounts and therefore failed).
+                    if let Some(err) = s.get("err") {
+                        if !err.is_null() {
+                            continue;
+                        }
                     }
-                }
-                let sig = match s.get("signature").and_then(|v| v.as_str()) {
-                    Some(v) => v,
-                    None => continue,
-                };
-
-                let tx_v = match self
-                    .rpc_call_tx_history(
-                        "getTransaction",
-                        json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}]),
-                    )
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(_) => {
-                        // Transient failures are common on public endpoints; keep scanning.
-                        continue;
-                    }
-                };
-
-                let msg = match tx_v
-                    .get("result")
-                    .and_then(|r| r.get("transaction"))
-                    .and_then(|t| t.get("message"))
-                {
-                    Some(v) => v,
-                    None => continue,
-                };
-
-                let meta = tx_v
-                    .get("result")
-                    .and_then(|r| r.get("meta"))
-                    .unwrap_or(&Value::Null);
-
-                let mut account_keys = match Self::parse_account_keys(msg) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                Self::extend_with_loaded_addresses(&mut account_keys, meta);
-
-                for ix in Self::collect_all_instructions(msg, meta) {
-                    let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
-                        Some(v) => v as usize,
-                        None => continue,
-                    };
-                    let program_id = match account_keys.get(program_id_index) {
+                    let sig = match s.get("signature").and_then(|v| v.as_str()) {
                         Some(v) => v,
                         None => continue,
                     };
-                    if program_id != PUMPFUN_AMM_PROGRAM_ID {
-                        continue;
-                    }
 
-                    let accounts: Vec<usize> = match ix.get("accounts").and_then(|v| v.as_array()) {
-                        Some(a) => a
-                            .iter()
-                            .filter_map(|v| v.as_u64().map(|x| x as usize))
-                            .collect(),
-                        None => continue,
+                    let tx_v = match self
+                        .rpc_call_tx_history(
+                            "getTransaction",
+                            json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}]),
+                        )
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(_) => {
+                            // Transient failures are common on public endpoints; keep scanning.
+                            continue;
+                        }
                     };
-                    if accounts.len() != 23 {
-                        continue;
-                    }
 
-                    let base_mint_ix = match account_keys.get(accounts[3]) {
+                    let msg = match tx_v
+                        .get("result")
+                        .and_then(|r| r.get("transaction"))
+                        .and_then(|t| t.get("message"))
+                    {
                         Some(v) => v,
                         None => continue,
                     };
-                    let quote_mint_ix = match account_keys.get(accounts[4]) {
-                        Some(v) => v,
-                        None => continue,
+
+                    let meta = tx_v
+                        .get("result")
+                        .and_then(|r| r.get("meta"))
+                        .unwrap_or(&Value::Null);
+
+                    let mut account_keys = match Self::parse_account_keys(msg) {
+                        Ok(v) => v,
+                        Err(_) => continue,
                     };
-                    if base_mint_ix != base_mint.to_string().as_str() {
-                        continue;
+                    Self::extend_with_loaded_addresses(&mut account_keys, meta);
+
+                    for ix in Self::collect_all_instructions(msg, meta) {
+                        let program_id_index =
+                            match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
+                                Some(v) => v as usize,
+                                None => continue,
+                            };
+                        let program_id = match account_keys.get(program_id_index) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        if program_id != PUMPFUN_AMM_PROGRAM_ID {
+                            continue;
+                        }
+
+                        let accounts: Vec<usize> =
+                            match ix.get("accounts").and_then(|v| v.as_array()) {
+                                Some(a) => a
+                                    .iter()
+                                    .filter_map(|v| v.as_u64().map(|x| x as usize))
+                                    .collect(),
+                                None => continue,
+                            };
+                        if accounts.len() != 23 {
+                            continue;
+                        }
+
+                        let base_mint_ix = match account_keys.get(accounts[3]) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let quote_mint_ix = match account_keys.get(accounts[4]) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        if base_mint_ix != base_mint.to_string().as_str() {
+                            continue;
+                        }
+                        if quote_mint_ix != WSOL_MINT {
+                            continue;
+                        }
+
+                        let pool = PumpAmmPoolStatic {
+                            pool_market: Pubkey::from_str(&account_keys[accounts[0]])?,
+                            global_config: Pubkey::from_str(&account_keys[accounts[2]])?,
+                            base_mint,
+                            quote_mint: Pubkey::from_str(WSOL_MINT)?,
+                            pool_base_vault: Pubkey::from_str(&account_keys[accounts[7]])?,
+                            pool_quote_vault: Pubkey::from_str(&account_keys[accounts[8]])?,
+                            protocol_fee_recipient: Pubkey::from_str(&account_keys[accounts[9]])?,
+                            protocol_fee_recipient_ta: Pubkey::from_str(
+                                &account_keys[accounts[10]],
+                            )?,
+                            event_authority: Pubkey::from_str(&account_keys[accounts[15]])?,
+                            coin_creator_vault_ata: Pubkey::from_str(&account_keys[accounts[17]])?,
+                            coin_creator_vault_authority: Pubkey::from_str(
+                                &account_keys[accounts[18]],
+                            )?,
+                            global_volume_accumulator: Pubkey::from_str(
+                                &account_keys[accounts[19]],
+                            )?,
+                            fee_config: Pubkey::default(),
+                            fee_program: Pubkey::default(),
+                        };
+
+                        // Deterministic mapping: our Geyser parser and observed on-chain swaps agree that
+                        // PumpSwap v1 uses fixed indices.
+                        // - fee_config: accounts[21]
+                        // - fee_program: accounts[22]
+                        let fee_config = Pubkey::from_str(&account_keys[accounts[21]])?;
+                        let fee_program = Pubkey::from_str(&account_keys[accounts[22]])?;
+
+                        // Guardrails: fee_config must be owned by pump_amm (Anchor constraint), and the
+                        // fee program is expected to be pfee.
+                        let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
+                        let expected_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
+                        if fee_program != expected_fee_program {
+                            continue;
+                        }
+                        let Some((fee_owner, fee_executable)) = self
+                            .rpc_get_account_owner_and_executable(fee_config)
+                            .await?
+                        else {
+                            continue;
+                        };
+                        if fee_executable || fee_owner != pump_amm_program {
+                            continue;
+                        }
+
+                        let mut pool = pool;
+                        pool.fee_program = fee_program;
+                        pool.fee_config = fee_config;
+
+                        self.pools_by_base.insert(base_mint, pool.clone());
+                        return Ok(Some(pool));
                     }
-                    if quote_mint_ix != WSOL_MINT {
-                        continue;
-                    }
-
-                    let pool = PumpAmmPoolStatic {
-                        pool_market: Pubkey::from_str(&account_keys[accounts[0]])?,
-                        global_config: Pubkey::from_str(&account_keys[accounts[2]])?,
-                        base_mint,
-                        quote_mint: Pubkey::from_str(WSOL_MINT)?,
-                        pool_base_vault: Pubkey::from_str(&account_keys[accounts[7]])?,
-                        pool_quote_vault: Pubkey::from_str(&account_keys[accounts[8]])?,
-                        protocol_fee_recipient: Pubkey::from_str(&account_keys[accounts[9]])?,
-                        protocol_fee_recipient_ta: Pubkey::from_str(&account_keys[accounts[10]])?,
-                        event_authority: Pubkey::from_str(&account_keys[accounts[15]])?,
-                        coin_creator_vault_ata: Pubkey::from_str(&account_keys[accounts[17]])?,
-                        coin_creator_vault_authority: Pubkey::from_str(
-                            &account_keys[accounts[18]],
-                        )?,
-                        global_volume_accumulator: Pubkey::from_str(&account_keys[accounts[19]])?,
-                        fee_config: Pubkey::default(),
-                        fee_program: Pubkey::default(),
-                    };
-
-                    // Deterministic mapping: our Geyser parser and observed on-chain swaps agree that
-                    // PumpSwap v1 uses fixed indices.
-                    // - fee_config: accounts[21]
-                    // - fee_program: accounts[22]
-                    let fee_config = Pubkey::from_str(&account_keys[accounts[21]])?;
-                    let fee_program = Pubkey::from_str(&account_keys[accounts[22]])?;
-
-                    // Guardrails: fee_config must be owned by pump_amm (Anchor constraint), and the
-                    // fee program is expected to be pfee.
-                    let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
-                    let expected_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
-                    if fee_program != expected_fee_program {
-                        continue;
-                    }
-                    let Some((fee_owner, fee_executable)) =
-                        self.rpc_get_account_owner_and_executable(fee_config).await?
-                    else {
-                        continue;
-                    };
-                    if fee_executable || fee_owner != pump_amm_program {
-                        continue;
-                    }
-
-                    let mut pool = pool;
-                    pool.fee_program = fee_program;
-                    pool.fee_config = fee_config;
-
-                    self.pools_by_base.insert(base_mint, pool.clone());
-                    return Ok(Some(pool));
-                }
                 }
 
                 // Small delay between pages to reduce rate-limit pressure.

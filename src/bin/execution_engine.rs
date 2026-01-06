@@ -1105,28 +1105,28 @@ impl ExecutionContext {
                         .await
                     {
                         Ok(Some(q)) => {
-                        #[cfg(unix)]
-                        maybe_ping_watchdog();
+                            #[cfg(unix)]
+                            maybe_ping_watchdog();
 
-                        // For Pump.fun, we include the bonding-curve account pubkey as
-                        // `resources.pools[0]` to keep tx planning deterministic and to satisfy the
-                        // tx_builder invariant that exactly one pool id is provided.
-                        if let Some(bc_str) = q.route.first() {
-                            resources.pools = vec![bc_str.clone()];
+                            // For Pump.fun, we include the bonding-curve account pubkey as
+                            // `resources.pools[0]` to keep tx planning deterministic and to satisfy the
+                            // tx_builder invariant that exactly one pool id is provided.
+                            if let Some(bc_str) = q.route.first() {
+                                resources.pools = vec![bc_str.clone()];
 
-                            if let Ok(bc) = Pubkey::from_str(bc_str) {
-                                if let Ok(acct) = ctx.rpc.rpc.get_account(&bc).await {
-                                    if let Ok(state) = BondingCurveState::parse(&acct.data) {
-                                        metadata.insert(
-                                            "creator".to_string(),
-                                            state.creator.to_string(),
-                                        );
+                                if let Ok(bc) = Pubkey::from_str(bc_str) {
+                                    if let Ok(acct) = ctx.rpc.rpc.get_account(&bc).await {
+                                        if let Ok(state) = BondingCurveState::parse(&acct.data) {
+                                            metadata.insert(
+                                                "creator".to_string(),
+                                                state.creator.to_string(),
+                                            );
+                                        }
                                     }
                                 }
                             }
-                        }
-                        #[cfg(unix)]
-                        maybe_ping_watchdog();
+                            #[cfg(unix)]
+                            maybe_ping_watchdog();
 
                             if metadata.contains_key("creator") && resources.pools.len() == 1 {
                                 metadata.insert("dex".to_string(), "pumpfun".to_string());
@@ -1169,46 +1169,44 @@ impl ExecutionContext {
                     .await
                 {
                     Ok(Some(q)) => {
-                    #[cfg(unix)]
-                    maybe_ping_watchdog();
+                        #[cfg(unix)]
+                        maybe_ping_watchdog();
 
-                    if let Some(pool_id) = q.route.first().cloned() {
-                        match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
-                            Ok(Some(accounts)) => {
-                                metadata.insert("dex".to_string(), "pump_amm".to_string());
-                                resources.pools = vec![pool_id.clone()];
-                                resources.accounts =
-                                    accounts.into_iter().map(|p| p.to_string()).collect();
-                                min_out_sol = Some(Self::apply_slippage_min_out(
-                                    q.amount_out,
-                                    max_slippage_bps,
-                                ));
-                                quote_attempts.push(format!(
-                                    "pump_amm=ok amount_out={} pool={} accounts_len={}"
-                                    ,
-                                    q.amount_out,
-                                    resources
-                                        .pools
-                                        .first()
-                                        .map(|s| s.as_str())
-                                        .unwrap_or("<none>"),
-                                    resources.accounts.len()
-                                ));
-                            }
-                            Ok(None) => {
-                                warn!(mint = %mint, "pump_amm quote returned route, but pool accounts not found; skipping pump_amm");
-                                quote_attempts.push(format!(
-                                    "pump_amm=skip no_pool_accounts amount_out={} pool={}",
-                                    q.amount_out,
-                                    pool_id
-                                ));
-                            }
-                            Err(e) => {
-                                warn!(mint = %mint, error = %e, "pump_amm pool account discovery failed; skipping pump_amm");
-                                quote_attempts.push(format!("pump_amm=err_discovery {e}"));
+                        if let Some(pool_id) = q.route.first().cloned() {
+                            match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
+                                Ok(Some(accounts)) => {
+                                    metadata.insert("dex".to_string(), "pump_amm".to_string());
+                                    resources.pools = vec![pool_id.clone()];
+                                    resources.accounts =
+                                        accounts.into_iter().map(|p| p.to_string()).collect();
+                                    min_out_sol = Some(Self::apply_slippage_min_out(
+                                        q.amount_out,
+                                        max_slippage_bps,
+                                    ));
+                                    quote_attempts.push(format!(
+                                        "pump_amm=ok amount_out={} pool={} accounts_len={}",
+                                        q.amount_out,
+                                        resources
+                                            .pools
+                                            .first()
+                                            .map(|s| s.as_str())
+                                            .unwrap_or("<none>"),
+                                        resources.accounts.len()
+                                    ));
+                                }
+                                Ok(None) => {
+                                    warn!(mint = %mint, "pump_amm quote returned route, but pool accounts not found; skipping pump_amm");
+                                    quote_attempts.push(format!(
+                                        "pump_amm=skip no_pool_accounts amount_out={} pool={}",
+                                        q.amount_out, pool_id
+                                    ));
+                                }
+                                Err(e) => {
+                                    warn!(mint = %mint, error = %e, "pump_amm pool account discovery failed; skipping pump_amm");
+                                    quote_attempts.push(format!("pump_amm=err_discovery {e}"));
+                                }
                             }
                         }
-                    }
                     }
                     Ok(None) => {
                         quote_attempts.push("pump_amm=none".to_string());
@@ -1226,19 +1224,19 @@ impl ExecutionContext {
                     .await
                 {
                     Ok(Some(q)) => {
-                    #[cfg(unix)]
-                    maybe_ping_watchdog();
+                        #[cfg(unix)]
+                        maybe_ping_watchdog();
 
-                    if let Some(pool_id) = q.route.first().cloned() {
-                        metadata.insert("dex".to_string(), "raydium".to_string());
-                        resources.pools = vec![pool_id.clone()];
-                        min_out_sol =
-                            Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
-                        quote_attempts.push(format!(
-                            "raydium=ok amount_out={} pool={}",
-                            q.amount_out, pool_id
-                        ));
-                    }
+                        if let Some(pool_id) = q.route.first().cloned() {
+                            metadata.insert("dex".to_string(), "raydium".to_string());
+                            resources.pools = vec![pool_id.clone()];
+                            min_out_sol =
+                                Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
+                            quote_attempts.push(format!(
+                                "raydium=ok amount_out={} pool={}",
+                                q.amount_out, pool_id
+                            ));
+                        }
                     }
                     Ok(None) => {
                         quote_attempts.push("raydium=none".to_string());
