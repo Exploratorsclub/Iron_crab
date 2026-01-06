@@ -550,29 +550,83 @@ impl PumpFunAmmDex {
         mint: Pubkey,
     ) -> Result<Option<Pubkey>> {
         // Fallback for cases where the recipient token account is not an ATA.
-        // Use program-indexed lookup (ideally via Helius) with strict memcmp filters.
-        let params = json!([
-            token_program.to_string(),
+        // Avoid `getProgramAccounts` over the token program (can be huge / Helius may reject).
+        // Prefer `getTokenAccountsByOwner` with a mint filter.
+
+        let params_mint_filtered = json!([
+            token_owner.to_string(),
+            {"mint": mint.to_string()},
             {
                 "encoding": "base64",
                 "commitment": "confirmed",
-                "dataSlice": {"offset": 0, "length": 0},
-                "filters": [
-                    {"memcmp": {"offset": 0, "bytes": mint.to_string()}},
-                    {"memcmp": {"offset": 32, "bytes": token_owner.to_string()}},
-                ]
+                "dataSlice": {"offset": 0, "length": 0}
             }
         ]);
 
-        let v = self.rpc_call("getProgramAccounts", params).await?;
-        let arr = match v.get("result").and_then(|r| r.as_array()) {
-            Some(a) => a,
-            None => return Ok(None),
+        let v = self
+            .rpc_call("getTokenAccountsByOwner", params_mint_filtered)
+            .await?;
+
+        if let Some(arr) = v
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_array())
+        {
+            for item in arr {
+                if let Some(pk) = item.get("pubkey").and_then(|p| p.as_str()) {
+                    if let Ok(parsed) = Pubkey::from_str(pk) {
+                        return Ok(Some(parsed));
+                    }
+                }
+            }
+        }
+
+        // Some RPCs may not return Token-2022 accounts for the mint-filtered variant.
+        // As a fallback, query by programId and filter client-side using a small dataSlice.
+        let params_programid_filtered = json!([
+            token_owner.to_string(),
+            {"programId": token_program.to_string()},
+            {
+                "encoding": "base64",
+                "commitment": "confirmed",
+                "dataSlice": {"offset": 0, "length": 72}
+            }
+        ]);
+
+        let v = self
+            .rpc_call("getTokenAccountsByOwner", params_programid_filtered)
+            .await?;
+
+        let Some(arr) = v
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_array())
+        else {
+            return Ok(None);
         };
 
         for item in arr {
-            let pk = item.get("pubkey").and_then(|p| p.as_str());
-            if let Some(pk) = pk {
+            let Some(pk) = item.get("pubkey").and_then(|p| p.as_str()) else {
+                continue;
+            };
+            let Some(data_arr) = item
+                .get("account")
+                .and_then(|a| a.get("data"))
+                .and_then(|d| d.as_array())
+            else {
+                continue;
+            };
+            let Some(b64) = data_arr.get(0).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(acc_data) = BASE64_STD.decode(b64) else {
+                continue;
+            };
+            let Some((acc_mint, acc_owner)) = Self::parse_spl_token_account_mint_and_owner(&acc_data)
+            else {
+                continue;
+            };
+            if acc_mint == mint && acc_owner == token_owner {
                 if let Ok(parsed) = Pubkey::from_str(pk) {
                     return Ok(Some(parsed));
                 }
