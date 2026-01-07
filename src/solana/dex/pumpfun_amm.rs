@@ -21,7 +21,6 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
-use tracing::{info, warn};
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PUMPFUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
@@ -1351,42 +1350,32 @@ impl PumpFunAmmDex {
             .rpc_call_tx_history("getSignaturesForAddress", json!([addr, {"limit": 200}]))
             .await?;
         
-        // Check for RPC errors
+        // Check for RPC errors - returnOk(None) triggers generic error message upstream
         if let Some(err) = sigs_v.get("error") {
-            warn!(
-                "pump_amm tx_history RPC error for market {}: {}",
+            // RPC error (e.g., method not found) - return as anyhow error with details  
+            return Err(anyhow!(
+                "pump_amm tx_history RPC error market={} error={}",
                 pool_market,
-                serde_json::to_string(err).unwrap_or_default()
-            );
-            return Ok(None);
+                serde_json::to_string(err).unwrap_or_else(|_| "unknown".to_string())
+            ));
         }
         
         let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
             Some(v) => v,
             None => {
-                warn!(
-                    "pump_amm tx_history unexpected response for market {}: {}",
+                // Unexpected response structure
+                return Err(anyhow!(
+                    "pump_amm tx_history unexpected response market={} response={}",
                     pool_market,
-                    serde_json::to_string(&sigs_v).unwrap_or_default()
-                );
-                return Ok(None);
+                    serde_json::to_string(&sigs_v).unwrap_or_else(|_| "unknown".to_string())
+                ));
             }
         };
         
         if sigs.is_empty() {
-            info!(
-                "pump_amm tx_history found no signatures for market {} base_mint {}",
-                pool_market, base_mint
-            );
+            // No transactions found - this is expected for brand-new pools, return None
             return Ok(None);
         }
-        
-        info!(
-            "pump_amm tx_history scanning {} signatures for market {} base_mint {}",
-            sigs.len(),
-            pool_market,
-            base_mint
-        );
 
         // Cap transaction fetches (sequential scan is more reliable than sampling for thin history).
         // Increased from 60 to 200 to handle markets with sparse/old swap history.
