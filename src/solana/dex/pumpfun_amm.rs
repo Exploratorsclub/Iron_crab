@@ -1027,9 +1027,15 @@ impl PumpFunAmmDex {
                 {
                     (auth, ta)
                 } else {
+                    let combined_list = combined
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
                     return Err(anyhow!(
-                        "pump_amm market parse: no protocol fee recipient token account (no embedded fee TA; no token account found) market={pool_market} global_config={global_config} tried_mints=[{quote_mint},{base_mint}] authority_candidates={}",
-                        combined.len()
+                        "pump_amm market parse: no protocol fee recipient token account (no embedded fee TA; no token account found) market={pool_market} global_config={global_config} tried_mints=[{quote_mint},{base_mint}] authority_candidates_count={} authority_candidates=[{}]",
+                        combined.len(),
+                        combined_list,
                     ));
                 }
             }
