@@ -1085,9 +1085,14 @@ impl PumpFunAmmDex {
         {
             (auth, ta)
         } else {
-            return Err(anyhow!(
-                "pump_amm market parse: no creator vault token account (no embedded creator ATA; no ATA found)"
-            ));
+            // Cannot find creator vault - skip this pool rather than failing hard.
+            // This is common when global_config doesn't exist and no authority candidates are available.
+            eprintln!(
+                "pump_amm market parse: no creator vault token account, skipping pool. \
+                 market={pool_market} base_mint={base_mint} authority_candidates_count={}",
+                authority_candidates.len()
+            );
+            return Ok(None);
         };
 
         // Derive remaining PDAs with a small set of common seed patterns and validate existence.
