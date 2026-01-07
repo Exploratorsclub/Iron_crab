@@ -27,6 +27,9 @@ const PUMPFUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXE
 // Observed on-chain in PumpSwap/Pump.fun AMM swaps: `fee_program` is this program id.
 const PUMPFUN_AMM_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 
+// Fallback protocol fee recipient when automatic discovery fails (observed in many PumpSwap pools)
+const PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfiiCL4DYk";
+
 // Best-effort: observed Pump.fun AMM "market" account layout contains
 // - base_mint at byte offset 43
 // - quote_mint at byte offset 75
@@ -740,7 +743,7 @@ impl PumpFunAmmDex {
         // The observed market layout is not 32-byte aligned (base_mint starts at offset 43), so
         // vault/accounts can appear at non-32-byte boundaries. Scan raw bytes for candidate
         // Pubkeys and resolve them in batches.
-        let embedded_pubkeys: HashSet<Pubkey> = rest_pubkeys.iter().copied().collect();
+        let _embedded_pubkeys: HashSet<Pubkey> = rest_pubkeys.iter().copied().collect();
         let mut scanned_pubkeys: Vec<Pubkey> = Vec::new();
         if data.len() >= 32 {
             for i in 0..=(data.len() - 32) {
@@ -765,9 +768,11 @@ impl PumpFunAmmDex {
         let associated_token_program =
             Pubkey::new_from_array(spl_associated_token_account::id().to_bytes());
         let system_program = Pubkey::from_str("11111111111111111111111111111111")?;
+        let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
         let mut token_accounts: Vec<TokenAccountMeta> = Vec::new();
         let mut non_token_pubkeys: Vec<Pubkey> = Vec::new();
         let mut program_owned_accounts: Vec<ProgramOwnedAccountMeta> = Vec::new();
+        let mut fee_program_owned_accounts: Vec<ProgramOwnedAccountMeta> = Vec::new();
 
         const MULTI_ACCOUNTS_CHUNK: usize = 100;
         for chunk in all_candidates.chunks(MULTI_ACCOUNTS_CHUNK) {
@@ -780,11 +785,6 @@ impl PumpFunAmmDex {
 
             for (pk, acc_opt) in chunk.iter().copied().zip(accounts.into_iter()) {
                 let Some(acc) = acc_opt else {
-                    // Only keep non-existent pubkeys if they were embedded explicitly; scanned
-                    // pubkeys would otherwise pollute authority candidate selection.
-                    if embedded_pubkeys.contains(&pk) {
-                        non_token_pubkeys.push(pk);
-                    }
                     continue;
                 };
 
@@ -814,7 +814,16 @@ impl PumpFunAmmDex {
                     continue;
                 }
 
-                if pk != Pubkey::default() {
+                // fee_config must be owned by the Fee Program, not the AMM program
+                if acc_owner == fee_program {
+                    fee_program_owned_accounts.push(ProgramOwnedAccountMeta {
+                        address: pk,
+                        data_len: acc_data.len(),
+                    });
+                    continue;
+                }
+
+                if !acc.executable && pk != Pubkey::default() {
                     non_token_pubkeys.push(pk);
                 }
             }
@@ -1027,16 +1036,31 @@ impl PumpFunAmmDex {
                 {
                     (auth, ta)
                 } else {
-                    let combined_list = combined
-                        .iter()
-                        .map(|p| p.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    return Err(anyhow!(
-                        "pump_amm market parse: no protocol fee recipient token account (no embedded fee TA; no token account found) market={pool_market} global_config={global_config} tried_mints=[{quote_mint},{base_mint}] authority_candidates_count={} authority_candidates=[{}]",
-                        combined.len(),
-                        combined_list,
-                    ));
+                    // CRITICAL FALLBACK: Use known PumpSwap protocol fee recipient when automatic
+                    // discovery fails (e.g., when global_config doesn't exist or authority candidates
+                    // are stale/deleted accounts). This is observed in many PumpSwap pools.
+                    let fallback_recipient = Pubkey::from_str(PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT)?;
+                    if let Some((auth, ta)) =
+                        find_authority_with_existing_token_account(vec![fallback_recipient], quote_mint).await?
+                    {
+                        (auth, ta)
+                    } else if let Some((auth, ta)) =
+                        find_authority_with_existing_token_account(vec![fallback_recipient], base_mint).await?
+                    {
+                        (auth, ta)
+                    } else {
+                        let combined_list = combined
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        return Err(anyhow!(
+                            "pump_amm market parse: no protocol fee recipient token account (no embedded fee TA; no token account found; fallback={}) market={pool_market} global_config={global_config} tried_mints=[{quote_mint},{base_mint}] authority_candidates_count={} authority_candidates=[{}]",
+                            fallback_recipient,
+                            combined.len(),
+                            combined_list,
+                        ));
+                    }
                 }
             }
         };
@@ -1072,49 +1096,20 @@ impl PumpFunAmmDex {
             }
         };
 
-        // Prefer extracting pump_amm-owned accounts directly from the market account, instead of
-        // guessing PDA seeds. Most pools include both `global_volume_accumulator` and `fee_config`
-        // as concrete, program-owned accounts.
-        let (fee_config, global_volume_accumulator) = if program_owned_accounts.len() >= 2 {
-            // Heuristic: fee_config tends to be the smaller account; volume accumulator tends to be larger.
-            let mut sorted = program_owned_accounts.clone();
-            sorted.sort_by_key(|m| m.data_len);
-            let fee = sorted.first().map(|m| m.address).unwrap_or_default();
-            let vol = sorted.last().map(|m| m.address).unwrap_or_default();
-            (fee, vol)
+        // Extract fee_config from fee-program owned accounts (CRITICAL: fee_config must be owned
+        // by pfeeUxB6... Fee Program, not the AMM program).
+        // Extract global_volume_accumulator from AMM-program owned accounts.
+        let fee_config = if !fee_program_owned_accounts.is_empty() {
+            // Prefer the first fee-program owned account found in market data
+            fee_program_owned_accounts
+                .first()
+                .map(|m| m.address)
+                .unwrap_or_default()
         } else {
-            // Fallback: try deriving if the market doesn't embed these accounts.
-            let vol = match self
+            // Fallback: try deriving fee_config PDA from Fee Program
+            match self
                 .derive_existing_pda(
-                    pump_amm_program,
-                    &[
-                        vec![
-                            b"global_volume_accumulator".to_vec(),
-                            global_config.to_bytes().to_vec(),
-                        ],
-                        vec![
-                            b"global_volume_accumulator".to_vec(),
-                            pool_market.to_bytes().to_vec(),
-                        ],
-                        vec![
-                            b"volume_accumulator".to_vec(),
-                            global_config.to_bytes().to_vec(),
-                        ],
-                        vec![
-                            b"volume_accumulator".to_vec(),
-                            pool_market.to_bytes().to_vec(),
-                        ],
-                    ],
-                )
-                .await?
-            {
-                Some(v) => v,
-                None => return Ok(None),
-            };
-
-            let fee = match self
-                .derive_existing_pda(
-                    pump_amm_program,
+                    fee_program,
                     &[
                         vec![b"fee_config".to_vec(), global_config.to_bytes().to_vec()],
                         vec![b"fee_config".to_vec(), pool_market.to_bytes().to_vec()],
@@ -1126,17 +1121,50 @@ impl PumpFunAmmDex {
                 .await?
             {
                 Some(v) => v,
-                None => return Ok(None),
-            };
+                None => Pubkey::default(),
+            }
+        };
 
-            (fee, vol)
+        let global_volume_accumulator = if !program_owned_accounts.is_empty() {
+            // global_volume_accumulator is owned by the AMM program
+            // Heuristic: prefer the larger account (volume accumulator tends to be bigger)
+            let mut sorted = program_owned_accounts.clone();
+            sorted.sort_by_key(|m| m.data_len);
+            sorted.last().map(|m| m.address).unwrap_or_default()
+        } else {
+            // Fallback: try deriving from AMM program
+            match self
+                .derive_existing_pda(
+                    pump_amm_program,
+                    &[
+                        vec![
+                            b"global_volume_accumulator".to_vec(),
+                            global_config.to_bytes().to_vec(),
+                        ],
+                        vec![
+                            b"global_volume_accumulator".to_vec(),
+                            pool_market.to_bytes().to_vec(),
+                        ],
+                        vec![
+                            b"volume_accumulator".to_vec(),
+                            global_config.to_bytes().to_vec(),
+                        ],
+                        vec![
+                            b"volume_accumulator".to_vec(),
+                            pool_market.to_bytes().to_vec(),
+                        ],
+                    ],
+                )
+                .await?
+            {
+                Some(v) => v,
+                None => Pubkey::default(),
+            }
         };
 
         if fee_config == Pubkey::default() || global_volume_accumulator == Pubkey::default() {
             return Ok(None);
         }
-
-        let fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
 
         Ok(Some(PumpAmmPoolStatic {
             pool_market,
