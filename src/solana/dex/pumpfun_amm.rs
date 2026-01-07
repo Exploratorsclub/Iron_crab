@@ -27,8 +27,10 @@ const PUMPFUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXE
 // Observed on-chain in PumpSwap/Pump.fun AMM swaps: `fee_program` is this program id.
 const PUMPFUN_AMM_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 
-// Fallback protocol fee recipient when automatic discovery fails (observed in many PumpSwap pools)
-const PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfiiCL4DYk";
+// Fallback protocol fee recipient when automatic discovery fails (observed in many PumpSwap pools).
+// This is the canonical Pump.fun protocol fee recipient wallet (owned by System Program, not a PDA).
+// Account: JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU (verified from multiple successful swap txs).
+const PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT: &str = "JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU";
 
 // Best-effort: observed Pump.fun AMM "market" account layout contains
 // - base_mint at byte offset 43
