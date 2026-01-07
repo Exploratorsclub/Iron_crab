@@ -1054,12 +1054,17 @@ impl PumpFunAmmDex {
                             .map(|p| p.to_string())
                             .collect::<Vec<_>>()
                             .join(",");
-                        return Err(anyhow!(
-                            "pump_amm market parse: no protocol fee recipient token account (no embedded fee TA; no token account found; fallback={}) market={pool_market} global_config={global_config} tried_mints=[{quote_mint},{base_mint}] authority_candidates_count={} authority_candidates=[{}]",
-                            fallback_recipient,
+                        // Cannot construct swap instruction without protocol_fee_recipient_ta.
+                        // Skip this pool rather than failing hard.
+                        eprintln!(
+                            "pump_amm market parse: no protocol fee recipient token account, skipping pool. \
+                             market={pool_market} global_config={global_config} tried_mints=[{quote_mint},{base_mint}] \
+                             authority_candidates_count={} authority_candidates=[{}] fallback={}",
                             combined.len(),
                             combined_list,
-                        ));
+                            fallback_recipient,
+                        );
+                        return Ok(None);
                     }
                 }
             }
