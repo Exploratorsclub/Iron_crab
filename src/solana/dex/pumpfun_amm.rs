@@ -1447,21 +1447,28 @@ impl PumpFunAmmDex {
                 }
 
                 // Build the subset we store as pool static.
+                // Account mapping from actual PumpSwap AMM swap instruction (23 accounts total):
+                // #0 = pool_market, #2 = global_config, #3 = base_mint, #4 = quote_mint,
+                // #7 = pool_base_vault, #8 = pool_quote_vault,
+                // #9 = protocol_fee_recipient, #10 = protocol_fee_recipient_ta,
+                // #15 = event_authority, #17 = coin_creator_vault_ata,
+                // #18 = coin_creator_vault_authority, #16 = global_volume_accumulator,
+                // #19 = fee_config, #20 = fee_program
                 let pool = PumpAmmPoolStatic {
                     pool_market: Pubkey::from_str(&account_keys[accounts[0]])?,
-                    global_config: Pubkey::from_str(&account_keys[accounts[1]])?,
+                    global_config: Pubkey::from_str(&account_keys[accounts[2]])?,
                     base_mint: Pubkey::from_str(&account_keys[accounts[3]])?,
                     quote_mint: Pubkey::from_str(&account_keys[accounts[4]])?,
-                    pool_base_vault: Pubkey::from_str(&account_keys[accounts[5]])?,
-                    pool_quote_vault: Pubkey::from_str(&account_keys[accounts[6]])?,
-                    protocol_fee_recipient: Pubkey::from_str(&account_keys[accounts[7]])?,
-                    protocol_fee_recipient_ta: Pubkey::from_str(&account_keys[accounts[8]])?,
-                    event_authority: Pubkey::from_str(&account_keys[accounts[9]])?,
-                    coin_creator_vault_ata: Pubkey::from_str(&account_keys[accounts[10]])?,
-                    coin_creator_vault_authority: Pubkey::from_str(&account_keys[accounts[11]])?,
-                    global_volume_accumulator: Pubkey::from_str(&account_keys[accounts[12]])?,
-                    fee_config: Pubkey::from_str(&account_keys[accounts[21]])?,
-                    fee_program: Pubkey::from_str(&account_keys[accounts[22]])?,
+                    pool_base_vault: Pubkey::from_str(&account_keys[accounts[7]])?,
+                    pool_quote_vault: Pubkey::from_str(&account_keys[accounts[8]])?,
+                    protocol_fee_recipient: Pubkey::from_str(&account_keys[accounts[9]])?,
+                    protocol_fee_recipient_ta: Pubkey::from_str(&account_keys[accounts[10]])?,
+                    event_authority: Pubkey::from_str(&account_keys[accounts[15]])?,
+                    coin_creator_vault_ata: Pubkey::from_str(&account_keys[accounts[17]])?,
+                    coin_creator_vault_authority: Pubkey::from_str(&account_keys[accounts[18]])?,
+                    global_volume_accumulator: Pubkey::from_str(&account_keys[accounts[16]])?,
+                    fee_config: Pubkey::from_str(&account_keys[accounts[19]])?,
+                    fee_program: Pubkey::from_str(&account_keys[accounts[20]])?,
                 };
 
                 // Fee guardrails (same as the broader scanner).
