@@ -1171,6 +1171,62 @@ impl PumpFunAmmDex {
             return Ok(None);
         }
 
+        // CRITICAL FIX: If protocol_fee_recipient is still Pubkey::default() (could not be
+        // discovered from market/global_config), derive it from Fee Program PDA seeds.
+        // Observed pattern: protocol_fee_recipient is a PDA owned by Fee Program with seeds
+        // like [b"protocol_fee", index] where index can vary (e.g., 8).
+        let (final_protocol_fee_recipient, final_protocol_fee_recipient_ta) =
+            if protocol_fee_recipient == Pubkey::default()
+                || protocol_fee_recipient_ta == Pubkey::default()
+            {
+                // Try deriving protocol_fee_recipient from Fee Program with common seed patterns
+                let derived_recipient = match self
+                    .derive_existing_pda(
+                        fee_program,
+                        &[
+                            // Common patterns observed in PumpSwap pools
+                            vec![b"protocol_fee".to_vec(), vec![8]],
+                            vec![b"protocol_fee".to_vec(), vec![0]],
+                            vec![b"protocol_fee".to_vec(), pool_market.to_bytes().to_vec()],
+                            vec![b"protocol_fee".to_vec(), global_config.to_bytes().to_vec()],
+                            vec![b"protocol_fee".to_vec(), fee_config.to_bytes().to_vec()],
+                            vec![b"fee_recipient".to_vec()],
+                            vec![b"protocol".to_vec()],
+                        ],
+                    )
+                    .await?
+                {
+                    Some(v) => v,
+                    None => {
+                        eprintln!(
+                            "pump_amm market parse: could not derive protocol_fee_recipient PDA, skipping pool. \
+                             market={pool_market} fee_program={fee_program} fee_config={fee_config}",
+                        );
+                        return Ok(None);
+                    }
+                };
+
+                // Derive ATA for derived_recipient
+                let derived_ta = Self::derive_ata(derived_recipient, quote_mint);
+
+                // Verify the ATA exists
+                match self
+                    .rpc_get_account_owner_and_executable(derived_ta)
+                    .await?
+                {
+                    Some(_) => (derived_recipient, derived_ta),
+                    None => {
+                        eprintln!(
+                            "pump_amm market parse: derived protocol_fee_recipient_ta does not exist, skipping pool. \
+                             recipient={derived_recipient} ta={derived_ta} market={pool_market}",
+                        );
+                        return Ok(None);
+                    }
+                }
+            } else {
+                (protocol_fee_recipient, protocol_fee_recipient_ta)
+            };
+
         Ok(Some(PumpAmmPoolStatic {
             pool_market,
             global_config,
@@ -1178,8 +1234,8 @@ impl PumpFunAmmDex {
             quote_mint,
             pool_base_vault,
             pool_quote_vault,
-            protocol_fee_recipient,
-            protocol_fee_recipient_ta,
+            protocol_fee_recipient: final_protocol_fee_recipient,
+            protocol_fee_recipient_ta: final_protocol_fee_recipient_ta,
             event_authority,
             coin_creator_vault_ata,
             coin_creator_vault_authority,
