@@ -580,9 +580,9 @@ impl PumpFunDex {
             }
         };
 
-        // Check if bonding curve is complete (migrated to Raydium)
+        // Check if bonding curve is complete (migrated to PumpSwap AMM)
         if state.complete {
-            info!(token_mint=%token_mint_str, bonding_curve=%bonding_curve, "pump.fun: bonding curve completed, migrated to raydium");
+            info!(token_mint=%token_mint_str, bonding_curve=%bonding_curve, "pump.fun: bonding curve completed, migrated to pump_amm (PumpSwap)");
             return Ok(None);
         }
 
@@ -752,9 +752,9 @@ impl Dex for PumpFunDex {
             }
         };
 
-        // Check if bonding curve is complete (migrated to Raydium)
+        // Check if bonding curve is complete (migrated to PumpSwap AMM)
         if state.complete {
-            info!(token_mint=%token_mint_str, bonding_curve=%bonding_curve, "pump.fun: bonding curve completed, migrated to raydium");
+            info!(token_mint=%token_mint_str, bonding_curve=%bonding_curve, "pump.fun: bonding curve completed, migrated to pump_amm (PumpSwap)");
             return Ok(None);
         }
 
