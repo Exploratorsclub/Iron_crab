@@ -1085,14 +1085,46 @@ impl PumpFunAmmDex {
         {
             (auth, ta)
         } else {
-            // Cannot find creator vault - skip this pool rather than failing hard.
-            // This is common when global_config doesn't exist and no authority candidates are available.
-            eprintln!(
-                "pump_amm market parse: no creator vault token account, skipping pool. \
-                 market={pool_market} base_mint={base_mint} authority_candidates_count={}",
-                authority_candidates.len()
-            );
-            return Ok(None);
+            // Try deriving creator vault authority as PDA from AMM program with common seed patterns
+            match self
+                .derive_existing_pda(
+                    pump_amm_program,
+                    &[
+                        vec![b"creator_vault_authority".to_vec(), pool_market.to_bytes().to_vec()],
+                        vec![b"creator_vault".to_vec(), pool_market.to_bytes().to_vec()],
+                        vec![b"creator".to_vec(), pool_market.to_bytes().to_vec()],
+                        vec![b"vault_authority".to_vec(), pool_market.to_bytes().to_vec()],
+                        vec![b"token_creator".to_vec(), pool_market.to_bytes().to_vec()],
+                    ],
+                )
+                .await?
+            {
+                Some(derived_authority) => {
+                    // Derive ATA for creator vault
+                    let derived_ata = Self::derive_ata(derived_authority, base_mint);
+                    
+                    // Verify ATA exists
+                    match self.rpc_get_account_owner_and_executable(derived_ata).await? {
+                        Some(_) => (derived_authority, derived_ata),
+                        None => {
+                            eprintln!(
+                                "pump_amm market parse: no creator vault token account (no embedded creator ATA; no ATA found; PDA derivation failed). \
+                                 market={pool_market} base_mint={base_mint} authority_candidates_count={}",
+                                authority_candidates.len()
+                            );
+                            return Ok(None);
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "pump_amm market parse: no creator vault token account (no embedded creator ATA; no ATA found; no valid PDA). \
+                         market={pool_market} base_mint={base_mint} authority_candidates_count={}",
+                        authority_candidates.len()
+                    );
+                    return Ok(None);
+                }
+            }
         };
 
         // Derive remaining PDAs with a small set of common seed patterns and validate existence.
