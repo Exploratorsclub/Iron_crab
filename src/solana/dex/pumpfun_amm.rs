@@ -21,6 +21,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
+use tracing::{info, warn};
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PUMPFUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
@@ -1349,13 +1350,43 @@ impl PumpFunAmmDex {
         let sigs_v = self
             .rpc_call_tx_history("getSignaturesForAddress", json!([addr, {"limit": 200}]))
             .await?;
-        let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        if sigs.is_empty() {
+        
+        // Check for RPC errors
+        if let Some(err) = sigs_v.get("error") {
+            warn!(
+                "pump_amm tx_history RPC error for market {}: {}",
+                pool_market,
+                serde_json::to_string(err).unwrap_or_default()
+            );
             return Ok(None);
         }
+        
+        let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
+            Some(v) => v,
+            None => {
+                warn!(
+                    "pump_amm tx_history unexpected response for market {}: {}",
+                    pool_market,
+                    serde_json::to_string(&sigs_v).unwrap_or_default()
+                );
+                return Ok(None);
+            }
+        };
+        
+        if sigs.is_empty() {
+            info!(
+                "pump_amm tx_history found no signatures for market {} base_mint {}",
+                pool_market, base_mint
+            );
+            return Ok(None);
+        }
+        
+        info!(
+            "pump_amm tx_history scanning {} signatures for market {} base_mint {}",
+            sigs.len(),
+            pool_market,
+            base_mint
+        );
 
         // Cap transaction fetches (sequential scan is more reliable than sampling for thin history).
         // Increased from 60 to 200 to handle markets with sparse/old swap history.
