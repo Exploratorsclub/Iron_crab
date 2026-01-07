@@ -1263,7 +1263,8 @@ impl PumpFunAmmDex {
         }
 
         // Cap transaction fetches (sequential scan is more reliable than sampling for thin history).
-        const MAX_TX_FETCHES: usize = 60;
+        // Increased from 60 to 200 to handle markets with sparse/old swap history.
+        const MAX_TX_FETCHES: usize = 200;
 
         let mut fetched = 0usize;
         for s in sigs.iter() {
