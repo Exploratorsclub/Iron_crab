@@ -1444,7 +1444,8 @@ impl PumpFunAmmDex {
                         .collect(),
                     None => continue,
                 };
-                if accounts.len() != 23 {
+                // PumpSwap AMM swap instructions have 21 accounts (not 23 as originally assumed).
+                if accounts.len() != 21 {
                     continue;
                 }
 
@@ -1715,7 +1716,8 @@ impl PumpFunAmmDex {
                                     .collect(),
                                 None => continue,
                             };
-                        if accounts.len() != 23 {
+                        // PumpSwap AMM swap instructions have 21 accounts (not 23 as originally assumed).
+                        if accounts.len() != 21 {
                             continue;
                         }
 
@@ -1900,7 +1902,8 @@ impl PumpFunAmmDex {
                         .collect(),
                     None => continue,
                 };
-                if accounts.len() != 23 {
+                // PumpSwap AMM swap instructions have 21 accounts (not 23 as originally assumed).
+                if accounts.len() != 21 {
                     continue;
                 }
 
