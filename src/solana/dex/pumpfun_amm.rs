@@ -1017,12 +1017,19 @@ impl PumpFunAmmDex {
                 combined.dedup();
 
                 if let Some((auth, ta)) =
-                    find_authority_with_existing_token_account(combined, quote_mint).await?
+                    find_authority_with_existing_token_account(combined.clone(), quote_mint).await?
+                {
+                    (auth, ta)
+                } else if let Some((auth, ta)) =
+                    // Some fee flows (notably `sell`) can accrue fees in the input mint.
+                    // If the protocol fee recipient TA is not for WSOL, fall back to base mint.
+                    find_authority_with_existing_token_account(combined.clone(), base_mint).await?
                 {
                     (auth, ta)
                 } else {
                     return Err(anyhow!(
-                        "pump_amm market parse: no protocol fee recipient token account (no embedded fee TA; no token account found)"
+                        "pump_amm market parse: no protocol fee recipient token account (no embedded fee TA; no token account found) market={pool_market} global_config={global_config} tried_mints=[{quote_mint},{base_mint}] authority_candidates={}",
+                        combined.len()
                     ));
                 }
             }
