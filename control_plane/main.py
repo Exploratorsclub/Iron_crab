@@ -810,6 +810,41 @@ async def get_aggregated_metrics(user: User = Depends(require_viewer)):
         "components": metrics
     }
 
+@app.get("/metrics/{component}")
+async def get_component_metrics(component: str, user: User = Depends(require_viewer)):
+    """
+    Proxy Prometheus metrics from a specific component (requires: viewer).
+    
+    This endpoint exists to provide CORS-enabled access to component metrics
+    without the UI needing to directly fetch from component ports.
+    """
+    component_urls = {
+        "market-data": config.MARKET_DATA_URL,
+        "momentum-bot": config.MOMENTUM_BOT_URL,
+        "arb-strategy": config.ARB_STRATEGY_URL,
+        "execution-engine": config.EXECUTION_ENGINE_URL,
+    }
+    
+    if component not in component_urls:
+        raise HTTPException(status_code=404, detail=f"Unknown component: {component}")
+    
+    base_url = component_urls[component]
+    
+    try:
+        response = await state.http_client.get(f"{base_url}/metrics", timeout=5.0)
+        if response.status_code == 200:
+            # Return raw Prometheus text format
+            from fastapi.responses import PlainTextResponse
+            return PlainTextResponse(content=response.text, media_type="text/plain")
+        else:
+            raise HTTPException(status_code=response.status_code, detail=f"Component returned {response.status_code}")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail=f"Cannot connect to {component}")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail=f"Timeout connecting to {component}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/kill")
 async def trigger_kill_switch(
     request: KillRequest, 
@@ -989,6 +1024,26 @@ async def systemd_component_action(
         "stderr": result.get("stderr", ""),
         "returncode": result.get("returncode"),
         "argv": " ".join(shlex.quote(a) for a in argv),
+    }
+
+@app.get("/config/{component}")
+async def get_config(component: str, user: User = Depends(require_viewer)):
+    """
+    Get current configuration for a component (requires: viewer).
+    
+    For now, returns empty config as components don't expose their current config yet.
+    This endpoint exists for UI compatibility.
+    """
+    valid_components = ["market-data", "momentum-bot", "arb-strategy", "execution-engine"]
+    if component not in valid_components:
+        raise HTTPException(status_code=400, detail=f"Invalid component. Must be one of: {valid_components}")
+    
+    # TODO: Implement config state tracking (either via NATS state or component /config endpoints)
+    # For now, return placeholder
+    return {
+        "component": component,
+        "config": {},
+        "note": "Config state tracking not yet implemented. Use POST /config to update."
     }
 
 @app.post("/config")
