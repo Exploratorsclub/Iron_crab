@@ -1347,9 +1347,20 @@ impl PumpFunAmmDex {
         // swap and extract the canonical account set from the on-chain transaction.
 
         let addr = pool_market.to_string();
+        
+        info!(
+            "pump_amm TX-history: starting getSignaturesForAddress for market={} base_mint={} limit=200",
+            pool_market, base_mint
+        );
+        
         let sigs_v = self
             .rpc_call_tx_history("getSignaturesForAddress", json!([addr, {"limit": 200}]))
             .await?;
+        
+        info!(
+            "pump_amm TX-history: received getSignaturesForAddress response for market={}",
+            pool_market
+        );
         
         // Check for RPC errors - returnOk(None) triggers generic error message upstream
         if let Some(err) = sigs_v.get("error") {
@@ -1365,6 +1376,11 @@ impl PumpFunAmmDex {
             Some(v) => v,
             None => {
                 // Unexpected response structure
+                warn!(
+                    "pump_amm TX-history: unexpected response from getSignaturesForAddress market={} response={}",
+                    pool_market,
+                    serde_json::to_string(&sigs_v).unwrap_or_else(|_| "unknown".to_string())
+                );
                 return Err(anyhow!(
                     "pump_amm tx_history unexpected response market={} response={}",
                     pool_market,
@@ -1373,8 +1389,14 @@ impl PumpFunAmmDex {
             }
         };
         
+        info!(
+            "pump_amm TX-history: found {} signatures for market={} base_mint={}, starting transaction scan...",
+            sigs.len(), pool_market, base_mint
+        );
+        
         if sigs.is_empty() {
             // No transactions found - this is expected for brand-new pools, return None
+            info!("pump_amm TX-history: no signatures found for market={}, returning None", pool_market);
             return Ok(None);
         }
 
@@ -1383,6 +1405,8 @@ impl PumpFunAmmDex {
         const MAX_TX_FETCHES: usize = 200;
 
         let mut fetched = 0usize;
+        let mut scanned_tx_count = 0usize;
+        
         for s in sigs.iter() {
             if fetched >= MAX_TX_FETCHES {
                 break;
@@ -1398,6 +1422,14 @@ impl PumpFunAmmDex {
             };
 
             fetched += 1;
+            
+            // Log progress every 20 transactions
+            if fetched % 20 == 0 {
+                info!(
+                    "pump_amm TX-history: scanned {}/{} transactions for market={}...",
+                    fetched, sigs.len(), pool_market
+                );
+            }
 
             let tx_v = self
                 .rpc_call_tx_history(
@@ -1424,6 +1456,8 @@ impl PumpFunAmmDex {
                 Err(_) => continue,
             };
             Self::extend_with_loaded_addresses(&mut account_keys, meta);
+            
+            scanned_tx_count += 1;
 
             for ix in Self::collect_all_instructions(msg, meta) {
                 let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
@@ -1447,6 +1481,13 @@ impl PumpFunAmmDex {
                 };
                 // PumpSwap AMM swap instructions have 21 accounts (not 23 as originally assumed).
                 if accounts.len() != 21 {
+                    // Log first mismatch
+                    if scanned_tx_count == 1 {
+                        info!(
+                            "pump_amm TX-history: account count mismatch sig={} expected=21 actual={} (logging first occurrence only)",
+                            sig, accounts.len()
+                        );
+                    }
                     continue;
                 }
 
@@ -1456,6 +1497,13 @@ impl PumpFunAmmDex {
                     None => continue,
                 };
                 if Pubkey::from_str(pool_market_ix).ok() != Some(pool_market) {
+                    // Log first mismatch
+                    if scanned_tx_count == 1 {
+                        info!(
+                            "pump_amm TX-history: market mismatch sig={} expected={} actual={} (logging first occurrence only)",
+                            sig, pool_market, pool_market_ix
+                        );
+                    }
                     continue;
                 }
 
@@ -1465,6 +1513,13 @@ impl PumpFunAmmDex {
                     None => continue,
                 };
                 if Pubkey::from_str(base_mint_ix).ok() != Some(base_mint) {
+                    // Log first mismatch
+                    if scanned_tx_count == 1 {
+                        info!(
+                            "pump_amm TX-history: base_mint mismatch sig={} expected={} actual={} (logging first occurrence only)",
+                            sig, base_mint, base_mint_ix
+                        );
+                    }
                     continue;
                 }
 
@@ -1513,6 +1568,10 @@ impl PumpFunAmmDex {
             }
         }
 
+        info!(
+            "pump_amm TX-history: scanned {} transactions, no matching swap found for market={} base_mint={}",
+            scanned_tx_count, pool_market, base_mint
+        );
         Ok(None)
     }
 
