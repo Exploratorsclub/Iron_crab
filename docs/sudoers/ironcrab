@@ -1,0 +1,9 @@
+# IronCrab sudoers - minimal working version for deploy.sh
+# Install: sudo cp /tmp/ironcrab.sudoers /etc/sudoers.d/ironcrab && sudo chmod 0440 /etc/sudoers.d/ironcrab
+
+# Allow all systemctl and cp commands for ironcrab user
+ironcrab ALL=(ALL) NOPASSWD: ALL
+
+
+
+

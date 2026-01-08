@@ -212,6 +212,7 @@ async fn compute_intent_fills_best_effort(
     Option<ExplicitAmount>,
     FillStatus,
     Option<FillUnavailableReason>,
+    Option<i128>, // SOL delta in lamports
 ) {
     let cfg = RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::JsonParsed),
@@ -234,6 +235,7 @@ async fn compute_intent_fills_best_effort(
                 None,
                 FillStatus::Unavailable,
                 Some(FillUnavailableReason::RpcTxFetchFailed),
+                None,
             );
         }
     };
@@ -244,6 +246,7 @@ async fn compute_intent_fills_best_effort(
             None,
             FillStatus::Unavailable,
             Some(FillUnavailableReason::TxMetaMissing),
+            None,
         );
     }
 
@@ -327,7 +330,14 @@ async fn compute_intent_fills_best_effort(
         Some(FillUnavailableReason::TokenBalanceDeltaMissing)
     };
 
-    (fill_in, fill_out, fill_status, fill_unavailable_reason)
+    // Return wallet SOL delta (5th tuple element) unless gated by noise
+    let wallet_sol_delta = if !lamport_noise {
+        Some(payer_delta_lamports as i128)
+    } else {
+        None
+    };
+
+    (fill_in, fill_out, fill_status, fill_unavailable_reason, wallet_sol_delta)
 }
 
 async fn discover_wallet_open_positions(rpc: &SolanaRpc, owner: Pubkey) -> anyhow::Result<usize> {
@@ -4136,11 +4146,14 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     (ctx.wallet_pubkey, exec.signature.as_deref())
                 {
                     if let Ok(sig) = Signature::from_str(sig_str) {
-                        let (fill_in, fill_out, fill_status, fill_reason) =
+                        let (fill_in, fill_out, fill_status, fill_reason, wallet_sol_delta) =
                             compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await;
                         exec = exec
                             .with_fills(fill_in, fill_out)
                             .with_fill_diagnostics(fill_status, fill_reason);
+                        if let Some(delta) = wallet_sol_delta {
+                            exec = exec.with_sol_delta(delta);
+                        }
                     }
                 }
             }
@@ -4176,11 +4189,11 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             .or_else(|| send_signature.clone())
             .unwrap_or_default();
 
-        let (fill_in, fill_out, _fill_status, _fill_reason) =
+        let (fill_in, fill_out, _fill_status, _fill_reason, _wallet_sol_delta) =
             if let (Some(wallet), Ok(sig)) = (ctx.wallet_pubkey, Signature::from_str(&tx_hash)) {
                 compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await
             } else {
-                (None, None, FillStatus::Unavailable, None)
+                (None, None, FillStatus::Unavailable, None, None)
             };
 
         let (mint, action, amount_tokens, price_sol) = match intent.side {

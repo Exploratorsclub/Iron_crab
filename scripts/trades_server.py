@@ -61,11 +61,17 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                                 dec = json.loads(line)
                                 decision_id = dec.get("decision_id")
                                 if decision_id and dec.get("outcome") == "Confirmed":
-                                    # Store only what we need: input_mint, output_mint
-                                    tx_plan = dec.get("tx_plan", {})
+                                    # Extract mint from capital_lock check details
+                                    mint = None
+                                    for check in dec.get("checks", []):
+                                        if check.get("check_name") == "capital_lock":
+                                            details = check.get("details", "")
+                                            if details.startswith("token:"):
+                                                mint = details[6:]  # Remove "token:" prefix
+                                                break
+                                    
                                     decision_cache[decision_id] = {
-                                        "input_mint": tx_plan.get("input_mint"),
-                                        "output_mint": tx_plan.get("output_mint")
+                                        "mint": mint
                                     }
                             except json.JSONDecodeError:
                                 continue
@@ -112,6 +118,9 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             fill_in = record.get('fill_in', {})
             fill_out = record.get('fill_out', {})
             
+            # NEW: Get actual wallet SOL delta (includes all fees)
+            wallet_sol_delta_lamports = record.get('wallet_sol_delta_lamports')
+            
             # Determine action from fill amounts
             # If fill_in has tokens (>1e6 raw), it's a SELL
             # If fill_out has tokens, it's a BUY
@@ -127,18 +136,25 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             if is_sell:
                 action = "SELL"
                 amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
-                sol_amount = fill_out_raw / 1e9  # WSOL received
-                token_mint = decision_data.get("input_mint", "unknown")
+                token_mint = decision_data.get("mint", "unknown")
             else:
                 action = "BUY"
                 amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
-                sol_amount = fill_in_raw / 1e9  # SOL paid
-                token_mint = decision_data.get("output_mint", "unknown")
+                token_mint = decision_data.get("mint", "unknown")
             
-            # NOTE: sol_amount is WSOL token account amount, not actual SOL balance change!
-            # For accurate SOL tracking, execution-engine would need to record pre/post balances
-            # Solscan shows ~0.002343 SOL which is likely market value, not actual received SOL
-            price_sol = sol_amount  # This is WSOL amount, actual user SOL change is different
+            # Prefer wallet_sol_delta_lamports (actual SOL change) over WSOL token amounts
+            if wallet_sol_delta_lamports is not None:
+                # wallet_sol_delta_lamports: positive = gained SOL, negative = lost SOL
+                # For price_sol, we want absolute amount
+                sol_amount = abs(wallet_sol_delta_lamports) / 1e9
+            else:
+                # Fallback to WSOL token amounts (old behavior)
+                if is_sell:
+                    sol_amount = fill_out_raw / 1e9  # WSOL received
+                else:
+                    sol_amount = fill_in_raw / 1e9  # SOL paid
+            
+            price_sol = sol_amount
             
             return {
                 "timestamp_ms": ts_ms,
@@ -147,7 +163,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 "token_mint": token_mint[:20] + "..." if token_mint != "unknown" else token_mint,
                 "tx_hash": signature,
                 "amount": amount_tokens,
-                "price_sol": round(price_sol, 9),  # WSOL token amount (not actual SOL balance change!)
+                "price_sol": round(price_sol, 9),
                 "pnl_sol": 0.0,  # Would need position tracking
                 "pnl_percent": 0.0  # Would need position tracking
             }

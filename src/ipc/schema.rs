@@ -1162,6 +1162,18 @@ pub struct ExecutionResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pnl: Option<ExecutionPnl>,
 
+    /// Wallet SOL balance delta (lamports)
+    ///
+    /// This is the actual change in the wallet's SOL balance from pre to post,
+    /// including all fees, rent, and protocol costs.
+    /// Positive = wallet gained SOL, Negative = wallet lost SOL
+    ///
+    /// Note: This differs from fill_in/fill_out which track token/WSOL amounts.
+    /// For SELL: wallet_sol_delta shows the net SOL received after all fees
+    /// For BUY: wallet_sol_delta shows the total SOL spent including fees
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_sol_delta_lamports: Option<i128>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
 
@@ -1196,6 +1208,7 @@ impl ExecutionResult {
             fill_out: None,
             fill_status: None,
             fill_unavailable_reason: None,
+            wallet_sol_delta_lamports: None,
             confirmed_slot: None,
             fees: None,
             pnl: None,
@@ -1221,6 +1234,11 @@ impl ExecutionResult {
     ) -> Self {
         self.fill_status = Some(fill_status);
         self.fill_unavailable_reason = fill_unavailable_reason;
+        self
+    }
+
+    pub fn with_sol_delta(mut self, delta_lamports: i128) -> Self {
+        self.wallet_sol_delta_lamports = Some(delta_lamports);
         self
     }
 
