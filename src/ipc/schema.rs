@@ -1281,7 +1281,9 @@ pub struct ConfigUpdate {
     pub command: String,
 
     /// Target component: "execution-engine", "momentum-bot", "market-data"
-    pub component: String,
+    /// Renamed from "component" to avoid collision with RecordHeader.component (sender)
+    #[serde(rename = "target_component")]
+    pub target_component: String,
 
     /// Key-value pairs to update
     pub config: HashMap<String, serde_json::Value>,
@@ -1301,7 +1303,7 @@ impl ConfigUpdate {
         Self {
             header: RecordHeader::new(component, build, run_id),
             command: "config_update".to_string(),
-            component: target.to_string(),
+            target_component: target.to_string(),
             config,
             timestamp: chrono::Utc::now().to_rfc3339(),
         }

@@ -3067,9 +3067,9 @@ async fn main() -> Result<()> {
                     match serde_json::from_slice::<ConfigUpdate>(&nats_msg.payload) {
                         Ok(update) => {
                             // Only process if targeted at momentum-bot
-                            if update.component == "momentum-bot" {
+                            if update.target_component == "momentum-bot" {
                                 info!(
-                                    component = %update.component,
+                                    component = %update.target_component,
                                     keys = ?update.config.keys().collect::<Vec<_>>(),
                                     "Received Config Update from control-plane"
                                 );
@@ -3081,7 +3081,7 @@ async fn main() -> Result<()> {
                                     "Config update processed"
                                 );
                             } else {
-                                debug!(component = %update.component, "Ignoring config update for other component");
+                                debug!(component = %update.target_component, "Ignoring config update for other component");
                             }
                         }
                         Err(e) => {

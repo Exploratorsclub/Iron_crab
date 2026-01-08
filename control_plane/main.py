@@ -1118,7 +1118,7 @@ async def update_config(update: ConfigUpdate, user: User = Depends(require_admin
         
         # ConfigUpdate fields
         "command": "config_update",
-        "component": update.component,  # Target component
+        "target_component": update.component,  # Target component (renamed to avoid collision with RecordHeader.component)
         "config": update.config,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

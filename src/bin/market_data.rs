@@ -730,9 +730,9 @@ async fn run_geyser_loop(
                 if let Some(nats_msg) = msg {
                     match serde_json::from_slice::<ConfigUpdate>(&nats_msg.payload) {
                         Ok(update) => {
-                            if update.component == "market-data" {
+                            if update.target_component == "market-data" {
                                 info!(
-                                    component = %update.component,
+                                    component = %update.target_component,
                                     keys = ?update.config.keys().collect::<Vec<_>>(),
                                     "Received Config Update from control-plane"
                                 );
@@ -744,7 +744,7 @@ async fn run_geyser_loop(
                                     "Config update processed"
                                 );
                             } else {
-                                debug!(component = %update.component, "Ignoring config update for other component");
+                                debug!(component = %update.target_component, "Ignoring config update for other component");
                             }
                         }
                         Err(e) => {
@@ -859,9 +859,9 @@ async fn run_simulation_loop(
                 if let Some(nats_msg) = msg {
                     match serde_json::from_slice::<ConfigUpdate>(&nats_msg.payload) {
                         Ok(update) => {
-                            if update.component == "market-data" {
+                            if update.target_component == "market-data" {
                                 info!(
-                                    component = %update.component,
+                                    component = %update.target_component,
                                     keys = ?update.config.keys().collect::<Vec<_>>(),
                                     "Received Config Update from control-plane"
                                 );
@@ -873,7 +873,7 @@ async fn run_simulation_loop(
                                     "Config update processed"
                                 );
                             } else {
-                                debug!(component = %update.component, "Ignoring config update for other component");
+                                debug!(component = %update.target_component, "Ignoring config update for other component");
                             }
                         }
                         Err(e) => {

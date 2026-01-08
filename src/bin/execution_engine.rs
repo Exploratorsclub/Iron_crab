@@ -2714,9 +2714,9 @@ async fn main() -> Result<()> {
                 match msg.deserialize::<ConfigUpdate>() {
                     Ok(update) => {
                         // Only process if targeted at execution-engine
-                        if update.component == "execution-engine" {
+                        if update.target_component == "execution-engine" {
                             info!(
-                                component = %update.component,
+                                component = %update.target_component,
                                 keys = ?update.config.keys().collect::<Vec<_>>(),
                                 "Received Config Update from control-plane"
                             );
@@ -2728,7 +2728,7 @@ async fn main() -> Result<()> {
                                 "Config update processed"
                             );
                         } else {
-                            debug!(component = %update.component, "Ignoring config update for other component");
+                            debug!(component = %update.target_component, "Ignoring config update for other component");
                         }
                     }
                     Err(e) => {
