@@ -1610,16 +1610,45 @@ impl PumpFunAmmDex {
                 let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
                 let expected_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
                 if pool.fee_program != expected_fee_program {
+                    if is_ref_tx {
+                        info!(
+                            "pump_amm TX-history: reference TX fee_program mismatch expected={} actual={}",
+                            expected_fee_program, pool.fee_program
+                        );
+                    }
                     continue;
                 }
+                
+                if is_ref_tx {
+                    info!("pump_amm TX-history: reference TX fee_program OK, checking fee_config owner...");
+                }
+                
                 let Some((fee_owner, fee_executable)) = self
                     .rpc_get_account_owner_and_executable(pool.fee_config)
                     .await?
                 else {
+                    if is_ref_tx {
+                        info!("pump_amm TX-history: reference TX fee_config account not found");
+                    }
                     continue;
                 };
+                
+                if is_ref_tx {
+                    info!(
+                        "pump_amm TX-history: reference TX fee_config owner={} executable={} (expected owner={})",
+                        fee_owner, fee_executable, pump_amm_program
+                    );
+                }
+                
                 if fee_executable || fee_owner != pump_amm_program {
+                    if is_ref_tx {
+                        info!("pump_amm TX-history: reference TX fee_config owner check FAILED");
+                    }
                     continue;
+                }
+                
+                if is_ref_tx {
+                    info!("pump_amm TX-history: reference TX SUCCESS! Returning pool...");
                 }
 
                 return Ok(Some(pool));
