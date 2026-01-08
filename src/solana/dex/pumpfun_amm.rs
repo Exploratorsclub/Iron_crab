@@ -2335,7 +2335,7 @@ impl Dex for PumpFunAmmDex {
             .as_ref()
             .map(|u| u.user_quote_ta)
             .unwrap_or_else(|| Self::derive_ata(user, pool.quote_mint));
-        let user_vol = user_acc
+        let _user_vol = user_acc
             .as_ref()
             .map(|u| u.user_volume_accumulator)
             .unwrap_or_else(|| {
@@ -2449,6 +2449,7 @@ impl PumpFunAmmDex {
         // NOTE: global_volume_accumulator removed (was pool_accounts[11])
         let fee_config = pool_accounts[11]; // was [12]
         // NOTE: fee_program is now derived, not from pool_accounts
+        let fee_program = expected_fee_program;
 
         // Intent-driven guardrails (no RPC calls): reject obviously wrong pool_accounts early.
         // This prevents ambiguous/incorrect fee_config mapping from reaching simulation.
