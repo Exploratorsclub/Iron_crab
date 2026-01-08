@@ -1137,13 +1137,12 @@ impl TokenTracker {
         if metrics.initial_liquidity_sol < config.early_min_liquidity_sol {
             FILTER_REJECTED_LIQUIDITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return (
-                false,
-                format!(
-                    "WAIT_INSUFFICIENT_LIQUIDITY: liq {:.2} SOL < {:.2} SOL",
-                    metrics.initial_liquidity_sol, config.early_min_liquidity_sol
-                ),
+            let reason = format!(
+                "WAIT_INSUFFICIENT_LIQUIDITY: liq {:.2} SOL < {:.2} SOL",
+                metrics.initial_liquidity_sol, config.early_min_liquidity_sol
             );
+            warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, reason = %reason, "🚫 Filter rejected");
+            return (false, reason);
         }
 
         // Filter 1b: LP removal
@@ -1152,6 +1151,7 @@ impl TokenTracker {
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
             self.blacklisted = true;
             self.blacklist_reason = Some("REJECT_LP_REMOVED".to_string());
+            warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, "🚫 Filter rejected: LP_REMOVED (blacklisted)");
             return (false, "REJECT_LP_REMOVED".to_string());
         }
 
@@ -1159,38 +1159,35 @@ impl TokenTracker {
         if metrics.unique_buyers_in_window < config.min_unique_buyers {
             FILTER_REJECTED_VELOCITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return (
-                false,
-                format!(
-                    "WAIT_BUYER_WINDOW: buyers {} < {}",
-                    metrics.unique_buyers_in_window, config.min_unique_buyers
-                ),
+            let reason = format!(
+                "WAIT_BUYER_WINDOW: buyers {} < {}",
+                metrics.unique_buyers_in_window, config.min_unique_buyers
             );
+            warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, reason = %reason, "🚫 Filter rejected");
+            return (false, reason);
         }
 
         if metrics.trades_per_sec < config.min_trades_per_sec {
             FILTER_REJECTED_VELOCITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return (
-                false,
-                format!(
-                    "WAIT_BUYER_WINDOW: trades_per_sec {:.2} < {:.2}",
-                    metrics.trades_per_sec, config.min_trades_per_sec
-                ),
+            let reason = format!(
+                "WAIT_BUYER_WINDOW: trades_per_sec {:.3} < {:.3}",
+                metrics.trades_per_sec, config.min_trades_per_sec
             );
+            warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, reason = %reason, "🚫 Filter rejected");
+            return (false, reason);
         }
 
         if metrics.buy_dominance < config.min_buy_dominance {
             FILTER_REJECTED_VELOCITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return (
-                false,
-                format!(
-                    "WAIT_BUYER_WINDOW: buy dominance {:.0}% < {:.0}%",
-                    metrics.buy_dominance * 100.0,
-                    config.min_buy_dominance * 100.0
-                ),
+            let reason = format!(
+                "WAIT_BUYER_WINDOW: buy dominance {:.0}% < {:.0}%",
+                metrics.buy_dominance * 100.0,
+                config.min_buy_dominance * 100.0
             );
+            warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, reason = %reason, "🚫 Filter rejected");
+            return (false, reason);
         }
 
         // Filter 2c: Micro-buy spam (anti-bot)
@@ -1284,14 +1281,13 @@ impl TokenTracker {
         if metrics.net_sol_inflow < config.min_sol_inflow_lamports {
             FILTER_REJECTED_INFLOW.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return (
-                false,
-                format!(
-                    "WAIT_BUYER_WINDOW: net inflow {:.2} SOL < {:.2} SOL",
-                    metrics.net_sol_inflow as f64 / 1_000_000_000.0,
-                    config.min_sol_inflow_lamports as f64 / 1_000_000_000.0
-                ),
+            let reason = format!(
+                "WAIT_BUYER_WINDOW: net inflow {:.2} SOL < {:.2} SOL",
+                metrics.net_sol_inflow as f64 / 1_000_000_000.0,
+                config.min_sol_inflow_lamports as f64 / 1_000_000_000.0
             );
+            warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, reason = %reason, "🚫 Filter rejected");
+            return (false, reason);
         }
 
         // Filter 3b: Dump-recovery gating (WAIT until recovery confirms after a dump)

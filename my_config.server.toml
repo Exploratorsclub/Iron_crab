@@ -306,10 +306,10 @@ default_position_lamports = 5_000_000  # 0.005 SOL per trade
 max_dev_supply_pct = 95.0           # Allow up to 95% dev supply (was 90)
 lp_removal_window_secs = 60         # Track LP removals for 60s
 
-# FILTER 2: Buyer Velocity (RELAXED - key filter causing 0 intents)
+# FILTER 2: Buyer Velocity (RELAXED for realistic meme token activity)
 min_unique_buyers = 3               # 3 unique buyers in window (WAS 10!)
-buyer_window_secs = 60              # 60 second window (was 20s)
-min_trades_per_sec = 0.1            # 0.1 trades/sec (WAS 0.5!)
+buyer_window_secs = 120             # 120 second window (was 60s) - longer window for sparse activity
+min_trades_per_sec = 0.02           # 0.02 trades/sec = 1 trade per 50s (WAS 0.1 = unrealistic!)
 min_buy_dominance = 0.45            # 45% buys vs sells (WAS 60%)
 
 # FILTER 3: SOL Inflow (RELAXED - major blocker)
