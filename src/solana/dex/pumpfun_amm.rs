@@ -2424,9 +2424,10 @@ impl PumpFunAmmDex {
         user: Pubkey,
         pool_accounts: &[Pubkey],
     ) -> Result<Vec<Instruction>> {
-        if pool_accounts.len() != 14 {
+        // NOTE: reduced from 14 to 12 after removing global_volume_accumulator
+        if pool_accounts.len() != 12 {
             return Err(anyhow!(
-                "pump_amm expected 14 pool_accounts (v1), got {}",
+                "pump_amm expected 12 pool_accounts (v2, no volume accumulators), got {}",
                 pool_accounts.len()
             ));
         }
@@ -2445,9 +2446,9 @@ impl PumpFunAmmDex {
         let event_authority = pool_accounts[8];
         let coin_creator_vault_ata = pool_accounts[9];
         let coin_creator_vault_authority = pool_accounts[10];
-        let global_volume_accumulator = pool_accounts[11];
-        let fee_config = pool_accounts[12];
-        let fee_program = pool_accounts[13];
+        // NOTE: global_volume_accumulator removed (was pool_accounts[11])
+        let fee_config = pool_accounts[11]; // was [12]
+        // NOTE: fee_program is now derived, not from pool_accounts
 
         // Intent-driven guardrails (no RPC calls): reject obviously wrong pool_accounts early.
         // This prevents ambiguous/incorrect fee_config mapping from reaching simulation.
@@ -2501,35 +2502,35 @@ impl PumpFunAmmDex {
 
         // Account ordering is taken from an observed on-chain Pump.fun AMM swap transaction.
         let metas = vec![
-            AccountMeta::new(pool_market, false),
-            AccountMeta::new(user, true),
-            AccountMeta::new_readonly(global_config, false),
-            AccountMeta::new_readonly(base_mint, false),
-            AccountMeta::new_readonly(quote_mint, false),
-            AccountMeta::new(user_base_ta, false),
-            AccountMeta::new(user_quote_ta, false),
-            AccountMeta::new(pool_base_vault, false),
-            AccountMeta::new(pool_quote_vault, false),
-            AccountMeta::new_readonly(protocol_fee_recipient, false),
-            AccountMeta::new(protocol_fee_recipient_ta, false),
-            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
-            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
+            AccountMeta::new(pool_market, false),               // 0
+            AccountMeta::new(user, true),                       // 1
+            AccountMeta::new_readonly(global_config, false),    // 2
+            AccountMeta::new_readonly(base_mint, false),        // 3
+            AccountMeta::new_readonly(quote_mint, false),       // 4
+            AccountMeta::new(user_base_ta, false),              // 5
+            AccountMeta::new(user_quote_ta, false),             // 6
+            AccountMeta::new(pool_base_vault, false),           // 7
+            AccountMeta::new(pool_quote_vault, false),          // 8
+            AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
+            AccountMeta::new(protocol_fee_recipient_ta, false), // 10
+            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 11
+            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 12
             AccountMeta::new_readonly(
                 Pubkey::new_from_array(solana_system_program::id().to_bytes()),
                 false,
-            ),
+            ), // 13
             AccountMeta::new_readonly(
                 Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
                 false,
-            ),
-            AccountMeta::new_readonly(event_authority, false),
-            AccountMeta::new_readonly(program_id, false),
-            AccountMeta::new(coin_creator_vault_ata, false),
-            AccountMeta::new_readonly(coin_creator_vault_authority, false),
-            AccountMeta::new(global_volume_accumulator, false),
-            AccountMeta::new(user_vol, false),
-            AccountMeta::new_readonly(fee_config, false),
-            AccountMeta::new_readonly(fee_program, false),
+            ), // 14
+            AccountMeta::new_readonly(event_authority, false),       // 15
+            AccountMeta::new_readonly(program_id, false),            // 16
+            AccountMeta::new(coin_creator_vault_ata, false),         // 17
+            AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
+            // NOTE: global_volume_accumulator and user_vol are NOT in actual on-chain swap TXs!
+            // Removed to match observed transaction structure (21 accounts total).
+            AccountMeta::new_readonly(fee_config, false),       // 19
+            AccountMeta::new_readonly(fee_program, false),      // 20
         ];
 
         Ok(vec![Instruction {
