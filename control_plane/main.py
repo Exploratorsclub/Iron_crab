@@ -1107,10 +1107,20 @@ async def update_config(update: ConfigUpdate, user: User = Depends(require_admin
     # P1: Persist config to control-plane state (survives reload)
     state.update_component_config(update.component, update.config)
     
-    # P1: Format matches Rust IPC schema (ConfigUpdate)
+    # P1: Format matches Rust IPC schema (ConfigUpdate) - must include header fields
     config_msg = {
-        "component": update.component,
+        # RecordHeader fields (required by Rust schema)
+        "schema_version": 1,
+        "ts_unix_ms": _now_unix_ms(),
+        "component": CONTROL_PLANE_COMPONENT,
+        "build": CONTROL_PLANE_BUILD,
+        "run_id": CONTROL_PLANE_RUN_ID,
+        
+        # ConfigUpdate fields
+        "command": "config_update",
+        "component": update.component,  # Target component
         "config": update.config,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     
     published = await state.publish(config.TOPIC_CONFIG_RELOAD, config_msg)
