@@ -15,7 +15,56 @@
 
 body {
   margin: 0;
-  padding: 16px;
+  padding: 0;
+}
+
+header {
+  background: #1a1a1a;
+  color: #fff;
+  padding: 16px 24px;
+  border-bottom: 2px solid #333;
+}
+
+header h1 {
+  margin: 0 0 12px 0;
+  font-size: 24px;
+}
+
+header h1 a {
+  color: #fff;
+  text-decoration: none;
+}
+
+header h1 a:hover {
+  color: #0ea5e9;
+}
+
+header nav {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+header nav a {
+  color: #aaa;
+  text-decoration: none;
+  padding: 6px 12px;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+header nav a:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+header nav a.active {
+  background: #0ea5e9;
+  color: #fff;
+}
+
+main {
+  padding: 16px 24px;
 }
 
 h1 {
@@ -23,8 +72,33 @@ h1 {
   font-size: 20px;
 }
 
+h2 {
+  margin: 0 0 16px 0;
+  font-size: 22px;
+}
+
 section {
-  margin-top: 16px;
+  margin-top: 24px;
+}
+
+.sectionHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.breadcrumb {
+  margin-bottom: 16px;
+}
+
+.breadcrumb a {
+  color: #0ea5e9;
+  text-decoration: none;
+}
+
+.breadcrumb a:hover {
+  text-decoration: underline;
 }
 
 .card {
@@ -100,8 +174,13 @@ button:hover {
 }
 
 button.danger {
-  border-color: #b00020;
-  color: #b00020;
+  background: #dc2626;
+  color: #fff;
+  border-color: #991b1b;
+}
+
+button.danger:hover {
+  background: #991b1b;
 }
 
 pre {
@@ -121,4 +200,34 @@ pre {
 
 .error {
   color: #b00020;
+}
+
+/* Additional styles for new pages */
+.metricsTable {
+  max-height: 600px;
+  overflow-y: auto;
+  margin-top: 8px;
+}
+
+.metricsTable table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.metricsTable th,
+.metricsTable td {
+  text-align: left;
+  padding: 8px;
+  border: 1px solid #ddd;
+}
+
+.metricsTable th {
+  background: #fafafa;
+  position: sticky;
+  top: 0;
+}
+
+.metricsTable code {
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
 }

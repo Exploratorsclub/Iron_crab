@@ -2522,6 +2522,252 @@ impl MomentumContext {
                         rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                     }
                 }
+
+                // === Filter 1: Liquidity Check ===
+                "max_dev_supply_pct" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=100.0).contains(&v) {
+                            config.max_dev_supply_pct = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 100.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "lp_removal_window_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.lp_removal_window_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+
+                // === Filter 2: Buyer Velocity ===
+                "min_unique_buyers" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.min_unique_buyers = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "buyer_window_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.buyer_window_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "min_trades_per_sec" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 {
+                            config.min_trades_per_sec = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be >= 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "min_buy_dominance" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=1.0).contains(&v) {
+                            config.min_buy_dominance = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 1.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+
+                // === Filter 3: SOL Inflow ===
+                "min_sol_inflow_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        config.min_sol_inflow_lamports = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "inflow_window_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.inflow_window_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "max_single_dump_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        config.max_single_dump_lamports = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+
+                // === Filter 4: Dev Behavior ===
+                "dev_early_sell_window_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.dev_early_sell_window_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "dev_rebuy_positive" => {
+                    if let Some(v) = value.as_bool() {
+                        config.dev_rebuy_positive = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+
+                // === Exit Strategy ===
+                "hard_stop_loss_pct" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 && v <= 100.0 {
+                            config.hard_stop_loss_pct = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 100.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "trailing_stop_pct" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 && v <= 100.0 {
+                            config.trailing_stop_pct = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 100.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "trailing_activation_pct" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 {
+                            config.trailing_activation_pct = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be >= 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "take_profit_pct" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 {
+                            config.take_profit_pct = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be >= 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "max_hold_time_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.max_hold_time_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "momentum_exit_buy_ratio" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=1.0).contains(&v) {
+                            config.momentum_exit_buy_ratio = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be in [0.0, 1.0]".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "momentum_exit_window_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.momentum_exit_window_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "momentum_exit_min_trades" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.momentum_exit_min_trades = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+
                 _ => {
                     rejected.push((key.clone(), format!("Unknown config key: {}", key)));
                 }
