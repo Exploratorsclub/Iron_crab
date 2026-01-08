@@ -1408,6 +1408,15 @@ impl PumpFunAmmDex {
         let mut scanned_tx_count = 0usize;
         const DEBUG_REF_TX: &str = "3nj499thZ6JrdrC2WGGGRKoSC5Ydrat9gxP3XEnW5JK5ZWnXPzHE2QuAX8y7gvfsjRaLxCy3qkn6BYc1sxtfYiiY";
         
+        // Log first few signatures for debugging
+        info!(
+            "pump_amm TX-history: first 10 signatures: {:?}",
+            sigs.iter()
+                .take(10)
+                .filter_map(|s| s.get("signature").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+        );
+        
         for s in sigs.iter() {
             if fetched >= MAX_TX_FETCHES {
                 break;
