@@ -21,6 +21,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
+use tracing::{info, warn};
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PUMPFUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
@@ -1565,12 +1566,35 @@ impl PumpFunAmmDex {
         // tx-history fallback by scanning only the market address. This is far cheaper than the
         // legacy scan across multiple addresses/pages.
         if let Some(m) = markets.first().copied() {
-            if let Some(pool) = self
+            info!(
+                "pump_amm attempting TX-history fallback for market {} base_mint {}",
+                m, base_mint
+            );
+            
+            match self
                 .discover_pool_static_via_tx_history_market_only(m, base_mint)
-                .await?
+                .await
             {
-                self.pools_by_base.insert(base_mint, pool.clone());
-                return Ok(Some(pool));
+                Ok(Some(pool)) => {
+                    info!(
+                        "pump_amm TX-history fallback SUCCESS for market {} base_mint {}",
+                        m, base_mint
+                    );
+                    self.pools_by_base.insert(base_mint, pool.clone());
+                    return Ok(Some(pool));
+                }
+                Ok(None) => {
+                    warn!(
+                        "pump_amm TX-history fallback returned None for market {} base_mint {}",
+                        m, base_mint
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "pump_amm TX-history fallback ERROR for market {} base_mint {}: {:#}",
+                        m, base_mint, e
+                    );
+                }
             }
 
             if let Some(e) = market_parse_err {
