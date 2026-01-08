@@ -1208,6 +1208,27 @@ async def rbac_info():
             },
             Role.VIEWER: {
                 "description": "Read-only access",
+                "endpoints": ["GET"]
+            },
+            Role.ANONYMOUS: {
+                "description": "Unauthenticated access",
+                "endpoints": ["/health", "/live", "/ready", "/status"]
+            }
+        }
+    }
+
+@app.get("/rbac")
+async def rbac_info_short():
+    """Alias for /rbac/info for backward compatibility"""
+    return {
+        "auth_required": config.REQUIRE_AUTH,
+        "roles": {
+            Role.ADMIN: {
+                "description": "Full access: read, write, kill switch",
+                "endpoints": ["ALL"]
+            },
+            Role.VIEWER: {
+                "description": "Read-only access",
                 "endpoints": ["GET /status", "GET /positions", "GET /metrics", "GET /logs/*"]
             }
         },
