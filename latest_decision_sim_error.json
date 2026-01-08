@@ -1,0 +1,10 @@
+﻿ssh : grep: trade_logs/decisions/decision_records-20250606.jsonl: Datei 
+oder Verzeichnis nicht gefunden
+In Zeile:1 Zeichen:1
++ ssh ironcrab-prod "cd ~/Iron_crab; grep 'pump_amm' trade_logs/decisio 
+...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (grep: trade_log... nicht gef 
+   unden:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
