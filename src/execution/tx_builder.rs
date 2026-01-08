@@ -344,17 +344,17 @@ pub async fn build_tx_plan(
             }
         };
 
-        if intent.resources.accounts.len() != 14 {
+        if intent.resources.accounts.len() != 12 {
             return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                 reason: RejectReason::UnsupportedIntent,
                 details: format!(
-                    "pump_amm requires resources.accounts (DexPoolAccounts v1, len=14), got len={}",
+                    "pump_amm requires resources.accounts (DexPoolAccounts v2, len=12, no volume accumulators), got len={}",
                     intent.resources.accounts.len()
                 ),
             });
         }
 
-        let mut pool_accounts: Vec<Pubkey> = Vec::with_capacity(14);
+        let mut pool_accounts: Vec<Pubkey> = Vec::with_capacity(12);
         for (idx, a) in intent.resources.accounts.iter().enumerate() {
             match Pubkey::from_str(a) {
                 Ok(pk) => pool_accounts.push(pk),

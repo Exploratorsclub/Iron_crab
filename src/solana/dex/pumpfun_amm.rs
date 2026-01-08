@@ -224,6 +224,8 @@ impl PumpFunAmmDex {
             None => return Ok(None),
         };
 
+        // NOTE: reduced from 14 to 12 accounts (removed global_volume_accumulator and fee_program)
+        // fee_program is now derived in build_swap_ix_from_pool_accounts()
         Ok(Some(vec![
             pool.pool_market,
             pool.global_config,
@@ -236,9 +238,9 @@ impl PumpFunAmmDex {
             pool.event_authority,
             pool.coin_creator_vault_ata,
             pool.coin_creator_vault_authority,
-            pool.global_volume_accumulator,
+            // pool.global_volume_accumulator,  // removed
             pool.fee_config,
-            pool.fee_program,
+            // pool.fee_program,  // removed (now derived)
         ]))
     }
 
@@ -2491,8 +2493,8 @@ impl PumpFunAmmDex {
         let user_base_ta = Self::derive_ata(user, base_mint);
         let user_quote_ta = Self::derive_ata(user, quote_mint);
 
-        // User volume accumulator is a PDA; derive deterministically.
-        let user_vol = Self::derive_user_volume_accumulator(program_id, pool_market, user);
+        // User volume accumulator is a PDA; derive deterministically (but not used in v2 account list).
+        let _user_vol = Self::derive_user_volume_accumulator(program_id, pool_market, user);
 
         let disc = if is_buy {
             anchor_disc("buy_exact_quote_in")
