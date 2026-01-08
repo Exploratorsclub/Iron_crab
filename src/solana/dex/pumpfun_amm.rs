@@ -1406,6 +1406,7 @@ impl PumpFunAmmDex {
 
         let mut fetched = 0usize;
         let mut scanned_tx_count = 0usize;
+        const DEBUG_REF_TX: &str = "3nj499thZ6JrdrC2WGGGRKoSC5Ydrat9gxP3XEnW5JK5ZWnXPzHE2QuAX8y7gvfsjRaLxCy3qkn6BYc1sxtfYiiY";
         
         for s in sigs.iter() {
             if fetched >= MAX_TX_FETCHES {
@@ -1420,6 +1421,14 @@ impl PumpFunAmmDex {
                 Some(v) => v,
                 None => continue,
             };
+            
+            // Debug: Check if reference TX is in signature list
+            if sig == DEBUG_REF_TX {
+                info!(
+                    "pump_amm TX-history: FOUND reference TX in signature list! sig={}",
+                    sig
+                );
+            }
 
             fetched += 1;
             
