@@ -105,88 +105,79 @@
     },
     {
       "type": "timeseries",
-      "title": "Events Published/sec",
-      "description": "Market events published per second",
+      "title": "Event Publish Rate",
+      "description": "Market events published by market-data service",
       "targets": [{ "expr": "rate(market_events_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "events/s" }],
-      "gridPos": {"h":6,"w":8,"x":0,"y":8},
+      "gridPos": {"h":6,"w":12,"x":0,"y":8},
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "ops" } }
-    },
-    {
-      "type": "stat",
-      "title": "Pools Tracked",
-      "targets": [{ "expr": "pools_tracked_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":8,"y":8},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "purple" } } }
-    },
-    {
-      "type": "stat",
-      "title": "Tokens Tracked",
-      "targets": [{ "expr": "tokens_tracked_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":12,"y":8},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "orange" } } }
     },
     {
       "type": "timeseries",
       "title": "NATS Message Rate",
+      "description": "NATS messages published by market-data",
       "targets": [{ "expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "msgs/s" }],
-      "gridPos": {"h":6,"w":8,"x":16,"y":8},
+      "gridPos": {"h":6,"w":12,"x":12,"y":8},
       "fieldConfig": { "defaults": { "unit": "ops" } }
     },
     {
-      "type": "stat",
-      "title": "Geyser Reconnects",
-      "targets": [{ "expr": "geyser_reconnects_total{job=\"ironcrab-market-data\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":8,"y":11},
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } } }
-    },
-    {
-      "type": "stat",
-      "title": "Geyser Errors",
-      "targets": [{ "expr": "geyser_errors_total{job=\"ironcrab-market-data\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":12,"y":11},
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } } }
-    },
-    {
       "type": "row",
-      "title": "🎯 Momentum Bot (Port 9802)",
+      "title": "🎯 Momentum Bot (Port 9802) - 4-Filter Policy",
       "gridPos": {"h":1,"w":24,"x":0,"y":14},
       "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "Tokens Tracked",
+      "description": "Tokens currently being observed by momentum-bot",
+      "targets": [{ "expr": "tokens_tracked_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
+      "gridPos": {"h":4,"w":4,"x":0,"y":15},
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "orange" } } }
+    },
+    {
+      "type": "stat",
+      "title": "Pools Tracked",
+      "description": "Pools currently being observed by momentum-bot",
+      "targets": [{ "expr": "pools_tracked_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
+      "gridPos": {"h":4,"w":4,"x":4,"y":15},
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "purple" } } }
     },
     {
       "type": "stat",
       "title": "Intents Generated",
       "description": "TradeIntents published to NATS",
       "targets": [{ "expr": "intents_generated_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":0,"y":15},
+      "gridPos": {"h":4,"w":4,"x":8,"y":15},
       "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "yellow", "value": null }, { "color": "green", "value": 1 }] } } }
     },
     {
       "type": "stat",
       "title": "4-Filter Passed",
       "targets": [{ "expr": "filter_passed_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":4,"y":15},
+      "gridPos": {"h":4,"w":3,"x":12,"y":15},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } }
     },
     {
       "type": "stat",
       "title": "4-Filter Rejected",
       "targets": [{ "expr": "filter_rejected_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":8,"y":15},
+      "gridPos": {"h":4,"w":3,"x":15,"y":15},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "red" } } }
     },
     {
       "type": "piechart",
       "title": "Filter Rejection Reasons",
+      "description": "Why tokens were rejected by 4-Filter policy",
       "targets": [{ "expr": "filter_rejection_by_reason{job=\"ironcrab-momentum-bot\"}", "refId": "A", "legendFormat": "{{reason}}" }],
-      "gridPos": {"h":8,"w":8,"x":12,"y":15},
-      "options": { "legend": { "displayMode": "table", "placement": "right" } }
+      "gridPos": {"h":8,"w":6,"x":18,"y":15},
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
     },
     {
       "type": "timeseries",
       "title": "Intent Generation Rate",
+      "description": "Rate of TradeIntents generated per minute",
       "targets": [{ "expr": "rate(intents_generated_total{job=\"ironcrab-momentum-bot\"}[5m]) * 60", "refId": "A", "legendFormat": "intents/min" }],
-      "gridPos": {"h":4,"w":12,"x":0,"y":19},
-      "fieldConfig": { "defaults": { "unit": "short" } }
+      "gridPos": {"h":4,"w":18,"x":0,"y":19},
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "palette-classic" } } }
     },
     {
       "type": "row",
@@ -218,11 +209,12 @@
     {
       "type": "timeseries",
       "title": "Arb NATS Message Rate",
+      "description": "NATS messages received and published by market-data",
       "targets": [
-        { "expr": "rate(nats_messages_received_total{job=\"ironcrab-arb-strategy\"}[1m])", "refId": "A", "legendFormat": "recv/s" },
-        { "expr": "rate(nats_messages_published_total{job=\"ironcrab-arb-strategy\"}[1m])", "refId": "B", "legendFormat": "pub/s" }
+        { "expr": "rate(nats_messages_received_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "recv/s" },
+        { "expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "B", "legendFormat": "pub/s" }
       ],
-      "gridPos": {"h":4,"w":6,"x":18,"y":24},
+      "gridPos": {"h":6,"w":12,"x":12,"y":8},
       "fieldConfig": { "defaults": { "unit": "ops" } }
     },
     {
