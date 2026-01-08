@@ -415,6 +415,43 @@ class ControlPlaneState:
         self.decisions_lock = asyncio.Lock()
         self.max_cached_decisions: int = 1000
         self.decision_subscriber_task: Optional[asyncio.Task] = None
+        # P1: Component config storage (persistent hot-reload state)
+        self.component_configs: Dict[str, Dict[str, Any]] = {}
+        self.config_file: str = "control_plane_configs.json"
+        self._load_configs()
+    
+    def _load_configs(self):
+        """Load component configs from JSON file"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    self.component_configs = json.load(f)
+                logger.info(f"Loaded component configs from {self.config_file}")
+            else:
+                logger.info(f"No existing config file found, starting with empty configs")
+        except Exception as e:
+            logger.error(f"Failed to load configs: {e}")
+            self.component_configs = {}
+    
+    def _save_configs(self):
+        """Save component configs to JSON file"""
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(self.component_configs, f, indent=2)
+            logger.info(f"Saved component configs to {self.config_file}")
+        except Exception as e:
+            logger.error(f"Failed to save configs: {e}")
+    
+    def update_component_config(self, component: str, config: Dict[str, Any]):
+        """Update and persist component config"""
+        if component not in self.component_configs:
+            self.component_configs[component] = {}
+        self.component_configs[component].update(config)
+        self._save_configs()
+    
+    def get_component_config(self, component: str) -> Dict[str, Any]:
+        """Get current config for a component"""
+        return self.component_configs.get(component, {})
     
     async def connect_nats(self):
         if not HAS_NATS:
@@ -1031,19 +1068,18 @@ async def get_config(component: str, user: User = Depends(require_viewer)):
     """
     Get current configuration for a component (requires: viewer).
     
-    For now, returns empty config as components don't expose their current config yet.
-    This endpoint exists for UI compatibility.
+    Returns the last saved config for this component from control-plane state.
     """
     valid_components = ["market-data", "momentum-bot", "arb-strategy", "execution-engine"]
     if component not in valid_components:
         raise HTTPException(status_code=400, detail=f"Invalid component. Must be one of: {valid_components}")
     
-    # TODO: Implement config state tracking (either via NATS state or component /config endpoints)
-    # For now, return placeholder
+    config_data = state.get_component_config(component)
+    
     return {
         "component": component,
-        "config": {},
-        "note": "Config state tracking not yet implemented. Use POST /config to update."
+        "config": config_data,
+        "note": "Config from control-plane persistent storage. Changes applied via POST /config."
     }
 
 @app.post("/config")
@@ -1067,6 +1103,9 @@ async def update_config(update: ConfigUpdate, user: User = Depends(require_admin
     
     # Audit log the config change
     audit_logger.info(f"CONFIG_UPDATE: user={user.name}, component={update.component}, keys={list(update.config.keys())}")
+    
+    # P1: Persist config to control-plane state (survives reload)
+    state.update_component_config(update.component, update.config)
     
     # P1: Format matches Rust IPC schema (ConfigUpdate)
     config_msg = {
