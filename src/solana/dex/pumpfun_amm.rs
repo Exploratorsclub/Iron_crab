@@ -1607,7 +1607,6 @@ impl PumpFunAmmDex {
                 };
 
                 // Fee guardrails (same as the broader scanner).
-                let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
                 let expected_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
                 if pool.fee_program != expected_fee_program {
                     if is_ref_tx {
@@ -1623,6 +1622,8 @@ impl PumpFunAmmDex {
                     info!("pump_amm TX-history: reference TX fee_program OK, checking fee_config owner...");
                 }
                 
+                // CRITICAL: fee_config must be owned by the Fee Program, not the AMM Program!
+                // This matches the fix in discover_pool_markets_via_program_accounts (lines 763-818).
                 let Some((fee_owner, fee_executable)) = self
                     .rpc_get_account_owner_and_executable(pool.fee_config)
                     .await?
@@ -1635,12 +1636,13 @@ impl PumpFunAmmDex {
                 
                 if is_ref_tx {
                     info!(
-                        "pump_amm TX-history: reference TX fee_config owner={} executable={} (expected owner={})",
-                        fee_owner, fee_executable, pump_amm_program
+                        "pump_amm TX-history: reference TX fee_config owner={} executable={} (expected owner={} Fee Program)",
+                        fee_owner, fee_executable, expected_fee_program
                     );
                 }
                 
-                if fee_executable || fee_owner != pump_amm_program {
+                // fee_config must be owned by Fee Program and not be executable
+                if fee_executable || fee_owner != expected_fee_program {
                     if is_ref_tx {
                         info!("pump_amm TX-history: reference TX fee_config owner check FAILED");
                     }
