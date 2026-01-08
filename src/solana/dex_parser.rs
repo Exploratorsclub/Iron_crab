@@ -425,7 +425,14 @@ fn parse_pumpfun_create(update: &GeyserTransactionUpdate) -> Option<ParsedDexEve
     // [6]: Metadata account
     // [7]: User (creator, fee payer)
 
+    // DEBUG: Log account count before returning None
     if update.instruction_accounts.len() < 8 {
+        info!(
+            sig = %update.signature,
+            slot = update.slot,
+            account_count = update.instruction_accounts.len(),
+            "⚠️  PumpFun CREATE: insufficient accounts (need 8)"
+        );
         return None;
     }
 
