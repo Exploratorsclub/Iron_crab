@@ -1476,6 +1476,14 @@ impl PumpFunAmmDex {
             Self::extend_with_loaded_addresses(&mut account_keys, meta);
             
             scanned_tx_count += 1;
+            
+            let is_ref_tx = sig == DEBUG_REF_TX;
+            if is_ref_tx {
+                info!(
+                    "pump_amm TX-history: processing reference TX sig={} account_keys_count={}",
+                    sig, account_keys.len()
+                );
+            }
 
             for ix in Self::collect_all_instructions(msg, meta) {
                 let program_id_index = match ix.get("programIdIndex").and_then(|v| v.as_u64()) {
@@ -1487,7 +1495,17 @@ impl PumpFunAmmDex {
                     None => continue,
                 };
                 if program_id != PUMPFUN_AMM_PROGRAM_ID {
+                    if is_ref_tx {
+                        info!(
+                            "pump_amm TX-history: reference TX ix program_id={} (not PumpSwap AMM, skipping)",
+                            program_id
+                        );
+                    }
                     continue;
+                }
+                
+                if is_ref_tx {
+                    info!("pump_amm TX-history: reference TX has PumpSwap AMM instruction!");
                 }
 
                 let accounts: Vec<usize> = match ix.get("accounts").and_then(|v| v.as_array()) {
@@ -1499,46 +1517,68 @@ impl PumpFunAmmDex {
                 };
                 // PumpSwap AMM swap instructions have 21 accounts (not 23 as originally assumed).
                 if accounts.len() != 21 {
-                    // Log first mismatch
-                    if scanned_tx_count == 1 {
+                    // Log first mismatch or reference TX
+                    if scanned_tx_count == 1 || is_ref_tx {
                         info!(
-                            "pump_amm TX-history: account count mismatch sig={} expected=21 actual={} (logging first occurrence only)",
+                            "pump_amm TX-history: account count mismatch sig={} expected=21 actual={}",
                             sig, accounts.len()
                         );
                     }
                     continue;
                 }
+                
+                if is_ref_tx {
+                    info!("pump_amm TX-history: reference TX account count OK (21)");
+                }
 
                 // Ensure we're extracting accounts for the market we scanned.
                 let pool_market_ix = match account_keys.get(accounts[0]) {
                     Some(v) => v,
-                    None => continue,
+                    None => {
+                        if is_ref_tx {
+                            info!("pump_amm TX-history: reference TX accounts[0] out of bounds");
+                        }
+                        continue;
+                    }
                 };
                 if Pubkey::from_str(pool_market_ix).ok() != Some(pool_market) {
-                    // Log first mismatch
-                    if scanned_tx_count == 1 {
+                    // Log first mismatch or reference TX
+                    if scanned_tx_count == 1 || is_ref_tx {
                         info!(
-                            "pump_amm TX-history: market mismatch sig={} expected={} actual={} (logging first occurrence only)",
+                            "pump_amm TX-history: market mismatch sig={} expected={} actual={}",
                             sig, pool_market, pool_market_ix
                         );
                     }
                     continue;
                 }
+                
+                if is_ref_tx {
+                    info!("pump_amm TX-history: reference TX market match OK");
+                }
 
                 // Base mint is accounts[3] for pump_amm v1.
                 let base_mint_ix = match account_keys.get(accounts[3]) {
                     Some(v) => v,
-                    None => continue,
+                    None => {
+                        if is_ref_tx {
+                            info!("pump_amm TX-history: reference TX accounts[3] out of bounds");
+                        }
+                        continue;
+                    }
                 };
                 if Pubkey::from_str(base_mint_ix).ok() != Some(base_mint) {
-                    // Log first mismatch
-                    if scanned_tx_count == 1 {
+                    // Log first mismatch or reference TX
+                    if scanned_tx_count == 1 || is_ref_tx {
                         info!(
-                            "pump_amm TX-history: base_mint mismatch sig={} expected={} actual={} (logging first occurrence only)",
+                            "pump_amm TX-history: base_mint mismatch sig={} expected={} actual={}",
                             sig, base_mint, base_mint_ix
                         );
                     }
                     continue;
+                }
+                
+                if is_ref_tx {
+                    info!("pump_amm TX-history: reference TX base_mint match OK, proceeding to build pool...");
                 }
 
                 // Build the subset we store as pool static.
