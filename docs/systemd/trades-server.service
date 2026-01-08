@@ -1,0 +1,23 @@
+[Unit]
+Description=IronCrab Trades Server (JSONL to JSON API for Grafana Infinity)
+After=network.target
+PartOf=ironcrab.target
+
+[Service]
+Type=simple
+User=ironcrab
+Group=ironcrab
+WorkingDirectory=/home/ironcrab/Iron_crab
+Environment="IRONCRAB_LOG_DIR=/home/ironcrab/Iron_crab/trade_logs"
+ExecStart=/usr/bin/python3 /home/ironcrab/Iron_crab/scripts/trades_server.py --port 9899
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits
+MemoryLimit=256M
+CPUQuota=10%
+
+[Install]
+WantedBy=ironcrab.target

@@ -102,6 +102,7 @@ install_service "momentum-bot"
 install_service "arb-strategy"
 install_service "execution-engine"
 install_service "control-plane"
+install_service "trades-server"
 sudo cp "$SYSTEMD_SRC_DIR/ironcrab.target" "$SYSTEMD_DIR/"
 
 sudo systemctl daemon-reload
@@ -131,7 +132,7 @@ sudo systemctl enable ironcrab.target
 sleep 2
 log_info "Service status:"
 echo ""
-for svc in market-data momentum-bot execution-engine control-plane; do
+for svc in market-data momentum-bot execution-engine control-plane trades-server; do
     status=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
     if [ "$status" = "active" ]; then
         echo -e "  ${GREEN}●${NC} $svc: $status"
@@ -157,6 +158,7 @@ echo "   - arb-strategy:     http://localhost:9803/metrics"
 echo "   - execution-engine: http://localhost:9804/metrics"
 echo ""
 echo "🔧 Control Plane:      http://localhost:8080"
+echo "📈 Trades API:         http://localhost:9899/trades (Grafana Infinity)"
 echo ""
 echo "📜 View logs:"
 echo "   journalctl -u market-data -f"
@@ -164,6 +166,7 @@ echo "   journalctl -u momentum-bot -f"
 echo "   journalctl -u arb-strategy -f"
 echo "   journalctl -u execution-engine -f"
 echo "   journalctl -u control-plane -f"
+echo "   journalctl -u trades-server -f"
 echo ""
 echo "🛑 Stop all:  sudo systemctl stop ironcrab.target"
 echo "▶️  Start all: sudo systemctl start ironcrab.target"

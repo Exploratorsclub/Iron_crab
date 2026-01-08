@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-Simple HTTP server that serves trade data from CSV files.
+Simple HTTP server that serves trade data from JSONL execution_results files.
 Run this separately from the bot to keep trade history available even when bot is stopped.
+
+Reads from: trade_logs/executions/execution_results-YYYYMMDD.jsonl
+Grafana Infinity data source connects to this for "Recent Trades" table panel.
 
 Usage: python3 trades_server.py [--port 9899]
 """
 
 import http.server
 import json
-import csv
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import argparse
 
-TRADE_LOG_DIR = os.environ.get("IRONCRAB_TRADE_LOG_DIR", "trade_logs")
+TRADE_LOG_DIR = os.environ.get("IRONCRAB_LOG_DIR", "trade_logs")
+EXECUTIONS_DIR = Path(TRADE_LOG_DIR) / "executions"
 
 class TradesHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -39,104 +42,123 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(trades).encode())
     
     def read_recent_trades(self, limit: int) -> list:
-        """Read last N trades from today's CSV file"""
-        today = datetime.now().strftime("%Y%m%d")
-        csv_path = Path(TRADE_LOG_DIR) / f"trades-{today}.csv"
-        
-        if not csv_path.exists():
-            # Try yesterday's file if today's doesn't exist
-            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
-            csv_path = Path(TRADE_LOG_DIR) / f"trades-{yesterday}.csv"
-            if not csv_path.exists():
-                return []
-        
+        """Read last N trades from execution_results JSONL files and join with decisions for mint"""
         trades = []
-        try:
-            with open(csv_path, 'r') as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-                # Take last N, reverse to show newest first
-                for row in rows[-limit:][::-1]:
-                    trade = self.parse_row(row)
-                    if trade:
-                        trades.append(trade)
-        except Exception as e:
-            print(f"Error reading CSV: {e}")
+        decision_cache = {}  # Cache decision records by decision_id
         
-        return trades
-    
-    def parse_row(self, row: dict) -> dict:
-        """Parse a CSV row into trade format"""
-        try:
-            ts = datetime.fromisoformat(row.get('timestamp_utc', '').replace('+00:00', '+00:00'))
-            timestamp_ms = int(ts.timestamp() * 1000)
-        except:
-            timestamp_ms = 0
-        
-        action = row.get('side', '')
-        lamports_in = int(row.get('lamports_in', 0) or 0)
-        lamports_out = int(row.get('lamports_out', 0) or 0)
-        tokens_in_raw = float(row.get('tokens_in', 0) or 0)
-        tokens_out_raw = float(row.get('tokens_out', 0) or 0)
-        expected_tokens_out_raw = float(row.get('expected_tokens_out', 0) or 0)
-        dex = row.get('dex', '').upper()
-        
-        # What matters: SOL amount of the trade (not price per token!)
-        if action == 'BUY':
-            amount_tokens_raw = tokens_out_raw if tokens_out_raw > 0 else expected_tokens_out_raw
-            sol_sent = lamports_in / 1e9  # SOL sent to DEX
+        # Load decision records first (for mint lookup)
+        for days_ago in [0, 1, 2]:
+            date = (datetime.now() - timedelta(days=days_ago)).strftime("%Y%m%d")
+            decisions_path = Path(TRADE_LOG_DIR) / "decisions" / f"decision_records-{date}.jsonl"
             
-            # Calculate ACTUAL swap amount after DEX fees (without RPC calls)
-            # Pump.fun: ~1% fee (0.3% + 0.7% = 1%)
-            # This matches what Solscan shows as the actual swap amount
-            if dex == 'PUMPFUN':
-                sol_amount = sol_sent * 0.99  # After 1% fee
-            else:
-                sol_amount = sol_sent  # Raydium/Orca: fee comes from output, not input
-        else:  # SELL
-            amount_tokens_raw = tokens_in_raw
-            sol_amount = lamports_out / 1e9  # SOL received (already after fees)
+            if decisions_path.exists():
+                try:
+                    with open(decisions_path, 'r') as f:
+                        for line in f:
+                            if not line.strip():
+                                continue
+                            try:
+                                dec = json.loads(line)
+                                decision_id = dec.get("decision_id")
+                                if decision_id and dec.get("outcome") == "Confirmed":
+                                    # Store only what we need: input_mint, output_mint
+                                    tx_plan = dec.get("tx_plan", {})
+                                    decision_cache[decision_id] = {
+                                        "input_mint": tx_plan.get("input_mint"),
+                                        "output_mint": tx_plan.get("output_mint")
+                                    }
+                            except json.JSONDecodeError:
+                                continue
+                except Exception:
+                    pass
         
-        # Get PnL for sells (already in CSV)
-        pnl_sol = None
-        pnl_pct = None
-        if action == 'SELL':
+        # Now read execution results
+        for days_ago in [0, 1, 2]:
+            date = (datetime.now() - timedelta(days=days_ago)).strftime("%Y%m%d")
+            jsonl_path = EXECUTIONS_DIR / f"execution_results-{date}.jsonl"
+            
+            if not jsonl_path.exists():
+                continue
+            
             try:
-                pnl_sol = float(row.get('realized_pnl_sol', '') or 0)
-                # Calculate PnL % based on exit fraction and original buy amount
-                # For partial exits: lamports_in from original buy was 5000000 (0.005 SOL)
-                # Approximate: pnl_pct = (pnl_sol / cost_basis) * 100
-                # Since we don't have exact cost basis, estimate from exit fraction
-                exit_fraction_str = row.get('notes', '')
-                if 'exit_fraction=' in exit_fraction_str:
-                    try:
-                        frac = float(exit_fraction_str.split('exit_fraction=')[1].split(',')[0])
-                        # Assume original buy was 0.005 SOL
-                        cost_basis = 0.005 * frac
-                        if cost_basis > 0:
-                            pnl_pct = (pnl_sol / cost_basis) * 100
-                    except:
-                        pass
-            except:
-                pass
+                with open(jsonl_path, 'r') as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            record = json.loads(line)
+                            # Only include confirmed/successful executions
+                            if record.get('status') == 'Confirmed':
+                                decision_id = record.get('decision_id')
+                                decision_data = decision_cache.get(decision_id, {})
+                                trade = self.parse_execution_result(record, decision_data)
+                                if trade:
+                                    trades.append(trade)
+                        except json.JSONDecodeError:
+                            continue
+            except Exception as e:
+                print(f"Error reading {jsonl_path}: {e}")
         
-        return {
-            'timestamp_ms': timestamp_ms,
-            'mint': row.get('mint', ''),
-            'action': action,
-            'tx_hash': row.get('signature', ''),
-            'amount_tokens': amount_tokens_raw,  # Raw token amount (for reference)
-            'price_sol': sol_amount,  # Actually: SOL amount of this trade!
-            'pnl_sol': pnl_sol,
-            'pnl_pct': pnl_pct,
-            'latency_ms': None
-        }
+        # Sort by timestamp descending, take last N
+        trades.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
+        return trades[:limit]
+    
+    def parse_execution_result(self, record: dict, decision_data: dict) -> dict:
+        """Parse execution_results JSONL record into Grafana-compatible trade format"""
+        try:
+            # Extract data from execution result
+            ts_ms = record.get('ts_unix_ms', 0)
+            signature = record.get('signature', '')
+            fill_in = record.get('fill_in', {})
+            fill_out = record.get('fill_out', {})
+            
+            # Determine action from fill amounts
+            # If fill_in has tokens (>1e6 raw), it's a SELL
+            # If fill_out has tokens, it's a BUY
+            fill_in_raw = fill_in.get('raw', 0)
+            fill_in_decimals = fill_in.get('decimals', 9)
+            fill_out_raw = fill_out.get('raw', 0)
+            fill_out_decimals = fill_out.get('decimals', 9)
+            
+            # Heuristic: tokens have 6-9 decimals, SOL has 9
+            # If fill_in has high decimals and large raw, it's tokens (SELL)
+            is_sell = fill_in_decimals <= 9 and fill_in_raw > 1_000_000
+            
+            if is_sell:
+                action = "SELL"
+                amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
+                sol_amount = fill_out_raw / 1e9  # WSOL received
+                token_mint = decision_data.get("input_mint", "unknown")
+            else:
+                action = "BUY"
+                amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
+                sol_amount = fill_in_raw / 1e9  # SOL paid
+                token_mint = decision_data.get("output_mint", "unknown")
+            
+            # NOTE: sol_amount is WSOL token account amount, not actual SOL balance change!
+            # For accurate SOL tracking, execution-engine would need to record pre/post balances
+            # Solscan shows ~0.002343 SOL which is likely market value, not actual received SOL
+            price_sol = sol_amount  # This is WSOL amount, actual user SOL change is different
+            
+            return {
+                "timestamp_ms": ts_ms,
+                "time": datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+                "action": action,
+                "token_mint": token_mint[:20] + "..." if token_mint != "unknown" else token_mint,
+                "tx_hash": signature,
+                "amount": amount_tokens,
+                "price_sol": round(price_sol, 9),  # WSOL token amount (not actual SOL balance change!)
+                "pnl_sol": 0.0,  # Would need position tracking
+                "pnl_percent": 0.0  # Would need position tracking
+            }
+        except Exception as e:
+            print(f"Error parsing execution result: {e}")
+            return None
     
     def log_message(self, format, *args):
         # Suppress default logging
         pass
 
-from datetime import timedelta
 
 def main():
     parser = argparse.ArgumentParser(description='Trades history server')
@@ -145,7 +167,7 @@ def main():
     
     server = http.server.HTTPServer(('0.0.0.0', args.port), TradesHandler)
     print(f"Trades server running on http://0.0.0.0:{args.port}/trades")
-    print(f"Reading from: {TRADE_LOG_DIR}")
+    print(f"Reading from: {EXECUTIONS_DIR}")
     server.serve_forever()
 
 if __name__ == '__main__':
