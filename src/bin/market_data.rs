@@ -55,19 +55,25 @@ const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Known DEX program IDs
 const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+const RAYDIUM_CPMM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
 /// Market data configuration (hot-reloadable via NATS)
 #[derive(Debug, Clone)]
 struct MarketDataConfig {
-    /// Enable Raydium discovery. Default: true
+    /// Enable Raydium AMM V4 discovery. Default: true
     enable_raydium: bool,
+    /// Enable Raydium CPMM discovery. Default: true
+    enable_raydium_cpmm: bool,
     /// Enable Orca discovery. Default: true
     enable_orca: bool,
     /// Enable PumpFun discovery. Default: true
     enable_pumpfun: bool,
+    /// Enable Meteora DLMM discovery. Default: true
+    enable_meteora_dlmm: bool,
     /// Max events per second rate limit. Default: 10000
     max_events_per_sec: u32,
 }
@@ -76,8 +82,10 @@ impl Default for MarketDataConfig {
     fn default() -> Self {
         Self {
             enable_raydium: true,
+            enable_raydium_cpmm: true,
             enable_orca: true,
             enable_pumpfun: true,
+            enable_meteora_dlmm: true,
             max_events_per_sec: 10_000,
         }
     }
@@ -396,12 +404,14 @@ async fn run_geyser_loop(
     mut config_subscription: Option<ironcrab::nats::NatsSubscription>,
     tracked_mints_rx: watch::Receiver<Vec<Pubkey>>,
 ) -> Result<()> {
-    // DEX program IDs to monitor
+    // DEX program IDs to monitor (must match validator account-index)
     let program_ids = vec![
         Pubkey::from_str(RAYDIUM_AMM_V4).expect("valid raydium pubkey"),
+        Pubkey::from_str(RAYDIUM_CPMM).expect("valid raydium cpmm pubkey"),
         Pubkey::from_str(ORCA_WHIRLPOOL).expect("valid orca pubkey"),
         Pubkey::from_str(PUMPFUN_PROGRAM).expect("valid pumpfun pubkey"),
         Pubkey::from_str(PUMPFUN_AMM_PROGRAM).expect("valid pumpfun amm pubkey"),
+        Pubkey::from_str(METEORA_DLMM).expect("valid meteora dlmm pubkey"),
     ];
 
     let (listener, mut account_rx, mut transaction_rx) = GeyserListener::new_with_tracked_accounts(

@@ -131,6 +131,7 @@ impl GeyserPoolDiscovery {
         // Identify DEX by owner
         let dex_type = match update.owner.to_string().as_str() {
             "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" => DexType::RaydiumAmmV4,
+            "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C" => DexType::RaydiumCpmm,
             "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" => DexType::OrcaWhirlpool,
             "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" => {
                 // Pump.fun: TX-based discovery is faster and simpler
@@ -149,6 +150,7 @@ impl GeyserPoolDiscovery {
         // Parse pool data based on DEX type
         let pool_data = match dex_type {
             DexType::RaydiumAmmV4 => Self::parse_raydium_pool(&update.data),
+            DexType::RaydiumCpmm => Self::parse_raydium_cpmm_pool(&update.data),
             DexType::OrcaWhirlpool => Self::parse_orca_pool(&update.data),
             DexType::PumpFun => {
                 // Should never reach here due to early return above
@@ -288,7 +290,7 @@ impl GeyserPoolDiscovery {
                     discovered_at_ms,
                 })
             }
-            DexType::RaydiumAmmV4 | DexType::OrcaWhirlpool => {
+            DexType::RaydiumAmmV4 | DexType::RaydiumCpmm | DexType::OrcaWhirlpool => {
                 // Raydium/Orca: TX-based discovery not implemented yet
                 // We use account-based discovery for these
                 None
@@ -349,6 +351,75 @@ impl GeyserPoolDiscovery {
             quote_mint,
             base_decimals: coin_decimals,
             quote_decimals: pc_decimals,
+            liquidity_lamports,
+            coin_vault: Some(coin_vault),
+            pc_vault: Some(pc_vault),
+        })
+    }
+
+    /// Parse Raydium CPMM pool account (1024 bytes)
+    /// Source: Raydium CPMM program (CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C)
+    fn parse_raydium_cpmm_pool(data: &[u8]) -> Option<PoolData> {
+        // CPMM pool account size: 1024 bytes (verified from mainnet)
+        if data.len() != 1024 {
+            tracing::debug!(len = data.len(), "geyser_pool_discovery: ignoring CPMM account (wrong size)");
+            return None;
+        }
+
+        // Offset 0: discriminator (8 bytes)
+        // Offset 8: status (u8) - 0 = uninitialized, 1 = initialized, 6 = disabled
+        let status = data[8];
+        if status == 0 {
+            tracing::debug!("geyser_pool_discovery: CPMM pool uninitialized (status=0)");
+            return None;
+        }
+
+        // Offset 73: token_0_mint (Pubkey 32 bytes)
+        let token_0_mint = Pubkey::new_from_array(data[73..105].try_into().ok()?);
+        // Offset 105: token_1_mint (Pubkey 32 bytes)
+        let token_1_mint = Pubkey::new_from_array(data[105..137].try_into().ok()?);
+
+        // Offset 137: token_0_vault (Pubkey 32 bytes)
+        let token_0_vault = Pubkey::new_from_array(data[137..169].try_into().ok()?);
+        // Offset 169: token_1_vault (Pubkey 32 bytes)
+        let token_1_vault = Pubkey::new_from_array(data[169..201].try_into().ok()?);
+
+        // Sanity check: mints should not be zero
+        if token_0_mint.to_bytes() == [0u8; 32] || token_1_mint.to_bytes() == [0u8; 32] {
+            tracing::debug!("geyser_pool_discovery: CPMM pool has zero mints");
+            return None;
+        }
+
+        // Determine which is base and which is quote (SOL is usually quote)
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+            .unwrap_or_else(|_| Pubkey::new_from_array([0u8; 32]));
+
+        let (base_mint, quote_mint, coin_vault, pc_vault) = if token_1_mint == sol_mint {
+            // Token 1 is SOL (quote), Token 0 is base
+            (token_0_mint, token_1_mint, token_0_vault, token_1_vault)
+        } else if token_0_mint == sol_mint {
+            // Token 0 is SOL (quote), Token 1 is base
+            (token_1_mint, token_0_mint, token_1_vault, token_0_vault)
+        } else {
+            // Neither is SOL, use token_0 as base by convention
+            (token_0_mint, token_1_mint, token_0_vault, token_1_vault)
+        };
+
+        // Conservative liquidity estimate (will be fetched from vaults in background)
+        let liquidity_lamports = 50_000_000_000; // 50 SOL default
+
+        tracing::info!(
+            base_mint=%base_mint,
+            quote_mint=%quote_mint,
+            status=status,
+            "geyser_pool_discovery: CPMM pool parsed"
+        );
+
+        Some(PoolData {
+            base_mint,
+            quote_mint,
+            base_decimals: 9, // Will be fetched from mint
+            quote_decimals: 9,
             liquidity_lamports,
             coin_vault: Some(coin_vault),
             pc_vault: Some(pc_vault),
@@ -461,6 +532,7 @@ impl GeyserPoolDiscovery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DexType {
     RaydiumAmmV4,
+    RaydiumCpmm,
     OrcaWhirlpool,
     PumpFun,
 }
@@ -469,6 +541,7 @@ impl std::fmt::Display for DexType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DexType::RaydiumAmmV4 => write!(f, "Raydium"),
+            DexType::RaydiumCpmm => write!(f, "RaydiumCPMM"),
             DexType::OrcaWhirlpool => write!(f, "Orca"),
             DexType::PumpFun => write!(f, "PumpFun"),
         }
