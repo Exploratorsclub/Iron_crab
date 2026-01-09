@@ -22,7 +22,7 @@ Environment=RUST_BACKTRACE=1
 ExecStart=/usr/local/bin/agave-validator \
   --identity /home/sol/validator-keypair.json \
   --ledger /var/solana/ledger \
-  --limit-ledger-size 50000000 \
+  --limit-ledger-size 100000000 \
   --accounts /var/solana/accounts \
   --no-voting \
   --rpc-port 8899 \
@@ -33,10 +33,13 @@ ExecStart=/usr/local/bin/agave-validator \
   --account-index spl-token-owner \
   --account-index spl-token-mint \
   --account-index-include-key 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 \
+  --account-index-include-key CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C \
   --account-index-include-key whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc \
-  --account-index-include-key Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM \
-  --accounts-db-cache-limit-mb 262144 \
-  --accounts-index-scan-results-limit-mb 8192 \
+  --account-index-include-key 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P \
+  --account-index-include-key pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA \
+  --account-index-include-key LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo \
+  --accounts-db-cache-limit-mb 327680 \
+  --accounts-index-scan-results-limit-mb 16384 \
   --enable-rpc-transaction-history \
   --dynamic-port-range 8000-8025 \
   --tpu-connection-pool-size 1024 \
