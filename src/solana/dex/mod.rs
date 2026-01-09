@@ -8,6 +8,12 @@ pub mod orca_whirlpool_layout;
 pub mod pumpfun;
 pub mod pumpfun_amm;
 pub mod raydium;
+pub mod raydium_cpmm;
+pub mod meteora_dlmm_layout;
+pub mod meteora_dlmm;
+pub mod meteora_bin_walker;
+pub mod meteora_bin_array_layout;
+pub mod meteora_swap_builder;
 pub mod router; // layout + heuristics
 
 #[derive(Debug, Clone)]
