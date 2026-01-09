@@ -1,15 +1,6 @@
 {
   "libpath": "/usr/local/lib/solana/libyellowstone_grpc_geyser.so",
-  "log": {
-    "level": "info"
-  },
   "grpc": {
-    "address": "127.0.0.1:10000",
-    "max_decoding_message_size": 8388608,
-    "unary_concurrency_limit": 100,
-    "unary_disabled": false
-  },
-  "prometheus": {
-    "address": "127.0.0.1:9091"
+    "address": "127.0.0.1:10000"
   }
 }
