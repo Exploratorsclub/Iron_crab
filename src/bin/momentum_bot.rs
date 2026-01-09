@@ -1461,6 +1461,7 @@ impl MomentumContext {
             || dex.eq_ignore_ascii_case("pump_amm")
             || dex.eq_ignore_ascii_case("PumpSwap")
             || dex.eq_ignore_ascii_case("pumpswap")
+            || dex.eq_ignore_ascii_case("pump-amm")
     }
 
     fn try_get_dex_pool_accounts_for_mint(&self, mint: &str) -> Option<Vec<String>> {
@@ -3396,10 +3397,14 @@ async fn generate_and_publish_buy_intent(
         },
     );
 
-    // Pump.fun tx building requires the creator/dev wallet.
-    if signal.dex == "pumpfun" {
+    // Pump.fun and PumpSwap tx building require the creator/dev wallet.
+    if signal.dex == "pumpfun" 
+        || signal.dex.eq_ignore_ascii_case("pump_amm")
+        || signal.dex.eq_ignore_ascii_case("pumpswap")
+        || signal.dex.eq_ignore_ascii_case("PumpFunAmm") 
+    {
         let creator = creator_opt.ok_or_else(|| {
-            anyhow::anyhow!("cannot generate pumpfun intent: missing dev_wallet/creator")
+            anyhow::anyhow!("cannot generate {} intent: missing dev_wallet/creator", signal.dex)
         })?;
         intent.metadata.insert("creator".to_string(), creator);
     }
@@ -4185,10 +4190,14 @@ async fn generate_and_publish_exit_intent(
         .metadata
         .insert("exit_type".to_string(), exit_type.to_string());
 
-    // Pump.fun sell tx building requires the creator/dev wallet.
-    if dex == "pumpfun" {
+    // Pump.fun and PumpSwap sell tx building require the creator/dev wallet.
+    if dex == "pumpfun" 
+        || dex.eq_ignore_ascii_case("pump_amm")
+        || dex.eq_ignore_ascii_case("pumpswap")
+        || dex.eq_ignore_ascii_case("PumpFunAmm")
+    {
         let creator = creator_opt.ok_or_else(|| {
-            anyhow::anyhow!("cannot generate pumpfun exit: missing dev_wallet/creator")
+            anyhow::anyhow!("cannot generate {} exit: missing dev_wallet/creator", dex)
         })?;
         intent.metadata.insert("creator".to_string(), creator);
     }
@@ -4311,13 +4320,20 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             let tracker_exists = ctx.token_trackers.read().contains_key(mint);
             
             if !tracker_exists && *is_buy && *sol_amount > 0 {
-                // Discover token via trade - infer DEX from pool_address pattern
+                // Discover token via trade - infer DEX from pool_address or default to pumpfun
                 let slot = event.slot.unwrap_or(0);
-                let dex = "pumpfun"; // Default assumption for missed CREATE events
+                // Try to infer DEX type from pool address pattern
+                // PumpSwap pools often start with specific prefixes
+                let dex = if pool_address.starts_with("pump") || pool_address.starts_with("pAMM") {
+                    "pump_amm"
+                } else {
+                    "pumpfun" // Default assumption for Bonding Curve
+                };
                 
                 debug!(
                     mint = %mint,
                     pool = %pool_address,
+                    dex = %dex,
                     sol = *sol_amount,
                     "🔍 Trade-based discovery: PoolCreated was missed, initializing from trade"
                 );
@@ -4330,6 +4346,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     info!(
                         mint = %mint,
                         pool = %pool_address,
+                        dex = %dex,
                         discovery = "trade",
                         "📊 Token tracker initialized (trade-based discovery)"
                     );
