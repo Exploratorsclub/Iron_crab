@@ -24,8 +24,12 @@ pub const RAYDIUM_CPMM_PROGRAM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5q
 /// SPL Token Program
 pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
-/// Pool state account size (estimated, needs verification from mainnet)
-const CPMM_POOL_ACCOUNT_SIZE: usize = 752;
+/// Pool state account size (verified from mainnet: 1024 bytes)
+/// SDK Layout: CpmmPoolInfoLayout with ~61 fields including:
+/// - discriminator(8) + configId(32) + creator(32) + vaults(64) + mints(96)
+/// - lp_mint(32) + mint_programs(64) + observation(32) + status fields
+/// - fees, amounts, timestamps, padding -> ~1024 total
+const CPMM_POOL_ACCOUNT_SIZE: usize = 1024;
 
 /// Cached pool state
 #[derive(Clone, Debug)]
