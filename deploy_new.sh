@@ -66,14 +66,21 @@ if [ "$SKIP_BUILD" = false ]; then
 
     ensure_cargo
     
-    # Build all binaries with nats feature
-    cargo build --release --features nats \
-        --bin market-data \
-        --bin momentum-bot \
-            --bin arb-strategy \
-        --bin execution-engine
+    # Build all binaries with NATS enabled (production-ready, no stubs)
+    # Note: Geyser (yellowstone-grpc) is only available on Linux, enabled automatically
+    log_info "Building market-data with NATS..."
+    cargo build --release --features nats --bin market-data
     
-    log_info "Build complete."
+    log_info "Building momentum-bot with NATS..."
+    cargo build --release --features nats --bin momentum-bot
+    
+    log_info "Building arb-strategy with NATS..."
+    cargo build --release --features nats --bin arb-strategy
+    
+    log_info "Building execution-engine with NATS..."
+    cargo build --release --features nats --bin execution-engine
+    
+    log_info "All binaries built successfully."
 else
     log_warn "Skipping build (--skip-build flag set)"
 fi
