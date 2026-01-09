@@ -4306,6 +4306,36 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             token_amount,
             signature,
         } => {
+            // P1: Trade-based Token Discovery
+            // If we missed the PoolCreated event (Geyser filter issues), discover via first trade
+            let tracker_exists = ctx.token_trackers.read().contains_key(mint);
+            
+            if !tracker_exists && *is_buy && *sol_amount > 0 {
+                // Discover token via trade - infer DEX from pool_address pattern
+                let slot = event.slot.unwrap_or(0);
+                let dex = "pumpfun"; // Default assumption for missed CREATE events
+                
+                debug!(
+                    mint = %mint,
+                    pool = %pool_address,
+                    sol = *sol_amount,
+                    "🔍 Trade-based discovery: PoolCreated was missed, initializing from trade"
+                );
+                
+                // Initialize tracker without initial_liquidity (will be 0)
+                // This allows us to track tokens we would have otherwise missed
+                let created = ctx.get_or_create_tracker(mint, pool_address, dex, slot, 0);
+                
+                if created {
+                    info!(
+                        mint = %mint,
+                        pool = %pool_address,
+                        discovery = "trade",
+                        "📊 Token tracker initialized (trade-based discovery)"
+                    );
+                }
+            }
+
             // Record the trade in the tracker
             let sol_lamports = *sol_amount;
             let token_raw = *token_amount;
