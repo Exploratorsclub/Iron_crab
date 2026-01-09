@@ -1,40 +1,37 @@
 {
-  "libPath": "/home/sol/geyser-plugins/solana_geyser_plugin_grpc.so",
-  "bind_address": "127.0.0.1:10001",
-  "accounts": [
-    {
-      "owner": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
-    },
-    {
-      "owner": "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
-    },
-    {
-      "owner": "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
-    },
-    {
-      "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-    },
-    {
-      "owner": "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
-    },
-    {
-      "owner": "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
+  "libpath": "/usr/local/lib/solana/libyellowstone_grpc_geyser.so",
+  "grpc": {
+    "address": "127.0.0.1:10001",
+    "max_decoding_message_size": 8388608,
+    "filters": {
+      "accounts": {
+        "raydium_amm": {
+          "account": [],
+          "owner": ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"]
+        },
+        "raydium_cpmm": {
+          "account": [],
+          "owner": ["CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"]
+        },
+        "orca_whirlpool": {
+          "account": [],
+          "owner": ["whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"]
+        },
+        "pumpfun": {
+          "account": [],
+          "owner": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"]
+        },
+        "pumpswap": {
+          "account": [],
+          "owner": ["pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"]
+        },
+        "meteora_dlmm": {
+          "account": [],
+          "owner": ["LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"]
+        }
+      },
+      "transactions": {},
+      "blocks": {}
     }
-  ],
-  "transaction_filters": [],
-  "blocks": {
-    "block_filters": []
-  },
-  "block_metadata_notifier": {
-    "enabled": true
-  },
-  "transaction_notifier": {
-    "enabled": true
-  },
-  "entry_notifier": {
-    "enabled": false
-  },
-  "slot_notifier": {
-    "enabled": true
   }
 }
