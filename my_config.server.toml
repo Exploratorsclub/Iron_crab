@@ -19,7 +19,7 @@ ws_failover_urls = ["ws://109.230.239.43:8900"]
 # Geyser gRPC (RECOMMENDED for <10ms latency)
 # Uncomment to use native Agave 3.0 Geyser instead of WebSocket
 # Requires: --geyser-plugin-config flag in validator service
-geyser_grpc_url = "http://127.0.0.1:10000"
+geyser_grpc_url = "http://127.0.0.1:10000"  # Yellowstone gRPC (http for tonic client)
 
 # CRITICAL: Helius RPC for mint validation (full transaction index)
 # Local validators do NOT have full transaction history - they return

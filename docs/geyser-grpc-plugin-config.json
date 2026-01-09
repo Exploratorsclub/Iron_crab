@@ -8,5 +8,8 @@
     "max_decoding_message_size": 8388608,
     "unary_concurrency_limit": 100,
     "unary_disabled": false
+  },
+  "prometheus": {
+    "address": "127.0.0.1:9091"
   }
 }
