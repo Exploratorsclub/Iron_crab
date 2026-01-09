@@ -1,37 +1,12 @@
 {
   "libpath": "/usr/local/lib/solana/libyellowstone_grpc_geyser.so",
+  "log": {
+    "level": "info"
+  },
   "grpc": {
-    "address": "127.0.0.1:10001",
+    "address": "127.0.0.1:10000",
     "max_decoding_message_size": 8388608,
-    "filters": {
-      "accounts": {
-        "raydium_amm": {
-          "account": [],
-          "owner": ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"]
-        },
-        "raydium_cpmm": {
-          "account": [],
-          "owner": ["CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"]
-        },
-        "orca_whirlpool": {
-          "account": [],
-          "owner": ["whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"]
-        },
-        "pumpfun": {
-          "account": [],
-          "owner": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"]
-        },
-        "pumpswap": {
-          "account": [],
-          "owner": ["pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"]
-        },
-        "meteora_dlmm": {
-          "account": [],
-          "owner": ["LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"]
-        }
-      },
-      "transactions": {},
-      "blocks": {}
-    }
+    "unary_concurrency_limit": 100,
+    "unary_disabled": false
   }
 }
