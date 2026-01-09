@@ -1,0 +1,119 @@
+{
+  "total_pools": 146,
+  "pool_ids": [
+    "3AFvR4L5p25KHiKmuvEXg9SxfCf4MpanN3KuK5qASqqc",
+    "FrBaZ4Grr9c9nFtHUvgSPfohhuzXgMkPA5Fk7hD6tYFt",
+    "5W8DC1uP51CDuNAkidCdECbSBeqzTZxCN8jCdUbert7S",
+    "HPKUqRq2u3BAyGWodxaEYrSZoirGBqgrFzds2RvbTCF7",
+    "Q2sPHPdUWFMg7M7wwrQKLrn619cAucfRsmhVJffodSp",
+    "HKRn6cDo5ACgWYY4N52ScCNzziAMSgS5YaEfwsBu4nu3",
+    "FbngWRevuCsfKyzKbpdBLXUNB5b61yeDAN4LTX9L8VHo",
+    "JCqaWrasKvJKY7sDXB82JGEq4CE5DopEUiVCH2svd9X7",
+    "Fjr2GkT1WHcvyyGWNvSWSwq3UeJrkNXZDv2KTtKJwqGF",
+    "J6i7Uc1giak9DRuHfvVM5Ky6tH8GBCrxMk8GbBZY7Gka",
+    "HshXCLduinxu3nhDz4WQxkk8FGWFoZDsi4bnMJExXSRt",
+    "CqmwcyB7fGor8z7As56yXBQzWjy7MnACtmj6wuLHgV5H",
+    "HLG1RRpF5CqMXwQWEU6hnHpDzUnbGe1abrCyHGVM4Wsf",
+    "2WNhaB6TPyZ3ynJjAUM4ZZ1Hdeep8FJ3A76FjGjTVjjS",
+    "9SxEcmwzHtSZu2jJSpSxuyxweYECvvtykoP3qtEprkvj",
+    "CP8fLuxUfduf6VQRa3ADYXLtvTVJStGzLBGA8MEHcAe3",
+    "5KXE8RMF7iW9Ptn665AHfzsMFjYb4LV2Ta8eZEtsTwWC",
+    "D382qBAVdXLF8jq716UHzNDuZWVSgG7ABJ3Fpzo2kDmP",
+    "6sEkZ73vph5AFYmQTzaV6H5vAQQLZ2C8WqeCQ6MhLqFk",
+    "9nxAnMD7K78a9RMd2L3w8kQT5u9i7gsvV5aHiZ78sCC2"
+  ],
+  "sample_pool": {
+    "type": "Standard",
+    "programId": "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+    "id": "3AFvR4L5p25KHiKmuvEXg9SxfCf4MpanN3KuK5qASqqc",
+    "mintA": {
+      "chainId": 101,
+      "address": "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
+      "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "logoURI": "https://img-v1.raydium.io/icon/orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE.png",
+      "symbol": "ORCA",
+      "name": "Orca",
+      "decimals": 6,
+      "tags": [],
+      "extensions": {}
+    },
+    "mintB": {
+      "chainId": 101,
+      "address": "5uZ4wBqvHPRB6wVhNB2AkMmj5FD8HoxRMSYfDWCmiD4P",
+      "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "logoURI": "https://img-v1.raydium.io/icon/5uZ4wBqvHPRB6wVhNB2AkMmj5FD8HoxRMSYfDWCmiD4P.png",
+      "symbol": "IVAN",
+      "name": "Ivanium",
+      "decimals": 8,
+      "tags": [],
+      "extensions": {}
+    },
+    "config": {
+      "id": "D4FPEruKEHrG5TenZ2mpDGEfu1iUvTiqBxvpU8HLBvC2",
+      "index": 0,
+      "protocolFeeRate": 120000,
+      "tradeFeeRate": 2500,
+      "fundFeeRate": 40000,
+      "createPoolFee": "150000000",
+      "creatorFeeRate": 500
+    },
+    "price": 31529.14895918516,
+    "mintAmountA": 72.423516,
+    "mintAmountB": 2283451.82411193,
+    "feeRate": 0.0025,
+    "openTime": "1731903317",
+    "tvl": 8413113500.26,
+    "day": {
+      "volume": 483298.46939640114,
+      "volumeQuote": 95593.4267614707,
+      "volumeFee": 1208.2461734910028,
+      "apr": 0.01,
+      "feeApr": 0.01,
+      "priceMin": 31433.678360067715,
+      "priceMax": 32295.940423060954,
+      "rewardApr": []
+    },
+    "week": {
+      "volume": 56337251.54733605,
+      "volumeQuote": 959105.6989339136,
+      "volumeFee": 140843.12886834014,
+      "apr": 0.05,
+      "feeApr": 0.05,
+      "priceMin": 29578.121439023264,
+      "priceMax": 35753.32353206066,
+      "rewardApr": []
+    },
+    "month": {
+      "volume": 88686680.74597064,
+      "volumeQuote": 3784885.82932994,
+      "volumeFee": 221716.70186492664,
+      "apr": 0.03,
+      "feeApr": 0.03,
+      "priceMin": 27421.6618521987,
+      "priceMax": 35753.32353206066,
+      "rewardApr": []
+    },
+    "pooltype": [
+      "Cpmm"
+    ],
+    "rewardDefaultInfos": [],
+    "farmUpcomingCount": 0,
+    "farmOngoingCount": 0,
+    "farmFinishedCount": 0,
+    "lpMint": {
+      "chainId": 101,
+      "address": "Ge6oMLAjhUMN7uy9veXVduGaFe6C7cZ2LYU2LjsGEQYx",
+      "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "logoURI": "",
+      "symbol": "",
+      "name": "",
+      "decimals": 9,
+      "tags": [],
+      "extensions": {}
+    },
+    "lpPrice": 67772128.69350071,
+    "lpAmount": 124.138250671,
+    "burnPercent": 0,
+    "launchMigratePool": false
+  }
+}
