@@ -707,6 +707,17 @@ async fn main() -> Result<()> {
 
 /// Handle a single MarketEvent
 async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<TradeIntent> {
+    // Debug: Log event type to verify Trade events are arriving
+    match &event.kind {
+        MarketEventKind::Trade { sol_amount, token_amount, .. } => {
+            info!(sol_amount, token_amount, "Received Trade event");
+        }
+        MarketEventKind::PoolCreated { .. } => {
+            info!("Received PoolCreated event");
+        }
+        _ => {}
+    }
+
     match &event.kind {
         MarketEventKind::PoolCreated {
             pool_address,
