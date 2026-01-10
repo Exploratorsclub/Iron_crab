@@ -825,25 +825,37 @@ fn calculate_token_balance_change(
 ) -> Option<u64> {
     let mint_str = mint.to_string();
     
-    // Find pre and post balance for this mint
-    let pre_balance = pre_balances
-        .iter()
-        .find(|b| b.mint == mint_str)?
-        .ui_token_amount
-        .amount
-        .parse::<u64>()
-        .ok()?;
+    // For Jupiter/aggregator trades, there may be multiple token accounts for the same mint
+    // (e.g., trader's ATA + pool's token vault). We need to find the one that actually changed.
+    // Strategy: Find the account with the largest absolute balance change
     
-    let post_balance = post_balances
-        .iter()
-        .find(|b| b.mint == mint_str)?
-        .ui_token_amount
-        .amount
-        .parse::<u64>()
-        .ok()?;
+    let mut max_change: u64 = 0;
     
-    // Return absolute change (received amount)
-    Some(post_balance.saturating_sub(pre_balance))
+    for post in post_balances.iter().filter(|b| b.mint == mint_str) {
+        let post_amount = post.ui_token_amount.amount.parse::<u64>().ok()?;
+        
+        // Find matching pre balance by account_index
+        if let Some(pre) = pre_balances.iter().find(|b| b.account_index == post.account_index) {
+            let pre_amount = pre.ui_token_amount.amount.parse::<u64>().ok()?;
+            
+            // Calculate absolute change
+            let change = if post_amount > pre_amount {
+                post_amount - pre_amount  // Tokens received
+            } else {
+                pre_amount - post_amount  // Tokens sent
+            };
+            
+            if change > max_change {
+                max_change = change;
+            }
+        }
+    }
+    
+    if max_change > 0 {
+        Some(max_change)
+    } else {
+        None
+    }
 }
 
 /// Calculate native SOL balance change for a specific account
