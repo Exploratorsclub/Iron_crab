@@ -26,7 +26,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use ironcrab::config::Config as AppConfig;
 use ironcrab::ipc::{
+    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus,
     ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind, TradeIntent,
     TradeResources, TradeSide, TradingRegime,
 };
@@ -41,6 +43,9 @@ use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// Build version for decision records
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// NATS topic for config reload commands from control-plane
+const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
 
 // ============================================================================
 // Configuration
@@ -78,9 +83,54 @@ impl Default for ArbConfig {
     }
 }
 
+fn load_initial_arb_config(config_path: &PathBuf) -> ArbConfig {
+    let mut cfg = ArbConfig::default();
+
+    let app_cfg = match AppConfig::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                error = %e,
+                config = %config_path.display(),
+                "Failed to load config TOML; using arb-strategy defaults"
+            );
+            return cfg;
+        }
+    };
+
+    let Some(arb) = app_cfg.arbitrage else {
+        info!(
+            config = %config_path.display(),
+            "No [arbitrage] section in config; using arb-strategy defaults"
+        );
+        return cfg;
+    };
+
+    if let Some(v) = arb.est_tx_cost_lamports {
+        cfg.est_tx_cost_lamports = v;
+    }
+    if let Some(exec) = arb.execution {
+        cfg.max_slippage_bps = exec.max_slippage_bps;
+        cfg.max_position_lamports = exec.max_position_lamports;
+    }
+
+    // Map min_profit_bps -> min_profit_lamports by interpreting it as net profit bps
+    // relative to max_position_lamports.
+    if let Some(min_profit_bps) = arb.min_profit_bps {
+        let implied_min_profit = (cfg
+            .max_position_lamports
+            .saturating_mul(min_profit_bps as u64))
+            / 10_000;
+        if implied_min_profit > 0 {
+            cfg.min_profit_lamports = implied_min_profit;
+        }
+    }
+
+    cfg
+}
+
 // Known token mints for sanity checks
 const NATIVE_SOL_MINT: &str = "11111111111111111111111111111111";
-const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
@@ -89,7 +139,6 @@ const MAX_REASONABLE_SPREAD_BPS: i64 = 1000; // 10%
 const STABLECOIN_MAX_SPREAD_BPS: i64 = 200;  // 2% for stablecoins
 const MAX_PRICE_AGE_SECS: u64 = 10;           // 10s max price staleness
 const MIN_TRADE_VOLUME_LAMPORTS: u64 = 100_000; // 0.0001 SOL minimum (filter dust)
-const MIN_LIQUIDITY_FOR_INTENT_LAMPORTS: u64 = 100_000_000; // 0.1 SOL min pool liquidity
 
 #[derive(Parser, Debug)]
 #[command(name = "arb-strategy")]
@@ -400,7 +449,6 @@ struct ArbContext {
     
     // Data quality metrics
     zero_amount_trades: AtomicU64,
-    zero_liquidity_pools: AtomicU64,
     data_quality_rejects: AtomicU64,
 }
 
@@ -408,6 +456,125 @@ impl ArbContext {
     fn next_intent_id(&self) -> String {
         let n = self.intent_counter.fetch_add(1, Ordering::Relaxed);
         format!("arb-{}-{:06}", &self.run_id[..8], n)
+    }
+
+    /// P1: Apply config update from control-plane (Runtime Configuration via UI)
+    fn apply_config_update(&self, update: &ConfigUpdate) -> ConfigUpdateResponse {
+        let mut config = self.config.write();
+        let mut applied = Vec::new();
+        let mut rejected = Vec::new();
+
+        for (key, value) in &update.config {
+            match key.as_str() {
+                "min_spread_bps" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 && v <= 100_000 {
+                            config.min_spread_bps = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-100000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "min_profit_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.min_profit_lamports = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "max_position_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.max_position_lamports = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "est_tx_cost_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 {
+                            config.est_tx_cost_lamports = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be > 0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "max_slippage_bps" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 && v <= 10_000 {
+                            config.max_slippage_bps = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-10000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "intent_cooldown_ms" => {
+                    if let Some(v) = value.as_u64() {
+                        if v <= 3_600_000 {
+                            config.intent_cooldown_ms = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be <= 3600000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "intent_ttl_ms" => {
+                    if let Some(v) = value.as_u64() {
+                        if v > 0 && v <= 60_000 {
+                            config.intent_ttl_ms = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-60000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                _ => rejected.push((key.clone(), format!("Unknown config key: {}", key))),
+            }
+        }
+
+        let status = if rejected.is_empty() {
+            ConfigUpdateStatus::Applied
+        } else if applied.is_empty() {
+            ConfigUpdateStatus::Rejected
+        } else {
+            ConfigUpdateStatus::PartiallyApplied
+        };
+
+        ConfigUpdateResponse {
+            status,
+            applied_keys: applied,
+            rejected_keys: rejected,
+            new_snapshot_id: None,
+        }
     }
 
     /// Update or create pool state from PoolCreated event
@@ -665,6 +832,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let run_id = Uuid::new_v4().to_string();
 
+    let initial_config = load_initial_arb_config(&args.config);
+
     info!(
         run_id = %run_id,
         config = %args.config.display(),
@@ -720,7 +889,7 @@ async fn main() -> Result<()> {
 
     let ctx = Arc::new(ArbContext {
         run_id: run_id.clone(),
-        config: RwLock::new(ArbConfig::default()),
+        config: RwLock::new(initial_config),
         nats,
         jsonl_writer,
         trackers: RwLock::new(HashMap::new()),
@@ -730,7 +899,6 @@ async fn main() -> Result<()> {
         intents_generated: AtomicU64::new(0),
         intent_counter: AtomicU64::new(0),
         zero_amount_trades: AtomicU64::new(0),
-        zero_liquidity_pools: AtomicU64::new(0),
         data_quality_rejects: AtomicU64::new(0),
     });
 
@@ -750,6 +918,22 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Subscribe to Config Updates (runtime hot reload via control-plane)
+    let config_subscription = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_CONFIG_RELOAD).await {
+            Ok(sub) => {
+                info!(topic = TOPIC_CONFIG_RELOAD, "Subscribed to Config Updates");
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(error = %e, topic = TOPIC_CONFIG_RELOAD, "Failed to subscribe to Config Updates");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Main event loop
     info!("Entering main event loop");
 
@@ -757,6 +941,7 @@ async fn main() -> Result<()> {
     tokio::pin!(shutdown);
 
     let mut market_sub = market_subscription;
+    let mut cfg_sub = config_subscription;
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(60));
 
     loop {
@@ -805,6 +990,36 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to deserialize MarketEvent");
+                        }
+                    }
+                }
+            }
+
+            // Config updates
+            msg = async {
+                if let Some(ref mut sub) = cfg_sub {
+                    sub.next().await
+                } else {
+                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
+                }
+            } => {
+                if let Some(nats_msg) = msg {
+                    match serde_json::from_slice::<ConfigUpdate>(&nats_msg.payload) {
+                        Ok(update) => {
+                            if update.target_component == "arb-strategy" {
+                                info!(component = %update.target_component, keys = ?update.config.keys(), "Applying config update");
+                                let response = ctx.apply_config_update(&update);
+                                match response.status {
+                                    ConfigUpdateStatus::Applied => info!(applied = ?response.applied_keys, "Config update applied"),
+                                    ConfigUpdateStatus::Rejected => warn!(rejected = ?response.rejected_keys, "Config update rejected"),
+                                    ConfigUpdateStatus::PartiallyApplied => warn!(applied = ?response.applied_keys, rejected = ?response.rejected_keys, "Config update partially applied"),
+                                }
+                            } else {
+                                debug!(component = %update.target_component, "Ignoring config update for other component");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to deserialize ConfigUpdate");
                         }
                     }
                 }

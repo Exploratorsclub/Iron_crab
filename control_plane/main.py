@@ -1097,7 +1097,7 @@ async def update_config(update: ConfigUpdate, user: User = Depends(require_admin
     - simulation_timeout_ms: u64 (100-30000)
     - send_enabled: bool (can only enable if wallet configured)
     """
-    valid_components = ["market-data", "momentum-bot", "execution-engine"]
+    valid_components = ["market-data", "momentum-bot", "arb-strategy", "execution-engine"]
     if update.component not in valid_components:
         raise HTTPException(status_code=400, detail=f"Invalid component. Must be one of: {valid_components}")
     

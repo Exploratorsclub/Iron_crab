@@ -122,6 +122,24 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     momentum_exit_window_secs: 'EXIT: Check last N seconds for momentum',
     momentum_exit_min_trades: 'EXIT: Min trades needed to evaluate exit',
   },
+  'arb-strategy': {
+    min_spread_bps: 'Min spread between DEX prices (bps, 100=1%)',
+    min_profit_lamports: 'Min net profit after estimated tx cost (lamports, 1e9=1 SOL)',
+    max_position_lamports: 'Max notional per arb intent (lamports, 1e9=1 SOL)',
+    est_tx_cost_lamports: 'Estimated tx cost used for net profit gating (lamports)',
+    max_slippage_bps: 'Max slippage included in intent (bps)',
+    intent_cooldown_ms: 'Cooldown per mint/pair before emitting another intent (ms)',
+    intent_ttl_ms: 'Intent time-to-live (ms)',
+  },
+  'execution-engine': {
+    max_position_size_lamports: 'RISK: Max single position size (lamports, 1e9=1 SOL)',
+    daily_loss_limit_lamports: 'RISK: Kill-switch daily loss limit (lamports)',
+    max_open_positions: 'RISK: Max concurrent open positions',
+    max_slippage_bps: 'RISK: Max allowed slippage (bps)',
+    simulation_timeout_ms: 'Ops: Simulation timeout (ms)',
+    confirmation_timeout_ms: 'Ops: Confirmation timeout (ms)',
+    send_enabled: 'Ops: If true, engine sends txs; if false, simulate-gated only',
+  },
 }
 
 // Config parameter grouping (for better UI structure)
@@ -163,6 +181,30 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
       'momentum_exit_buy_ratio',
       'momentum_exit_window_secs',
       'momentum_exit_min_trades',
+    ],
+  },
+  'arb-strategy': {
+    'Arbitrage (Active Knobs)': [
+      'min_spread_bps',
+      'min_profit_lamports',
+      'est_tx_cost_lamports',
+      'max_position_lamports',
+      'max_slippage_bps',
+      'intent_cooldown_ms',
+      'intent_ttl_ms',
+    ],
+  },
+  'execution-engine': {
+    'Risk (Enforced)': [
+      'max_position_size_lamports',
+      'daily_loss_limit_lamports',
+      'max_open_positions',
+      'max_slippage_bps',
+    ],
+    'Operational': [
+      'simulation_timeout_ms',
+      'confirmation_timeout_ms',
+      'send_enabled',
     ],
   },
 }
@@ -207,8 +249,25 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     momentum_exit_window_secs: 30,
     momentum_exit_min_trades: 5,
   },
+  'arb-strategy': {
+    min_spread_bps: 50,
+    min_profit_lamports: 10_000_000,
+    max_position_lamports: 1_000_000_000,
+    est_tx_cost_lamports: 50_000,
+    max_slippage_bps: 100,
+    intent_cooldown_ms: 5_000,
+    intent_ttl_ms: 3_000,
+  },
   'market-data': {},
-  'execution-engine': {},
+  'execution-engine': {
+    max_position_size_lamports: 500_000_000,
+    daily_loss_limit_lamports: 5_000_000_000,
+    max_open_positions: 5,
+    max_slippage_bps: 500,
+    simulation_timeout_ms: 2_000,
+    confirmation_timeout_ms: 30_000,
+    send_enabled: false,
+  },
 }
 
 export function ComponentDetail() {
@@ -338,7 +397,10 @@ export function ComponentDetail() {
 
   // Convert lamports to SOL for display (1e9 lamports = 1 SOL)
   function lamportsToSol(lamports: number): string {
-    return (lamports / 1_000_000_000).toFixed(3)
+    const sol = lamports / 1_000_000_000
+    // Keep small values readable (e.g. 15,000 lamports = 0.000015 SOL)
+    const fixed = sol.toFixed(9)
+    return fixed.replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1')
   }
 
   // Convert SOL to lamports (1 SOL = 1e9 lamports)
@@ -512,7 +574,7 @@ export function ComponentDetail() {
           <div className="small" style={{ marginTop: '0.5rem', background: '#f0f9ff', padding: '8px', borderRadius: '4px', border: '1px solid #0ea5e9' }}>
             <strong>💡 How it works:</strong><br/>
             • <strong>Lamports fields</strong> (ending in _lamports) are automatically converted to SOL for easier editing<br/>
-            • Click <strong>"Save Config"</strong> to apply changes to momentum-bot (takes effect immediately)<br/>
+            • Click <strong>"Save Config"</strong> to apply changes to the selected component (takes effect immediately if the component supports hot-reload)<br/>
             • Click <strong>"Reload"</strong> (top right) to fetch current server config<br/>
             • Click <strong>"Reset Changes"</strong> to discard unsaved edits
           </div>
