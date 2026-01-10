@@ -221,18 +221,27 @@ impl TokenArbTracker {
         }
 
         // Estimate profit
-        // Use smaller liquidity pool as constraint
-        let max_trade_sol = buy_pool
-            .liquidity_sol
-            .min(sell_pool.liquidity_sol)
-            .min(Decimal::from(config.max_position_lamports) / Decimal::from(1_000_000_000u64));
+        // Use smaller liquidity pool as constraint (fallback to max_position if liquidity unknown)
+        let max_trade_sol = if buy_pool.liquidity_sol > Decimal::ZERO
+            && sell_pool.liquidity_sol > Decimal::ZERO
+        {
+            buy_pool
+                .liquidity_sol
+                .min(sell_pool.liquidity_sol)
+                .min(Decimal::from(config.max_position_lamports) / Decimal::from(1_000_000_000u64))
+        } else {
+            // Liquidity unknown (trade-based pools) - use max_position as conservative estimate
+            Decimal::from(config.max_position_lamports) / Decimal::from(1_000_000_000u64)
+        };
 
         // Gross profit = trade_amount * spread_pct
         let gross_profit = max_trade_sol * (spread / Decimal::from(10000));
-        let gross_profit_lamports = (gross_profit * Decimal::from(1_000_000_000u64))
-            .to_string()
-            .parse::<u64>()
-            .unwrap_or(0);
+        // Convert to lamports using proper Decimal methods
+        let gross_profit_lamports = ((gross_profit * Decimal::from(1_000_000_000u64))
+            .round()
+            .to_u64()
+            .unwrap_or(0))
+        .min(u64::MAX);
 
         // Net profit after tx costs
         let net_profit = gross_profit_lamports.saturating_sub(config.est_tx_cost_lamports);
