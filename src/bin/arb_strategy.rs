@@ -394,6 +394,7 @@ impl ArbContext {
                     pool.last_price = Some(price);
                     pool.trade_count += 1;
                     pool.last_update = Instant::now();
+                    info!(pool = %pool_address, mint = %mint, dex = %pool.dex, price = %price, "Pool price updated");
                     break;
                 }
             }
@@ -412,6 +413,8 @@ impl ArbContext {
                 self.opportunities_found.fetch_add(1, Ordering::Relaxed);
                 return Some(opp);
             }
+        } else {
+            info!(mint = %mint, pool = %pool_address, "Trade ignored: no tracker for mint (PoolCreated event missing?)");
         }
 
         None
