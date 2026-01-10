@@ -502,7 +502,7 @@ impl GeyserListener {
                                     let mut post_token_balances = Vec::new();
                                     let mut pre_balances = Vec::new();
                                     let mut post_balances = Vec::new();
-                                    
+
                                     if let Some(meta) = &tx.meta {
                                         // Extract native SOL balances (lamports)
                                         pre_balances = meta.pre_balances.clone();

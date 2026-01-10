@@ -407,8 +407,8 @@ async fn run_geyser_loop(
     tracked_mints_rx: watch::Receiver<Vec<Pubkey>>,
 ) -> Result<()> {
     // Initialize RPC client for fallback/metadata (prefer local RPC, fallback to Helius)
-    let rpc_url = std::env::var("SOLANA_RPC_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8899".to_string()); // Local validator/private RPC preferred
+    let rpc_url =
+        std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string()); // Local validator/private RPC preferred
     let rpc = Arc::new(SolanaRpc::new(&rpc_url));
     info!(rpc_url = %rpc_url, "Initialized RPC client for metadata/fallback");
 

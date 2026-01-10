@@ -31,7 +31,8 @@ const PUMPFUN_AMM_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6
 // Fallback protocol fee recipient when automatic discovery fails (observed in many PumpSwap pools).
 // This is the canonical Pump.fun protocol fee recipient wallet (owned by System Program, not a PDA).
 // Account: JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU (verified from multiple successful swap txs).
-const PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT: &str = "JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU";
+const PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT: &str =
+    "JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU";
 
 // Best-effort: observed Pump.fun AMM "market" account layout contains
 // - base_mint at byte offset 43
@@ -630,7 +631,8 @@ impl PumpFunAmmDex {
             let Ok(acc_data) = BASE64_STD.decode(b64) else {
                 continue;
             };
-            let Some((acc_mint, acc_owner)) = Self::parse_spl_token_account_mint_and_owner(&acc_data)
+            let Some((acc_mint, acc_owner)) =
+                Self::parse_spl_token_account_mint_and_owner(&acc_data)
             else {
                 continue;
             };
@@ -1037,20 +1039,31 @@ impl PumpFunAmmDex {
                 } else if let Some((auth, ta)) =
                     // Some fee flows (notably `sell`) can accrue fees in the input mint.
                     // If the protocol fee recipient TA is not for WSOL, fall back to base mint.
-                    find_authority_with_existing_token_account(combined.clone(), base_mint).await?
+                    find_authority_with_existing_token_account(
+                        combined.clone(),
+                        base_mint,
+                    )
+                    .await?
                 {
                     (auth, ta)
                 } else {
                     // CRITICAL FALLBACK: Use known PumpSwap protocol fee recipient when automatic
                     // discovery fails (e.g., when global_config doesn't exist or authority candidates
                     // are stale/deleted accounts). This is observed in many PumpSwap pools.
-                    let fallback_recipient = Pubkey::from_str(PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT)?;
-                    if let Some((auth, ta)) =
-                        find_authority_with_existing_token_account(vec![fallback_recipient], quote_mint).await?
+                    let fallback_recipient =
+                        Pubkey::from_str(PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT)?;
+                    if let Some((auth, ta)) = find_authority_with_existing_token_account(
+                        vec![fallback_recipient],
+                        quote_mint,
+                    )
+                    .await?
                     {
                         (auth, ta)
-                    } else if let Some((auth, ta)) =
-                        find_authority_with_existing_token_account(vec![fallback_recipient], base_mint).await?
+                    } else if let Some((auth, ta)) = find_authority_with_existing_token_account(
+                        vec![fallback_recipient],
+                        base_mint,
+                    )
+                    .await?
                     {
                         (auth, ta)
                     } else {
@@ -1093,7 +1106,10 @@ impl PumpFunAmmDex {
                 .derive_existing_pda(
                     pump_amm_program,
                     &[
-                        vec![b"creator_vault_authority".to_vec(), pool_market.to_bytes().to_vec()],
+                        vec![
+                            b"creator_vault_authority".to_vec(),
+                            pool_market.to_bytes().to_vec(),
+                        ],
                         vec![b"creator_vault".to_vec(), pool_market.to_bytes().to_vec()],
                         vec![b"creator".to_vec(), pool_market.to_bytes().to_vec()],
                         vec![b"vault_authority".to_vec(), pool_market.to_bytes().to_vec()],
@@ -1105,9 +1121,12 @@ impl PumpFunAmmDex {
                 Some(derived_authority) => {
                     // Derive ATA for creator vault
                     let derived_ata = Self::derive_ata(derived_authority, base_mint);
-                    
+
                     // Verify ATA exists
-                    match self.rpc_get_account_owner_and_executable(derived_ata).await? {
+                    match self
+                        .rpc_get_account_owner_and_executable(derived_ata)
+                        .await?
+                    {
                         Some(_) => (derived_authority, derived_ata),
                         None => {
                             eprintln!(
@@ -1349,31 +1368,31 @@ impl PumpFunAmmDex {
         // swap and extract the canonical account set from the on-chain transaction.
 
         let addr = pool_market.to_string();
-        
+
         info!(
             "pump_amm TX-history: starting getSignaturesForAddress for market={} base_mint={} limit=200",
             pool_market, base_mint
         );
-        
+
         let sigs_v = self
             .rpc_call_tx_history("getSignaturesForAddress", json!([addr, {"limit": 200}]))
             .await?;
-        
+
         info!(
             "pump_amm TX-history: received getSignaturesForAddress response for market={}",
             pool_market
         );
-        
+
         // Check for RPC errors - returnOk(None) triggers generic error message upstream
         if let Some(err) = sigs_v.get("error") {
-            // RPC error (e.g., method not found) - return as anyhow error with details  
+            // RPC error (e.g., method not found) - return as anyhow error with details
             return Err(anyhow!(
                 "pump_amm tx_history RPC error market={} error={}",
                 pool_market,
                 serde_json::to_string(err).unwrap_or_else(|_| "unknown".to_string())
             ));
         }
-        
+
         let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
             Some(v) => v,
             None => {
@@ -1390,15 +1409,18 @@ impl PumpFunAmmDex {
                 ));
             }
         };
-        
+
         info!(
             "pump_amm TX-history: found {} signatures for market={} base_mint={}, starting transaction scan...",
             sigs.len(), pool_market, base_mint
         );
-        
+
         if sigs.is_empty() {
             // No transactions found - this is expected for brand-new pools, return None
-            info!("pump_amm TX-history: no signatures found for market={}, returning None", pool_market);
+            info!(
+                "pump_amm TX-history: no signatures found for market={}, returning None",
+                pool_market
+            );
             return Ok(None);
         }
 
@@ -1409,7 +1431,7 @@ impl PumpFunAmmDex {
         let mut fetched = 0usize;
         let mut scanned_tx_count = 0usize;
         const DEBUG_REF_TX: &str = "3nj499thZ6JrdrC2WGGGRKoSC5Ydrat9gxP3XEnW5JK5ZWnXPzHE2QuAX8y7gvfsjRaLxCy3qkn6BYc1sxtfYiiY";
-        
+
         // Log first few signatures for debugging
         info!(
             "pump_amm TX-history: first 10 signatures: {:?}",
@@ -1418,7 +1440,7 @@ impl PumpFunAmmDex {
                 .filter_map(|s| s.get("signature").and_then(|v| v.as_str()))
                 .collect::<Vec<_>>()
         );
-        
+
         for s in sigs.iter() {
             if fetched >= MAX_TX_FETCHES {
                 break;
@@ -1432,7 +1454,7 @@ impl PumpFunAmmDex {
                 Some(v) => v,
                 None => continue,
             };
-            
+
             // Debug: Check if reference TX is in signature list
             if sig == DEBUG_REF_TX {
                 info!(
@@ -1442,12 +1464,14 @@ impl PumpFunAmmDex {
             }
 
             fetched += 1;
-            
+
             // Log progress every 20 transactions
             if fetched % 20 == 0 {
                 info!(
                     "pump_amm TX-history: scanned {}/{} transactions for market={}...",
-                    fetched, sigs.len(), pool_market
+                    fetched,
+                    sigs.len(),
+                    pool_market
                 );
             }
 
@@ -1476,14 +1500,15 @@ impl PumpFunAmmDex {
                 Err(_) => continue,
             };
             Self::extend_with_loaded_addresses(&mut account_keys, meta);
-            
+
             scanned_tx_count += 1;
-            
+
             let is_ref_tx = sig == DEBUG_REF_TX;
             if is_ref_tx {
                 info!(
                     "pump_amm TX-history: processing reference TX sig={} account_keys_count={}",
-                    sig, account_keys.len()
+                    sig,
+                    account_keys.len()
                 );
             }
 
@@ -1505,7 +1530,7 @@ impl PumpFunAmmDex {
                     }
                     continue;
                 }
-                
+
                 if is_ref_tx {
                     info!("pump_amm TX-history: reference TX has PumpSwap AMM instruction!");
                 }
@@ -1528,7 +1553,7 @@ impl PumpFunAmmDex {
                     }
                     continue;
                 }
-                
+
                 if is_ref_tx {
                     info!("pump_amm TX-history: reference TX account count OK (21)");
                 }
@@ -1553,7 +1578,7 @@ impl PumpFunAmmDex {
                     }
                     continue;
                 }
-                
+
                 if is_ref_tx {
                     info!("pump_amm TX-history: reference TX market match OK");
                 }
@@ -1578,7 +1603,7 @@ impl PumpFunAmmDex {
                     }
                     continue;
                 }
-                
+
                 if is_ref_tx {
                     info!("pump_amm TX-history: reference TX base_mint match OK, proceeding to build pool...");
                 }
@@ -1619,11 +1644,11 @@ impl PumpFunAmmDex {
                     }
                     continue;
                 }
-                
+
                 if is_ref_tx {
                     info!("pump_amm TX-history: reference TX fee_program OK, checking fee_config owner...");
                 }
-                
+
                 // CRITICAL: fee_config must be owned by the Fee Program, not the AMM Program!
                 // This matches the fix in discover_pool_markets_via_program_accounts (lines 763-818).
                 let Some((fee_owner, fee_executable)) = self
@@ -1635,14 +1660,14 @@ impl PumpFunAmmDex {
                     }
                     continue;
                 };
-                
+
                 if is_ref_tx {
                     info!(
                         "pump_amm TX-history: reference TX fee_config owner={} executable={} (expected owner={} Fee Program)",
                         fee_owner, fee_executable, expected_fee_program
                     );
                 }
-                
+
                 // fee_config must be owned by Fee Program and not be executable
                 if fee_executable || fee_owner != expected_fee_program {
                     if is_ref_tx {
@@ -1650,7 +1675,7 @@ impl PumpFunAmmDex {
                     }
                     continue;
                 }
-                
+
                 if is_ref_tx {
                     info!("pump_amm TX-history: reference TX SUCCESS! Returning pool...");
                 }
@@ -1720,7 +1745,7 @@ impl PumpFunAmmDex {
                 "pump_amm attempting TX-history fallback for market {} base_mint {}",
                 m, base_mint
             );
-            
+
             match self
                 .discover_pool_static_via_tx_history_market_only(m, base_mint)
                 .await
@@ -2353,15 +2378,15 @@ impl Dex for PumpFunAmmDex {
 
         // Account ordering is taken from an observed on-chain Pump.fun AMM swap transaction.
         let metas = vec![
-            AccountMeta::new(pool.pool_market, false),               // 0
-            AccountMeta::new(user, true),                            // 1
-            AccountMeta::new_readonly(pool.global_config, false),    // 2
-            AccountMeta::new_readonly(pool.base_mint, false),        // 3
-            AccountMeta::new_readonly(pool.quote_mint, false),       // 4
-            AccountMeta::new(user_base_ta, false),                   // 5
-            AccountMeta::new(user_quote_ta, false),                  // 6
-            AccountMeta::new(pool.pool_base_vault, false),           // 7
-            AccountMeta::new(pool.pool_quote_vault, false),          // 8
+            AccountMeta::new(pool.pool_market, false),            // 0
+            AccountMeta::new(user, true),                         // 1
+            AccountMeta::new_readonly(pool.global_config, false), // 2
+            AccountMeta::new_readonly(pool.base_mint, false),     // 3
+            AccountMeta::new_readonly(pool.quote_mint, false),    // 4
+            AccountMeta::new(user_base_ta, false),                // 5
+            AccountMeta::new(user_quote_ta, false),               // 6
+            AccountMeta::new(pool.pool_base_vault, false),        // 7
+            AccountMeta::new(pool.pool_quote_vault, false),       // 8
             AccountMeta::new_readonly(pool.protocol_fee_recipient, false), // 9
             AccountMeta::new(pool.protocol_fee_recipient_ta, false), // 10
             AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 11
@@ -2374,14 +2399,14 @@ impl Dex for PumpFunAmmDex {
                 Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
                 false,
             ), // 14
-            AccountMeta::new_readonly(pool.event_authority, false),       // 15
-            AccountMeta::new_readonly(program_id, false),                 // 16
-            AccountMeta::new(pool.coin_creator_vault_ata, false),         // 17
+            AccountMeta::new_readonly(pool.event_authority, false), // 15
+            AccountMeta::new_readonly(program_id, false),           // 16
+            AccountMeta::new(pool.coin_creator_vault_ata, false),   // 17
             AccountMeta::new_readonly(pool.coin_creator_vault_authority, false), // 18
             // NOTE: global_volume_accumulator and user_vol are NOT in actual on-chain swap TXs!
             // Removed to match observed transaction structure (21 accounts total).
-            AccountMeta::new_readonly(pool.fee_config, false),       // 19
-            AccountMeta::new_readonly(pool.fee_program, false),      // 20
+            AccountMeta::new_readonly(pool.fee_config, false), // 19
+            AccountMeta::new_readonly(pool.fee_program, false), // 20
         ];
 
         Ok(vec![Instruction {
@@ -2450,7 +2475,7 @@ impl PumpFunAmmDex {
         let coin_creator_vault_authority = pool_accounts[10];
         // NOTE: global_volume_accumulator removed (was pool_accounts[11])
         let fee_config = pool_accounts[11]; // was [12]
-        // NOTE: fee_program is now derived, not from pool_accounts
+                                            // NOTE: fee_program is now derived, not from pool_accounts
         let fee_program = expected_fee_program;
 
         // Intent-driven guardrails (no RPC calls): reject obviously wrong pool_accounts early.
@@ -2505,17 +2530,17 @@ impl PumpFunAmmDex {
 
         // Account ordering is taken from an observed on-chain Pump.fun AMM swap transaction.
         let metas = vec![
-            AccountMeta::new(pool_market, false),               // 0
-            AccountMeta::new(user, true),                       // 1
-            AccountMeta::new_readonly(global_config, false),    // 2
-            AccountMeta::new_readonly(base_mint, false),        // 3
-            AccountMeta::new_readonly(quote_mint, false),       // 4
-            AccountMeta::new(user_base_ta, false),              // 5
-            AccountMeta::new(user_quote_ta, false),             // 6
-            AccountMeta::new(pool_base_vault, false),           // 7
-            AccountMeta::new(pool_quote_vault, false),          // 8
+            AccountMeta::new(pool_market, false),                     // 0
+            AccountMeta::new(user, true),                             // 1
+            AccountMeta::new_readonly(global_config, false),          // 2
+            AccountMeta::new_readonly(base_mint, false),              // 3
+            AccountMeta::new_readonly(quote_mint, false),             // 4
+            AccountMeta::new(user_base_ta, false),                    // 5
+            AccountMeta::new(user_quote_ta, false),                   // 6
+            AccountMeta::new(pool_base_vault, false),                 // 7
+            AccountMeta::new(pool_quote_vault, false),                // 8
             AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
-            AccountMeta::new(protocol_fee_recipient_ta, false), // 10
+            AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
             AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 11
             AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 12
             AccountMeta::new_readonly(
@@ -2526,14 +2551,14 @@ impl PumpFunAmmDex {
                 Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
                 false,
             ), // 14
-            AccountMeta::new_readonly(event_authority, false),       // 15
-            AccountMeta::new_readonly(program_id, false),            // 16
-            AccountMeta::new(coin_creator_vault_ata, false),         // 17
+            AccountMeta::new_readonly(event_authority, false), // 15
+            AccountMeta::new_readonly(program_id, false),      // 16
+            AccountMeta::new(coin_creator_vault_ata, false),   // 17
             AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
             // NOTE: global_volume_accumulator and user_vol are NOT in actual on-chain swap TXs!
             // Removed to match observed transaction structure (21 accounts total).
-            AccountMeta::new_readonly(fee_config, false),       // 19
-            AccountMeta::new_readonly(fee_program, false),      // 20
+            AccountMeta::new_readonly(fee_config, false), // 19
+            AccountMeta::new_readonly(fee_program, false), // 20
         ];
 
         Ok(vec![Instruction {

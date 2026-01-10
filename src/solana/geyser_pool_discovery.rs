@@ -292,7 +292,10 @@ impl GeyserPoolDiscovery {
                     discovered_at_ms,
                 })
             }
-            DexType::RaydiumAmmV4 | DexType::RaydiumCpmm | DexType::OrcaWhirlpool | DexType::MeteoraDlmm => {
+            DexType::RaydiumAmmV4
+            | DexType::RaydiumCpmm
+            | DexType::OrcaWhirlpool
+            | DexType::MeteoraDlmm => {
                 // Raydium/Orca/Meteora: TX-based discovery not implemented yet
                 // We use account-based discovery for these (more efficient)
                 None
@@ -364,7 +367,10 @@ impl GeyserPoolDiscovery {
     fn parse_raydium_cpmm_pool(data: &[u8]) -> Option<PoolData> {
         // CPMM pool account size: 1024 bytes (verified from mainnet)
         if data.len() != 1024 {
-            tracing::debug!(len = data.len(), "geyser_pool_discovery: ignoring CPMM account (wrong size)");
+            tracing::debug!(
+                len = data.len(),
+                "geyser_pool_discovery: ignoring CPMM account (wrong size)"
+            );
             return None;
         }
 
@@ -433,7 +439,10 @@ impl GeyserPoolDiscovery {
     fn parse_meteora_dlmm_pool(data: &[u8]) -> Option<PoolData> {
         // Meteora DLMM LB Pair account size: 904 bytes
         if data.len() != 904 {
-            tracing::debug!(len = data.len(), "geyser_pool_discovery: ignoring Meteora DLMM account (wrong size)");
+            tracing::debug!(
+                len = data.len(),
+                "geyser_pool_discovery: ignoring Meteora DLMM account (wrong size)"
+            );
             return None;
         }
 
@@ -441,7 +450,9 @@ impl GeyserPoolDiscovery {
         let parsed = crate::solana::dex::meteora_dlmm_layout::DlmmPool::parse(data).ok()?;
 
         // Sanity check: mints should not be zero
-        if parsed.token_x_mint.to_bytes() == [0u8; 32] || parsed.token_y_mint.to_bytes() == [0u8; 32] {
+        if parsed.token_x_mint.to_bytes() == [0u8; 32]
+            || parsed.token_y_mint.to_bytes() == [0u8; 32]
+        {
             tracing::debug!("geyser_pool_discovery: Meteora DLMM pool has zero mints");
             return None;
         }
@@ -452,13 +463,28 @@ impl GeyserPoolDiscovery {
 
         let (base_mint, quote_mint, coin_vault, pc_vault) = if parsed.token_y_mint == sol_mint {
             // Token Y is SOL (quote), Token X is base
-            (parsed.token_x_mint, parsed.token_y_mint, parsed.reserve_x, parsed.reserve_y)
+            (
+                parsed.token_x_mint,
+                parsed.token_y_mint,
+                parsed.reserve_x,
+                parsed.reserve_y,
+            )
         } else if parsed.token_x_mint == sol_mint {
             // Token X is SOL (quote), Token Y is base
-            (parsed.token_y_mint, parsed.token_x_mint, parsed.reserve_y, parsed.reserve_x)
+            (
+                parsed.token_y_mint,
+                parsed.token_x_mint,
+                parsed.reserve_y,
+                parsed.reserve_x,
+            )
         } else {
             // Neither is SOL, use token_x as base by convention
-            (parsed.token_x_mint, parsed.token_y_mint, parsed.reserve_x, parsed.reserve_y)
+            (
+                parsed.token_x_mint,
+                parsed.token_y_mint,
+                parsed.reserve_x,
+                parsed.reserve_y,
+            )
         };
 
         // Estimate liquidity from bin parameters
@@ -466,7 +492,9 @@ impl GeyserPoolDiscovery {
         let liquidity_lamports = if parsed.active_id > 0 && parsed.bin_step > 0 {
             // Conservative estimate based on active bin liquidity
             // Real reserves will be fetched from vaults in background
-            (parsed.active_id as u64).saturating_mul(1_000_000).min(100_000_000_000) // Cap at 100 SOL
+            (parsed.active_id as u64)
+                .saturating_mul(1_000_000)
+                .min(100_000_000_000) // Cap at 100 SOL
         } else {
             5_000_000_000 // 5 SOL default
         };

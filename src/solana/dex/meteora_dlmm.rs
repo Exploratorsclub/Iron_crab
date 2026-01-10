@@ -70,6 +70,86 @@ impl MeteoraDlmm {
             .unwrap_or_default()
     }
 
+    /// Discover pool on-demand by fetching account data directly
+    ///
+    /// This is used when the pool cache is empty (e.g., no refresh_pools() was called).
+    /// The method searches for pools containing both mints by scanning the Meteora program.
+    async fn discover_pool_on_demand(
+        &self,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+    ) -> Result<Option<Pubkey>> {
+        use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+        use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
+
+        let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
+
+        // Try both orderings (X/Y or Y/X)
+        for (mint_x, mint_y) in [(input_mint, output_mint), (output_mint, input_mint)] {
+            // Filter for accounts with token_x_mint at offset 88 and token_y_mint at offset 120
+            let config = RpcProgramAccountsConfig {
+                filters: Some(vec![
+                    RpcFilterType::DataSize(LB_PAIR_ACCOUNT_SIZE as u64),
+                    RpcFilterType::Memcmp(Memcmp::new(
+                        88, // token_x_mint offset
+                        MemcmpEncodedBytes::Base58(mint_x.to_string()),
+                    )),
+                    RpcFilterType::Memcmp(Memcmp::new(
+                        120, // token_y_mint offset
+                        MemcmpEncodedBytes::Base58(mint_y.to_string()),
+                    )),
+                ]),
+                account_config: RpcAccountInfoConfig {
+                    encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                    data_slice: None,
+                    commitment: None,
+                    min_context_slot: None,
+                },
+                with_context: None,
+                sort_results: None,
+            };
+
+            let accounts = self
+                .rpc
+                .get_program_accounts_with_config_retry(&program_id, config)
+                .await?;
+
+            if let Some((pubkey, account)) = accounts.into_iter().next() {
+                // Parse and cache the pool
+                if let Ok(pool) = DlmmPool::parse(&account.data) {
+                    debug!(
+                        "Discovered DLMM pool on-demand: {} ({}/{})",
+                        pubkey, pool.token_x_mint, pool.token_y_mint
+                    );
+
+                    let cache = PoolCache {
+                        address: pubkey,
+                        pool: pool.clone(),
+                        reserve_x_balance: None,
+                        reserve_y_balance: None,
+                        last_updated: std::time::SystemTime::now(),
+                    };
+                    self.pools.insert(pubkey, cache);
+
+                    // Update mint index
+                    self.mint_index
+                        .entry(pool.token_x_mint)
+                        .or_default()
+                        .push(pubkey);
+                    self.mint_index
+                        .entry(pool.token_y_mint)
+                        .or_default()
+                        .push(pubkey);
+
+                    return Ok(Some(pubkey));
+                }
+            }
+        }
+
+        debug!("No DLMM pool found for {}/{}", input_mint, output_mint);
+        Ok(None)
+    }
+
     /// Fetch reserve balances from vaults and update cache
     async fn update_reserve_balances(&self, pool_addr: &Pubkey) -> Result<(u64, u64)> {
         let pool = self
@@ -137,8 +217,8 @@ impl MeteoraDlmm {
         let reserve_in_u128 = reserve_in as u128;
         let reserve_out_u128 = reserve_out as u128;
 
-        let amount_out = (amount_in_after_fee * reserve_out_u128)
-            / (reserve_in_u128 + amount_in_after_fee);
+        let amount_out =
+            (amount_in_after_fee * reserve_out_u128) / (reserve_in_u128 + amount_in_after_fee);
 
         ensure!(
             amount_out < u64::MAX as u128,
@@ -179,17 +259,17 @@ impl MeteoraDlmm {
 #[async_trait]
 impl Dex for MeteoraDlmm {
     /// Refresh pool cache via RPC getProgramAccounts.
-    /// 
+    ///
     /// ⚠️ **RPC FALLBACK ONLY** - Use Geyser-based pool discovery in production!
-    /// 
+    ///
     /// This method exists for:
     /// - Bootstrap/initialization when Geyser is not yet available
     /// - Testing and development
     /// - Fallback when Geyser stream is interrupted
-    /// 
+    ///
     /// In production, pool discovery should happen via `GeyserPoolDiscovery`
     /// which provides real-time pool updates without expensive RPC scans.
-    /// 
+    ///
     /// See: docs/TARGET_ARCHITECTURE.md - "Geyser preferred, RPC only as fallback"
     async fn refresh_pools(&self) -> Result<()> {
         debug!("Fetching Meteora DLMM pools via getProgramAccounts");
@@ -269,21 +349,33 @@ impl Dex for MeteoraDlmm {
         let input_pk = Pubkey::from_str(input_mint)?;
         let output_pk = Pubkey::from_str(output_mint)?;
 
-        // Find pools with both mints
+        // Find pools with both mints from cache
         let input_pools = self.pools_for_mint(&input_pk);
         let output_pools = self.pools_for_mint(&output_pk);
 
-        let matching_pools: Vec<_> = input_pools
+        let mut matching_pools: Vec<_> = input_pools
             .iter()
             .filter(|p| output_pools.contains(p))
+            .copied()
             .collect();
+
+        // If no pool in cache, try on-demand discovery
+        if matching_pools.is_empty() {
+            debug!(
+                "No cached DLMM pool for {}/{}, attempting on-demand discovery",
+                input_mint, output_mint
+            );
+            if let Some(pool_addr) = self.discover_pool_on_demand(&input_pk, &output_pk).await? {
+                matching_pools.push(pool_addr);
+            }
+        }
 
         if matching_pools.is_empty() {
             return Ok(None);
         }
 
         // Use first matching pool (TODO: multi-pool routing in Phase 3)
-        let pool_addr = **matching_pools.first().unwrap();
+        let pool_addr = matching_pools[0];
 
         let pool = self
             .pools
@@ -379,10 +471,7 @@ impl Dex for MeteoraDlmm {
         let mut pairs = Vec::new();
         for entry in self.pools.iter() {
             let pool = &entry.value().pool;
-            pairs.push((
-                pool.token_x_mint.to_string(),
-                pool.token_y_mint.to_string(),
-            ));
+            pairs.push((pool.token_x_mint.to_string(), pool.token_y_mint.to_string()));
         }
         pairs
     }

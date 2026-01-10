@@ -54,29 +54,29 @@ struct PoolCache {
 pub struct CpmmPool {
     /// Status of the pool (0 = uninitialized, 1 = initialized, etc.)
     pub status: u8,
-    
+
     /// Token 0 mint
     pub token_0_mint: Pubkey,
-    
+
     /// Token 1 mint
     pub token_1_mint: Pubkey,
-    
+
     /// Token 0 vault (holds reserves)
     pub token_0_vault: Pubkey,
-    
+
     /// Token 1 vault (holds reserves)
     pub token_1_vault: Pubkey,
-    
+
     /// LP token mint
     pub lp_mint: Pubkey,
-    
+
     /// Fee rate in basis points
     pub fee_rate: u64,
 }
 
 impl CpmmPool {
     /// Parse CPMM pool from raw account data
-    /// 
+    ///
     /// Note: This is a simplified parser. Full implementation requires
     /// verifying exact offsets from Raydium's CPMM SDK or mainnet inspection.
     pub fn parse(data: &[u8]) -> Result<Self> {
@@ -85,53 +85,59 @@ impl CpmmPool {
             "Invalid CPMM pool size: {} (expected at least 200)",
             data.len()
         );
-        
+
         // Anchor discriminator (8 bytes) + status (1 byte)
         let status = data[8];
-        
+
         // Offsets are estimates - need to verify from mainnet
         // Typical Anchor layout: discriminator (8) + struct fields
-        
+
         // Token 0 mint (offset ~16, 32 bytes)
         let token_0_mint = Pubkey::new_from_array(
-            data[16..48].try_into()
-                .map_err(|_| anyhow!("Failed to parse token_0_mint"))?
+            data[16..48]
+                .try_into()
+                .map_err(|_| anyhow!("Failed to parse token_0_mint"))?,
         );
-        
+
         // Token 1 mint (offset ~48, 32 bytes)
         let token_1_mint = Pubkey::new_from_array(
-            data[48..80].try_into()
-                .map_err(|_| anyhow!("Failed to parse token_1_mint"))?
+            data[48..80]
+                .try_into()
+                .map_err(|_| anyhow!("Failed to parse token_1_mint"))?,
         );
-        
+
         // Token 0 vault (offset ~80, 32 bytes)
         let token_0_vault = Pubkey::new_from_array(
-            data[80..112].try_into()
-                .map_err(|_| anyhow!("Failed to parse token_0_vault"))?
+            data[80..112]
+                .try_into()
+                .map_err(|_| anyhow!("Failed to parse token_0_vault"))?,
         );
-        
+
         // Token 1 vault (offset ~112, 32 bytes)
         let token_1_vault = Pubkey::new_from_array(
-            data[112..144].try_into()
-                .map_err(|_| anyhow!("Failed to parse token_1_vault"))?
+            data[112..144]
+                .try_into()
+                .map_err(|_| anyhow!("Failed to parse token_1_vault"))?,
         );
-        
+
         // LP mint (offset ~144, 32 bytes)
         let lp_mint = Pubkey::new_from_array(
-            data[144..176].try_into()
-                .map_err(|_| anyhow!("Failed to parse lp_mint"))?
+            data[144..176]
+                .try_into()
+                .map_err(|_| anyhow!("Failed to parse lp_mint"))?,
         );
-        
+
         // Fee rate (offset ~176, 8 bytes, u64 LE)
         let fee_rate = if data.len() >= 184 {
             u64::from_le_bytes(
-                data[176..184].try_into()
-                    .map_err(|_| anyhow!("Failed to parse fee_rate"))?
+                data[176..184]
+                    .try_into()
+                    .map_err(|_| anyhow!("Failed to parse fee_rate"))?,
             )
         } else {
             2500 // Default: 0.25% = 25 bps
         };
-        
+
         Ok(Self {
             status,
             token_0_mint,
@@ -282,17 +288,17 @@ impl RaydiumCpmm {
 #[async_trait]
 impl Dex for RaydiumCpmm {
     /// Refresh pool cache via RPC getProgramAccounts.
-    /// 
+    ///
     /// ⚠️ **RPC FALLBACK ONLY** - Use Geyser-based pool discovery in production!
-    /// 
+    ///
     /// This method exists for:
     /// - Bootstrap/initialization when Geyser is not yet available
     /// - Testing and development
     /// - Fallback when Geyser stream is interrupted
-    /// 
+    ///
     /// In production, pool discovery should happen via `GeyserPoolDiscovery`
     /// which provides real-time pool updates without expensive RPC scans.
-    /// 
+    ///
     /// See: docs/TARGET_ARCHITECTURE.md - "Geyser preferred, RPC only as fallback"
     async fn refresh_pools(&self) -> Result<()> {
         debug!("Fetching Raydium CPMM pools via getProgramAccounts");
@@ -301,9 +307,7 @@ impl Dex for RaydiumCpmm {
 
         // Filter for CPMM pool accounts
         let config = RpcProgramAccountsConfig {
-            filters: Some(vec![
-                RpcFilterType::DataSize(CPMM_POOL_ACCOUNT_SIZE as u64)
-            ]),
+            filters: Some(vec![RpcFilterType::DataSize(CPMM_POOL_ACCOUNT_SIZE as u64)]),
             account_config: RpcAccountInfoConfig {
                 encoding: Some(UiAccountEncoding::Base64),
                 data_slice: None,
@@ -357,9 +361,7 @@ impl Dex for RaydiumCpmm {
 
                     debug!(
                         "Loaded CPMM pool: {} ({}/{})",
-                        pubkey,
-                        pool.token_0_mint,
-                        pool.token_1_mint
+                        pubkey, pool.token_0_mint, pool.token_1_mint
                     );
                 }
                 Err(e) => {
@@ -381,14 +383,11 @@ impl Dex for RaydiumCpmm {
         let output_mint_pk = Pubkey::from_str(output_mint)?;
 
         // Find pool for this pair
-        let pool_entry = self
-            .pools
-            .iter()
-            .find(|entry| {
-                let cache = entry.value();
-                (cache.token_0_mint == input_mint_pk && cache.token_1_mint == output_mint_pk)
-                    || (cache.token_0_mint == output_mint_pk && cache.token_1_mint == input_mint_pk)
-            });
+        let pool_entry = self.pools.iter().find(|entry| {
+            let cache = entry.value();
+            (cache.token_0_mint == input_mint_pk && cache.token_1_mint == output_mint_pk)
+                || (cache.token_0_mint == output_mint_pk && cache.token_1_mint == input_mint_pk)
+        });
 
         let pool_entry = match pool_entry {
             Some(entry) => entry,
@@ -484,10 +483,7 @@ impl Dex for RaydiumCpmm {
         let mut pairs = Vec::new();
         for entry in self.pools.iter() {
             let pool = entry.value();
-            pairs.push((
-                pool.token_0_mint.to_string(),
-                pool.token_1_mint.to_string(),
-            ));
+            pairs.push((pool.token_0_mint.to_string(), pool.token_1_mint.to_string()));
         }
         pairs
     }
@@ -515,32 +511,32 @@ mod tests {
     fn test_pool_parse() {
         // Create minimal valid pool data (200 bytes)
         let mut data = vec![0u8; 200];
-        
+
         // Discriminator (8 bytes) + status (1 byte)
         data[8] = 1; // status = initialized
-        
+
         // Token mints (random valid pubkeys)
         let token_0 = Pubkey::new_unique();
         let token_1 = Pubkey::new_unique();
         data[16..48].copy_from_slice(&token_0.to_bytes());
         data[48..80].copy_from_slice(&token_1.to_bytes());
-        
+
         // Vaults
         let vault_0 = Pubkey::new_unique();
         let vault_1 = Pubkey::new_unique();
         data[80..112].copy_from_slice(&vault_0.to_bytes());
         data[112..144].copy_from_slice(&vault_1.to_bytes());
-        
+
         // LP mint
         let lp_mint = Pubkey::new_unique();
         data[144..176].copy_from_slice(&lp_mint.to_bytes());
-        
+
         // Fee rate (25 bps = 2500 in raw)
         let fee_rate: u64 = 2500;
         data[176..184].copy_from_slice(&fee_rate.to_le_bytes());
-        
+
         let pool = CpmmPool::parse(&data).expect("Parse failed");
-        
+
         assert_eq!(pool.status, 1);
         assert_eq!(pool.token_0_mint, token_0);
         assert_eq!(pool.token_1_mint, token_1);

@@ -100,7 +100,7 @@ impl BinWalker {
             let k = bin.amount_x as u128 * bin.amount_y as u128;
             let new_x = bin.amount_x as u128 + remaining_in as u128;
             let new_y = k / new_x;
-            
+
             // Amount of Y we get out
             let amount_out_from_bin = bin.amount_y.saturating_sub(new_y as u64);
 
@@ -112,7 +112,7 @@ impl BinWalker {
             let actual_out = min(amount_out_from_bin, max_available_y);
 
             total_out = total_out.saturating_add(actual_out);
-            
+
             // Calculate how much input was actually consumed
             if actual_out < amount_out_from_bin {
                 // Partial fill - recalculate consumed input
@@ -124,7 +124,7 @@ impl BinWalker {
                 // Full fill - consumed all remaining_in
                 remaining_in = 0;
             }
-            
+
             bins_crossed += 1;
 
             if remaining_in == 0 {
@@ -173,7 +173,7 @@ impl BinWalker {
             let k = bin.amount_x as u128 * bin.amount_y as u128;
             let new_y = bin.amount_y as u128 + remaining_in as u128;
             let new_x = k / new_y;
-            
+
             let amount_out_from_bin = bin.amount_x.saturating_sub(new_x as u64);
 
             if amount_out_from_bin == 0 {
@@ -183,7 +183,7 @@ impl BinWalker {
             let actual_out = min(amount_out_from_bin, max_available_x);
 
             total_out = total_out.saturating_add(actual_out);
-            
+
             if actual_out < amount_out_from_bin {
                 let actual_new_x = bin.amount_x.saturating_sub(actual_out);
                 let actual_new_y = k / actual_new_x as u128;
@@ -192,7 +192,7 @@ impl BinWalker {
             } else {
                 remaining_in = 0;
             }
-            
+
             bins_crossed += 1;
 
             if remaining_in == 0 {

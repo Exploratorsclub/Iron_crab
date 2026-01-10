@@ -28,9 +28,9 @@ use uuid::Uuid;
 
 use ironcrab::config::Config as AppConfig;
 use ironcrab::ipc::{
-    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus,
-    ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind, TradeIntent,
-    TradeResources, TradeSide, TradingRegime,
+    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
+    IntentTier, MarketEvent, MarketEventKind, TradeIntent, TradeResources, TradeSide,
+    TradingRegime,
 };
 use ironcrab::metrics::{
     serve_metrics, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL,
@@ -136,8 +136,8 @@ const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
 // Maximum reasonable spread before considering it a data error
 const MAX_REASONABLE_SPREAD_BPS: i64 = 1000; // 10%
-const STABLECOIN_MAX_SPREAD_BPS: i64 = 200;  // 2% for stablecoins
-const MAX_PRICE_AGE_SECS: u64 = 10;           // 10s max price staleness
+const STABLECOIN_MAX_SPREAD_BPS: i64 = 200; // 2% for stablecoins
+const MAX_PRICE_AGE_SECS: u64 = 10; // 10s max price staleness
 const MIN_TRADE_VOLUME_LAMPORTS: u64 = 100_000; // 0.0001 SOL minimum (filter dust)
 
 fn is_known_dex_label(dex: &str) -> bool {
@@ -338,17 +338,15 @@ impl TokenArbTracker {
 
         // Estimate profit
         // Use smaller liquidity pool as constraint (fallback to max_position if liquidity unknown)
-        let max_trade_sol = if buy_pool.liquidity_sol > Decimal::ZERO
-            && sell_pool.liquidity_sol > Decimal::ZERO
-        {
-            buy_pool
-                .liquidity_sol
-                .min(sell_pool.liquidity_sol)
-                .min(Decimal::from(config.max_position_lamports) / Decimal::from(1_000_000_000u64))
-        } else {
-            // Liquidity unknown (trade-based pools) - use max_position as conservative estimate
-            Decimal::from(config.max_position_lamports) / Decimal::from(1_000_000_000u64)
-        };
+        let max_trade_sol =
+            if buy_pool.liquidity_sol > Decimal::ZERO && sell_pool.liquidity_sol > Decimal::ZERO {
+                buy_pool.liquidity_sol.min(sell_pool.liquidity_sol).min(
+                    Decimal::from(config.max_position_lamports) / Decimal::from(1_000_000_000u64),
+                )
+            } else {
+                // Liquidity unknown (trade-based pools) - use max_position as conservative estimate
+                Decimal::from(config.max_position_lamports) / Decimal::from(1_000_000_000u64)
+            };
 
         // Gross profit = trade_amount * spread_pct
         let gross_profit = max_trade_sol * (spread / Decimal::from(10000));
@@ -361,18 +359,18 @@ impl TokenArbTracker {
 
         // Net profit after tx costs
         let net_profit = gross_profit_lamports.saturating_sub(config.est_tx_cost_lamports);
-        
+
         // LIQUIDITY VALIDATION: For trade-discovered pools (liquidity=0), require higher profit threshold
         // This compensates for unknown actual liquidity and reduces risk
-        let effective_min_profit = if buy_pool.liquidity_sol <= Decimal::ZERO 
-            || sell_pool.liquidity_sol <= Decimal::ZERO 
+        let effective_min_profit = if buy_pool.liquidity_sol <= Decimal::ZERO
+            || sell_pool.liquidity_sol <= Decimal::ZERO
         {
             // Require 5x normal profit for unknown liquidity pools
             config.min_profit_lamports * 5
         } else {
             config.min_profit_lamports
         };
-        
+
         if buy_pool.liquidity_sol <= Decimal::ZERO || sell_pool.liquidity_sol <= Decimal::ZERO {
             debug!(
                 mint = %self.base_mint,
@@ -453,7 +451,7 @@ struct ArbContext {
     opportunities_found: AtomicU64,
     intents_generated: AtomicU64,
     intent_counter: AtomicU64,
-    
+
     // Data quality metrics
     zero_amount_trades: AtomicU64,
     data_quality_rejects: AtomicU64,
@@ -652,7 +650,7 @@ impl ArbContext {
             );
             return None;
         }
-        
+
         // DATA QUALITY: Filter dust trades (< 0.0001 SOL)
         if sol_amount < MIN_TRADE_VOLUME_LAMPORTS {
             debug!(
@@ -737,18 +735,18 @@ impl ArbContext {
 
         // Check for arbitrage opportunity
         if let Some(opp) = tracker.check_arbitrage(&config) {
-                // Check cooldown
-                let cooldown = Duration::from_millis(config.intent_cooldown_ms);
-                if let Some(last_time) = tracker.last_intent_time {
-                    if last_time.elapsed() < cooldown {
-                        return None;
-                    }
+            // Check cooldown
+            let cooldown = Duration::from_millis(config.intent_cooldown_ms);
+            if let Some(last_time) = tracker.last_intent_time {
+                if last_time.elapsed() < cooldown {
+                    return None;
                 }
-
-                tracker.last_intent_time = Some(Instant::now());
-                self.opportunities_found.fetch_add(1, Ordering::Relaxed);
-                return Some(opp);
             }
+
+            tracker.last_intent_time = Some(Instant::now());
+            self.opportunities_found.fetch_add(1, Ordering::Relaxed);
+            return Some(opp);
+        }
 
         None
     }
@@ -1101,7 +1099,11 @@ async fn main() -> Result<()> {
 async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<TradeIntent> {
     // Debug: Log event type to verify Trade events are arriving
     match &event.kind {
-        MarketEventKind::Trade { sol_amount, token_amount, .. } => {
+        MarketEventKind::Trade {
+            sol_amount,
+            token_amount,
+            ..
+        } => {
             info!(sol_amount, token_amount, "Received Trade event");
         }
         MarketEventKind::PoolCreated { .. } => {
@@ -1133,9 +1135,15 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             dex,
             ..
         } => {
-            if let Some(opp) =
-                ctx.handle_trade(pool_address, mint, *sol_amount, *token_amount, *token_decimals, *is_buy, dex)
-            {
+            if let Some(opp) = ctx.handle_trade(
+                pool_address,
+                mint,
+                *sol_amount,
+                *token_amount,
+                *token_decimals,
+                *is_buy,
+                dex,
+            ) {
                 // Prometheus: count arbitrage opportunities detected
                 ARB_TRIANGLE_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
                 info!(

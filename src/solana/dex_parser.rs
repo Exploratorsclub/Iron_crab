@@ -316,8 +316,8 @@ fn parse_raydium_swap(
             .unwrap_or_default()
     };
 
-    let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
-        .unwrap_or_default(); // SOL
+    let quote_mint =
+        Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default(); // SOL
 
     // Calculate actual amounts from token balance changes
     let (sol_amount, token_amount) = if is_buy {
@@ -481,8 +481,8 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
             .unwrap_or_default()
     };
 
-    let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
-        .unwrap_or_default(); // SOL
+    let quote_mint =
+        Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default(); // SOL
 
     // Calculate actual amounts from token balance changes
     let (sol_amount, token_amount) = if is_buy {
@@ -644,8 +644,8 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
     let token_amount_param = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
     let _sol_limit = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
 
-    let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
-        .unwrap_or_default();
+    let quote_mint =
+        Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default();
 
     // Calculate actual amounts from native and token balance changes
     // SOL is native balance, tokens from token_balances
@@ -656,14 +656,16 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
             &update.pre_balances,
             &update.post_balances,
             &trader,
-        ).unwrap_or(0);
-        
+        )
+        .unwrap_or(0);
+
         let tokens_received = calculate_token_balance_change(
             &update.pre_token_balances,
             &update.post_token_balances,
             &mint,
-        ).unwrap_or(0);
-        
+        )
+        .unwrap_or(0);
+
         (sol_spent, tokens_received)
     } else {
         // SELL: Calculate SOL received from native balance
@@ -672,8 +674,9 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
             &update.pre_balances,
             &update.post_balances,
             &trader,
-        ).unwrap_or(0);
-        
+        )
+        .unwrap_or(0);
+
         (sol_received, token_amount_param)
     };
 
@@ -761,8 +764,9 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
             &update.pre_token_balances,
             &update.post_token_balances,
             &base_mint,
-        ).unwrap_or(0);
-        
+        )
+        .unwrap_or(0);
+
         // Extract SOL spent from native balance (user account decreased)
         let sol_spent = calculate_native_balance_change(
             &update.account_keys,
@@ -771,7 +775,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
             &trader,
         )
         .unwrap_or(amount_in); // Fallback to instruction amount
-        
+
         (sol_spent, tokens_received)
     } else {
         // SELL: amount_in is tokens, need to calculate WSOL received from native balance
@@ -782,7 +786,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
             &trader,
         )
         .unwrap_or(0);
-        
+
         (sol_received, amount_in)
     };
 
@@ -841,33 +845,36 @@ fn calculate_token_balance_change(
     mint: &Pubkey,
 ) -> Option<u64> {
     let mint_str = mint.to_string();
-    
+
     // For Jupiter/aggregator trades, there may be multiple token accounts for the same mint
     // (e.g., trader's ATA + pool's token vault). We need to find the one that actually changed.
     // Strategy: Find the account with the largest absolute balance change
-    
+
     let mut max_change: u64 = 0;
-    
+
     for post in post_balances.iter().filter(|b| b.mint == mint_str) {
         let post_amount = post.ui_token_amount.amount.parse::<u64>().ok()?;
-        
+
         // Find matching pre balance by account_index
-        if let Some(pre) = pre_balances.iter().find(|b| b.account_index == post.account_index) {
+        if let Some(pre) = pre_balances
+            .iter()
+            .find(|b| b.account_index == post.account_index)
+        {
             let pre_amount = pre.ui_token_amount.amount.parse::<u64>().ok()?;
-            
+
             // Calculate absolute change
             let change = if post_amount > pre_amount {
-                post_amount - pre_amount  // Tokens received
+                post_amount - pre_amount // Tokens received
             } else {
-                pre_amount - post_amount  // Tokens sent
+                pre_amount - post_amount // Tokens sent
             };
-            
+
             if change > max_change {
                 max_change = change;
             }
         }
     }
-    
+
     if max_change > 0 {
         Some(max_change)
     } else {
@@ -886,11 +893,11 @@ fn calculate_native_balance_change(
 ) -> Option<u64> {
     // Find account index in account_keys
     let account_index = account_keys.iter().position(|k| k == account)?;
-    
+
     // Get pre and post native balances (lamports)
     let pre = *pre_balances.get(account_index)?;
     let post = *post_balances.get(account_index)?;
-    
+
     // Return absolute difference
     // For SELL: post > pre (user receives SOL)
     // For BUY: pre > post (user spends SOL)
@@ -1038,8 +1045,8 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
     let _min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
 
     // Determine direction from balance changes
-    let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
-        .unwrap_or_default();
+    let quote_mint =
+        Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default();
 
     // Find which token increased (that's what user received)
     let base_mint = update
@@ -1160,8 +1167,8 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
     let vault_0_mint = update.instruction_accounts.get(10).copied()?;
     let vault_1_mint = update.instruction_accounts.get(11).copied()?;
 
-    let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
-        .unwrap_or_default();
+    let quote_mint =
+        Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default();
 
     // Determine which is base (non-SOL) and which is quote (SOL)
     let (base_mint, is_buy) = if vault_0_mint == quote_mint {

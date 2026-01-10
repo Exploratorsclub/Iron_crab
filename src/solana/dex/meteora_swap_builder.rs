@@ -86,14 +86,14 @@ impl MeteoraDlmmSwapBuilder {
         // Note: This is a simplified version without bin arrays
         // Use build_swap_with_bins() for full version
         let accounts = vec![
-            AccountMeta::new(*lb_pair, false),          // LB Pair (writable)
-            AccountMeta::new(*reserve_x, false),        // Reserve X (writable)
-            AccountMeta::new(*reserve_y, false),        // Reserve Y (writable)
-            AccountMeta::new(*user_token_x, false),     // User token X (writable)
-            AccountMeta::new(*user_token_y, false),     // User token Y (writable)
-            AccountMeta::new_readonly(*user, true),     // User (signer)
+            AccountMeta::new(*lb_pair, false),      // LB Pair (writable)
+            AccountMeta::new(*reserve_x, false),    // Reserve X (writable)
+            AccountMeta::new(*reserve_y, false),    // Reserve Y (writable)
+            AccountMeta::new(*user_token_x, false), // User token X (writable)
+            AccountMeta::new(*user_token_y, false), // User token Y (writable)
+            AccountMeta::new_readonly(*user, true), // User (signer)
             AccountMeta::new_readonly(token_program, false), // Token program
-            // Note: Bin array accounts should be added via build_swap_with_bins
+                                                    // Note: Bin array accounts should be added via build_swap_with_bins
         ];
 
         Ok(Instruction {
@@ -180,19 +180,19 @@ impl MeteoraDlmmSwapBuilder {
         bin_step: u16,
     ) -> Result<Vec<BinArray>> {
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
-        
+
         // Calculate which bin arrays we need based on active_id
         // We fetch ±3 arrays around the active bin to handle larger swaps
         let active_array_index = Self::bin_id_to_bin_array_index(active_id);
         let array_indices: Vec<i64> = (active_array_index - 3..=active_array_index + 3).collect();
-        
+
         let mut bin_arrays = Vec::new();
-        
+
         // Method 1: Direct PDA derivation (faster, but needs all possible indices)
         // We try to fetch known PDAs directly
         for index in &array_indices {
             let pda = Self::derive_bin_array_pda(lb_pair, *index)?;
-            
+
             if let Ok(account) = self.rpc.get_account_retry(&pda).await {
                 if account.data.len() >= 56 {
                     if let Ok(bin_array) = BinArray::parse(&account.data, bin_step) {
@@ -201,7 +201,7 @@ impl MeteoraDlmmSwapBuilder {
                 }
             }
         }
-        
+
         // Method 2: getProgramAccounts with memcmp filter (slower, but comprehensive)
         // Only use if direct fetches didn't return enough data
         if bin_arrays.len() < 2 {
@@ -211,7 +211,7 @@ impl MeteoraDlmmSwapBuilder {
                 24, // offset of lb_pair in BinArray
                 MemcmpEncodedBytes::Base58(lb_pair.to_string()),
             );
-            
+
             let config = RpcProgramAccountsConfig {
                 filters: Some(vec![RpcFilterType::Memcmp(memcmp)]),
                 account_config: RpcAccountInfoConfig {
@@ -223,8 +223,12 @@ impl MeteoraDlmmSwapBuilder {
                 with_context: None,
                 sort_results: None,
             };
-            
-            if let Ok(accounts) = self.rpc.get_program_accounts_with_config_retry(&program_id, config).await {
+
+            if let Ok(accounts) = self
+                .rpc
+                .get_program_accounts_with_config_retry(&program_id, config)
+                .await
+            {
                 for (_pubkey, account) in accounts {
                     if let Ok(bin_array) = BinArray::parse(&account.data, bin_step) {
                         // Only include arrays near the active bin
@@ -235,7 +239,7 @@ impl MeteoraDlmmSwapBuilder {
                 }
             }
         }
-        
+
         Ok(bin_arrays)
     }
 
@@ -244,7 +248,7 @@ impl MeteoraDlmmSwapBuilder {
     /// Seed format: [b"bin_array", lb_pair.as_ref(), &bin_array_index.to_le_bytes()]
     pub fn derive_bin_array_pda(lb_pair: &Pubkey, bin_array_index: i64) -> Result<Pubkey> {
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
-        
+
         let (pda, _bump) = Pubkey::find_program_address(
             &[
                 b"bin_array",
@@ -253,7 +257,7 @@ impl MeteoraDlmmSwapBuilder {
             ],
             &program_id,
         );
-        
+
         Ok(pda)
     }
 
@@ -275,13 +279,13 @@ mod tests {
     fn test_bin_array_index_calculation() {
         // Bin 0 -> array 0
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(0), 0);
-        
+
         // Bin 69 -> array 0 (last bin in first array)
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(69), 0);
-        
+
         // Bin 70 -> array 1 (first bin in second array)
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(70), 1);
-        
+
         // Negative bins
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(-1), 0);
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(-70), -1);
@@ -290,12 +294,12 @@ mod tests {
     #[test]
     fn test_derive_bin_array_pda() {
         let lb_pair = Pubkey::new_unique();
-        
+
         // Should derive deterministically
         let pda1 = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&lb_pair, 0).unwrap();
         let pda2 = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&lb_pair, 0).unwrap();
         assert_eq!(pda1, pda2);
-        
+
         // Different indices should give different PDAs
         let pda3 = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&lb_pair, 1).unwrap();
         assert_ne!(pda1, pda3);

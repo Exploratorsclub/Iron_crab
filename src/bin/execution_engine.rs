@@ -337,7 +337,13 @@ async fn compute_intent_fills_best_effort(
         None
     };
 
-    (fill_in, fill_out, fill_status, fill_unavailable_reason, wallet_sol_delta)
+    (
+        fill_in,
+        fill_out,
+        fill_status,
+        fill_unavailable_reason,
+        wallet_sol_delta,
+    )
 }
 
 async fn discover_wallet_open_positions(rpc: &SolanaRpc, owner: Pubkey) -> anyhow::Result<usize> {
@@ -2588,8 +2594,8 @@ async fn main() -> Result<()> {
     // ARB_HANDLER_NOT_CONFIGURED.
     {
         let user_pk = ctx.treasury.as_ref().map(|t| t.pubkey());
-        let mut handler = CrossDexHandler::new(Arc::clone(&ctx.rpc), user_pk)
-            .with_rpc_url(ctx.rpc_url.clone());
+        let mut handler =
+            CrossDexHandler::new(Arc::clone(&ctx.rpc), user_pk).with_rpc_url(ctx.rpc_url.clone());
         match handler.init_dexes().await {
             Ok(()) => {
                 ctx.cross_dex_handler = Some(Arc::new(handler));
@@ -3620,13 +3626,15 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             let micro_lamports_per_cu = fee_policy.priority_fee_for_intent(&intent);
 
             let mut ixs = Vec::new();
-            ixs.push(ironcrab::solana::compute_budget_helper::set_compute_unit_limit(
-                compute_units,
-            ));
+            ixs.push(
+                ironcrab::solana::compute_budget_helper::set_compute_unit_limit(compute_units),
+            );
             if micro_lamports_per_cu > 0 {
-                ixs.push(ironcrab::solana::compute_budget_helper::set_compute_unit_price(
-                    micro_lamports_per_cu,
-                ));
+                ixs.push(
+                    ironcrab::solana::compute_budget_helper::set_compute_unit_price(
+                        micro_lamports_per_cu,
+                    ),
+                );
             }
             ixs.extend(plan.buy_instructions);
             ixs.extend(plan.sell_instructions);
@@ -3671,7 +3679,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         details: Some(u.details),
                     });
                     ctx.lock_manager.release_locks(&intent.intent_id);
-                    return emit_rejected_decision(ctx, decision_id, &intent, checks, u.reason).await;
+                    return emit_rejected_decision(ctx, decision_id, &intent, checks, u.reason)
+                        .await;
                 }
             }
         }

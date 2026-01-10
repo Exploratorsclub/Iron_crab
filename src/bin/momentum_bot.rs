@@ -3414,13 +3414,16 @@ async fn generate_and_publish_buy_intent(
     );
 
     // Pump.fun and PumpSwap tx building require the creator/dev wallet.
-    if signal.dex == "pumpfun" 
+    if signal.dex == "pumpfun"
         || signal.dex.eq_ignore_ascii_case("pump_amm")
         || signal.dex.eq_ignore_ascii_case("pumpswap")
-        || signal.dex.eq_ignore_ascii_case("PumpFunAmm") 
+        || signal.dex.eq_ignore_ascii_case("PumpFunAmm")
     {
         let creator = creator_opt.ok_or_else(|| {
-            anyhow::anyhow!("cannot generate {} intent: missing dev_wallet/creator", signal.dex)
+            anyhow::anyhow!(
+                "cannot generate {} intent: missing dev_wallet/creator",
+                signal.dex
+            )
         })?;
         intent.metadata.insert("creator".to_string(), creator);
     }
@@ -4207,7 +4210,7 @@ async fn generate_and_publish_exit_intent(
         .insert("exit_type".to_string(), exit_type.to_string());
 
     // Pump.fun and PumpSwap sell tx building require the creator/dev wallet.
-    if dex == "pumpfun" 
+    if dex == "pumpfun"
         || dex.eq_ignore_ascii_case("pump_amm")
         || dex.eq_ignore_ascii_case("pumpswap")
         || dex.eq_ignore_ascii_case("PumpFunAmm")
@@ -4336,7 +4339,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             // P1: Trade-based Token Discovery
             // If we missed the PoolCreated event (Geyser filter issues), discover via first trade
             let tracker_exists = ctx.token_trackers.read().contains_key(mint);
-            
+
             if !tracker_exists && *is_buy && *sol_amount > 0 {
                 // Use DEX from event if available, otherwise infer from pool_address pattern
                 let slot = event.slot.unwrap_or(0);
@@ -4347,7 +4350,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 } else {
                     "pumpfun" // Default assumption for Bonding Curve
                 };
-                
+
                 debug!(
                     mint = %mint,
                     pool = %pool_address,
@@ -4355,7 +4358,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     sol = *sol_amount,
                     "🔍 Trade-based discovery: PoolCreated was missed, initializing from trade"
                 );
-                
+
                 // Initialize tracker with a conservative/default initial liquidity.
                 // PumpFun bonding curve starts with a known ~30 SOL seed; if we missed the
                 // PoolCreated event, we still want liquidity gating to behave as expected.
@@ -4367,7 +4370,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
 
                 let created =
                     ctx.get_or_create_tracker(mint, pool_address, dex, slot, initial_liq_lamports);
-                
+
                 if created {
                     info!(
                         mint = %mint,

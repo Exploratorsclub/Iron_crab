@@ -9,9 +9,7 @@
 //! This module is used by execution-engine to process arb-strategy intents.
 
 use anyhow::{anyhow, Result};
-use solana_sdk::{
-    instruction::Instruction, pubkey::Pubkey,
-};
+use solana_sdk::{instruction::Instruction, pubkey::Pubkey};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -19,12 +17,8 @@ use tracing::{debug, info, warn};
 
 use crate::ipc::TradeIntent;
 use crate::solana::dex::{
-    pumpfun::PumpFunDex, 
-    pumpfun_amm::PumpFunAmmDex,
-    meteora_dlmm::MeteoraDlmm,
-    raydium::Raydium, 
-    Dex, 
-    Quote
+    meteora_dlmm::MeteoraDlmm, pumpfun::PumpFunDex, pumpfun_amm::PumpFunAmmDex, raydium::Raydium,
+    Dex, Quote,
 };
 use crate::solana::rpc::SolanaRpc;
 
@@ -150,11 +144,12 @@ impl CrossDexHandler {
         // Initialize PumpSwap AMM (pump_amm)
         if let Some(ref rpc_url) = self.rpc_url {
             let pump_amm = PumpFunAmmDex::new(
-                Arc::clone(&self.rpc), 
-                rpc_url.clone(), 
-                None // No separate Helius URL for now
+                Arc::clone(&self.rpc),
+                rpc_url.clone(),
+                None, // No separate Helius URL for now
             );
-            self.dexes.insert("pump_amm".to_string(), Arc::new(pump_amm));
+            self.dexes
+                .insert("pump_amm".to_string(), Arc::new(pump_amm));
             info!("Initialized PumpSwap AMM (pump_amm) DEX connector");
         } else {
             warn!("PumpSwap AMM not initialized: RPC URL not provided");
@@ -162,7 +157,8 @@ impl CrossDexHandler {
 
         // Initialize Meteora DLMM
         let meteora = MeteoraDlmm::new(Arc::clone(&self.rpc));
-        self.dexes.insert("meteora_dlmm".to_string(), Arc::new(meteora));
+        self.dexes
+            .insert("meteora_dlmm".to_string(), Arc::new(meteora));
         info!("Initialized Meteora DLMM DEX connector");
 
         // TODO: Add Orca Whirlpool
@@ -429,16 +425,16 @@ impl CrossDexHandler {
 
         // Prefer explicit metadata set by arb-strategy.
         // The identify_dex() heuristic is a stub and must not be the primary routing source.
-        let buy_dex = intent
-            .metadata
-            .get("buy_dex")
-            .cloned()
-            .unwrap_or_else(|| self.identify_dex(&pools[0]).map(|(d, _)| d).unwrap_or_default());
-        let sell_dex = intent
-            .metadata
-            .get("sell_dex")
-            .cloned()
-            .unwrap_or_else(|| self.identify_dex(&pools[1]).map(|(d, _)| d).unwrap_or_default());
+        let buy_dex = intent.metadata.get("buy_dex").cloned().unwrap_or_else(|| {
+            self.identify_dex(&pools[0])
+                .map(|(d, _)| d)
+                .unwrap_or_default()
+        });
+        let sell_dex = intent.metadata.get("sell_dex").cloned().unwrap_or_else(|| {
+            self.identify_dex(&pools[1])
+                .map(|(d, _)| d)
+                .unwrap_or_default()
+        });
 
         if buy_dex.is_empty() || sell_dex.is_empty() {
             return Err(anyhow!(
@@ -496,12 +492,8 @@ impl CrossDexHandler {
 
         // IMPORTANT: sell the guaranteed minimum tokens (buy_min_out), not the optimistic
         // quoted output. Otherwise the second leg may fail due to insufficient token balance.
-        let sell_instructions = sell_connector.build_swap_ix(
-            token_mint,
-            SOL_MINT,
-            buy_min_out,
-            sell_min_out,
-        )?;
+        let sell_instructions =
+            sell_connector.build_swap_ix(token_mint, SOL_MINT, buy_min_out, sell_min_out)?;
 
         // Estimate compute units
         let total_cu = 200_000 * 2; // ~200k per swap

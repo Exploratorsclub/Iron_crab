@@ -56,7 +56,11 @@ async fn test_meteora_dlmm_quote_wsol_usdc() {
 
     if let Some(q) = quote {
         println!("Quote for 1 SOL -> USDC:");
-        println!("  Amount out: {} (~${:.2})", q.amount_out, q.amount_out as f64 / 1_000_000.0);
+        println!(
+            "  Amount out: {} (~${:.2})",
+            q.amount_out,
+            q.amount_out as f64 / 1_000_000.0
+        );
         println!("  Price impact: {} bps", q.price_impact_bps);
         println!("  Fee: {} bps", q.fee_bps);
         println!("  Route: {:?}", q.route);
