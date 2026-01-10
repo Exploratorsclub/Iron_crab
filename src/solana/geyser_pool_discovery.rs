@@ -133,6 +133,7 @@ impl GeyserPoolDiscovery {
             "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" => DexType::RaydiumAmmV4,
             "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C" => DexType::RaydiumCpmm,
             "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" => DexType::OrcaWhirlpool,
+            "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo" => DexType::MeteoraDlmm,
             "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" => {
                 // Pump.fun: TX-based discovery is faster and simpler
                 // We don't need account updates for Pump.fun anymore
@@ -152,6 +153,7 @@ impl GeyserPoolDiscovery {
             DexType::RaydiumAmmV4 => Self::parse_raydium_pool(&update.data),
             DexType::RaydiumCpmm => Self::parse_raydium_cpmm_pool(&update.data),
             DexType::OrcaWhirlpool => Self::parse_orca_pool(&update.data),
+            DexType::MeteoraDlmm => Self::parse_meteora_dlmm_pool(&update.data),
             DexType::PumpFun => {
                 // Should never reach here due to early return above
                 return None;
@@ -290,9 +292,9 @@ impl GeyserPoolDiscovery {
                     discovered_at_ms,
                 })
             }
-            DexType::RaydiumAmmV4 | DexType::RaydiumCpmm | DexType::OrcaWhirlpool => {
-                // Raydium/Orca: TX-based discovery not implemented yet
-                // We use account-based discovery for these
+            DexType::RaydiumAmmV4 | DexType::RaydiumCpmm | DexType::OrcaWhirlpool | DexType::MeteoraDlmm => {
+                // Raydium/Orca/Meteora: TX-based discovery not implemented yet
+                // We use account-based discovery for these (more efficient)
                 None
             }
         }
@@ -426,6 +428,68 @@ impl GeyserPoolDiscovery {
         })
     }
 
+    /// Parse Meteora DLMM pool account (LB Pair - 904 bytes)
+    /// Source: Meteora DLMM program (LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo)
+    fn parse_meteora_dlmm_pool(data: &[u8]) -> Option<PoolData> {
+        // Meteora DLMM LB Pair account size: 904 bytes
+        if data.len() != 904 {
+            tracing::debug!(len = data.len(), "geyser_pool_discovery: ignoring Meteora DLMM account (wrong size)");
+            return None;
+        }
+
+        // Use existing parser from meteora_dlmm_layout
+        let parsed = crate::solana::dex::meteora_dlmm_layout::DlmmPool::parse(data).ok()?;
+
+        // Sanity check: mints should not be zero
+        if parsed.token_x_mint.to_bytes() == [0u8; 32] || parsed.token_y_mint.to_bytes() == [0u8; 32] {
+            tracing::debug!("geyser_pool_discovery: Meteora DLMM pool has zero mints");
+            return None;
+        }
+
+        // Determine which is base and which is quote (SOL is usually quote)
+        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+            .unwrap_or_else(|_| Pubkey::new_from_array([0u8; 32]));
+
+        let (base_mint, quote_mint, coin_vault, pc_vault) = if parsed.token_y_mint == sol_mint {
+            // Token Y is SOL (quote), Token X is base
+            (parsed.token_x_mint, parsed.token_y_mint, parsed.reserve_x, parsed.reserve_y)
+        } else if parsed.token_x_mint == sol_mint {
+            // Token X is SOL (quote), Token Y is base
+            (parsed.token_y_mint, parsed.token_x_mint, parsed.reserve_y, parsed.reserve_x)
+        } else {
+            // Neither is SOL, use token_x as base by convention
+            (parsed.token_x_mint, parsed.token_y_mint, parsed.reserve_x, parsed.reserve_y)
+        };
+
+        // Estimate liquidity from bin parameters
+        // liquidity (u128) represents concentrated liquidity at active bin
+        let liquidity_lamports = if parsed.active_id > 0 && parsed.bin_step > 0 {
+            // Conservative estimate based on active bin liquidity
+            // Real reserves will be fetched from vaults in background
+            (parsed.active_id as u64).saturating_mul(1_000_000).min(100_000_000_000) // Cap at 100 SOL
+        } else {
+            5_000_000_000 // 5 SOL default
+        };
+
+        tracing::info!(
+            token_x=%parsed.token_x_mint,
+            token_y=%parsed.token_y_mint,
+            active_id=parsed.active_id,
+            bin_step=parsed.bin_step,
+            "geyser_pool_discovery: Meteora DLMM pool parsed"
+        );
+
+        Some(PoolData {
+            base_mint,
+            quote_mint,
+            base_decimals: 9, // Will be fetched from mint
+            quote_decimals: 9,
+            liquidity_lamports,
+            coin_vault: Some(coin_vault),
+            pc_vault: Some(pc_vault),
+        })
+    }
+
     /// Parse Orca Whirlpool account
     fn parse_orca_pool(data: &[u8]) -> Option<PoolData> {
         // Use existing orca_whirlpool_layout parser
@@ -534,6 +598,7 @@ pub enum DexType {
     RaydiumAmmV4,
     RaydiumCpmm,
     OrcaWhirlpool,
+    MeteoraDlmm,
     PumpFun,
 }
 
@@ -543,6 +608,7 @@ impl std::fmt::Display for DexType {
             DexType::RaydiumAmmV4 => write!(f, "Raydium"),
             DexType::RaydiumCpmm => write!(f, "RaydiumCPMM"),
             DexType::OrcaWhirlpool => write!(f, "Orca"),
+            DexType::MeteoraDlmm => write!(f, "MeteoraDLMM"),
             DexType::PumpFun => write!(f, "PumpFun"),
         }
     }

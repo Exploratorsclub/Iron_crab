@@ -28,13 +28,27 @@ Abnahme: Siehe `docs/DEFINITION_OF_DONE.md`.
 
 Aufgabe: **einmalige** Markt-Daten-Ingestion und Normalisierung.
 
-- Geyser ingest (prefered), optional RPC/WS fallback
-- Pool/Account Cache (in-memory)
-- Normalisierte `MarketEvents` publizieren (NATS)
-- **Discovery Worker**: erkennt neue Mints/Pools als Events/Features (kein Buy)
+**Pool Discovery (Geyser-First):**
+- **PRIMARY**: `GeyserPoolDiscovery` für Echtzeit-Pool-Discovery
+  - Raydium AMM V4, CPMM
+  - Orca Whirlpool
+  - Meteora DLMM
+  - PumpFun (TX-based)
+- **FALLBACK**: RPC `getProgramAccounts` nur für Bootstrap/Offline-Analyse
+  - **NICHT** für laufenden Produktionsbetrieb (zu langsam, zu teuer)
 
-Output:
-- `MarketEvents` (Pub/Sub)
+**Datenquellen:**
+- **Geyser gRPC** (primary): Account/Transaction Updates in Echtzeit (<10ms Latenz)
+- **RPC/WS** (fallback): Nur für Daten die Geyser nicht liefert:
+  - Token Metadata (Name, Symbol, Decimals)
+  - Vault Balance Updates (wenn nicht über Geyser Account Subscription)
+  - Historic Data Backfill
+
+**Outputs:**
+- `MarketEvents` (NATS Pub/Sub)
+  - `PoolCreated`: Neue Pools via Geyser Account Updates
+  - `Trade`: Swaps via Geyser Transaction Updates
+  - Pool State Updates (Reserves, Liquidity)
 - Optional: `MarketSnapshots` (für Replay/Backtest)
 
 ### 2.2 Strategy Plane: `momentum-bot` (Rust)
@@ -135,7 +149,76 @@ NATS
 
 ---
 
+## 4) Pool State Management (Geyser-First Architecture)
+
+### 4.1 Pool Discovery Flow
+
+```
+Geyser Account Update (New Pool)
+    ↓
+GeyserPoolDiscovery::process_account_update()
+    ↓
+Parse pool data (mint, vaults, fee, reserves)
+    ↓
+PoolDiscoveryEvent
+    ↓
+market-data publishes MarketEvent::PoolCreated
+    ↓
+Strategies (momentum-bot, arb-strategy) receive event
+```
+
+### 4.2 DEX Connector Role
+
+**OLD (❌ Wrong):**
+- DEX Connectors (raydium.rs, orca.rs, meteora_dlmm.rs) call `refresh_pools()` via RPC
+- Expensive `getProgramAccounts` scans every N seconds
+- High RPC load, slow discovery, incomplete data
+
+**NEW (✅ Correct):**
+- `GeyserPoolDiscovery` handles ALL pool discovery via Geyser events
+- DEX Connectors:
+  - Provide `quote_exact_in()` for pricing
+  - Provide `build_swap_ix()` for transaction building
+  - Store pool state received from `MarketEvents` (not RPC!)
+  - `refresh_pools()` exists ONLY as fallback for:
+    - Bootstrap/initialization
+    - Testing/development
+    - Emergency fallback when Geyser unavailable
+
+### 4.3 Supported DEXes (Geyser-based Discovery)
+
+| DEX | Program ID | Account Size | Discovery Method | Status |
+|-----|-----------|--------------|------------------|--------|
+| Raydium AMM V4 | `675kPX9...` | 752 bytes | Geyser Account Update | ✅ Production |
+| Raydium CPMM | `CPMMoo8...` | 1024 bytes | Geyser Account Update | ✅ Production |
+| Orca Whirlpool | `whirLbM...` | 653 bytes | Geyser Account Update | ✅ Production |
+| Meteora DLMM | `LBUZKhR...` | 904 bytes | Geyser Account Update | ✅ Production |
+| PumpFun | `6EF8rre...` | Variable | Geyser TX Update | ✅ Production |
+| PumpSwap | `pAMMBay...` | Variable | Geyser TX Update | ✅ Production |
+
+### 4.4 Data Freshness Guarantees
+
+- **Geyser**: <10ms latency from on-chain to application
+- **RPC**: 400-800ms latency, rate-limited, incomplete (missed slots)
+- **Conclusion**: Geyser is 40-80x faster with 100% coverage
+
+### 4.5 When to Use RPC
+
+RPC should ONLY be used for:
+1. **Token Metadata**: Symbol, Name, Decimals (not available in Geyser)
+2. **Vault Balances**: If not subscribed via Geyser Account Updates
+3. **Historical Backfill**: Loading past data for analysis
+4. **Emergency Fallback**: If Geyser stream disconnects
+
+**Never use RPC for:**
+- Pool discovery (use `GeyserPoolDiscovery`)
+- Real-time pool updates (use Geyser Account Updates)
+- Transaction monitoring (use Geyser TX Updates)
+
+---
+
 ## 5) Storage / Datenbank (wichtig für Debuggability, nicht Hot Path)
+
 
 Ziel: Debuggability durch **Replay + Decision Records**, ohne den Hot Path zu blockieren.
 

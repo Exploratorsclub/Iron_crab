@@ -281,6 +281,19 @@ impl RaydiumCpmm {
 
 #[async_trait]
 impl Dex for RaydiumCpmm {
+    /// Refresh pool cache via RPC getProgramAccounts.
+    /// 
+    /// ⚠️ **RPC FALLBACK ONLY** - Use Geyser-based pool discovery in production!
+    /// 
+    /// This method exists for:
+    /// - Bootstrap/initialization when Geyser is not yet available
+    /// - Testing and development
+    /// - Fallback when Geyser stream is interrupted
+    /// 
+    /// In production, pool discovery should happen via `GeyserPoolDiscovery`
+    /// which provides real-time pool updates without expensive RPC scans.
+    /// 
+    /// See: docs/TARGET_ARCHITECTURE.md - "Geyser preferred, RPC only as fallback"
     async fn refresh_pools(&self) -> Result<()> {
         debug!("Fetching Raydium CPMM pools via getProgramAccounts");
 

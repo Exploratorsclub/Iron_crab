@@ -20,6 +20,7 @@ use tracing::{debug, info, trace};
 pub const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 pub const RAYDIUM_CPMM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 pub const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+pub const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 pub const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 pub const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -74,6 +75,7 @@ pub enum DexType {
     RaydiumAmmV4,
     RaydiumCpmm,
     OrcaWhirlpool,
+    MeteoraDlmm,
     PumpFun,
     PumpFunAmm,
 }
@@ -84,6 +86,7 @@ impl std::fmt::Display for DexType {
             DexType::RaydiumAmmV4 => write!(f, "raydium"),
             DexType::RaydiumCpmm => write!(f, "raydium_cpmm"),
             DexType::OrcaWhirlpool => write!(f, "orca"),
+            DexType::MeteoraDlmm => write!(f, "meteora_dlmm"),
             DexType::PumpFun => write!(f, "pumpfun"),
             DexType::PumpFunAmm => write!(f, "pump_amm"),
         }
