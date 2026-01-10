@@ -290,13 +290,9 @@ fn parse_raydium_swap(
     // For SOL/token pair: base_in means selling token, base_out means buying token
     let is_buy = !is_base_in;
 
-    // Get source and destination token accounts to determine mints
-    let user_source = update.instruction_accounts.get(14).copied()?;
-    let user_destination = update.instruction_accounts.get(15).copied()?;
-
     // Extract mints from token balances
     let base_mint = if is_buy {
-        // BUY: destination receives base tokens
+        // BUY: destination receives base tokens (account index 15)
         update
             .post_token_balances
             .iter()
@@ -304,7 +300,7 @@ fn parse_raydium_swap(
             .and_then(|b| Pubkey::from_str(&b.mint).ok())
             .unwrap_or_default()
     } else {
-        // SELL: source spends base tokens
+        // SELL: source spends base tokens (account index 14)
         update
             .pre_token_balances
             .iter()
