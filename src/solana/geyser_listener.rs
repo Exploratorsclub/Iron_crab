@@ -34,6 +34,29 @@ pub struct GeyserAccountUpdate {
     pub lamports: u64,
 }
 
+/// Inner instruction from transaction meta (for parsing token transfers)
+#[derive(Debug, Clone)]
+pub struct InnerInstruction {
+    pub program_id_index: u8,
+    pub accounts: Vec<u8>,
+    pub data: Vec<u8>,
+}
+
+/// Token balance change from transaction meta
+#[derive(Debug, Clone)]
+pub struct TokenBalance {
+    pub account_index: u8,
+    pub mint: String,
+    pub ui_token_amount: TokenAmount,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenAmount {
+    pub ui_amount: Option<f64>,
+    pub decimals: u8,
+    pub amount: String,
+}
+
 /// Event emitted when a transaction is processed via Geyser
 #[derive(Debug, Clone)]
 pub struct GeyserTransactionUpdate {
@@ -44,6 +67,11 @@ pub struct GeyserTransactionUpdate {
     pub instruction_accounts: Vec<Pubkey>,
     /// Instruction data (first 8 bytes = discriminator)
     pub instruction_data: Vec<u8>,
+    /// Inner instructions (CPI calls, including token transfers)
+    pub inner_instructions: Vec<InnerInstruction>,
+    /// Token balance changes (pre/post balances)
+    pub pre_token_balances: Vec<TokenBalance>,
+    pub post_token_balances: Vec<TokenBalance>,
 }
 
 pub struct GeyserListener {
@@ -452,12 +480,63 @@ impl GeyserListener {
                                         }
                                     }
 
+                                    // Extract inner instructions for token transfer parsing
+                                    let mut inner_instructions = Vec::new();
+                                    if let Some(meta) = &tx.meta {
+                                        for inner_ix_group in &meta.inner_instructions {
+                                            for inner_ix in &inner_ix_group.instructions {
+                                                inner_instructions.push(InnerInstruction {
+                                                    program_id_index: inner_ix.program_id_index as u8,
+                                                    accounts: inner_ix.accounts.iter().map(|&a| a as u8).collect(),
+                                                    data: inner_ix.data.clone(),
+                                                });
+                                            }
+                                        }
+                                    }
+
+                                    // Extract token balances for amount calculation
+                                    let mut pre_token_balances = Vec::new();
+                                    let mut post_token_balances = Vec::new();
+                                    
+                                    if let Some(meta) = &tx.meta {
+                                        for balance in &meta.pre_token_balances {
+                                            if let Some(ui_amount) = &balance.ui_token_amount {
+                                                pre_token_balances.push(TokenBalance {
+                                                    account_index: balance.account_index as u8,
+                                                    mint: balance.mint.clone(),
+                                                    ui_token_amount: TokenAmount {
+                                                        ui_amount: ui_amount.ui_amount,
+                                                        decimals: ui_amount.decimals as u8,
+                                                        amount: ui_amount.amount.clone(),
+                                                    },
+                                                });
+                                            }
+                                        }
+
+                                        for balance in &meta.post_token_balances {
+                                            if let Some(ui_amount) = &balance.ui_token_amount {
+                                                post_token_balances.push(TokenBalance {
+                                                    account_index: balance.account_index as u8,
+                                                    mint: balance.mint.clone(),
+                                                    ui_token_amount: TokenAmount {
+                                                        ui_amount: ui_amount.ui_amount,
+                                                        decimals: ui_amount.decimals as u8,
+                                                        amount: ui_amount.amount.clone(),
+                                                    },
+                                                });
+                                            }
+                                        }
+                                    }
+
                                     let event = GeyserTransactionUpdate {
                                         signature,
                                         slot: tx_update.slot,
                                         account_keys,
                                         instruction_accounts,
                                         instruction_data,
+                                        inner_instructions,
+                                        pre_token_balances,
+                                        post_token_balances,
                                     };
 
                                     // Broadcast to subscribers

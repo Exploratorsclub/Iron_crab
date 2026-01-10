@@ -575,6 +575,27 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     let amount_in = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
     let min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
 
+    // Calculate actual amount_out from token balance changes
+    // For BUY: user receives base tokens (token_amount)
+    // For SELL: user receives quote tokens (sol_amount)
+    let (sol_amount, token_amount) = if is_buy {
+        // BUY: amount_in is SOL, need to calculate tokens received
+        let tokens_received = calculate_token_balance_change(
+            &update.pre_token_balances,
+            &update.post_token_balances,
+            &base_mint,
+        ).unwrap_or(0);
+        (amount_in, tokens_received)
+    } else {
+        // SELL: amount_in is tokens, need to calculate SOL received
+        let sol_received = calculate_token_balance_change(
+            &update.pre_token_balances,
+            &update.post_token_balances,
+            &quote_mint,
+        ).unwrap_or(0);
+        (sol_received, amount_in)
+    };
+
     // Pool static accounts order (v1) for intent resources.accounts
     let pool_accounts = vec![
         pool_market,
@@ -599,7 +620,8 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         trader = %user,
         is_buy = is_buy,
         amount_in = amount_in,
-        min_out = min_out,
+        sol_amount = sol_amount,
+        token_amount = token_amount,
         sig = %update.signature,
         "Pump.fun AMM swap detected"
     );
@@ -610,12 +632,42 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         trader: user,
         dex: DexType::PumpFunAmm,
         is_buy,
-        sol_amount: if is_buy { amount_in } else { min_out },
-        token_amount: if is_buy { 0 } else { amount_in },
+        sol_amount,
+        token_amount,
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: Some(pool_accounts),
     })
+}
+
+/// Calculate token balance change for a specific mint
+/// Returns positive value for increase (received), negative for decrease (sent)
+fn calculate_token_balance_change(
+    pre_balances: &[crate::solana::geyser_listener::TokenBalance],
+    post_balances: &[crate::solana::geyser_listener::TokenBalance],
+    mint: &Pubkey,
+) -> Option<u64> {
+    let mint_str = mint.to_string();
+    
+    // Find pre and post balance for this mint
+    let pre_balance = pre_balances
+        .iter()
+        .find(|b| b.mint == mint_str)?
+        .ui_token_amount
+        .amount
+        .parse::<u64>()
+        .ok()?;
+    
+    let post_balance = post_balances
+        .iter()
+        .find(|b| b.mint == mint_str)?
+        .ui_token_amount
+        .amount
+        .parse::<u64>()
+        .ok()?;
+    
+    // Return absolute change (received amount)
+    Some(post_balance.saturating_sub(pre_balance))
 }
 
 // ============================================================================
