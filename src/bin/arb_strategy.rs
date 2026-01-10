@@ -140,6 +140,13 @@ const STABLECOIN_MAX_SPREAD_BPS: i64 = 200;  // 2% for stablecoins
 const MAX_PRICE_AGE_SECS: u64 = 10;           // 10s max price staleness
 const MIN_TRADE_VOLUME_LAMPORTS: u64 = 100_000; // 0.0001 SOL minimum (filter dust)
 
+fn is_known_dex_label(dex: &str) -> bool {
+    matches!(
+        dex,
+        "raydium" | "raydium_cpmm" | "orca" | "meteora_dlmm" | "pumpfun" | "pump_amm"
+    )
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "arb-strategy")]
 #[command(about = "IronCrab Typ A Arbitrage Strategy – Market-driven cross-DEX arbitrage")]
@@ -215,7 +222,7 @@ impl TokenArbTracker {
         let pools_with_price: Vec<_> = self
             .pools_by_dex
             .values()
-            .filter(|p| p.last_price.is_some())
+            .filter(|p| p.last_price.is_some() && is_known_dex_label(&p.dex))
             .collect();
 
         if pools_with_price.len() < 2 {
@@ -686,18 +693,36 @@ impl ArbContext {
         });
 
         // Find or create pool for this pool_address
-        // We don't know the DEX from Trade events, so use pool_address as key
-        let pool = tracker.pools_by_dex.entry(pool_address.to_string()).or_insert_with(|| {
-            info!(pool = %pool_address, mint = %mint, "Creating pool from Trade event");
-            PoolState {
-                pool_address: pool_address.to_string(),
-                dex: pool_address.to_string(), // Use pool address as DEX identifier when unknown
-                liquidity_sol: Decimal::ZERO, // Unknown liquidity
-                last_price: None,
-                trade_count: 0,
-                last_update: Instant::now(),
-            }
-        });
+        // Prefer updating a pool we already know (from PoolCreated) by matching pool_address.
+        let existing_dex_key = tracker
+            .pools_by_dex
+            .iter()
+            .find(|(_, p)| p.pool_address == pool_address)
+            .map(|(k, _)| k.clone());
+
+        let pool = if let Some(dex_key) = existing_dex_key {
+            tracker
+                .pools_by_dex
+                .get_mut(&dex_key)
+                .expect("dex_key must exist")
+        } else {
+            // We don't know the DEX from Trade events alone.
+            // Create a placeholder pool, but ensure it won't be used for cross-DEX intent routing.
+            tracker
+                .pools_by_dex
+                .entry(pool_address.to_string())
+                .or_insert_with(|| {
+                    info!(pool = %pool_address, mint = %mint, "Creating unknown-dex pool from Trade event");
+                    PoolState {
+                        pool_address: pool_address.to_string(),
+                        dex: "unknown".to_string(),
+                        liquidity_sol: Decimal::ZERO, // Unknown liquidity
+                        last_price: None,
+                        trade_count: 0,
+                        last_update: Instant::now(),
+                    }
+                })
+        };
 
         // Update price
         pool.last_price = Some(price);
