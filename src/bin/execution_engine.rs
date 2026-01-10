@@ -2544,7 +2544,7 @@ async fn main() -> Result<()> {
         .map(|s| s.kill_switch_active)
         .unwrap_or(false);
 
-    let ctx = Arc::new(ExecutionContext {
+    let mut ctx = ExecutionContext {
         run_id: run_id.clone(),
         rpc_url: args.rpc_url.clone(),
         helius_rpc_url,
@@ -2581,7 +2581,26 @@ async fn main() -> Result<()> {
         tx_sent: std::sync::atomic::AtomicU64::new(0),
         arb_validated: std::sync::atomic::AtomicU64::new(0),
         arb_executed: std::sync::atomic::AtomicU64::new(0),
-    });
+    };
+
+    // Initialize cross-DEX handler (keyless: uses treasury pubkey for user authority).
+    // If this fails, we keep it disabled and cross-DEX arb intents will be rejected with
+    // ARB_HANDLER_NOT_CONFIGURED.
+    {
+        let user_pk = ctx.treasury.as_ref().map(|t| t.pubkey());
+        let mut handler = CrossDexHandler::new(Arc::clone(&ctx.rpc), user_pk);
+        match handler.init_dexes().await {
+            Ok(()) => {
+                ctx.cross_dex_handler = Some(Arc::new(handler));
+                info!("Initialized CrossDexHandler");
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to initialize CrossDexHandler; cross-DEX arb disabled");
+            }
+        }
+    }
+
+    let ctx = Arc::new(ctx);
 
     // Publish initial gauge values immediately (before the first 30s heartbeat).
     OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);

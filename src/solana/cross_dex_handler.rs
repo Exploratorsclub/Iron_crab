@@ -10,8 +10,7 @@
 
 use anyhow::{anyhow, Result};
 use solana_sdk::{
-    instruction::Instruction, pubkey::Pubkey, signature::Keypair, signer::Signer,
-    transaction::Transaction,
+    instruction::Instruction, pubkey::Pubkey,
 };
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -19,7 +18,6 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::ipc::TradeIntent;
-use crate::solana::compute_budget_helper;
 use crate::solana::dex::{pumpfun::PumpFunDex, raydium::Raydium, Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 
@@ -60,8 +58,8 @@ pub struct CrossDexHandler {
     rpc: Arc<SolanaRpc>,
     /// DEX connectors by name
     dexes: HashMap<String, Arc<dyn Dex>>,
-    /// Wallet keypair (for building transactions)
-    wallet: Option<Keypair>,
+    /// Wallet pubkey (used as user authority / payer)
+    wallet_pubkey: Option<Pubkey>,
     /// Default slippage for swaps (bps)
     default_slippage_bps: u32,
 }
@@ -106,11 +104,11 @@ impl CrossDexHandler {
     }
 
     /// Create a new CrossDexHandler
-    pub fn new(rpc: Arc<SolanaRpc>, wallet: Option<Keypair>) -> Self {
+    pub fn new(rpc: Arc<SolanaRpc>, wallet_pubkey: Option<Pubkey>) -> Self {
         Self {
             rpc,
             dexes: HashMap::new(),
-            wallet,
+            wallet_pubkey,
             default_slippage_bps: 100, // 1% default
         }
     }
@@ -119,19 +117,25 @@ impl CrossDexHandler {
     pub async fn init_dexes(&mut self) -> Result<()> {
         // Initialize Raydium
         let mut raydium = Raydium::new(Arc::clone(&self.rpc));
-        if let Some(w) = self.wallet.as_ref() {
-            raydium.set_user_authority(w.pubkey());
+        if let Some(pk) = self.wallet_pubkey {
+            raydium.set_user_authority(pk);
         }
         self.dexes.insert("raydium".to_string(), Arc::new(raydium));
         info!("Initialized Raydium DEX connector");
 
         // Initialize PumpFun
-        let pumpfun = PumpFunDex::new(Arc::clone(&self.rpc))?;
+        let mut pumpfun = PumpFunDex::new(Arc::clone(&self.rpc))?;
+        if let Some(pk) = self.wallet_pubkey {
+            pumpfun.set_user_authority(pk);
+        }
         self.dexes.insert("pumpfun".to_string(), Arc::new(pumpfun));
         info!("Initialized PumpFun DEX connector");
 
         // TODO: Add Orca Whirlpool
-        // let orca = OrcaDex::new((*self.rpc).clone());
+        // let mut orca = Orca::new(Arc::clone(&self.rpc));
+        // if let Some(pk) = self.wallet_pubkey {
+        //     orca.set_user_authority(pk);
+        // }
         // self.dexes.insert("orca".to_string(), Arc::new(orca));
 
         Ok(())
@@ -139,10 +143,9 @@ impl CrossDexHandler {
 
     /// Check if this intent is a cross-DEX arbitrage intent
     pub fn is_cross_dex_arb_intent(intent: &TradeIntent) -> bool {
-        // Cross-DEX arb intents have 2 pools and require_bundle
-        intent.resources.pools.len() == 2
-            && intent.requires_bundle()
-            && intent.source == "arb-strategy"
+        // Cross-DEX arb intents have 2 pools.
+        // Do NOT require metadata.dex; routing is driven by buy_dex/sell_dex metadata.
+        intent.resources.pools.len() == 2 && intent.source == "arb-strategy"
     }
 
     /// Validate a cross-DEX arbitrage opportunity with live quotes
@@ -478,51 +481,6 @@ impl CrossDexHandler {
             input_sol_lamports: buy_amount_in,
             expected_output_sol_lamports: sell_quote.amount_out,
         })
-    }
-
-    /// Build a Jito-compatible transaction bundle for atomic execution
-    pub fn build_atomic_bundle(
-        &self,
-        plan: &CrossDexSwapPlan,
-        recent_blockhash: solana_sdk::hash::Hash,
-        priority_fee_lamports: u64,
-    ) -> Result<Transaction> {
-        let wallet = self
-            .wallet
-            .as_ref()
-            .ok_or_else(|| anyhow!("No wallet configured for transaction building"))?;
-
-        let mut all_instructions = Vec::new();
-
-        // Add compute budget instructions
-        all_instructions.push(compute_budget_helper::set_compute_unit_limit(
-            plan.total_compute_units,
-        ));
-
-        if priority_fee_lamports > 0 {
-            // Convert lamports to micro-lamports per CU
-            let micro_lamports_per_cu =
-                (priority_fee_lamports * 1_000_000) / plan.total_compute_units as u64;
-            all_instructions.push(compute_budget_helper::set_compute_unit_price(
-                micro_lamports_per_cu,
-            ));
-        }
-
-        // Add buy leg
-        all_instructions.extend(plan.buy_instructions.clone());
-
-        // Add sell leg
-        all_instructions.extend(plan.sell_instructions.clone());
-
-        // Build transaction
-        let tx = Transaction::new_signed_with_payer(
-            &all_instructions,
-            Some(&wallet.pubkey()),
-            &[wallet],
-            recent_blockhash,
-        );
-
-        Ok(tx)
     }
 
     /// Identify which DEX a pool belongs to based on address pattern
