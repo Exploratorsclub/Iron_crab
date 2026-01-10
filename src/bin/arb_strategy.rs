@@ -78,6 +78,17 @@ impl Default for ArbConfig {
     }
 }
 
+// Known token mints for sanity checks
+const NATIVE_SOL_MINT: &str = "11111111111111111111111111111111";
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+
+// Maximum reasonable spread before considering it a data error
+const MAX_REASONABLE_SPREAD_BPS: i64 = 1000; // 10%
+const STABLECOIN_MAX_SPREAD_BPS: i64 = 200;  // 2% for stablecoins
+const MAX_PRICE_AGE_SECS: u64 = 10;           // 10s max price staleness
+
 #[derive(Parser, Debug)]
 #[command(name = "arb-strategy")]
 #[command(about = "IronCrab Typ A Arbitrage Strategy – Market-driven cross-DEX arbitrage")]
@@ -205,6 +216,53 @@ impl TokenArbTracker {
         let spread = (sell_price - buy_price) / buy_price * Decimal::from(10000);
         // Convert to i64, handling large spreads correctly
         let spread_bps = spread.round().to_i64().unwrap_or(i64::MAX);
+
+        // DATA QUALITY FILTERS
+
+        // Filter 1: Exclude Native SOL arbitrage (these are wrap/unwrap, not real arb)
+        if self.base_mint == NATIVE_SOL_MINT {
+            debug!(
+                mint = %self.base_mint,
+                "Arb check rejected: Native SOL trades are wrap/unwrap, not arbitrage"
+            );
+            return None;
+        }
+
+        // Filter 2: Check price staleness
+        let now = Instant::now();
+        let buy_age = now.duration_since(buy_pool.last_update).as_secs();
+        let sell_age = now.duration_since(sell_pool.last_update).as_secs();
+        if buy_age > MAX_PRICE_AGE_SECS || sell_age > MAX_PRICE_AGE_SECS {
+            debug!(
+                mint = %self.base_mint,
+                buy_age_secs = buy_age,
+                sell_age_secs = sell_age,
+                max_age = MAX_PRICE_AGE_SECS,
+                "Arb check rejected: stale price data"
+            );
+            return None;
+        }
+
+        // Filter 3: Sanity check for unrealistic spreads
+        let max_spread = if self.base_mint == USDC_MINT || self.base_mint == USDT_MINT {
+            STABLECOIN_MAX_SPREAD_BPS
+        } else {
+            MAX_REASONABLE_SPREAD_BPS
+        };
+
+        if spread_bps > max_spread {
+            warn!(
+                mint = %self.base_mint,
+                spread_bps = spread_bps,
+                max_spread = max_spread,
+                buy_price = %buy_price,
+                sell_price = %sell_price,
+                buy_dex = %buy_pool.dex,
+                sell_dex = %sell_pool.dex,
+                "Arb check rejected: spread too large (likely data error)"
+            );
+            return None;
+        }
 
         if spread_bps < config.min_spread_bps as i64 {
             info!(
