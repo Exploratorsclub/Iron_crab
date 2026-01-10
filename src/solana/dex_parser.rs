@@ -53,6 +53,7 @@ pub enum ParsedDexEvent {
         is_buy: bool,
         sol_amount: u64,
         token_amount: u64,
+        token_decimals: u8,
         signature: String,
         slot: u64,
         /// Optional static pool account list for deterministic intent building.
@@ -343,6 +344,8 @@ fn parse_raydium_swap(
         "Raydium swap detected"
     );
 
+    let token_decimals = get_token_decimals(&update.post_token_balances, &base_mint);
+
     Some(ParsedDexEvent::Trade {
         pool_address,
         mint: base_mint,
@@ -351,6 +354,7 @@ fn parse_raydium_swap(
         is_buy,
         sol_amount,
         token_amount,
+        token_decimals,
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: None,
@@ -499,6 +503,8 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
         "Orca swap detected"
     );
 
+    let token_decimals = get_token_decimals(&update.post_token_balances, &base_mint);
+
     Some(ParsedDexEvent::Trade {
         pool_address,
         mint: base_mint,
@@ -507,6 +513,7 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
         is_buy,
         sol_amount,
         token_amount,
+        token_decimals,
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: None,
@@ -667,6 +674,8 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
         "PumpFun swap detected"
     );
 
+    let token_decimals = get_token_decimals(&update.post_token_balances, &mint);
+
     Some(ParsedDexEvent::Trade {
         pool_address: bonding_curve,
         mint,
@@ -675,6 +684,7 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
         is_buy,
         sol_amount,
         token_amount,
+        token_decimals,
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: None,
@@ -789,6 +799,8 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         "Pump.fun AMM swap detected"
     );
 
+    let token_decimals = get_token_decimals(&update.post_token_balances, &base_mint);
+
     Some(ParsedDexEvent::Trade {
         pool_address: pool_market,
         mint: base_mint,
@@ -797,6 +809,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         is_buy,
         sol_amount,
         token_amount,
+        token_decimals,
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: Some(pool_accounts),
@@ -855,6 +868,20 @@ fn calculate_native_balance_change(
     Some(post.abs_diff(pre))
 }
 
+/// Extract token decimals from token_balances
+/// Returns decimals if found, otherwise defaults to 9 (most Solana tokens)
+fn get_token_decimals(
+    post_balances: &[crate::solana::geyser_listener::TokenBalance],
+    mint: &Pubkey,
+) -> u8 {
+    let mint_str = mint.to_string();
+    post_balances
+        .iter()
+        .find(|b| b.mint == mint_str)
+        .map(|b| b.ui_token_amount.decimals)
+        .unwrap_or(9) // Default to 9 decimals (most pump.fun and Solana tokens)
+}
+
 // ============================================================================
 // Helper to convert ParsedDexEvent to MarketEventKind
 // ============================================================================
@@ -893,6 +920,7 @@ impl ParsedDexEvent {
                 is_buy,
                 sol_amount,
                 token_amount,
+                token_decimals,
                 signature,
                 ..
             } => MarketEventKind::Trade {
@@ -902,6 +930,7 @@ impl ParsedDexEvent {
                 is_buy: *is_buy,
                 sol_amount: *sol_amount,
                 token_amount: *token_amount,
+                token_decimals: *token_decimals,
                 signature: Some(signature.clone()),
             },
             ParsedDexEvent::LiquidityRemoved {
@@ -1025,6 +1054,8 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
         "Meteora DLMM swap detected"
     );
 
+    let token_decimals = get_token_decimals(&update.post_token_balances, &base_mint);
+
     Some(ParsedDexEvent::Trade {
         pool_address,
         mint: base_mint,
@@ -1033,6 +1064,7 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
         is_buy,
         sol_amount,
         token_amount,
+        token_decimals,
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: None,
@@ -1131,6 +1163,8 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
         "Raydium CPMM swap detected"
     );
 
+    let token_decimals = get_token_decimals(&update.post_token_balances, &base_mint);
+
     Some(ParsedDexEvent::Trade {
         pool_address,
         mint: base_mint,
@@ -1139,6 +1173,7 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
         is_buy,
         sol_amount,
         token_amount,
+        token_decimals,
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: None,

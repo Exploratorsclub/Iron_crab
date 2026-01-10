@@ -359,6 +359,7 @@ impl ArbContext {
         mint: &str,
         sol_amount: u64,
         token_amount: u64,
+        token_decimals: u8,
         _is_buy: bool,
     ) -> Option<ArbOpportunity> {
         if token_amount == 0 || sol_amount == 0 {
@@ -367,7 +368,8 @@ impl ArbContext {
 
         // Calculate price: SOL per token
         let sol_dec = Decimal::from(sol_amount) / Decimal::from(1_000_000_000u64);
-        let token_dec = Decimal::from(token_amount) / Decimal::from(1_000_000u64); // assume 6 decimals
+        let token_divisor = 10u64.pow(token_decimals as u32);
+        let token_dec = Decimal::from(token_amount) / Decimal::from(token_divisor);
         let price = sol_dec / token_dec;
 
         let config = self.config.read().clone();
@@ -713,11 +715,12 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             mint,
             sol_amount,
             token_amount,
+            token_decimals,
             is_buy,
             ..
         } => {
             if let Some(opp) =
-                ctx.handle_trade(pool_address, mint, *sol_amount, *token_amount, *is_buy)
+                ctx.handle_trade(pool_address, mint, *sol_amount, *token_amount, *token_decimals, *is_buy)
             {
                 // Prometheus: count arbitrage opportunities detected
                 ARB_TRIANGLE_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);

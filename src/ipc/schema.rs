@@ -163,6 +163,7 @@ pub enum MarketEventKind {
         is_buy: bool,
         sol_amount: u64, // lamports
         token_amount: u64,
+        token_decimals: u8, // e.g., 6 for USDC, 9 for most pump.fun tokens
         signature: Option<String>,
     },
     /// Swap observed on-chain (legacy format)

@@ -4314,6 +4314,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             sol_amount,
             token_amount,
             signature,
+            ..  // Ignore token_decimals, we don't need it for momentum detection
         } => {
             // P1: Trade-based Token Discovery
             // If we missed the PoolCreated event (Geyser filter issues), discover via first trade
