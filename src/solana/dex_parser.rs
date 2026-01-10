@@ -114,8 +114,15 @@ const RAYDIUM_SWAP_BASE_IN: u8 = 9;
 const RAYDIUM_SWAP_BASE_OUT: u8 = 11;
 const RAYDIUM_INITIALIZE2: u8 = 1;
 
+// Meteora DLMM swap (Anchor: sighash("global:swap"))
+const METEORA_SWAP: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
+
+// Raydium CPMM swap (Anchor: similar pattern)
+const RAYDIUM_CPMM_SWAP: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
+
 // ============================================================================
 // Main Parsing Functions (Public API)
+// ============================================================================
 // ============================================================================
 
 /// Parse an account update into a DEX event (pool creation/update)
@@ -140,10 +147,18 @@ pub fn parse_account_update(update: &GeyserAccountUpdate) -> Option<ParsedDexEve
 pub fn parse_transaction_update(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
     // Identify DEX by checking account keys
     let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).ok()?;
+    let raydium_cpmm = Pubkey::from_str(RAYDIUM_CPMM).ok()?;
     let orca = Pubkey::from_str(ORCA_WHIRLPOOL).ok()?;
+    let meteora = Pubkey::from_str(METEORA_DLMM).ok()?;
     let pumpfun = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
     let pumpfun_amm = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).ok()?;
 
+    if update.account_keys.contains(&meteora) {
+        return parse_meteora_transaction(update);
+    }
+    if update.account_keys.contains(&raydium_cpmm) {
+        return parse_raydium_cpmm_transaction(update);
+    }
     if update.account_keys.contains(&pumpfun_amm) {
         return parse_pumpfun_amm_transaction(update);
     }
@@ -883,6 +898,214 @@ impl ParsedDexEvent {
             ParsedDexEvent::LiquidityRemoved { slot, .. } => *slot,
         }
     }
+}
+
+// ============================================================================
+// Meteora DLMM Parsing
+// ============================================================================
+
+fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
+    if update.instruction_data.len() < 8 {
+        return None;
+    }
+
+    let disc = &update.instruction_data[0..8];
+    if disc != METEORA_SWAP {
+        return None;
+    }
+
+    // Meteora swap accounts (simplified, bin arrays ignored):
+    // [0]: LB Pair (pool)
+    // [1]: Reserve X
+    // [2]: Reserve Y
+    // [3]: User token X
+    // [4]: User token Y
+    // [5]: User (TRADER!)
+    // [6]: Token program
+    // ... bin arrays ...
+
+    if update.instruction_accounts.len() < 7 {
+        return None;
+    }
+
+    let pool_address = update.instruction_accounts[0];
+    let trader = update.instruction_accounts[5];
+
+    // Parse amounts: discriminator(8) + amount_in(8) + min_out(8)
+    if update.instruction_data.len() < 24 {
+        return None;
+    }
+
+    let amount_in = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
+    let _min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
+
+    // Determine direction from balance changes
+    let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+        .unwrap_or_default();
+
+    // Find which token increased (that's what user received)
+    let base_mint = update
+        .post_token_balances
+        .iter()
+        .find(|post| {
+            let post_amt: u64 = post.ui_token_amount.amount.parse().unwrap_or(0);
+            let pre_amt: u64 = update
+                .pre_token_balances
+                .iter()
+                .find(|pre| pre.mint == post.mint && pre.account_index == post.account_index)
+                .and_then(|pre| pre.ui_token_amount.amount.parse().ok())
+                .unwrap_or(0);
+            post_amt > pre_amt && post.mint != "So11111111111111111111111111111111111111112"
+        })
+        .and_then(|b| Pubkey::from_str(&b.mint).ok())
+        .unwrap_or_default();
+
+    let is_buy = base_mint != Pubkey::default();
+
+    // Calculate actual amounts from balance changes
+    let (sol_amount, token_amount) = if is_buy {
+        let tokens_received = calculate_token_balance_change(
+            &update.pre_token_balances,
+            &update.post_token_balances,
+            &base_mint,
+        )
+        .unwrap_or(0);
+        (amount_in, tokens_received)
+    } else {
+        let sol_received = calculate_token_balance_change(
+            &update.pre_token_balances,
+            &update.post_token_balances,
+            &quote_mint,
+        )
+        .unwrap_or(0);
+        (sol_received, amount_in)
+    };
+
+    debug!(
+        pool = %pool_address,
+        trader = %trader,
+        is_buy = is_buy,
+        sol_amount = sol_amount,
+        token_amount = token_amount,
+        sig = %update.signature,
+        "Meteora DLMM swap detected"
+    );
+
+    Some(ParsedDexEvent::Trade {
+        pool_address,
+        mint: base_mint,
+        trader,
+        dex: DexType::MeteoraDlmm,
+        is_buy,
+        sol_amount,
+        token_amount,
+        signature: update.signature.clone(),
+        slot: update.slot,
+        pool_accounts: None,
+    })
+}
+
+// ============================================================================
+// Raydium CPMM Parsing
+// ============================================================================
+
+fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
+    if update.instruction_data.len() < 8 {
+        return None;
+    }
+
+    let disc = &update.instruction_data[0..8];
+    if disc != RAYDIUM_CPMM_SWAP {
+        return None;
+    }
+
+    // Raydium CPMM swap accounts:
+    // [0]: Payer
+    // [1]: Authority
+    // [2]: Pool config
+    // [3]: Pool state
+    // [4]: User source token
+    // [5]: User destination token
+    // [6]: Pool vault 0
+    // [7]: Pool vault 1
+    // [8]: Token program 0
+    // [9]: Token program 1
+    // [10]: Vault 0 mint
+    // [11]: Vault 1 mint
+
+    if update.instruction_accounts.len() < 12 {
+        return None;
+    }
+
+    let pool_address = update.instruction_accounts[3];
+    let trader = update.instruction_accounts[0];
+
+    // Parse amounts: discriminator(8) + amount_in(8) + min_out(8)
+    if update.instruction_data.len() < 24 {
+        return None;
+    }
+
+    let amount_in = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
+    let _min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
+
+    // Extract mints from accounts
+    let vault_0_mint = update.instruction_accounts.get(10).copied()?;
+    let vault_1_mint = update.instruction_accounts.get(11).copied()?;
+
+    let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+        .unwrap_or_default();
+
+    // Determine which is base (non-SOL) and which is quote (SOL)
+    let (base_mint, is_buy) = if vault_0_mint == quote_mint {
+        (vault_1_mint, true) // Vault 0 = SOL, so buying vault 1 token
+    } else if vault_1_mint == quote_mint {
+        (vault_0_mint, false) // Vault 1 = SOL, so selling vault 0 token
+    } else {
+        // Non-SOL pair, use first vault as base
+        (vault_0_mint, true)
+    };
+
+    // Calculate actual amounts from balance changes
+    let (sol_amount, token_amount) = if is_buy {
+        let tokens_received = calculate_token_balance_change(
+            &update.pre_token_balances,
+            &update.post_token_balances,
+            &base_mint,
+        )
+        .unwrap_or(0);
+        (amount_in, tokens_received)
+    } else {
+        let sol_received = calculate_token_balance_change(
+            &update.pre_token_balances,
+            &update.post_token_balances,
+            &quote_mint,
+        )
+        .unwrap_or(0);
+        (sol_received, amount_in)
+    };
+
+    debug!(
+        pool = %pool_address,
+        trader = %trader,
+        is_buy = is_buy,
+        sol_amount = sol_amount,
+        token_amount = token_amount,
+        sig = %update.signature,
+        "Raydium CPMM swap detected"
+    );
+
+    Some(ParsedDexEvent::Trade {
+        pool_address,
+        mint: base_mint,
+        trader,
+        dex: DexType::RaydiumCpmm,
+        is_buy,
+        sol_amount,
+        token_amount,
+        signature: update.signature.clone(),
+        slot: update.slot,
+        pool_accounts: None,
+    })
 }
 
 #[cfg(test)]
