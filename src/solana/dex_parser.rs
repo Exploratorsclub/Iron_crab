@@ -906,11 +906,13 @@ impl ParsedDexEvent {
 
 fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
     if update.instruction_data.len() < 8 {
+        trace!(sig = %update.signature, "Meteora: instruction_data too short (< 8)");
         return None;
     }
 
     let disc = &update.instruction_data[0..8];
     if disc != METEORA_SWAP {
+        trace!(sig = %update.signature, disc = ?disc, "Meteora: discriminator mismatch");
         return None;
     }
 
@@ -925,6 +927,7 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
     // ... bin arrays ...
 
     if update.instruction_accounts.len() < 7 {
+        trace!(sig = %update.signature, account_count = update.instruction_accounts.len(), "Meteora: insufficient accounts (< 7)");
         return None;
     }
 
@@ -1011,11 +1014,13 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
 
 fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
     if update.instruction_data.len() < 8 {
+        trace!(sig = %update.signature, "Raydium CPMM: instruction_data too short (< 8)");
         return None;
     }
 
     let disc = &update.instruction_data[0..8];
     if disc != RAYDIUM_CPMM_SWAP {
+        trace!(sig = %update.signature, disc = ?disc, "Raydium CPMM: discriminator mismatch");
         return None;
     }
 
@@ -1034,6 +1039,7 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
     // [11]: Vault 1 mint
 
     if update.instruction_accounts.len() < 12 {
+        trace!(sig = %update.signature, account_count = update.instruction_accounts.len(), "Raydium CPMM: insufficient accounts (< 12)");
         return None;
     }
 
