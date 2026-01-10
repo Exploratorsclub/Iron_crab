@@ -505,7 +505,7 @@ impl GeyserListener {
                                                     account_index: balance.account_index as u8,
                                                     mint: balance.mint.clone(),
                                                     ui_token_amount: TokenAmount {
-                                                        ui_amount: ui_amount.ui_amount,
+                                                        ui_amount: Some(ui_amount.ui_amount),
                                                         decimals: ui_amount.decimals as u8,
                                                         amount: ui_amount.amount.clone(),
                                                     },
@@ -519,7 +519,7 @@ impl GeyserListener {
                                                     account_index: balance.account_index as u8,
                                                     mint: balance.mint.clone(),
                                                     ui_token_amount: TokenAmount {
-                                                        ui_amount: ui_amount.ui_amount,
+                                                        ui_amount: Some(ui_amount.ui_amount),
                                                         decimals: ui_amount.decimals as u8,
                                                         amount: ui_amount.amount.clone(),
                                                     },
