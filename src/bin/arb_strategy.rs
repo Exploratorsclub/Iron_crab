@@ -88,6 +88,8 @@ const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 const MAX_REASONABLE_SPREAD_BPS: i64 = 1000; // 10%
 const STABLECOIN_MAX_SPREAD_BPS: i64 = 200;  // 2% for stablecoins
 const MAX_PRICE_AGE_SECS: u64 = 10;           // 10s max price staleness
+const MIN_TRADE_VOLUME_LAMPORTS: u64 = 100_000; // 0.0001 SOL minimum (filter dust)
+const MIN_LIQUIDITY_FOR_INTENT_LAMPORTS: u64 = 100_000_000; // 0.1 SOL min pool liquidity
 
 #[derive(Parser, Debug)]
 #[command(name = "arb-strategy")]
@@ -303,8 +305,30 @@ impl TokenArbTracker {
 
         // Net profit after tx costs
         let net_profit = gross_profit_lamports.saturating_sub(config.est_tx_cost_lamports);
+        
+        // LIQUIDITY VALIDATION: For trade-discovered pools (liquidity=0), require higher profit threshold
+        // This compensates for unknown actual liquidity and reduces risk
+        let effective_min_profit = if buy_pool.liquidity_sol <= Decimal::ZERO 
+            || sell_pool.liquidity_sol <= Decimal::ZERO 
+        {
+            // Require 5x normal profit for unknown liquidity pools
+            config.min_profit_lamports * 5
+        } else {
+            config.min_profit_lamports
+        };
+        
+        if buy_pool.liquidity_sol <= Decimal::ZERO || sell_pool.liquidity_sol <= Decimal::ZERO {
+            debug!(
+                mint = %self.base_mint,
+                buy_liquidity = %buy_pool.liquidity_sol,
+                sell_liquidity = %sell_pool.liquidity_sol,
+                net_profit = net_profit,
+                required_profit = effective_min_profit,
+                "Using higher profit threshold for unknown liquidity pools"
+            );
+        }
 
-        if net_profit < config.min_profit_lamports {
+        if net_profit < effective_min_profit {
             info!(
                 mint = %self.base_mint,
                 buy_dex = %buy_pool.dex,
@@ -314,6 +338,9 @@ impl TokenArbTracker {
                 tx_cost = config.est_tx_cost_lamports,
                 net_profit = net_profit,
                 min_profit = config.min_profit_lamports,
+                effective_min_profit = effective_min_profit,
+                buy_liquidity_known = buy_pool.liquidity_sol > Decimal::ZERO,
+                sell_liquidity_known = sell_pool.liquidity_sol > Decimal::ZERO,
                 "Arb check rejected: profit below minimum"
             );
             return None;
@@ -370,6 +397,11 @@ struct ArbContext {
     opportunities_found: AtomicU64,
     intents_generated: AtomicU64,
     intent_counter: AtomicU64,
+    
+    // Data quality metrics
+    zero_amount_trades: AtomicU64,
+    zero_liquidity_pools: AtomicU64,
+    data_quality_rejects: AtomicU64,
 }
 
 impl ArbContext {
@@ -433,7 +465,27 @@ impl ArbContext {
         token_decimals: u8,
         _is_buy: bool,
     ) -> Option<ArbOpportunity> {
+        // DATA QUALITY: Reject trades with zero amounts (parser failed to extract token balance)
         if token_amount == 0 || sol_amount == 0 {
+            self.zero_amount_trades.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                pool = %pool_address,
+                mint = %mint,
+                sol_amount = sol_amount,
+                token_amount = token_amount,
+                "Trade rejected: zero amount (parser failed to extract token balance)"
+            );
+            return None;
+        }
+        
+        // DATA QUALITY: Filter dust trades (< 0.0001 SOL)
+        if sol_amount < MIN_TRADE_VOLUME_LAMPORTS {
+            debug!(
+                pool = %pool_address,
+                sol_amount = sol_amount,
+                min_volume = MIN_TRADE_VOLUME_LAMPORTS,
+                "Trade rejected: volume too low (dust trade)"
+            );
             return None;
         }
 
@@ -677,6 +729,9 @@ async fn main() -> Result<()> {
         opportunities_found: AtomicU64::new(0),
         intents_generated: AtomicU64::new(0),
         intent_counter: AtomicU64::new(0),
+        zero_amount_trades: AtomicU64::new(0),
+        zero_liquidity_pools: AtomicU64::new(0),
+        data_quality_rejects: AtomicU64::new(0),
     });
 
     // Subscribe to MarketEvents
@@ -776,6 +831,9 @@ async fn main() -> Result<()> {
                     intents_generated = ctx.intents_generated.load(Ordering::Relaxed),
                     intents_written = records,
                     bytes_written = bytes,
+                    // Data quality metrics
+                    zero_amount_trades = ctx.zero_amount_trades.load(Ordering::Relaxed),
+                    data_quality_rejects = ctx.data_quality_rejects.load(Ordering::Relaxed),
                     "arb-strategy heartbeat"
                 );
             }
