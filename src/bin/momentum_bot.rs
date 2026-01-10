@@ -4339,9 +4339,17 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     "🔍 Trade-based discovery: PoolCreated was missed, initializing from trade"
                 );
                 
-                // Initialize tracker without initial_liquidity (will be 0)
-                // This allows us to track tokens we would have otherwise missed
-                let created = ctx.get_or_create_tracker(mint, pool_address, dex, slot, 0);
+                // Initialize tracker with a conservative/default initial liquidity.
+                // PumpFun bonding curve starts with a known ~30 SOL seed; if we missed the
+                // PoolCreated event, we still want liquidity gating to behave as expected.
+                let initial_liq_lamports = if dex == "pumpfun" {
+                    30_000_000_000
+                } else {
+                    0
+                };
+
+                let created =
+                    ctx.get_or_create_tracker(mint, pool_address, dex, slot, initial_liq_lamports);
                 
                 if created {
                     info!(

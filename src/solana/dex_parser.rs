@@ -276,7 +276,13 @@ fn parse_raydium_swap(
     }
 
     let pool_address = update.instruction_accounts[1];
-    let trader = update.instruction_accounts[16];
+    // Use fee payer as trader for robust "unique buyers" counting.
+    // In routed/aggregator swaps, the instruction "user" fields can be authorities/PDAs.
+    let trader = update
+        .account_keys
+        .first()
+        .copied()
+        .unwrap_or(update.instruction_accounts[16]);
 
     // Parse amounts from instruction data
     // Layout: discriminator(1) + amount_in(8) + min_amount_out(8)
@@ -420,7 +426,11 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
     }
 
     let pool_address = update.instruction_accounts[2];
-    let trader = update.instruction_accounts[3];
+    let trader = update
+        .account_keys
+        .first()
+        .copied()
+        .unwrap_or(update.instruction_accounts[3]);
 
     // Parse amounts
     // Layout: discriminator(8) + amount(8) + other_amount_threshold(8) + sqrt_price_limit(16) + ...
@@ -618,7 +628,11 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
 
     let mint = update.instruction_accounts[2];
     let bonding_curve = update.instruction_accounts[3];
-    let trader = update.instruction_accounts[6];
+    let trader = update
+        .account_keys
+        .first()
+        .copied()
+        .unwrap_or(update.instruction_accounts[6]);
 
     // Parse amounts from instruction data
     // BUY layout: discriminator(8) + token_amount(8) + max_sol_cost(8)
@@ -718,6 +732,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     // Observed account order (see src/solana/dex/pumpfun_amm.rs)
     let pool_market = update.instruction_accounts[0];
     let user = update.instruction_accounts[1];
+    let trader = update.account_keys.first().copied().unwrap_or(user);
     let global_config = update.instruction_accounts[2];
     let base_mint = update.instruction_accounts[3];
     // Note: instruction_accounts[4] is quote_account (user's WSOL ATA), not the mint itself!
@@ -753,8 +768,9 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
             &update.account_keys,
             &update.pre_balances,
             &update.post_balances,
-            &user,
-        ).unwrap_or(amount_in); // Fallback to instruction amount
+            &trader,
+        )
+        .unwrap_or(amount_in); // Fallback to instruction amount
         
         (sol_spent, tokens_received)
     } else {
@@ -763,8 +779,9 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
             &update.account_keys,
             &update.pre_balances,
             &update.post_balances,
-            &user,
-        ).unwrap_or(0);
+            &trader,
+        )
+        .unwrap_or(0);
         
         (sol_received, amount_in)
     };
@@ -790,7 +807,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     debug!(
         pool = %pool_market,
         mint = %base_mint,
-        trader = %user,
+        trader = %trader,
         is_buy = is_buy,
         amount_in = amount_in,
         sol_amount = sol_amount,
@@ -804,7 +821,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     Some(ParsedDexEvent::Trade {
         pool_address: pool_market,
         mint: base_mint,
-        trader: user,
+        trader,
         dex: DexType::PumpFunAmm,
         is_buy,
         sol_amount,
@@ -1004,7 +1021,11 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
     }
 
     let pool_address = update.instruction_accounts[0];
-    let trader = update.instruction_accounts[5];
+    let trader = update
+        .account_keys
+        .first()
+        .copied()
+        .unwrap_or(update.instruction_accounts[5]);
 
     // Parse amounts: discriminator(8) + amount_in(8) + min_out(8)
     if update.instruction_data.len() < 24 {
@@ -1119,7 +1140,11 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
     }
 
     let pool_address = update.instruction_accounts[3];
-    let trader = update.instruction_accounts[0];
+    let trader = update
+        .account_keys
+        .first()
+        .copied()
+        .unwrap_or(update.instruction_accounts[0]);
 
     // Parse amounts: discriminator(8) + amount_in(8) + min_out(8)
     if update.instruction_data.len() < 24 {
