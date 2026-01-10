@@ -36,6 +36,8 @@ use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
 use ironcrab::solana::dex_parser::{
     parse_account_update, parse_transaction_update, DexType, ParsedDexEvent,
 };
+use ironcrab::solana::geyser_pool_discovery::GeyserPoolDiscovery;
+use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::solana::wallet_tracker::WalletTracker;
 use spl_token::solana_program::program_option::COption;
 use spl_token::solana_program::program_pack::Pack;
@@ -404,6 +406,12 @@ async fn run_geyser_loop(
     mut config_subscription: Option<ironcrab::nats::NatsSubscription>,
     tracked_mints_rx: watch::Receiver<Vec<Pubkey>>,
 ) -> Result<()> {
+    // Initialize RPC client for fallback/metadata (prefer local RPC, fallback to Helius)
+    let rpc_url = std::env::var("SOLANA_RPC_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8899".to_string()); // Local validator/private RPC preferred
+    let rpc = Arc::new(SolanaRpc::new(&rpc_url));
+    info!(rpc_url = %rpc_url, "Initialized RPC client for metadata/fallback");
+
     // DEX program IDs to monitor (must match validator account-index)
     let program_ids = vec![
         Pubkey::from_str(RAYDIUM_AMM_V4).expect("valid raydium pubkey"),
@@ -414,6 +422,18 @@ async fn run_geyser_loop(
         Pubkey::from_str(METEORA_DLMM).expect("valid meteora dlmm pubkey"),
     ];
 
+    // Initialize Geyser-based pool discovery (PRIMARY method for pool discovery)
+    let (pool_discovery, mut pool_discovery_rx) =
+        GeyserPoolDiscovery::new(geyser_url.to_string(), program_ids.clone(), rpc.clone());
+
+    // Spawn pool discovery task
+    let pool_discovery_handle = tokio::spawn(async move {
+        if let Err(e) = pool_discovery.start().await {
+            error!(error = %e, "GeyserPoolDiscovery crashed");
+        }
+    });
+
+    // Start legacy GeyserListener for transaction parsing (will be phased out in favor of pool discovery)
     let (listener, mut account_rx, mut transaction_rx) = GeyserListener::new_with_tracked_accounts(
         geyser_url.to_string(),
         program_ids,
@@ -721,6 +741,63 @@ async fn run_geyser_loop(
                 if let Some(ref nats) = ctx.nats {
                     if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
                         warn!(error = %e, "Failed to publish tx event to NATS");
+                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            // Pool Discovery Events (Geyser-based pool creation events)
+            Ok(pool_event) = pool_discovery_rx.recv() => {
+                ironcrab::metrics::record_activity();
+
+                info!(
+                    dex = %pool_event.dex_type,
+                    pool = %pool_event.pool_address,
+                    base = %pool_event.base_mint,
+                    quote = %pool_event.quote_mint,
+                    liquidity_lamports = pool_event.liquidity_estimate_lamports,
+                    "Pool discovered via Geyser"
+                );
+
+                // Track base mint for metadata fetching
+                let mut tracked = ctx.tracked_mints.write();
+                if tracked.insert(pool_event.base_mint) {
+                    let updated: Vec<Pubkey> = tracked.iter().copied().collect();
+                    let _ = ctx.tracked_mints_tx.send(updated);
+                }
+
+                // Convert to MarketEvent::PoolCreated
+                let event = MarketEvent::new(
+                    "market-data",
+                    BUILD_VERSION,
+                    run_id,
+                    ctx.next_event_id(),
+                    "geyser_pool_discovery",
+                    Some(pool_event.slot),
+                    MarketEventKind::PoolCreated {
+                        pool_address: pool_event.pool_address.to_string(),
+                        base_mint: pool_event.base_mint.to_string(),
+                        quote_mint: pool_event.quote_mint.to_string(),
+                        dex: pool_event.dex_type.to_string(),
+                        initial_liquidity_sol: Some(
+                            rust_decimal::Decimal::from(pool_event.liquidity_estimate_lamports)
+                                / rust_decimal::Decimal::from(1_000_000_000u64)
+                        ),
+                    },
+                );
+
+                // Write to JSONL
+                if let Err(e) = ctx.jsonl_writer.write(&event) {
+                    error!(error = %e, "Failed to write pool discovery event to JSONL");
+                }
+
+                // Publish to NATS
+                if let Some(ref nats) = ctx.nats {
+                    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
+                        warn!(error = %e, "Failed to publish pool discovery event to NATS");
                         NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                     } else {
                         NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
