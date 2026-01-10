@@ -946,6 +946,7 @@ impl ParsedDexEvent {
                 pool_address,
                 mint,
                 trader,
+                dex,
                 is_buy,
                 sol_amount,
                 token_amount,
@@ -961,6 +962,7 @@ impl ParsedDexEvent {
                 token_amount: *token_amount,
                 token_decimals: *token_decimals,
                 signature: Some(signature.clone()),
+                dex: dex.to_string(),
             },
             ParsedDexEvent::LiquidityRemoved {
                 pool_address,

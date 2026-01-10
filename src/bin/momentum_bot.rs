@@ -4330,6 +4330,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             sol_amount,
             token_amount,
             signature,
+            dex: event_dex,
             ..  // Ignore token_decimals, we don't need it for momentum detection
         } => {
             // P1: Trade-based Token Discovery
@@ -4337,11 +4338,11 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             let tracker_exists = ctx.token_trackers.read().contains_key(mint);
             
             if !tracker_exists && *is_buy && *sol_amount > 0 {
-                // Discover token via trade - infer DEX from pool_address or default to pumpfun
+                // Use DEX from event if available, otherwise infer from pool_address pattern
                 let slot = event.slot.unwrap_or(0);
-                // Try to infer DEX type from pool address pattern
-                // PumpSwap pools often start with specific prefixes
-                let dex = if pool_address.starts_with("pump") || pool_address.starts_with("pAMM") {
+                let dex = if !event_dex.is_empty() && event_dex != "unknown" {
+                    event_dex.as_str()
+                } else if pool_address.starts_with("pump") || pool_address.starts_with("pAMM") {
                     "pump_amm"
                 } else {
                     "pumpfun" // Default assumption for Bonding Curve

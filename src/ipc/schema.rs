@@ -165,6 +165,8 @@ pub enum MarketEventKind {
         token_amount: u64,
         token_decimals: u8, // e.g., 6 for USDC, 9 for most pump.fun tokens
         signature: Option<String>,
+        /// DEX name (raydium, orca, meteora_dlmm, pumpfun, pump_amm)
+        dex: String,
     },
     /// Swap observed on-chain (legacy format)
     SwapObserved {

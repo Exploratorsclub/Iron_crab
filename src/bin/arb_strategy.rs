@@ -638,6 +638,7 @@ impl ArbContext {
         token_amount: u64,
         token_decimals: u8,
         _is_buy: bool,
+        dex: &str,
     ) -> Option<ArbOpportunity> {
         // DATA QUALITY: Reject trades with zero amounts (parser failed to extract token balance)
         if token_amount == 0 || sol_amount == 0 {
@@ -706,16 +707,20 @@ impl ArbContext {
                 .get_mut(&dex_key)
                 .expect("dex_key must exist")
         } else {
-            // We don't know the DEX from Trade events alone.
-            // Create a placeholder pool, but ensure it won't be used for cross-DEX intent routing.
+            // Use the DEX from the Trade event. If empty/unknown, use pool_address as key.
+            let effective_dex = if !dex.is_empty() && dex != "unknown" {
+                dex.to_string()
+            } else {
+                pool_address.to_string()
+            };
             tracker
                 .pools_by_dex
-                .entry(pool_address.to_string())
+                .entry(effective_dex.clone())
                 .or_insert_with(|| {
-                    info!(pool = %pool_address, mint = %mint, "Creating unknown-dex pool from Trade event");
+                    info!(pool = %pool_address, mint = %mint, dex = %effective_dex, "Creating pool from Trade event");
                     PoolState {
                         pool_address: pool_address.to_string(),
-                        dex: "unknown".to_string(),
+                        dex: effective_dex,
                         liquidity_sol: Decimal::ZERO, // Unknown liquidity
                         last_price: None,
                         trade_count: 0,
@@ -1125,10 +1130,11 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             token_amount,
             token_decimals,
             is_buy,
+            dex,
             ..
         } => {
             if let Some(opp) =
-                ctx.handle_trade(pool_address, mint, *sol_amount, *token_amount, *token_decimals, *is_buy)
+                ctx.handle_trade(pool_address, mint, *sol_amount, *token_amount, *token_decimals, *is_buy, dex)
             {
                 // Prometheus: count arbitrage opportunities detected
                 ARB_TRIANGLE_OPPORTUNITIES.fetch_add(1, Ordering::Relaxed);
