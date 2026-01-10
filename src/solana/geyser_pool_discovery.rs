@@ -604,12 +604,15 @@ pub enum DexType {
 
 impl std::fmt::Display for DexType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // IMPORTANT: These names must match:
+        // 1. is_known_dex_label() in arb_strategy.rs
+        // 2. DEX connector keys in cross_dex_handler.rs
         match self {
-            DexType::RaydiumAmmV4 => write!(f, "Raydium"),
-            DexType::RaydiumCpmm => write!(f, "RaydiumCPMM"),
-            DexType::OrcaWhirlpool => write!(f, "Orca"),
-            DexType::MeteoraDlmm => write!(f, "MeteoraDLMM"),
-            DexType::PumpFun => write!(f, "PumpFun"),
+            DexType::RaydiumAmmV4 => write!(f, "raydium"),
+            DexType::RaydiumCpmm => write!(f, "raydium_cpmm"),
+            DexType::OrcaWhirlpool => write!(f, "orca"),
+            DexType::MeteoraDlmm => write!(f, "meteora_dlmm"),
+            DexType::PumpFun => write!(f, "pumpfun"),
         }
     }
 }
