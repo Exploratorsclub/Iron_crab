@@ -377,14 +377,20 @@ export function ComponentDetail() {
     }
   }
 
+  function normalizeNumberString(raw: string): string {
+    // Allow German decimal comma input (e.g. "0,5")
+    return raw.trim().replace(',', '.')
+  }
+
   function parseConfigValue(raw: string): ConfigValue {
     const trimmed = raw.trim()
     if (trimmed === '') return ''
     if (trimmed === 'null') return null
     if (trimmed === 'true') return true
     if (trimmed === 'false') return false
-    const num = parseFloat(trimmed)
-    if (!Number.isNaN(num) && trimmed === String(num)) return num
+    const normalized = normalizeNumberString(trimmed)
+    const num = parseFloat(normalized)
+    if (!Number.isNaN(num) && /^-?\d+(\.\d+)?$/.test(normalized)) return num
     return trimmed
   }
 
@@ -414,7 +420,11 @@ export function ComponentDetail() {
 
   // Convert SOL to lamports (1 SOL = 1e9 lamports)
   function solToLamports(sol: string): number {
-    return Math.floor(parseFloat(sol) * 1_000_000_000)
+    const normalized = normalizeNumberString(sol)
+    if (normalized === '') return 0
+    const parsed = parseFloat(normalized)
+    if (!Number.isFinite(parsed) || parsed < 0) return 0
+    return Math.floor(parsed * 1_000_000_000)
   }
 
   // Check if a key represents lamports (for automatic conversion)
