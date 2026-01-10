@@ -387,20 +387,38 @@ impl ArbContext {
         let config = self.config.read().clone();
         let mut trackers = self.trackers.write();
 
-        if let Some(tracker) = trackers.get_mut(mint) {
-            // Find which pool this is
-            for pool in tracker.pools_by_dex.values_mut() {
-                if pool.pool_address == pool_address {
-                    pool.last_price = Some(price);
-                    pool.trade_count += 1;
-                    pool.last_update = Instant::now();
-                    info!(pool = %pool_address, mint = %mint, dex = %pool.dex, price = %price, "Pool price updated");
-                    break;
-                }
+        // Get or create tracker for this mint
+        let tracker = trackers.entry(mint.to_string()).or_insert_with(|| {
+            info!(mint = %mint, "Creating tracker from Trade event (no PoolCreated)");
+            TokenArbTracker {
+                base_mint: mint.to_string(),
+                pools_by_dex: HashMap::new(),
+                last_intent_time: None,
             }
+        });
 
-            // Check for arbitrage opportunity
-            if let Some(opp) = tracker.check_arbitrage(&config) {
+        // Find or create pool for this pool_address
+        // We don't know the DEX from Trade events, so use pool_address as key
+        let pool = tracker.pools_by_dex.entry(pool_address.to_string()).or_insert_with(|| {
+            info!(pool = %pool_address, mint = %mint, "Creating pool from Trade event");
+            PoolState {
+                pool_address: pool_address.to_string(),
+                dex: pool_address.to_string(), // Use pool address as DEX identifier when unknown
+                liquidity_sol: Decimal::ZERO, // Unknown liquidity
+                last_price: None,
+                trade_count: 0,
+                last_update: Instant::now(),
+            }
+        });
+
+        // Update price
+        pool.last_price = Some(price);
+        pool.trade_count += 1;
+        pool.last_update = Instant::now();
+        info!(pool = %pool_address, mint = %mint, dex = %pool.dex, price = %price, "Pool price updated");
+
+        // Check for arbitrage opportunity
+        if let Some(opp) = tracker.check_arbitrage(&config) {
                 // Check cooldown
                 let cooldown = Duration::from_millis(config.intent_cooldown_ms);
                 if let Some(last_time) = tracker.last_intent_time {
@@ -413,9 +431,6 @@ impl ArbContext {
                 self.opportunities_found.fetch_add(1, Ordering::Relaxed);
                 return Some(opp);
             }
-        } else {
-            info!(mint = %mint, pool = %pool_address, "Trade ignored: no tracker for mint (PoolCreated event missing?)");
-        }
 
         None
     }
