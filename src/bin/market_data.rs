@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -412,6 +412,13 @@ async fn run_geyser_loop(
     let rpc = Arc::new(SolanaRpc::new(&rpc_url));
     info!(rpc_url = %rpc_url, "Initialized RPC client for metadata/fallback");
 
+    // Mint metadata fetch pipeline:
+    // - We add mints to `tracked_mints` when we see them via tx/pool discovery.
+    // - Mint accounts often *never change*, so relying on a future Geyser account update
+    //   means we may never emit TokenMintInfo (decimals/supply), which strategies need.
+    // - Therefore we proactively fetch the mint account once via RPC and emit TokenMintInfo.
+    let (mint_info_tx, mut mint_info_rx) = mpsc::unbounded_channel::<MarketEvent>();
+
     // DEX program IDs to monitor (must match validator account-index)
     let program_ids = vec![
         Pubkey::from_str(RAYDIUM_AMM_V4).expect("valid raydium pubkey"),
@@ -458,6 +465,25 @@ async fn run_geyser_loop(
 
     loop {
         tokio::select! {
+            // Proactive mint metadata (decimals/supply) fetched via RPC.
+            Some(mint_event) = mint_info_rx.recv() => {
+                // Write to JSONL
+                if let Err(e) = ctx.jsonl_writer.write(&mint_event) {
+                    error!(error = %e, "Failed to write TokenMintInfo event to JSONL");
+                }
+
+                // Publish to NATS
+                if let Some(ref nats) = ctx.nats {
+                    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &mint_event).await {
+                        warn!(error = %e, "Failed to publish TokenMintInfo event to NATS");
+                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+
             // Keep /ready fresh even if Geyser/NATS are quiet.
             _ = activity_interval.tick() => {
                 ironcrab::metrics::record_activity();
@@ -577,6 +603,46 @@ async fn run_geyser_loop(
                             // push updated list to geyser listener (resubscribe)
                             let updated: Vec<Pubkey> = tracked.iter().copied().collect();
                             let _ = ctx.tracked_mints_tx.send(updated);
+
+                            // Proactively fetch mint account once to emit TokenMintInfo.
+                            // (Mint accounts are usually static, so Geyser may never send an update.)
+                            let rpc = rpc.clone();
+                            let ctx_clone = ctx.clone();
+                            let run_id = run_id.to_string();
+                            let mint_info_tx = mint_info_tx.clone();
+                            let slot = tx_update.slot;
+                            tokio::spawn(async move {
+                                match rpc.get_account_retry(&mint).await {
+                                    Ok(acc) => {
+                                        if let Some((decimals, supply, mint_authority, freeze_authority)) =
+                                            try_parse_mint_account(&acc.owner, &acc.data)
+                                        {
+                                            let mint_event = MarketEvent::new(
+                                                "market-data",
+                                                BUILD_VERSION,
+                                                &run_id,
+                                                ctx_clone.next_event_id(),
+                                                "rpc",
+                                                Some(slot),
+                                                MarketEventKind::TokenMintInfo {
+                                                    mint: mint.to_string(),
+                                                    token_program: acc.owner.to_string(),
+                                                    decimals,
+                                                    supply,
+                                                    mint_authority,
+                                                    freeze_authority,
+                                                },
+                                            );
+
+                                            // Best-effort: if receiver is dropped, ignore.
+                                            let _ = mint_info_tx.send(mint_event);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(mint = %mint, error = %e, "Failed to fetch mint account via RPC for TokenMintInfo");
+                                    }
+                                }
+                            });
                         }
                     }
                 }
@@ -767,6 +833,45 @@ async fn run_geyser_loop(
                 if tracked.insert(pool_event.base_mint) {
                     let updated: Vec<Pubkey> = tracked.iter().copied().collect();
                     let _ = ctx.tracked_mints_tx.send(updated);
+
+                    // Proactively fetch mint account once to emit TokenMintInfo.
+                    let rpc = rpc.clone();
+                    let ctx_clone = ctx.clone();
+                    let run_id = run_id.to_string();
+                    let mint_info_tx = mint_info_tx.clone();
+                    let mint = pool_event.base_mint;
+                    let slot = pool_event.slot;
+                    tokio::spawn(async move {
+                        match rpc.get_account_retry(&mint).await {
+                            Ok(acc) => {
+                                if let Some((decimals, supply, mint_authority, freeze_authority)) =
+                                    try_parse_mint_account(&acc.owner, &acc.data)
+                                {
+                                    let mint_event = MarketEvent::new(
+                                        "market-data",
+                                        BUILD_VERSION,
+                                        &run_id,
+                                        ctx_clone.next_event_id(),
+                                        "rpc",
+                                        Some(slot),
+                                        MarketEventKind::TokenMintInfo {
+                                            mint: mint.to_string(),
+                                            token_program: acc.owner.to_string(),
+                                            decimals,
+                                            supply,
+                                            mint_authority,
+                                            freeze_authority,
+                                        },
+                                    );
+
+                                    let _ = mint_info_tx.send(mint_event);
+                                }
+                            }
+                            Err(e) => {
+                                warn!(mint = %mint, error = %e, "Failed to fetch mint account via RPC for TokenMintInfo");
+                            }
+                        }
+                    });
                 }
 
                 // Convert to MarketEvent::PoolCreated

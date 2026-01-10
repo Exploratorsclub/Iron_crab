@@ -3489,15 +3489,15 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         }
     }
 
-    // === Cross-DEX Arbitrage Validation (if applicable) ===
+    // === Cross-DEX Arbitrage Detection (if applicable) ===
     let is_cross_dex_arb = CrossDexHandler::is_cross_dex_arb_intent(&intent);
 
     // Planned tx (RS-2.1): deterministic tx plan + plan_hash
+    // NOTE: Cross-DEX arb intents are NOT single-swap plans and therefore must not go through
+    // tx_builder::build_tx_plan (which requires metadata.dex and pools_len==1).
     let (tx_plan, plan_hash_str) = {
-        // === Plan (RS-2.1) ===
-        // RS-3.1 requires real simulation, which depends on a deterministic tx plan.
-        // Therefore planning is now mandatory (unsupported intents are rejected explicitly).
         info!(intent_id = %intent.intent_id, "Building tx plan");
+
         let wallet_pubkey = match ctx.wallet_pubkey {
             Some(pk) => pk,
             None => {
@@ -3513,77 +3513,31 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             }
         };
 
-        match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc)).await {
-            tx_builder::TxPlanOutcome::Planned(plan) => {
-                let plan_hash_str = plan.hash_string();
+        if is_cross_dex_arb {
+            info!(intent_id = %intent.intent_id, "Planning cross-DEX arb tx (atomic bundle)");
+
+            let Some(ref handler) = ctx.cross_dex_handler else {
+                let reason = RejectReason::ArbHandlerNotConfigured;
                 checks.push(CheckResult {
-                    check_name: "tx_plan".to_string(),
-                    passed: true,
-                    reason_code: None,
-                    details: Some(format!(
-                        "ix_count={} plan_hash={}",
-                        plan.instructions.len(),
-                        plan_hash_str
-                    )),
-                });
-                (plan, plan_hash_str)
-            }
-            tx_builder::TxPlanOutcome::Unsupported(u) => {
-                checks.push(CheckResult {
-                    check_name: "tx_plan".to_string(),
+                    check_name: "cross_dex_handler".to_string(),
                     passed: false,
-                    reason_code: Some(u.reason.to_string()),
-                    details: Some(u.details),
+                    reason_code: Some(reason.to_string()),
+                    details: Some("Cross-DEX handler not initialized".to_string()),
                 });
                 ctx.lock_manager.release_locks(&intent.intent_id);
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, u.reason).await;
-            }
-        }
-    };
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            };
 
-    let plan_hash: Option<String> = Some(plan_hash_str.clone());
+            // Use the same fee policy estimates that will be used for the actual send path.
+            let (_base_fee, _priority_fee_lamports, total_cost_lamports) =
+                fee_policy.estimate_tx_cost(&intent);
 
-    if is_cross_dex_arb {
-        info!(intent_id = %intent.intent_id, "Processing as Cross-DEX arbitrage intent");
-
-        if let Some(ref handler) = ctx.cross_dex_handler {
-            // Estimate tx cost for profitability check
-            let estimated_tx_cost = 50_000u64; // ~0.00005 SOL (TODO: use fee policy)
-
-            match handler
-                .validate_arb_opportunity(&intent, estimated_tx_cost)
+            // Cross-DEX arb must be revalidated with live quotes before plan is built.
+            let validation = match handler
+                .validate_arb_opportunity(&intent, total_cost_lamports)
                 .await
             {
-                Ok(validation) => {
-                    ctx.arb_validated
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                    if !validation.is_valid {
-                        let reason = RejectReason::ArbSpreadInsufficient;
-                        checks.push(CheckResult {
-                            check_name: "cross_dex_validation".to_string(),
-                            passed: false,
-                            reason_code: Some(reason.to_string()),
-                            details: validation.reject_reason.clone(),
-                        });
-
-                        // Release lock on rejection
-                        ctx.lock_manager.release_locks(&intent.intent_id);
-
-                        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason)
-                            .await;
-                    }
-
-                    checks.push(CheckResult {
-                        check_name: "cross_dex_validation".to_string(),
-                        passed: true,
-                        reason_code: None,
-                        details: Some(format!(
-                            "spread={}bps profit={}lamports",
-                            validation.actual_spread_bps, validation.estimated_profit_lamports
-                        )),
-                    });
-                }
+                Ok(v) => v,
                 Err(e) => {
                     warn!(error = %e, "Cross-DEX validation failed");
                     let reason = RejectReason::ArbValidationError;
@@ -3593,25 +3547,117 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         reason_code: Some(reason.to_string()),
                         details: Some(e.to_string()),
                     });
-
                     ctx.lock_manager.release_locks(&intent.intent_id);
                     return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
                 }
+            };
+
+            ctx.arb_validated
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            if !validation.is_valid {
+                let reason = RejectReason::ArbSpreadInsufficient;
+                checks.push(CheckResult {
+                    check_name: "cross_dex_validation".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: validation.reject_reason.clone(),
+                });
+                ctx.lock_manager.release_locks(&intent.intent_id);
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
             }
-        } else {
-            // Cross-DEX handler not configured
-            let reason = RejectReason::ArbHandlerNotConfigured;
+
             checks.push(CheckResult {
-                check_name: "cross_dex_handler".to_string(),
-                passed: false,
-                reason_code: Some(reason.to_string()),
-                details: Some("Cross-DEX handler not initialized".to_string()),
+                check_name: "cross_dex_validation".to_string(),
+                passed: true,
+                reason_code: None,
+                details: Some(format!(
+                    "spread={}bps profit={}lamports tx_cost={}lamports",
+                    validation.actual_spread_bps,
+                    validation.estimated_profit_lamports,
+                    total_cost_lamports
+                )),
             });
 
-            ctx.lock_manager.release_locks(&intent.intent_id);
-            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            // Build the two-leg swap instruction plan.
+            let plan = match handler.build_swap_plan(&intent, &validation).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let reason = RejectReason::UnsupportedIntent;
+                    checks.push(CheckResult {
+                        check_name: "tx_plan".to_string(),
+                        passed: false,
+                        reason_code: Some(reason.to_string()),
+                        details: Some(format!("cross_dex_plan_error:{e}")),
+                    });
+                    ctx.lock_manager.release_locks(&intent.intent_id);
+                    return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+                }
+            };
+
+            // Include compute budget ixs so simulation matches send (and CU limit is sufficient).
+            let compute_units = fee_policy.compute_units_for_intent(&intent);
+            let micro_lamports_per_cu = fee_policy.priority_fee_for_intent(&intent);
+
+            let mut ixs = Vec::new();
+            ixs.push(ironcrab::solana::compute_budget_helper::set_compute_unit_limit(
+                compute_units,
+            ));
+            if micro_lamports_per_cu > 0 {
+                ixs.push(ironcrab::solana::compute_budget_helper::set_compute_unit_price(
+                    micro_lamports_per_cu,
+                ));
+            }
+            ixs.extend(plan.buy_instructions);
+            ixs.extend(plan.sell_instructions);
+
+            let tx_plan = tx_builder::TxPlan { instructions: ixs };
+            let plan_hash_str = tx_plan.hash_string();
+            checks.push(CheckResult {
+                check_name: "tx_plan".to_string(),
+                passed: true,
+                reason_code: None,
+                details: Some(format!(
+                    "ix_count={} plan_hash={} buy_dex={} sell_dex={}",
+                    tx_plan.instructions.len(),
+                    plan_hash_str,
+                    plan.buy_dex,
+                    plan.sell_dex
+                )),
+            });
+
+            (tx_plan, plan_hash_str)
+        } else {
+            match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc)).await {
+                tx_builder::TxPlanOutcome::Planned(plan) => {
+                    let plan_hash_str = plan.hash_string();
+                    checks.push(CheckResult {
+                        check_name: "tx_plan".to_string(),
+                        passed: true,
+                        reason_code: None,
+                        details: Some(format!(
+                            "ix_count={} plan_hash={}",
+                            plan.instructions.len(),
+                            plan_hash_str
+                        )),
+                    });
+                    (plan, plan_hash_str)
+                }
+                tx_builder::TxPlanOutcome::Unsupported(u) => {
+                    checks.push(CheckResult {
+                        check_name: "tx_plan".to_string(),
+                        passed: false,
+                        reason_code: Some(u.reason.to_string()),
+                        details: Some(u.details),
+                    });
+                    ctx.lock_manager.release_locks(&intent.intent_id);
+                    return emit_rejected_decision(ctx, decision_id, &intent, checks, u.reason).await;
+                }
+            }
         }
-    }
+    };
+
+    let plan_hash: Option<String> = Some(plan_hash_str.clone());
 
     // === P1: Check if bundle required for atomic execution ===
     let requires_bundle = intent.requires_bundle();

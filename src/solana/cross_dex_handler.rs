@@ -188,14 +188,34 @@ impl CrossDexHandler {
             }
         };
 
-        // Get live quote from sell DEX (Token -> SOL)
+        // Compute a conservative minimum-out for the buy leg, then quote the sell leg using
+        // that guaranteed amount. This prevents building a 2nd-leg sell that requires more
+        // tokens than we might actually receive (even if the buy meets its min_out).
+        let slippage_bps = intent.max_slippage_bps.min(self.default_slippage_bps);
+        let buy_min_out = buy_quote
+            .amount_out
+            .saturating_mul(10_000u64.saturating_sub(slippage_bps as u64))
+            / 10_000u64;
+
+        if buy_min_out == 0 {
+            return Ok(CrossDexValidation {
+                is_valid: false,
+                buy_quote: Some(buy_quote),
+                sell_quote: None,
+                actual_spread_bps: 0,
+                estimated_profit_lamports: 0,
+                reject_reason: Some("buy_min_out=0 (cannot build safe arb)".to_string()),
+            });
+        }
+
+        // Get live quote from sell DEX (Token -> SOL) based on conservative buy_min_out
         let sell_connector = self
             .dexes
             .get(&sell_dex)
             .ok_or_else(|| anyhow!("Unknown sell DEX: {}", sell_dex))?;
 
         let sell_quote = sell_connector
-            .quote_exact_in(token_mint, SOL_MINT, buy_quote.amount_out)
+            .quote_exact_in(token_mint, SOL_MINT, buy_min_out)
             .await?;
 
         let sell_quote = match sell_quote {
@@ -212,8 +232,8 @@ impl CrossDexHandler {
             }
         };
 
-        // Calculate actual spread
-        // We input X SOL, buy tokens, sell tokens, get Y SOL
+        // Calculate actual spread (conservative path: based on buy_min_out)
+        // We input X SOL, buy >= min_out tokens, sell those tokens, get Y SOL.
         // Spread = (Y - X) / X * 10000 bps
         let input_sol = trade_amount as i64;
         let output_sol = sell_quote.amount_out as i64;
@@ -299,8 +319,24 @@ impl CrossDexHandler {
         let token_mint = &intent.resources.output_mint;
         let trade_amount = intent.required_capital.raw;
 
-        let (buy_dex, _) = self.identify_dex(&pools[0])?;
-        let (sell_dex, _) = self.identify_dex(&pools[1])?;
+        // Prefer explicit metadata set by arb-strategy.
+        // The identify_dex() heuristic is a stub and must not be the primary routing source.
+        let buy_dex = intent
+            .metadata
+            .get("buy_dex")
+            .cloned()
+            .unwrap_or_else(|| self.identify_dex(&pools[0]).map(|(d, _)| d).unwrap_or_default());
+        let sell_dex = intent
+            .metadata
+            .get("sell_dex")
+            .cloned()
+            .unwrap_or_else(|| self.identify_dex(&pools[1]).map(|(d, _)| d).unwrap_or_default());
+
+        if buy_dex.is_empty() || sell_dex.is_empty() {
+            return Err(anyhow!(
+                "cannot build swap plan: missing buy_dex/sell_dex routing hints"
+            ));
+        }
 
         // Calculate min_out with slippage
         let slippage_bps = intent.max_slippage_bps.min(self.default_slippage_bps);
@@ -332,10 +368,12 @@ impl CrossDexHandler {
             .get(&sell_dex)
             .ok_or_else(|| anyhow!("Unknown sell DEX: {}", sell_dex))?;
 
+        // IMPORTANT: sell the guaranteed minimum tokens (buy_min_out), not the optimistic
+        // quoted output. Otherwise the second leg may fail due to insufficient token balance.
         let sell_instructions = sell_connector.build_swap_ix(
             token_mint,
             SOL_MINT,
-            buy_quote.amount_out, // Use expected tokens from buy
+            buy_min_out,
             sell_min_out,
         )?;
 

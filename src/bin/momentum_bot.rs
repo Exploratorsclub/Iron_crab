@@ -1678,6 +1678,14 @@ impl MomentumContext {
 
                 if should_trade {
                     if probe_sol == 0 {
+                        warn!(
+                            mint = %mint,
+                            pool = %tracker.pool,
+                            dex = %tracker.dex,
+                            default_position_lamports = config.default_position_lamports,
+                            probe_buy_pct = config.probe_buy_pct,
+                            "Entry signal suppressed: probe_sol rounds to 0; increase default_position_lamports or probe_buy_pct"
+                        );
                         tracker.intent_generated = true;
                         continue;
                     }
@@ -1718,6 +1726,14 @@ impl MomentumContext {
 
                 if should_trade {
                     if scale_sol == 0 {
+                        warn!(
+                            mint = %mint,
+                            pool = %tracker.pool,
+                            dex = %tracker.dex,
+                            default_position_lamports = config.default_position_lamports,
+                            probe_buy_pct = config.probe_buy_pct,
+                            "Scale-in suppressed: scale_sol is 0 (after probe rounding); increase default_position_lamports or adjust probe_buy_pct"
+                        );
                         tracker.intent_generated = true;
                         continue;
                     }
