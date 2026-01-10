@@ -67,6 +67,44 @@ pub struct CrossDexHandler {
 }
 
 impl CrossDexHandler {
+    async fn estimate_min_amount_in_for_target_out(
+        &self,
+        dex: &Arc<dyn Dex>,
+        input_mint: &str,
+        output_mint: &str,
+        target_out: u64,
+        max_in: u64,
+        max_in_out: u64,
+    ) -> Result<Option<u64>> {
+        if target_out == 0 || max_in == 0 {
+            return Ok(None);
+        }
+
+        if max_in_out < target_out {
+            return Ok(None);
+        }
+
+        // Binary-search the smallest amount_in that yields >= target_out.
+        // Assumes quote_exact_in is monotonic in amount_in for the current pool state.
+        let mut lo: u64 = 1;
+        let mut hi: u64 = max_in;
+        for _ in 0..24 {
+            if lo >= hi {
+                break;
+            }
+            let mid = lo + (hi - lo) / 2;
+            let q = dex.quote_exact_in(input_mint, output_mint, mid).await?;
+            let out = q.map(|qq| qq.amount_out).unwrap_or(0);
+            if out >= target_out {
+                hi = mid;
+            } else {
+                lo = mid.saturating_add(1);
+            }
+        }
+
+        Ok(Some(hi))
+    }
+
     /// Create a new CrossDexHandler
     pub fn new(rpc: Arc<SolanaRpc>, wallet: Option<Keypair>) -> Self {
         Self {
@@ -208,6 +246,37 @@ impl CrossDexHandler {
             });
         }
 
+        // Estimate the minimum input needed to achieve buy_min_out.
+        // This approximates "exact out" behavior: we try to buy a fixed token amount with a
+        // max SOL spend (trade_amount) by choosing the smallest amount_in that still yields
+        // >= buy_min_out. This minimizes leftover tokens when we sell exactly buy_min_out.
+        let buy_amount_in_est = self
+            .estimate_min_amount_in_for_target_out(
+                buy_connector,
+                SOL_MINT,
+                token_mint,
+                buy_min_out,
+                trade_amount,
+                buy_quote.amount_out,
+            )
+            .await?;
+
+        let buy_amount_in_est = match buy_amount_in_est {
+            Some(v) if v <= trade_amount => v,
+            _ => {
+                return Ok(CrossDexValidation {
+                    is_valid: false,
+                    buy_quote: Some(buy_quote),
+                    sell_quote: None,
+                    actual_spread_bps: 0,
+                    estimated_profit_lamports: 0,
+                    reject_reason: Some(
+                        "cannot estimate amount_in for buy_min_out within max capital".to_string(),
+                    ),
+                });
+            }
+        };
+
         // Get live quote from sell DEX (Token -> SOL) based on conservative buy_min_out
         let sell_connector = self
             .dexes
@@ -232,10 +301,10 @@ impl CrossDexHandler {
             }
         };
 
-        // Calculate actual spread (conservative path: based on buy_min_out)
-        // We input X SOL, buy >= min_out tokens, sell those tokens, get Y SOL.
+        // Calculate spread based on estimated input for buy_min_out.
+        // We input ~X SOL, buy >= buy_min_out tokens, sell buy_min_out tokens, get Y SOL.
         // Spread = (Y - X) / X * 10000 bps
-        let input_sol = trade_amount as i64;
+        let input_sol = buy_amount_in_est as i64;
         let output_sol = sell_quote.amount_out as i64;
         let gross_profit = output_sol - input_sol;
         let actual_spread_bps = if input_sol > 0 {
@@ -249,6 +318,8 @@ impl CrossDexHandler {
 
         info!(
             input_sol = input_sol,
+            max_input_sol = trade_amount,
+            buy_amount_in_est = buy_amount_in_est,
             output_sol = output_sol,
             gross_profit = gross_profit,
             tx_cost = tx_cost_lamports,
@@ -347,6 +418,10 @@ impl CrossDexHandler {
             .saturating_mul(10000 - slippage_bps as u64)
             / 10000;
 
+        if buy_min_out == 0 {
+            return Err(anyhow!("buy_min_out=0 (cannot build safe arb)"));
+        }
+
         // Sell leg: min SOL out
         let sell_min_out = sell_quote
             .amount_out
@@ -359,8 +434,22 @@ impl CrossDexHandler {
             .get(&buy_dex)
             .ok_or_else(|| anyhow!("Unknown buy DEX: {}", buy_dex))?;
 
+        // Approximate exact-out: spend the smallest SOL amount that should yield >= buy_min_out,
+        // bounded by trade_amount (max capital).
+        let buy_amount_in = self
+            .estimate_min_amount_in_for_target_out(
+                buy_connector,
+                SOL_MINT,
+                token_mint,
+                buy_min_out,
+                trade_amount,
+                buy_quote.amount_out,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("cannot estimate buy amount_in for buy_min_out"))?;
+
         let buy_instructions =
-            buy_connector.build_swap_ix(SOL_MINT, token_mint, trade_amount, buy_min_out)?;
+            buy_connector.build_swap_ix(SOL_MINT, token_mint, buy_amount_in, buy_min_out)?;
 
         // Build sell instructions
         let sell_connector = self
@@ -386,7 +475,7 @@ impl CrossDexHandler {
             total_compute_units: total_cu,
             buy_dex,
             sell_dex,
-            input_sol_lamports: trade_amount,
+            input_sol_lamports: buy_amount_in,
             expected_output_sol_lamports: sell_quote.amount_out,
         })
     }
