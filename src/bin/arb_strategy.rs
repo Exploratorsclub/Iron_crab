@@ -205,10 +205,12 @@ impl TokenArbTracker {
         let spread_bps = spread.to_string().parse::<i64>().unwrap_or(0);
 
         if spread_bps < config.min_spread_bps as i64 {
-            debug!(
+            info!(
                 mint = %self.base_mint,
                 buy_dex = %buy_pool.dex,
                 sell_dex = %sell_pool.dex,
+                buy_price = %buy_price,
+                sell_price = %sell_price,
                 spread_bps = spread_bps,
                 min_spread = config.min_spread_bps,
                 "Arb check rejected: spread below minimum"
@@ -234,7 +236,7 @@ impl TokenArbTracker {
         let net_profit = gross_profit_lamports.saturating_sub(config.est_tx_cost_lamports);
 
         if net_profit < config.min_profit_lamports {
-            debug!(
+            info!(
                 mint = %self.base_mint,
                 buy_dex = %buy_pool.dex,
                 sell_dex = %sell_pool.dex,
