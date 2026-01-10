@@ -284,6 +284,7 @@ export function ComponentDetail() {
   const [metrics, setMetrics] = useState<MetricsData | null>(null)
   const [config, setConfig] = useState<ComponentConfig | null>(null)
   const [configDraft, setConfigDraft] = useState<ComponentConfig>({})
+  const [lamportsDisplayDraft, setLamportsDisplayDraft] = useState<Record<string, string>>({})
   const [newKey, setNewKey] = useState('')
   const [newValue, setNewValue] = useState('')
   const [isLoadingMetrics, setIsLoadingMetrics] = useState(false)
@@ -344,6 +345,7 @@ export function ComponentDetail() {
       
       setConfig(loadedConfig)
       setConfigDraft(loadedConfig)
+      setLamportsDisplayDraft({})
     } catch (err) {
       setConfigError(err instanceof Error ? err.message : String(err))
       
@@ -351,6 +353,7 @@ export function ComponentDetail() {
       const fallback = DEFAULT_CONFIGS[component] || {}
       setConfig(fallback)
       setConfigDraft(fallback)
+      setLamportsDisplayDraft({})
     } finally {
       setIsLoadingConfig(false)
     }
@@ -363,12 +366,21 @@ export function ComponentDetail() {
     setSaveStatus(null)
 
     try {
+      // Resolve any in-progress *_lamports edits (user might not have blurred the input yet)
+      const resolved: ComponentConfig = { ...configDraft }
+      for (const [key, raw] of Object.entries(lamportsDisplayDraft)) {
+        if (!isLamportsField(key)) continue
+        resolved[key] = solToLamports(raw)
+      }
+
       await postJson(`${CONTROL_PLANE}/config`, {
         component,
-        config: configDraft,
+        config: resolved,
       })
       setSaveStatus('✅ Config saved successfully!')
-      setConfig(configDraft)
+      setConfig(resolved)
+      setConfigDraft(resolved)
+      setLamportsDisplayDraft({})
       setTimeout(() => setSaveStatus(null), 3000)
     } catch (err) {
       setSaveStatus(`❌ Error: ${err instanceof Error ? err.message : String(err)}`)
@@ -408,6 +420,10 @@ export function ComponentDetail() {
   function deleteConfigKey(key: string) {
     const { [key]: _, ...rest } = configDraft
     setConfigDraft(rest)
+    setLamportsDisplayDraft((prev) => {
+      const { [key]: __, ...next } = prev
+      return next
+    })
   }
 
   // Convert lamports to SOL for display (1e9 lamports = 1 SOL)
@@ -435,19 +451,33 @@ export function ComponentDetail() {
   // Get display value (converts lamports to SOL if applicable)
   function getDisplayValue(key: string, val: ConfigValue): string {
     if (typeof val === 'number' && isLamportsField(key)) {
+      const draft = lamportsDisplayDraft[key]
+      if (draft !== undefined) return draft
       return lamportsToSol(val)
     }
     return String(val ?? '')
   }
 
-  // Update value from display (converts SOL to lamports if applicable)
+  // Update value from display.
+  // NOTE: For *_lamports we keep raw text while typing and only convert on blur/enter.
   function updateFromDisplay(key: string, displayValue: string) {
     if (isLamportsField(key)) {
-      const lamports = solToLamports(displayValue)
-      setConfigDraft({ ...configDraft, [key]: lamports })
-    } else {
-      setConfigDraft({ ...configDraft, [key]: parseConfigValue(displayValue) })
+      setLamportsDisplayDraft((prev) => ({ ...prev, [key]: displayValue }))
+      return
     }
+    setConfigDraft({ ...configDraft, [key]: parseConfigValue(displayValue) })
+  }
+
+  function commitLamportsDisplay(key: string) {
+    if (!isLamportsField(key)) return
+    const raw = lamportsDisplayDraft[key]
+    if (raw === undefined) return
+    const lamports = solToLamports(raw)
+    setConfigDraft((prev) => ({ ...prev, [key]: lamports }))
+    setLamportsDisplayDraft((prev) => {
+      const { [key]: _, ...rest } = prev
+      return rest
+    })
   }
 
   // Filter relevant metrics
@@ -526,6 +556,12 @@ export function ComponentDetail() {
                           type="text"
                           value={displayValue}
                           onChange={(e) => updateFromDisplay(key, e.target.value)}
+                          onBlur={() => commitLamportsDisplay(key)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              commitLamportsDisplay(key)
+                            }
+                          }}
                           className="textInput"
                           title={description || ''}
                           style={{ flex: '1' }}
