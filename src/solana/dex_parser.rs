@@ -710,7 +710,9 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     let user = update.instruction_accounts[1];
     let global_config = update.instruction_accounts[2];
     let base_mint = update.instruction_accounts[3];
-    let quote_mint = update.instruction_accounts[4];
+    // Note: instruction_accounts[4] is quote_account (user's WSOL ATA), not the mint itself!
+    // PumpFun AMM always uses WSOL as quote, so we hardcode it
+    let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
     let pool_base_vault = update.instruction_accounts[7];
     let pool_quote_vault = update.instruction_accounts[8];
     let protocol_fee_recipient = update.instruction_accounts[9];
@@ -727,7 +729,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
 
     // Calculate actual amount_out from token balance changes
     // For BUY: user receives base tokens (token_amount)
-    // For SELL: user receives quote tokens (sol_amount)
+    // For SELL: user receives quote tokens (sol_amount from WSOL balance)
     let (sol_amount, token_amount) = if is_buy {
         // BUY: amount_in is SOL, need to calculate tokens received
         let tokens_received = calculate_token_balance_change(
@@ -737,7 +739,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         ).unwrap_or(0);
         (amount_in, tokens_received)
     } else {
-        // SELL: amount_in is tokens, need to calculate SOL received
+        // SELL: amount_in is tokens, need to calculate WSOL received
         let sol_received = calculate_token_balance_change(
             &update.pre_token_balances,
             &update.post_token_balances,
