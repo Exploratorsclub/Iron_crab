@@ -16,6 +16,7 @@
 use anyhow::Result;
 use clap::Parser;
 use parking_lot::RwLock;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -202,7 +203,8 @@ impl TokenArbTracker {
         }
 
         let spread = (sell_price - buy_price) / buy_price * Decimal::from(10000);
-        let spread_bps = spread.to_string().parse::<i64>().unwrap_or(0);
+        // Convert to i64, handling large spreads correctly
+        let spread_bps = spread.round().to_i64().unwrap_or(i64::MAX);
 
         if spread_bps < config.min_spread_bps as i64 {
             info!(
