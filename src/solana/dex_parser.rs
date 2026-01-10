@@ -275,26 +275,71 @@ fn parse_raydium_swap(
     // For SOL/token pair: base_in means selling token, base_out means buying token
     let is_buy = !is_base_in;
 
-    // We need the mint - for now use placeholder, will be enriched by momentum-bot
-    let mint = Pubkey::default();
+    // Get source and destination token accounts to determine mints
+    let user_source = update.instruction_accounts.get(14).copied()?;
+    let user_destination = update.instruction_accounts.get(15).copied()?;
+
+    // Extract mints from token balances
+    let base_mint = if is_buy {
+        // BUY: destination receives base tokens
+        update
+            .post_token_balances
+            .iter()
+            .find(|b| b.account_index == 15)
+            .and_then(|b| Pubkey::from_str(&b.mint).ok())
+            .unwrap_or_default()
+    } else {
+        // SELL: source spends base tokens
+        update
+            .pre_token_balances
+            .iter()
+            .find(|b| b.account_index == 14)
+            .and_then(|b| Pubkey::from_str(&b.mint).ok())
+            .unwrap_or_default()
+    };
+
+    let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+        .unwrap_or_default(); // SOL
+
+    // Calculate actual amounts from token balance changes
+    let (sol_amount, token_amount) = if is_buy {
+        // BUY: User pays SOL, receives tokens
+        let tokens_received = calculate_token_balance_change(
+            &update.pre_token_balances,
+            &update.post_token_balances,
+            &base_mint,
+        )
+        .unwrap_or(0);
+        (amount_in, tokens_received)
+    } else {
+        // SELL: User pays tokens, receives SOL
+        let sol_received = calculate_token_balance_change(
+            &update.pre_token_balances,
+            &update.post_token_balances,
+            &quote_mint,
+        )
+        .unwrap_or(0);
+        (sol_received, amount_in)
+    };
 
     debug!(
         pool = %pool_address,
         trader = %trader,
         is_buy = is_buy,
-        amount = amount_in,
+        sol_amount = sol_amount,
+        token_amount = token_amount,
         sig = %update.signature,
         "Raydium swap detected"
     );
 
     Some(ParsedDexEvent::Trade {
         pool_address,
-        mint,
+        mint: base_mint,
         trader,
         dex: DexType::RaydiumAmmV4,
         is_buy,
-        sol_amount: if is_buy { amount_in } else { 0 },
-        token_amount: if !is_buy { amount_in } else { 0 },
+        sol_amount,
+        token_amount,
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: None,
@@ -373,23 +418,84 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
 
     let is_buy = !a_to_b; // a_to_b=true means selling token A
 
+    // Extract mints from token balances (similar to Raydium)
+    // Account indices vary, use mint matching instead
+    let base_mint = if is_buy {
+        // BUY: Find token account with increasing balance
+        update
+            .post_token_balances
+            .iter()
+            .find(|post| {
+                let post_amt: u64 = post.ui_token_amount.amount.parse().unwrap_or(0);
+                let pre_amt: u64 = update
+                    .pre_token_balances
+                    .iter()
+                    .find(|pre| pre.mint == post.mint && pre.account_index == post.account_index)
+                    .and_then(|pre| pre.ui_token_amount.amount.parse().ok())
+                    .unwrap_or(0);
+                post_amt > pre_amt && post.mint != "So11111111111111111111111111111111111111112"
+            })
+            .and_then(|b| Pubkey::from_str(&b.mint).ok())
+            .unwrap_or_default()
+    } else {
+        // SELL: Find token account with decreasing balance
+        update
+            .pre_token_balances
+            .iter()
+            .find(|pre| {
+                let pre_amt: u64 = pre.ui_token_amount.amount.parse().unwrap_or(0);
+                let post_amt: u64 = update
+                    .post_token_balances
+                    .iter()
+                    .find(|post| post.mint == pre.mint && post.account_index == pre.account_index)
+                    .and_then(|post| post.ui_token_amount.amount.parse().ok())
+                    .unwrap_or(0);
+                pre_amt > post_amt && pre.mint != "So11111111111111111111111111111111111111112"
+            })
+            .and_then(|b| Pubkey::from_str(&b.mint).ok())
+            .unwrap_or_default()
+    };
+
+    let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+        .unwrap_or_default(); // SOL
+
+    // Calculate actual amounts from token balance changes
+    let (sol_amount, token_amount) = if is_buy {
+        let tokens_received = calculate_token_balance_change(
+            &update.pre_token_balances,
+            &update.post_token_balances,
+            &base_mint,
+        )
+        .unwrap_or(0);
+        (amount, tokens_received)
+    } else {
+        let sol_received = calculate_token_balance_change(
+            &update.pre_token_balances,
+            &update.post_token_balances,
+            &quote_mint,
+        )
+        .unwrap_or(0);
+        (sol_received, amount)
+    };
+
     debug!(
         pool = %pool_address,
         trader = %trader,
         is_buy = is_buy,
-        amount = amount,
+        sol_amount = sol_amount,
+        token_amount = token_amount,
         sig = %update.signature,
         "Orca swap detected"
     );
 
     Some(ParsedDexEvent::Trade {
         pool_address,
-        mint: Pubkey::default(),
+        mint: base_mint,
         trader,
         dex: DexType::OrcaWhirlpool,
         is_buy,
-        sol_amount: if is_buy { amount } else { 0 },
-        token_amount: if !is_buy { amount } else { 0 },
+        sol_amount,
+        token_amount,
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: None,
@@ -497,22 +603,55 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
     let trader = update.instruction_accounts[6];
 
     // Parse amounts from instruction data
-    // BUY layout: discriminator(8) + amount(8) + max_sol_cost(8)
-    // SELL layout: discriminator(8) + amount(8) + min_sol_output(8)
+    // BUY layout: discriminator(8) + token_amount(8) + max_sol_cost(8)
+    // SELL layout: discriminator(8) + token_amount(8) + min_sol_output(8)
     if update.instruction_data.len() < 24 {
         return None;
     }
 
-    let token_amount = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
-    let sol_amount = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
+    let token_amount_param = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
+    let _sol_limit = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
+
+    let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+        .unwrap_or_default();
+
+    // Calculate actual amounts from token balance changes
+    let (sol_amount, token_amount) = if is_buy {
+        // BUY: Calculate SOL spent and tokens received
+        let sol_spent = calculate_token_balance_change(
+            &update.post_token_balances,  // Note: reversed for spent
+            &update.pre_token_balances,
+            &quote_mint,
+        )
+        .unwrap_or(0);  // How much SOL was paid
+        
+        let tokens_received = calculate_token_balance_change(
+            &update.pre_token_balances,
+            &update.post_token_balances,
+            &mint,
+        )
+        .unwrap_or(0);
+        
+        (sol_spent, tokens_received)
+    } else {
+        // SELL: Calculate tokens sold and SOL received
+        let sol_received = calculate_token_balance_change(
+            &update.pre_token_balances,
+            &update.post_token_balances,
+            &quote_mint,
+        )
+        .unwrap_or(0);
+        
+        (sol_received, token_amount_param)
+    };
 
     debug!(
         pool = %bonding_curve,
         mint = %mint,
         trader = %trader,
         is_buy = is_buy,
-        sol = sol_amount,
-        tokens = token_amount,
+        sol_amount = sol_amount,
+        token_amount = token_amount,
         sig = %update.signature,
         "PumpFun swap detected"
     );
