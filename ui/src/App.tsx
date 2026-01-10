@@ -119,6 +119,7 @@ export default function App() {
             <Link to="/">Overview</Link>
             <Link to="/market-data">Market Data</Link>
             <Link to="/momentum-bot">Momentum Bot</Link>
+            <Link to="/arb-strategy">Arb Strategy</Link>
             <Link to="/execution-engine">Execution Engine</Link>
             <Link to="/kill-switch">Kill Switch</Link>
           </nav>

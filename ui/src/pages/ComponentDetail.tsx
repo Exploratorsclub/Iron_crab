@@ -73,6 +73,15 @@ const RELEVANT_METRICS: Record<string, string[]> = {
     'filter_rejected_total',
     'filter_rejection_by_reason',
   ],
+  'arb-strategy': [
+    'arb_triangle_opportunities_total',
+    'intents_generated_total',
+    'market_events_consumed_total',
+    'nats_messages_received_total',
+    'nats_messages_published_total',
+    'pools_tracked_gauge',
+    'tokens_tracked_gauge',
+  ],
   'execution-engine': [
     'intents_received_total',
     'intents_executed_total',
