@@ -72,6 +72,9 @@ pub struct GeyserTransactionUpdate {
     /// Token balance changes (pre/post balances)
     pub pre_token_balances: Vec<TokenBalance>,
     pub post_token_balances: Vec<TokenBalance>,
+    /// Native SOL balances (lamports) for all accounts
+    pub pre_balances: Vec<u64>,
+    pub post_balances: Vec<u64>,
 }
 
 pub struct GeyserListener {
@@ -497,8 +500,13 @@ impl GeyserListener {
                                     // Extract token balances for amount calculation
                                     let mut pre_token_balances = Vec::new();
                                     let mut post_token_balances = Vec::new();
+                                    let mut pre_balances = Vec::new();
+                                    let mut post_balances = Vec::new();
                                     
                                     if let Some(meta) = &tx.meta {
+                                        // Extract native SOL balances (lamports)
+                                        pre_balances = meta.pre_balances.clone();
+                                        post_balances = meta.post_balances.clone();
                                         for balance in &meta.pre_token_balances {
                                             if let Some(ui_amount) = &balance.ui_token_amount {
                                                 pre_token_balances.push(TokenBalance {
@@ -537,6 +545,8 @@ impl GeyserListener {
                                         inner_instructions,
                                         pre_token_balances,
                                         post_token_balances,
+                                        pre_balances,
+                                        post_balances,
                                     };
 
                                     // Broadcast to subscribers

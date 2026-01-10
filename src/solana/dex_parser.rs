@@ -626,32 +626,32 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
     let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
         .unwrap_or_default();
 
-    // Calculate actual amounts from token balance changes
+    // Calculate actual amounts from native and token balance changes
+    // SOL is native balance, tokens from token_balances
     let (sol_amount, token_amount) = if is_buy {
-        // BUY: Calculate SOL spent and tokens received
-        let sol_spent = calculate_token_balance_change(
-            &update.post_token_balances,  // Note: reversed for spent
-            &update.pre_token_balances,
-            &quote_mint,
-        )
-        .unwrap_or(0);  // How much SOL was paid
+        // BUY: Calculate SOL spent from native balance
+        let sol_spent = calculate_native_balance_change(
+            &update.account_keys,
+            &update.pre_balances,
+            &update.post_balances,
+            &trader,
+        ).unwrap_or(0);
         
         let tokens_received = calculate_token_balance_change(
             &update.pre_token_balances,
             &update.post_token_balances,
             &mint,
-        )
-        .unwrap_or(0);
+        ).unwrap_or(0);
         
         (sol_spent, tokens_received)
     } else {
-        // SELL: Calculate tokens sold and SOL received
-        let sol_received = calculate_token_balance_change(
-            &update.pre_token_balances,
-            &update.post_token_balances,
-            &quote_mint,
-        )
-        .unwrap_or(0);
+        // SELL: Calculate SOL received from native balance
+        let sol_received = calculate_native_balance_change(
+            &update.account_keys,
+            &update.pre_balances,
+            &update.post_balances,
+            &trader,
+        ).unwrap_or(0);
         
         (sol_received, token_amount_param)
     };
@@ -728,23 +728,34 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     let min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
 
     // Calculate actual amount_out from token balance changes
-    // For BUY: user receives base tokens (token_amount)
-    // For SELL: user receives quote tokens (sol_amount from WSOL balance)
+    // For BUY: user receives base tokens (token_amount), SOL from native balance
+    // For SELL: user receives WSOL as native balance, tokens from token balance
     let (sol_amount, token_amount) = if is_buy {
-        // BUY: amount_in is SOL, need to calculate tokens received
+        // BUY: amount_in is SOL (from native balance), need to calculate tokens received
         let tokens_received = calculate_token_balance_change(
             &update.pre_token_balances,
             &update.post_token_balances,
             &base_mint,
         ).unwrap_or(0);
-        (amount_in, tokens_received)
+        
+        // Extract SOL spent from native balance (user account decreased)
+        let sol_spent = calculate_native_balance_change(
+            &update.account_keys,
+            &update.pre_balances,
+            &update.post_balances,
+            &user,
+        ).unwrap_or(amount_in); // Fallback to instruction amount
+        
+        (sol_spent, tokens_received)
     } else {
-        // SELL: amount_in is tokens, need to calculate WSOL received
-        let sol_received = calculate_token_balance_change(
-            &update.pre_token_balances,
-            &update.post_token_balances,
-            &quote_mint,
+        // SELL: amount_in is tokens, need to calculate WSOL received from native balance
+        let sol_received = calculate_native_balance_change(
+            &update.account_keys,
+            &update.pre_balances,
+            &update.post_balances,
+            &user,
         ).unwrap_or(0);
+        
         (sol_received, amount_in)
     };
 
@@ -820,6 +831,28 @@ fn calculate_token_balance_change(
     
     // Return absolute change (received amount)
     Some(post_balance.saturating_sub(pre_balance))
+}
+
+/// Calculate native SOL balance change for a specific account
+/// WSOL is tracked as native lamports in balances array, not token_balances!
+/// Returns absolute change in lamports
+fn calculate_native_balance_change(
+    account_keys: &[Pubkey],
+    pre_balances: &[u64],
+    post_balances: &[u64],
+    account: &Pubkey,
+) -> Option<u64> {
+    // Find account index in account_keys
+    let account_index = account_keys.iter().position(|k| k == account)?;
+    
+    // Get pre and post native balances (lamports)
+    let pre = *pre_balances.get(account_index)?;
+    let post = *post_balances.get(account_index)?;
+    
+    // Return absolute difference
+    // For SELL: post > pre (user receives SOL)
+    // For BUY: pre > post (user spends SOL)
+    Some(post.abs_diff(pre))
 }
 
 // ============================================================================
