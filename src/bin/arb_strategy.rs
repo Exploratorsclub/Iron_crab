@@ -372,6 +372,16 @@ impl ArbContext {
         let token_dec = Decimal::from(token_amount) / Decimal::from(token_divisor);
         let price = sol_dec / token_dec;
 
+        info!(
+            pool = %pool_address,
+            mint = %mint,
+            sol_amount = sol_amount,
+            token_amount = token_amount,
+            token_decimals = token_decimals,
+            price = %price,
+            "Price calculated from trade"
+        );
+
         let config = self.config.read().clone();
         let mut trackers = self.trackers.write();
 
