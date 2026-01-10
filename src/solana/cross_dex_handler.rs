@@ -18,7 +18,14 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::ipc::TradeIntent;
-use crate::solana::dex::{pumpfun::PumpFunDex, raydium::Raydium, Dex, Quote};
+use crate::solana::dex::{
+    pumpfun::PumpFunDex, 
+    pumpfun_amm::PumpFunAmmDex,
+    meteora_dlmm::MeteoraDlmm,
+    raydium::Raydium, 
+    Dex, 
+    Quote
+};
 use crate::solana::rpc::SolanaRpc;
 
 /// SOL mint address
@@ -62,6 +69,8 @@ pub struct CrossDexHandler {
     wallet_pubkey: Option<Pubkey>,
     /// Default slippage for swaps (bps)
     default_slippage_bps: u32,
+    /// RPC URL for DEXes that need it directly
+    rpc_url: Option<String>,
 }
 
 impl CrossDexHandler {
@@ -110,7 +119,14 @@ impl CrossDexHandler {
             dexes: HashMap::new(),
             wallet_pubkey,
             default_slippage_bps: 100, // 1% default
+            rpc_url: None,
         }
+    }
+
+    /// Set RPC URL for DEXes that need direct HTTP access
+    pub fn with_rpc_url(mut self, url: String) -> Self {
+        self.rpc_url = Some(url);
+        self
     }
 
     /// Initialize DEX connectors
@@ -123,13 +139,31 @@ impl CrossDexHandler {
         self.dexes.insert("raydium".to_string(), Arc::new(raydium));
         info!("Initialized Raydium DEX connector");
 
-        // Initialize PumpFun
+        // Initialize PumpFun (Bonding Curve)
         let mut pumpfun = PumpFunDex::new(Arc::clone(&self.rpc))?;
         if let Some(pk) = self.wallet_pubkey {
             pumpfun.set_user_authority(pk);
         }
         self.dexes.insert("pumpfun".to_string(), Arc::new(pumpfun));
         info!("Initialized PumpFun DEX connector");
+
+        // Initialize PumpSwap AMM (pump_amm)
+        if let Some(ref rpc_url) = self.rpc_url {
+            let pump_amm = PumpFunAmmDex::new(
+                Arc::clone(&self.rpc), 
+                rpc_url.clone(), 
+                None // No separate Helius URL for now
+            );
+            self.dexes.insert("pump_amm".to_string(), Arc::new(pump_amm));
+            info!("Initialized PumpSwap AMM (pump_amm) DEX connector");
+        } else {
+            warn!("PumpSwap AMM not initialized: RPC URL not provided");
+        }
+
+        // Initialize Meteora DLMM
+        let meteora = MeteoraDlmm::new(Arc::clone(&self.rpc));
+        self.dexes.insert("meteora_dlmm".to_string(), Arc::new(meteora));
+        info!("Initialized Meteora DLMM DEX connector");
 
         // TODO: Add Orca Whirlpool
         // let mut orca = Orca::new(Arc::clone(&self.rpc));

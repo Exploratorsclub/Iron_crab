@@ -2588,11 +2588,12 @@ async fn main() -> Result<()> {
     // ARB_HANDLER_NOT_CONFIGURED.
     {
         let user_pk = ctx.treasury.as_ref().map(|t| t.pubkey());
-        let mut handler = CrossDexHandler::new(Arc::clone(&ctx.rpc), user_pk);
+        let mut handler = CrossDexHandler::new(Arc::clone(&ctx.rpc), user_pk)
+            .with_rpc_url(ctx.rpc_url.clone());
         match handler.init_dexes().await {
             Ok(()) => {
                 ctx.cross_dex_handler = Some(Arc::new(handler));
-                info!("Initialized CrossDexHandler");
+                info!("Initialized CrossDexHandler with pump_amm and meteora_dlmm support");
             }
             Err(e) => {
                 warn!(error = %e, "Failed to initialize CrossDexHandler; cross-DEX arb disabled");
