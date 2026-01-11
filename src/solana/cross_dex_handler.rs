@@ -1,12 +1,22 @@
 //! Cross-DEX Arbitrage Handler
 //!
-//! Handles arbitrage intents by:
-//! 1. Fetching live quotes from both DEXes
-//! 2. Validating the spread is still profitable
-//! 3. Building swap instructions
-//! 4. Creating atomic Jito bundle
+//! **ARCHITECTURE (TARGET_ARCHITECTURE.md Section 4.2):**
 //!
-//! This module is used by execution-engine to process arb-strategy intents.
+//! - Pool Discovery gehört NUR in market-data (Data Plane)
+//! - execution-engine macht KEINE RPC-basierte Pool Discovery
+//! - Quote-Berechnungen werden von arb-strategy gemacht (hat Geyser-Daten)
+//! - execution-engine verwendet Intent-Daten für Validierung
+//! - Nur `build_swap_ix()` darf RPC verwenden (für Instruction Building)
+//!
+//! Handles arbitrage intents by:
+//! 1. Validating intent data (TTL, spread from arb-strategy)
+//! 2. Building swap instructions using DEX connectors
+//! 3. Creating atomic Jito bundle
+//!
+//! **NICHT** zuständig für:
+//! - Pool Discovery (das macht market-data via Geyser)
+//! - Quote-Berechnung (das macht arb-strategy)
+//! - RPC getProgramAccounts calls
 
 use anyhow::{anyhow, Result};
 use solana_sdk::{instruction::Instruction, pubkey::Pubkey};
@@ -25,10 +35,13 @@ use crate::solana::rpc::SolanaRpc;
 /// SOL mint address
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
-/// Minimum spread in bps to execute after re-validation
-const MIN_EXECUTION_SPREAD_BPS: i64 = 30; // 0.3% minimum after live quote
+/// Minimum spread in bps to execute (from intent metadata, no re-quote!)
+const MIN_EXECUTION_SPREAD_BPS: i64 = 30; // 0.3% minimum
 
 /// Result of Cross-DEX arbitrage validation
+/// 
+/// NOTE: buy_quote/sell_quote are constructed from Intent metadata,
+/// NOT from RPC calls. arb-strategy is the source of truth for quotes.
 #[derive(Debug)]
 pub struct CrossDexValidation {
     pub is_valid: bool,
@@ -53,11 +66,14 @@ pub struct CrossDexSwapPlan {
 
 /// Cross-DEX Arbitrage Handler
 ///
-/// Manages DEX connectors and provides methods for validating and executing
-/// cross-DEX arbitrage opportunities.
+/// **ARCHITECTURE COMPLIANCE:**
+/// - Does NOT do pool discovery (that's market-data's job via Geyser)
+/// - Does NOT call quote_exact_in() (that's arb-strategy's job with Geyser data)
+/// - ONLY validates intent metadata and builds swap instructions
+/// - DEX connectors are used ONLY for build_swap_ix()
 pub struct CrossDexHandler {
     rpc: Arc<SolanaRpc>,
-    /// DEX connectors by name
+    /// DEX connectors by name - used ONLY for build_swap_ix()
     dexes: HashMap<String, Arc<dyn Dex>>,
     /// Wallet pubkey (used as user authority / payer)
     wallet_pubkey: Option<Pubkey>,
@@ -68,44 +84,6 @@ pub struct CrossDexHandler {
 }
 
 impl CrossDexHandler {
-    async fn estimate_min_amount_in_for_target_out(
-        &self,
-        dex: &Arc<dyn Dex>,
-        input_mint: &str,
-        output_mint: &str,
-        target_out: u64,
-        max_in: u64,
-        max_in_out: u64,
-    ) -> Result<Option<u64>> {
-        if target_out == 0 || max_in == 0 {
-            return Ok(None);
-        }
-
-        if max_in_out < target_out {
-            return Ok(None);
-        }
-
-        // Binary-search the smallest amount_in that yields >= target_out.
-        // Assumes quote_exact_in is monotonic in amount_in for the current pool state.
-        let mut lo: u64 = 1;
-        let mut hi: u64 = max_in;
-        for _ in 0..24 {
-            if lo >= hi {
-                break;
-            }
-            let mid = lo + (hi - lo) / 2;
-            let q = dex.quote_exact_in(input_mint, output_mint, mid).await?;
-            let out = q.map(|qq| qq.amount_out).unwrap_or(0);
-            if out >= target_out {
-                hi = mid;
-            } else {
-                lo = mid.saturating_add(1);
-            }
-        }
-
-        Ok(Some(hi))
-    }
-
     /// Create a new CrossDexHandler
     pub fn new(rpc: Arc<SolanaRpc>, wallet_pubkey: Option<Pubkey>) -> Self {
         Self {
@@ -124,73 +102,68 @@ impl CrossDexHandler {
     }
 
     /// Initialize DEX connectors
+    /// 
+    /// NOTE: These connectors are used ONLY for build_swap_ix().
+    /// They should NOT be used for quote_exact_in() or pool discovery.
+    /// Pool data comes from arb-strategy via Intent metadata.
     pub async fn init_dexes(&mut self) -> Result<()> {
-        // Initialize Raydium
+        // Initialize Raydium - for build_swap_ix() only
         let mut raydium = Raydium::new(Arc::clone(&self.rpc));
         if let Some(pk) = self.wallet_pubkey {
             raydium.set_user_authority(pk);
         }
         self.dexes.insert("raydium".to_string(), Arc::new(raydium));
-        info!("Initialized Raydium DEX connector");
+        info!("Initialized Raydium DEX connector (for IX building only)");
 
-        // Initialize PumpFun (Bonding Curve)
+        // Initialize PumpFun (Bonding Curve) - for build_swap_ix() only
         let mut pumpfun = PumpFunDex::new(Arc::clone(&self.rpc))?;
         if let Some(pk) = self.wallet_pubkey {
             pumpfun.set_user_authority(pk);
         }
         self.dexes.insert("pumpfun".to_string(), Arc::new(pumpfun));
-        info!("Initialized PumpFun DEX connector");
+        info!("Initialized PumpFun DEX connector (for IX building only)");
 
-        // Initialize PumpSwap AMM (pump_amm)
+        // Initialize PumpSwap AMM (pump_amm) - for build_swap_ix() only
         if let Some(ref rpc_url) = self.rpc_url {
             let pump_amm = PumpFunAmmDex::new(
                 Arc::clone(&self.rpc),
                 rpc_url.clone(),
-                None, // No separate Helius URL for now
+                None,
             );
             self.dexes
                 .insert("pump_amm".to_string(), Arc::new(pump_amm));
-            info!("Initialized PumpSwap AMM (pump_amm) DEX connector");
+            info!("Initialized PumpSwap AMM connector (for IX building only)");
         } else {
             warn!("PumpSwap AMM not initialized: RPC URL not provided");
         }
 
-        // Initialize Meteora DLMM
+        // Initialize Meteora DLMM - for build_swap_ix() only
         let meteora = MeteoraDlmm::new(Arc::clone(&self.rpc));
         self.dexes
             .insert("meteora_dlmm".to_string(), Arc::new(meteora));
-        info!("Initialized Meteora DLMM DEX connector");
-
-        // TODO: Add Orca Whirlpool
-        // let mut orca = Orca::new(Arc::clone(&self.rpc));
-        // if let Some(pk) = self.wallet_pubkey {
-        //     orca.set_user_authority(pk);
-        // }
-        // self.dexes.insert("orca".to_string(), Arc::new(orca));
+        info!("Initialized Meteora DLMM connector (for IX building only)");
 
         Ok(())
     }
 
     /// Check if this intent is a cross-DEX arbitrage intent
     pub fn is_cross_dex_arb_intent(intent: &TradeIntent) -> bool {
-        // Cross-DEX arb intents have 2 pools.
-        // Do NOT require metadata.dex; routing is driven by buy_dex/sell_dex metadata.
         intent.resources.pools.len() == 2 && intent.source == "arb-strategy"
     }
 
-    /// Validate a cross-DEX arbitrage opportunity with live quotes
+    /// Validate a cross-DEX arbitrage opportunity using INTENT DATA ONLY
     ///
-    /// This fetches fresh quotes from both DEXes and validates:
-    /// 1. The spread is still profitable
-    /// 2. Both DEXes have sufficient liquidity
-    /// 3. The estimated profit covers transaction costs
+    /// **ARCHITECTURE COMPLIANCE (TARGET_ARCHITECTURE.md Section 4.2):**
+    /// - NO RPC calls for quotes (arb-strategy already computed them via Geyser data)
+    /// - Uses spread_bps, estimated_profit_lamports from intent metadata
+    /// - Only validates: TTL, spread threshold, profit threshold
+    ///
+    /// arb-strategy is the SOURCE OF TRUTH for price/quote data.
     pub async fn validate_arb_opportunity(
         &self,
         intent: &TradeIntent,
         tx_cost_lamports: u64,
     ) -> Result<CrossDexValidation> {
-        // Parse pools from intent
-        // Expected format in metadata or pool addresses
         let pools = &intent.resources.pools;
         if pools.len() != 2 {
             return Ok(CrossDexValidation {
@@ -203,198 +176,152 @@ impl CrossDexHandler {
             });
         }
 
-        let token_mint = &intent.resources.output_mint;
-        let trade_amount = intent.required_capital.raw;
+        // Extract data from intent metadata (computed by arb-strategy via Geyser)
+        let buy_dex = intent.metadata.get("buy_dex").cloned().unwrap_or_default();
+        let sell_dex = intent.metadata.get("sell_dex").cloned().unwrap_or_default();
+        
+        // Parse spread and profit from intent - arb-strategy computed these
+        let spread_bps: i64 = intent
+            .metadata
+            .get("spread_bps")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(intent.expected_roi_bps as i64);
+            
+        let estimated_profit: i64 = intent
+            .metadata
+            .get("estimated_profit_lamports")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
-        // Extract DEX info from intent metadata (set by arb-strategy)
-        // Fallback to identify_dex if metadata not present
-        let buy_dex = intent.metadata.get("buy_dex").cloned().unwrap_or_else(|| {
-            self.identify_dex(&pools[0])
-                .map(|(d, _)| d)
-                .unwrap_or_default()
-        });
-        let sell_dex = intent.metadata.get("sell_dex").cloned().unwrap_or_else(|| {
-            self.identify_dex(&pools[1])
-                .map(|(d, _)| d)
-                .unwrap_or_default()
-        });
-
-        // Log original spread from strategy for comparison
-        if let Some(orig_spread) = intent.metadata.get("spread_bps") {
-            debug!(
-                original_spread_bps = %orig_spread,
-                "Cross-DEX validation using strategy's original spread for reference"
-            );
-        }
-
-        debug!(
-            token = %token_mint,
-            buy_dex = %buy_dex,
-            sell_dex = %sell_dex,
-            amount = trade_amount,
-            "Validating cross-DEX arb opportunity"
-        );
-
-        // Get live quote from buy DEX (SOL -> Token)
-        let buy_connector = self
-            .dexes
-            .get(&buy_dex)
-            .ok_or_else(|| anyhow!("Unknown buy DEX: {}", buy_dex))?;
-
-        let buy_quote = buy_connector
-            .quote_exact_in(SOL_MINT, token_mint, trade_amount)
-            .await?;
-
-        let buy_quote = match buy_quote {
-            Some(q) => q,
-            None => {
-                return Ok(CrossDexValidation {
-                    is_valid: false,
-                    buy_quote: None,
-                    sell_quote: None,
-                    actual_spread_bps: 0,
-                    estimated_profit_lamports: 0,
-                    reject_reason: Some(format!("No buy quote available from {}", buy_dex)),
-                });
-            }
-        };
-
-        // Compute a conservative minimum-out for the buy leg, then quote the sell leg using
-        // that guaranteed amount. This prevents building a 2nd-leg sell that requires more
-        // tokens than we might actually receive (even if the buy meets its min_out).
-        let slippage_bps = intent.max_slippage_bps.min(self.default_slippage_bps);
-        let buy_min_out = buy_quote
-            .amount_out
-            .saturating_mul(10_000u64.saturating_sub(slippage_bps as u64))
-            / 10_000u64;
-
-        if buy_min_out == 0 {
+        // Verify DEX names are known
+        if !buy_dex.is_empty() && !self.dexes.contains_key(&buy_dex) {
             return Ok(CrossDexValidation {
                 is_valid: false,
-                buy_quote: Some(buy_quote),
+                buy_quote: None,
                 sell_quote: None,
-                actual_spread_bps: 0,
-                estimated_profit_lamports: 0,
-                reject_reason: Some("buy_min_out=0 (cannot build safe arb)".to_string()),
+                actual_spread_bps: spread_bps,
+                estimated_profit_lamports: estimated_profit,
+                reject_reason: Some(format!("Unknown buy DEX: {} (not registered for IX building)", buy_dex)),
             });
         }
 
-        // Estimate the minimum input needed to achieve buy_min_out.
-        // This approximates "exact out" behavior: we try to buy a fixed token amount with a
-        // max SOL spend (trade_amount) by choosing the smallest amount_in that still yields
-        // >= buy_min_out. This minimizes leftover tokens when we sell exactly buy_min_out.
-        let buy_amount_in_est = self
-            .estimate_min_amount_in_for_target_out(
-                buy_connector,
-                SOL_MINT,
-                token_mint,
-                buy_min_out,
-                trade_amount,
-                buy_quote.amount_out,
-            )
-            .await?;
+        if !sell_dex.is_empty() && !self.dexes.contains_key(&sell_dex) {
+            return Ok(CrossDexValidation {
+                is_valid: false,
+                buy_quote: None,
+                sell_quote: None,
+                actual_spread_bps: spread_bps,
+                estimated_profit_lamports: estimated_profit,
+                reject_reason: Some(format!("Unknown sell DEX: {} (not registered for IX building)", sell_dex)),
+            });
+        }
 
-        let buy_amount_in_est = match buy_amount_in_est {
-            Some(v) if v <= trade_amount => v,
-            _ => {
-                return Ok(CrossDexValidation {
-                    is_valid: false,
-                    buy_quote: Some(buy_quote),
-                    sell_quote: None,
-                    actual_spread_bps: 0,
-                    estimated_profit_lamports: 0,
-                    reject_reason: Some(
-                        "cannot estimate amount_in for buy_min_out within max capital".to_string(),
-                    ),
-                });
-            }
-        };
+        debug!(
+            buy_dex = %buy_dex,
+            sell_dex = %sell_dex,
+            spread_bps = spread_bps,
+            estimated_profit = estimated_profit,
+            tx_cost = tx_cost_lamports,
+            "Validating cross-DEX arb from intent metadata (no RPC re-quote)"
+        );
 
-        // Get live quote from sell DEX (Token -> SOL) based on conservative buy_min_out
-        let sell_connector = self
-            .dexes
-            .get(&sell_dex)
-            .ok_or_else(|| anyhow!("Unknown sell DEX: {}", sell_dex))?;
+        // Validate spread threshold
+        if spread_bps < MIN_EXECUTION_SPREAD_BPS {
+            return Ok(CrossDexValidation {
+                is_valid: false,
+                buy_quote: None,
+                sell_quote: None,
+                actual_spread_bps: spread_bps,
+                estimated_profit_lamports: estimated_profit,
+                reject_reason: Some(format!(
+                    "Spread too low: {}bps < {}bps minimum",
+                    spread_bps, MIN_EXECUTION_SPREAD_BPS
+                )),
+            });
+        }
 
-        let sell_quote = sell_connector
-            .quote_exact_in(token_mint, SOL_MINT, buy_min_out)
-            .await?;
+        // Validate profit after tx costs
+        let net_profit = estimated_profit - tx_cost_lamports as i64;
+        if net_profit <= 0 {
+            return Ok(CrossDexValidation {
+                is_valid: false,
+                buy_quote: None,
+                sell_quote: None,
+                actual_spread_bps: spread_bps,
+                estimated_profit_lamports: net_profit,
+                reject_reason: Some(format!(
+                    "Not profitable after tx costs: {} - {} = {} lamports",
+                    estimated_profit, tx_cost_lamports, net_profit
+                )),
+            });
+        }
 
-        let sell_quote = match sell_quote {
-            Some(q) => q,
-            None => {
-                return Ok(CrossDexValidation {
-                    is_valid: false,
-                    buy_quote: Some(buy_quote),
-                    sell_quote: None,
-                    actual_spread_bps: 0,
-                    estimated_profit_lamports: 0,
-                    reject_reason: Some(format!("No sell quote available from {}", sell_dex)),
-                });
-            }
-        };
+        // Create placeholder quotes from intent metadata
+        // These are used by build_swap_plan for slippage calculation
+        let trade_amount = intent.required_capital.raw;
+        let buy_price: f64 = intent
+            .metadata
+            .get("buy_price")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let sell_price: f64 = intent
+            .metadata
+            .get("sell_price")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
 
-        // Calculate spread based on estimated input for buy_min_out.
-        // We input ~X SOL, buy >= buy_min_out tokens, sell buy_min_out tokens, get Y SOL.
-        // Spread = (Y - X) / X * 10000 bps
-        let input_sol = buy_amount_in_est as i64;
-        let output_sol = sell_quote.amount_out as i64;
-        let gross_profit = output_sol - input_sol;
-        let actual_spread_bps = if input_sol > 0 {
-            (gross_profit * 10000) / input_sol
+        // Estimate token amount from price (SOL/token price -> tokens per SOL input)
+        let estimated_tokens = if buy_price > 0.0 {
+            (trade_amount as f64 / buy_price) as u64
         } else {
             0
         };
 
-        // Subtract tx costs
-        let net_profit = gross_profit - tx_cost_lamports as i64;
+        // Estimate SOL output from selling tokens
+        let estimated_sol_out = if sell_price > 0.0 {
+            (estimated_tokens as f64 * sell_price) as u64
+        } else {
+            0
+        };
+
+        let buy_quote = Quote {
+            amount_out: estimated_tokens,
+            price_impact_bps: 0,
+            route: vec![pools[0].clone()],
+            fee_bps: 30, // Default estimate
+            in_reserve: 0,
+            out_reserve: 0,
+            input_mint: SOL_MINT.to_string(),
+            output_mint: intent.resources.output_mint.clone(),
+            tick_spacing: None,
+        };
+
+        let sell_quote = Quote {
+            amount_out: estimated_sol_out,
+            price_impact_bps: 0,
+            route: vec![pools[1].clone()],
+            fee_bps: 30,
+            in_reserve: 0,
+            out_reserve: 0,
+            input_mint: intent.resources.output_mint.clone(),
+            output_mint: SOL_MINT.to_string(),
+            tick_spacing: None,
+        };
 
         info!(
-            input_sol = input_sol,
-            max_input_sol = trade_amount,
-            buy_amount_in_est = buy_amount_in_est,
-            output_sol = output_sol,
-            gross_profit = gross_profit,
-            tx_cost = tx_cost_lamports,
+            spread_bps = spread_bps,
+            estimated_profit = estimated_profit,
             net_profit = net_profit,
-            spread_bps = actual_spread_bps,
-            "Cross-DEX arb validation result"
+            buy_dex = %buy_dex,
+            sell_dex = %sell_dex,
+            "Cross-DEX arb validation PASSED (using intent data, no RPC)"
         );
-
-        // Validate profitability
-        if actual_spread_bps < MIN_EXECUTION_SPREAD_BPS {
-            return Ok(CrossDexValidation {
-                is_valid: false,
-                buy_quote: Some(buy_quote),
-                sell_quote: Some(sell_quote),
-                actual_spread_bps,
-                estimated_profit_lamports: net_profit,
-                reject_reason: Some(format!(
-                    "Spread too low: {}bps < {}bps minimum",
-                    actual_spread_bps, MIN_EXECUTION_SPREAD_BPS
-                )),
-            });
-        }
-
-        if net_profit <= 0 {
-            return Ok(CrossDexValidation {
-                is_valid: false,
-                buy_quote: Some(buy_quote),
-                sell_quote: Some(sell_quote),
-                actual_spread_bps,
-                estimated_profit_lamports: net_profit,
-                reject_reason: Some(format!(
-                    "Not profitable after tx costs: {} lamports",
-                    net_profit
-                )),
-            });
-        }
 
         Ok(CrossDexValidation {
             is_valid: true,
             buy_quote: Some(buy_quote),
             sell_quote: Some(sell_quote),
-            actual_spread_bps,
+            actual_spread_bps: spread_bps,
             estimated_profit_lamports: net_profit,
             reject_reason: None,
         })
@@ -423,8 +350,7 @@ impl CrossDexHandler {
         let token_mint = &intent.resources.output_mint;
         let trade_amount = intent.required_capital.raw;
 
-        // Prefer explicit metadata set by arb-strategy.
-        // The identify_dex() heuristic is a stub and must not be the primary routing source.
+        // Use metadata from arb-strategy (source of truth)
         let buy_dex = intent.metadata.get("buy_dex").cloned().unwrap_or_else(|| {
             self.identify_dex(&pools[0])
                 .map(|(d, _)| d)
@@ -467,19 +393,9 @@ impl CrossDexHandler {
             .get(&buy_dex)
             .ok_or_else(|| anyhow!("Unknown buy DEX: {}", buy_dex))?;
 
-        // Approximate exact-out: spend the smallest SOL amount that should yield >= buy_min_out,
-        // bounded by trade_amount (max capital).
-        let buy_amount_in = self
-            .estimate_min_amount_in_for_target_out(
-                buy_connector,
-                SOL_MINT,
-                token_mint,
-                buy_min_out,
-                trade_amount,
-                buy_quote.amount_out,
-            )
-            .await?
-            .ok_or_else(|| anyhow!("cannot estimate buy amount_in for buy_min_out"))?;
+        // Use trade_amount (from intent) as buy_amount_in
+        // arb-strategy already computed the optimal amounts
+        let buy_amount_in = trade_amount;
 
         let buy_instructions =
             buy_connector.build_swap_ix(SOL_MINT, token_mint, buy_amount_in, buy_min_out)?;
