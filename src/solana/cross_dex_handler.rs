@@ -181,6 +181,41 @@ impl CrossDexHandler {
 
         Ok(())
     }
+    
+    /// Parse pool accounts from intent.resources.accounts
+    /// 
+    /// Format from arb-strategy:
+    /// - "buy_pool_accounts_start:N" followed by N account strings
+    /// - "sell_pool_accounts_start:M" followed by M account strings
+    /// 
+    /// Returns (buy_accounts, sell_accounts)
+    fn parse_pool_accounts_from_intent(&self, accounts: &[String]) -> (Option<Vec<String>>, Option<Vec<String>>) {
+        let mut buy_accounts: Option<Vec<String>> = None;
+        let mut sell_accounts: Option<Vec<String>> = None;
+        
+        let mut i = 0;
+        while i < accounts.len() {
+            if let Some(rest) = accounts[i].strip_prefix("buy_pool_accounts_start:") {
+                if let Ok(count) = rest.parse::<usize>() {
+                    let end = (i + 1 + count).min(accounts.len());
+                    buy_accounts = Some(accounts[i + 1..end].to_vec());
+                    i = end;
+                    continue;
+                }
+            }
+            if let Some(rest) = accounts[i].strip_prefix("sell_pool_accounts_start:") {
+                if let Ok(count) = rest.parse::<usize>() {
+                    let end = (i + 1 + count).min(accounts.len());
+                    sell_accounts = Some(accounts[i + 1..end].to_vec());
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        
+        (buy_accounts, sell_accounts)
+    }
 
     /// Check if this intent is a cross-DEX arbitrage intent
     pub fn is_cross_dex_arb_intent(intent: &TradeIntent) -> bool {
@@ -426,6 +461,21 @@ impl CrossDexHandler {
         // Get pool addresses from intent metadata (provided by arb-strategy)
         let buy_pool = intent.metadata.get("buy_pool").cloned().unwrap_or_default();
         let sell_pool = intent.metadata.get("sell_pool").cloned().unwrap_or_default();
+        
+        // =======================================================================
+        // Parse pool accounts from intent.resources.accounts (NO RPC!)
+        // Format from arb-strategy: "buy_pool_accounts_start:N" followed by N accounts,
+        // then "sell_pool_accounts_start:M" followed by M accounts.
+        // =======================================================================
+        let (buy_accounts, sell_accounts) = self.parse_pool_accounts_from_intent(&intent.resources.accounts);
+        
+        debug!(
+            buy_pool = %buy_pool,
+            sell_pool = %sell_pool,
+            buy_accounts_count = buy_accounts.as_ref().map(|a| a.len()).unwrap_or(0),
+            sell_accounts_count = sell_accounts.as_ref().map(|a| a.len()).unwrap_or(0),
+            "Parsed pool accounts from intent"
+        );
 
         // Build buy instructions
         let buy_connector = self
@@ -433,18 +483,22 @@ impl CrossDexHandler {
             .get(&buy_dex)
             .ok_or_else(|| anyhow!("Unknown buy DEX: {}", buy_dex))?;
 
-        // Pre-load the buy pool into connector cache (single getAccount, not getProgramAccounts)
-        if !buy_pool.is_empty() {
-            if let Ok(pool_pk) = Pubkey::from_str(&buy_pool) {
-                if let Err(e) = buy_connector.load_pool_by_address(&pool_pk).await {
-                    warn!(
-                        pool = %buy_pool,
-                        dex = %buy_dex,
-                        error = %e,
-                        "Failed to pre-load buy pool - build_swap_ix will likely fail"
-                    );
-                }
+        // Set pool from intent accounts (NO RPC!) - arb-strategy provides these from DexPoolAccounts events
+        if let Some(ref accts) = buy_accounts {
+            if let Err(e) = buy_connector.set_pool_from_accounts(&buy_pool, accts) {
+                warn!(
+                    pool = %buy_pool,
+                    dex = %buy_dex,
+                    error = %e,
+                    "Failed to set buy pool from intent accounts"
+                );
             }
+        } else if !buy_pool.is_empty() {
+            // No accounts in intent - reject (we don't do RPC anymore!)
+            return Err(anyhow!(
+                "buy pool {} has no accounts in intent - arb-strategy must include DexPoolAccounts",
+                buy_pool
+            ));
         }
 
         // Use trade_amount (from intent) as buy_amount_in
@@ -510,18 +564,22 @@ impl CrossDexHandler {
             .get(&sell_dex)
             .ok_or_else(|| anyhow!("Unknown sell DEX: {}", sell_dex))?;
 
-        // Pre-load the sell pool into connector cache
-        if !sell_pool.is_empty() {
-            if let Ok(pool_pk) = Pubkey::from_str(&sell_pool) {
-                if let Err(e) = sell_connector.load_pool_by_address(&pool_pk).await {
-                    warn!(
-                        pool = %sell_pool,
-                        dex = %sell_dex,
-                        error = %e,
-                        "Failed to pre-load sell pool - build_swap_ix will likely fail"
-                    );
-                }
+        // Set sell pool from intent accounts (NO RPC!)
+        if let Some(ref accts) = sell_accounts {
+            if let Err(e) = sell_connector.set_pool_from_accounts(&sell_pool, accts) {
+                warn!(
+                    pool = %sell_pool,
+                    dex = %sell_dex,
+                    error = %e,
+                    "Failed to set sell pool from intent accounts"
+                );
             }
+        } else if !sell_pool.is_empty() {
+            // No accounts in intent - reject (we don't do RPC anymore!)
+            return Err(anyhow!(
+                "sell pool {} has no accounts in intent - arb-strategy must include DexPoolAccounts",
+                sell_pool
+            ));
         }
 
         // IMPORTANT: sell the guaranteed minimum tokens (buy_min_out), not the optimistic

@@ -2366,6 +2366,101 @@ impl Dex for PumpFunAmmDex {
             )),
         }
     }
+    
+    /// Set pool data directly from accounts list (NO RPC!)
+    ///
+    /// Accounts format (v1 from DexPoolAccounts, 14 elements):
+    /// [0] pool_market
+    /// [1] global_config
+    /// [2] base_mint
+    /// [3] quote_mint
+    /// [4] pool_base_vault
+    /// [5] pool_quote_vault
+    /// [6] protocol_fee_recipient
+    /// [7] protocol_fee_recipient_ta
+    /// [8] event_authority
+    /// [9] coin_creator_vault_ata
+    /// [10] coin_creator_vault_authority
+    /// [11] global_volume_accumulator
+    /// [12] fee_config
+    /// [13] fee_program
+    fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Result<()> {
+        // Accept both 14-element (v1 with volume accumulators) and 12-element (v2 without)
+        if accounts.len() < 12 {
+            return Err(anyhow!(
+                "pump_amm set_pool_from_accounts requires at least 12 accounts, got {}",
+                accounts.len()
+            ));
+        }
+        
+        let parse_pubkey = |s: &str, name: &str| -> Result<Pubkey> {
+            Pubkey::from_str(s).map_err(|e| anyhow!("Invalid {} pubkey '{}': {}", name, s, e))
+        };
+        
+        let pool_market = parse_pubkey(&accounts[0], "pool_market")?;
+        let global_config = parse_pubkey(&accounts[1], "global_config")?;
+        let base_mint = parse_pubkey(&accounts[2], "base_mint")?;
+        let quote_mint = parse_pubkey(&accounts[3], "quote_mint")?;
+        let pool_base_vault = parse_pubkey(&accounts[4], "pool_base_vault")?;
+        let pool_quote_vault = parse_pubkey(&accounts[5], "pool_quote_vault")?;
+        let protocol_fee_recipient = parse_pubkey(&accounts[6], "protocol_fee_recipient")?;
+        let protocol_fee_recipient_ta = parse_pubkey(&accounts[7], "protocol_fee_recipient_ta")?;
+        let event_authority = parse_pubkey(&accounts[8], "event_authority")?;
+        let coin_creator_vault_ata = parse_pubkey(&accounts[9], "coin_creator_vault_ata")?;
+        let coin_creator_vault_authority = parse_pubkey(&accounts[10], "coin_creator_vault_authority")?;
+        let fee_config = parse_pubkey(&accounts[11], "fee_config")?;
+        
+        // Optional fields for v1 format (14 elements)
+        let global_volume_accumulator = if accounts.len() > 12 {
+            parse_pubkey(&accounts[12], "global_volume_accumulator").ok()
+        } else {
+            None
+        }.unwrap_or(Pubkey::default());
+        
+        let fee_program = if accounts.len() > 13 {
+            parse_pubkey(&accounts[13], "fee_program").ok()
+        } else {
+            None
+        }.unwrap_or_else(|| Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap());
+        
+        // Validate pool_address matches accounts[0]
+        let expected_pool = parse_pubkey(pool_address, "pool_address")?;
+        if expected_pool != pool_market {
+            return Err(anyhow!(
+                "pool_address {} does not match accounts[0] {}",
+                pool_address,
+                pool_market
+            ));
+        }
+        
+        let pool = PumpAmmPoolStatic {
+            pool_market,
+            global_config,
+            base_mint,
+            quote_mint,
+            pool_base_vault,
+            pool_quote_vault,
+            protocol_fee_recipient,
+            protocol_fee_recipient_ta,
+            event_authority,
+            coin_creator_vault_ata,
+            coin_creator_vault_authority,
+            global_volume_accumulator,
+            fee_config,
+            fee_program,
+        };
+        
+        debug!(
+            pool_market = %pool_market,
+            base_mint = %base_mint,
+            "pump_amm pool set from intent accounts (NO RPC)"
+        );
+        
+        self.pools_by_base.insert(base_mint, pool);
+        self.pools_by_market.insert(pool_market, base_mint);
+        
+        Ok(())
+    }
 
     async fn quote_exact_in(
         &self,

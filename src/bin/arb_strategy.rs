@@ -189,6 +189,9 @@ struct PoolState {
     last_update: Instant,
     /// Trade count for activity tracking
     trade_count: u64,
+    /// DEX-specific accounts from DexPoolAccounts event (for deterministic IX building)
+    /// These are passed through to execution-engine so it needs ZERO RPC calls.
+    dex_accounts: Option<Vec<String>>,
 }
 
 /// Tracks same token across multiple DEXes
@@ -197,6 +200,9 @@ struct TokenArbTracker {
     base_mint: String,
     /// Pool states by DEX name
     pools_by_dex: HashMap<String, PoolState>,
+    /// Pool accounts by pool_address (from DexPoolAccounts events)
+    /// Key: pool_address, Value: accounts vec
+    pool_accounts: HashMap<String, Vec<String>>,
     /// Last intent generated time
     last_intent_time: Option<Instant>,
 }
@@ -206,8 +212,19 @@ impl TokenArbTracker {
         Self {
             base_mint: base_mint.to_string(),
             pools_by_dex: HashMap::new(),
+            pool_accounts: HashMap::new(),
             last_intent_time: None,
         }
+    }
+
+    /// Store DEX pool accounts (from DexPoolAccounts event)
+    fn set_pool_accounts(&mut self, pool_address: &str, accounts: Vec<String>) {
+        self.pool_accounts.insert(pool_address.to_string(), accounts);
+    }
+
+    /// Get DEX pool accounts for a pool
+    fn get_pool_accounts(&self, pool_address: &str) -> Option<&Vec<String>> {
+        self.pool_accounts.get(pool_address)
     }
 
     /// Add or update a pool for this token
@@ -609,6 +626,7 @@ impl ArbContext {
             liquidity_sol,
             last_update: Instant::now(),
             trade_count: 0,
+            dex_accounts: None, // Will be filled by DexPoolAccounts event
         };
 
         let is_new = !tracker.pools_by_dex.contains_key(dex);
@@ -623,6 +641,35 @@ impl ArbContext {
                 liquidity = %liquidity_sol,
                 dexes = tracker.pools_by_dex.len(),
                 "Pool added to arb tracker"
+            );
+        }
+    }
+
+    /// Store DEX pool accounts from DexPoolAccounts event
+    /// These are passed through to execution-engine in TradeIntent.resources.accounts
+    /// so execution-engine needs ZERO RPC calls.
+    fn handle_dex_pool_accounts(&self, pool_address: &str, base_mint: &str, accounts: Vec<String>) {
+        let mut trackers = self.trackers.write();
+        
+        // If tracker exists for this mint, store the accounts
+        if let Some(tracker) = trackers.get_mut(base_mint) {
+            tracker.set_pool_accounts(pool_address, accounts.clone());
+            debug!(
+                pool = %pool_address,
+                mint = %base_mint,
+                accounts_len = accounts.len(),
+                "DexPoolAccounts cached in tracker"
+            );
+        } else {
+            // Create tracker and store accounts for later
+            let mut tracker = TokenArbTracker::new(base_mint);
+            tracker.set_pool_accounts(pool_address, accounts.clone());
+            trackers.insert(base_mint.to_string(), tracker);
+            debug!(
+                pool = %pool_address,
+                mint = %base_mint,
+                accounts_len = accounts.len(),
+                "DexPoolAccounts cached (new tracker created)"
             );
         }
     }
@@ -687,6 +734,7 @@ impl ArbContext {
             TokenArbTracker {
                 base_mint: mint.to_string(),
                 pools_by_dex: HashMap::new(),
+                pool_accounts: HashMap::new(),
                 last_intent_time: None,
             }
         });
@@ -723,6 +771,7 @@ impl ArbContext {
                         last_price: None,
                         trade_count: 0,
                         last_update: Instant::now(),
+                        dex_accounts: None, // Will be filled by DexPoolAccounts event
                     }
                 })
         };
@@ -750,6 +799,19 @@ impl ArbContext {
 
         None
     }
+
+    /// Get pool accounts for both buy and sell pools
+    /// Returns (buy_accounts, sell_accounts) if available
+    fn get_pool_accounts_for_arb(&self, opp: &ArbOpportunity) -> (Option<Vec<String>>, Option<Vec<String>>) {
+        let trackers = self.trackers.read();
+        if let Some(tracker) = trackers.get(&opp.base_mint) {
+            let buy_accounts = tracker.get_pool_accounts(&opp.buy_pool).cloned();
+            let sell_accounts = tracker.get_pool_accounts(&opp.sell_pool).cloned();
+            (buy_accounts, sell_accounts)
+        } else {
+            (None, None)
+        }
+    }
 }
 
 // ============================================================================
@@ -759,12 +821,43 @@ impl ArbContext {
 fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> TradeIntent {
     let config = ctx.config.read();
 
+    // Get pool accounts from DexPoolAccounts events (NO RPC needed in execution-engine!)
+    let (buy_accounts, sell_accounts) = ctx.get_pool_accounts_for_arb(opp);
+    
+    // Combine accounts: buy pool accounts + sell pool accounts
+    // Format: buy accounts are prefixed with "buy:" and sell with "sell:" for disambiguation
+    // execution-engine will parse these to build instructions without RPC
+    let mut all_accounts = Vec::new();
+    
+    if let Some(buy_accts) = &buy_accounts {
+        // Store buy accounts with marker
+        all_accounts.push(format!("buy_pool_accounts_start:{}", buy_accts.len()));
+        all_accounts.extend(buy_accts.iter().cloned());
+    }
+    
+    if let Some(sell_accts) = &sell_accounts {
+        // Store sell accounts with marker
+        all_accounts.push(format!("sell_pool_accounts_start:{}", sell_accts.len()));
+        all_accounts.extend(sell_accts.iter().cloned());
+    }
+
     let resources = TradeResources {
         input_mint: "So11111111111111111111111111111111111111112".to_string(),
         output_mint: opp.base_mint.clone(),
         pools: vec![opp.buy_pool.clone(), opp.sell_pool.clone()],
-        accounts: vec![],
+        accounts: all_accounts,
     };
+
+    // Log warning if accounts missing - execution-engine will need to reject or use fallback
+    if buy_accounts.is_none() || sell_accounts.is_none() {
+        warn!(
+            buy_pool = %opp.buy_pool,
+            sell_pool = %opp.sell_pool,
+            buy_accounts_present = buy_accounts.is_some(),
+            sell_accounts_present = sell_accounts.is_some(),
+            "Arb intent missing pool accounts - execution-engine may reject"
+        );
+    }
 
     let mut intent = TradeIntent::new(
         "arb-strategy",
@@ -1158,6 +1251,25 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             } else {
                 None
             }
+        }
+
+        // Handle DexPoolAccounts - cache for deterministic IX building (NO RPC in execution-engine)
+        MarketEventKind::DexPoolAccounts {
+            dex,
+            pool_address,
+            base_mint,
+            accounts,
+            ..
+        } => {
+            debug!(
+                dex = %dex,
+                pool = %pool_address,
+                base_mint = %base_mint,
+                accounts_len = accounts.len(),
+                "Received DexPoolAccounts event"
+            );
+            ctx.handle_dex_pool_accounts(pool_address, base_mint, accounts.clone());
+            None
         }
 
         _ => None,

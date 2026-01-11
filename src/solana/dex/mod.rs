@@ -52,12 +52,22 @@ pub trait Dex: Send + Sync {
     
     /// Load a specific pool by address into the connector's cache.
     /// 
-    /// This is used by execution-engine to load pools from Intent metadata
-    /// without doing getProgramAccounts discovery. The pool address comes
-    /// from arb-strategy which has Geyser data.
+    /// **DEPRECATED**: This makes RPC calls. Use `set_pool_from_accounts` instead
+    /// with accounts from Intent.resources.accounts (from DexPoolAccounts events).
     /// 
     /// Default implementation returns Ok(()) (no-op for DEXes that don't need pre-loading).
     async fn load_pool_by_address(&self, _pool_address: &Pubkey) -> Result<()> {
+        Ok(())
+    }
+    
+    /// Set pool data directly from accounts list (NO RPC calls).
+    /// 
+    /// This is the preferred method for execution-engine. The accounts come from
+    /// `Intent.resources.accounts` which were populated by arb-strategy from
+    /// `DexPoolAccounts` events (Geyser data).
+    /// 
+    /// Default implementation returns Ok(()) - override for DEXes that support it.
+    fn set_pool_from_accounts(&self, _pool_address: &str, _accounts: &[String]) -> Result<()> {
         Ok(())
     }
 
