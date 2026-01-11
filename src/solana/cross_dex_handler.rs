@@ -452,33 +452,50 @@ impl CrossDexHandler {
         let buy_amount_in = trade_amount;
 
         // ====================================================================
-        // Create ATA for the token we're buying (idempotent - safe if exists)
-        // This is needed because the user may not have an ATA for this token.
-        // Without this, swaps fail with AnchorError AccountNotInitialized (3012).
+        // Create ATAs for BOTH tokens involved in the swap (idempotent)
+        // 
+        // Orca Whirlpool requires ATAs for token_owner_account_a AND token_owner_account_b.
+        // - token_owner_account_a = User's ATA for pool.token_mint_a (often WSOL)
+        // - token_owner_account_b = User's ATA for pool.token_mint_b (the token)
+        //
+        // For SOL→Token swaps: We need WSOL ATA (for input) AND Token ATA (for output).
+        // Without both, Orca fails with AnchorError AccountNotInitialized (3012).
         // ====================================================================
         let mut ata_creation_instructions = Vec::new();
         if let Some(wallet) = self.wallet_pubkey {
-            let token_mint_pk = Pubkey::from_str(token_mint)
-                .map_err(|_| anyhow!("Invalid token mint: {}", token_mint))?;
-            
-            // Convert to spl_token pubkeys for ATA derivation
             let wallet_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(wallet.to_bytes());
-            let token_mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint_pk.to_bytes());
             
-            // Create idempotent ATA instruction (no-op if ATA already exists)
-            let create_ata_ix_prog = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            // 1. Create WSOL ATA (needed for Orca which uses WSOL, not native SOL)
+            let wsol_mint_pk = Pubkey::from_str(SOL_MINT)
+                .map_err(|_| anyhow!("Invalid WSOL mint"))?;
+            let wsol_mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(wsol_mint_pk.to_bytes());
+            
+            let create_wsol_ata_ix_prog = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                 &wallet_spl,        // payer
                 &wallet_spl,        // owner  
-                &token_mint_spl,    // mint
+                &wsol_mint_spl,     // WSOL mint
                 &spl_token::id(),   // token program
             );
-            let create_ata_ix = prog_ix_to_sdk(create_ata_ix_prog);
-            ata_creation_instructions.push(create_ata_ix);
+            ata_creation_instructions.push(prog_ix_to_sdk(create_wsol_ata_ix_prog));
+            
+            // 2. Create Token ATA (for the token being bought/sold)
+            let token_mint_pk = Pubkey::from_str(token_mint)
+                .map_err(|_| anyhow!("Invalid token mint: {}", token_mint))?;
+            let token_mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint_pk.to_bytes());
+            
+            let create_token_ata_ix_prog = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &wallet_spl,        // payer
+                &wallet_spl,        // owner  
+                &token_mint_spl,    // token mint
+                &spl_token::id(),   // token program
+            );
+            ata_creation_instructions.push(prog_ix_to_sdk(create_token_ata_ix_prog));
             
             debug!(
                 token_mint = %token_mint,
+                wsol_mint = %SOL_MINT,
                 wallet = %wallet,
-                "Added idempotent ATA creation instruction for token"
+                "Added idempotent ATA creation for WSOL and token"
             );
         }
 
@@ -514,12 +531,13 @@ impl CrossDexHandler {
             .await?;
 
         // Combine: ATA creation (if any) + buy swap + sell swap
-        // ATA creation is idempotent (safe if already exists) and costs ~20k CU
+        // ATA creation is idempotent (safe if already exists) and costs ~20k CU each
+        let ata_count = ata_creation_instructions.len();
         let mut combined_buy_instructions = ata_creation_instructions;
         combined_buy_instructions.extend(buy_instructions);
 
-        // Estimate compute units (ATA create ~20k + 2x swap ~200k each)
-        let ata_cu = if combined_buy_instructions.len() > 1 { 25_000 } else { 0 };
+        // Estimate compute units (ATA create ~25k each + 2x swap ~200k each)
+        let ata_cu = (ata_count as u32) * 25_000;
         let total_cu = ata_cu + 200_000 * 2;
 
         Ok(CrossDexSwapPlan {
