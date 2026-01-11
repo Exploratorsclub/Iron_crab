@@ -41,6 +41,7 @@ pub struct MeteoraDlmm {
     rpc: Arc<SolanaRpc>,
     pools: Arc<DashMap<Pubkey, PoolCache>>,
     mint_index: Arc<DashMap<Pubkey, Vec<Pubkey>>>, // mint -> pool addresses
+    user_authority: parking_lot::RwLock<Option<Pubkey>>,
 }
 
 impl MeteoraDlmm {
@@ -49,7 +50,13 @@ impl MeteoraDlmm {
             rpc,
             pools: Arc::new(DashMap::new()),
             mint_index: Arc::new(DashMap::new()),
+            user_authority: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Set the user authority (wallet pubkey) for building swap instructions
+    pub fn set_user_authority(&mut self, auth: Pubkey) {
+        *self.user_authority.write() = Some(auth);
     }
 
     /// Get pool snapshot for a specific address
@@ -437,10 +444,27 @@ impl Dex for MeteoraDlmm {
         // 3. Proper authority derivation
         let swap_builder = MeteoraDlmmSwapBuilder::new(self.rpc.clone());
 
-        // Placeholder: In production, these would come from wallet/treasury
-        let user = Pubkey::default(); // TODO: Get from caller
-        let user_token_x = Pubkey::default(); // TODO: Derive ATA
-        let user_token_y = Pubkey::default(); // TODO: Derive ATA
+        // Get user authority
+        let user = self.user_authority.read()
+            .ok_or_else(|| anyhow!("meteora_dlmm user_authority not set"))?;
+
+        // Convert to spl_token Pubkey type for ATA derivation
+        let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(user.to_bytes());
+        let token_x_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(pool.token_x_mint.to_bytes());
+        let token_y_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(pool.token_y_mint.to_bytes());
+        let token_program_spl = spl_token::id();
+
+        // Derive ATAs for user
+        let user_token_x_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_spl, &token_x_spl, &token_program_spl
+        );
+        let user_token_y_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_spl, &token_y_spl, &token_program_spl
+        );
+
+        // Convert back to solana_sdk Pubkey
+        let user_token_x = Pubkey::new_from_array(user_token_x_spl.to_bytes());
+        let user_token_y = Pubkey::new_from_array(user_token_y_spl.to_bytes());
 
         let ix = swap_builder.build_swap(
             &pool_addr,

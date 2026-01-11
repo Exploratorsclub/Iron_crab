@@ -127,11 +127,14 @@ impl CrossDexHandler {
 
         // Initialize PumpSwap AMM (pump_amm) - for build_swap_ix() only
         if let Some(ref rpc_url) = self.rpc_url {
-            let pump_amm = PumpFunAmmDex::new(
+            let mut pump_amm = PumpFunAmmDex::new(
                 Arc::clone(&self.rpc),
                 rpc_url.clone(),
                 None,
             );
+            if let Some(pk) = self.wallet_pubkey {
+                pump_amm.set_user_authority(pk);
+            }
             self.dexes
                 .insert("pump_amm".to_string(), Arc::new(pump_amm));
             info!("Initialized PumpSwap AMM connector (for IX building only)");
@@ -140,13 +143,19 @@ impl CrossDexHandler {
         }
 
         // Initialize Meteora DLMM - for build_swap_ix() only
-        let meteora = MeteoraDlmm::new(Arc::clone(&self.rpc));
+        let mut meteora = MeteoraDlmm::new(Arc::clone(&self.rpc));
+        if let Some(pk) = self.wallet_pubkey {
+            meteora.set_user_authority(pk);
+        }
         self.dexes
             .insert("meteora_dlmm".to_string(), Arc::new(meteora));
         info!("Initialized Meteora DLMM connector (for IX building only)");
 
         // Initialize Orca Whirlpool - for build_swap_ix() only
         let orca = Orca::new(Arc::clone(&self.rpc));
+        if let Some(pk) = self.wallet_pubkey {
+            orca.set_user_authority(pk);
+        }
         self.dexes.insert("orca".to_string(), Arc::new(orca));
         info!("Initialized Orca Whirlpool connector (for IX building only)");
 

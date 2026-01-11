@@ -744,14 +744,32 @@ impl Dex for Orca {
         } else {
             (out_pk, in_pk)
         };
-        let user_source = *self
+        // Auto-derive ATAs if not explicitly registered
+        let user_source = self
             .user_token_accounts
             .get(&input_mint)
-            .ok_or_else(|| anyhow!("missing user source token account for input mint"))?;
-        let user_destination = *self
+            .map(|v| *v)
+            .unwrap_or_else(|| {
+                // Convert to spl_token Pubkey for ATA derivation, then back to solana_sdk
+                let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
+                let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(input_mint.to_bytes());
+                let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &owner_spl, &mint_spl, &spl_token::id()
+                );
+                Pubkey::new_from_array(ata_spl.to_bytes())
+            });
+        let user_destination = self
             .user_token_accounts
             .get(&output_mint)
-            .ok_or_else(|| anyhow!("missing user destination token account for output mint"))?;
+            .map(|v| *v)
+            .unwrap_or_else(|| {
+                let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
+                let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(output_mint.to_bytes());
+                let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &owner_spl, &mint_spl, &spl_token::id()
+                );
+                Pubkey::new_from_array(ata_spl.to_bytes())
+            });
         accounts.push(AM {
             pubkey: authority,
             is_signer: true,
