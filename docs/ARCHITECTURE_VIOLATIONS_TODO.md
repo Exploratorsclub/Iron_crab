@@ -175,10 +175,10 @@ pub struct PoolCreatedEvent {
 }
 ```
 
-#### C2: Pool State in TradeIntent Metadata ⚠️ NÄCHSTER SCHRITT
+#### C2: Pool State in TradeIntent Metadata ✅ BEREITS VORHANDEN
 **Datei:** `src/bin/arb_strategy.rs`
 
-arb-strategy sollte alle Quote-Daten im Intent mitschicken:
+arb-strategy sendet **bereits** alle Quote-Daten im Intent (siehe Lines 800-840):
 ```rust
 intent.metadata.insert("spread_bps", spread_bps.to_string());
 intent.metadata.insert("estimated_profit_lamports", profit.to_string());
@@ -186,8 +186,28 @@ intent.metadata.insert("buy_price", buy_price.to_string());
 intent.metadata.insert("sell_price", sell_price.to_string());
 intent.metadata.insert("buy_dex", buy_dex.clone());
 intent.metadata.insert("sell_dex", sell_dex.clone());
-// CrossDexHandler validiert jetzt nur noch diese Werte
+intent.metadata.insert("buy_pool", buy_pool.clone());
+intent.metadata.insert("sell_pool", sell_pool.clone());
 ```
+
+CrossDexHandler validiert jetzt nur noch diese Intent-Metadaten (✅ ERLEDIGT).
+
+---
+
+### ⚠️ HINWEIS: Momentum-Bot SELL Path
+
+Der Momentum-Bot SELL-Pfad in execution-engine nutzt weiterhin `quote_exact_in()`:
+- **Datei:** `src/bin/execution_engine.rs` (Lines 1110-1240, 1720-1750)
+- **Grund:** momentum-bot Intents enthalten keine Quote-Daten in Metadata
+- **Problem:** pumpfun_amm.quote_exact_in() ruft discover_pool_static() auf → RPC
+
+**Akzeptierter Kompromiss (für MVP):**
+- arb-strategy Path (Cross-DEX): ✅ Intent-Metadaten-basiert (kein RPC)
+- momentum-bot Path (SELL): ⚠️ Nutzt noch RPC für Quote (akzeptabel für Sells)
+
+**Langfrist-Fix:**
+- momentum-bot sollte Quote-Daten im SELL-Intent mitschicken
+- execution-engine sollte für SELL-Intents auch nur Metadaten verwenden
 
 #### ~~C3: On-Demand Discovery aus DEX Connectors entfernen~~ ✅ ERLEDIGT
 **Dateien:**
@@ -288,30 +308,38 @@ ExecutionResult
 
 ## Migration Plan
 
-### Phase 1: Intent Enrichment (Quick Fix)
-1. arb-strategy fügt alle Pool-Daten zu Intent Metadata hinzu
-2. execution-engine verwendet Metadata statt RPC Discovery
-3. Keine Architektur-Änderungen, nur Daten-Durchreichung
+### Phase 1: Intent Enrichment ✅ ERLEDIGT
+1. ✅ arb-strategy fügt alle Pool-Daten zu Intent Metadata hinzu
+2. ✅ execution-engine verwendet Metadata statt RPC Discovery für arb-intents
+3. ⚠️ momentum-bot SELL-Path nutzt noch RPC (akzeptiert für MVP)
 
-### Phase 2: MarketEvent Enrichment
+### Phase 2: MarketEvent Enrichment (TODO)
 1. `PoolCreatedEvent` um alle Pool-State Felder erweitern
 2. `PoolStateUpdate` Event für Reserve Changes
 3. Strategies cachen Pool State aus MarketEvents
 
-### Phase 3: CrossDexHandler Cleanup
-1. RPC-abhängige Quote-Validation entfernen
-2. DEX Connectors als stateless Quote/IX Builders
-3. Pool State nur aus Intent oder NATS Cache
+### Phase 3: CrossDexHandler Cleanup ✅ ERLEDIGT
+1. ✅ RPC-abhängige Quote-Validation entfernt (validate_arb_opportunity)
+2. ⚠️ DEX Connectors haben noch State (für IX Building nötig)
+3. ✅ Pool State aus Intent für arb-strategy Path
 
 ---
 
 ## Metriken für Erfolg
 
-- [ ] Keine `getProgramAccounts` Calls im Hot Path
-- [ ] execution-engine macht 0 RPC Calls für Pool Discovery
-- [ ] Pool State Latenz: Geyser → execution-engine < 50ms
-- [ ] Keine "rpc timeout" Decision Records
-- [ ] Single Source of Truth für Pool State (market-data)
+- [x] Keine `getProgramAccounts` Calls im arb-strategy Hot Path
+- [x] execution-engine macht 0 RPC Calls für arb-intent Pool Discovery
+- [ ] Pool State Latenz: Geyser → execution-engine < 50ms (nicht messbar ohne deploy)
+- [ ] Keine "rpc timeout" Decision Records für arb-intents
+- [x] arb-strategy ist Source of Truth für Quote-Daten (Intent Metadata)
+
+---
+
+## Offene Punkte (P1/P2)
+
+1. **momentum-bot SELL Path**: Nutzt noch RPC quote_exact_in()
+2. **PoolCreatedEvent Enrichment**: Fehlende Felder (vault, reserves, fee)
+3. **Pool State Registry**: Zentrale Registry in market-data für Request/Reply
 
 ---
 
