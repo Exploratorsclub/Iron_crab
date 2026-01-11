@@ -21,7 +21,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PUMPFUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
@@ -134,6 +134,8 @@ pub struct PumpFunAmmDex {
 
     // Cache by base mint (WSOL quote only for now)
     pools_by_base: DashMap<Pubkey, PumpAmmPoolStatic>,
+    // Index by pool_market address (for load_pool_by_address)
+    pools_by_market: DashMap<Pubkey, Pubkey>, // pool_market -> base_mint
     user_accounts: DashMap<(Pubkey, Pubkey), PumpAmmUserAccounts>, // (pool_market, user)
 }
 
@@ -156,6 +158,7 @@ impl PumpFunAmmDex {
             helius_throttle,
             discovery_lock: Arc::new(Mutex::new(())),
             pools_by_base: DashMap::new(),
+            pools_by_market: DashMap::new(),
             user_accounts: DashMap::new(),
         }
     }
@@ -1726,6 +1729,7 @@ impl PumpFunAmmDex {
             {
                 Ok(Some(pool)) => {
                     self.pools_by_base.insert(base_mint, pool.clone());
+                    self.pools_by_market.insert(pool.pool_market, base_mint);
                     return Ok(Some(pool));
                 }
                 Ok(None) => {}
@@ -1756,6 +1760,7 @@ impl PumpFunAmmDex {
                         m, base_mint
                     );
                     self.pools_by_base.insert(base_mint, pool.clone());
+                    self.pools_by_market.insert(pool.pool_market, base_mint);
                     return Ok(Some(pool));
                 }
                 Ok(None) => {
@@ -1987,6 +1992,7 @@ impl PumpFunAmmDex {
                         pool.fee_config = fee_config;
 
                         self.pools_by_base.insert(base_mint, pool.clone());
+                        self.pools_by_market.insert(pool.pool_market, base_mint);
                         return Ok(Some(pool));
                     }
                 }
@@ -2264,6 +2270,101 @@ impl PumpFunAmmDex {
 impl Dex for PumpFunAmmDex {
     async fn refresh_pools(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Load a single pool by its market address (pool_address) via getAccount RPC.
+    ///
+    /// **ARCHITECTURE COMPLIANCE (TARGET_ARCHITECTURE.md Section 4.2):**
+    /// This is a single getAccount call (acceptable) to pre-load a pool
+    /// that arb-strategy discovered and passed via Intent metadata.
+    /// NOT getProgramAccounts - no scanning.
+    async fn load_pool_by_address(&self, pool_address: &Pubkey) -> Result<()> {
+        // Check if already cached via market index
+        if self.pools_by_market.contains_key(pool_address) {
+            debug!("pump_amm pool {} already in cache", pool_address);
+            return Ok(());
+        }
+
+        debug!(
+            "Loading pump_amm pool {} via single getAccount",
+            pool_address
+        );
+
+        // Fetch the pool market account to get base_mint
+        let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
+        let expected_quote_mint = Pubkey::from_str(WSOL_MINT)?;
+
+        let account = self
+            .rpc
+            .get_account_retry(pool_address)
+            .await
+            .map_err(|e| anyhow!("Failed to fetch pump_amm pool {}: {}", pool_address, e))?;
+
+        if account.owner != pump_amm_program {
+            return Err(anyhow!(
+                "pump_amm pool {} has wrong owner: {}",
+                pool_address,
+                account.owner
+            ));
+        }
+
+        // Parse base_mint from market account data
+        let min_len = PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET + (32 * 3);
+        if account.data.len() < min_len {
+            return Err(anyhow!(
+                "pump_amm pool {} data too short: {} < {}",
+                pool_address,
+                account.data.len(),
+                min_len
+            ));
+        }
+
+        let base_mint = Pubkey::new_from_array(
+            account.data[PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET as usize
+                ..(PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET as usize + 32)]
+                .try_into()
+                .map_err(|_| anyhow!("pump_amm market base_mint slice"))?,
+        );
+        let quote_mint = Pubkey::new_from_array(
+            account.data[PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET as usize
+                ..(PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET as usize + 32)]
+                .try_into()
+                .map_err(|_| anyhow!("pump_amm market quote_mint slice"))?,
+        );
+
+        // PumpSwap AMM only supports WSOL quote
+        if quote_mint != expected_quote_mint {
+            return Err(anyhow!(
+                "pump_amm pool {} has unexpected quote_mint: {} (expected WSOL)",
+                pool_address,
+                quote_mint
+            ));
+        }
+
+        // Use existing method to parse full pool structure
+        match self
+            .try_parse_pool_static_from_market_account(*pool_address, base_mint)
+            .await
+        {
+            Ok(Some(pool)) => {
+                self.pools_by_base.insert(base_mint, pool.clone());
+                self.pools_by_market.insert(*pool_address, base_mint);
+                debug!(
+                    "Loaded pump_amm pool {}: base_mint={} via single RPC call",
+                    pool_address, base_mint
+                );
+                Ok(())
+            }
+            Ok(None) => Err(anyhow!(
+                "pump_amm pool {} could not be parsed (returned None)",
+                pool_address
+            )),
+            Err(e) => Err(anyhow!(
+                "pump_amm pool {} parse failed: {}",
+                pool_address,
+                e
+            )),
+        }
     }
 
     async fn quote_exact_in(

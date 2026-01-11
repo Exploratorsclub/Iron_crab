@@ -994,6 +994,16 @@ impl Dex for Raydium {
             .map(|p| (p.base_mint.to_string(), p.quote_mint.to_string()))
             .collect()
     }
+
+    async fn load_pool_by_address(&self, pool_address: &Pubkey) -> Result<()> {
+        // Check if already cached
+        if self.pools.iter().any(|p| &p.address == pool_address) {
+            return Ok(());
+        }
+        
+        // Use existing load_pool_from_geyser which fetches via single getAccount
+        self.load_pool_from_geyser(pool_address).await
+    }
 }
 
 impl Raydium {

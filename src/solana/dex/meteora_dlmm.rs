@@ -273,6 +273,67 @@ impl Dex for MeteoraDlmm {
         Ok(())
     }
 
+    /// Load a single pool by address via getAccount RPC.
+    ///
+    /// **ARCHITECTURE COMPLIANCE (TARGET_ARCHITECTURE.md Section 4.2):**
+    /// This is a single getAccount call (acceptable) to pre-load a pool
+    /// that arb-strategy discovered and passed via Intent metadata.
+    /// NOT getProgramAccounts - no scanning.
+    async fn load_pool_by_address(&self, pool_address: &Pubkey) -> Result<()> {
+        // Check if already cached
+        if self.pools.contains_key(pool_address) {
+            debug!(
+                "Meteora DLMM pool {} already in cache",
+                pool_address
+            );
+            return Ok(());
+        }
+
+        debug!(
+            "Loading Meteora DLMM pool {} via single getAccount",
+            pool_address
+        );
+
+        // Fetch account data
+        let account = self
+            .rpc
+            .get_account_retry(pool_address)
+            .await
+            .map_err(|e| anyhow!("Failed to fetch DLMM pool {}: {}", pool_address, e))?;
+
+        // Parse pool
+        let pool = DlmmPool::parse(&account.data)
+            .map_err(|e| anyhow!("Failed to parse DLMM pool {}: {}", pool_address, e))?;
+
+        // Insert into cache
+        let cache = PoolCache {
+            address: *pool_address,
+            pool: pool.clone(),
+            reserve_x_balance: None,
+            reserve_y_balance: None,
+            last_updated: std::time::SystemTime::now(),
+        };
+
+        self.pools.insert(*pool_address, cache);
+
+        // Update mint index
+        self.mint_index
+            .entry(pool.token_x_mint)
+            .or_default()
+            .push(*pool_address);
+        self.mint_index
+            .entry(pool.token_y_mint)
+            .or_default()
+            .push(*pool_address);
+
+        debug!(
+            "Loaded Meteora DLMM pool {}: {}/{} (bin_step={}) via single RPC call",
+            pool_address, pool.token_x_mint, pool.token_y_mint, pool.bin_step
+        );
+
+        Ok(())
+    }
+
     async fn quote_exact_in(
         &self,
         input_mint: &str,

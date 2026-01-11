@@ -29,6 +29,8 @@ pub struct Quote {
     pub tick_spacing: Option<u16>,
 }
 
+use solana_sdk::pubkey::Pubkey;
+
 #[async_trait]
 pub trait Dex: Send + Sync {
     async fn refresh_pools(&self) -> Result<()>;
@@ -47,4 +49,15 @@ pub trait Dex: Send + Sync {
     ) -> Result<Vec<Instruction>>;
     /// List available direct trading pairs (unordered; include both directions if symmetric desired).
     fn list_pairs(&self) -> Vec<(String, String)>;
+    
+    /// Load a specific pool by address into the connector's cache.
+    /// 
+    /// This is used by execution-engine to load pools from Intent metadata
+    /// without doing getProgramAccounts discovery. The pool address comes
+    /// from arb-strategy which has Geyser data.
+    /// 
+    /// Default implementation returns Ok(()) (no-op for DEXes that don't need pre-loading).
+    async fn load_pool_by_address(&self, _pool_address: &Pubkey) -> Result<()> {
+        Ok(())
+    }
 }

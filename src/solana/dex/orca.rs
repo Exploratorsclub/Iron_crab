@@ -794,6 +794,57 @@ impl Dex for Orca {
             })
             .collect()
     }
+
+    async fn load_pool_by_address(&self, pool_address: &Pubkey) -> Result<()> {
+        // Check if already cached
+        if self.pools.contains_key(pool_address) {
+            return Ok(());
+        }
+        
+        // Fetch pool account via single getAccount RPC call
+        let account = self.rpc.get_account_retry(pool_address).await?;
+        
+        // Parse whirlpool layout
+        let parsed = layout::parse_whirlpool(&account.data)
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse Orca whirlpool at {}", pool_address))?;
+        
+        // Insert into cache
+        let pool = OrcaPool {
+            base_mint: parsed.token_mint_a,
+            quote_mint: parsed.token_mint_b,
+            reserve_base: 0, // Will be lazy-loaded
+            reserve_quote: 0,
+            fee_bps: (parsed.fee_rate / 100) as u32, // fee_rate is in hundredths of a bps
+            fee_tier: None,
+            tick_spacing: Some(parsed.tick_spacing),
+            vault_a: parsed.token_vault_a,
+            vault_b: parsed.token_vault_b,
+            tick_current_index: Some(parsed.tick_current_index),
+            cached_reserves: None,
+            last_reserve_fetch: None,
+        };
+        
+        self.pools.insert(*pool_address, pool.clone());
+        
+        // Update mint index
+        self.mint_index
+            .entry(pool.base_mint)
+            .or_default()
+            .push(*pool_address);
+        self.mint_index
+            .entry(pool.quote_mint)
+            .or_default()
+            .push(*pool_address);
+        
+        tracing::debug!(
+            pool = %pool_address,
+            base_mint = %pool.base_mint,
+            quote_mint = %pool.quote_mint,
+            "Loaded Orca whirlpool via single getAccount"
+        );
+        
+        Ok(())
+    }
 }
 
 impl Orca {

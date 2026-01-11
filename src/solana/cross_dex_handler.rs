@@ -394,11 +394,29 @@ impl CrossDexHandler {
             .saturating_mul(10000 - slippage_bps as u64)
             / 10000;
 
+        // Get pool addresses from intent metadata (provided by arb-strategy)
+        let buy_pool = intent.metadata.get("buy_pool").cloned().unwrap_or_default();
+        let sell_pool = intent.metadata.get("sell_pool").cloned().unwrap_or_default();
+
         // Build buy instructions
         let buy_connector = self
             .dexes
             .get(&buy_dex)
             .ok_or_else(|| anyhow!("Unknown buy DEX: {}", buy_dex))?;
+
+        // Pre-load the buy pool into connector cache (single getAccount, not getProgramAccounts)
+        if !buy_pool.is_empty() {
+            if let Ok(pool_pk) = Pubkey::from_str(&buy_pool) {
+                if let Err(e) = buy_connector.load_pool_by_address(&pool_pk).await {
+                    debug!(
+                        pool = %buy_pool,
+                        dex = %buy_dex,
+                        error = %e,
+                        "Failed to pre-load buy pool (will try build_swap_ix anyway)"
+                    );
+                }
+            }
+        }
 
         // Use trade_amount (from intent) as buy_amount_in
         // arb-strategy already computed the optimal amounts
@@ -412,6 +430,20 @@ impl CrossDexHandler {
             .dexes
             .get(&sell_dex)
             .ok_or_else(|| anyhow!("Unknown sell DEX: {}", sell_dex))?;
+
+        // Pre-load the sell pool into connector cache
+        if !sell_pool.is_empty() {
+            if let Ok(pool_pk) = Pubkey::from_str(&sell_pool) {
+                if let Err(e) = sell_connector.load_pool_by_address(&pool_pk).await {
+                    debug!(
+                        pool = %sell_pool,
+                        dex = %sell_dex,
+                        error = %e,
+                        "Failed to pre-load sell pool (will try build_swap_ix anyway)"
+                    );
+                }
+            }
+        }
 
         // IMPORTANT: sell the guaranteed minimum tokens (buy_min_out), not the optimistic
         // quoted output. Otherwise the second leg may fail due to insufficient token balance.
