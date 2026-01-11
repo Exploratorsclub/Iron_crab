@@ -94,13 +94,21 @@ pub struct Config {
     pub wallet_tracker: Option<WalletTrackerCfg>,
     #[serde(default)]
     pub momentum: Option<MomentumCfg>,
+    #[serde(default)]
+    pub execution_engine: Option<ExecutionEngineCfg>,
+}
 
-    // === ROOT-LEVEL JITO CONFIG (for execution-engine) ===
-    // These are read directly from root level in TOML, not from a section
+/// Execution Engine Configuration (for execution-engine binary)
+/// TOML section: [execution_engine]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecutionEngineCfg {
+    /// Enable Jito bundle submission for atomic execution
     #[serde(default)]
     pub jito_enabled: Option<bool>,
+    /// Tip amount in lamports for Jito bundles (default: 10000)
     #[serde(default)]
     pub jito_tip_lamports: Option<u64>,
+    /// Jito block engine region: frankfurt, amsterdam, ny, tokyo, slc
     #[serde(default)]
     pub jito_region: Option<String>,
 }

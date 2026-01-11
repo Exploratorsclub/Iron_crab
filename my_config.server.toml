@@ -330,3 +330,12 @@ max_hold_time_secs = 300            # Max 5 minutes hold
 momentum_exit_buy_ratio = 0.4       # Exit if buy ratio < 40%
 momentum_exit_window_secs = 30      # Check last 30s of trades
 momentum_exit_min_trades = 5        # Need 5+ trades to evaluate
+
+# ============================================================================
+# EXECUTION ENGINE CONFIGURATION
+# Used by execution-engine binary for atomic cross-DEX arbitrage
+# ============================================================================
+[execution_engine]
+jito_enabled = true                 # Enable Jito bundle submission
+jito_tip_lamports = 10000          # Tip: 0.00001 SOL per bundle
+jito_region = "frankfurt"          # Block Engine: frankfurt, amsterdam, ny, tokyo, slc

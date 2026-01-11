@@ -2368,20 +2368,24 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Setup config - read Jito settings from TOML config file (root level)
+    // Jito settings from [execution_engine] section (preferred) or [sniper] section (legacy fallback)
+    let exec_eng_cfg = app_config.as_ref().and_then(|c| c.execution_engine.as_ref());
+    let sniper_cfg = app_config.as_ref().and_then(|c| c.sniper.as_ref());
+
+    // Setup config - read Jito settings: prefer [execution_engine] section, fallback to [sniper]
     let exec_config = ExecutionConfig {
         send_enabled: !args.simulate_only && !args.dry_run && has_keys,
-        jito_enabled: app_config
-            .as_ref()
-            .and_then(|c| c.jito_enabled)
+        jito_enabled: exec_eng_cfg
+            .and_then(|e| e.jito_enabled)
+            .or_else(|| sniper_cfg.and_then(|s| s.jito_enabled))
             .unwrap_or(false),
-        jito_tip_lamports: app_config
-            .as_ref()
-            .and_then(|c| c.jito_tip_lamports)
+        jito_tip_lamports: exec_eng_cfg
+            .and_then(|e| e.jito_tip_lamports)
+            .or_else(|| sniper_cfg.and_then(|s| s.jito_tip_lamports))
             .unwrap_or(10_000),
-        jito_region: app_config
-            .as_ref()
-            .and_then(|c| c.jito_region.clone())
+        jito_region: exec_eng_cfg
+            .and_then(|e| e.jito_region.clone())
+            .or_else(|| sniper_cfg.and_then(|s| s.jito_region.clone()))
             .unwrap_or_else(|| "frankfurt".to_string()),
         ..Default::default()
     };
