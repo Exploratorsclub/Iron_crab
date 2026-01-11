@@ -2,7 +2,7 @@
 
 **Erstellt:** 2026-01-11  
 **Aktualisiert:** 2026-01-11  
-**Status:** 🟡 V1, V2 behoben (arb-strategy Pfad) - momentum-bot Pfad noch offen  
+**Status:** � V1-V4 behoben (arb-strategy Pfad komplett) - momentum-bot Pfad noch offen  
 **Source of Truth:** `docs/TARGET_ARCHITECTURE.md`, `docs/ROLE_SEPARATION.md`
 
 ---
@@ -13,8 +13,8 @@ Während der Fehlerbehebung für "No buy quote available from meteora_dlmm/pump_
 
 1. **~~Pool Discovery in der execution-engine~~** ✅ BEHOBEN - `discover_pool_on_demand()` entfernt
 2. **~~RPC-basierte On-Demand Discovery (arb-strategy)~~** ✅ BEHOBEN - CrossDexHandler nutzt jetzt Intent-Metadaten
-3. **Duplizierte DEX Connector Instanzen** 🟡 TEILWEISE - execution-engine braucht Connectors nur für IX Building
-4. **Pool State nicht über MarketEvents propagiert** ❌ OFFEN - arb-strategy muss Quote-Daten im Intent senden
+3. **~~Duplizierte DEX Connector Instanzen~~** ✅ BEHOBEN - execution-engine lädt Pools nur via `load_pool_by_address()` (single getAccount, kein getProgramAccounts)
+4. **Pool State nicht über MarketEvents propagiert** ❌ OFFEN - arb-strategy muss Quote-Daten im Intent senden (bereits vorhanden, aber execution-engine muss validieren)
 5. **Momentum-Bot Pfad macht RPC Quotes** ❌ OFFEN - execution.rs ruft quote_exact_in() für SELL-Intents auf
 
 ---
@@ -31,6 +31,13 @@ Während der Fehlerbehebung für "No buy quote available from meteora_dlmm/pump_
 - **Änderung:** `validate_arb_opportunity()` extrahiert `spread_bps`, `estimated_profit_lamports`, `buy_price`, `sell_price` aus Intent-Metadaten
 - **Entfernt:** `estimate_min_amount_in_for_target_out()` (RPC binary search)
 - **Verhalten jetzt:** arb-strategy ist Source of Truth für Quote-Daten
+
+### ✅ F3: `load_pool_by_address()` für Intent-basiertes Pool Loading
+- **Dateien:** `src/solana/dex/mod.rs`, `raydium.rs`, `orca.rs`, `meteora_dlmm.rs`, `pumpfun_amm.rs`
+- **Änderung:** Neues Dex-Trait-Methode `load_pool_by_address(&self, pool_address: &Pubkey) -> Result<()>`
+- **Verhalten:** Lädt einzelne Pools via single getAccount RPC (akzeptabel) basierend auf Intent-Metadaten
+- **Wichtig:** KEIN getProgramAccounts - nur spezifische Pool-Adressen aus dem Intent
+- **CrossDexHandler:** Ruft `load_pool_by_address()` vor `build_swap_ix()` auf
 
 ---
 
