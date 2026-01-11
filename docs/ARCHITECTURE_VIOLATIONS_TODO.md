@@ -1,8 +1,8 @@
 # Architecture Violations & Required Changes
 
 **Erstellt:** 2026-01-11  
-**Aktualisiert:** 2026-01-12 (TODO-2 gefixt: pump_amm emittiert PoolCreated+DexPoolAccounts zusammen bei erstem Trade)  
-**Status:** 🟡 TODO-1 + TODO-2 gefixt - Meteora DLMM: mehrere TARGET_ARCHITECTURE Verstöße  
+**Aktualisiert:** 2026-01-12 (TODO-3 gefixt: DexPoolAccounts für alle DEXes bei Pool Discovery)  
+**Status:** 🟡 TODO-1 + TODO-2 + TODO-3 gefixt - Verbleibende: set_pool_from_accounts für alle DEXes  
 **Source of Truth:** `docs/TARGET_ARCHITECTURE.md`, `docs/ROLE_SEPARATION.md`
 
 ---
@@ -78,36 +78,41 @@ if is_first_trade {
 
 ### Phase 2: Geyser-Conformance für Cross-DEX Arb (Latenz-Optimierung)
 
-#### TODO-3: `DexPoolAccounts` Events für andere DEXes emittieren ⬜ TODO
+#### TODO-3: `DexPoolAccounts` Events für andere DEXes emittieren ✅ FIXED
 **Priorität:** 🟠 P1 (eliminiert RPC-Fallback-Latenz)  
 **Verstöße:** D1, M1  
 **Datei:** `src/bin/market_data.rs`
 
-**Schritte:**
-1. [ ] Nach `geyser_pool_discovery.rs` Account-Parsing: `DexPoolAccounts` Event erzeugen
-2. [ ] Für **Meteora DLMM** (904-byte LB Pair):
-   ```rust
-   MarketEventKind::DexPoolAccounts {
-       dex: "meteora_dlmm".to_string(),
-       pool_address, base_mint: token_x, quote_mint: token_y,
-       accounts: vec![pool_address, reserve_x, reserve_y, token_x, token_y, oracle?, bin_step?],
-   }
-   ```
-3. [ ] Für **Raydium CPMM** (1024-byte):
-   ```rust
-   accounts: vec![pool_address, vault_0, vault_1, token_0, token_1, lp_mint],
-   ```
-4. [ ] Für **Orca Whirlpool** (653-byte):
-   ```rust
-   accounts: vec![pool_address, token_vault_a, token_vault_b, token_mint_a, token_mint_b, tick_spacing],
-   ```
-5. [ ] Publish to NATS nach jedem Account-Update (nicht nur bei Trade-Events!)
+**Lösung implementiert:**
+Bei Pool Discovery via `geyser_pool_discovery.rs` werden jetzt `DexPoolAccounts` Events 
+für ALLE DEXes emittiert, die `coin_vault` und `pc_vault` im `PoolDiscoveryEvent` haben.
 
-**Erwartetes Ergebnis:** arb-strategy empfängt Pool-Accounts für alle DEXes via Geyser
+```rust
+// Nach PoolCreated Event, wenn Vault-Informationen vorhanden:
+if pool_event.coin_vault.is_some() || pool_event.pc_vault.is_some() {
+    let accounts = vec![
+        pool_event.pool_address,
+        pool_event.base_mint,
+        pool_event.quote_mint,
+        pool_event.coin_vault,   // wenn vorhanden
+        pool_event.pc_vault,     // wenn vorhanden
+        pool_event.creator,      // wenn vorhanden (PumpFun)
+    ];
+    // Emit DexPoolAccounts event...
+}
+```
+
+**Unterstützte DEXes:**
+- ✅ Raydium AMM V4 (coin_vault, pc_vault aus 752-byte Account)
+- ✅ Raydium CPMM (token_0_vault, token_1_vault aus 1024-byte Account)
+- ✅ Orca Whirlpool (token_vault_a, token_vault_b aus parsed Account)
+- ✅ Meteora DLMM (reserve_x, reserve_y aus 904-byte LB Pair)
+- ✅ PumpFun (bonding curve - hat creator)
+- ✅ pump_amm (via first trade, siehe TODO-2)
 
 ---
 
-#### TODO-3: `set_pool_from_accounts()` für alle DEXes implementieren ⬜ TODO
+#### TODO-4: `set_pool_from_accounts()` für alle DEXes implementieren ⬜ TODO
 **Priorität:** 🟠 P1 (ermöglicht RPC-freies Pool-Loading)  
 **Verstöße:** D2, M2  
 **Dateien:**

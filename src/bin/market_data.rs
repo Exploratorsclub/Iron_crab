@@ -962,6 +962,61 @@ async fn run_geyser_loop(
                         MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+
+                // Emit DexPoolAccounts for all DEXes that have vault information
+                // This enables arb-strategy to have pool accounts BEFORE first trade
+                if pool_event.coin_vault.is_some() || pool_event.pc_vault.is_some() {
+                    let mut accounts = vec![
+                        pool_event.pool_address.to_string(),
+                        pool_event.base_mint.to_string(),
+                        pool_event.quote_mint.to_string(),
+                    ];
+                    
+                    if let Some(coin_vault) = pool_event.coin_vault {
+                        accounts.push(coin_vault.to_string());
+                    }
+                    if let Some(pc_vault) = pool_event.pc_vault {
+                        accounts.push(pc_vault.to_string());
+                    }
+                    if let Some(creator) = pool_event.creator {
+                        accounts.push(creator.to_string());
+                    }
+
+                    let accounts_event = MarketEvent::new(
+                        "market-data",
+                        BUILD_VERSION,
+                        run_id,
+                        ctx.next_event_id(),
+                        "geyser_pool_discovery",
+                        Some(pool_event.slot),
+                        MarketEventKind::DexPoolAccounts {
+                            dex: pool_event.dex_type.to_string(),
+                            pool_address: pool_event.pool_address.to_string(),
+                            base_mint: pool_event.base_mint.to_string(),
+                            quote_mint: pool_event.quote_mint.to_string(),
+                            accounts,
+                        },
+                    );
+
+                    if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
+                        error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
+                    }
+
+                    if let Some(ref nats) = ctx.nats {
+                        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &accounts_event).await {
+                            warn!(error = %e, "Failed to publish DexPoolAccounts event to NATS");
+                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                dex = %pool_event.dex_type,
+                                pool = %pool_event.pool_address,
+                                "Emitted DexPoolAccounts for pool discovery"
+                            );
+                        }
+                    }
+                }
             }
 
             // P1: Handle Config Updates (Runtime Configuration via UI)
