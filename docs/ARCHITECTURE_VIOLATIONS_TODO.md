@@ -1,8 +1,8 @@
 # Architecture Violations & Required Changes
 
 **Erstellt:** 2026-01-11  
-**Aktualisiert:** 2026-01-12 (TODO-4 gefixt: set_pool_from_accounts() für alle DEXes)  
-**Status:** 🟡 TODO-1 bis TODO-4 gefixt - Verbleibende: arb-strategy Intent-Accounts, RPC-Elimination  
+**Aktualisiert:** 2026-01-12 (TODO-5 bereits implementiert erkannt)  
+**Status:** 🟢 TODO-1 bis TODO-5 erledigt - Verbleibende: Phase 3 RPC-Elimination (P2)  
 **Source of Truth:** `docs/TARGET_ARCHITECTURE.md`, `docs/ROLE_SEPARATION.md`
 
 ---
@@ -146,29 +146,36 @@ fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Res
 
 ---
 
-#### TODO-5: arb-strategy sendet Pool-Accounts im Intent ⬜ TODO
+#### TODO-5: arb-strategy sendet Pool-Accounts im Intent ✅ ALREADY IMPLEMENTED
 **Priorität:** 🟠 P1 (vervollständigt Geyser-Pipeline)  
 **Datei:** `src/bin/arb_strategy.rs`
 
-**Schritte:**
-1. [ ] `DexPoolAccounts` Events in arb-strategy cachen (bereits teilweise vorhanden)
-2. [ ] Beim Intent-Erstellen: `intent.resources.accounts` mit Pool-Accounts füllen
-   ```rust
-   // Für buy_pool
-   if let Some(accounts) = pool_accounts_cache.get(&buy_pool) {
-       intent.resources.accounts.push(("buy_pool".to_string(), accounts.clone()));
-   }
-   // Für sell_pool analog
-   ```
-3. [ ] `cross_dex_handler.rs` passt bereits (prüft `intent.resources.accounts`)
+**Bereits implementiert in `create_arb_intent()`:**
 
-**Erwartetes Ergebnis:** execution-engine macht 0 RPC Calls für Pool-Loading
+1. ✅ `DexPoolAccounts` Events werden in `pool_accounts` HashMap gecached
+   - `handle_dex_pool_accounts()` speichert Accounts per Pool
+   - `get_pool_accounts_for_arb()` holt Accounts für Buy/Sell-Pools
+
+2. ✅ Intent.resources.accounts wird befüllt:
+   ```rust
+   // Format: "buy_pool_accounts_start:N" + N accounts + "sell_pool_accounts_start:M" + M accounts
+   if let Some(buy_accts) = &buy_accounts {
+       all_accounts.push(format!("buy_pool_accounts_start:{}", buy_accts.len()));
+       all_accounts.extend(buy_accts.iter().cloned());
+   }
+   ```
+
+3. ✅ `cross_dex_handler.rs` verarbeitet Intent-Accounts:
+   - `parse_pool_accounts_from_intent()` extrahiert buy/sell Accounts
+   - `set_pool_from_accounts()` wird für beide Pools aufgerufen
+
+**Erwartetes Ergebnis:** execution-engine macht 0 RPC Calls für Pool-Loading bei Arb-Intents mit Accounts ✅
 
 ---
 
 ### Phase 3: RPC-Elimination im Hot Path (Performance)
 
-#### TODO-5: `refresh_pools()` mit Feature-Flag schützen ⬜ TODO
+#### TODO-6: `refresh_pools()` mit Feature-Flag schützen ⬜ TODO
 **Priorität:** 🟡 P2 (verhindert versehentliche RPC-Scans)  
 **Verstöße:** D3, M3  
 **Dateien:** alle DEX Connectors
