@@ -130,7 +130,7 @@ fn load_initial_arb_config(config_path: &PathBuf) -> ArbConfig {
 }
 
 // Known token mints for sanity checks
-const NATIVE_SOL_MINT: &str = "11111111111111111111111111111111";
+const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
