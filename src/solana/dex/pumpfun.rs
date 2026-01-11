@@ -826,6 +826,18 @@ impl Dex for PumpFunDex {
         // Pump.fun pairs are dynamic, discovered via Geyser
         Vec::new()
     }
+
+    /// Override the async build for PumpFun - routes to the real async implementation
+    async fn build_swap_ix_async(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount_in: u64,
+        min_out: u64,
+    ) -> Result<Vec<Instruction>> {
+        // Use the impl-block async method (not trait method)
+        PumpFunDex::build_swap_ix_async(self, input_mint, output_mint, amount_in, min_out, None).await
+    }
 }
 
 impl PumpFunDex {

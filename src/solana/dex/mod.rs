@@ -60,4 +60,20 @@ pub trait Dex: Send + Sync {
     async fn load_pool_by_address(&self, _pool_address: &Pubkey) -> Result<()> {
         Ok(())
     }
+
+    /// Async version of build_swap_ix for DEXes that need async operations
+    /// (e.g., PumpFun bonding curve needs to fetch creator from chain).
+    ///
+    /// Default implementation calls the sync `build_swap_ix()`.
+    /// Override for DEXes that require async (PumpFun, etc.).
+    async fn build_swap_ix_async(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount_in: u64,
+        min_out: u64,
+    ) -> Result<Vec<Instruction>> {
+        // Default: call sync version
+        self.build_swap_ix(input_mint, output_mint, amount_in, min_out)
+    }
 }

@@ -417,11 +417,11 @@ impl CrossDexHandler {
         if !buy_pool.is_empty() {
             if let Ok(pool_pk) = Pubkey::from_str(&buy_pool) {
                 if let Err(e) = buy_connector.load_pool_by_address(&pool_pk).await {
-                    debug!(
+                    warn!(
                         pool = %buy_pool,
                         dex = %buy_dex,
                         error = %e,
-                        "Failed to pre-load buy pool (will try build_swap_ix anyway)"
+                        "Failed to pre-load buy pool - build_swap_ix will likely fail"
                     );
                 }
             }
@@ -431,8 +431,10 @@ impl CrossDexHandler {
         // arb-strategy already computed the optimal amounts
         let buy_amount_in = trade_amount;
 
-        let buy_instructions =
-            buy_connector.build_swap_ix(SOL_MINT, token_mint, buy_amount_in, buy_min_out)?;
+        // Use async build to support DEXes that need it (PumpFun, etc.)
+        let buy_instructions = buy_connector
+            .build_swap_ix_async(SOL_MINT, token_mint, buy_amount_in, buy_min_out)
+            .await?;
 
         // Build sell instructions
         let sell_connector = self
@@ -444,11 +446,11 @@ impl CrossDexHandler {
         if !sell_pool.is_empty() {
             if let Ok(pool_pk) = Pubkey::from_str(&sell_pool) {
                 if let Err(e) = sell_connector.load_pool_by_address(&pool_pk).await {
-                    debug!(
+                    warn!(
                         pool = %sell_pool,
                         dex = %sell_dex,
                         error = %e,
-                        "Failed to pre-load sell pool (will try build_swap_ix anyway)"
+                        "Failed to pre-load sell pool - build_swap_ix will likely fail"
                     );
                 }
             }
@@ -456,8 +458,9 @@ impl CrossDexHandler {
 
         // IMPORTANT: sell the guaranteed minimum tokens (buy_min_out), not the optimistic
         // quoted output. Otherwise the second leg may fail due to insufficient token balance.
-        let sell_instructions =
-            sell_connector.build_swap_ix(token_mint, SOL_MINT, buy_min_out, sell_min_out)?;
+        let sell_instructions = sell_connector
+            .build_swap_ix_async(token_mint, SOL_MINT, buy_min_out, sell_min_out)
+            .await?;
 
         // Estimate compute units
         let total_cu = 200_000 * 2; // ~200k per swap
