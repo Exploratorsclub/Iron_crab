@@ -99,7 +99,7 @@ impl MeteoraDlmmSwapBuilder {
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_amount_out.to_le_bytes());
 
-        // Account ordering for Meteora DLMM swap (from IDL/working txs):
+        // Account ordering for Meteora DLMM swap (from official IDL dlmm.json):
         // 0. lb_pair (writable)
         // 1. bin_array_bitmap_extension (optional, use program_id if not needed)
         // 2. reserve_x (writable)
@@ -108,13 +108,14 @@ impl MeteoraDlmmSwapBuilder {
         // 5. user_token_out (writable)
         // 6. token_x_mint
         // 7. token_y_mint
-        // 8. oracle (derived PDA)
-        // 9. host_fee_in (optional, use program_id)
+        // 8. oracle (writable, derived PDA)
+        // 9. host_fee_in (optional, writable, use program_id if not needed)
         // 10. user (signer)
-        // 11. token_program
-        // 12. event_authority (derived PDA)
-        // 13. program
-        // 14+ bin_arrays (writable)
+        // 11. token_x_program (SPL Token or Token-2022)
+        // 12. token_y_program (SPL Token or Token-2022)
+        // 13. event_authority (derived PDA)
+        // 14. program
+        // 15+ bin_arrays (writable, remaining accounts)
 
         // Derive oracle PDA: seeds = ["oracle", lb_pair]
         let (oracle, _) = Pubkey::find_program_address(
@@ -137,13 +138,14 @@ impl MeteoraDlmmSwapBuilder {
             AccountMeta::new(*user_token_y, false), // 5: User token Y (writable)
             AccountMeta::new_readonly(*token_x_mint, false), // 6: Token X mint
             AccountMeta::new_readonly(*token_y_mint, false), // 7: Token Y mint
-            AccountMeta::new_readonly(oracle, false), // 8: Oracle PDA
+            AccountMeta::new(oracle, false),        // 8: Oracle PDA (WRITABLE!)
             AccountMeta::new_readonly(program_id, false), // 9: host_fee_in (optional, use program_id)
             AccountMeta::new_readonly(*user, true), // 10: User (signer)
-            AccountMeta::new_readonly(token_program, false), // 11: Token program
-            AccountMeta::new_readonly(event_authority, false), // 12: Event authority
-            AccountMeta::new_readonly(program_id, false), // 13: Program ID
-            AccountMeta::new(bin_array_pda, false), // 14: Bin array (writable)
+            AccountMeta::new_readonly(token_program, false), // 11: token_x_program
+            AccountMeta::new_readonly(token_program, false), // 12: token_y_program
+            AccountMeta::new_readonly(event_authority, false), // 13: Event authority
+            AccountMeta::new_readonly(program_id, false), // 14: Program ID
+            AccountMeta::new(bin_array_pda, false), // 15: Bin array (writable)
         ];
 
         Ok(Instruction {
@@ -157,6 +159,7 @@ impl MeteoraDlmmSwapBuilder {
     ///
     /// This is the full version that fetches and includes bin array accounts.
     /// Required for production swaps.
+    #[allow(clippy::too_many_arguments)]
     pub async fn build_swap_with_bins(
         &self,
         lb_pair: &Pubkey,
@@ -164,10 +167,12 @@ impl MeteoraDlmmSwapBuilder {
         reserve_y: &Pubkey,
         user_token_x: &Pubkey,
         user_token_y: &Pubkey,
+        token_x_mint: &Pubkey,
+        token_y_mint: &Pubkey,
         user: &Pubkey,
         amount_in: u64,
         min_amount_out: u64,
-        direction: SwapDirection,
+        _direction: SwapDirection,
         active_id: i32,
         bin_step: u16,
     ) -> Result<Instruction> {
@@ -177,8 +182,23 @@ impl MeteoraDlmmSwapBuilder {
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
         let token_program = Pubkey::from_str(TOKEN_PROGRAM)?;
 
+        // bin_array_bitmap_extension is OPTIONAL. Not all pools have it.
+        let bin_array_bitmap_extension = program_id;
+
         // Fetch bin arrays for this pool
         let bin_arrays = self.fetch_bin_arrays(lb_pair, active_id, bin_step).await?;
+
+        // Derive oracle PDA
+        let (oracle, _) = Pubkey::find_program_address(
+            &[b"oracle", lb_pair.as_ref()],
+            &program_id,
+        );
+
+        // Derive event_authority PDA
+        let (event_authority, _) = Pubkey::find_program_address(
+            &[b"__event_authority"],
+            &program_id,
+        );
 
         // Build instruction data
         let mut data = Vec::with_capacity(24);
@@ -186,18 +206,26 @@ impl MeteoraDlmmSwapBuilder {
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_amount_out.to_le_bytes());
 
-        // Build account list
+        // Build account list (matching official IDL order)
         let mut accounts = vec![
-            AccountMeta::new(*lb_pair, false),
-            AccountMeta::new(*reserve_x, false),
-            AccountMeta::new(*reserve_y, false),
-            AccountMeta::new(*user_token_x, false),
-            AccountMeta::new(*user_token_y, false),
-            AccountMeta::new_readonly(*user, true),
-            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new(*lb_pair, false),      // 0: LB Pair (writable)
+            AccountMeta::new_readonly(bin_array_bitmap_extension, false), // 1: bitmap extension (optional)
+            AccountMeta::new(*reserve_x, false),    // 2: Reserve X (writable)
+            AccountMeta::new(*reserve_y, false),    // 3: Reserve Y (writable)
+            AccountMeta::new(*user_token_x, false), // 4: User token X (writable)
+            AccountMeta::new(*user_token_y, false), // 5: User token Y (writable)
+            AccountMeta::new_readonly(*token_x_mint, false), // 6: Token X mint
+            AccountMeta::new_readonly(*token_y_mint, false), // 7: Token Y mint
+            AccountMeta::new(oracle, false),        // 8: Oracle PDA (WRITABLE!)
+            AccountMeta::new_readonly(program_id, false), // 9: host_fee_in (optional)
+            AccountMeta::new_readonly(*user, true), // 10: User (signer)
+            AccountMeta::new_readonly(token_program, false), // 11: token_x_program
+            AccountMeta::new_readonly(token_program, false), // 12: token_y_program
+            AccountMeta::new_readonly(event_authority, false), // 13: Event authority
+            AccountMeta::new_readonly(program_id, false), // 14: Program ID
         ];
 
-        // Add bin array accounts (writable, as swap will update bin liquidity)
+        // Add bin array accounts as remaining accounts (writable)
         for bin_array in bin_arrays {
             let bin_array_pda = Self::derive_bin_array_pda(lb_pair, bin_array.index)?;
             accounts.push(AccountMeta::new(bin_array_pda, false));
