@@ -2,7 +2,7 @@
 
 **Erstellt:** 2026-01-11  
 **Aktualisiert:** 2026-01-11  
-**Status:** 🟡 V1, V2 behoben - weitere Arbeit erforderlich  
+**Status:** 🟡 V1, V2 behoben (arb-strategy Pfad) - momentum-bot Pfad noch offen  
 **Source of Truth:** `docs/TARGET_ARCHITECTURE.md`, `docs/ROLE_SEPARATION.md`
 
 ---
@@ -12,9 +12,10 @@
 Während der Fehlerbehebung für "No buy quote available from meteora_dlmm/pump_amm" wurden mehrere architektonische Prinzipien verletzt:
 
 1. **~~Pool Discovery in der execution-engine~~** ✅ BEHOBEN - `discover_pool_on_demand()` entfernt
-2. **~~RPC-basierte On-Demand Discovery~~** ✅ BEHOBEN - CrossDexHandler nutzt jetzt Intent-Metadaten
+2. **~~RPC-basierte On-Demand Discovery (arb-strategy)~~** ✅ BEHOBEN - CrossDexHandler nutzt jetzt Intent-Metadaten
 3. **Duplizierte DEX Connector Instanzen** 🟡 TEILWEISE - execution-engine braucht Connectors nur für IX Building
 4. **Pool State nicht über MarketEvents propagiert** ❌ OFFEN - arb-strategy muss Quote-Daten im Intent senden
+5. **Momentum-Bot Pfad macht RPC Quotes** ❌ OFFEN - execution.rs ruft quote_exact_in() für SELL-Intents auf
 
 ---
 
@@ -152,6 +153,42 @@ Während der Fehlerbehebung für "No buy quote available from meteora_dlmm/pump_
 
 ---
 
+### V6: Momentum-Bot Pfad macht RPC Quotes in execution-engine
+
+**Spezifikation (Sektion 4.2):**
+> "DEX Connectors: Store pool state **received from MarketEvents** (not RPC!)"
+> 
+> "execution-engine: Use Intent metadata for validation, NOT RPC calls"
+
+**Aktuelle Implementierung (❌ FALSCH):**
+- `src/solana/execution.rs` ruft `quote_exact_in()` für SELL-Intents auf
+- `src/solana/dex/router.rs` macht RPC-basierte Quote-Berechnung
+- Momentum-Bot sendet Intents ohne Quote-Metadaten
+- execution-engine muss Quote selbst via RPC ermitteln
+
+**Betroffene Dateien:**
+- `src/solana/execution.rs` - `handle_sell_intent()` 
+- `src/solana/dex/router.rs` - `quote_exact_in()` calls
+- `src/bin/momentum_bot.rs` - sendet keine Quote-Metadaten im Intent
+
+**Problem:**
+- RPC Latenz im Trading Hot Path (400-800ms)
+- Inkonsistente Quotes zwischen momentum-bot (Geyser) und execution-engine (RPC)
+- Verstößt gegen "arb-strategy/momentum-bot ist Source of Truth für Quotes"
+
+**Soll-Zustand:**
+```rust
+// momentum-bot (HAT Geyser-Daten) sollte Quote-Daten mitschicken:
+intent.metadata.insert("sell_quote_amount_out", quote.amount_out.to_string());
+intent.metadata.insert("sell_quote_price", price.to_string());
+intent.metadata.insert("sell_pool", pool_address.clone());
+intent.metadata.insert("sell_dex", dex_name.clone());
+
+// execution-engine sollte diese Daten NUR validieren, NICHT re-quoten
+```
+
+---
+
 ## Required Changes (Priorisiert)
 
 ### P0 - Kritisch (vor Production)
@@ -192,22 +229,35 @@ intent.metadata.insert("sell_pool", sell_pool.clone());
 
 CrossDexHandler validiert jetzt nur noch diese Intent-Metadaten (✅ ERLEDIGT).
 
+#### C5: Momentum-Bot SELL Path auf Intent-Metadaten umstellen ❌ OFFEN
+**Betroffene Dateien:**
+- `src/bin/momentum_bot.rs` - muss Quote-Daten im SELL-Intent senden
+- `src/solana/execution.rs` - muss Intent-Metadaten statt RPC-Quotes verwenden
+
+**Aktueller Zustand:**
+```rust
+// momentum-bot sendet SELL-Intent OHNE Quote-Daten:
+let intent = TradeIntent::new_sell(...);
+// Keine metadata für sell_quote, sell_pool, sell_dex
+
+// execution-engine muss dann RPC-Quote holen:
+let quote = dex_connector.quote_exact_in(token_mint, SOL_MINT, amount).await?;
+```
+
+**Soll-Zustand:**
+```rust
+// momentum-bot (HAT Geyser-Daten) sendet Quote-Daten:
+intent.metadata.insert("sell_quote_amount_out", quote.amount_out.to_string());
+intent.metadata.insert("sell_quote_min_out", min_out.to_string());
+intent.metadata.insert("sell_pool", pool_address.clone());
+intent.metadata.insert("sell_dex", dex_name.clone());
+
+// execution-engine validiert nur noch Metadaten, KEIN RPC re-quote
+```
+
+**Priorität:** P1 (nach arb-strategy Path stabilisiert)
+
 ---
-
-### ⚠️ HINWEIS: Momentum-Bot SELL Path
-
-Der Momentum-Bot SELL-Pfad in execution-engine nutzt weiterhin `quote_exact_in()`:
-- **Datei:** `src/bin/execution_engine.rs` (Lines 1110-1240, 1720-1750)
-- **Grund:** momentum-bot Intents enthalten keine Quote-Daten in Metadata
-- **Problem:** pumpfun_amm.quote_exact_in() ruft discover_pool_static() auf → RPC
-
-**Akzeptierter Kompromiss (für MVP):**
-- arb-strategy Path (Cross-DEX): ✅ Intent-Metadaten-basiert (kein RPC)
-- momentum-bot Path (SELL): ⚠️ Nutzt noch RPC für Quote (akzeptabel für Sells)
-
-**Langfrist-Fix:**
-- momentum-bot sollte Quote-Daten im SELL-Intent mitschicken
-- execution-engine sollte für SELL-Intents auch nur Metadaten verwenden
 
 #### ~~C3: On-Demand Discovery aus DEX Connectors entfernen~~ ✅ ERLEDIGT
 **Dateien:**
