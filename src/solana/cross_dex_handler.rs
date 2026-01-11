@@ -19,7 +19,10 @@
 //! - RPC getProgramAccounts calls
 
 use anyhow::{anyhow, Result};
-use solana_sdk::{instruction::Instruction, pubkey::Pubkey};
+use solana_sdk::{
+    instruction::{AccountMeta, Instruction},
+    pubkey::Pubkey,
+};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -33,6 +36,23 @@ use crate::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use crate::solana::dex::raydium::Raydium;
 use crate::solana::dex::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
+
+/// Helper to convert spl_token instruction to solana_sdk instruction
+fn prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> Instruction {
+    Instruction {
+        program_id: Pubkey::new_from_array(ix.program_id.to_bytes()),
+        accounts: ix
+            .accounts
+            .into_iter()
+            .map(|m| AccountMeta {
+                pubkey: Pubkey::new_from_array(m.pubkey.to_bytes()),
+                is_signer: m.is_signer,
+                is_writable: m.is_writable,
+            })
+            .collect(),
+        data: ix.data,
+    }
+}
 
 /// SOL mint address
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -431,6 +451,37 @@ impl CrossDexHandler {
         // arb-strategy already computed the optimal amounts
         let buy_amount_in = trade_amount;
 
+        // ====================================================================
+        // Create ATA for the token we're buying (idempotent - safe if exists)
+        // This is needed because the user may not have an ATA for this token.
+        // Without this, swaps fail with AnchorError AccountNotInitialized (3012).
+        // ====================================================================
+        let mut ata_creation_instructions = Vec::new();
+        if let Some(wallet) = self.wallet_pubkey {
+            let token_mint_pk = Pubkey::from_str(token_mint)
+                .map_err(|_| anyhow!("Invalid token mint: {}", token_mint))?;
+            
+            // Convert to spl_token pubkeys for ATA derivation
+            let wallet_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(wallet.to_bytes());
+            let token_mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint_pk.to_bytes());
+            
+            // Create idempotent ATA instruction (no-op if ATA already exists)
+            let create_ata_ix_prog = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &wallet_spl,        // payer
+                &wallet_spl,        // owner  
+                &token_mint_spl,    // mint
+                &spl_token::id(),   // token program
+            );
+            let create_ata_ix = prog_ix_to_sdk(create_ata_ix_prog);
+            ata_creation_instructions.push(create_ata_ix);
+            
+            debug!(
+                token_mint = %token_mint,
+                wallet = %wallet,
+                "Added idempotent ATA creation instruction for token"
+            );
+        }
+
         // Use async build to support DEXes that need it (PumpFun, etc.)
         let buy_instructions = buy_connector
             .build_swap_ix_async(SOL_MINT, token_mint, buy_amount_in, buy_min_out)
@@ -462,11 +513,17 @@ impl CrossDexHandler {
             .build_swap_ix_async(token_mint, SOL_MINT, buy_min_out, sell_min_out)
             .await?;
 
-        // Estimate compute units
-        let total_cu = 200_000 * 2; // ~200k per swap
+        // Combine: ATA creation (if any) + buy swap + sell swap
+        // ATA creation is idempotent (safe if already exists) and costs ~20k CU
+        let mut combined_buy_instructions = ata_creation_instructions;
+        combined_buy_instructions.extend(buy_instructions);
+
+        // Estimate compute units (ATA create ~20k + 2x swap ~200k each)
+        let ata_cu = if combined_buy_instructions.len() > 1 { 25_000 } else { 0 };
+        let total_cu = ata_cu + 200_000 * 2;
 
         Ok(CrossDexSwapPlan {
-            buy_instructions,
+            buy_instructions: combined_buy_instructions,
             sell_instructions,
             total_compute_units: total_cu,
             buy_dex,
