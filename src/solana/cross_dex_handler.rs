@@ -26,10 +26,12 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::ipc::TradeIntent;
-use crate::solana::dex::{
-    meteora_dlmm::MeteoraDlmm, pumpfun::PumpFunDex, pumpfun_amm::PumpFunAmmDex, raydium::Raydium,
-    Dex, Quote,
-};
+use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
+use crate::solana::dex::orca::Orca;
+use crate::solana::dex::pumpfun::PumpFunDex;
+use crate::solana::dex::pumpfun_amm::PumpFunAmmDex;
+use crate::solana::dex::raydium::Raydium;
+use crate::solana::dex::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 
 /// SOL mint address
@@ -142,6 +144,11 @@ impl CrossDexHandler {
         self.dexes
             .insert("meteora_dlmm".to_string(), Arc::new(meteora));
         info!("Initialized Meteora DLMM connector (for IX building only)");
+
+        // Initialize Orca Whirlpool - for build_swap_ix() only
+        let orca = Orca::new(Arc::clone(&self.rpc));
+        self.dexes.insert("orca".to_string(), Arc::new(orca));
+        info!("Initialized Orca Whirlpool connector (for IX building only)");
 
         Ok(())
     }
