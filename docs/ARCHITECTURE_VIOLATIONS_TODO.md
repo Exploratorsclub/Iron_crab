@@ -1,9 +1,255 @@
 # Architecture Violations & Required Changes
 
 **Erstellt:** 2026-01-11  
-**Aktualisiert:** 2026-01-11 (Jito Config Fix deployed)  
-**Status:** 🟡 Jito Config gefixt - Noch R2 (pump_amm pool discovery) offen  
+**Aktualisiert:** 2026-01-12 (TODO-2 gefixt: pump_amm emittiert PoolCreated+DexPoolAccounts zusammen bei erstem Trade)  
+**Status:** 🟡 TODO-1 + TODO-2 gefixt - Meteora DLMM: mehrere TARGET_ARCHITECTURE Verstöße  
 **Source of Truth:** `docs/TARGET_ARCHITECTURE.md`, `docs/ROLE_SEPARATION.md`
+
+---
+
+## 📋 KONKRETE TODO-LISTE (Sortiert nach technischer Relevanz)
+
+### Phase 1: Akute Bugs beheben (Blocking für Arb-Execution)
+
+#### TODO-1: pump_amm DexPoolAccounts Missing ✅ FIXED
+**Priorität:** 🔴 P0 (blockiert Live-Arb)  
+**Reject-Grund:** R2 "pump_amm pool not discovered/cached for base_mint=..."  
+
+**Gefundene Ursache:**
+- `DexPoolAccounts` Events werden von `market-data` emittiert (828k+ Events/Tag)
+- Aber arb-strategy erzeugt Intents BEVOR die Accounts gecached sind
+- Nur ~7% der Arb-Intents hatten `sell_pool_accounts` wenn pump_amm verwendet wurde
+- execution-engine rejected dann mit "pump_amm pool not discovered/cached"
+
+**Fix implementiert in `src/bin/arb_strategy.rs`:**
+```rust
+// pump_amm requires DexPoolAccounts per TARGET_ARCHITECTURE.md
+// Reject early if pump_amm is used but accounts are missing
+if opp.buy_dex == "pump_amm" && buy_accounts.is_none() {
+    warn!(..., "Rejecting arb: pump_amm buy pool missing DexPoolAccounts");
+    ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+    return None;
+}
+if opp.sell_dex == "pump_amm" && sell_accounts.is_none() {
+    warn!(..., "Rejecting arb: pump_amm sell pool missing DexPoolAccounts");
+    ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+    return None;
+}
+```
+
+**Neue Metrik:** `arb_rejected_missing_accounts_total` in Prometheus
+
+---
+
+#### TODO-2: pump_amm Pool Discovery mit DexPoolAccounts ✅ FIXED
+**Priorität:** 🔴 P0 (Race Condition gefixt)
+
+**Problem-Analyse:**
+- pump_amm (pAMMBay...) hat keine Pool Creation Events - Pools sind nur via Trades sichtbar
+- Die 12-14 benötigten Accounts (vaults, fee accounts, etc.) kommen aus Transaction Account Keys
+- PoolCreated wurde VOR DexPoolAccounts emittiert → arb-strategy sah Pool bevor Accounts da waren
+
+**Lösung implementiert in `src/bin/market_data.rs`:**
+```rust
+// Check if this is the FIRST trade for this pool (new pool discovery)
+let is_first_trade = ctx.known_pump_amm_pools.write().insert(*pool_address);
+
+// If first trade, emit PoolCreated FIRST (before DexPoolAccounts)
+// This ensures arb-strategy sees PoolCreated + DexPoolAccounts together
+if is_first_trade {
+    info!(..., "pump_amm pool discovered via first trade - emitting PoolCreated + DexPoolAccounts");
+    // Emit PoolCreated event
+    ...
+}
+// Always emit DexPoolAccounts on pump_amm trades
+...
+```
+
+**Neues Verhalten:**
+1. pump_amm Pools werden NICHT bei Account Update emittiert (weil keine 12-14 Accounts verfügbar)
+2. Beim ERSTEN Trade: `PoolCreated` + `DexPoolAccounts` werden ZUSAMMEN emittiert
+3. Bei weiteren Trades: nur `DexPoolAccounts` (für Account-Updates)
+
+**Warum das funktioniert:**
+- Arbitrage: Braucht Preisdifferenzen → ohne Trades gibt's keinen Preis → kein Verlust
+- Momentum: Reagiert auf Preisbewegungen → ohne Trades keine Bewegung → kein Verlust
+
+---
+
+### Phase 2: Geyser-Conformance für Cross-DEX Arb (Latenz-Optimierung)
+
+#### TODO-3: `DexPoolAccounts` Events für andere DEXes emittieren ⬜ TODO
+**Priorität:** 🟠 P1 (eliminiert RPC-Fallback-Latenz)  
+**Verstöße:** D1, M1  
+**Datei:** `src/bin/market_data.rs`
+
+**Schritte:**
+1. [ ] Nach `geyser_pool_discovery.rs` Account-Parsing: `DexPoolAccounts` Event erzeugen
+2. [ ] Für **Meteora DLMM** (904-byte LB Pair):
+   ```rust
+   MarketEventKind::DexPoolAccounts {
+       dex: "meteora_dlmm".to_string(),
+       pool_address, base_mint: token_x, quote_mint: token_y,
+       accounts: vec![pool_address, reserve_x, reserve_y, token_x, token_y, oracle?, bin_step?],
+   }
+   ```
+3. [ ] Für **Raydium CPMM** (1024-byte):
+   ```rust
+   accounts: vec![pool_address, vault_0, vault_1, token_0, token_1, lp_mint],
+   ```
+4. [ ] Für **Orca Whirlpool** (653-byte):
+   ```rust
+   accounts: vec![pool_address, token_vault_a, token_vault_b, token_mint_a, token_mint_b, tick_spacing],
+   ```
+5. [ ] Publish to NATS nach jedem Account-Update (nicht nur bei Trade-Events!)
+
+**Erwartetes Ergebnis:** arb-strategy empfängt Pool-Accounts für alle DEXes via Geyser
+
+---
+
+#### TODO-3: `set_pool_from_accounts()` für alle DEXes implementieren ⬜ TODO
+**Priorität:** 🟠 P1 (ermöglicht RPC-freies Pool-Loading)  
+**Verstöße:** D2, M2  
+**Dateien:**
+- `src/solana/dex/meteora_dlmm.rs`
+- `src/solana/dex/raydium_cpmm.rs`
+- `src/solana/dex/raydium.rs`
+- `src/solana/dex/orca.rs`
+
+**Schritte:**
+1. [ ] **Meteora DLMM:** `set_pool_from_accounts()` implementieren
+   ```rust
+   fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Result<()> {
+       // accounts[0]=pool, [1]=reserve_x, [2]=reserve_y, [3]=token_x, [4]=token_y
+       let pool = DlmmPool { token_x_mint, token_y_mint, reserve_x, reserve_y, ... };
+       self.pools.insert(pool_pk, PoolCache { pool, ... });
+   }
+   ```
+2. [ ] **Raydium CPMM:** analog
+3. [ ] **Raydium AMM V4:** analog (komplexer wegen Serum)
+4. [ ] **Orca Whirlpool:** analog
+5. [ ] Unit-Tests für jedes DEX hinzufügen
+
+**Erwartetes Ergebnis:** `cross_dex_handler.rs` kann `set_pool_from_accounts()` für alle DEXes aufrufen
+
+---
+
+#### TODO-4: arb-strategy sendet Pool-Accounts im Intent ⬜ TODO
+**Priorität:** 🟠 P1 (vervollständigt Geyser-Pipeline)  
+**Datei:** `src/bin/arb_strategy.rs`
+
+**Schritte:**
+1. [ ] `DexPoolAccounts` Events in arb-strategy cachen (bereits teilweise vorhanden)
+2. [ ] Beim Intent-Erstellen: `intent.resources.accounts` mit Pool-Accounts füllen
+   ```rust
+   // Für buy_pool
+   if let Some(accounts) = pool_accounts_cache.get(&buy_pool) {
+       intent.resources.accounts.push(("buy_pool".to_string(), accounts.clone()));
+   }
+   // Für sell_pool analog
+   ```
+3. [ ] `cross_dex_handler.rs` passt bereits (prüft `intent.resources.accounts`)
+
+**Erwartetes Ergebnis:** execution-engine macht 0 RPC Calls für Pool-Loading
+
+---
+
+### Phase 3: RPC-Elimination im Hot Path (Performance)
+
+#### TODO-5: `refresh_pools()` mit Feature-Flag schützen ⬜ TODO
+**Priorität:** 🟡 P2 (verhindert versehentliche RPC-Scans)  
+**Verstöße:** D3, M3  
+**Dateien:** alle DEX Connectors
+
+**Schritte:**
+1. [ ] Feature-Flag `rpc_fallback` in `Cargo.toml` hinzufügen
+2. [ ] `refresh_pools()` mit `#[cfg(feature = "rpc_fallback")]` oder Runtime-Check schützen
+3. [ ] In Production: Feature disabled, `refresh_pools()` returnt sofort `Ok(())`
+4. [ ] Nur für Bootstrap/Testing/Fallback aktivieren
+
+**Erwartetes Ergebnis:** Keine versehentlichen getProgramAccounts im Production Hot Path
+
+---
+
+#### TODO-6: Vault Balances aus Intent-Metadata statt RPC ⬜ TODO
+**Priorität:** 🟡 P2 (eliminiert 2 RPC Calls pro Quote)  
+**Verstöße:** D4, M4  
+**Dateien:**
+- `src/solana/dex/meteora_dlmm.rs` - `update_reserve_balances()`
+- `src/solana/dex/raydium_cpmm.rs` - analog
+- `src/bin/arb_strategy.rs` - Vault Balances im Intent senden
+
+**Schritte:**
+1. [ ] arb-strategy: `reserve_x_balance`, `reserve_y_balance` in Intent-Metadata hinzufügen
+2. [ ] DEX Connectors: `build_swap_ix()` verwendet Intent-Metadata statt RPC
+3. [ ] Fallback: Wenn Metadata fehlt, akzeptiere cached Werte oder reject
+
+**Erwartetes Ergebnis:** Keine Vault-Balance RPC Calls im IX-Building
+
+---
+
+#### TODO-7: Meteora Bin Arrays ohne RPC laden ⬜ TODO
+**Priorität:** 🟡 P2 (eliminiert bis zu 8 RPC Calls)  
+**Verstöße:** D5, M5  
+**Datei:** `src/solana/dex/meteora_swap_builder.rs`
+
+**Optionen (wähle eine):**
+- **Option A:** Bin Array PDAs in `DexPoolAccounts` Event inkludieren
+  - Pro: Einheitlicher Datenfluss
+  - Con: Event wird größer, Bin Arrays ändern sich häufig
+  
+- **Option B:** Lazy PDA-Derivation ohne RPC
+  - Nur PDA berechnen, keine Account-Fetches
+  - Bin-State aus Pool-Account (active_id) ableiten
+  - Pro: Kein RPC, Pool-Account reicht
+  - Con: Weniger genau für große Swaps
+
+**Schritte für Option B (empfohlen):**
+1. [ ] `build_swap_ix()` ohne `fetch_bin_arrays()` RPC aufrufen
+2. [ ] Bin Array PDAs nur via `derive_bin_array_pda()` berechnen (kein RPC)
+3. [ ] Für Simulation: Bin Arrays werden on-chain validiert
+
+**Erwartetes Ergebnis:** `build_swap_ix()` macht 0 RPC Calls
+
+---
+
+### Phase 4: Momentum-Bot Geyser-Conformance (Separate Pipeline)
+
+#### TODO-8: Momentum-Bot SELL Path auf Intent-Metadata umstellen ⬜ TODO
+**Priorität:** 🟢 P3 (separater Code-Path, nicht arb-blocking)  
+**Verstöße:** V6  
+**Dateien:**
+- `src/bin/momentum_bot.rs`
+- `src/solana/execution.rs`
+
+**Schritte:**
+1. [ ] momentum-bot: Quote-Daten im SELL-Intent mitschicken
+   ```rust
+   intent.metadata.insert("sell_quote_amount_out", quote.amount_out.to_string());
+   intent.metadata.insert("sell_pool", pool_address.clone());
+   intent.metadata.insert("sell_dex", dex_name.clone());
+   ```
+2. [ ] execution.rs: Intent-Metadata statt RPC-Quote verwenden
+3. [ ] Fallback für alte Intents ohne Metadata
+
+**Erwartetes Ergebnis:** momentum-bot SELL-Intents brauchen keine RPC-Quotes in execution-engine
+
+---
+
+## 📊 Fortschritts-Tracking
+
+| TODO | Status | Blocker | ETA |
+|------|--------|---------|-----|
+| TODO-1 | ⏳ | - | Sofort |
+| TODO-2 | ⬜ | - | 2h |
+| TODO-3 | ⬜ | TODO-2 | 3h |
+| TODO-4 | ⬜ | TODO-2, TODO-3 | 1h |
+| TODO-5 | ⬜ | - | 30min |
+| TODO-6 | ⬜ | TODO-4 | 1h |
+| TODO-7 | ⬜ | - | 2h |
+| TODO-8 | ⬜ | - | 2h |
+
+**Kritischer Pfad:** TODO-1 → TODO-2 → TODO-3 → TODO-4 (dann ist Geyser-Pipeline komplett)
 
 ---
 
@@ -29,6 +275,128 @@ Nach Deploy werden arb-intents mit folgenden Fehlern rejected:
 - **Ursache:** `load_pool_by_address()` fügt Pool in `pools_by_base` mit `base_mint` ein, aber bei manchen Intents wird WSOL als base_mint interpretiert
 - **Hypothese:** arb-strategy sendet buy_pool/sell_pool vertauscht ODER Intent hat falschen token_mint
 - **Nächster Schritt:** Debug-Log um Intent-Inhalte zu analysieren
+
+---
+
+## 🔴 DEX Connectors: TARGET_ARCHITECTURE Verstöße (Audit 2026-01-11)
+
+`DexPoolAccounts` Events werden **NUR für `pump_amm`** emittiert. Alle anderen DEXes verletzen das Geyser-First-Prinzip.
+
+### Übersicht: DEX Geyser-Conformance
+
+| DEX | DexPoolAccounts Events | set_pool_from_accounts() | refresh_pools() RPC | Vault RPC | Status |
+|-----|------------------------|--------------------------|---------------------|-----------|--------|
+| pump_amm | ✅ | ✅ | N/A | N/A | **Konform** |
+| pumpfun | ❌ (bonding curve) | ❌ | N/A | N/A | Teilweise |
+| meteora_dlmm | ❌ | ❌ | getProgramAccounts | get_account×2 | **Verletzt** |
+| raydium_cpmm | ❌ | ❌ | getProgramAccounts | get_account×2 | **Verletzt** |
+| raydium_amm_v4 | ❌ | ❌ | getProgramAccounts | get_account×2 | **Verletzt** |
+| orca | ❌ | ❌ | getProgramAccounts | get_account×2 | **Verletzt** |
+
+### ❌ D1: Keine `DexPoolAccounts` Events für Nicht-PumpAMM DEXes
+- **Datei:** `src/bin/market_data.rs` (Lines 737-768)
+- **Problem:** `DexPoolAccounts` Events werden **NUR für `pump_amm`** emittiert
+- **Betroffene DEXes:** meteora_dlmm, raydium_cpmm, raydium_amm_v4, orca
+- **Auswirkung:** arb-strategy/execution-engine bekommen keine Pool-Accounts
+- **Workaround aktuell:** RPC Fallback via `load_pool_by_address()` in cross_dex_handler.rs
+- **Spezifikation verletzt:** TARGET_ARCHITECTURE.md Section 4.1
+
+### ❌ D2: `set_pool_from_accounts()` fehlt in allen DEXes außer pump_amm
+- **Betroffene Dateien:**
+  - `src/solana/dex/meteora_dlmm.rs` - ❌ Nicht implementiert
+  - `src/solana/dex/raydium_cpmm.rs` - ❌ Nicht implementiert
+  - `src/solana/dex/raydium.rs` - ❌ Nicht implementiert (AMM V4)
+  - `src/solana/dex/orca.rs` - ❌ Nicht implementiert
+- **Problem:** Nur `pumpfun_amm.rs` implementiert `set_pool_from_accounts()`
+- **Spezifikation verletzt:** TARGET_ARCHITECTURE.md Section 4.2
+
+### ❌ D3: `refresh_pools()` macht `getProgramAccounts` RPC Calls
+- **Betroffene Dateien:**
+  - `src/solana/dex/meteora_dlmm.rs` (Lines 214-234)
+  - `src/solana/dex/raydium_cpmm.rs` (Lines 304-323)
+  - `src/solana/dex/orca.rs` (Line 576)
+- **Problem:** Teure RPC-Scans statt Geyser Account Updates
+- **Spezifikation verletzt:** TARGET_ARCHITECTURE.md Section 4.2 "refresh_pools() exists ONLY as fallback"
+
+### ❌ D4: Vault Balances via RPC statt Geyser/Intent
+- **Betroffene Dateien:**
+  - `src/solana/dex/meteora_dlmm.rs` (Lines 105-106) - `update_reserve_balances()`
+  - `src/solana/dex/raydium_cpmm.rs` (Lines 198-199) - `update_reserve_balances()`
+  - `src/solana/dex/orca.rs` - ähnlich
+- **Problem:** 2x `get_account_retry()` pro Quote im Hot Path
+- **Spezifikation verletzt:** TARGET_ARCHITECTURE.md Section 4.5
+
+### ❌ D5: Meteora Bin Arrays via RPC
+- **Datei:** `src/solana/dex/meteora_swap_builder.rs` (Lines 274, 307)
+- **Problem:** Bis zu 7 `get_account_retry()` + 1 `getProgramAccounts` für Bin Arrays
+- **Spezifikation verletzt:** TARGET_ARCHITECTURE.md Section 4.2
+
+---
+
+## 🔴 Meteora DLMM: Detaillierte Verstöße (Audit 2026-01-11)
+
+Meteora DLMM Implementation ist **unvollständig** und verletzt mehrere architektonische Prinzipien:
+
+### ❌ M1: Keine `DexPoolAccounts` Events für Meteora DLMM
+- **Datei:** `src/bin/market_data.rs` (Lines 737-768)
+- **Problem:** `DexPoolAccounts` Events werden **NUR für `pump_amm`** emittiert
+- **Auswirkung:** arb-strategy/execution-engine bekommen keine Pool-Accounts für Meteora
+- **Workaround aktuell:** RPC Fallback via `load_pool_by_address()` in cross_dex_handler.rs
+- **Spezifikation verletzt:** TARGET_ARCHITECTURE.md Section 4.1 "GeyserPoolDiscovery handles ALL pool discovery"
+
+### ❌ M2: `set_pool_from_accounts()` fehlt in `meteora_dlmm.rs`
+- **Datei:** `src/solana/dex/meteora_dlmm.rs`
+- **Problem:** Nur `pumpfun_amm.rs` implementiert `set_pool_from_accounts()`
+- **Auswirkung:** Intent-Accounts aus `DexPoolAccounts` Events können nicht direkt genutzt werden
+- **Folge:** Erzwingt RPC Calls via `load_pool_by_address()` im Hot Path
+- **Spezifikation verletzt:** TARGET_ARCHITECTURE.md Section 4.2 "DEX Connectors: Store pool state received from MarketEvents"
+
+### ❌ M3: `refresh_pools()` macht `getProgramAccounts` RPC Call
+- **Datei:** `src/solana/dex/meteora_dlmm.rs` (Lines 214-234)
+- **Problem:** Scannt alle 904-byte DLMM Pools via RPC (expensive!)
+- **Kommentar im Code:** "⚠️ RPC FALLBACK ONLY" aber **kein Feature-Flag oder Guard**
+- **Auswirkung:** Kann im Hot Path aufgerufen werden und 400-800ms Latenz erzeugen
+- **Spezifikation verletzt:** TARGET_ARCHITECTURE.md Section 4.2 "refresh_pools() exists ONLY as fallback"
+
+### ❌ M4: `update_reserve_balances()` macht RPC Calls für Vault Balances
+- **Datei:** `src/solana/dex/meteora_dlmm.rs` (Lines 93-126)
+- **Problem:** Fetcht Reserve Balances via `rpc.get_account_retry()` für beide Vaults
+- **Auswirkung:** 2x RPC Calls pro Quote/IX Building im Hot Path
+- **Soll-Zustand:** Vault Balances sollen aus Geyser Account Updates oder Intent-Metadata kommen
+- **Spezifikation verletzt:** TARGET_ARCHITECTURE.md Section 4.5 "Never use RPC for: Real-time pool updates"
+
+### ❌ M5: `meteora_swap_builder.rs` macht `getProgramAccounts` für Bin Arrays
+- **Datei:** `src/solana/dex/meteora_swap_builder.rs` (Lines 283-318)
+- **Problem:** `fetch_bin_arrays()` macht:
+  1. 7x `get_account_retry()` für PDA-basierte Bin Arrays
+  2. Falls <2 Arrays: `getProgramAccounts` mit memcmp Filter (Line 307)
+- **Auswirkung:** Bis zu 7 RPC Calls + 1 getProgramAccounts im IX-Building Hot Path
+- **Soll-Zustand:** Bin Arrays sollten mit Pool im Intent kommen (Geyser Account Updates)
+- **Spezifikation verletzt:** TARGET_ARCHITECTURE.md Section 4.2 "DEX Connectors must NOT do getProgramAccounts"
+
+### ❌ M6: RPC Fallback in `cross_dex_handler.rs` für Meteora/Orca
+- **Datei:** `src/solana/cross_dex_handler.rs` (Lines 497-527)
+- **Problem:** Wenn Intent keine Accounts hat, wird `load_pool_by_address()` aufgerufen
+- **Code:** "Single getAccount RPC fallback for Meteora/Orca (acceptable)"
+- **Bewertung:** **Nicht akzeptabel** nach TARGET_ARCHITECTURE.md - Data Plane soll Daten liefern
+- **Workaround:** Weil M1 nicht gelöst ist (keine DexPoolAccounts für Meteora)
+
+### Zusammenfassung Meteora DLMM
+
+| Check | Status | Problem |
+|-------|--------|---------|
+| DexPoolAccounts Events | ❌ | Nur pump_amm emittiert Events |
+| set_pool_from_accounts() | ❌ | Nicht implementiert |
+| refresh_pools() Guard | ❌ | Kein Feature-Flag, RPC im Hot Path möglich |
+| Vault Balance via Geyser | ❌ | RPC Calls in update_reserve_balances() |
+| Bin Arrays via Geyser | ❌ | getProgramAccounts in swap_builder |
+| Intent-basiertes Pool Loading | ⚠️ | Fallback via RPC load_pool_by_address() |
+
+**Erforderliche Änderungen (Priorität P0 für Geyser-Conformance):**
+1. **M1 Fix:** `market_data.rs` erweitern: `DexPoolAccounts` auch für Meteora DLMM emittieren
+2. **M2 Fix:** `set_pool_from_accounts()` in `meteora_dlmm.rs` implementieren
+3. **M4 Fix:** Vault Balances aus Intent-Metadata oder Geyser Account Updates
+4. **M5 Fix:** Bin Arrays in `DexPoolAccounts` Event inkludieren ODER lazy PDA-Derivation ohne RPC
 
 ---
 
@@ -261,6 +629,102 @@ intent.metadata.insert("sell_pool", sell_pool.clone());
 
 CrossDexHandler validiert jetzt nur noch diese Intent-Metadaten (✅ ERLEDIGT).
 
+---
+
+### P0 - Meteora DLMM Geyser-Conformance (NEU)
+
+#### C6: DexPoolAccounts Events für Meteora DLMM emittieren ❌ OFFEN
+**Datei:** `src/bin/market_data.rs`
+
+**Problem:** `DexPoolAccounts` werden nur für `pump_amm` emittiert (Lines 737-768).
+
+**Erforderliche Änderung:**
+```rust
+// Nach dem Parsen von Meteora DLMM Account Updates:
+if let DexType::MeteoraDlmm = dex_type {
+    let accounts_event = MarketEvent::new(
+        "market-data",
+        BUILD_VERSION,
+        run_id,
+        ctx.next_event_id(),
+        "geyser",
+        Some(slot),
+        MarketEventKind::DexPoolAccounts {
+            dex: "meteora_dlmm".to_string(),
+            pool_address: pool_address.to_string(),
+            base_mint: token_x_mint.to_string(),
+            quote_mint: token_y_mint.to_string(),
+            accounts: vec![
+                pool_address.to_string(),
+                reserve_x.to_string(),     // Vault X
+                reserve_y.to_string(),     // Vault Y
+                token_x_mint.to_string(),
+                token_y_mint.to_string(),
+                oracle.map(|o| o.to_string()).unwrap_or_default(),
+                // ... weitere relevante Accounts
+            ],
+        },
+    );
+    // Publish to NATS...
+}
+```
+
+#### C7: `set_pool_from_accounts()` für Meteora DLMM implementieren ❌ OFFEN
+**Datei:** `src/solana/dex/meteora_dlmm.rs`
+
+**Erforderliche Änderung:**
+```rust
+impl Dex for MeteoraDlmm {
+    fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Result<()> {
+        // Parse accounts from DexPoolAccounts event:
+        // [0] = pool_address
+        // [1] = reserve_x (vault)
+        // [2] = reserve_y (vault)
+        // [3] = token_x_mint
+        // [4] = token_y_mint
+        // ...
+        
+        let pool_pk = Pubkey::from_str(pool_address)?;
+        let vault_x = Pubkey::from_str(accounts.get(1).ok_or(anyhow!("missing vault_x"))?)?;
+        let vault_y = Pubkey::from_str(accounts.get(2).ok_or(anyhow!("missing vault_y"))?)?;
+        let token_x = Pubkey::from_str(accounts.get(3).ok_or(anyhow!("missing token_x"))?)?;
+        let token_y = Pubkey::from_str(accounts.get(4).ok_or(anyhow!("missing token_y"))?)?;
+        
+        // Insert into pool cache (NO RPC!)
+        let pool = DlmmPool {
+            token_x_mint: token_x,
+            token_y_mint: token_y,
+            reserve_x: vault_x,
+            reserve_y: vault_y,
+            // ... weitere Felder aus accounts parsen
+        };
+        
+        self.pools.insert(pool_pk, PoolCache {
+            address: pool_pk,
+            pool,
+            reserve_x_balance: None, // Will be filled from intent metadata
+            reserve_y_balance: None,
+            last_updated: std::time::SystemTime::now(),
+        });
+        
+        Ok(())
+    }
+}
+```
+
+#### C8: Bin Arrays aus Geyser/Intent statt RPC ❌ OFFEN (P1)
+**Datei:** `src/solana/dex/meteora_swap_builder.rs`
+
+**Problem:** `fetch_bin_arrays()` macht bis zu 7 RPC Calls + 1 getProgramAccounts.
+
+**Optionen:**
+1. **Option A:** Bin Array PDAs in `DexPoolAccounts` inkludieren (präferiert)
+2. **Option B:** Lazy PDA-Derivation ohne RPC, Bin Data aus Intent-Metadata
+
+**Priorität:** P1 (nach C6/C7 gelöst)
+
+---
+
 #### C5: Momentum-Bot SELL Path auf Intent-Metadaten umstellen ❌ OFFEN
 **Betroffene Dateien:**
 - `src/bin/momentum_bot.rs` - muss Quote-Daten im SELL-Intent senden
@@ -393,7 +857,7 @@ ExecutionResult
 ### Phase 1: Intent Enrichment ✅ ERLEDIGT
 1. ✅ arb-strategy fügt alle Pool-Daten zu Intent Metadata hinzu
 2. ✅ execution-engine verwendet Metadata statt RPC Discovery für arb-intents
-3. ⚠️ momentum-bot SELL-Path nutzt noch RPC (akzeptiert für MVP)
+3. ⚠️ momentum-bot SELL-Path nutzt noch RPC 
 
 ### Phase 2: MarketEvent Enrichment (TODO)
 1. `PoolCreatedEvent` um alle Pool-State Felder erweitern
@@ -414,6 +878,9 @@ ExecutionResult
 - [ ] Pool State Latenz: Geyser → execution-engine < 50ms (nicht messbar ohne deploy)
 - [ ] Keine "rpc timeout" Decision Records für arb-intents
 - [x] arb-strategy ist Source of Truth für Quote-Daten (Intent Metadata)
+- [ ] **NEU:** Meteora DLMM: `DexPoolAccounts` Events werden emittiert
+- [ ] **NEU:** Meteora DLMM: `set_pool_from_accounts()` implementiert
+- [ ] **NEU:** Meteora DLMM: Keine RPC Calls in `build_swap_ix()` Hot Path
 
 ---
 
@@ -422,6 +889,13 @@ ExecutionResult
 1. **momentum-bot SELL Path**: Nutzt noch RPC quote_exact_in()
 2. **PoolCreatedEvent Enrichment**: Fehlende Felder (vault, reserves, fee)
 3. **Pool State Registry**: Zentrale Registry in market-data für Request/Reply
+4. **NEU - DEX Geyser-Conformance P0:**
+   - D1: `DexPoolAccounts` Events für alle DEXes emittieren (market_data.rs)
+   - D2: `set_pool_from_accounts()` für alle DEXes implementieren
+5. **NEU - DEX Geyser-Conformance P1:**
+   - D3: `refresh_pools()` Guards (nur Fallback/Bootstrap, nicht Hot Path)
+   - D4: Vault Balances aus Geyser/Intent statt RPC
+   - D5: Meteora Bin Arrays ohne getProgramAccounts
 
 ---
 

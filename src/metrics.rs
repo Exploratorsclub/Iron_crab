@@ -201,6 +201,8 @@ pub static ROUTER_HOPS3: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRIANGLE_ATTEMPTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRIANGLE_PROFITABLE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRIANGLE_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Count of arb opportunities rejected due to missing DexPoolAccounts for pump_amm
+pub static ARB_REJECTED_MISSING_ACCOUNTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static QUOTE_LATENCY_TOTAL_NS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Generic cycle search metrics
 pub static CYCLE_PARTIAL_EXAMINED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -826,6 +828,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_triangle_opportunities_total",
         ARB_TRIANGLE_OPPORTUNITIES.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_rejected_missing_accounts_total",
+        ARB_REJECTED_MISSING_ACCOUNTS.load(Ordering::Relaxed)
     );
     line!(
         "cycle_partial_examined_total",

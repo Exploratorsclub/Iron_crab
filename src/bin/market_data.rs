@@ -140,6 +140,11 @@ struct MarketDataContext {
     /// Tracked token mints for mint-authority/freeze-authority metadata.
     tracked_mints: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
     tracked_mints_tx: watch::Sender<Vec<Pubkey>>,
+
+    /// Known pump_amm pools (already seen first trade).
+    /// We emit PoolCreated + DexPoolAccounts on FIRST trade, then just DexPoolAccounts on subsequent trades.
+    /// Key: pool_address
+    known_pump_amm_pools: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
 }
 
 impl MarketDataContext {
@@ -345,6 +350,7 @@ async fn main() -> Result<()> {
         wallet_tracker,
         tracked_mints: parking_lot::RwLock::new(std::collections::HashSet::new()),
         tracked_mints_tx,
+        known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -731,8 +737,11 @@ async fn run_geyser_loop(
                 }
 
                 // Pump.fun AMM: emit static pool account metadata for intent-driven execution.
+                // IMPORTANT: We emit PoolCreated + DexPoolAccounts TOGETHER on first trade.
+                // This ensures arb-strategy has all required accounts before seeing the pool.
                 if let Some(ParsedDexEvent::Trade {
                     pool_address,
+                    mint: base_mint_pk,
                     dex: DexType::PumpFunAmm,
                     pool_accounts: Some(pool_accounts),
                     ..
@@ -742,6 +751,50 @@ async fn run_geyser_loop(
                     let base_mint = pool_accounts.get(2).map(|p| p.to_string()).unwrap_or_default();
                     let quote_mint = pool_accounts.get(3).map(|p| p.to_string()).unwrap_or_default();
 
+                    // Check if this is the FIRST trade for this pool (new pool discovery)
+                    let is_first_trade = ctx.known_pump_amm_pools.write().insert(*pool_address);
+                    
+                    // If first trade, emit PoolCreated FIRST (before DexPoolAccounts)
+                    // This ensures arb-strategy sees PoolCreated + DexPoolAccounts together
+                    if is_first_trade {
+                        info!(
+                            pool = %pool_address,
+                            base_mint = %base_mint_pk,
+                            "pump_amm pool discovered via first trade - emitting PoolCreated + DexPoolAccounts"
+                        );
+
+                        let pool_created_event = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            ctx.next_event_id(),
+                            "geyser_first_trade",
+                            Some(tx_update.slot),
+                            MarketEventKind::PoolCreated {
+                                pool_address: pool_address.to_string(),
+                                base_mint: base_mint.clone(),
+                                quote_mint: quote_mint.clone(),
+                                dex: "pump_amm".to_string(),
+                                initial_liquidity_sol: None, // Not available from trade
+                            },
+                        );
+
+                        if let Err(e) = ctx.jsonl_writer.write(&pool_created_event) {
+                            error!(error = %e, "Failed to write pump_amm PoolCreated event to JSONL");
+                        }
+
+                        if let Some(ref nats) = ctx.nats {
+                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &pool_created_event).await {
+                                warn!(error = %e, "Failed to publish pump_amm PoolCreated event to NATS");
+                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+
+                    // Always emit DexPoolAccounts on pump_amm trades
                     let accounts_event = MarketEvent::new(
                         "market-data",
                         BUILD_VERSION,

@@ -33,9 +33,9 @@ use ironcrab::ipc::{
     TradingRegime,
 };
 use ironcrab::metrics::{
-    serve_metrics, ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL,
-    MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
-    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    serve_metrics, ARB_REJECTED_MISSING_ACCOUNTS, ARB_TRIANGLE_OPPORTUNITIES,
+    INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
+    NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
@@ -818,11 +818,36 @@ impl ArbContext {
 // Intent Generation
 // ============================================================================
 
-fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> TradeIntent {
+/// Creates an arb intent from the opportunity.
+/// Returns None if pump_amm is used but required DexPoolAccounts are missing.
+fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeIntent> {
     let config = ctx.config.read();
 
     // Get pool accounts from DexPoolAccounts events (NO RPC needed in execution-engine!)
     let (buy_accounts, sell_accounts) = ctx.get_pool_accounts_for_arb(opp);
+    
+    // pump_amm requires DexPoolAccounts per TARGET_ARCHITECTURE.md
+    // Reject early if pump_amm is used but accounts are missing (saves roundtrip to execution-engine)
+    if opp.buy_dex == "pump_amm" && buy_accounts.is_none() {
+        warn!(
+            buy_pool = %opp.buy_pool,
+            buy_dex = %opp.buy_dex,
+            mint = %opp.base_mint,
+            "Rejecting arb: pump_amm buy pool missing DexPoolAccounts"
+        );
+        ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    if opp.sell_dex == "pump_amm" && sell_accounts.is_none() {
+        warn!(
+            sell_pool = %opp.sell_pool,
+            sell_dex = %opp.sell_dex,
+            mint = %opp.base_mint,
+            "Rejecting arb: pump_amm sell pool missing DexPoolAccounts"
+        );
+        ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     
     // Combine accounts: buy pool accounts + sell pool accounts
     // Format: buy accounts are prefixed with "buy:" and sell with "sell:" for disambiguation
@@ -848,14 +873,14 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> TradeIntent {
         accounts: all_accounts,
     };
 
-    // Log warning if accounts missing - execution-engine will need to reject or use fallback
+    // Log warning if non-pump_amm accounts missing (execution-engine will use RPC fallback)
     if buy_accounts.is_none() || sell_accounts.is_none() {
-        warn!(
+        debug!(
             buy_pool = %opp.buy_pool,
             sell_pool = %opp.sell_pool,
             buy_accounts_present = buy_accounts.is_some(),
             sell_accounts_present = sell_accounts.is_some(),
-            "Arb intent missing pool accounts - execution-engine may reject"
+            "Arb intent missing some pool accounts - execution-engine will use RPC fallback"
         );
     }
 
@@ -932,7 +957,7 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> TradeIntent {
         config.min_profit_lamports
     ));
 
-    intent
+    Some(intent)
 }
 
 // ============================================================================
@@ -1247,7 +1272,8 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
                     profit_lamports = opp.estimated_profit_lamports,
                     "🔥 Arbitrage opportunity detected!"
                 );
-                Some(create_arb_intent(ctx, &opp))
+                // create_arb_intent returns None if pump_amm is used but DexPoolAccounts are missing
+                create_arb_intent(ctx, &opp)
             } else {
                 None
             }
