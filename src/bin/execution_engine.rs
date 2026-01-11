@@ -2353,7 +2353,20 @@ async fn main() -> Result<()> {
     let has_keys = treasury.is_some();
 
     // Load app config for Jito and other settings
-    let app_config = AppConfig::load(&args.config).ok();
+    let app_config = match AppConfig::load(&args.config) {
+        Ok(c) => {
+            debug!("Config loaded successfully from {:?}", args.config);
+            Some(c)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                config = %args.config.display(),
+                "Failed to load config for Jito settings - using defaults"
+            );
+            None
+        }
+    };
 
     // Setup config - read Jito settings from TOML config file (root level)
     let exec_config = ExecutionConfig {
