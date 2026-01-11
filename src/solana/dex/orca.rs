@@ -725,30 +725,53 @@ impl Dex for Orca {
         let tick_now = pool.tick_current_index.unwrap_or(0);
         let ticks_per_array = spacing * TICK_ARRAY_SIZE;
         
+        // Log tick array calculation for debugging
+        tracing::debug!(
+            pool = %pool_id,
+            tick_spacing = spacing,
+            tick_current = tick_now,
+            ticks_per_array = ticks_per_array,
+            a_to_b = a_to_b,
+            "orca: calculating tick arrays for swap"
+        );
+        
         // Order tick arrays based on swap direction
-        let (tick_array_0, tick_array_1, tick_array_2) = if a_to_b {
+        let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) = if a_to_b {
             // A->B: price decreases, ticks decrease
             // Start from current tick's array and go downward
-            let start0 = get_tick_array_start_index(tick_now, spacing);
-            let start1 = start0 - ticks_per_array;
-            let start2 = start1 - ticks_per_array;
+            let s0 = get_tick_array_start_index(tick_now, spacing);
+            let s1 = s0 - ticks_per_array;
+            let s2 = s1 - ticks_per_array;
             (
-                derive_tick_array_pda(&pool_id, start0),
-                derive_tick_array_pda(&pool_id, start1),
-                derive_tick_array_pda(&pool_id, start2),
+                derive_tick_array_pda(&pool_id, s0),
+                derive_tick_array_pda(&pool_id, s1),
+                derive_tick_array_pda(&pool_id, s2),
+                s0, s1, s2,
             )
         } else {
             // B->A: price increases, ticks increase
             // Start from current tick's array and go upward
-            let start0 = get_tick_array_start_index(tick_now, spacing);
-            let start1 = start0 + ticks_per_array;
-            let start2 = start1 + ticks_per_array;
+            let s0 = get_tick_array_start_index(tick_now, spacing);
+            let s1 = s0 + ticks_per_array;
+            let s2 = s1 + ticks_per_array;
             (
-                derive_tick_array_pda(&pool_id, start0),
-                derive_tick_array_pda(&pool_id, start1),
-                derive_tick_array_pda(&pool_id, start2),
+                derive_tick_array_pda(&pool_id, s0),
+                derive_tick_array_pda(&pool_id, s1),
+                derive_tick_array_pda(&pool_id, s2),
+                s0, s1, s2,
             )
         };
+
+        tracing::debug!(
+            pool = %pool_id,
+            tick_array_0 = %tick_array_0,
+            tick_array_1 = %tick_array_1,
+            tick_array_2 = %tick_array_2,
+            start0 = start0,
+            start1 = start1,
+            start2 = start2,
+            "orca: derived tick array PDAs"
+        );
 
         let oracle = derive_oracle_pda(&pool_id);
 
