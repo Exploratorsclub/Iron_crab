@@ -76,6 +76,13 @@ impl MeteoraDlmmSwapBuilder {
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
         let token_program = Pubkey::from_str(TOKEN_PROGRAM)?;
 
+        // Derive bin_array_bitmap_extension PDA
+        // Seeds: ["lb_pair", lb_pair.as_ref()]
+        let (bin_array_bitmap_extension, _bump) = Pubkey::find_program_address(
+            &[b"bitmap", lb_pair.as_ref()],
+            &program_id,
+        );
+
         // Build instruction data
         let mut data = Vec::with_capacity(24);
         data.extend_from_slice(&SWAP_DISCRIMINATOR);
@@ -83,17 +90,17 @@ impl MeteoraDlmmSwapBuilder {
         data.extend_from_slice(&min_amount_out.to_le_bytes());
 
         // Account ordering for Meteora DLMM swap:
-        // Note: This is a simplified version without bin arrays
-        // Use build_swap_with_bins() for full version
+        // Per Meteora IDL - must include bin_array_bitmap_extension
         let accounts = vec![
             AccountMeta::new(*lb_pair, false),      // LB Pair (writable)
+            AccountMeta::new(bin_array_bitmap_extension, false), // Bitmap extension (writable)
             AccountMeta::new(*reserve_x, false),    // Reserve X (writable)
             AccountMeta::new(*reserve_y, false),    // Reserve Y (writable)
             AccountMeta::new(*user_token_x, false), // User token X (writable)
             AccountMeta::new(*user_token_y, false), // User token Y (writable)
             AccountMeta::new_readonly(*user, true), // User (signer)
             AccountMeta::new_readonly(token_program, false), // Token program
-                                                    // Note: Bin array accounts should be added via build_swap_with_bins
+            // Note: Bin array accounts should be added via build_swap_with_bins for production
         ];
 
         Ok(Instruction {
