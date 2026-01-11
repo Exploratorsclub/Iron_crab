@@ -129,13 +129,40 @@ impl Orca {
     }
 
     fn find_pool(&self, input: &Pubkey, output: &Pubkey) -> Option<(Pubkey, bool, OrcaPool)> {
+        tracing::debug!(
+            input = %input,
+            output = %output,
+            pools_count = self.pools.len(),
+            "Orca find_pool searching for pair"
+        );
+        
         for p in self.pools.iter() {
             let forward = p.base_mint == *input && p.quote_mint == *output;
             let reverse = p.base_mint == *output && p.quote_mint == *input;
+            tracing::trace!(
+                pool_key = %p.key(),
+                base_mint = %p.base_mint,
+                quote_mint = %p.quote_mint,
+                forward = forward,
+                reverse = reverse,
+                "Checking pool"
+            );
             if forward || reverse {
+                tracing::info!(
+                    pool = %p.key(),
+                    direction = if forward { "forward" } else { "reverse" },
+                    "Orca pool found for pair"
+                );
                 return Some((*p.key(), forward, p.clone()));
             }
         }
+        
+        tracing::warn!(
+            input = %input,
+            output = %output,
+            pools_count = self.pools.len(),
+            "No Orca pool found for pair"
+        );
         None
     }
 
@@ -851,11 +878,26 @@ impl Dex for Orca {
     async fn load_pool_by_address(&self, pool_address: &Pubkey) -> Result<()> {
         // Check if already cached
         if self.pools.contains_key(pool_address) {
+            tracing::info!(
+                pool = %pool_address,
+                "Orca pool already cached, skipping RPC"
+            );
             return Ok(());
         }
         
+        tracing::info!(
+            pool = %pool_address,
+            "Fetching Orca whirlpool via RPC getAccount"
+        );
+        
         // Fetch pool account via single getAccount RPC call
         let account = self.rpc.get_account_retry(pool_address).await?;
+        
+        tracing::info!(
+            pool = %pool_address,
+            data_len = account.data.len(),
+            "Orca pool account fetched, parsing whirlpool layout"
+        );
         
         // Parse whirlpool layout
         let parsed = layout::parse_whirlpool(&account.data)
@@ -889,11 +931,12 @@ impl Dex for Orca {
             .or_default()
             .push(*pool_address);
         
-        tracing::debug!(
+        tracing::info!(
             pool = %pool_address,
             base_mint = %pool.base_mint,
             quote_mint = %pool.quote_mint,
-            "Loaded Orca whirlpool via single getAccount"
+            pools_count = self.pools.len(),
+            "Orca whirlpool loaded and cached successfully"
         );
         
         Ok(())

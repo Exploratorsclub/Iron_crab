@@ -504,15 +504,24 @@ impl CrossDexHandler {
                 ));
             } else {
                 // Single getAccount RPC fallback for Meteora/Orca (acceptable)
-                debug!(
+                info!(
                     pool = %buy_pool,
                     dex = %buy_dex,
-                    "No accounts in intent for buy pool, using single getAccount fallback"
+                    "No accounts in intent for buy pool, using single getAccount RPC fallback"
                 );
                 let pool_pk = Pubkey::from_str(&buy_pool)
                     .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
-                if let Err(e) = buy_connector.load_pool_by_address(&pool_pk).await {
-                    return Err(anyhow!("Failed to load buy pool {} via RPC: {}", buy_pool, e));
+                match buy_connector.load_pool_by_address(&pool_pk).await {
+                    Ok(()) => {
+                        info!(
+                            pool = %buy_pool,
+                            dex = %buy_dex,
+                            "Successfully loaded buy pool via RPC"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(anyhow!("Failed to load buy pool {} via RPC: {}", buy_pool, e));
+                    }
                 }
             }
         }
@@ -601,15 +610,24 @@ impl CrossDexHandler {
                 ));
             } else {
                 // Single getAccount RPC fallback for Meteora/Orca (acceptable)
-                debug!(
+                info!(
                     pool = %sell_pool,
                     dex = %sell_dex,
-                    "No accounts in intent for sell pool, using single getAccount fallback"
+                    "No accounts in intent for sell pool, using single getAccount RPC fallback"
                 );
                 let pool_pk = Pubkey::from_str(&sell_pool)
                     .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;
-                if let Err(e) = sell_connector.load_pool_by_address(&pool_pk).await {
-                    return Err(anyhow!("Failed to load sell pool {} via RPC: {}", sell_pool, e));
+                match sell_connector.load_pool_by_address(&pool_pk).await {
+                    Ok(()) => {
+                        info!(
+                            pool = %sell_pool,
+                            dex = %sell_dex,
+                            "Successfully loaded sell pool via RPC"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(anyhow!("Failed to load sell pool {} via RPC: {}", sell_pool, e));
+                    }
                 }
             }
         }
