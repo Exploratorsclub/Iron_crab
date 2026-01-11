@@ -816,6 +816,113 @@ impl Dex for Raydium {
         Ok(())
     }
 
+    /// Set pool data directly from accounts list (NO RPC calls).
+    ///
+    /// This is the preferred method for execution-engine. The accounts come from
+    /// `Intent.resources.accounts` which were populated by arb-strategy from
+    /// `DexPoolAccounts` events (Geyser data).
+    ///
+    /// Expected accounts format (from market_data.rs DexPoolAccounts):
+    /// - accounts[0] = pool_address (amm_id)
+    /// - accounts[1] = base_mint
+    /// - accounts[2] = quote_mint
+    /// - accounts[3] = coin_vault (base_vault)
+    /// - accounts[4] = pc_vault (quote_vault)
+    ///
+    /// Note: Raydium AMM V4 requires many more accounts for actual IX building
+    /// (open_orders, serum market, etc.). This creates a minimal entry.
+    /// For full IX building, the pool should be loaded via load_pool_by_address
+    /// or Geyser account updates should provide full state.
+    fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Result<()> {
+        // Minimum required: pool_address, base_mint, quote_mint
+        if accounts.len() < 3 {
+            return Err(anyhow!(
+                "raydium set_pool_from_accounts requires at least 3 accounts, got {}",
+                accounts.len()
+            ));
+        }
+
+        let parse_pubkey = |s: &str, name: &str| -> Result<Pubkey> {
+            Pubkey::from_str(s).map_err(|e| anyhow!("Invalid {} pubkey '{}': {}", name, s, e))
+        };
+
+        let pool_pk = parse_pubkey(pool_address, "pool_address")?;
+        let base_mint = parse_pubkey(&accounts[1], "base_mint")?;
+        let quote_mint = parse_pubkey(&accounts[2], "quote_mint")?;
+
+        // Vaults are optional in DexPoolAccounts
+        let base_vault = if accounts.len() > 3 {
+            parse_pubkey(&accounts[3], "coin_vault/base_vault")?
+        } else {
+            Pubkey::default()
+        };
+
+        let quote_vault = if accounts.len() > 4 {
+            parse_pubkey(&accounts[4], "pc_vault/quote_vault")?
+        } else {
+            Pubkey::default()
+        };
+
+        // Validate pool_address matches accounts[0]
+        let expected_pool = parse_pubkey(&accounts[0], "accounts[0]")?;
+        if pool_pk != expected_pool {
+            return Err(anyhow!(
+                "pool_address {} does not match accounts[0] {}",
+                pool_address,
+                expected_pool
+            ));
+        }
+
+        let (amm_auth, _) = Self::derive_amm_authority();
+
+        // Create minimal pool entry
+        // Note: Many fields are default - IX building may fail if full state needed
+        let obj = SimplePool {
+            base_mint,
+            quote_mint,
+            base_vault,
+            quote_vault,
+            lp_reserve: 0,
+            address: pool_pk,
+            reserve_base: 0,  // Will be fetched on-demand if needed
+            reserve_quote: 0, // Will be fetched on-demand if needed
+            fee_bps: 25,      // Fixed 0.25% for Raydium AMM v4
+            last_update: std::time::SystemTime::now(),
+            open_orders: None,       // Not in DexPoolAccounts
+            market_id: None,         // Not in DexPoolAccounts
+            market_program_id: None, // Not in DexPoolAccounts
+            amm_authority: Some(amm_auth),
+            serum_vault_signer: None,
+            target_orders: None,
+            serum_bids: None,
+            serum_asks: None,
+            serum_event_queue: None,
+            serum_base_vault: None,
+            serum_quote_vault: None,
+        };
+
+        debug!(
+            pool = %pool_pk,
+            base_mint = %base_mint,
+            quote_mint = %quote_mint,
+            "raydium pool set from intent accounts (NO RPC)"
+        );
+
+        self.pools.insert(pool_pk, obj);
+
+        // Update mint index
+        self.mint_index
+            .entry(base_mint)
+            .or_insert_with(|| Vec::with_capacity(2))
+            .push(pool_pk);
+        self.mint_index
+            .entry(quote_mint)
+            .or_insert_with(|| Vec::with_capacity(2))
+            .push(pool_pk);
+
+        Ok(())
+    }
+
     async fn quote_exact_in(
         &self,
         input_mint: &str,

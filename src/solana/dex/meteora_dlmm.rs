@@ -341,6 +341,105 @@ impl Dex for MeteoraDlmm {
         Ok(())
     }
 
+    /// Set pool data directly from accounts list (NO RPC calls).
+    ///
+    /// This is the preferred method for execution-engine. The accounts come from
+    /// `Intent.resources.accounts` which were populated by arb-strategy from
+    /// `DexPoolAccounts` events (Geyser data).
+    ///
+    /// Expected accounts format (from market_data.rs DexPoolAccounts):
+    /// - accounts[0] = pool_address
+    /// - accounts[1] = base_mint (token_x_mint)
+    /// - accounts[2] = quote_mint (token_y_mint)
+    /// - accounts[3] = coin_vault (reserve_x) - optional
+    /// - accounts[4] = pc_vault (reserve_y) - optional
+    ///
+    /// Note: This creates a minimal pool entry for IX building.
+    /// For accurate quotes, Geyser account updates should provide full pool state.
+    fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Result<()> {
+        // Minimum required: pool_address, base_mint, quote_mint
+        if accounts.len() < 3 {
+            return Err(anyhow!(
+                "meteora_dlmm set_pool_from_accounts requires at least 3 accounts, got {}",
+                accounts.len()
+            ));
+        }
+
+        let parse_pubkey = |s: &str, name: &str| -> Result<Pubkey> {
+            Pubkey::from_str(s).map_err(|e| anyhow!("Invalid {} pubkey '{}': {}", name, s, e))
+        };
+
+        let pool_pk = parse_pubkey(pool_address, "pool_address")?;
+        let token_x_mint = parse_pubkey(&accounts[1], "base_mint/token_x_mint")?;
+        let token_y_mint = parse_pubkey(&accounts[2], "quote_mint/token_y_mint")?;
+
+        // Reserve vaults are optional (may not be in DexPoolAccounts for all DEXes)
+        let reserve_x = if accounts.len() > 3 {
+            parse_pubkey(&accounts[3], "coin_vault/reserve_x")?
+        } else {
+            // Use placeholder - IX building will fail if actual vault needed
+            Pubkey::default()
+        };
+
+        let reserve_y = if accounts.len() > 4 {
+            parse_pubkey(&accounts[4], "pc_vault/reserve_y")?
+        } else {
+            Pubkey::default()
+        };
+
+        // Validate pool_address matches accounts[0]
+        let expected_pool = parse_pubkey(&accounts[0], "accounts[0]")?;
+        if pool_pk != expected_pool {
+            return Err(anyhow!(
+                "pool_address {} does not match accounts[0] {}",
+                pool_address,
+                expected_pool
+            ));
+        }
+
+        // Create minimal DlmmPool structure
+        // Note: bin_step and active_id are not in DexPoolAccounts, use defaults
+        // For accurate swaps, execution-engine may need to fetch these via Geyser updates
+        let pool = DlmmPool {
+            discriminator: [0u8; 8], // Not needed for IX building
+            bin_step: 10,            // Default, actual value comes from on-chain
+            active_id: 0,            // Will be updated from Geyser account updates
+            token_x_mint,
+            token_y_mint,
+            reserve_x,
+            reserve_y,
+        };
+
+        let cache = PoolCache {
+            address: pool_pk,
+            pool: pool.clone(),
+            reserve_x_balance: None,
+            reserve_y_balance: None,
+            last_updated: std::time::SystemTime::now(),
+        };
+
+        debug!(
+            pool = %pool_pk,
+            token_x = %token_x_mint,
+            token_y = %token_y_mint,
+            "meteora_dlmm pool set from intent accounts (NO RPC)"
+        );
+
+        self.pools.insert(pool_pk, cache);
+
+        // Update mint index
+        self.mint_index
+            .entry(token_x_mint)
+            .or_default()
+            .push(pool_pk);
+        self.mint_index
+            .entry(token_y_mint)
+            .or_default()
+            .push(pool_pk);
+
+        Ok(())
+    }
+
     async fn quote_exact_in(
         &self,
         input_mint: &str,

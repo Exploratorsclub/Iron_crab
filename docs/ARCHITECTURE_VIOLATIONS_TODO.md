@@ -1,8 +1,8 @@
 # Architecture Violations & Required Changes
 
 **Erstellt:** 2026-01-11  
-**Aktualisiert:** 2026-01-12 (TODO-3 gefixt: DexPoolAccounts für alle DEXes bei Pool Discovery)  
-**Status:** 🟡 TODO-1 + TODO-2 + TODO-3 gefixt - Verbleibende: set_pool_from_accounts für alle DEXes  
+**Aktualisiert:** 2026-01-12 (TODO-4 gefixt: set_pool_from_accounts() für alle DEXes)  
+**Status:** 🟡 TODO-1 bis TODO-4 gefixt - Verbleibende: arb-strategy Intent-Accounts, RPC-Elimination  
 **Source of Truth:** `docs/TARGET_ARCHITECTURE.md`, `docs/ROLE_SEPARATION.md`
 
 ---
@@ -112,34 +112,41 @@ if pool_event.coin_vault.is_some() || pool_event.pc_vault.is_some() {
 
 ---
 
-#### TODO-4: `set_pool_from_accounts()` für alle DEXes implementieren ⬜ TODO
+#### TODO-4: `set_pool_from_accounts()` für alle DEXes implementieren ✅ FIXED
 **Priorität:** 🟠 P1 (ermöglicht RPC-freies Pool-Loading)  
 **Verstöße:** D2, M2  
 **Dateien:**
-- `src/solana/dex/meteora_dlmm.rs`
-- `src/solana/dex/raydium_cpmm.rs`
-- `src/solana/dex/raydium.rs`
-- `src/solana/dex/orca.rs`
+- `src/solana/dex/meteora_dlmm.rs` ✅
+- `src/solana/dex/raydium_cpmm.rs` ✅
+- `src/solana/dex/raydium.rs` ✅
+- `src/solana/dex/orca.rs` ✅
 
-**Schritte:**
-1. [ ] **Meteora DLMM:** `set_pool_from_accounts()` implementieren
-   ```rust
-   fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Result<()> {
-       // accounts[0]=pool, [1]=reserve_x, [2]=reserve_y, [3]=token_x, [4]=token_y
-       let pool = DlmmPool { token_x_mint, token_y_mint, reserve_x, reserve_y, ... };
-       self.pools.insert(pool_pk, PoolCache { pool, ... });
-   }
-   ```
-2. [ ] **Raydium CPMM:** analog
-3. [ ] **Raydium AMM V4:** analog (komplexer wegen Serum)
-4. [ ] **Orca Whirlpool:** analog
-5. [ ] Unit-Tests für jedes DEX hinzufügen
+**Implementierung:**
+Alle DEX Connectors haben jetzt `set_pool_from_accounts()` implementiert:
 
-**Erwartetes Ergebnis:** `cross_dex_handler.rs` kann `set_pool_from_accounts()` für alle DEXes aufrufen
+```rust
+// Gemeinsames Format für alle DEXes:
+fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Result<()> {
+    // accounts[0] = pool_address
+    // accounts[1] = base_mint
+    // accounts[2] = quote_mint
+    // accounts[3] = coin_vault (optional)
+    // accounts[4] = pc_vault (optional)
+    // ...zusätzliche DEX-spezifische Felder
+}
+```
+
+**Hinweise:**
+- Meteora DLMM: bin_step/active_id nicht in DexPoolAccounts, verwendet Defaults
+- Raydium AMM V4: Serum-Accounts nicht in DexPoolAccounts, IX-Building braucht ggf. RPC
+- Orca: tick_spacing/tick_current_index nicht in DexPoolAccounts
+- pump_amm: vollständig (12-14 Accounts aus Trade-TX)
+
+**Erwartetes Ergebnis:** `cross_dex_handler.rs` kann `set_pool_from_accounts()` für alle DEXes aufrufen ✅
 
 ---
 
-#### TODO-4: arb-strategy sendet Pool-Accounts im Intent ⬜ TODO
+#### TODO-5: arb-strategy sendet Pool-Accounts im Intent ⬜ TODO
 **Priorität:** 🟠 P1 (vervollständigt Geyser-Pipeline)  
 **Datei:** `src/bin/arb_strategy.rs`
 

@@ -373,6 +373,94 @@ impl Dex for RaydiumCpmm {
         Ok(())
     }
 
+    /// Set pool data directly from accounts list (NO RPC calls).
+    ///
+    /// This is the preferred method for execution-engine. The accounts come from
+    /// `Intent.resources.accounts` which were populated by arb-strategy from
+    /// `DexPoolAccounts` events (Geyser data).
+    ///
+    /// Expected accounts format (from market_data.rs DexPoolAccounts):
+    /// - accounts[0] = pool_address
+    /// - accounts[1] = base_mint (token_0_mint)
+    /// - accounts[2] = quote_mint (token_1_mint)
+    /// - accounts[3] = coin_vault (token_0_vault) - optional
+    /// - accounts[4] = pc_vault (token_1_vault) - optional
+    fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Result<()> {
+        // Minimum required: pool_address, base_mint, quote_mint
+        if accounts.len() < 3 {
+            return Err(anyhow!(
+                "raydium_cpmm set_pool_from_accounts requires at least 3 accounts, got {}",
+                accounts.len()
+            ));
+        }
+
+        let parse_pubkey = |s: &str, name: &str| -> Result<Pubkey> {
+            Pubkey::from_str(s).map_err(|e| anyhow!("Invalid {} pubkey '{}': {}", name, s, e))
+        };
+
+        let pool_pk = parse_pubkey(pool_address, "pool_address")?;
+        let token_0_mint = parse_pubkey(&accounts[1], "base_mint/token_0_mint")?;
+        let token_1_mint = parse_pubkey(&accounts[2], "quote_mint/token_1_mint")?;
+
+        // Vaults are optional
+        let token_0_vault = if accounts.len() > 3 {
+            parse_pubkey(&accounts[3], "coin_vault/token_0_vault")?
+        } else {
+            Pubkey::default()
+        };
+
+        let token_1_vault = if accounts.len() > 4 {
+            parse_pubkey(&accounts[4], "pc_vault/token_1_vault")?
+        } else {
+            Pubkey::default()
+        };
+
+        // Validate pool_address matches accounts[0]
+        let expected_pool = parse_pubkey(&accounts[0], "accounts[0]")?;
+        if pool_pk != expected_pool {
+            return Err(anyhow!(
+                "pool_address {} does not match accounts[0] {}",
+                pool_address,
+                expected_pool
+            ));
+        }
+
+        // Create cache entry
+        let cache = PoolCache {
+            address: pool_pk,
+            token_0_mint,
+            token_1_mint,
+            token_0_vault,
+            token_1_vault,
+            lp_mint: Pubkey::default(), // Not in DexPoolAccounts, not needed for swaps
+            reserve_0: 0,
+            reserve_1: 0,
+            fee_bps: 25, // Default 0.25%, actual comes from on-chain
+            last_updated: std::time::SystemTime::now(),
+        };
+
+        debug!(
+            pool = %pool_pk,
+            token_0 = %token_0_mint,
+            token_1 = %token_1_mint,
+            "raydium_cpmm pool set from intent accounts (NO RPC)"
+        );
+
+        self.pools.insert(pool_pk, cache);
+
+        // Update mint index
+        self.mint_index
+            .entry(token_0_mint)
+            .or_insert_with(Vec::new)
+            .push(pool_pk);
+        self.mint_index
+            .entry(token_1_mint)
+            .or_insert_with(Vec::new)
+            .push(pool_pk);
+
+        Ok(())
+    }
+
     async fn quote_exact_in(
         &self,
         input_mint: &str,

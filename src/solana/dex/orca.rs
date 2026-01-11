@@ -647,6 +647,100 @@ impl Dex for Orca {
         Ok(())
     }
 
+    /// Set pool data directly from accounts list (NO RPC calls).
+    ///
+    /// This is the preferred method for execution-engine. The accounts come from
+    /// `Intent.resources.accounts` which were populated by arb-strategy from
+    /// `DexPoolAccounts` events (Geyser data).
+    ///
+    /// Expected accounts format (from market_data.rs DexPoolAccounts):
+    /// - accounts[0] = pool_address (whirlpool id)
+    /// - accounts[1] = base_mint (token_mint_a)
+    /// - accounts[2] = quote_mint (token_mint_b)
+    /// - accounts[3] = coin_vault (token_vault_a)
+    /// - accounts[4] = pc_vault (token_vault_b)
+    fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Result<()> {
+        use std::str::FromStr;
+        
+        // Minimum required: pool_address, base_mint, quote_mint
+        if accounts.len() < 3 {
+            return Err(anyhow!(
+                "orca set_pool_from_accounts requires at least 3 accounts, got {}",
+                accounts.len()
+            ));
+        }
+
+        let parse_pubkey = |s: &str, name: &str| -> Result<Pubkey> {
+            Pubkey::from_str(s).map_err(|e| anyhow!("Invalid {} pubkey '{}': {}", name, s, e))
+        };
+
+        let pool_pk = parse_pubkey(pool_address, "pool_address")?;
+        let token_mint_a = parse_pubkey(&accounts[1], "base_mint/token_mint_a")?;
+        let token_mint_b = parse_pubkey(&accounts[2], "quote_mint/token_mint_b")?;
+
+        // Vaults are optional
+        let token_vault_a = if accounts.len() > 3 {
+            parse_pubkey(&accounts[3], "coin_vault/token_vault_a")?
+        } else {
+            Pubkey::default()
+        };
+
+        let token_vault_b = if accounts.len() > 4 {
+            parse_pubkey(&accounts[4], "pc_vault/token_vault_b")?
+        } else {
+            Pubkey::default()
+        };
+
+        // Validate pool_address matches accounts[0]
+        let expected_pool = parse_pubkey(&accounts[0], "accounts[0]")?;
+        if pool_pk != expected_pool {
+            return Err(anyhow!(
+                "pool_address {} does not match accounts[0] {}",
+                pool_address,
+                expected_pool
+            ));
+        }
+
+        // Create pool entry with minimal info
+        // Note: tick_spacing and tick_current_index are not in DexPoolAccounts
+        // For accurate CLAMM swaps, full pool state from Geyser updates is needed
+        let pool = OrcaPool {
+            base_mint: token_mint_a,
+            quote_mint: token_mint_b,
+            reserve_base: 0,
+            reserve_quote: 0,
+            fee_bps: 30, // Default, actual comes from on-chain
+            fee_tier: None,
+            tick_spacing: None, // Not in DexPoolAccounts
+            vault_a: token_vault_a,
+            vault_b: token_vault_b,
+            tick_current_index: None,
+            cached_reserves: None,
+            last_reserve_fetch: None,
+        };
+
+        tracing::debug!(
+            pool = %pool_pk,
+            token_a = %token_mint_a,
+            token_b = %token_mint_b,
+            "orca pool set from intent accounts (NO RPC)"
+        );
+
+        self.pools.insert(pool_pk, pool);
+
+        // Update mint index
+        self.mint_index
+            .entry(token_mint_a)
+            .or_insert_with(|| Vec::with_capacity(2))
+            .push(pool_pk);
+        self.mint_index
+            .entry(token_mint_b)
+            .or_insert_with(|| Vec::with_capacity(2))
+            .push(pool_pk);
+
+        Ok(())
+    }
+
     async fn quote_exact_in(
         &self,
         _input_mint: &str,
