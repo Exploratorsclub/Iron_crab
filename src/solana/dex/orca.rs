@@ -677,114 +677,121 @@ impl Dex for Orca {
     ) -> Result<Vec<Instruction>> {
         use solana_sdk::instruction::AccountMeta as AM;
         use std::str::FromStr;
+
+        // Orca Whirlpool swap discriminator: SHA256("global:swap")[0..8]
+        // From official SDK: [248, 198, 158, 145, 225, 117, 135, 200]
+        const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
+
         let in_pk = Pubkey::from_str(_input_mint).map_err(|_| anyhow!("bad input mint"))?;
         let out_pk = Pubkey::from_str(_output_mint).map_err(|_| anyhow!("bad output mint"))?;
         let (pool_id, forward, pool) = self
             .find_pool(&in_pk, &out_pk)
             .ok_or_else(|| anyhow!("no orca pool for pair"))?;
-        let spacing = pool.tick_spacing.unwrap_or(64) as i32;
-        let tick_now = pool.tick_current_index.unwrap_or(0);
-        let start0 = align_to_start(tick_now, spacing);
-        let start1 = align_to_start(tick_now + spacing * 88, spacing);
-        let start_1 = align_to_start(tick_now - spacing * 88, spacing);
-        let tick_arrays = [start_1, start0, start1].map(|s| derive_tick_array_pda(&pool_id, s));
-        let oracle = derive_oracle_pda(&pool_id);
-        let mut data = Vec::with_capacity(1 + 8 + 8 + 1 + 16);
-        data.push(0u8);
-        data.extend_from_slice(&_amount_in.to_le_bytes());
-        data.extend_from_slice(&_min_out.to_le_bytes());
-        data.push(if forward { 1 } else { 0 });
-        data.extend_from_slice(&0u128.to_le_bytes());
-        let program_id =
-            Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).map_err(|_| anyhow!("orca program id"))?;
-        let mut accounts = vec![
-            AM {
-                pubkey: pool_id,
-                is_signer: false,
-                is_writable: true,
-            },
-            AM {
-                pubkey: pool.vault_a,
-                is_signer: false,
-                is_writable: true,
-            },
-            AM {
-                pubkey: pool.vault_b,
-                is_signer: false,
-                is_writable: true,
-            },
-        ];
-        if let Some(ft) = pool.fee_tier {
-            accounts.push(AM {
-                pubkey: ft,
-                is_signer: false,
-                is_writable: false,
-            });
-        }
-        for t in &tick_arrays {
-            accounts.push(AM {
-                pubkey: *t,
-                is_signer: false,
-                is_writable: true,
-            });
-        }
-        accounts.push(AM {
-            pubkey: oracle,
-            is_signer: false,
-            is_writable: false,
-        });
-        // Real user authority & token accounts
+
+        // Get user authority first (needed for ATAs)
         let authority = self
             .user_authority
             .read()
             .unwrap()
             .ok_or_else(|| anyhow!("orca user authority not set"))?;
-        let (input_mint, output_mint) = if forward {
-            (in_pk, out_pk)
-        } else {
-            (out_pk, in_pk)
+
+        // Determine token A/B based on pool ordering (not swap direction)
+        // Pool always has base_mint=A, quote_mint=B
+        // forward=true means input=A, output=B (a_to_b=true)
+        // forward=false means input=B, output=A (a_to_b=false)
+        let a_to_b = forward;
+
+        // Token owner accounts (user's ATAs)
+        let derive_ata = |mint: &Pubkey| -> Pubkey {
+            self.user_token_accounts
+                .get(mint)
+                .map(|v| *v)
+                .unwrap_or_else(|| {
+                    let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
+                    let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(mint.to_bytes());
+                    let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+                        &owner_spl, &mint_spl, &spl_token::id()
+                    );
+                    Pubkey::new_from_array(ata_spl.to_bytes())
+                })
         };
-        // Auto-derive ATAs if not explicitly registered
-        let user_source = self
-            .user_token_accounts
-            .get(&input_mint)
-            .map(|v| *v)
-            .unwrap_or_else(|| {
-                // Convert to spl_token Pubkey for ATA derivation, then back to solana_sdk
-                let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
-                let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(input_mint.to_bytes());
-                let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-                    &owner_spl, &mint_spl, &spl_token::id()
-                );
-                Pubkey::new_from_array(ata_spl.to_bytes())
-            });
-        let user_destination = self
-            .user_token_accounts
-            .get(&output_mint)
-            .map(|v| *v)
-            .unwrap_or_else(|| {
-                let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
-                let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(output_mint.to_bytes());
-                let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-                    &owner_spl, &mint_spl, &spl_token::id()
-                );
-                Pubkey::new_from_array(ata_spl.to_bytes())
-            });
-        accounts.push(AM {
-            pubkey: authority,
-            is_signer: true,
-            is_writable: false,
-        });
-        accounts.push(AM {
-            pubkey: user_source,
-            is_signer: false,
-            is_writable: true,
-        });
-        accounts.push(AM {
-            pubkey: user_destination,
-            is_signer: false,
-            is_writable: true,
-        });
+
+        let token_owner_account_a = derive_ata(&pool.base_mint);  // Always token A
+        let token_owner_account_b = derive_ata(&pool.quote_mint); // Always token B
+
+        // Tick arrays for the swap range
+        let spacing = pool.tick_spacing.unwrap_or(64) as i32;
+        let tick_now = pool.tick_current_index.unwrap_or(0);
+        // Order tick arrays based on swap direction
+        let (tick_array_0, tick_array_1, tick_array_2) = if a_to_b {
+            // A->B: ticks decrease, so start from current and go down
+            let start0 = align_to_start(tick_now, spacing);
+            let start1 = align_to_start(tick_now - spacing * 88, spacing);
+            let start2 = align_to_start(tick_now - spacing * 176, spacing);
+            (
+                derive_tick_array_pda(&pool_id, start0),
+                derive_tick_array_pda(&pool_id, start1),
+                derive_tick_array_pda(&pool_id, start2),
+            )
+        } else {
+            // B->A: ticks increase, so start from current and go up
+            let start0 = align_to_start(tick_now, spacing);
+            let start1 = align_to_start(tick_now + spacing * 88, spacing);
+            let start2 = align_to_start(tick_now + spacing * 176, spacing);
+            (
+                derive_tick_array_pda(&pool_id, start0),
+                derive_tick_array_pda(&pool_id, start1),
+                derive_tick_array_pda(&pool_id, start2),
+            )
+        };
+
+        let oracle = derive_oracle_pda(&pool_id);
+
+        // Build instruction data per Orca Whirlpool Anchor IDL:
+        // - discriminator: [u8; 8]
+        // - amount: u64
+        // - other_amount_threshold: u64
+        // - sqrt_price_limit: u128
+        // - amount_specified_is_input: bool
+        // - a_to_b: bool
+        let mut data = Vec::with_capacity(8 + 8 + 8 + 16 + 1 + 1);
+        data.extend_from_slice(&SWAP_DISCRIMINATOR);
+        data.extend_from_slice(&_amount_in.to_le_bytes());       // amount (exact input)
+        data.extend_from_slice(&_min_out.to_le_bytes());         // other_amount_threshold (min output)
+        data.extend_from_slice(&0u128.to_le_bytes());            // sqrt_price_limit (0 = no limit)
+        data.push(1u8);                                           // amount_specified_is_input = true
+        data.push(if a_to_b { 1u8 } else { 0u8 });               // a_to_b
+
+        let program_id =
+            Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).map_err(|_| anyhow!("orca program id"))?;
+
+        // Account ordering per Orca Whirlpool swap instruction:
+        // 0. token_program (SPL Token)
+        // 1. token_authority (signer - user wallet)
+        // 2. whirlpool (writable)
+        // 3. token_owner_account_a (writable - user's token A ATA)
+        // 4. token_vault_a (writable - pool's token A vault)
+        // 5. token_owner_account_b (writable - user's token B ATA)
+        // 6. token_vault_b (writable - pool's token B vault)
+        // 7. tick_array_0 (writable)
+        // 8. tick_array_1 (writable)
+        // 9. tick_array_2 (writable)
+        // 10. oracle (readonly)
+        let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let accounts = vec![
+            AM { pubkey: token_program, is_signer: false, is_writable: false },
+            AM { pubkey: authority, is_signer: true, is_writable: false },
+            AM { pubkey: pool_id, is_signer: false, is_writable: true },
+            AM { pubkey: token_owner_account_a, is_signer: false, is_writable: true },
+            AM { pubkey: pool.vault_a, is_signer: false, is_writable: true },
+            AM { pubkey: token_owner_account_b, is_signer: false, is_writable: true },
+            AM { pubkey: pool.vault_b, is_signer: false, is_writable: true },
+            AM { pubkey: tick_array_0, is_signer: false, is_writable: true },
+            AM { pubkey: tick_array_1, is_signer: false, is_writable: true },
+            AM { pubkey: tick_array_2, is_signer: false, is_writable: true },
+            AM { pubkey: oracle, is_signer: false, is_writable: false },
+        ];
+
         Ok(vec![Instruction {
             program_id,
             accounts,
