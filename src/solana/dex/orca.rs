@@ -720,24 +720,29 @@ impl Dex for Orca {
         let token_owner_account_b = derive_ata(&pool.quote_mint); // Always token B
 
         // Tick arrays for the swap range
+        // Orca requires tick arrays covering the price range the swap might traverse
         let spacing = pool.tick_spacing.unwrap_or(64) as i32;
         let tick_now = pool.tick_current_index.unwrap_or(0);
+        let ticks_per_array = spacing * TICK_ARRAY_SIZE;
+        
         // Order tick arrays based on swap direction
         let (tick_array_0, tick_array_1, tick_array_2) = if a_to_b {
-            // A->B: ticks decrease, so start from current and go down
-            let start0 = align_to_start(tick_now, spacing);
-            let start1 = align_to_start(tick_now - spacing * 88, spacing);
-            let start2 = align_to_start(tick_now - spacing * 176, spacing);
+            // A->B: price decreases, ticks decrease
+            // Start from current tick's array and go downward
+            let start0 = get_tick_array_start_index(tick_now, spacing);
+            let start1 = start0 - ticks_per_array;
+            let start2 = start1 - ticks_per_array;
             (
                 derive_tick_array_pda(&pool_id, start0),
                 derive_tick_array_pda(&pool_id, start1),
                 derive_tick_array_pda(&pool_id, start2),
             )
         } else {
-            // B->A: ticks increase, so start from current and go up
-            let start0 = align_to_start(tick_now, spacing);
-            let start1 = align_to_start(tick_now + spacing * 88, spacing);
-            let start2 = align_to_start(tick_now + spacing * 176, spacing);
+            // B->A: price increases, ticks increase
+            // Start from current tick's array and go upward
+            let start0 = get_tick_array_start_index(tick_now, spacing);
+            let start1 = start0 + ticks_per_array;
+            let start2 = start1 + ticks_per_array;
             (
                 derive_tick_array_pda(&pool_id, start0),
                 derive_tick_array_pda(&pool_id, start1),
@@ -885,8 +890,11 @@ impl Orca {
 
 // (Removed) WhirlpoolMeta replaced by canonical parser struct in layout module.
 
-fn derive_tick_array_pda(pool: &Pubkey, start_tick: i32) -> Pubkey {
-    let seeds: &[&[u8]] = &[b"tick_array", pool.as_ref(), &start_tick.to_le_bytes()];
+/// Orca Whirlpool constants
+const TICK_ARRAY_SIZE: i32 = 88; // Number of ticks per TickArray
+
+fn derive_tick_array_pda(pool: &Pubkey, start_tick_index: i32) -> Pubkey {
+    let seeds: &[&[u8]] = &[b"tick_array", pool.as_ref(), &start_tick_index.to_le_bytes()];
     Pubkey::find_program_address(seeds, &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap()).0
 }
 
@@ -895,6 +903,11 @@ fn derive_oracle_pda(pool: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(seeds, &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap()).0
 }
 
-fn align_to_start(tick: i32, spacing: i32) -> i32 {
-    tick - (tick.rem_euclid(spacing))
+/// Calculate the start tick index of the TickArray containing `tick_index`.
+/// TickArrays are aligned on boundaries of `tick_spacing * TICK_ARRAY_SIZE`.
+fn get_tick_array_start_index(tick_index: i32, tick_spacing: i32) -> i32 {
+    let ticks_per_array = tick_spacing * TICK_ARRAY_SIZE;
+    // Use euclidean div/mod to handle negative tick indices correctly
+    let array_index = tick_index.div_euclid(ticks_per_array);
+    array_index * ticks_per_array
 }
