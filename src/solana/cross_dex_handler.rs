@@ -494,11 +494,27 @@ impl CrossDexHandler {
                 );
             }
         } else if !buy_pool.is_empty() {
-            // No accounts in intent - reject (we don't do RPC anymore!)
-            return Err(anyhow!(
-                "buy pool {} has no accounts in intent - arb-strategy must include DexPoolAccounts",
-                buy_pool
-            ));
+            // No accounts in intent
+            // For pump_amm: REJECT (DexPoolAccounts required per TARGET_ARCHITECTURE.md)
+            // For meteora_dlmm/orca: Allow single getAccount fallback (acceptable per TARGET_ARCHITECTURE.md Section 4.2)
+            if buy_dex == "pump_amm" {
+                return Err(anyhow!(
+                    "buy pool {} has no accounts in intent - pump_amm requires DexPoolAccounts",
+                    buy_pool
+                ));
+            } else {
+                // Single getAccount RPC fallback for Meteora/Orca (acceptable)
+                debug!(
+                    pool = %buy_pool,
+                    dex = %buy_dex,
+                    "No accounts in intent for buy pool, using single getAccount fallback"
+                );
+                let pool_pk = Pubkey::from_str(&buy_pool)
+                    .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
+                if let Err(e) = buy_connector.load_pool_by_address(&pool_pk).await {
+                    return Err(anyhow!("Failed to load buy pool {} via RPC: {}", buy_pool, e));
+                }
+            }
         }
 
         // Use trade_amount (from intent) as buy_amount_in
@@ -575,11 +591,27 @@ impl CrossDexHandler {
                 );
             }
         } else if !sell_pool.is_empty() {
-            // No accounts in intent - reject (we don't do RPC anymore!)
-            return Err(anyhow!(
-                "sell pool {} has no accounts in intent - arb-strategy must include DexPoolAccounts",
-                sell_pool
-            ));
+            // No accounts in intent
+            // For pump_amm: REJECT (DexPoolAccounts required per TARGET_ARCHITECTURE.md)
+            // For meteora_dlmm/orca: Allow single getAccount fallback (acceptable per TARGET_ARCHITECTURE.md Section 4.2)
+            if sell_dex == "pump_amm" {
+                return Err(anyhow!(
+                    "sell pool {} has no accounts in intent - pump_amm requires DexPoolAccounts",
+                    sell_pool
+                ));
+            } else {
+                // Single getAccount RPC fallback for Meteora/Orca (acceptable)
+                debug!(
+                    pool = %sell_pool,
+                    dex = %sell_dex,
+                    "No accounts in intent for sell pool, using single getAccount fallback"
+                );
+                let pool_pk = Pubkey::from_str(&sell_pool)
+                    .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;
+                if let Err(e) = sell_connector.load_pool_by_address(&pool_pk).await {
+                    return Err(anyhow!("Failed to load sell pool {} via RPC: {}", sell_pool, e));
+                }
+            }
         }
 
         // IMPORTANT: sell the guaranteed minimum tokens (buy_min_out), not the optimistic
