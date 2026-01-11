@@ -94,6 +94,15 @@ pub struct Config {
     pub wallet_tracker: Option<WalletTrackerCfg>,
     #[serde(default)]
     pub momentum: Option<MomentumCfg>,
+
+    // === ROOT-LEVEL JITO CONFIG (for execution-engine) ===
+    // These are read directly from root level in TOML, not from a section
+    #[serde(default)]
+    pub jito_enabled: Option<bool>,
+    #[serde(default)]
+    pub jito_tip_lamports: Option<u64>,
+    #[serde(default)]
+    pub jito_region: Option<String>,
 }
 
 /// Wallet Tracker Configuration

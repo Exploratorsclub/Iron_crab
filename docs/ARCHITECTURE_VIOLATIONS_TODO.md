@@ -1,9 +1,34 @@
 # Architecture Violations & Required Changes
 
 **Erstellt:** 2026-01-11  
-**Aktualisiert:** 2026-01-11  
-**Status:** � V1-V4 behoben (arb-strategy Pfad komplett) - momentum-bot Pfad noch offen  
+**Aktualisiert:** 2026-01-11 (Post-Deploy Analyse)  
+**Status:** 🔴 tx_plan + bundle_config Failures - mehrere Probleme identifiziert  
 **Source of Truth:** `docs/TARGET_ARCHITECTURE.md`, `docs/ROLE_SEPARATION.md`
+
+---
+
+## 🚨 Aktuelle Reject-Gründe (Live Decision Records 2026-01-11)
+
+Nach Deploy werden arb-intents mit folgenden Fehlern rejected:
+
+### R1: "orca user authority not set" (UNSUPPORTED_INTENT)
+- **Check:** `tx_plan`
+- **Ursache:** Orca Connector hat keine `user_authority` gesetzt
+- **Root Cause:** `CrossDexHandler::init_dexes()` ruft `orca.set_user_authority(pk)` nur auf wenn `self.wallet_pubkey.is_some()`. Wenn Treasury nicht geladen wird (dry_run, keine Keys), bleibt wallet_pubkey=None.
+- **Fix benötigt:** Entweder Treasury immer laden ODER pubkey auch ohne private key als Parameter übergeben
+
+### R2: "pump_amm pool not discovered/cached for base_mint=So11..." (UNSUPPORTED_INTENT)
+- **Check:** `tx_plan`
+- **Detail:** base_mint ist WSOL (`So11...2`) statt des Token-Mints
+- **Ursache:** `load_pool_by_address()` fügt Pool in `pools_by_base` mit `base_mint` ein, aber bei manchen Intents wird WSOL als base_mint interpretiert
+- **Hypothese:** arb-strategy sendet buy_pool/sell_pool vertauscht ODER Intent hat falschen token_mint
+- **Fix benötigt:** Debug-Log um Intent-Inhalte zu analysieren
+
+### R3: "Intent requires atomic bundle but Jito not configured" (BUNDLE_NOT_CONFIGURED)
+- **Check:** `bundle_config`
+- **Detail:** tx_plan PASSED, aber Jito Bundle nicht konfiguriert
+- **Ursache:** Cross-DEX Arb erfordert atomare Ausführung via Jito Bundle
+- **Fix benötigt:** Jito Bundle Support aktivieren in Server Config ODER Arb ohne Bundle erlauben (riskant)
 
 ---
 

@@ -2352,11 +2352,33 @@ async fn main() -> Result<()> {
     };
     let has_keys = treasury.is_some();
 
-    // Setup config
+    // Load app config for Jito and other settings
+    let app_config = AppConfig::load(&args.config).ok();
+
+    // Setup config - read Jito settings from TOML config file (root level)
     let exec_config = ExecutionConfig {
         send_enabled: !args.simulate_only && !args.dry_run && has_keys,
+        jito_enabled: app_config
+            .as_ref()
+            .and_then(|c| c.jito_enabled)
+            .unwrap_or(false),
+        jito_tip_lamports: app_config
+            .as_ref()
+            .and_then(|c| c.jito_tip_lamports)
+            .unwrap_or(10_000),
+        jito_region: app_config
+            .as_ref()
+            .and_then(|c| c.jito_region.clone())
+            .unwrap_or_else(|| "frankfurt".to_string()),
         ..Default::default()
     };
+
+    info!(
+        jito_enabled = exec_config.jito_enabled,
+        jito_region = %exec_config.jito_region,
+        jito_tip = exec_config.jito_tip_lamports,
+        "Jito config loaded"
+    );
 
     if exec_config.send_enabled {
         info!("Transaction sending ENABLED");
