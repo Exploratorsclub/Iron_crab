@@ -472,10 +472,13 @@ impl Dex for MeteoraDlmm {
             &pool.reserve_y,
             &user_token_x,
             &user_token_y,
+            &pool.token_x_mint,
+            &pool.token_y_mint,
             &user,
             amount_in,
             min_out,
             direction,
+            pool.active_id,
         )?;
 
         Ok(vec![ix])
