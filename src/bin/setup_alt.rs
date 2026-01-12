@@ -165,13 +165,18 @@ async fn main() -> Result<()> {
         alt_pubkey
     } else {
         // Create new ALT
+        // Note: For dry-run, we use the current slot to derive the ALT address,
+        // but the actual ALT address will be different when created later with a different slot
         let slot = rpc.get_slot().await?;
-        let (create_ix, alt_pubkey) = create_alt_instructions(&authority, slot)?;
-
-        info!(alt_address = %alt_pubkey, "Creating new ALT");
 
         if !args.dry_run {
-            // Create ALT
+            // Get fresh slot right before sending
+            let fresh_slot = rpc.get_slot().await?;
+            let (create_ix, alt_pubkey) = create_alt_instructions(&authority, fresh_slot)?;
+
+            info!(alt_address = %alt_pubkey, slot = fresh_slot, "Creating new ALT");
+
+            // Create ALT - get blockhash as close to sending as possible
             let blockhash = rpc.get_latest_blockhash().await?;
             let tx = Transaction::new_signed_with_payer(
                 &[create_ix],
@@ -202,11 +207,14 @@ async fn main() -> Result<()> {
                 let sig = rpc.send_and_confirm_transaction(&tx).await?;
                 info!(signature = %sig, added = chunk.len(), "Extended ALT");
             }
+            
+            alt_pubkey
         } else {
+            // Dry run - derive ALT address from current slot for preview
+            let (_, alt_pubkey) = create_alt_instructions(&authority, slot)?;
             info!("DRY RUN - would create ALT at {} with {} addresses", alt_pubkey, addresses_to_add.len());
+            alt_pubkey
         }
-
-        alt_pubkey
     };
 
     // Final summary
