@@ -96,6 +96,9 @@ notify_watch = ["notify"]
 nats = ["async-nats"]
 legacy_monolith = []
 legacy_sniper = []
+# Enable RPC fallback methods like refresh_pools() - DISABLED in production
+# Use only for bootstrap/testing when Geyser is not available
+rpc_fallback = []
 
 [dependencies.pyo3]
 version = "0.24.2"

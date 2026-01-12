@@ -9,8 +9,11 @@ use tracing::debug;
 use super::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 use dashmap::DashMap;
+#[cfg(feature = "rpc_fallback")]
 use solana_account_decoder::UiAccountEncoding;
+#[cfg(feature = "rpc_fallback")]
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+#[cfg(feature = "rpc_fallback")]
 use solana_client::rpc_filter::RpcFilterType;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey; // SDK Pubkey (not Address wrapper)
@@ -331,6 +334,7 @@ impl Raydium {
         Ok(u64::from_le_bytes(amt_bytes))
     }
 
+    #[cfg(feature = "rpc_fallback")]
     fn pool_filters() -> Vec<RpcFilterType> {
         // Only filter by data size - status filtering excluded as it's unreliable
         // Raydium AMM v4 pools have fixed size 752 bytes
@@ -662,7 +666,20 @@ impl Raydium {
 
 #[async_trait]
 impl Dex for Raydium {
+    /// Refresh pool cache via RPC getProgramAccounts.
+    ///
+    /// ⚠️ **RPC FALLBACK ONLY** - Use Geyser-based pool discovery in production!
+    ///
+    /// **Feature-gated:** Only available with `rpc_fallback` feature.
     async fn refresh_pools(&self) -> Result<()> {
+        #[cfg(not(feature = "rpc_fallback"))]
+        {
+            tracing::debug!("refresh_pools() disabled - rpc_fallback feature not enabled");
+            return Ok(());
+        }
+
+        #[cfg(feature = "rpc_fallback")]
+        {
         use crate::metrics::{RAYDIUM_POOLS_LOADED, RAYDIUM_POOLS_SKIPPED_INVALID};
         use std::time::{Duration, SystemTime};
         tracing::trace!("raydium.refresh_pools() start");
@@ -814,6 +831,7 @@ impl Dex for Raydium {
             "raydium.refresh_pools done"
         );
         Ok(())
+        } // end #[cfg(feature = "rpc_fallback")]
     }
 
     /// Set pool data directly from accounts list (NO RPC calls).

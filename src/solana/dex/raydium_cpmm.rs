@@ -6,14 +6,19 @@
 use anyhow::{anyhow, ensure, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
+#[cfg(feature = "rpc_fallback")]
 use solana_account_decoder::UiAccountEncoding;
+#[cfg(feature = "rpc_fallback")]
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+#[cfg(feature = "rpc_fallback")]
 use solana_client::rpc_filter::RpcFilterType;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(feature = "rpc_fallback")]
+use tracing::warn;
 
 use super::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
@@ -29,6 +34,7 @@ pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 /// - discriminator(8) + configId(32) + creator(32) + vaults(64) + mints(96)
 /// - lp_mint(32) + mint_programs(64) + observation(32) + status fields
 /// - fees, amounts, timestamps, padding -> ~1024 total
+#[cfg(feature = "rpc_fallback")]
 const CPMM_POOL_ACCOUNT_SIZE: usize = 1024;
 
 /// Cached pool state
@@ -300,7 +306,17 @@ impl Dex for RaydiumCpmm {
     /// which provides real-time pool updates without expensive RPC scans.
     ///
     /// See: docs/TARGET_ARCHITECTURE.md - "Geyser preferred, RPC only as fallback"
+    ///
+    /// **Feature-gated:** Only available with `rpc_fallback` feature.
     async fn refresh_pools(&self) -> Result<()> {
+        #[cfg(not(feature = "rpc_fallback"))]
+        {
+            debug!("refresh_pools() disabled - rpc_fallback feature not enabled");
+            return Ok(());
+        }
+
+        #[cfg(feature = "rpc_fallback")]
+        {
         debug!("Fetching Raydium CPMM pools via getProgramAccounts");
 
         let program_id = Pubkey::from_str(RAYDIUM_CPMM_PROGRAM)?;
@@ -371,6 +387,7 @@ impl Dex for RaydiumCpmm {
         }
 
         Ok(())
+        } // end #[cfg(feature = "rpc_fallback")]
     }
 
     /// Set pool data directly from accounts list (NO RPC calls).

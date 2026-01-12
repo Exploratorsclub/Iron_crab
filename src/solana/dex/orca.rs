@@ -547,7 +547,20 @@ impl Orca {
 
 #[async_trait]
 impl Dex for Orca {
+    /// Refresh pool cache via RPC getProgramAccounts.
+    ///
+    /// ⚠️ **RPC FALLBACK ONLY** - Use Geyser-based pool discovery in production!
+    ///
+    /// **Feature-gated:** Only available with `rpc_fallback` feature.
     async fn refresh_pools(&self) -> Result<()> {
+        #[cfg(not(feature = "rpc_fallback"))]
+        {
+            tracing::debug!("refresh_pools() disabled - rpc_fallback feature not enabled");
+            return Ok(());
+        }
+
+        #[cfg(feature = "rpc_fallback")]
+        {
         use solana_account_decoder::UiAccountEncoding;
         use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
         use solana_client::rpc_filter::RpcFilterType;
@@ -645,6 +658,7 @@ impl Dex for Orca {
             "orca.refresh_pools() done"
         );
         Ok(())
+        } // end #[cfg(feature = "rpc_fallback")]
     }
 
     /// Set pool data directly from accounts list (NO RPC calls).

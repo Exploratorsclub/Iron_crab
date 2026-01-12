@@ -6,13 +6,17 @@
 use anyhow::{anyhow, ensure, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
+#[cfg(feature = "rpc_fallback")]
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+#[cfg(feature = "rpc_fallback")]
 use solana_client::rpc_filter::RpcFilterType;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(feature = "rpc_fallback")]
+use tracing::warn;
 
 use super::meteora_dlmm_layout::DlmmPool;
 use super::meteora_swap_builder::{MeteoraDlmmSwapBuilder, SwapDirection};
@@ -23,6 +27,7 @@ use crate::solana::rpc::SolanaRpc;
 pub const METEORA_DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
 /// LB Pair account size (904 bytes)
+#[cfg(feature = "rpc_fallback")]
 const LB_PAIR_ACCOUNT_SIZE: usize = 904;
 
 /// Cached pool state
@@ -211,7 +216,18 @@ impl Dex for MeteoraDlmm {
     /// which provides real-time pool updates without expensive RPC scans.
     ///
     /// See: docs/TARGET_ARCHITECTURE.md - "Geyser preferred, RPC only as fallback"
+    ///
+    /// **Feature-gated:** Only available with `rpc_fallback` feature.
+    /// In production builds without this feature, returns Ok(()) immediately.
     async fn refresh_pools(&self) -> Result<()> {
+        #[cfg(not(feature = "rpc_fallback"))]
+        {
+            debug!("refresh_pools() disabled - rpc_fallback feature not enabled");
+            return Ok(());
+        }
+
+        #[cfg(feature = "rpc_fallback")]
+        {
         debug!("Fetching Meteora DLMM pools via getProgramAccounts");
 
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
@@ -278,6 +294,7 @@ impl Dex for MeteoraDlmm {
         );
 
         Ok(())
+        } // end #[cfg(feature = "rpc_fallback")]
     }
 
     /// Load a single pool by address via getAccount RPC.

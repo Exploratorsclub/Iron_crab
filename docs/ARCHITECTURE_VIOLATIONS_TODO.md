@@ -1,8 +1,8 @@
 # Architecture Violations & Required Changes
 
 **Erstellt:** 2026-01-11  
-**Aktualisiert:** 2026-01-12 (TODO-5 bereits implementiert erkannt)  
-**Status:** 🟢 TODO-1 bis TODO-5 erledigt - Verbleibende: Phase 3 RPC-Elimination (P2)  
+**Aktualisiert:** 2026-01-12 (TODO-6 gefixt: rpc_fallback Feature-Flag)  
+**Status:** 🟢 TODO-1 bis TODO-6 erledigt - Verbleibende: Vault Balances + Meteora Bin Arrays (P2)  
 **Source of Truth:** `docs/TARGET_ARCHITECTURE.md`, `docs/ROLE_SEPARATION.md`
 
 ---
@@ -175,22 +175,50 @@ fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Res
 
 ### Phase 3: RPC-Elimination im Hot Path (Performance)
 
-#### TODO-6: `refresh_pools()` mit Feature-Flag schützen ⬜ TODO
+#### TODO-6: `refresh_pools()` mit Feature-Flag schützen ✅ FIXED
 **Priorität:** 🟡 P2 (verhindert versehentliche RPC-Scans)  
 **Verstöße:** D3, M3  
 **Dateien:** alle DEX Connectors
 
-**Schritte:**
-1. [ ] Feature-Flag `rpc_fallback` in `Cargo.toml` hinzufügen
-2. [ ] `refresh_pools()` mit `#[cfg(feature = "rpc_fallback")]` oder Runtime-Check schützen
-3. [ ] In Production: Feature disabled, `refresh_pools()` returnt sofort `Ok(())`
-4. [ ] Nur für Bootstrap/Testing/Fallback aktivieren
+**Implementierung:**
+1. ✅ Feature-Flag `rpc_fallback` in `Cargo.toml` hinzugefügt
+2. ✅ `refresh_pools()` in allen DEX Connectors geschützt mit:
+   ```rust
+   async fn refresh_pools(&self) -> Result<()> {
+       #[cfg(not(feature = "rpc_fallback"))]
+       {
+           debug!("refresh_pools() disabled - rpc_fallback feature not enabled");
+           return Ok(());
+       }
+       
+       #[cfg(feature = "rpc_fallback")]
+       { /* ... actual RPC scan code ... */ }
+   }
+   ```
+3. ✅ RPC-spezifische Imports und Konstanten ebenfalls feature-gated
+4. ✅ In Production: Ohne `--features rpc_fallback` returnen alle `refresh_pools()` sofort `Ok(())`
 
-**Erwartetes Ergebnis:** Keine versehentlichen getProgramAccounts im Production Hot Path
+**Geschützte DEXes:**
+- ✅ `meteora_dlmm.rs`
+- ✅ `raydium_cpmm.rs`
+- ✅ `raydium.rs`
+- ✅ `orca.rs`
+- ✅ `pumpfun_amm.rs` (war bereits no-op)
+
+**Nutzung:**
+```bash
+# Production (default): Kein RPC-Scan
+cargo build --release
+
+# Bootstrap/Testing: Mit RPC-Fallback
+cargo build --release --features rpc_fallback
+```
+
+**Erwartetes Ergebnis:** Keine versehentlichen getProgramAccounts im Production Hot Path ✅
 
 ---
 
-#### TODO-6: Vault Balances aus Intent-Metadata statt RPC ⬜ TODO
+#### TODO-7: Vault Balances aus Intent-Metadata statt RPC ⬜ TODO
 **Priorität:** 🟡 P2 (eliminiert 2 RPC Calls pro Quote)  
 **Verstöße:** D4, M4  
 **Dateien:**
