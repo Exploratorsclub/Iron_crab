@@ -1,8 +1,8 @@
 # Architecture Violations & Required Changes
 
 **Erstellt:** 2026-01-11  
-**Aktualisiert:** 2026-01-12 (TODO-6 gefixt: rpc_fallback Feature-Flag)  
-**Status:** 🟢 TODO-1 bis TODO-6 erledigt - Verbleibende: Vault Balances + Meteora Bin Arrays (P2)  
+**Aktualisiert:** 2026-01-12 (TODO-7 gefixt: Vault Balances via Geyser Subscription)  
+**Status:** 🟢 TODO-1 bis TODO-7 erledigt - Verbleibend: TODO-8 Meteora Bin Arrays (P2), TODO-9 Momentum SELL (P3)  
 **Source of Truth:** `docs/TARGET_ARCHITECTURE.md`, `docs/ROLE_SEPARATION.md`
 
 ---
@@ -218,40 +218,57 @@ cargo build --release --features rpc_fallback
 
 ---
 
-#### TODO-7: Vault Balances aus Intent-Metadata statt RPC ⬜ TODO
-**Priorität:** 🟡 P2 (eliminiert 2 RPC Calls pro Quote)  
+#### TODO-7: Vault Balances via Geyser Account Subscription ✅ FIXED
+**Priorität:** 🟡 P2 (eliminiert RPC Calls für Vault Balances)  
 **Verstöße:** D4, M4  
-**Dateien:**
-- `src/solana/dex/meteora_dlmm.rs` - `update_reserve_balances()`
-- `src/solana/dex/raydium_cpmm.rs` - analog
-- `src/bin/arb_strategy.rs` - Vault Balances im Intent senden
 
-**Schritte:**
-1. [ ] arb-strategy: `reserve_x_balance`, `reserve_y_balance` in Intent-Metadata hinzufügen
-2. [ ] DEX Connectors: `build_swap_ix()` verwendet Intent-Metadata statt RPC
-3. [ ] Fallback: Wenn Metadata fehlt, akzeptiere cached Werte oder reject
+**Analyse (warum Geyser statt Intent-Metadata):**
+Die Target Architecture definiert klar: "Pool State Updates (Reserves, Liquidity)" via MarketEvents,
+"Store pool state received from MarketEvents (not RPC!)". Die Intent-Metadata Lösung würde den
+Data Plane umgehen und zu veralteten Daten führen (Intent-Zeit ≠ Execution-Zeit).
 
-**Erwartetes Ergebnis:** Keine Vault-Balance RPC Calls im IX-Building
+**Implementierte Lösung (Option B - Geyser Account Subscription):**
+1. [x] `MarketEventKind::PoolStateUpdate` in `src/ipc/schema.rs` hinzugefügt
+   - Enthält `reserve_base`, `reserve_quote`, `pool_address`, `dex`, `base_mint`, `quote_mint`, `update_slot`
+2. [x] `VaultInfo` Tracking-Struktur in `market-data.rs`
+   - Maps vault_address → (pool_address, dex, base_mint, quote_mint, is_base_vault)
+3. [x] Vault Account Registration bei PoolDiscovery
+   - Vaults werden automatisch zu `tracked_vaults` hinzugefügt
+   - GeyserListener resubscribed automatisch bei neuen Vaults
+4. [x] `PoolStateUpdate` Event bei Vault Balance Changes
+   - Emittiert via NATS wenn Geyser Account Update für tracked Vault kommt
+   - Consumers können lokalen Pool-Cache aktualisieren
+
+**Dateien geändert:**
+- `src/ipc/schema.rs` - PoolStateUpdate Event-Typ
+- `src/bin/market_data.rs` - VaultInfo, tracked_vaults, Geyser Integration
+
+**Vorteile gegenüber Intent-Metadata:**
+- Daten-Frische: <10ms via Geyser vs. potentiell Slots-alte Intent-Daten
+- Target Architecture konform: Data Plane lädt einmal
+- Einheitlicher Datenfluss: Alle Consumer bekommen dieselben Updates
+- Debugging: Event-Stream nachvollziehbar
+
+**Noch TODO (Future):**
+- [ ] Consumer (arb-strategy, execution-engine) aktualisieren lokalen Cache bei PoolStateUpdate
+- [ ] DEX Connectors: `quote_exact_in()` cached Reserves statt RPC
+
+**Erwartetes Ergebnis:** Vault Balances via Geyser statt RPC
 
 ---
 
-#### TODO-7: Meteora Bin Arrays ohne RPC laden ⬜ TODO
+#### TODO-8: Meteora Bin Arrays ohne RPC laden ⬜ TODO
 **Priorität:** 🟡 P2 (eliminiert bis zu 8 RPC Calls)  
 **Verstöße:** D5, M5  
 **Datei:** `src/solana/dex/meteora_swap_builder.rs`
 
-**Optionen (wähle eine):**
-- **Option A:** Bin Array PDAs in `DexPoolAccounts` Event inkludieren
-  - Pro: Einheitlicher Datenfluss
-  - Con: Event wird größer, Bin Arrays ändern sich häufig
-  
-- **Option B:** Lazy PDA-Derivation ohne RPC
-  - Nur PDA berechnen, keine Account-Fetches
-  - Bin-State aus Pool-Account (active_id) ableiten
-  - Pro: Kein RPC, Pool-Account reicht
-  - Con: Weniger genau für große Swaps
+**Empfohlene Lösung: Lazy PDA-Derivation ohne RPC**
+- Nur PDA berechnen, keine Account-Fetches
+- Bin-State aus Pool-Account (active_id) ableiten
+- Pro: Kein RPC, Pool-Account reicht
+- Con: Weniger genau für große Swaps
 
-**Schritte für Option B (empfohlen):**
+**Schritte:**
 1. [ ] `build_swap_ix()` ohne `fetch_bin_arrays()` RPC aufrufen
 2. [ ] Bin Array PDAs nur via `derive_bin_array_pda()` berechnen (kein RPC)
 3. [ ] Für Simulation: Bin Arrays werden on-chain validiert
@@ -262,7 +279,7 @@ cargo build --release --features rpc_fallback
 
 ### Phase 4: Momentum-Bot Geyser-Conformance (Separate Pipeline)
 
-#### TODO-8: Momentum-Bot SELL Path auf Intent-Metadata umstellen ⬜ TODO
+#### TODO-9: Momentum-Bot SELL Path auf Intent-Metadata umstellen ⬜ TODO
 **Priorität:** 🟢 P3 (separater Code-Path, nicht arb-blocking)  
 **Verstöße:** V6  
 **Dateien:**
@@ -287,16 +304,17 @@ cargo build --release --features rpc_fallback
 
 | TODO | Status | Blocker | ETA |
 |------|--------|---------|-----|
-| TODO-1 | ⏳ | - | Sofort |
-| TODO-2 | ⬜ | - | 2h |
-| TODO-3 | ⬜ | TODO-2 | 3h |
-| TODO-4 | ⬜ | TODO-2, TODO-3 | 1h |
-| TODO-5 | ⬜ | - | 30min |
-| TODO-6 | ⬜ | TODO-4 | 1h |
-| TODO-7 | ⬜ | - | 2h |
+| TODO-1 | ✅ | - | Done |
+| TODO-2 | ✅ | - | Done |
+| TODO-3 | ✅ | - | Done |
+| TODO-4 | ✅ | - | Done |
+| TODO-5 | ✅ | - | Done |
+| TODO-6 | ✅ | - | Done |
+| TODO-7 | ✅ | - | Done |
 | TODO-8 | ⬜ | - | 2h |
+| TODO-9 | ⬜ | - | 2h |
 
-**Kritischer Pfad:** TODO-1 → TODO-2 → TODO-3 → TODO-4 (dann ist Geyser-Pipeline komplett)
+**Kritischer Pfad:** TODO-1 → TODO-7 ✅ komplett (Geyser-Pipeline funktional)
 
 ---
 

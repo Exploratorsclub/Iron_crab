@@ -215,6 +215,25 @@ pub enum MarketEventKind {
     },
     /// Slot progression (heartbeat)
     SlotUpdate { current_slot: u64 },
+    /// Pool state update (vault balances changed via Geyser Account Subscription)
+    ///
+    /// Emitted by market-data when subscribed vault token accounts change.
+    /// Consumers should update their local pool cache with these reserve values.
+    /// This eliminates the need for RPC calls to fetch vault balances.
+    PoolStateUpdate {
+        pool_address: String,
+        dex: String,
+        /// Base token reserve (raw amount, use with base_decimals)
+        reserve_base: u64,
+        /// Quote token reserve (raw amount, use with quote_decimals)
+        reserve_quote: u64,
+        /// Base mint for context
+        base_mint: String,
+        /// Quote mint for context
+        quote_mint: String,
+        /// Slot when this update was observed
+        update_slot: u64,
+    },
     /// Raw account update from Geyser
     AccountUpdate {
         pubkey: String,

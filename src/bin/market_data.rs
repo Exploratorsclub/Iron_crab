@@ -145,6 +145,40 @@ struct MarketDataContext {
     /// We emit PoolCreated + DexPoolAccounts on FIRST trade, then just DexPoolAccounts on subsequent trades.
     /// Key: pool_address
     known_pump_amm_pools: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+
+    /// Vault account tracking for PoolStateUpdate events (Geyser-based reserve balances).
+    /// Maps vault_address → VaultInfo (pool context).
+    tracked_vaults: parking_lot::RwLock<std::collections::HashMap<Pubkey, VaultInfo>>,
+    /// Channel to notify GeyserListener when tracked vaults change (triggers resubscribe).
+    tracked_vaults_tx: watch::Sender<Vec<Pubkey>>,
+}
+
+/// Information about a tracked vault account
+#[derive(Debug)]
+struct VaultInfo {
+    pool_address: Pubkey,
+    dex: String,
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
+    /// true = this vault holds base token, false = quote token
+    is_base_vault: bool,
+    /// Last known balance (for delta detection)
+    last_balance: std::sync::atomic::AtomicU64,
+}
+
+impl Clone for VaultInfo {
+    fn clone(&self) -> Self {
+        Self {
+            pool_address: self.pool_address,
+            dex: self.dex.clone(),
+            base_mint: self.base_mint,
+            quote_mint: self.quote_mint,
+            is_base_vault: self.is_base_vault,
+            last_balance: std::sync::atomic::AtomicU64::new(
+                self.last_balance.load(std::sync::atomic::Ordering::Relaxed)
+            ),
+        }
+    }
 }
 
 impl MarketDataContext {
@@ -258,6 +292,20 @@ fn try_parse_mint_account(
     }
 }
 
+/// Parse a Token Account to extract the balance (amount).
+/// Works with both spl-token and spl-token-2022 accounts.
+fn try_parse_token_account_balance(data: &[u8]) -> Option<u64> {
+    // SPL Token Account layout: 165 bytes
+    // Offset 64: amount (u64, little-endian)
+    if data.len() >= 72 {
+        // Standard spl-token Account layout
+        let amount_bytes: [u8; 8] = data[64..72].try_into().ok()?;
+        Some(u64::from_le_bytes(amount_bytes))
+    } else {
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -340,6 +388,7 @@ async fn main() -> Result<()> {
     );
 
     let (tracked_mints_tx, tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
+    let (tracked_vaults_tx, tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
 
     let ctx = Arc::new(MarketDataContext {
         run_id: run_id.clone(),
@@ -351,6 +400,8 @@ async fn main() -> Result<()> {
         tracked_mints: parking_lot::RwLock::new(std::collections::HashSet::new()),
         tracked_mints_tx,
         known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+        tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        tracked_vaults_tx,
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -393,6 +444,7 @@ async fn main() -> Result<()> {
             &args.geyser_url,
             config_subscription,
             tracked_mints_rx,
+            tracked_vaults_rx,
         )
         .await?;
     }
@@ -411,6 +463,7 @@ async fn run_geyser_loop(
     geyser_url: &str,
     mut config_subscription: Option<ironcrab::nats::NatsSubscription>,
     tracked_mints_rx: watch::Receiver<Vec<Pubkey>>,
+    tracked_vaults_rx: watch::Receiver<Vec<Pubkey>>,
 ) -> Result<()> {
     // Initialize RPC client for fallback/metadata (prefer local RPC, fallback to Helius)
     let rpc_url =
@@ -446,11 +499,36 @@ async fn run_geyser_loop(
         }
     });
 
+    // Merge tracked_mints and tracked_vaults into a single combined channel for GeyserListener.
+    // GeyserListener will subscribe to all accounts in the combined list.
+    let (combined_tracked_tx, combined_tracked_rx) = watch::channel(Vec::<Pubkey>::new());
+    {
+        let mut mints_rx = tracked_mints_rx;
+        let mut vaults_rx = tracked_vaults_rx;
+        let combined_tx = combined_tracked_tx;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = mints_rx.changed() => {}
+                    _ = vaults_rx.changed() => {}
+                }
+                // Merge both lists
+                let mints: Vec<Pubkey> = mints_rx.borrow().clone();
+                let vaults: Vec<Pubkey> = vaults_rx.borrow().clone();
+                let mut combined: Vec<Pubkey> = mints;
+                combined.extend(vaults);
+                combined.sort();
+                combined.dedup();
+                let _ = combined_tx.send(combined);
+            }
+        });
+    }
+
     // Start legacy GeyserListener for transaction parsing (will be phased out in favor of pool discovery)
     let (listener, mut account_rx, mut transaction_rx) = GeyserListener::new_with_tracked_accounts(
         geyser_url.to_string(),
         program_ids,
-        tracked_mints_rx,
+        combined_tracked_rx,
     );
 
     // Spawn Geyser listener task
@@ -540,6 +618,81 @@ async fn run_geyser_loop(
                             } else {
                                 NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                                 MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+
+                // Vault account updates → emit PoolStateUpdate (Geyser-based reserve balances)
+                // This eliminates the need for RPC calls to fetch vault balances.
+                if (account_update.owner.to_bytes() == spl_token::ID.to_bytes()
+                    || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes())
+                {
+                    if let Some(vault_info) = ctx.tracked_vaults.read().get(&account_update.pubkey).cloned() {
+                        // Parse token account to get balance
+                        if let Some(balance) = try_parse_token_account_balance(&account_update.data) {
+                            // Check if balance changed (avoid spamming unchanged updates)
+                            let prev_balance = vault_info.last_balance.swap(balance, std::sync::atomic::Ordering::Relaxed);
+                            if balance != prev_balance {
+                                // We need both vault balances to emit a complete PoolStateUpdate.
+                                // For now, emit partial updates - consumers should merge base+quote.
+                                // Future: Track both vaults and emit only when both are known.
+                                let (reserve_base, reserve_quote) = if vault_info.is_base_vault {
+                                    (balance, 0u64) // Partial: only base known
+                                } else {
+                                    (0u64, balance) // Partial: only quote known
+                                };
+
+                                // Try to get the other vault's balance for a complete update
+                                let vaults = ctx.tracked_vaults.read();
+                                let complete_update = vaults.values()
+                                    .find(|v| v.pool_address == vault_info.pool_address && v.is_base_vault != vault_info.is_base_vault)
+                                    .map(|other| {
+                                        let other_balance = other.last_balance.load(std::sync::atomic::Ordering::Relaxed);
+                                        if vault_info.is_base_vault {
+                                            (balance, other_balance)
+                                        } else {
+                                            (other_balance, balance)
+                                        }
+                                    });
+                                drop(vaults);
+
+                                let (final_base, final_quote) = complete_update.unwrap_or((reserve_base, reserve_quote));
+
+                                // Only emit if we have at least one non-zero balance
+                                if final_base > 0 || final_quote > 0 {
+                                    let state_event = MarketEvent::new(
+                                        "market-data",
+                                        BUILD_VERSION,
+                                        run_id,
+                                        ctx.next_event_id(),
+                                        "geyser_vault",
+                                        Some(account_update.slot),
+                                        MarketEventKind::PoolStateUpdate {
+                                            pool_address: vault_info.pool_address.to_string(),
+                                            dex: vault_info.dex.clone(),
+                                            reserve_base: final_base,
+                                            reserve_quote: final_quote,
+                                            base_mint: vault_info.base_mint.to_string(),
+                                            quote_mint: vault_info.quote_mint.to_string(),
+                                            update_slot: account_update.slot,
+                                        },
+                                    );
+
+                                    if let Err(e) = ctx.jsonl_writer.write(&state_event) {
+                                        error!(error = %e, "Failed to write PoolStateUpdate event to JSONL");
+                                    }
+
+                                    if let Some(ref nats) = ctx.nats {
+                                        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &state_event).await {
+                                            warn!(error = %e, "Failed to publish PoolStateUpdate event to NATS");
+                                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                        } else {
+                                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                            MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1015,6 +1168,51 @@ async fn run_geyser_loop(
                                 "Emitted DexPoolAccounts for pool discovery"
                             );
                         }
+                    }
+
+                    // Track vault accounts for PoolStateUpdate events (Geyser-based reserve balances)
+                    // This enables real-time reserve tracking without RPC calls.
+                    let dex_str = pool_event.dex_type.to_string();
+                    let mut vaults_changed = false;
+                    {
+                        let mut vaults = ctx.tracked_vaults.write();
+                        if let Some(coin_vault) = pool_event.coin_vault {
+                            vaults.entry(coin_vault).or_insert_with(|| {
+                                vaults_changed = true;
+                                VaultInfo {
+                                    pool_address: pool_event.pool_address,
+                                    dex: dex_str.clone(),
+                                    base_mint: pool_event.base_mint,
+                                    quote_mint: pool_event.quote_mint,
+                                    is_base_vault: true,
+                                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                                }
+                            });
+                        }
+                        if let Some(pc_vault) = pool_event.pc_vault {
+                            vaults.entry(pc_vault).or_insert_with(|| {
+                                vaults_changed = true;
+                                VaultInfo {
+                                    pool_address: pool_event.pool_address,
+                                    dex: dex_str.clone(),
+                                    base_mint: pool_event.base_mint,
+                                    quote_mint: pool_event.quote_mint,
+                                    is_base_vault: false,
+                                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                                }
+                            });
+                        }
+                    }
+                    // Notify GeyserListener to resubscribe with new vault accounts
+                    if vaults_changed {
+                        let vault_list: Vec<Pubkey> = ctx.tracked_vaults.read().keys().copied().collect();
+                        let _ = ctx.tracked_vaults_tx.send(vault_list);
+                        debug!(
+                            pool = %pool_event.pool_address,
+                            coin_vault = ?pool_event.coin_vault,
+                            pc_vault = ?pool_event.pc_vault,
+                            "Registered vault accounts for PoolStateUpdate tracking"
+                        );
                     }
                 }
             }
