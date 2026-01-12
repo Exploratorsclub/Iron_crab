@@ -170,13 +170,17 @@ async fn main() -> Result<()> {
         let slot = rpc.get_slot().await?;
 
         if !args.dry_run {
-            // Get fresh slot right before sending
-            let fresh_slot = rpc.get_slot().await?;
+            // Get the slot with processed commitment for most current slot
+            // The ALT program requires a slot within the last ~150 slots (slot hashes sysvar)
+            let fresh_slot = rpc.get_slot_with_commitment(CommitmentConfig::processed()).await?;
+            
+            info!(fresh_slot = fresh_slot, "Got current slot for ALT creation");
+            
             let (create_ix, alt_pubkey) = create_alt_instructions(&authority, fresh_slot)?;
 
             info!(alt_address = %alt_pubkey, slot = fresh_slot, "Creating new ALT");
 
-            // Create ALT - get blockhash as close to sending as possible
+            // Create ALT - get blockhash and send immediately
             let blockhash = rpc.get_latest_blockhash().await?;
             let tx = Transaction::new_signed_with_payer(
                 &[create_ix],
@@ -185,11 +189,16 @@ async fn main() -> Result<()> {
                 blockhash,
             );
 
-            let sig = rpc.send_and_confirm_transaction(&tx).await?;
-            info!(signature = %sig, "Created ALT");
+            // Skip preflight to avoid simulation delay
+            let sig = rpc.send_transaction(&tx).await?;
+            info!(signature = %sig, "Sent ALT creation TX (awaiting confirmation)");
+            
+            // Wait for confirmation
+            let _ = rpc.confirm_transaction(&sig).await?;
+            info!("ALT creation confirmed");
 
-            // Wait a bit for the ALT to be created
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            // Wait a bit more for the ALT to be fully active
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
             // Extend with addresses in batches
             for chunk in addresses_to_add.chunks(30) {
