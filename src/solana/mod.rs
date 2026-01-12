@@ -1,4 +1,5 @@
 pub mod account_listener;
+pub mod address_lookup_table;
 pub mod arbitrage;
 pub mod compute_budget_estimator;
 pub mod compute_budget_helper;

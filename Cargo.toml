@@ -54,6 +54,8 @@ solana-account-decoder = "=3.0.0"
 solana-program = "=3.0.0"
 solana-system-program = "=3.0.0"
 solana-commitment-config = "=3.0.0"
+solana-address-lookup-table-interface = "=3.0.0"
+solana-message = "=3.0.1"
 
 # SPL crates (off-chain instruction builders)
 solana-rpc-client-api = "=3.0.0"
@@ -153,3 +155,7 @@ path = "src/bin/latency_stress.rs"
 [[bin]]
 name = "pump-amm-tx-probe"
 path = "src/bin/pump_amm_tx_probe.rs"
+
+[[bin]]
+name = "setup-alt"
+path = "src/bin/setup_alt.rs"

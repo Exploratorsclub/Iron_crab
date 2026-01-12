@@ -33,6 +33,7 @@ use solana_client::rpc_config::{
 };
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_commitment_config::CommitmentLevel;
+use solana_message::{v0, AddressLookupTableAccount, VersionedMessage};
 use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -808,6 +809,10 @@ struct ExecutionContext {
     cross_dex_handler: Option<Arc<CrossDexHandler>>,
     /// RPC wrapper for read-only queries and (future) sim/send
     rpc: Arc<SolanaRpc>,
+
+    // === Address Lookup Table (P0: TX size reduction) ===
+    /// Loaded ALT for versioned transactions (reduces TX size by ~60%)
+    address_lookup_table: Option<ironcrab::solana::address_lookup_table::LoadedAlt>,
 
     // Metrics
     intents_received: std::sync::atomic::AtomicU64,
@@ -2432,6 +2437,44 @@ async fn main() -> Result<()> {
         None
     };
 
+    // P0: Load Address Lookup Table for transaction size reduction
+    // Required for cross-DEX arbitrage (transactions > 1232 bytes without ALT)
+    let address_lookup_table = if let Some(alt_addr_str) = exec_eng_cfg.and_then(|e| e.address_lookup_table.as_ref()) {
+        match solana_sdk::pubkey::Pubkey::from_str(alt_addr_str) {
+            Ok(alt_pubkey) => {
+                match ironcrab::solana::address_lookup_table::load_alt(&rpc.rpc, &alt_pubkey).await {
+                    Ok(loaded_alt) => {
+                        info!(
+                            alt_address = %alt_pubkey,
+                            accounts_count = loaded_alt.accounts.len(),
+                            "Loaded Address Lookup Table for TX size reduction"
+                        );
+                        Some(loaded_alt)
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            alt_address = %alt_pubkey,
+                            "Failed to load ALT - transactions may fail due to size limit"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    alt_address = alt_addr_str,
+                    "Invalid ALT address in config"
+                );
+                None
+            }
+        }
+    } else {
+        info!("No Address Lookup Table configured - cross-DEX arb may fail due to TX size");
+        None
+    };
+
     // Setup JSONL writers
     let log_base = args
         .log_dir
@@ -2619,6 +2662,8 @@ async fn main() -> Result<()> {
         // Cross-DEX handler (initialized below)
         cross_dex_handler: None,
         rpc: Arc::clone(&rpc),
+        // P0: Address Lookup Table for TX size reduction
+        address_lookup_table,
         // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
@@ -4458,13 +4503,78 @@ async fn emit_sim_failed_decision(
 /// Notes:
 /// - Uses `sig_verify=false` (unsigned tx is fine for simulation).
 /// - Uses `replace_recent_blockhash=true` so simulation does not depend on blockhash freshness.
+/// - Uses Versioned Transaction (v0) with Address Lookup Table if configured.
 async fn simulate_transaction(
     ctx: &ExecutionContext,
     wallet_pubkey: Pubkey,
     plan: &tx_builder::TxPlan,
 ) -> SimulationResult {
-    let message = solana_sdk::message::Message::new(&plan.instructions, Some(&wallet_pubkey));
-    let tx = Transaction::new_unsigned(message);
+    use solana_sdk::transaction::VersionedTransaction;
+
+    // Build Versioned Transaction with ALT if available
+    let tx_result: Result<VersionedTransaction, String> = if let Some(ref alt) = ctx.address_lookup_table {
+        // Use v0 message with ALT for size reduction
+        let alt_account = AddressLookupTableAccount {
+            key: alt.address,
+            addresses: alt.accounts.clone(),
+        };
+
+        // Get a recent blockhash for v0 message compilation
+        let blockhash = match ctx.rpc.rpc.get_latest_blockhash().await {
+            Ok(bh) => bh,
+            Err(e) => {
+                return SimulationResult {
+                    success: false,
+                    error_code: Some(format!("rpc_error:blockhash:{e}")),
+                    logs_preview: None,
+                    compute_units_consumed: None,
+                };
+            }
+        };
+
+        match v0::Message::try_compile(&wallet_pubkey, &plan.instructions, &[alt_account], blockhash) {
+            Ok(message) => {
+                let versioned_message = VersionedMessage::V0(message);
+                // Create unsigned versioned transaction
+                Ok(VersionedTransaction {
+                    signatures: vec![solana_sdk::signature::Signature::default()],
+                    message: versioned_message,
+                })
+            }
+            Err(e) => Err(format!("v0_compile_error:{e}")),
+        }
+    } else {
+        // Fallback to legacy transaction (will fail if too large)
+        let blockhash = match ctx.rpc.rpc.get_latest_blockhash().await {
+            Ok(bh) => bh,
+            Err(e) => {
+                return SimulationResult {
+                    success: false,
+                    error_code: Some(format!("rpc_error:blockhash:{e}")),
+                    logs_preview: None,
+                    compute_units_consumed: None,
+                };
+            }
+        };
+        let message = solana_sdk::message::Message::new_with_blockhash(
+            &plan.instructions,
+            Some(&wallet_pubkey),
+            &blockhash,
+        );
+        Ok(VersionedTransaction::from(Transaction::new_unsigned(message)))
+    };
+
+    let tx = match tx_result {
+        Ok(tx) => tx,
+        Err(e) => {
+            return SimulationResult {
+                success: false,
+                error_code: Some(e),
+                logs_preview: None,
+                compute_units_consumed: None,
+            };
+        }
+    };
 
     let cfg = RpcSimulateTransactionConfig {
         sig_verify: false,
@@ -4516,6 +4626,7 @@ async fn simulate_transaction(
 /// - Only called after successful simulation (simulate-gated).
 /// - Builds and SIGNS using the single-signer `Treasury`.
 /// - Uses `skip_preflight=true` (we already simulated).
+/// - Uses Versioned Transaction (v0) with Address Lookup Table if configured.
 async fn send_transaction_rpc(
     ctx: &ExecutionContext,
     wallet_pubkey: Pubkey,
@@ -4523,6 +4634,9 @@ async fn send_transaction_rpc(
     skip_preflight: bool,
     preflight_commitment: Option<CommitmentLevel>,
 ) -> std::result::Result<String, String> {
+    use solana_sdk::message::{v0, VersionedMessage};
+    use solana_sdk::transaction::VersionedTransaction;
+
     TX_SEND_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let treasury = ctx
         .treasury
@@ -4536,12 +4650,30 @@ async fn send_transaction_rpc(
         .await
         .map_err(|e| format!("rpc_error:{e}"))?;
 
-    let tx = Transaction::new_signed_with_payer(
-        &plan.instructions,
-        Some(&wallet_pubkey),
-        &[signer],
-        blockhash,
-    );
+    // Build Versioned Transaction with ALT if available
+    let tx: VersionedTransaction = if let Some(ref alt) = ctx.address_lookup_table {
+        // Use v0 message with ALT for size reduction
+        let alt_account = AddressLookupTableAccount {
+            key: alt.address,
+            addresses: alt.accounts.clone(),
+        };
+
+        let message = v0::Message::try_compile(&wallet_pubkey, &plan.instructions, &[alt_account], blockhash)
+            .map_err(|e| format!("v0_compile_error:{e}"))?;
+
+        let versioned_message = VersionedMessage::V0(message);
+        VersionedTransaction::try_new(versioned_message, &[signer])
+            .map_err(|e| format!("v0_sign_error:{e}"))?
+    } else {
+        // Fallback to legacy transaction
+        let legacy_tx = Transaction::new_signed_with_payer(
+            &plan.instructions,
+            Some(&wallet_pubkey),
+            &[signer],
+            blockhash,
+        );
+        VersionedTransaction::from(legacy_tx)
+    };
 
     let config = RpcSendTransactionConfig {
         skip_preflight,

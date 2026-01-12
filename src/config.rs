@@ -111,6 +111,11 @@ pub struct ExecutionEngineCfg {
     /// Jito block engine region: frankfurt, amsterdam, ny, tokyo, slc
     #[serde(default)]
     pub jito_region: Option<String>,
+    /// Address Lookup Table (ALT) pubkey for transaction size reduction.
+    /// Required for cross-DEX arbitrage (transactions > 1232 bytes).
+    /// Create with: cargo run --bin setup-alt
+    #[serde(default)]
+    pub address_lookup_table: Option<String>,
 }
 
 /// Wallet Tracker Configuration
