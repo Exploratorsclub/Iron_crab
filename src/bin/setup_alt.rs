@@ -19,6 +19,7 @@ use ironcrab::solana::address_lookup_table::{
 };
 use ironcrab::wallet::Treasury;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{
     pubkey::Pubkey,
@@ -189,13 +190,43 @@ async fn main() -> Result<()> {
                 blockhash,
             );
 
-            // Skip preflight to avoid simulation delay
-            let sig = rpc.send_transaction(&tx).await?;
+            // Skip preflight simulation - ALT creation is timing-sensitive
+            // The slot must be within ~150 slots of current slot
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                preflight_commitment: None,
+                encoding: None,
+                max_retries: Some(3),
+                min_context_slot: None,
+            };
+            let sig = rpc.send_transaction_with_config(&tx, config).await?;
             info!(signature = %sig, "Sent ALT creation TX (awaiting confirmation)");
             
-            // Wait for confirmation
-            let _ = rpc.confirm_transaction(&sig).await?;
-            info!("ALT creation confirmed");
+            // Wait for confirmation with retries
+            let mut confirmed = false;
+            for attempt in 1..=10 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                match rpc.get_signature_statuses(&[sig]).await {
+                    Ok(response) => {
+                        if let Some(Some(status)) = response.value.first() {
+                            if status.err.is_none() {
+                                confirmed = true;
+                                info!("ALT creation confirmed");
+                                break;
+                            } else {
+                                anyhow::bail!("ALT creation failed: {:?}", status.err);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(attempt = attempt, error = %e, "Failed to get signature status");
+                    }
+                }
+            }
+            
+            if !confirmed {
+                anyhow::bail!("ALT creation TX not confirmed after 10 attempts");
+            }
 
             // Wait a bit more for the ALT to be fully active
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
