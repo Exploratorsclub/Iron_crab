@@ -187,6 +187,8 @@ impl GeyserPoolDiscovery {
             pc_vault: pool_data.pc_vault,
             creator: None, // Account-based discovery doesn't have creator info
             discovered_at_ms,
+            active_id: pool_data.active_id,
+            bin_step: pool_data.bin_step,
         })
     }
 
@@ -290,6 +292,8 @@ impl GeyserPoolDiscovery {
                     pc_vault: None,
                     creator,
                     discovered_at_ms,
+                    active_id: None,
+                    bin_step: None,
                 })
             }
             DexType::RaydiumAmmV4
@@ -359,6 +363,8 @@ impl GeyserPoolDiscovery {
             liquidity_lamports,
             coin_vault: Some(coin_vault),
             pc_vault: Some(pc_vault),
+            active_id: None,
+            bin_step: None,
         })
     }
 
@@ -431,6 +437,8 @@ impl GeyserPoolDiscovery {
             liquidity_lamports,
             coin_vault: Some(coin_vault),
             pc_vault: Some(pc_vault),
+            active_id: None,
+            bin_step: None,
         })
     }
 
@@ -504,6 +512,8 @@ impl GeyserPoolDiscovery {
             liquidity_lamports,
             coin_vault: Some(coin_vault),
             pc_vault: Some(pc_vault),
+            active_id: Some(parsed.active_id),
+            bin_step: Some(parsed.bin_step),
         })
     }
 
@@ -533,6 +543,8 @@ impl GeyserPoolDiscovery {
             liquidity_lamports,
             coin_vault: Some(parsed.token_vault_a), // Enable background vault fetch
             pc_vault: Some(parsed.token_vault_b),
+            active_id: None,
+            bin_step: None,
         })
     }
 
@@ -606,6 +618,8 @@ impl GeyserPoolDiscovery {
             liquidity_lamports,
             coin_vault: None, // Pump.fun uses bonding curve, not traditional vaults
             pc_vault: None,
+            active_id: None,
+            bin_step: None,
         })
     }
 }
@@ -650,6 +664,10 @@ pub struct PoolDiscoveryEvent {
     pub creator: Option<Pubkey>,
     /// Timestamp when this event was created (for latency tracking)
     pub discovered_at_ms: u64,
+    /// Meteora DLMM: active bin ID (current price bin)
+    pub active_id: Option<i32>,
+    /// Meteora DLMM: bin step (price step between bins in bps)
+    pub bin_step: Option<u16>,
 }
 
 struct PoolData {
@@ -660,4 +678,8 @@ struct PoolData {
     liquidity_lamports: u64,
     coin_vault: Option<Pubkey>,
     pc_vault: Option<Pubkey>,
+    /// Meteora DLMM: active bin ID (current price bin)
+    active_id: Option<i32>,
+    /// Meteora DLMM: bin step (price step between bins in bps)
+    bin_step: Option<u16>,
 }

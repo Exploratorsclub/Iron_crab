@@ -1226,6 +1226,14 @@ async fn run_geyser_loop(
                     if let Some(creator) = pool_event.creator {
                         accounts.push(creator.to_string());
                     }
+                    // Meteora DLMM: add active_id and bin_step as tagged values
+                    // Format: "active_id:<value>" and "bin_step:<value>"
+                    if let Some(active_id) = pool_event.active_id {
+                        accounts.push(format!("active_id:{}", active_id));
+                    }
+                    if let Some(bin_step) = pool_event.bin_step {
+                        accounts.push(format!("bin_step:{}", bin_step));
+                    }
 
                     let accounts_event = MarketEvent::new(
                         "market-data",

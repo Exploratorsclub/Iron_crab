@@ -370,9 +370,9 @@ impl Dex for MeteoraDlmm {
     /// - accounts[2] = token_y_mint (in original lb_pair order, NOT semantically "quote")
     /// - accounts[3] = reserve_x (token_x vault)
     /// - accounts[4] = reserve_y (token_y vault)
+    /// - accounts[5+] = tagged values: "active_id:<value>", "bin_step:<value>"
     ///
     /// Note: This creates a minimal pool entry for IX building.
-    /// For accurate quotes, Geyser account updates should provide full pool state.
     fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Result<()> {
         // Minimum required: pool_address, token_x_mint, token_y_mint
         if accounts.len() < 3 {
@@ -393,14 +393,14 @@ impl Dex for MeteoraDlmm {
         let token_y_mint = parse_pubkey(&accounts[2], "token_y_mint")?;
 
         // Reserve vaults: reserve_x is token_x vault, reserve_y is token_y vault
-        let reserve_x = if accounts.len() > 3 {
+        let reserve_x = if accounts.len() > 3 && !accounts[3].contains(':') {
             parse_pubkey(&accounts[3], "reserve_x")?
         } else {
             // Use placeholder - IX building will fail if actual vault needed
             Pubkey::default()
         };
 
-        let reserve_y = if accounts.len() > 4 {
+        let reserve_y = if accounts.len() > 4 && !accounts[4].contains(':') {
             parse_pubkey(&accounts[4], "reserve_y")?
         } else {
             Pubkey::default()
@@ -416,13 +416,27 @@ impl Dex for MeteoraDlmm {
             ));
         }
 
-        // Create minimal DlmmPool structure
-        // Note: bin_step and active_id are not in DexPoolAccounts, use defaults
-        // For accurate swaps, execution-engine may need to fetch these via Geyser updates
+        // Parse tagged values (active_id, bin_step) from remaining accounts
+        let mut active_id: i32 = 0;
+        let mut bin_step: u16 = 10; // Default
+        
+        for account in accounts.iter().skip(3) {
+            if let Some(value) = account.strip_prefix("active_id:") {
+                if let Ok(v) = value.parse::<i32>() {
+                    active_id = v;
+                }
+            } else if let Some(value) = account.strip_prefix("bin_step:") {
+                if let Ok(v) = value.parse::<u16>() {
+                    bin_step = v;
+                }
+            }
+        }
+
+        // Create DlmmPool structure with actual values from DexPoolAccounts
         let pool = DlmmPool {
             discriminator: [0u8; 8], // Not needed for IX building
-            bin_step: 10,            // Default, actual value comes from on-chain
-            active_id: 0,            // Will be updated from Geyser account updates
+            bin_step,
+            active_id,
             token_x_mint,
             token_y_mint,
             reserve_x,
@@ -441,6 +455,8 @@ impl Dex for MeteoraDlmm {
             pool = %pool_pk,
             token_x = %token_x_mint,
             token_y = %token_y_mint,
+            active_id = active_id,
+            bin_step = bin_step,
             "meteora_dlmm pool set from intent accounts (NO RPC)"
         );
 
@@ -544,6 +560,9 @@ impl Dex for MeteoraDlmm {
     /// The exact bin arrays needed depend on the active_id and swap size.
     /// This async method uses `build_swap_with_bins()` which fetches the correct
     /// bin arrays from chain.
+    ///
+    /// NOTE: Pool data (active_id, bin_step) comes from DexPoolAccounts event
+    /// which is populated by market-data from Geyser. No RPC calls in hot path.
     async fn build_swap_ix_async(
         &self,
         input_mint: &str,
@@ -568,6 +587,26 @@ impl Dex for MeteoraDlmm {
         let pool_addr = *pool_entry.key();
         let pool = pool_entry.value().pool.clone();
         drop(pool_entry); // Release DashMap lock before async call
+
+        // Validate that we have real active_id/bin_step from DexPoolAccounts
+        // If active_id is 0 and bin_step is default (10), the Intent may be missing data
+        if pool.active_id == 0 && pool.bin_step == 10 {
+            debug!(
+                pool = %pool_addr,
+                active_id = pool.active_id,
+                bin_step = pool.bin_step,
+                "meteora_dlmm: WARNING - using default active_id/bin_step, Intent may be missing DexPoolAccounts data"
+            );
+        }
+
+        debug!(
+            pool = %pool_addr,
+            active_id = pool.active_id,
+            bin_step = pool.bin_step,
+            token_x = %pool.token_x_mint,
+            token_y = %pool.token_y_mint,
+            "meteora_dlmm: building swap with cached pool data (no RPC)"
+        );
 
         // Determine swap direction
         let direction = if pool.token_x_mint == input_mint_pk {
@@ -612,6 +651,7 @@ impl Dex for MeteoraDlmm {
         let user_token_y = Pubkey::new_from_array(user_token_y_spl.to_bytes());
 
         // Build swap instruction WITH bin arrays (async)
+        // Uses active_id and bin_step from DexPoolAccounts (via set_pool_from_accounts)
         let swap_builder = MeteoraDlmmSwapBuilder::new(self.rpc.clone());
         let ix = swap_builder
             .build_swap_with_bins(
