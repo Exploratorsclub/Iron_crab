@@ -674,20 +674,38 @@ impl ArbContext {
     /// Store DEX pool accounts from DexPoolAccounts event
     /// These are passed through to execution-engine in TradeIntent.resources.accounts
     /// so execution-engine needs ZERO RPC calls.
-    fn handle_dex_pool_accounts(&self, pool_address: &str, base_mint: &str, accounts: Vec<String>) {
+    ///
+    /// CRITICAL: We store accounts under BOTH base_mint AND quote_mint keys because:
+    /// - Orca pools have base_mint=WSOL, quote_mint=TOKEN
+    /// - But TokenArbTracker is indexed by TOKEN mint
+    /// - Without storing under both keys, Orca pools would never be found!
+    fn handle_dex_pool_accounts(
+        &self,
+        pool_address: &str,
+        base_mint: &str,
+        quote_mint: &str,
+        accounts: Vec<String>,
+    ) {
         let mut trackers = self.trackers.write();
-        
-        // If tracker exists for this mint, store the accounts
-        if let Some(tracker) = trackers.get_mut(base_mint) {
-            tracker.set_pool_accounts(pool_address, accounts.clone());
-            debug!(
-                pool = %pool_address,
-                mint = %base_mint,
-                accounts_len = accounts.len(),
-                "DexPoolAccounts cached in tracker"
-            );
-        } else {
-            // Create tracker and store accounts for later
+
+        // Store under BOTH mints - this ensures the pool is found regardless of
+        // whether the token is base or quote in this particular pool.
+        let mints_to_store = [base_mint, quote_mint];
+        for mint in &mints_to_store {
+            if let Some(tracker) = trackers.get_mut(*mint) {
+                tracker.set_pool_accounts(pool_address, accounts.clone());
+                debug!(
+                    pool = %pool_address,
+                    mint = %mint,
+                    accounts_len = accounts.len(),
+                    "DexPoolAccounts cached in tracker"
+                );
+            }
+        }
+
+        // If no tracker exists for either mint yet, create one for base_mint
+        // (will be used when PoolDiscovered event arrives)
+        if !trackers.contains_key(base_mint) && !trackers.contains_key(quote_mint) {
             let mut tracker = TokenArbTracker::new(base_mint);
             tracker.set_pool_accounts(pool_address, accounts.clone());
             trackers.insert(base_mint.to_string(), tracker);
@@ -1399,17 +1417,18 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             dex,
             pool_address,
             base_mint,
+            quote_mint,
             accounts,
-            ..
         } => {
             debug!(
                 dex = %dex,
                 pool = %pool_address,
                 base_mint = %base_mint,
+                quote_mint = %quote_mint,
                 accounts_len = accounts.len(),
                 "Received DexPoolAccounts event"
             );
-            ctx.handle_dex_pool_accounts(pool_address, base_mint, accounts.clone());
+            ctx.handle_dex_pool_accounts(pool_address, base_mint, quote_mint, accounts.clone());
             None
         }
 
