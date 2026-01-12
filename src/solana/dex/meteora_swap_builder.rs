@@ -3,7 +3,7 @@
 //! Builds swap instructions for Meteora's Dynamic Liquidity Market Maker.
 //! Handles bin array discovery and proper account ordering.
 
-use anyhow::{ensure, Result};
+use anyhow::{anyhow, ensure, Result};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -187,6 +187,15 @@ impl MeteoraDlmmSwapBuilder {
 
         // Fetch bin arrays for this pool
         let bin_arrays = self.fetch_bin_arrays(lb_pair, active_id, bin_step).await?;
+        
+        // Meteora DLMM requires at least 1 bin array to be present
+        if bin_arrays.is_empty() {
+            return Err(anyhow!(
+                "No bin arrays found for pool {} (active_id={}, bin_step={}). \
+                 RPC might be rate-limited or bin arrays don't exist on-chain.",
+                lb_pair, active_id, bin_step
+            ));
+        }
 
         // Derive oracle PDA
         let (oracle, _) = Pubkey::find_program_address(

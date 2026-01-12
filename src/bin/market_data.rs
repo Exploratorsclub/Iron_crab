@@ -1319,11 +1319,11 @@ async fn run_geyser_loop(
                     // This enables real-time liquidity tracking without RPC calls.
                     if pool_event.dex_type == PoolDexType::MeteoraDlmm {
                         // For Meteora DLMM, we need to subscribe to bin array accounts.
-                        // We derive PDAs for ±3 arrays around the active bin (index 0 initially).
-                        // TODO: Get actual active_id from pool account parsing in geyser_pool_discovery
-                        let active_id = 0i32; // Initial assumption; will be updated via pool state
+                        // We derive PDAs for ±3 arrays around the active bin.
+                        // Use actual active_id/bin_step from pool_event (parsed in geyser_pool_discovery)
+                        let active_id = pool_event.active_id.unwrap_or(0);
                         let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
-                        let bin_step = 1u16; // Default; will be updated from pool account
+                        let bin_step = pool_event.bin_step.unwrap_or(1);
 
                         let mut bin_arrays_changed = false;
                         {
