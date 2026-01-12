@@ -457,35 +457,24 @@ impl GeyserPoolDiscovery {
             return None;
         }
 
-        // Determine which is base and which is quote (SOL is usually quote)
-        let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
-            .unwrap_or_else(|_| Pubkey::new_from_array([0u8; 32]));
-
-        let (base_mint, quote_mint, coin_vault, pc_vault) = if parsed.token_y_mint == sol_mint {
-            // Token Y is SOL (quote), Token X is base
-            (
-                parsed.token_x_mint,
-                parsed.token_y_mint,
-                parsed.reserve_x,
-                parsed.reserve_y,
-            )
-        } else if parsed.token_x_mint == sol_mint {
-            // Token X is SOL (quote), Token Y is base
-            (
-                parsed.token_y_mint,
-                parsed.token_x_mint,
-                parsed.reserve_y,
-                parsed.reserve_x,
-            )
-        } else {
-            // Neither is SOL, use token_x as base by convention
-            (
-                parsed.token_x_mint,
-                parsed.token_y_mint,
-                parsed.reserve_x,
-                parsed.reserve_y,
-            )
-        };
+        // IMPORTANT for Meteora DLMM:
+        //
+        // The lb_pair account has fixed positions for token_x/token_y and reserve_x/reserve_y.
+        // The Meteora swap instruction requires these accounts in their ORIGINAL positions -
+        // swapping them causes ConstraintHasOne errors.
+        //
+        // We send everything in the original lb_pair structure order:
+        // - base_mint = token_x_mint (position in lb_pair, not semantically "base")
+        // - quote_mint = token_y_mint
+        // - coin_vault = reserve_x (token_x vault)
+        // - pc_vault = reserve_y (token_y vault)
+        //
+        // The swap builder in execution-engine will determine swap direction based on
+        // which token is actually being traded.
+        let base_mint = parsed.token_x_mint;
+        let quote_mint = parsed.token_y_mint;
+        let coin_vault = parsed.reserve_x;
+        let pc_vault = parsed.reserve_y;
 
         // Estimate liquidity from bin parameters
         // liquidity (u128) represents concentrated liquidity at active bin

@@ -364,17 +364,17 @@ impl Dex for MeteoraDlmm {
     /// `Intent.resources.accounts` which were populated by arb-strategy from
     /// `DexPoolAccounts` events (Geyser data).
     ///
-    /// Expected accounts format (from market_data.rs DexPoolAccounts):
-    /// - accounts[0] = pool_address
-    /// - accounts[1] = base_mint (token_x_mint)
-    /// - accounts[2] = quote_mint (token_y_mint)
-    /// - accounts[3] = coin_vault (reserve_x) - optional
-    /// - accounts[4] = pc_vault (reserve_y) - optional
+    /// Expected accounts format (from market_data.rs DexPoolAccounts for Meteora DLMM):
+    /// - accounts[0] = pool_address (lb_pair)
+    /// - accounts[1] = token_x_mint (in original lb_pair order, NOT semantically "base")
+    /// - accounts[2] = token_y_mint (in original lb_pair order, NOT semantically "quote")
+    /// - accounts[3] = reserve_x (token_x vault)
+    /// - accounts[4] = reserve_y (token_y vault)
     ///
     /// Note: This creates a minimal pool entry for IX building.
     /// For accurate quotes, Geyser account updates should provide full pool state.
     fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Result<()> {
-        // Minimum required: pool_address, base_mint, quote_mint
+        // Minimum required: pool_address, token_x_mint, token_y_mint
         if accounts.len() < 3 {
             return Err(anyhow!(
                 "meteora_dlmm set_pool_from_accounts requires at least 3 accounts, got {}",
@@ -387,19 +387,21 @@ impl Dex for MeteoraDlmm {
         };
 
         let pool_pk = parse_pubkey(pool_address, "pool_address")?;
-        let token_x_mint = parse_pubkey(&accounts[1], "base_mint/token_x_mint")?;
-        let token_y_mint = parse_pubkey(&accounts[2], "quote_mint/token_y_mint")?;
+        
+        // accounts[1] and accounts[2] are token_x_mint and token_y_mint in ORIGINAL lb_pair order
+        let token_x_mint = parse_pubkey(&accounts[1], "token_x_mint")?;
+        let token_y_mint = parse_pubkey(&accounts[2], "token_y_mint")?;
 
-        // Reserve vaults are optional (may not be in DexPoolAccounts for all DEXes)
+        // Reserve vaults: reserve_x is token_x vault, reserve_y is token_y vault
         let reserve_x = if accounts.len() > 3 {
-            parse_pubkey(&accounts[3], "coin_vault/reserve_x")?
+            parse_pubkey(&accounts[3], "reserve_x")?
         } else {
             // Use placeholder - IX building will fail if actual vault needed
             Pubkey::default()
         };
 
         let reserve_y = if accounts.len() > 4 {
-            parse_pubkey(&accounts[4], "pc_vault/reserve_y")?
+            parse_pubkey(&accounts[4], "reserve_y")?
         } else {
             Pubkey::default()
         };
@@ -524,6 +526,26 @@ impl Dex for MeteoraDlmm {
 
     fn build_swap_ix(
         &self,
+        _input_mint: &str,
+        _output_mint: &str,
+        _amount_in: u64,
+        _min_out: u64,
+    ) -> Result<Vec<Instruction>> {
+        // Meteora DLMM requires async build (for bin array fetching).
+        // Use build_swap_ix_async instead.
+        Err(anyhow!(
+            "meteora_dlmm: use build_swap_ix_async (requires bin array fetching)"
+        ))
+    }
+
+    /// Async version that properly fetches bin arrays.
+    ///
+    /// Meteora DLMM swaps require multiple bin_array accounts as "remaining accounts".
+    /// The exact bin arrays needed depend on the active_id and swap size.
+    /// This async method uses `build_swap_with_bins()` which fetches the correct
+    /// bin arrays from chain.
+    async fn build_swap_ix_async(
+        &self,
         input_mint: &str,
         output_mint: &str,
         amount_in: u64,
@@ -544,7 +566,8 @@ impl Dex for MeteoraDlmm {
             .ok_or_else(|| anyhow!("No pool found for {}/{}", input_mint, output_mint))?;
 
         let pool_addr = *pool_entry.key();
-        let pool = &pool_entry.value().pool;
+        let pool = pool_entry.value().pool.clone();
+        drop(pool_entry); // Release DashMap lock before async call
 
         // Determine swap direction
         let direction = if pool.token_x_mint == input_mint_pk {
@@ -553,49 +576,60 @@ impl Dex for MeteoraDlmm {
             SwapDirection::YtoX
         };
 
-        // Build swap instruction
-        // Note: This is a simplified implementation. Full version needs:
-        // 1. User's actual token accounts (ATAs)
-        // 2. Bin array accounts (dynamic based on active_id)
-        // 3. Proper authority derivation
-        let swap_builder = MeteoraDlmmSwapBuilder::new(self.rpc.clone());
-
         // Get user authority
-        let user = self.user_authority.read()
+        let user = self
+            .user_authority
+            .read()
             .ok_or_else(|| anyhow!("meteora_dlmm user_authority not set"))?;
 
         // Convert to spl_token Pubkey type for ATA derivation
-        let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(user.to_bytes());
-        let token_x_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(pool.token_x_mint.to_bytes());
-        let token_y_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(pool.token_y_mint.to_bytes());
+        let owner_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(user.to_bytes());
+        let token_x_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+            pool.token_x_mint.to_bytes(),
+        );
+        let token_y_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+            pool.token_y_mint.to_bytes(),
+        );
         let token_program_spl = spl_token::id();
 
         // Derive ATAs for user
-        let user_token_x_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-            &owner_spl, &token_x_spl, &token_program_spl
-        );
-        let user_token_y_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-            &owner_spl, &token_y_spl, &token_program_spl
-        );
+        let user_token_x_spl =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &owner_spl,
+                &token_x_spl,
+                &token_program_spl,
+            );
+        let user_token_y_spl =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &owner_spl,
+                &token_y_spl,
+                &token_program_spl,
+            );
 
         // Convert back to solana_sdk Pubkey
         let user_token_x = Pubkey::new_from_array(user_token_x_spl.to_bytes());
         let user_token_y = Pubkey::new_from_array(user_token_y_spl.to_bytes());
 
-        let ix = swap_builder.build_swap(
-            &pool_addr,
-            &pool.reserve_x,
-            &pool.reserve_y,
-            &user_token_x,
-            &user_token_y,
-            &pool.token_x_mint,
-            &pool.token_y_mint,
-            &user,
-            amount_in,
-            min_out,
-            direction,
-            pool.active_id,
-        )?;
+        // Build swap instruction WITH bin arrays (async)
+        let swap_builder = MeteoraDlmmSwapBuilder::new(self.rpc.clone());
+        let ix = swap_builder
+            .build_swap_with_bins(
+                &pool_addr,
+                &pool.reserve_x,
+                &pool.reserve_y,
+                &user_token_x,
+                &user_token_y,
+                &pool.token_x_mint,
+                &pool.token_y_mint,
+                &user,
+                amount_in,
+                min_out,
+                direction,
+                pool.active_id,
+                pool.bin_step,
+            )
+            .await?;
 
         Ok(vec![ix])
     }
