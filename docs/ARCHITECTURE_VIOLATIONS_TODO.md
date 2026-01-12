@@ -2,7 +2,7 @@
 
 **Erstellt:** 2026-01-11  
 **Aktualisiert:** 2026-01-12 (TODO-7/8 komplett inkl. Consumer-Cache)  
-**Status:** 🟢 TODO-1 bis TODO-8 komplett - Verbleibend: TODO-9 Momentum SELL (P3)  
+**Status:** 🟢 TODO-1 bis TODO-9 komplett - Alle Architektur-Violations behoben!  
 **Source of Truth:** `docs/TARGET_ARCHITECTURE.md`, `docs/ROLE_SEPARATION.md`
 
 ---
@@ -331,24 +331,35 @@ nicht per Lazy-PDA im Consumer. Analog zu Vault Balances.
 
 ### Phase 4: Momentum-Bot Geyser-Conformance (Separate Pipeline)
 
-#### TODO-9: Momentum-Bot SELL Path auf Intent-Metadata umstellen ⬜ TODO
+#### TODO-9: Momentum-Bot SELL Path auf Intent-Metadata umstellen ✅ BEREITS ERFÜLLT
 **Priorität:** 🟢 P3 (separater Code-Path, nicht arb-blocking)  
-**Verstöße:** V6  
+**Verstöße:** V6 (nach Analyse: nicht zutreffend)  
 **Dateien:**
 - `src/bin/momentum_bot.rs`
-- `src/solana/execution.rs`
+- `src/execution/tx_builder.rs`
 
-**Schritte:**
-1. [ ] momentum-bot: Quote-Daten im SELL-Intent mitschicken
-   ```rust
-   intent.metadata.insert("sell_quote_amount_out", quote.amount_out.to_string());
-   intent.metadata.insert("sell_pool", pool_address.clone());
-   intent.metadata.insert("sell_dex", dex_name.clone());
-   ```
-2. [ ] execution.rs: Intent-Metadata statt RPC-Quote verwenden
-3. [ ] Fallback für alte Intents ohne Metadata
+**Status nach Code-Analyse:**
+Der Momentum SELL Path ist **bereits architektur-konform**:
 
-**Erwartetes Ergebnis:** momentum-bot SELL-Intents brauchen keine RPC-Quotes in execution-engine
+1. ✅ momentum-bot berechnet Quote und schickt:
+   - `intent.execution.min_out` (deterministic min SOL output)
+   - `intent.metadata.min_out_raw` (legacy fallback)
+   - `intent.metadata.dex` (sell_dex)
+   - `intent.resources.pools[0]` (sell_pool)
+
+2. ✅ tx_builder nutzt Intent-Metadata (KEIN RPC für Quotes):
+   - `min_out_raw_from_intent()` liest aus `intent.execution.min_out.raw`
+   - Fallback auf `intent.metadata.min_out_raw`
+
+3. ✅ Fallback für alte Intents ohne `execution.min_out` ist implementiert
+
+**Verbleibende RPC Calls (separate Issues, nicht Quote-bezogen):**
+- Orca: Pool State Loading via `rpc.get_account()` 
+- Raydium: Pool + Serum Account Loading
+
+Diese betreffen Pool State Loading, nicht Quote-Berechnung, und sind nur relevant wenn momentum-bot auf Orca/Raydium SELL routes wechselt (aktuell primär PumpFun).
+
+**Erwartetes Ergebnis:** ✅ Erfüllt - momentum-bot SELL-Intents verwenden bereits Intent-Metadata für Quotes
 
 ---
 
@@ -364,9 +375,9 @@ nicht per Lazy-PDA im Consumer. Analog zu Vault Balances.
 | TODO-6 | ✅ | - | Done |
 | TODO-7 | ✅ | - | Done |
 | TODO-8 | ✅ | - | Done |
-| TODO-9 | ⬜ | - | 2h |
+| TODO-9 | ✅ | - | Done (bereits erfüllt) |
 
-**Kritischer Pfad:** TODO-1 → TODO-8 ✅ komplett (Geyser-Pipeline funktional inkl. Consumer-Cache)
+**Kritischer Pfad:** TODO-1 → TODO-9 ✅ ALLE KOMPLETT!
 
 ---
 
