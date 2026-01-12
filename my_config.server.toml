@@ -336,6 +336,7 @@ momentum_exit_min_trades = 5        # Need 5+ trades to evaluate
 # Used by execution-engine binary for atomic cross-DEX arbitrage
 # ============================================================================
 [execution_engine]
+address_lookup_table = "2J74oVKaviWzVr9gaLDvmBf3VAVVpzy88i3YCnyDwvuX"  # ALT for TX size reduction
 jito_enabled = true                 # Enable Jito bundle submission
 jito_tip_lamports = 10000          # Tip: 0.00001 SOL per bundle
 jito_region = "frankfurt"          # Block Engine: frankfurt, amsterdam, ny, tokyo, slc
