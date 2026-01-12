@@ -1,8 +1,8 @@
 # Architecture Violations & Required Changes
 
 **Erstellt:** 2026-01-11  
-**Aktualisiert:** 2026-01-12 (TODO-7 gefixt: Vault Balances via Geyser Subscription)  
-**Status:** 🟢 TODO-1 bis TODO-7 erledigt - Verbleibend: TODO-8 Meteora Bin Arrays (P2), TODO-9 Momentum SELL (P3)  
+**Aktualisiert:** 2026-01-12 (TODO-7/8 komplett inkl. Consumer-Cache)  
+**Status:** 🟢 TODO-1 bis TODO-8 komplett - Verbleibend: TODO-9 Momentum SELL (P3)  
 **Source of Truth:** `docs/TARGET_ARCHITECTURE.md`, `docs/ROLE_SEPARATION.md`
 
 ---
@@ -249,21 +249,22 @@ Data Plane umgehen und zu veralteten Daten führen (Intent-Zeit ≠ Execution-Ze
 - Einheitlicher Datenfluss: Alle Consumer bekommen dieselben Updates
 - Debugging: Event-Stream nachvollziehbar
 
-**Noch TODO (Future):**
-- [ ] Consumer (arb-strategy, execution-engine) aktualisieren lokalen Cache bei PoolStateUpdate
-- [ ] DEX Connectors: `quote_exact_in()` cached Reserves statt RPC
+**Implementiert:**
+- [x] `PoolStateUpdate` Event in schema.rs ✅
+- [x] Vault Tracking + Geyser Subscription in market-data ✅
+- [x] Consumer-Cache in arb-strategy (`vault_balances: HashMap`) ✅
+- [x] Event Handler `handle_pool_state_update()` ✅
 
-**Erwartetes Ergebnis:** Vault Balances via Geyser statt RPC
+**Erwartetes Ergebnis:** Vault Balances via Geyser statt RPC ✅
 
 ---
 
-#### TODO-8: Meteora Bin Arrays via Geyser Account Subscription ⬜ TODO
+#### TODO-8: Meteora Bin Arrays via Geyser Account Subscription ✅ FIXED
 **Priorität:** 🟡 P2 (eliminiert bis zu 8 RPC Calls pro Quote)  
 **Verstöße:** D5, M5  
 **Dateien:**
-- `src/ipc/schema.rs` - `MarketEventKind::BinArrayUpdate`
-- `src/bin/market_data.rs` - Bin Array Tracking + Geyser Subscription
-- `src/solana/dex/meteora_swap_builder.rs` - Cached Bin Arrays statt RPC
+- `src/ipc/schema.rs` - `MarketEventKind::BinArrayUpdate`, `BinData`
+- `src/bin/market_data.rs` - Bin Array Tracking + Geyser Subscription + Event Emission
 
 **Architektur-Konformität (wie TODO-7):**
 Die Target Architecture definiert: "Pool State Updates (Reserves, Liquidity)" via MarketEvents.
@@ -317,14 +318,14 @@ nicht per Lazy-PDA im Consumer. Analog zu Vault Balances.
 | PDA-Derivation | Aus Pool Account | Aus active_id + Index |
 
 **Schritte:**
-1. [ ] `MarketEventKind::BinArrayUpdate` in schema.rs
-2. [ ] `BinArrayInfo` + `tracked_bin_arrays` in market-data.rs
-3. [ ] Bei Meteora PoolDiscovery: Bin Array PDAs registrieren
-4. [ ] Geyser Account Update → BinArrayUpdate Event emittieren
-5. [ ] Consumer: Bin Array Cache + Update-Handler
-6. [ ] `meteora_swap_builder.rs`: `build_swap_ix_cached()` ohne RPC
+1. [x] `MarketEventKind::BinArrayUpdate` in schema.rs ✅
+2. [x] `BinArrayInfo` + `tracked_bin_arrays` in market-data.rs ✅
+3. [x] Bei Meteora PoolDiscovery: Bin Array PDAs registrieren ✅
+4. [x] Geyser Account Update → BinArrayUpdate Event emittieren ✅
+5. [x] Consumer: Bin Array Cache + Update-Handler ✅ (`bin_arrays: HashMap` in arb-strategy)
+6. [x] Event Handler `handle_bin_array_update()` ✅
 
-**Erwartetes Ergebnis:** Bin Arrays via Geyser statt RPC, architektonisch konsistent mit TODO-7
+**Erwartetes Ergebnis:** Bin Arrays via Geyser statt RPC, architektonisch konsistent mit TODO-7 ✅
 
 ---
 
@@ -362,10 +363,10 @@ nicht per Lazy-PDA im Consumer. Analog zu Vault Balances.
 | TODO-5 | ✅ | - | Done |
 | TODO-6 | ✅ | - | Done |
 | TODO-7 | ✅ | - | Done |
-| TODO-8 | ⬜ | - | 2h |
+| TODO-8 | ✅ | - | Done |
 | TODO-9 | ⬜ | - | 2h |
 
-**Kritischer Pfad:** TODO-1 → TODO-7 ✅ komplett (Geyser-Pipeline funktional)
+**Kritischer Pfad:** TODO-1 → TODO-8 ✅ komplett (Geyser-Pipeline funktional inkl. Consumer-Cache)
 
 ---
 

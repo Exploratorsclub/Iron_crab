@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use ironcrab::config::Config as AppConfig;
 use ironcrab::ipc::{
-    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
+    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
     IntentTier, MarketEvent, MarketEventKind, TradeIntent, TradeResources, TradeSide,
     TradingRegime,
 };
@@ -472,6 +472,32 @@ struct ArbContext {
     // Data quality metrics
     zero_amount_trades: AtomicU64,
     data_quality_rejects: AtomicU64,
+
+    // =========================================================================
+    // Geyser-based Pool State Cache (from PoolStateUpdate / BinArrayUpdate)
+    // =========================================================================
+    /// Vault balances cache: pool_address → (reserve_base, reserve_quote, update_slot)
+    /// Updated from PoolStateUpdate events (via market-data Geyser subscription)
+    vault_balances: RwLock<HashMap<String, VaultBalanceCache>>,
+
+    /// Meteora DLMM Bin Arrays cache: pool_address → bin_array_index → bins
+    /// Updated from BinArrayUpdate events (via market-data Geyser subscription)
+    bin_arrays: RwLock<HashMap<String, HashMap<i64, BinArrayCache>>>,
+}
+
+/// Cached vault balances from PoolStateUpdate events
+#[derive(Debug, Clone)]
+struct VaultBalanceCache {
+    reserve_base: u64,
+    reserve_quote: u64,
+    update_slot: u64,
+}
+
+/// Cached bin array data from BinArrayUpdate events
+#[derive(Debug, Clone)]
+struct BinArrayCache {
+    bins: Vec<BinData>,
+    update_slot: u64,
 }
 
 impl ArbContext {
@@ -672,6 +698,93 @@ impl ArbContext {
                 "DexPoolAccounts cached (new tracker created)"
             );
         }
+    }
+
+    /// Handle PoolStateUpdate event - cache vault balances from Geyser
+    /// This eliminates RPC calls to fetch vault balances during quoting.
+    fn handle_pool_state_update(
+        &self,
+        pool_address: &str,
+        _dex: &str,
+        reserve_base: u64,
+        reserve_quote: u64,
+        update_slot: u64,
+    ) {
+        let mut cache = self.vault_balances.write();
+        let is_new = !cache.contains_key(pool_address);
+        cache.insert(
+            pool_address.to_string(),
+            VaultBalanceCache {
+                reserve_base,
+                reserve_quote,
+                update_slot,
+            },
+        );
+        if is_new {
+            debug!(
+                pool = %pool_address,
+                reserve_base,
+                reserve_quote,
+                slot = update_slot,
+                "Vault balances cached (new pool)"
+            );
+        } else {
+            debug!(
+                pool = %pool_address,
+                reserve_base,
+                reserve_quote,
+                slot = update_slot,
+                "Vault balances updated"
+            );
+        }
+    }
+
+    /// Handle BinArrayUpdate event - cache Meteora DLMM bin arrays from Geyser
+    /// This eliminates RPC calls to fetch bin arrays during quoting.
+    fn handle_bin_array_update(
+        &self,
+        pool_address: &str,
+        bin_array_index: i64,
+        bins: Vec<BinData>,
+        update_slot: u64,
+    ) {
+        let mut cache = self.bin_arrays.write();
+        let pool_cache = cache.entry(pool_address.to_string()).or_default();
+        let bins_count = bins.len();
+        pool_cache.insert(
+            bin_array_index,
+            BinArrayCache { bins, update_slot },
+        );
+        debug!(
+            pool = %pool_address,
+            bin_array_index,
+            bins_count,
+            slot = update_slot,
+            "Bin array cached"
+        );
+    }
+
+    /// Get cached vault balances for a pool (returns None if not cached)
+    #[allow(dead_code)]
+    fn get_vault_balances(&self, pool_address: &str) -> Option<(u64, u64)> {
+        self.vault_balances
+            .read()
+            .get(pool_address)
+            .map(|c| (c.reserve_base, c.reserve_quote))
+    }
+
+    /// Get cached bin arrays for a Meteora DLMM pool (returns None if not cached)
+    #[allow(dead_code)]
+    fn get_bin_arrays(&self, pool_address: &str) -> Option<HashMap<i64, Vec<BinData>>> {
+        self.bin_arrays
+            .read()
+            .get(pool_address)
+            .map(|arrays| {
+                arrays
+                    .iter()
+                    .map(|(idx, cache)| (*idx, cache.bins.clone()))
+                    .collect()
+            })
     }
 
     /// Update price from trade event
@@ -1046,6 +1159,8 @@ async fn main() -> Result<()> {
         intent_counter: AtomicU64::new(0),
         zero_amount_trades: AtomicU64::new(0),
         data_quality_rejects: AtomicU64::new(0),
+        vault_balances: RwLock::new(HashMap::new()),
+        bin_arrays: RwLock::new(HashMap::new()),
     });
 
     // Subscribe to MarketEvents
@@ -1295,6 +1410,30 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
                 "Received DexPoolAccounts event"
             );
             ctx.handle_dex_pool_accounts(pool_address, base_mint, accounts.clone());
+            None
+        }
+
+        // Handle PoolStateUpdate - cache vault balances from Geyser (eliminates RPC calls)
+        MarketEventKind::PoolStateUpdate {
+            pool_address,
+            dex,
+            reserve_base,
+            reserve_quote,
+            update_slot,
+            ..
+        } => {
+            ctx.handle_pool_state_update(pool_address, dex, *reserve_base, *reserve_quote, *update_slot);
+            None
+        }
+
+        // Handle BinArrayUpdate - cache Meteora DLMM bin arrays from Geyser (eliminates RPC calls)
+        MarketEventKind::BinArrayUpdate {
+            pool_address,
+            bin_array_index,
+            bins,
+            update_slot,
+        } => {
+            ctx.handle_bin_array_update(pool_address, *bin_array_index, bins.clone(), *update_slot);
             None
         }
 

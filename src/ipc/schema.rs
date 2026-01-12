@@ -117,6 +117,23 @@ impl ExplicitAmount {
 }
 
 // ============================================================================
+// Meteora DLMM Bin Data (for BinArrayUpdate events)
+// ============================================================================
+
+/// Single bin data for Meteora DLMM (compact serialization)
+///
+/// Only bins with non-zero liquidity are included in BinArrayUpdate events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BinData {
+    /// Offset within the bin array (0-69)
+    pub offset: u8,
+    /// Amount of token X (base) in this bin
+    pub amount_x: u64,
+    /// Amount of token Y (quote) in this bin
+    pub amount_y: u64,
+}
+
+// ============================================================================
 // MarketEvent (produced by market-data)
 // ============================================================================
 
@@ -231,6 +248,20 @@ pub enum MarketEventKind {
         base_mint: String,
         /// Quote mint for context
         quote_mint: String,
+        /// Slot when this update was observed
+        update_slot: u64,
+    },
+    /// Meteora DLMM Bin Array update (via Geyser Account Subscription)
+    ///
+    /// Emitted by market-data when subscribed Bin Array accounts change.
+    /// Contains liquidity distribution data for accurate quoting.
+    /// Eliminates the need for RPC calls to fetch bin arrays.
+    BinArrayUpdate {
+        pool_address: String,
+        /// Index of this bin array (determines which bins it contains)
+        bin_array_index: i64,
+        /// Bin data (compact: only bins with liquidity)
+        bins: Vec<BinData>,
         /// Slot when this update was observed
         update_slot: u64,
     },

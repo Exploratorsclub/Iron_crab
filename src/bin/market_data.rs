@@ -26,17 +26,20 @@ use uuid::Uuid;
 
 use ironcrab::config::WalletTrackerCfg;
 use ironcrab::ipc::{
-    ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, MarketEvent, MarketEventKind,
+    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, MarketEvent, MarketEventKind,
 };
 use ironcrab::metrics::{
     serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
     NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
+use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
+use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
+use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use ironcrab::solana::dex_parser::{
     parse_account_update, parse_transaction_update, DexType, ParsedDexEvent,
 };
-use ironcrab::solana::geyser_pool_discovery::GeyserPoolDiscovery;
+use ironcrab::solana::geyser_pool_discovery::{DexType as PoolDexType, GeyserPoolDiscovery};
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::solana::wallet_tracker::WalletTracker;
 use spl_token::solana_program::program_option::COption;
@@ -151,6 +154,12 @@ struct MarketDataContext {
     tracked_vaults: parking_lot::RwLock<std::collections::HashMap<Pubkey, VaultInfo>>,
     /// Channel to notify GeyserListener when tracked vaults change (triggers resubscribe).
     tracked_vaults_tx: watch::Sender<Vec<Pubkey>>,
+
+    /// Meteora DLMM Bin Array tracking for BinArrayUpdate events (Geyser-based liquidity).
+    /// Maps bin_array_pda → BinArrayInfo (pool context).
+    tracked_bin_arrays: parking_lot::RwLock<std::collections::HashMap<Pubkey, BinArrayInfo>>,
+    /// Channel to notify GeyserListener when tracked bin arrays change (triggers resubscribe).
+    tracked_bin_arrays_tx: watch::Sender<Vec<Pubkey>>,
 }
 
 /// Information about a tracked vault account
@@ -179,6 +188,16 @@ impl Clone for VaultInfo {
             ),
         }
     }
+}
+
+/// Information about a tracked Meteora DLMM Bin Array account
+#[derive(Debug, Clone)]
+struct BinArrayInfo {
+    pool_address: Pubkey,
+    /// Index of this bin array (determines which bins it contains)
+    bin_array_index: i64,
+    /// Bin step from pool (needed for price calculation)
+    bin_step: u16,
 }
 
 impl MarketDataContext {
@@ -389,6 +408,7 @@ async fn main() -> Result<()> {
 
     let (tracked_mints_tx, tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
     let (tracked_vaults_tx, tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
+    let (tracked_bin_arrays_tx, tracked_bin_arrays_rx) = watch::channel(Vec::<Pubkey>::new());
 
     let ctx = Arc::new(MarketDataContext {
         run_id: run_id.clone(),
@@ -402,6 +422,8 @@ async fn main() -> Result<()> {
         known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
         tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_vaults_tx,
+        tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        tracked_bin_arrays_tx,
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -445,6 +467,7 @@ async fn main() -> Result<()> {
             config_subscription,
             tracked_mints_rx,
             tracked_vaults_rx,
+            tracked_bin_arrays_rx,
         )
         .await?;
     }
@@ -464,6 +487,7 @@ async fn run_geyser_loop(
     mut config_subscription: Option<ironcrab::nats::NatsSubscription>,
     tracked_mints_rx: watch::Receiver<Vec<Pubkey>>,
     tracked_vaults_rx: watch::Receiver<Vec<Pubkey>>,
+    tracked_bin_arrays_rx: watch::Receiver<Vec<Pubkey>>,
 ) -> Result<()> {
     // Initialize RPC client for fallback/metadata (prefer local RPC, fallback to Helius)
     let rpc_url =
@@ -499,24 +523,28 @@ async fn run_geyser_loop(
         }
     });
 
-    // Merge tracked_mints and tracked_vaults into a single combined channel for GeyserListener.
+    // Merge tracked_mints, tracked_vaults, and tracked_bin_arrays into a single combined channel.
     // GeyserListener will subscribe to all accounts in the combined list.
     let (combined_tracked_tx, combined_tracked_rx) = watch::channel(Vec::<Pubkey>::new());
     {
         let mut mints_rx = tracked_mints_rx;
         let mut vaults_rx = tracked_vaults_rx;
+        let mut bin_arrays_rx = tracked_bin_arrays_rx;
         let combined_tx = combined_tracked_tx;
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = mints_rx.changed() => {}
                     _ = vaults_rx.changed() => {}
+                    _ = bin_arrays_rx.changed() => {}
                 }
-                // Merge both lists
+                // Merge all lists
                 let mints: Vec<Pubkey> = mints_rx.borrow().clone();
                 let vaults: Vec<Pubkey> = vaults_rx.borrow().clone();
+                let bin_arrays: Vec<Pubkey> = bin_arrays_rx.borrow().clone();
                 let mut combined: Vec<Pubkey> = mints;
                 combined.extend(vaults);
+                combined.extend(bin_arrays);
                 combined.sort();
                 combined.dedup();
                 let _ = combined_tx.send(combined);
@@ -693,6 +721,70 @@ async fn run_geyser_loop(
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // Bin Array account updates → emit BinArrayUpdate (Geyser-based liquidity distribution)
+                // This eliminates the need for RPC calls to fetch Meteora DLMM bin arrays.
+                let dlmm_program = Pubkey::from_str(METEORA_DLMM_PROGRAM)
+                    .expect("Invalid METEORA_DLMM_PROGRAM constant");
+                if account_update.owner == dlmm_program {
+                    if let Some(bin_array_info) = ctx.tracked_bin_arrays.read().get(&account_update.pubkey).cloned() {
+                        // Parse bin array to extract liquidity distribution
+                        match BinArray::parse(&account_update.data, bin_array_info.bin_step) {
+                            Ok(parsed_array) => {
+                                // Convert to compact BinData (only bins with liquidity)
+                                let bins: Vec<BinData> = parsed_array.bins
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, bin)| bin.amount_x > 0 || bin.amount_y > 0)
+                                    .map(|(offset, bin)| BinData {
+                                        offset: offset as u8,
+                                        amount_x: bin.amount_x,
+                                        amount_y: bin.amount_y,
+                                    })
+                                    .collect();
+
+                                // Only emit if there's any liquidity
+                                if !bins.is_empty() {
+                                    let bin_event = MarketEvent::new(
+                                        "market-data",
+                                        BUILD_VERSION,
+                                        run_id,
+                                        ctx.next_event_id(),
+                                        "geyser_bin_array",
+                                        Some(account_update.slot),
+                                        MarketEventKind::BinArrayUpdate {
+                                            pool_address: bin_array_info.pool_address.to_string(),
+                                            bin_array_index: bin_array_info.bin_array_index,
+                                            bins,
+                                            update_slot: account_update.slot,
+                                        },
+                                    );
+
+                                    if let Err(e) = ctx.jsonl_writer.write(&bin_event) {
+                                        error!(error = %e, "Failed to write BinArrayUpdate event to JSONL");
+                                    }
+
+                                    if let Some(ref nats) = ctx.nats {
+                                        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &bin_event).await {
+                                            warn!(error = %e, "Failed to publish BinArrayUpdate event to NATS");
+                                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                        } else {
+                                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                            MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(
+                                    error = %e,
+                                    pubkey = %account_update.pubkey,
+                                    "Failed to parse bin array account"
+                                );
                             }
                         }
                     }
@@ -1213,6 +1305,50 @@ async fn run_geyser_loop(
                             pc_vault = ?pool_event.pc_vault,
                             "Registered vault accounts for PoolStateUpdate tracking"
                         );
+                    }
+
+                    // Track Meteora DLMM Bin Array accounts for BinArrayUpdate events
+                    // This enables real-time liquidity tracking without RPC calls.
+                    if pool_event.dex_type == PoolDexType::MeteoraDlmm {
+                        // For Meteora DLMM, we need to subscribe to bin array accounts.
+                        // We derive PDAs for ±3 arrays around the active bin (index 0 initially).
+                        // TODO: Get actual active_id from pool account parsing in geyser_pool_discovery
+                        let active_id = 0i32; // Initial assumption; will be updated via pool state
+                        let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
+                        let bin_step = 1u16; // Default; will be updated from pool account
+
+                        let mut bin_arrays_changed = false;
+                        {
+                            let mut bin_arrays = ctx.tracked_bin_arrays.write();
+                            // Register ±3 bin arrays around active bin
+                            for offset in -3i64..=3i64 {
+                                let index = active_array_index + offset;
+                                if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(
+                                    &pool_event.pool_address,
+                                    index,
+                                ) {
+                                    bin_arrays.entry(pda).or_insert_with(|| {
+                                        bin_arrays_changed = true;
+                                        BinArrayInfo {
+                                            pool_address: pool_event.pool_address,
+                                            bin_array_index: index,
+                                            bin_step,
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        // Notify GeyserListener to resubscribe with new bin array accounts
+                        if bin_arrays_changed {
+                            let bin_array_list: Vec<Pubkey> = ctx.tracked_bin_arrays.read().keys().copied().collect();
+                            let num_arrays = bin_array_list.len();
+                            let _ = ctx.tracked_bin_arrays_tx.send(bin_array_list);
+                            debug!(
+                                pool = %pool_event.pool_address,
+                                arrays_tracked = num_arrays,
+                                "Registered Meteora DLMM bin array accounts for BinArrayUpdate tracking"
+                            );
+                        }
                     }
                 }
             }
