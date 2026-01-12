@@ -257,23 +257,74 @@ Data Plane umgehen und zu veralteten Daten führen (Intent-Zeit ≠ Execution-Ze
 
 ---
 
-#### TODO-8: Meteora Bin Arrays ohne RPC laden ⬜ TODO
-**Priorität:** 🟡 P2 (eliminiert bis zu 8 RPC Calls)  
+#### TODO-8: Meteora Bin Arrays via Geyser Account Subscription ⬜ TODO
+**Priorität:** 🟡 P2 (eliminiert bis zu 8 RPC Calls pro Quote)  
 **Verstöße:** D5, M5  
-**Datei:** `src/solana/dex/meteora_swap_builder.rs`
+**Dateien:**
+- `src/ipc/schema.rs` - `MarketEventKind::BinArrayUpdate`
+- `src/bin/market_data.rs` - Bin Array Tracking + Geyser Subscription
+- `src/solana/dex/meteora_swap_builder.rs` - Cached Bin Arrays statt RPC
 
-**Empfohlene Lösung: Lazy PDA-Derivation ohne RPC**
-- Nur PDA berechnen, keine Account-Fetches
-- Bin-State aus Pool-Account (active_id) ableiten
-- Pro: Kein RPC, Pool-Account reicht
-- Con: Weniger genau für große Swaps
+**Architektur-Konformität (wie TODO-7):**
+Die Target Architecture definiert: "Pool State Updates (Reserves, Liquidity)" via MarketEvents.
+Bin Arrays enthalten Liquidity-Verteilung und müssen via Data Plane (market-data) geladen werden,
+nicht per Lazy-PDA im Consumer. Analog zu Vault Balances.
+
+**Implementierung (Full Geyser - Option A):**
+
+1. **MarketEventKind::BinArrayUpdate** in `src/ipc/schema.rs`:
+   ```rust
+   BinArrayUpdate {
+       pool_address: String,
+       bin_array_index: i64,
+       /// Serialized bin data (compact format)
+       bins: Vec<BinData>,
+       update_slot: u64,
+   }
+   ```
+
+2. **BinArrayInfo Tracking** in `market-data.rs`:
+   ```rust
+   struct BinArrayInfo {
+       pool_address: Pubkey,
+       bin_array_index: i64,
+       // PDA derived once, then tracked
+   }
+   tracked_bin_arrays: HashMap<Pubkey, BinArrayInfo>
+   ```
+
+3. **Registration bei PoolDiscovery:**
+   - Bei Meteora DLMM PoolCreated: active_id aus Pool Account lesen
+   - Bin Array PDAs für ±3 Arrays um active_id ableiten
+   - Zu `tracked_bin_arrays` hinzufügen
+   - GeyserListener resubscribed
+
+4. **BinArrayUpdate bei Geyser Account Update:**
+   - Wenn tracked Bin Array Account sich ändert
+   - Parse Bin Data, emit `BinArrayUpdate` via NATS
+
+5. **Consumer Cache:**
+   - `arb-strategy` / `execution-engine`: Lokaler Bin Array Cache
+   - Update bei `BinArrayUpdate` Events
+   - `meteora_swap_builder.rs`: Cached Bins statt `fetch_bin_arrays()` RPC
+
+**Komplexität vs. Vaults:**
+| Aspekt | Vaults (TODO-7) | Bin Arrays (TODO-8) |
+|--------|----------------|---------------------|
+| Accounts/Pool | 2 (statisch) | 3-7 (dynamisch um active_id) |
+| Update-Frequenz | Bei jedem Swap | Bei jedem Swap |
+| Parse-Komplexität | 8 bytes (u64) | ~5KB pro Array |
+| PDA-Derivation | Aus Pool Account | Aus active_id + Index |
 
 **Schritte:**
-1. [ ] `build_swap_ix()` ohne `fetch_bin_arrays()` RPC aufrufen
-2. [ ] Bin Array PDAs nur via `derive_bin_array_pda()` berechnen (kein RPC)
-3. [ ] Für Simulation: Bin Arrays werden on-chain validiert
+1. [ ] `MarketEventKind::BinArrayUpdate` in schema.rs
+2. [ ] `BinArrayInfo` + `tracked_bin_arrays` in market-data.rs
+3. [ ] Bei Meteora PoolDiscovery: Bin Array PDAs registrieren
+4. [ ] Geyser Account Update → BinArrayUpdate Event emittieren
+5. [ ] Consumer: Bin Array Cache + Update-Handler
+6. [ ] `meteora_swap_builder.rs`: `build_swap_ix_cached()` ohne RPC
 
-**Erwartetes Ergebnis:** `build_swap_ix()` macht 0 RPC Calls
+**Erwartetes Ergebnis:** Bin Arrays via Geyser statt RPC, architektonisch konsistent mit TODO-7
 
 ---
 
