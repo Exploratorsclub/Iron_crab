@@ -82,6 +82,58 @@ impl MeteoraDlmmSwapBuilder {
         }
     }
 
+    /// Fetch the CURRENT active_id from the pool account on-chain.
+    ///
+    /// This is critical because the Intent's active_id may be stale -
+    /// prices can move between Intent creation and execution.
+    /// Using the wrong active_id leads to fetching wrong bin_arrays → Error 3005.
+    ///
+    /// If we can't fetch the pool, we fall back to the Intent's active_id.
+    async fn fetch_current_active_id(&self, lb_pair: &Pubkey, fallback_active_id: i32) -> Result<i32> {
+        // LB Pair account layout: active_id is at offset 0x30 (48 decimal), 4 bytes i32 LE
+        const ACTIVE_ID_OFFSET: usize = 0x30;
+        const MIN_ACCOUNT_SIZE: usize = ACTIVE_ID_OFFSET + 4;
+
+        match self.rpc.get_account_retry(lb_pair).await {
+            Ok(account) => {
+                if account.data.len() >= MIN_ACCOUNT_SIZE {
+                    let active_id_bytes: [u8; 4] = account.data[ACTIVE_ID_OFFSET..ACTIVE_ID_OFFSET + 4]
+                        .try_into()
+                        .map_err(|_| anyhow!("Failed to read active_id bytes from pool"))?;
+                    let current_active_id = i32::from_le_bytes(active_id_bytes);
+                    
+                    if current_active_id != fallback_active_id {
+                        info!(
+                            pool = %lb_pair,
+                            intent_active_id = fallback_active_id,
+                            current_active_id = current_active_id,
+                            delta = current_active_id - fallback_active_id,
+                            "Meteora: active_id changed since Intent creation - using current on-chain value"
+                        );
+                    }
+                    
+                    Ok(current_active_id)
+                } else {
+                    warn!(
+                        pool = %lb_pair,
+                        account_size = account.data.len(),
+                        required_size = MIN_ACCOUNT_SIZE,
+                        "Meteora: pool account too small to read active_id, using Intent fallback"
+                    );
+                    Ok(fallback_active_id)
+                }
+            }
+            Err(e) => {
+                warn!(
+                    pool = %lb_pair,
+                    error = %e,
+                    "Meteora: failed to fetch pool for current active_id, using Intent fallback"
+                );
+                Ok(fallback_active_id)
+            }
+        }
+    }
+
     /// Build a swap instruction for Meteora DLMM
     ///
     /// # Arguments
@@ -209,7 +261,7 @@ impl MeteoraDlmmSwapBuilder {
         amount_in: u64,
         min_amount_out: u64,
         _direction: SwapDirection,
-        active_id: i32,
+        active_id_from_intent: i32,
         _bin_step: u16,
     ) -> Result<Instruction> {
         ensure!(amount_in > 0, "Amount in must be positive");
@@ -217,6 +269,11 @@ impl MeteoraDlmmSwapBuilder {
 
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
         let token_program = Pubkey::from_str(TOKEN_PROGRAM)?;
+
+        // CRITICAL: Fetch CURRENT active_id from pool on-chain!
+        // The Intent's active_id may be stale (price moved since Intent creation).
+        // If we use stale active_id, we fetch wrong bin_arrays → Error 3005.
+        let active_id = self.fetch_current_active_id(lb_pair, active_id_from_intent).await?;
 
         // Check if bitmap extension account exists for this pool
         // The bitmap extension is required for pools with extended price range (> 512 arrays)
