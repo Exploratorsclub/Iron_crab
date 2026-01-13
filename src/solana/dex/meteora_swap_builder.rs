@@ -67,10 +67,13 @@ impl MeteoraDlmmSwapBuilder {
 
     /// Check if bitmap extension account exists on-chain
     ///
-    /// IMPORTANT: If this returns false but the pool needs the extension,
-    /// the swap will fail with Error 6036 (BitmapExtensionAccountIsNotProvided).
-    /// We err on the side of including it if unsure.
-    async fn check_bitmap_extension_exists(&self, lb_pair: &Pubkey) -> bool {
+    /// Returns (exists: bool, pda: Pubkey) so we can decide what to include.
+    /// - If account exists → include the PDA
+    /// - If account doesn't exist → include program_id as placeholder
+    /// - If RPC fails with other error → include PDA (safer, may cause other error)
+    async fn check_bitmap_extension(&self, lb_pair: &Pubkey) -> (bool, Pubkey) {
+        let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM).expect("invalid program id");
+        
         let pda = match Self::derive_bitmap_extension_pda(lb_pair) {
             Ok(p) => p,
             Err(e) => {
@@ -79,7 +82,7 @@ impl MeteoraDlmmSwapBuilder {
                     error = %e,
                     "Failed to derive bitmap extension PDA"
                 );
-                return false;
+                return (false, program_id);
             }
         };
         
@@ -95,21 +98,39 @@ impl MeteoraDlmmSwapBuilder {
                         data_len = account.data.len(),
                         "Bitmap extension account found on-chain"
                     );
+                    (true, pda)
+                } else {
+                    debug!(
+                        pool = %lb_pair,
+                        pda = %pda,
+                        "Bitmap extension account exists but is empty - using program_id"
+                    );
+                    (false, program_id)
                 }
-                exists
             }
             Err(e) => {
-                // RPC failed - this could be a transient error.
-                // To be safe, we'll include the extension anyway (Error 6036 fix).
-                // If the account doesn't exist, the program will ignore it.
-                warn!(
-                    pool = %lb_pair,
-                    pda = %pda,
-                    error = %e,
-                    "Failed to check bitmap extension (will include PDA to be safe)"
-                );
-                // Return true to include the extension - safer than excluding it
-                true
+                let error_str = e.to_string();
+                // Check if error is specifically "account not found" vs other RPC errors
+                if error_str.contains("AccountNotFound") || error_str.contains("could not find account") {
+                    // Account definitively doesn't exist - use program_id placeholder
+                    debug!(
+                        pool = %lb_pair,
+                        pda = %pda,
+                        "Bitmap extension account does not exist - using program_id placeholder"
+                    );
+                    (false, program_id)
+                } else {
+                    // Other RPC error (timeout, rate limit, etc.)
+                    // We can't be sure if account exists, but including PDA is safer
+                    // than missing a required account (which causes 6036)
+                    warn!(
+                        pool = %lb_pair,
+                        pda = %pda,
+                        error = %e,
+                        "RPC error checking bitmap extension - including PDA to be safe"
+                    );
+                    (true, pda)
+                }
             }
         }
     }
@@ -310,22 +331,19 @@ impl MeteoraDlmmSwapBuilder {
         // Check if bitmap extension account exists for this pool
         // The bitmap extension is required for pools with extended price range (> 512 arrays)
         // If it exists on-chain, we MUST include it; otherwise use program_id as placeholder
-        let bitmap_extension_pda = Self::derive_bitmap_extension_pda(lb_pair)?;
-        let bitmap_extension_exists = self.check_bitmap_extension_exists(lb_pair).await;
-        let bin_array_bitmap_extension = if bitmap_extension_exists {
+        let (has_bitmap_extension, bin_array_bitmap_extension) = self.check_bitmap_extension(lb_pair).await;
+        if has_bitmap_extension {
             debug!(
                 pool = %lb_pair,
-                bitmap_extension = %bitmap_extension_pda,
+                bitmap_extension = %bin_array_bitmap_extension,
                 "Meteora pool has bitmap extension account - including in TX"
             );
-            bitmap_extension_pda
         } else {
             debug!(
                 pool = %lb_pair,
                 "Meteora pool has no bitmap extension - using program_id placeholder"
             );
-            program_id
-        };
+        }
 
         // Fetch bin arrays for this pool (direct PDA derivation)
         let bin_arrays = self.fetch_bin_arrays_direct(lb_pair, active_id).await?;
