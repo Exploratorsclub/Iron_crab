@@ -66,19 +66,51 @@ impl MeteoraDlmmSwapBuilder {
     }
 
     /// Check if bitmap extension account exists on-chain
+    ///
+    /// IMPORTANT: If this returns false but the pool needs the extension,
+    /// the swap will fail with Error 6036 (BitmapExtensionAccountIsNotProvided).
+    /// We err on the side of including it if unsure.
     async fn check_bitmap_extension_exists(&self, lb_pair: &Pubkey) -> bool {
         let pda = match Self::derive_bitmap_extension_pda(lb_pair) {
             Ok(p) => p,
-            Err(_) => return false,
+            Err(e) => {
+                warn!(
+                    pool = %lb_pair,
+                    error = %e,
+                    "Failed to derive bitmap extension PDA"
+                );
+                return false;
+            }
         };
         
         // Try to fetch the account - if it exists, we need to include it
         match self.rpc.get_account_retry(&pda).await {
             Ok(account) => {
                 // Account exists and has data
-                !account.data.is_empty()
+                let exists = !account.data.is_empty();
+                if exists {
+                    debug!(
+                        pool = %lb_pair,
+                        pda = %pda,
+                        data_len = account.data.len(),
+                        "Bitmap extension account found on-chain"
+                    );
+                }
+                exists
             }
-            Err(_) => false,
+            Err(e) => {
+                // RPC failed - this could be a transient error.
+                // To be safe, we'll include the extension anyway (Error 6036 fix).
+                // If the account doesn't exist, the program will ignore it.
+                warn!(
+                    pool = %lb_pair,
+                    pda = %pda,
+                    error = %e,
+                    "Failed to check bitmap extension (will include PDA to be safe)"
+                );
+                // Return true to include the extension - safer than excluding it
+                true
+            }
         }
     }
 
