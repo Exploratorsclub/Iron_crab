@@ -37,6 +37,9 @@ use crate::solana::dex::raydium::Raydium;
 use crate::solana::dex::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 
+/// Token-2022 Program ID
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
 /// Helper to convert spl_token instruction to solana_sdk instruction
 fn prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> Instruction {
     Instruction {
@@ -56,6 +59,26 @@ fn prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> In
 
 /// SOL mint address
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Determine the token program for a given mint by checking the mint account's owner.
+/// Returns either SPL Token or Token-2022 program ID.
+async fn get_token_program_for_mint(rpc: &SolanaRpc, mint: &Pubkey) -> Result<spl_token::solana_program::pubkey::Pubkey> {
+    // Fetch mint account to determine owner (token program)
+    let mint_acct = rpc.get_account_retry(mint).await
+        .map_err(|e| anyhow!("Failed to fetch mint account {}: {}", mint, e))?;
+    
+    let owner = mint_acct.owner;
+    let token_2022_id = Pubkey::from_str(TOKEN_2022_PROGRAM_ID)?;
+    
+    if owner == token_2022_id {
+        debug!(mint = %mint, "Mint uses Token-2022 program");
+        Ok(spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes()))
+    } else {
+        // Default to SPL Token (covers both spl_token and unknown owners)
+        debug!(mint = %mint, owner = %owner, "Mint uses SPL Token program (or unknown)");
+        Ok(spl_token::id())
+    }
+}
 
 /// Minimum spread in bps to execute (from intent metadata, no re-quote!)
 const MIN_EXECUTION_SPREAD_BPS: i64 = 30; // 0.3% minimum
@@ -539,12 +562,15 @@ impl CrossDexHandler {
         //
         // For SOL→Token swaps: We need WSOL ATA (for input) AND Token ATA (for output).
         // Without both, Orca fails with AnchorError AccountNotInitialized (3012).
+        //
+        // IMPORTANT: For Token-2022 mints, we MUST use the Token-2022 program ID,
+        // otherwise ATA creation fails with IncorrectProgramId.
         // ====================================================================
         let mut ata_creation_instructions = Vec::new();
         if let Some(wallet) = self.wallet_pubkey {
             let wallet_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(wallet.to_bytes());
             
-            // 1. Create WSOL ATA (needed for Orca which uses WSOL, not native SOL)
+            // 1. Create WSOL ATA (WSOL always uses SPL Token, not Token-2022)
             let wsol_mint_pk = Pubkey::from_str(SOL_MINT)
                 .map_err(|_| anyhow!("Invalid WSOL mint"))?;
             let wsol_mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(wsol_mint_pk.to_bytes());
@@ -553,20 +579,24 @@ impl CrossDexHandler {
                 &wallet_spl,        // payer
                 &wallet_spl,        // owner  
                 &wsol_mint_spl,     // WSOL mint
-                &spl_token::id(),   // token program
+                &spl_token::id(),   // token program (WSOL is always SPL Token)
             );
             ata_creation_instructions.push(prog_ix_to_sdk(create_wsol_ata_ix_prog));
             
             // 2. Create Token ATA (for the token being bought/sold)
+            //    MUST use the correct token program (SPL Token OR Token-2022)
             let token_mint_pk = Pubkey::from_str(token_mint)
                 .map_err(|_| anyhow!("Invalid token mint: {}", token_mint))?;
             let token_mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint_pk.to_bytes());
+            
+            // Determine the token program by checking the mint account's owner
+            let token_program = get_token_program_for_mint(&self.rpc, &token_mint_pk).await?;
             
             let create_token_ata_ix_prog = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                 &wallet_spl,        // payer
                 &wallet_spl,        // owner  
                 &token_mint_spl,    // token mint
-                &spl_token::id(),   // token program
+                &token_program,     // token program (dynamically determined!)
             );
             ata_creation_instructions.push(prog_ix_to_sdk(create_token_ata_ix_prog));
             
@@ -574,6 +604,7 @@ impl CrossDexHandler {
                 token_mint = %token_mint,
                 wsol_mint = %SOL_MINT,
                 wallet = %wallet,
+                token_program = %Pubkey::new_from_array(token_program.to_bytes()),
                 "Added idempotent ATA creation for WSOL and token"
             );
         }

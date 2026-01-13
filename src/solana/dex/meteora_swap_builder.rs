@@ -398,6 +398,10 @@ impl MeteoraDlmmSwapBuilder {
     ///
     /// We fetch bin arrays for indices [active_index - 1, active_index, active_index + 1]
     /// to cover typical swap ranges.
+    ///
+    /// Note: To minimize TX size, we only fetch the bin array containing the active bin.
+    /// For small arb amounts (0.1 SOL), this is usually sufficient.
+    /// If swaps cross multiple arrays, they may fail - but this is acceptable for arb.
     pub async fn fetch_bin_arrays_direct(
         &self,
         lb_pair: &Pubkey,
@@ -405,58 +409,66 @@ impl MeteoraDlmmSwapBuilder {
     ) -> Result<Vec<Pubkey>> {
         let active_array_index = Self::bin_id_to_bin_array_index(active_id);
         
-        // For most swaps, we need the active bin array and potentially adjacent ones
-        // Fetch ±1 arrays to cover typical price movement
+        // For cross-DEX arb with small amounts, we only need the active bin array.
+        // This minimizes TX size (each bin array = 1 account = 32 bytes).
+        // For larger swaps that might cross multiple arrays, this may fail,
+        // but for 0.1 SOL arb amounts, single array is typically sufficient.
+        let pda = Self::derive_bin_array_pda(lb_pair, active_array_index)?;
+        
+        // Check if this bin array exists on-chain
+        match self.rpc.get_account_retry(&pda).await {
+            Ok(account) => {
+                // Bin array accounts are typically ~10KB+
+                if account.data.len() >= 100 {
+                    debug!(
+                        pool = %lb_pair,
+                        bin_array_index = active_array_index,
+                        pda = %pda,
+                        "Found active bin array on-chain"
+                    );
+                    return Ok(vec![pda]);
+                }
+            }
+            Err(_) => {
+                // Bin array doesn't exist - this is normal for arrays outside liquidity range
+                debug!(
+                    pool = %lb_pair,
+                    bin_array_index = active_array_index,
+                    "Active bin array not found on-chain"
+                );
+            }
+        }
+
+        // Active bin array not found, try adjacent arrays (might help if price moved)
         let indices_to_check: Vec<i64> = vec![
             active_array_index - 1,
-            active_array_index,
             active_array_index + 1,
         ];
-
-        let mut bin_array_pdas = Vec::new();
 
         for index in indices_to_check {
             let pda = Self::derive_bin_array_pda(lb_pair, index)?;
             
-            // Check if this bin array exists on-chain
-            match self.rpc.get_account_retry(&pda).await {
-                Ok(account) => {
-                    // Bin array accounts are typically ~10KB+
-                    if account.data.len() >= 100 {
-                        debug!(
-                            pool = %lb_pair,
-                            bin_array_index = index,
-                            pda = %pda,
-                            "Found bin array on-chain"
-                        );
-                        bin_array_pdas.push(pda);
-                    }
-                }
-                Err(_) => {
-                    // Bin array doesn't exist - this is normal for arrays outside liquidity range
+            if let Ok(account) = self.rpc.get_account_retry(&pda).await {
+                if account.data.len() >= 100 {
                     debug!(
                         pool = %lb_pair,
                         bin_array_index = index,
-                        "Bin array not found on-chain (normal if outside liquidity range)"
+                        pda = %pda,
+                        "Found adjacent bin array on-chain (active not found)"
                     );
+                    return Ok(vec![pda]);
                 }
             }
         }
 
-        // Sort by index to ensure consistent ordering
-        // (PDAs are deterministic, so we can sort by the pubkey bytes)
-        bin_array_pdas.sort();
+        warn!(
+            pool = %lb_pair,
+            active_id = active_id,
+            active_array_index = active_array_index,
+            "No bin arrays found - pool might have no liquidity at current price"
+        );
 
-        if bin_array_pdas.is_empty() {
-            warn!(
-                pool = %lb_pair,
-                active_id = active_id,
-                active_array_index = active_array_index,
-                "No bin arrays found - pool might have no liquidity at current price"
-            );
-        }
-
-        Ok(bin_array_pdas)
+        Ok(vec![])
     }
 
     /// Derive bin array PDA for a given bin array index
