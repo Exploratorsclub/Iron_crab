@@ -2417,11 +2417,25 @@ impl Dex for PumpFunAmmDex {
             let gva = parse_pubkey(&accounts[11], "global_volume_accumulator")?;
             let fc = parse_pubkey(&accounts[12], "fee_config")?;
             let fp = parse_pubkey(&accounts[13], "fee_program")?;
+            info!(
+                accounts_len = accounts.len(),
+                format = "v1",
+                fee_config = %fc,
+                fee_program = %fp,
+                "pump_amm set_pool_from_accounts: parsed v1 format"
+            );
             (gva, fc, fp)
         } else {
             // v2 format: 12 accounts without volume accumulators
             let fc = parse_pubkey(&accounts[11], "fee_config")?;
             let fp = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
+            info!(
+                accounts_len = accounts.len(),
+                format = "v2",
+                fee_config = %fc,
+                fee_program = %fp,
+                "pump_amm set_pool_from_accounts: parsed v2 format"
+            );
             (Pubkey::default(), fc, fp)
         };
         
