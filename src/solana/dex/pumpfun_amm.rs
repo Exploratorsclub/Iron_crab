@@ -2408,20 +2408,22 @@ impl Dex for PumpFunAmmDex {
         let event_authority = parse_pubkey(&accounts[8], "event_authority")?;
         let coin_creator_vault_ata = parse_pubkey(&accounts[9], "coin_creator_vault_ata")?;
         let coin_creator_vault_authority = parse_pubkey(&accounts[10], "coin_creator_vault_authority")?;
-        let fee_config = parse_pubkey(&accounts[11], "fee_config")?;
         
-        // Optional fields for v1 format (14 elements)
-        let global_volume_accumulator = if accounts.len() > 12 {
-            parse_pubkey(&accounts[12], "global_volume_accumulator").ok()
+        // CRITICAL: v1 format (14 accounts) vs v2 format (12 accounts) have different layouts!
+        // v1: [0..10]=common, [11]=global_volume_accumulator, [12]=fee_config, [13]=fee_program
+        // v2: [0..10]=common, [11]=fee_config (no volume accumulators)
+        let (global_volume_accumulator, fee_config, fee_program) = if accounts.len() >= 14 {
+            // v1 format: 14 accounts with volume accumulators
+            let gva = parse_pubkey(&accounts[11], "global_volume_accumulator")?;
+            let fc = parse_pubkey(&accounts[12], "fee_config")?;
+            let fp = parse_pubkey(&accounts[13], "fee_program")?;
+            (gva, fc, fp)
         } else {
-            None
-        }.unwrap_or(Pubkey::default());
-        
-        let fee_program = if accounts.len() > 13 {
-            parse_pubkey(&accounts[13], "fee_program").ok()
-        } else {
-            None
-        }.unwrap_or_else(|| Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap());
+            // v2 format: 12 accounts without volume accumulators
+            let fc = parse_pubkey(&accounts[11], "fee_config")?;
+            let fp = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
+            (Pubkey::default(), fc, fp)
+        };
         
         // Validate pool_address matches accounts[0]
         let expected_pool = parse_pubkey(pool_address, "pool_address")?;
@@ -2647,10 +2649,10 @@ impl PumpFunAmmDex {
         user: Pubkey,
         pool_accounts: &[Pubkey],
     ) -> Result<Vec<Instruction>> {
-        // NOTE: reduced from 14 to 12 after removing global_volume_accumulator
-        if pool_accounts.len() != 12 {
+        // Accept both v1 (14 accounts with volume accumulators) and v2 (12 accounts without)
+        if pool_accounts.len() < 12 {
             return Err(anyhow!(
-                "pump_amm expected 12 pool_accounts (v2, no volume accumulators), got {}",
+                "pump_amm expected at least 12 pool_accounts, got {}",
                 pool_accounts.len()
             ));
         }
@@ -2669,10 +2671,16 @@ impl PumpFunAmmDex {
         let event_authority = pool_accounts[8];
         let coin_creator_vault_ata = pool_accounts[9];
         let coin_creator_vault_authority = pool_accounts[10];
-        // NOTE: global_volume_accumulator removed (was pool_accounts[11])
-        let fee_config = pool_accounts[11]; // was [12]
-                                            // NOTE: fee_program is now derived, not from pool_accounts
-        let fee_program = expected_fee_program;
+        
+        // CRITICAL: v1 format (14 accounts) vs v2 format (12 accounts) have different layouts!
+        // v1: [11]=global_volume_accumulator, [12]=fee_config, [13]=fee_program
+        // v2: [11]=fee_config (no volume accumulators)
+        let fee_config = if pool_accounts.len() >= 14 {
+            pool_accounts[12] // v1 format
+        } else {
+            pool_accounts[11] // v2 format
+        };
+        let fee_program = expected_fee_program; // Always use expected, don't trust intent
 
         // Intent-driven guardrails (no RPC calls): reject obviously wrong pool_accounts early.
         // This prevents ambiguous/incorrect fee_config mapping from reaching simulation.
