@@ -856,25 +856,39 @@ impl Dex for Orca {
 
         // Tick arrays for the swap range
         // Orca requires tick arrays covering the price range the swap might traverse
+        // The tick arrays MUST be in the correct sequence relative to current tick
         let spacing = pool.tick_spacing.unwrap_or(64) as i32;
         let tick_now = pool.tick_current_index.unwrap_or(0);
         let ticks_per_array = spacing * TICK_ARRAY_SIZE;
+        
+        // Calculate the start index of the tick array containing current tick
+        let current_array_start = get_tick_array_start_index(tick_now, spacing);
         
         // Log tick array calculation for debugging
         tracing::debug!(
             pool = %pool_id,
             tick_spacing = spacing,
             tick_current = tick_now,
+            current_array_start = current_array_start,
             ticks_per_array = ticks_per_array,
             a_to_b = a_to_b,
             "orca: calculating tick arrays for swap"
         );
         
-        // Order tick arrays based on swap direction
+        // CRITICAL: Tick array sequence depends on swap direction
+        // For a_to_b swaps: price goes DOWN, ticks DECREASE
+        //   - First array must contain current tick
+        //   - Subsequent arrays are at LOWER tick indices
+        // For b_to_a swaps: price goes UP, ticks INCREASE  
+        //   - First array must contain current tick
+        //   - Subsequent arrays are at HIGHER tick indices
+        //
+        // The key insight: the FIRST tick array must always be the one containing
+        // the current tick, then we extend in the direction of the swap.
         let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) = if a_to_b {
             // A->B: price decreases, ticks decrease
-            // Start from current tick's array and go downward
-            let s0 = get_tick_array_start_index(tick_now, spacing);
+            // Start from current tick's array, then lower arrays
+            let s0 = current_array_start;
             let s1 = s0 - ticks_per_array;
             let s2 = s1 - ticks_per_array;
             (
@@ -885,8 +899,9 @@ impl Dex for Orca {
             )
         } else {
             // B->A: price increases, ticks increase
-            // Start from current tick's array and go upward
-            let s0 = get_tick_array_start_index(tick_now, spacing);
+            // Start from current tick's array, then higher arrays
+            // BUT: if current tick is at the boundary, we may need the previous array too
+            let s0 = current_array_start;
             let s1 = s0 + ticks_per_array;
             let s2 = s1 + ticks_per_array;
             (
@@ -984,24 +999,18 @@ impl Dex for Orca {
     }
 
     async fn load_pool_by_address(&self, pool_address: &Pubkey) -> Result<()> {
-        // Check if already cached
-        if self.pools.contains_key(pool_address) {
-            tracing::info!(
-                pool = %pool_address,
-                "Orca pool already cached, skipping RPC"
-            );
-            return Ok(());
-        }
-        
+        // Always fetch fresh data for tick_current_index accuracy
+        // This is critical for correct tick array calculation
         tracing::info!(
             pool = %pool_address,
-            "Fetching Orca whirlpool via RPC getAccount"
+            cached = self.pools.contains_key(pool_address),
+            "Fetching Orca whirlpool via RPC getAccount (always refresh for tick accuracy)"
         );
         
         // Fetch pool account via single getAccount RPC call
         let account = self.rpc.get_account_retry(pool_address).await?;
         
-        tracing::info!(
+        tracing::debug!(
             pool = %pool_address,
             data_len = account.data.len(),
             "Orca pool account fetched, parsing whirlpool layout"
@@ -1011,7 +1020,7 @@ impl Dex for Orca {
         let parsed = layout::parse_whirlpool(&account.data)
             .ok_or_else(|| anyhow::anyhow!("Failed to parse Orca whirlpool at {}", pool_address))?;
         
-        // Insert into cache
+        // Insert/update cache with fresh data
         let pool = OrcaPool {
             base_mint: parsed.token_mint_a,
             quote_mint: parsed.token_mint_b,
@@ -1027,24 +1036,31 @@ impl Dex for Orca {
             last_reserve_fetch: None,
         };
         
+        let is_update = self.pools.contains_key(pool_address);
         self.pools.insert(*pool_address, pool.clone());
         
-        // Update mint index
-        self.mint_index
-            .entry(pool.base_mint)
-            .or_default()
-            .push(*pool_address);
-        self.mint_index
-            .entry(pool.quote_mint)
-            .or_default()
-            .push(*pool_address);
+        // Update mint index only for new pools (avoid duplicates)
+        if !is_update {
+            self.mint_index
+                .entry(pool.base_mint)
+                .or_default()
+                .push(*pool_address);
+            self.mint_index
+                .entry(pool.quote_mint)
+                .or_default()
+                .push(*pool_address);
+        }
         
         tracing::info!(
             pool = %pool_address,
             base_mint = %pool.base_mint,
             quote_mint = %pool.quote_mint,
+            tick_current = parsed.tick_current_index,
+            tick_spacing = parsed.tick_spacing,
+            is_update = is_update,
             pools_count = self.pools.len(),
-            "Orca whirlpool loaded and cached successfully"
+            "Orca whirlpool {} successfully",
+            if is_update { "refreshed" } else { "loaded" }
         );
         
         Ok(())
@@ -1079,9 +1095,24 @@ fn derive_oracle_pda(pool: &Pubkey) -> Pubkey {
 
 /// Calculate the start tick index of the TickArray containing `tick_index`.
 /// TickArrays are aligned on boundaries of `tick_spacing * TICK_ARRAY_SIZE`.
+///
+/// IMPORTANT: Orca Whirlpool tick arrays are indexed by their start_tick_index.
+/// For negative ticks, we need floor division to get the correct array.
 fn get_tick_array_start_index(tick_index: i32, tick_spacing: i32) -> i32 {
     let ticks_per_array = tick_spacing * TICK_ARRAY_SIZE;
-    // Use euclidean div/mod to handle negative tick indices correctly
+    // Use euclidean div (floor division) to handle negative tick indices correctly
+    // Example with tick_spacing=64, TICK_ARRAY_SIZE=88:
+    //   ticks_per_array = 5632
+    //   tick_index=100 -> array_index=0 -> start=0
+    //   tick_index=-100 -> array_index=-1 -> start=-5632
     let array_index = tick_index.div_euclid(ticks_per_array);
     array_index * ticks_per_array
+}
+
+/// Validate that a tick array start index contains the given tick
+#[allow(dead_code)]
+fn tick_array_contains_tick(array_start: i32, tick_index: i32, tick_spacing: i32) -> bool {
+    let ticks_per_array = tick_spacing * TICK_ARRAY_SIZE;
+    let array_end = array_start + ticks_per_array;
+    tick_index >= array_start && tick_index < array_end
 }

@@ -2,6 +2,11 @@
 //!
 //! Builds swap instructions for Meteora's Dynamic Liquidity Market Maker.
 //! Handles bin array discovery and proper account ordering.
+//!
+//! Key accounts:
+//! - `bin_array_bitmap_extension`: Optional PDA for pools with extended price range
+//!   Seeds: ["bitmap_extension", lb_pair.as_ref()]
+//!   Required when pool liquidity spans > 512 bin arrays (rare for most pools)
 
 use anyhow::{anyhow, ensure, Result};
 use solana_sdk::{
@@ -16,6 +21,7 @@ use crate::solana::rpc::SolanaRpc;
 use solana_account_decoder::UiAccountEncoding;
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
+use tracing::{debug, warn};
 
 /// SPL Token program ID
 pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -24,7 +30,7 @@ pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const METEORA_DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
 /// Instruction discriminator for swap (first 8 bytes of instruction data)
-/// This is a placeholder - needs to be reverse-engineered from mainnet transactions
+/// Anchor: sha256("global:swap")[0..8]
 const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
 /// Swap direction
@@ -44,6 +50,36 @@ pub struct MeteoraDlmmSwapBuilder {
 impl MeteoraDlmmSwapBuilder {
     pub fn new(rpc: Arc<SolanaRpc>) -> Self {
         Self { rpc }
+    }
+
+    /// Derive the bin_array_bitmap_extension PDA for a pool
+    /// 
+    /// This account is required for pools with extended price range (liquidity across > 512 arrays).
+    /// Seeds: ["bitmap_extension", lb_pair.as_ref()]
+    pub fn derive_bitmap_extension_pda(lb_pair: &Pubkey) -> Result<Pubkey> {
+        let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
+        let (pda, _bump) = Pubkey::find_program_address(
+            &[b"bitmap_extension", lb_pair.as_ref()],
+            &program_id,
+        );
+        Ok(pda)
+    }
+
+    /// Check if bitmap extension account exists on-chain
+    async fn check_bitmap_extension_exists(&self, lb_pair: &Pubkey) -> bool {
+        let pda = match Self::derive_bitmap_extension_pda(lb_pair) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        
+        // Try to fetch the account - if it exists, we need to include it
+        match self.rpc.get_account_retry(&pda).await {
+            Ok(account) => {
+                // Account exists and has data
+                !account.data.is_empty()
+            }
+            Err(_) => false,
+        }
     }
 
     /// Build a swap instruction for Meteora DLMM
@@ -174,7 +210,7 @@ impl MeteoraDlmmSwapBuilder {
         min_amount_out: u64,
         _direction: SwapDirection,
         active_id: i32,
-        bin_step: u16,
+        _bin_step: u16,
     ) -> Result<Instruction> {
         ensure!(amount_in > 0, "Amount in must be positive");
         ensure!(min_amount_out > 0, "Min amount out must be positive");
@@ -182,20 +218,44 @@ impl MeteoraDlmmSwapBuilder {
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
         let token_program = Pubkey::from_str(TOKEN_PROGRAM)?;
 
-        // bin_array_bitmap_extension is OPTIONAL. Not all pools have it.
-        let bin_array_bitmap_extension = program_id;
+        // Check if bitmap extension account exists for this pool
+        // The bitmap extension is required for pools with extended price range (> 512 arrays)
+        // If it exists on-chain, we MUST include it; otherwise use program_id as placeholder
+        let bitmap_extension_pda = Self::derive_bitmap_extension_pda(lb_pair)?;
+        let bitmap_extension_exists = self.check_bitmap_extension_exists(lb_pair).await;
+        let bin_array_bitmap_extension = if bitmap_extension_exists {
+            debug!(
+                pool = %lb_pair,
+                bitmap_extension = %bitmap_extension_pda,
+                "Meteora pool has bitmap extension account - including in TX"
+            );
+            bitmap_extension_pda
+        } else {
+            debug!(
+                pool = %lb_pair,
+                "Meteora pool has no bitmap extension - using program_id placeholder"
+            );
+            program_id
+        };
 
-        // Fetch bin arrays for this pool
-        let bin_arrays = self.fetch_bin_arrays(lb_pair, active_id, bin_step).await?;
+        // Fetch bin arrays for this pool (direct PDA derivation)
+        let bin_arrays = self.fetch_bin_arrays_direct(lb_pair, active_id).await?;
         
         // Meteora DLMM requires at least 1 bin array to be present
         if bin_arrays.is_empty() {
             return Err(anyhow!(
-                "No bin arrays found for pool {} (active_id={}, bin_step={}). \
-                 RPC might be rate-limited or bin arrays don't exist on-chain.",
-                lb_pair, active_id, bin_step
+                "No bin arrays found for pool {} (active_id={}). \
+                 Bin array PDAs might not exist on-chain yet.",
+                lb_pair, active_id
             ));
         }
+
+        debug!(
+            pool = %lb_pair,
+            active_id = active_id,
+            bin_arrays_count = bin_arrays.len(),
+            "Meteora: fetched bin arrays for swap"
+        );
 
         // Derive oracle PDA
         let (oracle, _) = Pubkey::find_program_address(
@@ -218,7 +278,7 @@ impl MeteoraDlmmSwapBuilder {
         // Build account list (matching official IDL order)
         let mut accounts = vec![
             AccountMeta::new(*lb_pair, false),      // 0: LB Pair (writable)
-            AccountMeta::new_readonly(bin_array_bitmap_extension, false), // 1: bitmap extension (optional)
+            AccountMeta::new_readonly(bin_array_bitmap_extension, false), // 1: bitmap extension (required if exists!)
             AccountMeta::new(*reserve_x, false),    // 2: Reserve X (writable)
             AccountMeta::new(*reserve_y, false),    // 3: Reserve Y (writable)
             AccountMeta::new(*user_token_x, false), // 4: User token X (writable)
@@ -235,8 +295,8 @@ impl MeteoraDlmmSwapBuilder {
         ];
 
         // Add bin array accounts as remaining accounts (writable)
-        for bin_array in bin_arrays {
-            let bin_array_pda = Self::derive_bin_array_pda(lb_pair, bin_array.index)?;
+        // bin_arrays is now Vec<Pubkey> from fetch_bin_arrays_direct
+        for bin_array_pda in bin_arrays {
             accounts.push(AccountMeta::new(bin_array_pda, false));
         }
 
@@ -247,7 +307,7 @@ impl MeteoraDlmmSwapBuilder {
         })
     }
 
-    /// Fetch bin array accounts for a pool
+    /// Fetch bin array accounts for a pool (DEPRECATED - use fetch_bin_arrays_direct)
     ///
     /// Meteora DLMM stores bins in "Bin Array" accounts. Each bin array contains
     /// a range of bins (typically 70 bins per array). We need to find which
@@ -328,6 +388,75 @@ impl MeteoraDlmmSwapBuilder {
         }
 
         Ok(bin_arrays)
+    }
+
+    /// Fetch bin arrays by direct PDA derivation (more reliable than getProgramAccounts)
+    ///
+    /// This method derives bin array PDAs directly from the active_id and fetches them
+    /// via individual getAccount calls. This is more reliable than getProgramAccounts
+    /// which can be rate-limited or return incomplete results.
+    ///
+    /// We fetch bin arrays for indices [active_index - 1, active_index, active_index + 1]
+    /// to cover typical swap ranges.
+    pub async fn fetch_bin_arrays_direct(
+        &self,
+        lb_pair: &Pubkey,
+        active_id: i32,
+    ) -> Result<Vec<Pubkey>> {
+        let active_array_index = Self::bin_id_to_bin_array_index(active_id);
+        
+        // For most swaps, we need the active bin array and potentially adjacent ones
+        // Fetch ±1 arrays to cover typical price movement
+        let indices_to_check: Vec<i64> = vec![
+            active_array_index - 1,
+            active_array_index,
+            active_array_index + 1,
+        ];
+
+        let mut bin_array_pdas = Vec::new();
+
+        for index in indices_to_check {
+            let pda = Self::derive_bin_array_pda(lb_pair, index)?;
+            
+            // Check if this bin array exists on-chain
+            match self.rpc.get_account_retry(&pda).await {
+                Ok(account) => {
+                    // Bin array accounts are typically ~10KB+
+                    if account.data.len() >= 100 {
+                        debug!(
+                            pool = %lb_pair,
+                            bin_array_index = index,
+                            pda = %pda,
+                            "Found bin array on-chain"
+                        );
+                        bin_array_pdas.push(pda);
+                    }
+                }
+                Err(_) => {
+                    // Bin array doesn't exist - this is normal for arrays outside liquidity range
+                    debug!(
+                        pool = %lb_pair,
+                        bin_array_index = index,
+                        "Bin array not found on-chain (normal if outside liquidity range)"
+                    );
+                }
+            }
+        }
+
+        // Sort by index to ensure consistent ordering
+        // (PDAs are deterministic, so we can sort by the pubkey bytes)
+        bin_array_pdas.sort();
+
+        if bin_array_pdas.is_empty() {
+            warn!(
+                pool = %lb_pair,
+                active_id = active_id,
+                active_array_index = active_array_index,
+                "No bin arrays found - pool might have no liquidity at current price"
+            );
+        }
+
+        Ok(bin_array_pdas)
     }
 
     /// Derive bin array PDA for a given bin array index
