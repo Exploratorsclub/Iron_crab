@@ -598,15 +598,20 @@ impl CrossDexHandler {
                 &token_mint_spl,    // token mint
                 &token_program,     // token program (dynamically determined!)
             );
-            ata_creation_instructions.push(prog_ix_to_sdk(create_token_ata_ix_prog));
+            let token_ata_ix = prog_ix_to_sdk(create_token_ata_ix_prog);
             
-            debug!(
+            // Log the actual instruction accounts for debugging Token-2022 issues
+            info!(
                 token_mint = %token_mint,
                 wsol_mint = %SOL_MINT,
                 wallet = %wallet,
                 token_program = %Pubkey::new_from_array(token_program.to_bytes()),
-                "Added idempotent ATA creation for WSOL and token"
+                token_ata_ix_accounts_count = token_ata_ix.accounts.len(),
+                token_ata_ix_last_account = %token_ata_ix.accounts.last().map(|a| a.pubkey.to_string()).unwrap_or_default(),
+                "Token ATA creation instruction built"
             );
+            
+            ata_creation_instructions.push(token_ata_ix);
         }
 
         // Use async build to support DEXes that need it (PumpFun, etc.)
