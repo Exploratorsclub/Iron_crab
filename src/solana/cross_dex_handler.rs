@@ -627,7 +627,8 @@ impl CrossDexHandler {
             );
             let wsol_ata_sdk = Pubkey::new_from_array(wsol_ata.to_bytes());
             
-            // Transfer native SOL to WSOL ATA (manually build system transfer instruction)
+            // Transfer native SOL to WSOL ATA
+            // System program transfer: 4-byte discriminator (2u32) + 8-byte lamports
             let system_program_id = Pubkey::from_str("11111111111111111111111111111111")
                 .expect("valid system program id");
             let transfer_ix = Instruction {
@@ -645,9 +646,9 @@ impl CrossDexHandler {
                     },
                 ],
                 data: {
-                    // system transfer: instruction enum index 2 + u64 lamports little-endian
-                    let mut d = Vec::with_capacity(1 + 8);
-                    d.push(2u8);
+                    // System transfer instruction: 4-byte enum index (2u32 LE) + 8-byte lamports (u64 LE)
+                    let mut d = Vec::with_capacity(4 + 8);
+                    d.extend_from_slice(&2u32.to_le_bytes()); // Transfer discriminator (4 bytes!)
                     d.extend_from_slice(&buy_amount_in.to_le_bytes());
                     d
                 },
