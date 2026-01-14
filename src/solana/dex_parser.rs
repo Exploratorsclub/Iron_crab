@@ -316,7 +316,8 @@ fn parse_raydium_swap(
             .unwrap_or_default()
     };
 
-    let quote_mint =
+    // Note: quote_mint not needed anymore - SELL path uses native balance
+    let _quote_mint =
         Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default(); // SOL
 
     // Calculate actual amounts from token balance changes
@@ -330,11 +331,12 @@ fn parse_raydium_swap(
         .unwrap_or(0);
         (amount_in, tokens_received)
     } else {
-        // SELL: User pays tokens, receives SOL
-        let sol_received = calculate_token_balance_change(
-            &update.pre_token_balances,
-            &update.post_token_balances,
-            &quote_mint,
+        // SELL: User pays tokens, receives SOL (native balance, not token_balances!)
+        let sol_received = calculate_native_balance_change(
+            &update.account_keys,
+            &update.pre_balances,
+            &update.post_balances,
+            &trader,
         )
         .unwrap_or(0);
         (sol_received, amount_in)
@@ -481,7 +483,8 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
             .unwrap_or_default()
     };
 
-    let quote_mint =
+    // Note: quote_mint not needed anymore - SELL path uses native balance
+    let _quote_mint =
         Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default(); // SOL
 
     // Calculate actual amounts from token balance changes
@@ -494,10 +497,12 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
         .unwrap_or(0);
         (amount, tokens_received)
     } else {
-        let sol_received = calculate_token_balance_change(
-            &update.pre_token_balances,
-            &update.post_token_balances,
-            &quote_mint,
+        // SELL: SOL received is in native balances, not token_balances!
+        let sol_received = calculate_native_balance_change(
+            &update.account_keys,
+            &update.pre_balances,
+            &update.post_balances,
+            &trader,
         )
         .unwrap_or(0);
         (sol_received, amount)
@@ -644,7 +649,8 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
     let token_amount_param = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
     let _sol_limit = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
 
-    let quote_mint =
+    // Note: quote_mint not needed - PumpFun BC uses native balance for SOL
+    let _quote_mint =
         Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default();
 
     // Calculate actual amounts from native and token balance changes
@@ -732,28 +738,33 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         return None;
     };
 
-    // Observed account order (see src/solana/dex/pumpfun_amm.rs)
+    // Observed account order from on-chain PumpFun AMM swap TX (21 accounts total):
+    // See src/solana/dex/pumpfun_amm.rs build_swap_ix_from_pool_accounts for reference.
+    // NOTE: global_volume_accumulator is NOT in the TX - it's only a PDA.
     let pool_market = update.instruction_accounts[0];
     let user = update.instruction_accounts[1];
     let trader = update.account_keys.first().copied().unwrap_or(user);
     let global_config = update.instruction_accounts[2];
     let base_mint = update.instruction_accounts[3];
-    // Note: instruction_accounts[4] is quote_account (user's WSOL ATA), not the mint itself!
-    // PumpFun AMM always uses WSOL as quote, so we hardcode it
+    // instruction_accounts[4] = quote_mint (WSOL)
+    // instruction_accounts[5] = user_base_ta
+    // instruction_accounts[6] = user_quote_ta
     let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
     let pool_base_vault = update.instruction_accounts[7];
     let pool_quote_vault = update.instruction_accounts[8];
     let protocol_fee_recipient = update.instruction_accounts[9];
     let protocol_fee_recipient_ta = update.instruction_accounts[10];
+    // instruction_accounts[11..14] = spl_token, spl_token, system, ata_program (readonly)
     let event_authority = update.instruction_accounts[15];
+    // instruction_accounts[16] = program_id (readonly)
     let coin_creator_vault_ata = update.instruction_accounts[17];
     let coin_creator_vault_authority = update.instruction_accounts[18];
-    let global_volume_accumulator = update.instruction_accounts[19];
-    let fee_config = update.instruction_accounts[21];
-    let fee_program = update.instruction_accounts[22];
+    // v2 format: no global_volume_accumulator in TX!
+    let fee_config = update.instruction_accounts[19];
+    let fee_program = update.instruction_accounts[20];
 
     let amount_in = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
-    let min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
+    let _min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
 
     // Calculate actual amount_out from token balance changes
     // For BUY: user receives base tokens (token_amount), SOL from native balance
@@ -790,22 +801,21 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         (sol_received, amount_in)
     };
 
-    // Pool static accounts order (v1) for intent resources.accounts
+    // Pool static accounts in v2 format (12 accounts, no global_volume_accumulator)
+    // See docs/MOMENTUM_V2_SPEC.md section 9.2 and pumpfun_amm.rs build_swap_ix_from_pool_accounts
     let pool_accounts = vec![
-        pool_market,
-        global_config,
-        base_mint,
-        quote_mint,
-        pool_base_vault,
-        pool_quote_vault,
-        protocol_fee_recipient,
-        protocol_fee_recipient_ta,
-        event_authority,
-        coin_creator_vault_ata,
-        coin_creator_vault_authority,
-        global_volume_accumulator,
-        fee_config,
-        fee_program,
+        pool_market,              // [0]
+        global_config,            // [1]
+        base_mint,                // [2]
+        quote_mint,               // [3]
+        pool_base_vault,          // [4]
+        pool_quote_vault,         // [5]
+        protocol_fee_recipient,   // [6]
+        protocol_fee_recipient_ta,// [7]
+        event_authority,          // [8]
+        coin_creator_vault_ata,   // [9]
+        coin_creator_vault_authority, // [10]
+        fee_config,               // [11] - v2 format: fee_config is at index 11
     ];
 
     debug!(
@@ -1045,7 +1055,8 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
     let _min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
 
     // Determine direction from balance changes
-    let quote_mint =
+    // Note: quote_mint not needed anymore - SELL path uses native balance
+    let _quote_mint =
         Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default();
 
     // Find which token increased (that's what user received)
@@ -1077,10 +1088,12 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
         .unwrap_or(0);
         (amount_in, tokens_received)
     } else {
-        let sol_received = calculate_token_balance_change(
-            &update.pre_token_balances,
-            &update.post_token_balances,
-            &quote_mint,
+        // SELL: SOL received is in native balances, not token_balances!
+        let sol_received = calculate_native_balance_change(
+            &update.account_keys,
+            &update.pre_balances,
+            &update.post_balances,
+            &trader,
         )
         .unwrap_or(0);
         (sol_received, amount_in)
@@ -1190,10 +1203,12 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
         .unwrap_or(0);
         (amount_in, tokens_received)
     } else {
-        let sol_received = calculate_token_balance_change(
-            &update.pre_token_balances,
-            &update.post_token_balances,
-            &quote_mint,
+        // SELL: SOL received is in native balances, not token_balances!
+        let sol_received = calculate_native_balance_change(
+            &update.account_keys,
+            &update.pre_balances,
+            &update.post_balances,
+            &trader,
         )
         .unwrap_or(0);
         (sol_received, amount_in)
