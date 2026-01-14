@@ -14,7 +14,7 @@ use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, info};
 #[cfg(feature = "rpc_fallback")]
 use tracing::warn;
 
@@ -649,6 +649,19 @@ impl Dex for MeteoraDlmm {
         // Convert back to solana_sdk Pubkey
         let user_token_x = Pubkey::new_from_array(user_token_x_spl.to_bytes());
         let user_token_y = Pubkey::new_from_array(user_token_y_spl.to_bytes());
+
+        // Log the ATAs being used for swap debugging
+        info!(
+            pool = %pool_addr,
+            direction = ?direction,
+            token_x_mint = %pool.token_x_mint,
+            token_y_mint = %pool.token_y_mint,
+            user_token_x = %user_token_x,
+            user_token_y = %user_token_y,
+            amount_in = amount_in,
+            min_out = min_out,
+            "meteora_dlmm: building swap with user ATAs"
+        );
 
         // Build swap instruction WITH bin arrays (async)
         // Uses active_id and bin_step from DexPoolAccounts (via set_pool_from_accounts)
