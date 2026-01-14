@@ -595,10 +595,15 @@ impl MeteoraDlmmSwapBuilder {
     /// Calculate which bin array index a bin ID belongs to
     ///
     /// Meteora DLMM uses bin arrays of fixed size (typically 70 bins per array).
-    /// Bin array index = bin_id / BIN_ARRAY_SIZE
+    /// Bin array index = floor(bin_id / BIN_ARRAY_SIZE)
+    ///
+    /// CRITICAL: Must use floor division for negative bin_ids!
+    /// - bin_id = -1:  floor(-1/70) = -1  (correct)
+    /// - bin_id = -1:  -1 / 70 = 0       (wrong! integer division truncates toward zero)
     pub fn bin_id_to_bin_array_index(bin_id: i32) -> i64 {
         const BIN_ARRAY_SIZE: i32 = 70; // Meteora default
-        (bin_id / BIN_ARRAY_SIZE) as i64
+        // Use div_euclid for floor division (handles negative numbers correctly)
+        bin_id.div_euclid(BIN_ARRAY_SIZE) as i64
     }
 }
 
@@ -617,9 +622,13 @@ mod tests {
         // Bin 70 -> array 1 (first bin in second array)
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(70), 1);
 
-        // Negative bins
-        assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(-1), 0);
+        // Negative bins - MUST use floor division!
+        // bin_id = -1:  floor(-1/70) = -1
+        assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(-1), -1);
+        // bin_id = -70: floor(-70/70) = -1
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(-70), -1);
+        // bin_id = -71: floor(-71/70) = -2
+        assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(-71), -2);
     }
 
     #[test]

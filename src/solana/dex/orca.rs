@@ -237,6 +237,55 @@ impl Orca {
             .collect()
     }
 
+    /// Fetch the CURRENT tick_current_index from the pool on-chain.
+    ///
+    /// This is critical because the cached tick may be stale (price moved since cache update).
+    /// Using the wrong tick leads to wrong tick array calculation → Error 6023.
+    ///
+    /// If we can't fetch the pool, we fall back to the cached tick (or 0).
+    async fn fetch_current_tick(&self, pool_id: &Pubkey, fallback_tick: Option<i32>) -> i32 {
+        let fallback = fallback_tick.unwrap_or(0);
+        
+        match self.rpc.get_account_retry(pool_id).await {
+            Ok(account) => {
+                if account.data.len() >= layout::MIN_WHIRLPOOL_ACCOUNT_LEN {
+                    // Read tick_current_index at offset 81 (i32 LE)
+                    let tick_bytes: [u8; 4] = account.data[layout::OFF_TICK_CURRENT..layout::OFF_TICK_CURRENT + 4]
+                        .try_into()
+                        .unwrap_or([0; 4]);
+                    let current_tick = i32::from_le_bytes(tick_bytes);
+                    
+                    if current_tick != fallback {
+                        tracing::info!(
+                            pool = %pool_id,
+                            cached_tick = fallback,
+                            current_tick = current_tick,
+                            delta = current_tick - fallback,
+                            "Orca: tick changed since cache - using fresh on-chain value"
+                        );
+                    }
+                    
+                    current_tick
+                } else {
+                    tracing::warn!(
+                        pool = %pool_id,
+                        account_size = account.data.len(),
+                        "Orca: pool account too small, using cached tick"
+                    );
+                    fallback
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pool = %pool_id,
+                    error = %e,
+                    "Orca: failed to fetch pool for current tick, using cached value"
+                );
+                fallback
+            }
+        }
+    }
+
     /// Lazy-load reserves from vaults with persistent SQLite cache fallback.
     /// Returns (reserve_base, reserve_quote) or falls back to pool's static reserves.
     /// Priority: (1) SQLite persistent cache (2) In-memory cache (3) RPC fetch
@@ -956,6 +1005,142 @@ impl Dex for Orca {
         // 9. tick_array_2 (writable)
         // 10. oracle (readonly)
         let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let accounts = vec![
+            AM { pubkey: token_program, is_signer: false, is_writable: false },
+            AM { pubkey: authority, is_signer: true, is_writable: false },
+            AM { pubkey: pool_id, is_signer: false, is_writable: true },
+            AM { pubkey: token_owner_account_a, is_signer: false, is_writable: true },
+            AM { pubkey: pool.vault_a, is_signer: false, is_writable: true },
+            AM { pubkey: token_owner_account_b, is_signer: false, is_writable: true },
+            AM { pubkey: pool.vault_b, is_signer: false, is_writable: true },
+            AM { pubkey: tick_array_0, is_signer: false, is_writable: true },
+            AM { pubkey: tick_array_1, is_signer: false, is_writable: true },
+            AM { pubkey: tick_array_2, is_signer: false, is_writable: true },
+            AM { pubkey: oracle, is_signer: false, is_writable: false },
+        ];
+
+        Ok(vec![Instruction {
+            program_id,
+            accounts,
+            data,
+        }])
+    }
+
+    /// Async version that fetches current tick_current_index from chain
+    /// 
+    /// CRITICAL: The cached tick_current_index may be stale (price moved since cache update).
+    /// Using stale tick leads to wrong tick array calculation → Error 6023 (InvalidTickArraySequence).
+    /// This async version fetches the CURRENT tick from the pool on-chain.
+    async fn build_swap_ix_async(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount_in: u64,
+        min_out: u64,
+    ) -> Result<Vec<Instruction>> {
+        use solana_sdk::instruction::AccountMeta as AM;
+        use std::str::FromStr;
+
+        const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
+
+        let in_pk = Pubkey::from_str(input_mint).map_err(|_| anyhow!("bad input mint"))?;
+        let out_pk = Pubkey::from_str(output_mint).map_err(|_| anyhow!("bad output mint"))?;
+        let (pool_id, forward, pool) = self
+            .find_pool(&in_pk, &out_pk)
+            .ok_or_else(|| anyhow!("no orca pool for pair"))?;
+
+        let authority = self
+            .user_authority
+            .read()
+            .unwrap()
+            .ok_or_else(|| anyhow!("orca user authority not set"))?;
+
+        let a_to_b = forward;
+
+        // Derive ATAs
+        let derive_ata = |mint: &Pubkey| -> Pubkey {
+            self.user_token_accounts
+                .get(mint)
+                .map(|v| *v)
+                .unwrap_or_else(|| {
+                    let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
+                    let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(mint.to_bytes());
+                    let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+                        &owner_spl, &mint_spl, &spl_token::id()
+                    );
+                    Pubkey::new_from_array(ata_spl.to_bytes())
+                })
+        };
+
+        let token_owner_account_a = derive_ata(&pool.base_mint);
+        let token_owner_account_b = derive_ata(&pool.quote_mint);
+
+        // CRITICAL: Fetch CURRENT tick_current_index from pool on-chain!
+        // The cached tick may be stale (price moved since cache update).
+        let tick_now = self.fetch_current_tick(&pool_id, pool.tick_current_index).await;
+        let spacing = pool.tick_spacing.unwrap_or(64) as i32;
+        let ticks_per_array = spacing * TICK_ARRAY_SIZE;
+
+        let current_array_start = get_tick_array_start_index(tick_now, spacing);
+
+        tracing::debug!(
+            pool = %pool_id,
+            tick_spacing = spacing,
+            tick_current = tick_now,
+            cached_tick = ?pool.tick_current_index,
+            current_array_start = current_array_start,
+            a_to_b = a_to_b,
+            "orca: calculating tick arrays with FRESH tick from chain"
+        );
+
+        // Calculate tick arrays based on current on-chain tick
+        let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) = if a_to_b {
+            let s0 = current_array_start;
+            let s1 = s0 - ticks_per_array;
+            let s2 = s1 - ticks_per_array;
+            (
+                derive_tick_array_pda(&pool_id, s0),
+                derive_tick_array_pda(&pool_id, s1),
+                derive_tick_array_pda(&pool_id, s2),
+                s0, s1, s2,
+            )
+        } else {
+            let s0 = current_array_start;
+            let s1 = s0 + ticks_per_array;
+            let s2 = s1 + ticks_per_array;
+            (
+                derive_tick_array_pda(&pool_id, s0),
+                derive_tick_array_pda(&pool_id, s1),
+                derive_tick_array_pda(&pool_id, s2),
+                s0, s1, s2,
+            )
+        };
+
+        tracing::debug!(
+            pool = %pool_id,
+            tick_array_0 = %tick_array_0,
+            tick_array_1 = %tick_array_1,
+            tick_array_2 = %tick_array_2,
+            start0 = start0,
+            start1 = start1,
+            start2 = start2,
+            "orca: derived tick array PDAs (async with fresh tick)"
+        );
+
+        let oracle = derive_oracle_pda(&pool_id);
+
+        // Build instruction data
+        let mut data = Vec::with_capacity(8 + 8 + 8 + 16 + 1 + 1);
+        data.extend_from_slice(&SWAP_DISCRIMINATOR);
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_out.to_le_bytes());
+        data.extend_from_slice(&0u128.to_le_bytes()); // sqrt_price_limit = no limit
+        data.push(1u8);                               // amount_specified_is_input = true
+        data.push(if a_to_b { 1u8 } else { 0u8 });   // a_to_b
+
+        let program_id = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).map_err(|_| anyhow!("orca program id"))?;
+        let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+
         let accounts = vec![
             AM { pubkey: token_program, is_signer: false, is_writable: false },
             AM { pubkey: authority, is_signer: true, is_writable: false },
