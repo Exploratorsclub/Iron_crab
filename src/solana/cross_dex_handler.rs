@@ -612,6 +612,60 @@ impl CrossDexHandler {
             );
             
             ata_creation_instructions.push(token_ata_ix);
+            
+            // ====================================================================
+            // WRAP SOL: Transfer native SOL → WSOL ATA and sync
+            //
+            // DEXes like Meteora DLMM and Orca require WSOL (SPL token) in the ATA,
+            // not native SOL. We must:
+            // 1. Transfer native SOL from wallet to WSOL ATA
+            // 2. Call SyncNative to update the WSOL balance
+            // ====================================================================
+            let wsol_ata = spl_associated_token_account::get_associated_token_address(
+                &wallet_spl,
+                &wsol_mint_spl,
+            );
+            let wsol_ata_sdk = Pubkey::new_from_array(wsol_ata.to_bytes());
+            
+            // Transfer native SOL to WSOL ATA (manually build system transfer instruction)
+            let system_program_id = Pubkey::from_str("11111111111111111111111111111111")
+                .expect("valid system program id");
+            let transfer_ix = Instruction {
+                program_id: system_program_id,
+                accounts: vec![
+                    AccountMeta {
+                        pubkey: wallet,
+                        is_signer: true,
+                        is_writable: true,
+                    },
+                    AccountMeta {
+                        pubkey: wsol_ata_sdk,
+                        is_signer: false,
+                        is_writable: true,
+                    },
+                ],
+                data: {
+                    // system transfer: instruction enum index 2 + u64 lamports little-endian
+                    let mut d = Vec::with_capacity(1 + 8);
+                    d.push(2u8);
+                    d.extend_from_slice(&buy_amount_in.to_le_bytes());
+                    d
+                },
+            };
+            ata_creation_instructions.push(transfer_ix);
+            
+            // Sync native balance to WSOL token balance
+            let sync_native_ix_prog = spl_token::instruction::sync_native(
+                &spl_token::id(),
+                &wsol_ata,
+            ).map_err(|e| anyhow!("Failed to create sync_native instruction: {}", e))?;
+            ata_creation_instructions.push(prog_ix_to_sdk(sync_native_ix_prog));
+            
+            info!(
+                wsol_ata = %wsol_ata_sdk,
+                amount = buy_amount_in,
+                "Added wrap SOL instructions (transfer + sync_native)"
+            );
         }
 
         // Use async build to support DEXes that need it (PumpFun, etc.)
@@ -674,15 +728,21 @@ impl CrossDexHandler {
             .build_swap_ix_async(token_mint, SOL_MINT, buy_min_out, sell_min_out)
             .await?;
 
-        // Combine: ATA creation (if any) + buy swap + sell swap
-        // ATA creation is idempotent (safe if already exists) and costs ~20k CU each
+        // Combine: ATA creation + wrap SOL (if any) + buy swap + sell swap
+        // Instructions in ata_creation_instructions:
+        // - 2x CreateIdempotent ATA (~20k CU each)
+        // - 1x System Transfer (~300 CU)
+        // - 1x SyncNative (~1k CU)
         let ata_count = ata_creation_instructions.len();
         let mut combined_buy_instructions = ata_creation_instructions;
         combined_buy_instructions.extend(buy_instructions);
 
-        // Estimate compute units (ATA create ~25k each + 2x swap ~200k each)
-        let ata_cu = (ata_count as u32) * 25_000;
-        let total_cu = ata_cu + 200_000 * 2;
+        // Estimate compute units:
+        // - 2x ATA create ~25k each = 50k
+        // - 1x Transfer + SyncNative ~2k
+        // - 2x swap ~200k each = 400k
+        // Total ~452k, round up to 500k for safety
+        let total_cu = 500_000_u32;
 
         Ok(CrossDexSwapPlan {
             buy_instructions: combined_buy_instructions,
