@@ -28,7 +28,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::execution::live_pool_cache::LivePoolCache;
+use crate::execution::live_pool_cache::{CachedPoolState, LivePoolCache};
+use crate::execution::quote_calculator;
 use crate::ipc::TradeIntent;
 use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::orca::Orca;
@@ -258,8 +259,6 @@ impl CrossDexHandler {
     /// Try to inject pool state from LivePoolCache into DEX connector.
     /// Returns true if cache hit and injection successful.
     fn try_inject_from_cache(&self, dex: &str, pool_pk: &Pubkey, connector: &Arc<dyn Dex>) -> bool {
-        use crate::execution::live_pool_cache::CachedPoolState;
-
         let Some(ref cache) = self.pool_cache else {
             return false;
         };
@@ -582,11 +581,95 @@ impl CrossDexHandler {
         // Calculate min_out with slippage
         let slippage_bps = intent.max_slippage_bps.min(self.default_slippage_bps);
 
-        // Buy leg: min tokens out
-        let buy_min_out = buy_quote
-            .amount_out
-            .saturating_mul(10000 - slippage_bps as u64)
-            / 10000;
+        // =======================================================================
+        // FRESH QUOTE FROM LIVEPOOL CACHE (Option C - no stale price-based quotes)
+        // =======================================================================
+        // The buy_quote from validation may be stale (computed from price metadata).
+        // We compute a fresh quote from LivePoolCache if available.
+        // This uses actual pool reserves, not just price.
+        let buy_min_out = if let Some(ref cache) = self.pool_cache {
+            // Try to get fresh quote from LivePoolCache
+            let buy_pool_pk = Pubkey::from_str(&pools[0]).ok();
+            let fresh_min_out = buy_pool_pk.and_then(|pk| {
+                let (state, _slot, age_ms) = cache.get_with_metadata(&pk)?;
+                
+                // Don't use stale data (>10 seconds)
+                if age_ms > 10_000 {
+                    debug!(
+                        pool = %pk,
+                        age_ms,
+                        "LivePoolCache too stale for fresh quote, using validation quote"
+                    );
+                    return None;
+                }
+                
+                // Calculate quote based on DEX type and pool state
+                let amount_out = match state {
+                    CachedPoolState::Meteora(ref s) => {
+                        // Meteora: Y to X swap (SOL -> Token)
+                        // reserve_y = SOL reserve, reserve_x = Token reserve
+                        let reserve_in = s.reserve_y_balance? as u128;
+                        let reserve_out = s.reserve_x_balance? as u128;
+                        if reserve_in == 0 || reserve_out == 0 {
+                            return None;
+                        }
+                        // Constant product with ~30bps fee
+                        let amount_in = trade_amount as u128;
+                        let amount_after_fee = amount_in * 9970 / 10000;
+                        let k = reserve_in * reserve_out;
+                        let new_reserve_in = reserve_in + amount_after_fee;
+                        let new_reserve_out = k / new_reserve_in;
+                        Some(reserve_out.saturating_sub(new_reserve_out) as u64)
+                    }
+                    CachedPoolState::Orca(ref s) => {
+                        // Similar constant product calculation
+                        let reserve_in = s.vault_b_balance? as u128; // SOL
+                        let reserve_out = s.vault_a_balance? as u128; // Token
+                        if reserve_in == 0 || reserve_out == 0 {
+                            return None;
+                        }
+                        let amount_in = trade_amount as u128;
+                        let amount_after_fee = amount_in * 9970 / 10000;
+                        let k = reserve_in * reserve_out;
+                        let new_reserve_in = reserve_in + amount_after_fee;
+                        let new_reserve_out = k / new_reserve_in;
+                        Some(reserve_out.saturating_sub(new_reserve_out) as u64)
+                    }
+                    _ => None, // Other DEXes use validation quote
+                }?;
+                
+                // Apply slippage
+                let min_out = quote_calculator::apply_slippage(amount_out, slippage_bps);
+                info!(
+                    pool = %pk,
+                    dex = %buy_dex,
+                    trade_amount,
+                    amount_out,
+                    min_out,
+                    age_ms,
+                    validation_amount_out = buy_quote.amount_out,
+                    "Fresh buy quote from LivePoolCache (replaces stale validation quote)"
+                );
+                Some(min_out)
+            });
+            
+            match fresh_min_out {
+                Some(min_out) if min_out > 0 => min_out,
+                _ => {
+                    // Fallback to validation quote
+                    buy_quote
+                        .amount_out
+                        .saturating_mul(10000 - slippage_bps as u64)
+                        / 10000
+                }
+            }
+        } else {
+            // No cache available, use validation quote
+            buy_quote
+                .amount_out
+                .saturating_mul(10000 - slippage_bps as u64)
+                / 10000
+        };
 
         if buy_min_out == 0 {
             return Err(anyhow!("buy_min_out=0 (cannot build safe arb)"));
