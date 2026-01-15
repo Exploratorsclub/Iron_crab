@@ -885,6 +885,9 @@ impl Dex for Orca {
         // forward=false means input=B, output=A (a_to_b=false)
         let a_to_b = forward;
 
+        // NOTE: This sync function uses SPL Token program by default.
+        // For Token-2022 support, use build_swap_ix_async() instead which
+        // can fetch mint account owners to determine the correct token program.
         // Token owner accounts (user's ATAs)
         let derive_ata = |mint: &Pubkey| -> Pubkey {
             self.user_token_accounts
@@ -1057,23 +1060,50 @@ impl Dex for Orca {
 
         let a_to_b = forward;
 
-        // Derive ATAs
-        let derive_ata = |mint: &Pubkey| -> Pubkey {
-            self.user_token_accounts
-                .get(mint)
-                .map(|v| *v)
-                .unwrap_or_else(|| {
-                    let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
-                    let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(mint.to_bytes());
-                    let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-                        &owner_spl, &mint_spl, &spl_token::id()
-                    );
-                    Pubkey::new_from_array(ata_spl.to_bytes())
-                })
+        // CRITICAL: Determine token programs BEFORE deriving ATAs!
+        // Token-2022 mints have different ATA addresses than SPL Token mints.
+        let token_2022_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
+        
+        let token_a_program = match self.rpc.get_account_retry(&pool.base_mint).await {
+            Ok(acct) if acct.owner == token_2022_id => {
+                tracing::debug!(mint = %pool.base_mint, "Orca async: token A uses Token-2022");
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes())
+            }
+            _ => spl_token::id(),
+        };
+        
+        let token_b_program = match self.rpc.get_account_retry(&pool.quote_mint).await {
+            Ok(acct) if acct.owner == token_2022_id => {
+                tracing::debug!(mint = %pool.quote_mint, "Orca async: token B uses Token-2022");
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes())
+            }
+            _ => spl_token::id(),
         };
 
-        let token_owner_account_a = derive_ata(&pool.base_mint);
-        let token_owner_account_b = derive_ata(&pool.quote_mint);
+        // Derive ATAs with correct token programs
+        let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
+        
+        let token_owner_account_a = self.user_token_accounts
+            .get(&pool.base_mint)
+            .map(|v| *v)
+            .unwrap_or_else(|| {
+                let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(pool.base_mint.to_bytes());
+                let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &owner_spl, &mint_spl, &token_a_program
+                );
+                Pubkey::new_from_array(ata_spl.to_bytes())
+            });
+            
+        let token_owner_account_b = self.user_token_accounts
+            .get(&pool.quote_mint)
+            .map(|v| *v)
+            .unwrap_or_else(|| {
+                let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(pool.quote_mint.to_bytes());
+                let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &owner_spl, &mint_spl, &token_b_program
+                );
+                Pubkey::new_from_array(ata_spl.to_bytes())
+            });
 
         // CRITICAL: Fetch CURRENT tick_current_index from pool on-chain!
         // The cached tick may be stale (price moved since cache update).

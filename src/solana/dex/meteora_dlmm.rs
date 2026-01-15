@@ -693,20 +693,41 @@ impl Dex for MeteoraDlmm {
         let token_y_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
             pool.token_y_mint.to_bytes(),
         );
-        let token_program_spl = spl_token::id();
+        
+        // CRITICAL: Determine the correct token program for each mint!
+        // Token-2022 mints require Token-2022 ATAs, which have different addresses
+        // than SPL Token ATAs. If we use the wrong program, the ATA won't exist.
+        let token_2022_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
+        
+        // Fetch mint account owners to determine token programs
+        let token_x_program_spl = match self.rpc.get_account_retry(&pool.token_x_mint).await {
+            Ok(acct) if acct.owner == token_2022_id => {
+                debug!(mint = %pool.token_x_mint, "Token X uses Token-2022");
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes())
+            }
+            _ => spl_token::id(),
+        };
+        
+        let token_y_program_spl = match self.rpc.get_account_retry(&pool.token_y_mint).await {
+            Ok(acct) if acct.owner == token_2022_id => {
+                debug!(mint = %pool.token_y_mint, "Token Y uses Token-2022");
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes())
+            }
+            _ => spl_token::id(),
+        };
 
-        // Derive ATAs for user
+        // Derive ATAs for user with correct token programs
         let user_token_x_spl =
             spl_associated_token_account::get_associated_token_address_with_program_id(
                 &owner_spl,
                 &token_x_spl,
-                &token_program_spl,
+                &token_x_program_spl, // Use correct program for X mint!
             );
         let user_token_y_spl =
             spl_associated_token_account::get_associated_token_address_with_program_id(
                 &owner_spl,
                 &token_y_spl,
-                &token_program_spl,
+                &token_y_program_spl, // Use correct program for Y mint!
             );
 
         // Convert back to solana_sdk Pubkey
