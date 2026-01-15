@@ -50,6 +50,7 @@ pub struct OrcaWhirlpoolState {
     pub sqrt_price: u128,
     pub liquidity: u128,
     pub fee_rate: u16,
+    pub protocol_fee_rate: u16,
     pub tick_spacing: u16,
     /// Vault balances (updated from vault account subscriptions)
     pub vault_a_balance: Option<u64>,
@@ -67,6 +68,7 @@ impl From<WhirlpoolParsed> for OrcaWhirlpoolState {
             sqrt_price: p.sqrt_price,
             liquidity: p.liquidity,
             fee_rate: p.fee_rate,
+            protocol_fee_rate: p.protocol_fee_rate,
             tick_spacing: p.tick_spacing,
             vault_a_balance: None,
             vault_b_balance: None,

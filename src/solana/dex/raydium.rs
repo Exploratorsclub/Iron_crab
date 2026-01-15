@@ -279,6 +279,83 @@ impl Raydium {
         Ok(())
     }
 
+    /// Inject cached AMM state from LivePoolCache (avoids RPC call)
+    ///
+    /// This is used by tx_builder when pool state is available in the live cache.
+    /// Serum accounts are optional - if not provided, they'll be fetched via RPC.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inject_cached_amm_state(
+        &self,
+        pool_address: Pubkey,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        base_vault: Pubkey,
+        quote_vault: Pubkey,
+        _base_decimals: u8,
+        _quote_decimals: u8,
+        market_id: Pubkey,
+        serum_bids: Option<Pubkey>,
+        serum_asks: Option<Pubkey>,
+        serum_event_queue: Option<Pubkey>,
+    ) {
+        // Derive PDAs (same as load_pool_from_geyser)
+        let (amm_auth, _) = Self::derive_amm_authority();
+
+        // Try to derive serum vault signer (market_program_id not in cache, use OpenBook default)
+        let openbook_v1 =
+            Pubkey::from_str("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX").ok();
+        let serum_vault_signer = openbook_v1.and_then(|prog| {
+            let (v, _) = Self::derive_serum_vault_signer(&market_id, &prog);
+            Some(v)
+        });
+
+        // Create SimplePool entry from cached state
+        let pool = SimplePool {
+            base_mint,
+            quote_mint,
+            base_vault,
+            quote_vault,
+            lp_reserve: 0, // Not needed for swap
+            address: pool_address,
+            open_orders: None, // Will be derived or fetched if needed
+            market_id: Some(market_id),
+            market_program_id: openbook_v1,
+            amm_authority: Some(amm_auth),
+            serum_vault_signer,
+            target_orders: None, // Not needed for swap
+            reserve_base: 0,     // Not used for instruction building
+            reserve_quote: 0,
+            fee_bps: 30, // Default Raydium fee
+            last_update: std::time::SystemTime::now(),
+            serum_bids,
+            serum_asks,
+            serum_event_queue,
+            serum_base_vault: None, // Will be fetched if needed
+            serum_quote_vault: None,
+        };
+
+        // Insert into pools cache
+        self.pools.insert(pool_address, pool.clone());
+
+        // Update mint index
+        self.mint_index
+            .entry(base_mint)
+            .or_default()
+            .push(pool_address);
+        self.mint_index
+            .entry(quote_mint)
+            .or_default()
+            .push(pool_address);
+
+        tracing::debug!(
+            pool=%pool_address,
+            base=%base_mint,
+            quote=%quote_mint,
+            has_serum_accounts = serum_bids.is_some(),
+            "injected raydium pool from live cache"
+        );
+    }
+
     /// Check if a pool is already cached
     pub fn pool_exists(&self, pool_address: &Pubkey) -> bool {
         self.pools.contains_key(pool_address)

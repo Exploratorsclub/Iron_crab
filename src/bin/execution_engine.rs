@@ -3740,7 +3740,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
             (tx_plan, plan_hash_str)
         } else {
-            match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc)).await {
+            // TODO: Pass LivePoolCache once initialized in main()
+            match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc), None).await {
                 tx_builder::TxPlanOutcome::Planned(plan) => {
                     let plan_hash_str = plan.hash_string();
                     checks.push(CheckResult {

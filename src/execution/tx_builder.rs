@@ -1,3 +1,4 @@
+use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
 use crate::ipc::{RejectReason, TradeIntent, TradeSide};
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::orca_whirlpool_layout;
@@ -13,6 +14,7 @@ use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::warn;
 
 /// System program ID
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
@@ -209,10 +211,35 @@ fn min_out_raw_from_intent(intent: &TradeIntent) -> Result<u64, UnsupportedTxPla
     }
 }
 
+/// Fetch Orca Whirlpool state from RPC (fallback when cache miss)
+async fn fetch_orca_from_rpc(
+    rpc: &Arc<SolanaRpc>,
+    pool_id: &Pubkey,
+) -> Result<orca_whirlpool_layout::WhirlpoolParsed, UnsupportedTxPlan> {
+    let acct = match rpc.rpc.get_account(pool_id).await {
+        Ok(a) => a,
+        Err(e) => {
+            return Err(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: format!("orca whirlpool account fetch failed: {e}"),
+            })
+        }
+    };
+
+    match orca_whirlpool_layout::parse_whirlpool(&acct.data) {
+        Some(p) => Ok(p),
+        None => Err(UnsupportedTxPlan {
+            reason: RejectReason::UnsupportedIntent,
+            details: "orca whirlpool parse failed (invalid layout/size)".to_string(),
+        }),
+    }
+}
+
 pub async fn build_tx_plan(
     intent: &TradeIntent,
     wallet_pubkey: Pubkey,
     rpc: Arc<SolanaRpc>,
+    cache: Option<&SharedLivePoolCache>,
 ) -> TxPlanOutcome {
     let dex_hint = match dex_hint_from_intent(intent) {
         Ok(h) => h,
@@ -285,23 +312,51 @@ pub async fn build_tx_plan(
             }
         };
 
-        let acct = match rpc.rpc.get_account(&pool_id).await {
-            Ok(a) => a,
-            Err(e) => {
-                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                    reason: RejectReason::UnsupportedIntent,
-                    details: format!("orca whirlpool account fetch failed: {e}"),
-                })
+        // Try cache first, fallback to RPC
+        let parsed = if let Some(cache) = cache {
+            if let Some((state, slot, age_ms)) = cache.get_with_metadata(&pool_id) {
+                match state {
+                    CachedPoolState::Orca(orca_state) => {
+                        // Convert cached state to WhirlpoolParsed
+                        tracing::debug!(
+                            pool = %pool_id,
+                            slot,
+                            age_ms,
+                            "orca: using cached pool state"
+                        );
+                        orca_whirlpool_layout::WhirlpoolParsed {
+                            token_mint_a: orca_state.token_mint_a,
+                            token_mint_b: orca_state.token_mint_b,
+                            token_vault_a: orca_state.token_vault_a,
+                            token_vault_b: orca_state.token_vault_b,
+                            tick_current_index: orca_state.tick_current_index,
+                            sqrt_price: orca_state.sqrt_price,
+                            liquidity: orca_state.liquidity,
+                            fee_rate: orca_state.fee_rate,
+                            protocol_fee_rate: orca_state.protocol_fee_rate,
+                            tick_spacing: orca_state.tick_spacing,
+                        }
+                    }
+                    _ => {
+                        warn!(pool = %pool_id, "orca: cache hit but wrong DEX type, falling back to RPC");
+                        match fetch_orca_from_rpc(&rpc, &pool_id).await {
+                            Ok(p) => p,
+                            Err(e) => return TxPlanOutcome::Unsupported(e),
+                        }
+                    }
+                }
+            } else {
+                warn!(pool = %pool_id, "orca: cache miss, falling back to RPC");
+                match fetch_orca_from_rpc(&rpc, &pool_id).await {
+                    Ok(p) => p,
+                    Err(e) => return TxPlanOutcome::Unsupported(e),
+                }
             }
-        };
-
-        let parsed = match orca_whirlpool_layout::parse_whirlpool(&acct.data) {
-            Some(p) => p,
-            None => {
-                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                    reason: RejectReason::UnsupportedIntent,
-                    details: "orca whirlpool parse failed (invalid layout/size)".to_string(),
-                })
+        } else {
+            // No cache provided, use RPC directly
+            match fetch_orca_from_rpc(&rpc, &pool_id).await {
+                Ok(p) => p,
+                Err(e) => return TxPlanOutcome::Unsupported(e),
             }
         };
 
@@ -380,15 +435,55 @@ pub async fn build_tx_plan(
         let mut raydium = Raydium::new(Arc::clone(&rpc));
         raydium.set_user_authority(wallet_pubkey);
 
-        // Load the specific pool snapshot into the Raydium adapter.
-        if let Err(e) = raydium.load_pool_from_geyser(&pool_id).await {
-            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                reason: RejectReason::UnsupportedIntent,
-                details: format!("raydium load_pool_from_geyser failed: {e}"),
-            });
+        // Try cache first for pool state, fallback to RPC
+        let mut used_cache = false;
+        if let Some(cache) = cache {
+            if let Some((state, slot, age_ms)) = cache.get_with_metadata(&pool_id) {
+                match state {
+                    CachedPoolState::RaydiumAmm(amm_state) => {
+                        tracing::debug!(
+                            pool = %pool_id,
+                            slot,
+                            age_ms,
+                            "raydium: using cached pool state"
+                        );
+                        // Inject cached state into Raydium adapter
+                        raydium.inject_cached_amm_state(
+                            pool_id,
+                            amm_state.base_mint,
+                            amm_state.quote_mint,
+                            amm_state.coin_vault,
+                            amm_state.pc_vault,
+                            amm_state.base_decimals,
+                            amm_state.quote_decimals,
+                            amm_state.market_id,
+                            amm_state.serum_bids,
+                            amm_state.serum_asks,
+                            amm_state.serum_event_queue,
+                        );
+                        used_cache = true;
+                    }
+                    _ => {
+                        warn!(pool = %pool_id, "raydium: cache hit but wrong DEX type, falling back to RPC");
+                    }
+                }
+            } else {
+                warn!(pool = %pool_id, "raydium: cache miss, falling back to RPC");
+            }
+        }
+
+        // If cache didn't provide state, load from RPC
+        if !used_cache {
+            if let Err(e) = raydium.load_pool_from_geyser(&pool_id).await {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!("raydium load_pool_from_geyser failed: {e}"),
+                });
+            }
         }
 
         // Raydium tx building needs Serum/OpenBook market accounts.
+        // Note: These are static and could be cached, but for now we still fetch if not in cache
         if let Err(e) = raydium.fetch_and_populate_serum_accounts(&pool_id).await {
             return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                 reason: RejectReason::UnsupportedIntent,
