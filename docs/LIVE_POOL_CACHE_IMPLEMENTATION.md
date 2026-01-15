@@ -71,39 +71,42 @@
 ### 2.3 Fallback-Logik
 - [x] Wenn Pool nicht im Cache: RPC als Fallback (mit Warning-Log)
 - [ ] Metric: `cache_miss_total{dex="..."}` - TODO
-## Phase 3: Quote-Berechnung in execution-engine (2h)
+## Phase 3: Quote-Berechnung in execution-engine (2h) ✅ COMPLETE
 
 ### 3.1 Quote-Funktionen aus Cache
-- [ ] `calculate_orca_quote(state: &OrcaWhirlpoolState, amount_in: u64, a_to_b: bool) -> u64`
-- [ ] `calculate_raydium_quote(state: &RaydiumAmmState, amount_in: u64, base_to_quote: bool) -> u64`
-- [ ] `calculate_meteora_quote(state: &MeteoraState, amount_in: u64, x_to_y: bool) -> u64`
-- [ ] `calculate_pumpfun_quote(state: &PumpFunState, amount_in: u64, buy: bool) -> u64`
-- [ ] `calculate_pumpamm_quote(state: &PumpAmmState, amount_in: u64, buy: bool) -> u64`
+- [x] `calculate_orca_quote(state: &OrcaWhirlpoolState, amount_in: u64, a_to_b: bool) -> u64`
+- [x] `calculate_raydium_amm_quote(state: &RaydiumAmmState, amount_in: u64, base_to_quote: bool) -> u64`
+- [x] `calculate_raydium_cpmm_quote(state: &RaydiumCpmmState, amount_in: u64) -> u64`
+- [x] `calculate_meteora_quote(state: &MeteoraState, amount_in: u64, x_to_y: bool) -> u64`
+- [x] `calculate_pumpfun_quote(state: &PumpFunState, amount_in: u64, buy: bool) -> u64`
+- [x] `calculate_pumpamm_quote(state: &PumpAmmState, amount_in: u64, buy: bool) -> u64`
 
 ### 3.2 Fresh min_out Berechnung
-- [ ] `fn calculate_fresh_min_out(cache: &LivePoolCache, intent: &TradeIntent) -> Result<u64>`
-- [ ] Slippage anwenden: `quote * (10000 - slippage_bps) / 10000`
+- [x] `fn calculate_fresh_min_out(cache: &LivePoolCache, intent: &TradeIntent) -> Result<u64>`
+- [x] Slippage anwenden: `quote * (10000 - slippage_bps) / 10000`
+- [x] Modul: `src/execution/quote_calculator.rs` (~480 Zeilen)
 
 ### 3.3 Integration in Intent-Processing
-- [ ] Wenn `intent.execution.min_out` fehlt: frisch berechnen
-- [ ] Log: "Recalculated min_out from cache: old={} new={}"
+- [x] `min_out_raw_from_intent()` → `Option<u64>` (nicht mehr Result)
+- [x] Wenn `intent.execution.min_out` fehlt: frisch berechnen aus Cache
+- [x] Log: "tx_plan: calculated fresh min_out from cache"
+- [x] Tests aktualisiert und bestanden
 
 ---
 
-## Phase 4: Intent-Schema + arb-strategy anpassen (1h)
+## Phase 4: Intent-Schema + arb-strategy anpassen (1h) ✅ COMPLETE
 
 ### 4.1 TradeIntent anpassen
-- [ ] `execution.min_out` bleibt optional
-- [ ] Doku: "Wenn None, berechnet execution-engine aus Live-Cache"
+- [x] `execution.min_out` bleibt optional (already was)
+- [x] Doku: "Wenn None, berechnet execution-engine aus Live-Cache"
 
 ### 4.2 arb-strategy anpassen
-- [ ] Kein `min_out` mehr in Intent setzen
-- [ ] Nur `max_slippage_bps` setzen
-- [ ] TTL reduzieren: `intent_ttl_ms = 1000` (kann später auf 500 gesenkt werden)
+- [x] Kein `min_out` mehr in Intent setzen (already doesn't set it!)
+- [x] Nur `max_slippage_bps` setzen (already does this)
+- [x] TTL reduzieren: `intent_ttl_ms = 1000` (von 3000ms, kann später auf 500 gesenkt werden)
 
-### 4.3 momentum-bot anpassen (optional)
-- [ ] Gleiche Logik: `min_out` optional
-- [ ] Oder: Momentum behält min_out (Quote ist relativ frisch)
+### 4.3 momentum-bot anpassen (optional - SKIPPED)
+- [x] Momentum behält min_out (Quote ist relativ frisch vom Signal)
 
 ---
 

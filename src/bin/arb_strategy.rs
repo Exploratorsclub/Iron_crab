@@ -65,7 +65,9 @@ struct ArbConfig {
     max_slippage_bps: u32,
     /// Cooldown between intents for same pair in ms. Default: 5000ms
     intent_cooldown_ms: u64,
-    /// TTL for intents in ms. Default: 3000ms
+    /// TTL for intents in ms. Default: 1000ms (reduced from 3000ms for Option C)
+    /// Since execution-engine calculates fresh min_out from Geyser cache,
+    /// we can use shorter TTL without quote staleness issues.
     intent_ttl_ms: u64,
 }
 
@@ -78,7 +80,7 @@ impl Default for ArbConfig {
             est_tx_cost_lamports: 50_000,         // 0.00005 SOL tx cost
             max_slippage_bps: 100,                // 1% max slippage
             intent_cooldown_ms: 5000,             // 5s cooldown per pair
-            intent_ttl_ms: 3000,                  // 3s TTL
+            intent_ttl_ms: 1000,                  // 1s TTL (Option C: fresh quotes in exec-engine)
         }
     }
 }
