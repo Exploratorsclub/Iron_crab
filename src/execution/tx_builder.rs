@@ -1,5 +1,6 @@
 use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
 use crate::ipc::{RejectReason, TradeIntent, TradeSide};
+use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::orca_whirlpool_layout;
 use crate::solana::dex::pumpfun::PumpFunDex;
@@ -150,6 +151,7 @@ enum DexHint {
     Orca,
     Pumpfun,
     PumpAmm,
+    MeteoraDlmm,
 }
 
 fn dex_hint_from_intent(intent: &TradeIntent) -> Result<DexHint, UnsupportedTxPlan> {
@@ -158,6 +160,7 @@ fn dex_hint_from_intent(intent: &TradeIntent) -> Result<DexHint, UnsupportedTxPl
         Some("orca") => Ok(DexHint::Orca),
         Some("pumpfun") => Ok(DexHint::Pumpfun),
         Some("pump_amm") => Ok(DexHint::PumpAmm),
+        Some("meteora_dlmm") => Ok(DexHint::MeteoraDlmm),
         Some(other) => Err(UnsupportedTxPlan {
             reason: RejectReason::UnsupportedIntent,
             details: format!("unsupported metadata.dex={other}"),
@@ -634,6 +637,101 @@ pub async fn build_tx_plan(
         }
 
         return TxPlanOutcome::Planned(TxPlan { instructions: ixs });
+    }
+
+    // Meteora DLMM planning
+    if dex_hint == DexHint::MeteoraDlmm {
+        let pool_id_str = &intent.resources.pools[0];
+        let _pool_id = match Pubkey::from_str(pool_id_str) {
+            Ok(pk) => pk,
+            Err(e) => {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::InvalidIntent,
+                    details: format!("invalid resources.pools[0] pubkey for meteora_dlmm: {e}"),
+                })
+            }
+        };
+
+        // Meteora DLMM requires DexPoolAccounts with pool data
+        // Format: [lb_pair, token_x_mint, token_y_mint, reserve_x?, reserve_y?, active_id:N?, bin_step:N?]
+        if intent.resources.accounts.len() < 3 {
+            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: format!(
+                    "meteora_dlmm requires resources.accounts (DexPoolAccounts), got len={}",
+                    intent.resources.accounts.len()
+                ),
+            });
+        }
+
+        let mut meteora = MeteoraDlmm::new(Arc::clone(&rpc));
+        meteora.set_user_authority(wallet_pubkey);
+
+        // Parse accounts and set pool from intent data
+        if let Err(e) = meteora.set_pool_from_accounts(pool_id_str, &intent.resources.accounts) {
+            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: format!("meteora_dlmm set_pool_from_accounts failed: {e}"),
+            });
+        }
+
+        let ixs = match meteora
+            .build_swap_ix(
+                &intent.resources.input_mint,
+                &intent.resources.output_mint,
+                intent.required_capital.raw,
+                min_out,
+            )
+        {
+            Ok(ixs) => ixs,
+            Err(e) => {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!("meteora_dlmm build failed: {e}"),
+                })
+            }
+        };
+
+        // For BUY trades (SOL → Token), prepend wrap SOL + token ATA instructions
+        let final_ixs = if intent.side == TradeSide::Buy {
+            let mut all_ixs = build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
+            
+            // Also create token ATA (for receiving bought tokens)
+            let token_mint = Pubkey::from_str(&intent.resources.output_mint).unwrap_or_default();
+            let token_mint_spl = SplProgramPubkey::new_from_array(token_mint.to_bytes());
+            let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
+            let token_program_spl = spl_token::id();
+            let token_ata_ix = prog_ix_to_sdk(
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &payer_spl,
+                    &payer_spl,
+                    &token_mint_spl,
+                    &token_program_spl,
+                ),
+            );
+            all_ixs.push(token_ata_ix);
+            all_ixs.extend(ixs);
+            all_ixs
+        } else {
+            // SELL: ensure WSOL ATA exists
+            let wsol_mint = Pubkey::from_str(SOL_MINT).expect("valid SOL_MINT");
+            let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
+            let wsol_mint_spl = SplProgramPubkey::new_from_array(wsol_mint.to_bytes());
+            let token_program_spl = spl_token::id();
+            let ata_ix = prog_ix_to_sdk(
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &payer_spl,
+                    &payer_spl,
+                    &wsol_mint_spl,
+                    &token_program_spl,
+                ),
+            );
+            let mut all_ixs = vec![ata_ix];
+            all_ixs.extend(ixs);
+            all_ixs
+        };
+
+        return TxPlanOutcome::Planned(TxPlan { instructions: final_ixs });
     }
 
     debug_assert_eq!(dex_hint, DexHint::Pumpfun);
