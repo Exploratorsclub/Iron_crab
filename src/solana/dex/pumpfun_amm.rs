@@ -2686,14 +2686,36 @@ impl PumpFunAmmDex {
         let coin_creator_vault_ata = pool_accounts[9];
         let coin_creator_vault_authority = pool_accounts[10];
         
-        // CRITICAL: v1 format (14 accounts) vs v2 format (12 accounts) have different layouts!
-        // v1: [11]=global_volume_accumulator, [12]=fee_config, [13]=fee_program
-        // v2: [11]=fee_config (no volume accumulators)
-        let fee_config = if pool_accounts.len() >= 14 {
-            pool_accounts[12] // v1 format
-        } else {
-            pool_accounts[11] // v2 format
+        // CRITICAL FIX: Instead of trusting fee_config from pool_accounts (which may be
+        // an AMM-owned PDA), we derive the correct fee_config PDA from the Fee Program.
+        // The fee_config passed in pool_accounts[11] is often the AMM's internal state,
+        // not the Fee Program's config account. The correct fee_config is a PDA with
+        // seeds ["fee_config", global_config] owned by the Fee Program.
+        let derived_fee_config = {
+            let seeds_to_try: &[&[&[u8]]] = &[
+                &[b"fee_config", global_config.as_ref()],
+                &[b"fee_config"],
+            ];
+            
+            let mut found = None;
+            for seeds in seeds_to_try {
+                let (pda, _bump) = Pubkey::find_program_address(seeds, &expected_fee_program);
+                // Use the first PDA that doesn't match known invalid patterns
+                if pda != expected_fee_program && pda != program_id && pda != Pubkey::default() {
+                    found = Some(pda);
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| {
+                // Fallback to pool_accounts if PDA derivation fails
+                if pool_accounts.len() >= 14 {
+                    pool_accounts[12]
+                } else {
+                    pool_accounts[11]
+                }
+            })
         };
+        let fee_config = derived_fee_config;
         let fee_program = expected_fee_program; // Always use expected, don't trust intent
 
         // Intent-driven guardrails (no RPC calls): reject obviously wrong pool_accounts early.
