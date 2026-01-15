@@ -606,23 +606,28 @@ impl CrossDexHandler {
                 // Calculate quote based on DEX type and pool state
                 let amount_out = match state {
                     CachedPoolState::Meteora(ref s) => {
-                        // Meteora: Y to X swap (SOL -> Token)
+                        // Meteora DLMM uses BINS with concentrated liquidity, NOT constant product.
+                        // Our constant product approximation is optimistic - add extra buffer.
                         // reserve_y = SOL reserve, reserve_x = Token reserve
                         let reserve_in = s.reserve_y_balance? as u128;
                         let reserve_out = s.reserve_x_balance? as u128;
                         if reserve_in == 0 || reserve_out == 0 {
                             return None;
                         }
-                        // Constant product with ~30bps fee
+                        // Constant product approximation with ~30bps fee
                         let amount_in = trade_amount as u128;
                         let amount_after_fee = amount_in * 9970 / 10000;
                         let k = reserve_in * reserve_out;
                         let new_reserve_in = reserve_in + amount_after_fee;
                         let new_reserve_out = k / new_reserve_in;
-                        Some(reserve_out.saturating_sub(new_reserve_out) as u64)
+                        let raw_out = reserve_out.saturating_sub(new_reserve_out) as u64;
+                        // DLMM bins cause more slippage than constant product - apply 15% extra buffer
+                        // This is because active bins may have less liquidity than reserves suggest
+                        Some(raw_out.saturating_mul(85) / 100)
                     }
                     CachedPoolState::Orca(ref s) => {
-                        // Similar constant product calculation
+                        // Orca Whirlpool uses concentrated liquidity (like DLMM)
+                        // Constant product is an approximation - add extra buffer
                         let reserve_in = s.vault_b_balance? as u128; // SOL
                         let reserve_out = s.vault_a_balance? as u128; // Token
                         if reserve_in == 0 || reserve_out == 0 {
@@ -633,7 +638,9 @@ impl CrossDexHandler {
                         let k = reserve_in * reserve_out;
                         let new_reserve_in = reserve_in + amount_after_fee;
                         let new_reserve_out = k / new_reserve_in;
-                        Some(reserve_out.saturating_sub(new_reserve_out) as u64)
+                        let raw_out = reserve_out.saturating_sub(new_reserve_out) as u64;
+                        // Concentrated liquidity causes more slippage - apply 10% extra buffer
+                        Some(raw_out.saturating_mul(90) / 100)
                     }
                     _ => None, // Other DEXes use validation quote
                 }?;
