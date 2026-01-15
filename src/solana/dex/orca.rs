@@ -1112,6 +1112,10 @@ impl Dex for Orca {
         let ticks_per_array = spacing * TICK_ARRAY_SIZE;
 
         let current_array_start = get_tick_array_start_index(tick_now, spacing);
+        
+        // Calculate position within current tick array (0 to ticks_per_array-1)
+        let position_in_array = (tick_now - current_array_start).abs();
+        let array_boundary_margin = ticks_per_array / 4; // 25% margin from boundary
 
         tracing::debug!(
             pool = %pool_id,
@@ -1119,25 +1123,44 @@ impl Dex for Orca {
             tick_current = tick_now,
             cached_tick = ?pool.tick_current_index,
             current_array_start = current_array_start,
+            position_in_array = position_in_array,
             a_to_b = a_to_b,
             "orca: calculating tick arrays with FRESH tick from chain"
         );
 
-        // Calculate tick arrays based on current on-chain tick
-        let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) = if a_to_b {
+        // IMPROVED: Select tick arrays to handle price movement in EITHER direction.
+        // 
+        // Problem: Between fetch_current_tick() and simulation, price may move.
+        // If we only select arrays in the swap direction, we fail with Error 6023.
+        //
+        // Solution: Always include the current array PLUS arrays in BOTH directions.
+        // - tick_array_0: Current array (always contains current tick)
+        // - tick_array_1: Array in swap direction (primary movement)
+        // - tick_array_2: Array in OPPOSITE direction (handle reverse movement)
+        //
+        // This handles ~2 arrays worth of price movement in either direction.
+        let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) = {
             let s0 = current_array_start;
-            let s1 = s0 - ticks_per_array;
-            let s2 = s1 - ticks_per_array;
-            (
-                derive_tick_array_pda(&pool_id, s0),
-                derive_tick_array_pda(&pool_id, s1),
-                derive_tick_array_pda(&pool_id, s2),
-                s0, s1, s2,
-            )
-        } else {
-            let s0 = current_array_start;
-            let s1 = s0 + ticks_per_array;
-            let s2 = s1 + ticks_per_array;
+            // Primary direction based on swap type
+            let s_primary = if a_to_b { s0 - ticks_per_array } else { s0 + ticks_per_array };
+            // Opposite direction to handle price reversal
+            let s_opposite = if a_to_b { s0 + ticks_per_array } else { s0 - ticks_per_array };
+            
+            // If tick is near the boundary in primary direction, extend further in that direction
+            let near_low_boundary = position_in_array < array_boundary_margin;
+            let near_high_boundary = position_in_array > (ticks_per_array - array_boundary_margin);
+            
+            let (s1, s2) = if a_to_b && near_low_boundary {
+                // A→B swap, tick near low boundary - extend further in decreasing direction
+                (s_primary, s_primary - ticks_per_array)
+            } else if !a_to_b && near_high_boundary {
+                // B→A swap, tick near high boundary - extend further in increasing direction  
+                (s_primary, s_primary + ticks_per_array)
+            } else {
+                // Normal case: cover both directions
+                (s_primary, s_opposite)
+            };
+            
             (
                 derive_tick_array_pda(&pool_id, s0),
                 derive_tick_array_pda(&pool_id, s1),
