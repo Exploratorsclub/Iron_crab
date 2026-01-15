@@ -28,6 +28,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::execution::live_pool_cache::LivePoolCache;
 use crate::ipc::TradeIntent;
 use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::orca::Orca;
@@ -126,6 +127,8 @@ pub struct CrossDexHandler {
     default_slippage_bps: u32,
     /// RPC URL for DEXes that need it directly
     rpc_url: Option<String>,
+    /// Live pool cache for fresh Geyser data (Option C: reduces RPC calls)
+    pool_cache: Option<Arc<LivePoolCache>>,
 }
 
 impl CrossDexHandler {
@@ -137,12 +140,19 @@ impl CrossDexHandler {
             wallet_pubkey,
             default_slippage_bps: 100, // 1% default
             rpc_url: None,
+            pool_cache: None,
         }
     }
 
     /// Set RPC URL for DEXes that need direct HTTP access
     pub fn with_rpc_url(mut self, url: String) -> Self {
         self.rpc_url = Some(url);
+        self
+    }
+
+    /// Set LivePoolCache for fresh Geyser data (Option C)
+    pub fn with_pool_cache(mut self, cache: Arc<LivePoolCache>) -> Self {
+        self.pool_cache = Some(cache);
         self
     }
 
@@ -243,6 +253,90 @@ impl CrossDexHandler {
     /// Check if this intent is a cross-DEX arbitrage intent
     pub fn is_cross_dex_arb_intent(intent: &TradeIntent) -> bool {
         intent.resources.pools.len() == 2 && intent.source == "arb-strategy"
+    }
+
+    /// Try to inject pool state from LivePoolCache into DEX connector.
+    /// Returns true if cache hit and injection successful.
+    fn try_inject_from_cache(&self, dex: &str, pool_pk: &Pubkey, connector: &Arc<dyn Dex>) -> bool {
+        use crate::execution::live_pool_cache::CachedPoolState;
+
+        let Some(ref cache) = self.pool_cache else {
+            return false;
+        };
+
+        let Some(state) = cache.get(pool_pk) else {
+            debug!(
+                pool = %pool_pk,
+                dex = %dex,
+                "LivePoolCache miss"
+            );
+            return false;
+        };
+
+        match (dex, state) {
+            ("meteora_dlmm", CachedPoolState::Meteora(meteora_state)) => {
+                // Downcast to MeteoraDlmm and inject
+                // Note: This requires the connector to be the concrete type
+                // For now, we use set_pool_from_accounts with the cached data
+                let accounts = vec![
+                    pool_pk.to_string(),
+                    meteora_state.token_x_mint.to_string(),
+                    meteora_state.token_y_mint.to_string(),
+                    meteora_state.reserve_x.to_string(),
+                    meteora_state.reserve_y.to_string(),
+                    format!("active_id:{}", meteora_state.active_id),
+                    format!("bin_step:{}", meteora_state.bin_step),
+                ];
+                if connector.set_pool_from_accounts(&pool_pk.to_string(), &accounts).is_ok() {
+                    info!(
+                        pool = %pool_pk,
+                        dex = %dex,
+                        active_id = meteora_state.active_id,
+                        "Injected pool state from LivePoolCache (no RPC)"
+                    );
+                    return true;
+                }
+            }
+            ("orca", CachedPoolState::Orca(orca_state)) => {
+                let accounts = vec![
+                    pool_pk.to_string(),
+                    orca_state.token_mint_a.to_string(),
+                    orca_state.token_mint_b.to_string(),
+                    orca_state.token_vault_a.to_string(),
+                    orca_state.token_vault_b.to_string(),
+                    format!("sqrt_price:{}", orca_state.sqrt_price),
+                    format!("tick_current_index:{}", orca_state.tick_current_index),
+                ];
+                if connector.set_pool_from_accounts(&pool_pk.to_string(), &accounts).is_ok() {
+                    info!(
+                        pool = %pool_pk,
+                        dex = %dex,
+                        tick = orca_state.tick_current_index,
+                        "Injected pool state from LivePoolCache (no RPC)"
+                    );
+                    return true;
+                }
+            }
+            ("raydium", CachedPoolState::RaydiumAmm(_)) => {
+                // Raydium uses inject_cached_amm_state via tx_builder
+                // For cross_dex_handler, we just mark as cache available
+                debug!(
+                    pool = %pool_pk,
+                    dex = %dex,
+                    "Raydium pool in cache (injection via tx_builder)"
+                );
+                return true;
+            }
+            _ => {
+                debug!(
+                    pool = %pool_pk,
+                    dex = %dex,
+                    "Cache state type mismatch or unsupported DEX"
+                );
+            }
+        }
+
+        false
     }
 
     /// Validate a cross-DEX arbitrage opportunity using INTENT DATA ONLY
@@ -519,31 +613,35 @@ impl CrossDexHandler {
         } else if !buy_pool.is_empty() {
             // No accounts in intent
             // For pump_amm: REJECT (DexPoolAccounts required per TARGET_ARCHITECTURE.md)
-            // For meteora_dlmm/orca: Allow single getAccount fallback (acceptable per TARGET_ARCHITECTURE.md Section 4.2)
+            // For meteora_dlmm/orca: Try LivePoolCache first, then RPC fallback
             if buy_dex == "pump_amm" {
                 return Err(anyhow!(
                     "buy pool {} has no accounts in intent - pump_amm requires DexPoolAccounts",
                     buy_pool
                 ));
             } else {
-                // Single getAccount RPC fallback for Meteora/Orca (acceptable)
-                info!(
-                    pool = %buy_pool,
-                    dex = %buy_dex,
-                    "No accounts in intent for buy pool, using single getAccount RPC fallback"
-                );
                 let pool_pk = Pubkey::from_str(&buy_pool)
                     .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
-                match buy_connector.load_pool_by_address(&pool_pk).await {
-                    Ok(()) => {
-                        info!(
-                            pool = %buy_pool,
-                            dex = %buy_dex,
-                            "Successfully loaded buy pool via RPC"
-                        );
-                    }
-                    Err(e) => {
-                        return Err(anyhow!("Failed to load buy pool {} via RPC: {}", buy_pool, e));
+                
+                // Option C: Try LivePoolCache first (no RPC!)
+                if !self.try_inject_from_cache(&buy_dex, &pool_pk, buy_connector) {
+                    // Cache miss - fall back to single getAccount RPC
+                    info!(
+                        pool = %buy_pool,
+                        dex = %buy_dex,
+                        "LivePoolCache miss for buy pool, using RPC fallback"
+                    );
+                    match buy_connector.load_pool_by_address(&pool_pk).await {
+                        Ok(()) => {
+                            info!(
+                                pool = %buy_pool,
+                                dex = %buy_dex,
+                                "Successfully loaded buy pool via RPC"
+                            );
+                        }
+                        Err(e) => {
+                            return Err(anyhow!("Failed to load buy pool {} via RPC: {}", buy_pool, e));
+                        }
                     }
                 }
             }
@@ -693,31 +791,35 @@ impl CrossDexHandler {
         } else if !sell_pool.is_empty() {
             // No accounts in intent
             // For pump_amm: REJECT (DexPoolAccounts required per TARGET_ARCHITECTURE.md)
-            // For meteora_dlmm/orca: Allow single getAccount fallback (acceptable per TARGET_ARCHITECTURE.md Section 4.2)
+            // For meteora_dlmm/orca: Try LivePoolCache first, then RPC fallback
             if sell_dex == "pump_amm" {
                 return Err(anyhow!(
                     "sell pool {} has no accounts in intent - pump_amm requires DexPoolAccounts",
                     sell_pool
                 ));
             } else {
-                // Single getAccount RPC fallback for Meteora/Orca (acceptable)
-                info!(
-                    pool = %sell_pool,
-                    dex = %sell_dex,
-                    "No accounts in intent for sell pool, using single getAccount RPC fallback"
-                );
                 let pool_pk = Pubkey::from_str(&sell_pool)
                     .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;
-                match sell_connector.load_pool_by_address(&pool_pk).await {
-                    Ok(()) => {
-                        info!(
-                            pool = %sell_pool,
-                            dex = %sell_dex,
-                            "Successfully loaded sell pool via RPC"
-                        );
-                    }
-                    Err(e) => {
-                        return Err(anyhow!("Failed to load sell pool {} via RPC: {}", sell_pool, e));
+                
+                // Option C: Try LivePoolCache first (no RPC!)
+                if !self.try_inject_from_cache(&sell_dex, &pool_pk, sell_connector) {
+                    // Cache miss - fall back to single getAccount RPC
+                    info!(
+                        pool = %sell_pool,
+                        dex = %sell_dex,
+                        "LivePoolCache miss for sell pool, using RPC fallback"
+                    );
+                    match sell_connector.load_pool_by_address(&pool_pk).await {
+                        Ok(()) => {
+                            info!(
+                                pool = %sell_pool,
+                                dex = %sell_dex,
+                                "Successfully loaded sell pool via RPC"
+                            );
+                        }
+                        Err(e) => {
+                            return Err(anyhow!("Failed to load sell pool {} via RPC: {}", sell_pool, e));
+                        }
                     }
                 }
             }

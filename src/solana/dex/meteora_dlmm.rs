@@ -21,6 +21,7 @@ use tracing::warn;
 use super::meteora_dlmm_layout::DlmmPool;
 use super::meteora_swap_builder::{MeteoraDlmmSwapBuilder, SwapDirection};
 use super::{Dex, Quote};
+use crate::execution::live_pool_cache::MeteoraState;
 use crate::solana::rpc::SolanaRpc;
 
 /// Meteora DLMM Program ID
@@ -80,6 +81,68 @@ impl MeteoraDlmm {
             .get(mint)
             .map(|entry| entry.value().clone())
             .unwrap_or_default()
+    }
+
+    /// Inject cached Meteora pool state from LivePoolCache.
+    /// 
+    /// This allows build_swap_ix to use fresh Geyser-sourced data
+    /// instead of making RPC calls. The cached state includes the
+    /// current active_id which changes with price.
+    ///
+    /// Returns Ok(true) if state was injected, Ok(false) if pool already exists.
+    pub fn inject_cached_meteora_state(&self, pool_address: &Pubkey, state: &MeteoraState) -> Result<bool> {
+        // Check if already exists
+        if self.pools.contains_key(pool_address) {
+            // Update existing entry with fresh active_id
+            if let Some(mut entry) = self.pools.get_mut(pool_address) {
+                entry.pool.active_id = state.active_id;
+                entry.pool.bin_step = state.bin_step;
+                entry.reserve_x_balance = state.reserve_x_balance;
+                entry.reserve_y_balance = state.reserve_y_balance;
+                entry.last_updated = std::time::SystemTime::now();
+            }
+            return Ok(false);
+        }
+
+        // Create new pool entry from cached state
+        let pool = DlmmPool {
+            discriminator: [0u8; 8],
+            bin_step: state.bin_step,
+            active_id: state.active_id,
+            token_x_mint: state.token_x_mint,
+            token_y_mint: state.token_y_mint,
+            reserve_x: state.reserve_x,
+            reserve_y: state.reserve_y,
+        };
+
+        let cache_entry = PoolCache {
+            address: *pool_address,
+            pool,
+            reserve_x_balance: state.reserve_x_balance,
+            reserve_y_balance: state.reserve_y_balance,
+            last_updated: std::time::SystemTime::now(),
+        };
+
+        self.pools.insert(*pool_address, cache_entry);
+
+        // Update mint index
+        self.mint_index
+            .entry(state.token_x_mint)
+            .or_default()
+            .push(*pool_address);
+        self.mint_index
+            .entry(state.token_y_mint)
+            .or_default()
+            .push(*pool_address);
+
+        info!(
+            pool = %pool_address,
+            active_id = state.active_id,
+            bin_step = state.bin_step,
+            "meteora_dlmm: injected cached state from LivePoolCache"
+        );
+
+        Ok(true)
     }
 
     // REMOVED: discover_pool_on_demand()

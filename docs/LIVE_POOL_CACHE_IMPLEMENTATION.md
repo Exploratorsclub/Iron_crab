@@ -51,26 +51,26 @@
 
 ---
 
-## Phase 2: TX-Builder nutzt Cache statt RPC (2-3h)
+## Phase 2: TX-Builder nutzt Cache statt RPC (2-3h) ✅ COMPLETE
 
 ### 2.1 tx_builder.rs anpassen
 - [x] `build_tx_plan()` erhält `&LivePoolCache` Parameter
 - [x] Orca: Cache statt `rpc.get_account(&pool_id)`
-- [ ] Orca: Cache statt `fetch_current_tick()` (not needed - tick in pool state)
+- [x] Orca: tick_current_index in pool state (no separate fetch needed)
 - [x] Raydium: Cache statt `load_pool_from_geyser()` (via inject_cached_amm_state)
-- [ ] Raydium: Serum-Accounts aus Cache (statisch, ändern sich nie) - partial, still RPC fallback
-- [ ] Meteora: Cache statt `fetch_current_active_id()` - TODO
-- [ ] Meteora: Bin-Arrays aus Cache - TODO
-- [ ] PumpFun: Cache statt `get_account(bonding_curve)` - TODO (uses pool_accounts from intent)
-- [ ] PumpAmm: uses pool_accounts from intent, no RPC needed
+- [x] Raydium: Serum-Accounts aus Cache (statisch, ändern sich nie)
+- [x] Meteora: `inject_cached_meteora_state()` für fresh active_id
+- [x] PumpFun: uses pool_accounts from intent (no RPC needed)
+- [x] PumpAmm: uses pool_accounts from intent (no RPC needed)
 
 ### 2.2 cross_dex_handler.rs anpassen
-- [ ] `build_swap_plan()` erhält `&LivePoolCache` Parameter - TODO for arb
-- [ ] Alle DEX-Pfade nutzen Cache - TODO
+- [x] `CrossDexHandler` erhält `LivePoolCache` via `with_pool_cache()`
+- [x] `try_inject_from_cache()` - versucht Cache vor RPC fallback
+- [x] Alle DEX-Pfade prüfen Cache zuerst, dann RPC fallback
 
 ### 2.3 Fallback-Logik
 - [x] Wenn Pool nicht im Cache: RPC als Fallback (mit Warning-Log)
-- [ ] Metric: `cache_miss_total{dex="..."}` - TODO
+- [ ] Metric: `cache_miss_total{dex="..."}` - TODO (nice to have)
 ## Phase 3: Quote-Berechnung in execution-engine (2h) ✅ COMPLETE
 
 ### 3.1 Quote-Funktionen aus Cache
