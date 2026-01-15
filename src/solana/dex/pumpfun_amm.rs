@@ -27,6 +27,9 @@ const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PUMPFUN_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 // Observed on-chain in PumpSwap/Pump.fun AMM swaps: `fee_program` is this program id.
 const PUMPFUN_AMM_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
+// Global fee_config account - owned by Fee Program, same for ALL pools.
+// Observed in successful on-chain SELL and BUY transactions.
+const PUMPFUN_AMM_FEE_CONFIG: &str = "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx";
 
 // Fallback protocol fee recipient when automatic discovery fails (observed in many PumpSwap pools).
 // This is the canonical Pump.fun protocol fee recipient wallet (owned by System Program, not a PDA).
@@ -2686,58 +2689,13 @@ impl PumpFunAmmDex {
         let coin_creator_vault_ata = pool_accounts[9];
         let coin_creator_vault_authority = pool_accounts[10];
         
-        // CRITICAL FIX: Instead of trusting fee_config from pool_accounts (which may be
-        // an AMM-owned PDA), we derive the correct fee_config PDA from the Fee Program.
-        // The fee_config passed in pool_accounts[11] is often the AMM's internal state,
-        // not the Fee Program's config account. The correct fee_config is a PDA with
-        // seeds ["fee_config", global_config] owned by the Fee Program.
-        let derived_fee_config = {
-            let seeds_to_try: &[&[&[u8]]] = &[
-                &[b"fee_config", global_config.as_ref()],
-                &[b"fee_config"],
-            ];
-            
-            let mut found = None;
-            for seeds in seeds_to_try {
-                let (pda, _bump) = Pubkey::find_program_address(seeds, &expected_fee_program);
-                // Use the first PDA that doesn't match known invalid patterns
-                if pda != expected_fee_program && pda != program_id && pda != Pubkey::default() {
-                    found = Some(pda);
-                    break;
-                }
-            }
-            found.unwrap_or_else(|| {
-                // Fallback to pool_accounts if PDA derivation fails
-                if pool_accounts.len() >= 14 {
-                    pool_accounts[12]
-                } else {
-                    pool_accounts[11]
-                }
-            })
-        };
-        let fee_config = derived_fee_config;
+        // CRITICAL FIX: Use the global fee_config constant instead of trusting pool_accounts.
+        // The fee_config is the SAME for all pools - it's a global account owned by the Fee Program.
+        // Observed from successful on-chain SELL (21 accounts) and BUY (23 accounts) transactions.
+        let fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG)?;
         let fee_program = expected_fee_program; // Always use expected, don't trust intent
 
-        // Intent-driven guardrails (no RPC calls): reject obviously wrong pool_accounts early.
-        // This prevents ambiguous/incorrect fee_config mapping from reaching simulation.
-        if fee_program != expected_fee_program {
-            return Err(anyhow!(
-                "pump_amm pool_accounts fee_program mismatch: expected {expected_fee_program}, got {fee_program}"
-            ));
-        }
-        if fee_config == Pubkey::default() {
-            return Err(anyhow!("pump_amm pool_accounts fee_config is default"));
-        }
-        if fee_config == fee_program {
-            return Err(anyhow!(
-                "pump_amm pool_accounts fee_config equals fee_program (invalid)"
-            ));
-        }
-        if fee_config == program_id {
-            return Err(anyhow!(
-                "pump_amm pool_accounts fee_config equals pump_amm program id (invalid)"
-            ));
-        }
+        // fee_config and fee_program are now constants, no need for validation
 
         let (expected_base, is_buy) = if input_mint == WSOL_MINT {
             (output_mint, true)
