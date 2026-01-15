@@ -281,6 +281,20 @@ impl TokenArbTracker {
             return None;
         }
 
+        // CRITICAL: Exclude pumpfun (bonding curve) from ALL arbitrage!
+        // While a token is on the bonding curve, there are NO other pools for it.
+        // Other DEXes (Meteora, Orca, Raydium) only list tokens AFTER migration.
+        // Therefore pumpfun arbitrage is NEVER valid - there's nothing to arb against.
+        if buy_pool.dex == "pumpfun" || sell_pool.dex == "pumpfun" {
+            debug!(
+                mint = %self.base_mint,
+                buy_dex = %buy_pool.dex,
+                sell_dex = %sell_pool.dex,
+                "Arb check rejected: pumpfun (bonding curve) has no other pools to arb against"
+            );
+            return None;
+        }
+
         let buy_price = buy_pool.last_price.unwrap();
         let sell_price = sell_pool.last_price.unwrap();
 
