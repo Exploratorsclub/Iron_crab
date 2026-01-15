@@ -3258,8 +3258,23 @@ async fn generate_and_publish_buy_intent(
         mint_infos.get(&signal.mint).map(|m| m.decimals)
     };
 
+    // Fallback: pump.fun/pumpfun/pump_amm tokens ALWAYS have 6 decimals
+    let is_pump_dex = matches!(
+        signal.dex.to_lowercase().as_str(),
+        "pumpfun" | "pump_amm" | "pump.fun"
+    );
+
     let token_decimals = match token_decimals_opt {
         Some(d) => d,
+        None if is_pump_dex => {
+            // Pump.fun tokens always have 6 decimals - safe fallback
+            info!(
+                mint = %signal.mint,
+                dex = %signal.dex,
+                "Using pump.fun fallback decimals=6 (TokenMintInfo not received)"
+            );
+            6
+        }
         None => {
             // Roll back stage markers so we can try again when mint decimals arrive.
             {

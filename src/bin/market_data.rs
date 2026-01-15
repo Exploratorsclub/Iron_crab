@@ -842,58 +842,48 @@ async fn run_geyser_loop(
                 let parsed_event = parse_transaction_update(&tx_update);
 
                 // Track mint pubkeys for mint-authority/freeze metadata.
+                // GEYSER-FIRST: No RPC calls! For pump.fun we know decimals=6. For others, Geyser delivers.
                 if let Some(parsed) = parsed_event.as_ref() {
-                    let mint_opt: Option<Pubkey> = match parsed {
-                        ParsedDexEvent::PoolCreated { base_mint, .. } => Some(*base_mint),
-                        ParsedDexEvent::Trade { mint, .. } => Some(*mint),
-                        ParsedDexEvent::LiquidityRemoved { mint, .. } => Some(*mint),
+                    let mint_and_dex: Option<(Pubkey, Option<DexType>)> = match parsed {
+                        ParsedDexEvent::PoolCreated { base_mint, dex, .. } => Some((*base_mint, Some(*dex))),
+                        ParsedDexEvent::Trade { mint, dex, .. } => Some((*mint, Some(*dex))),
+                        ParsedDexEvent::LiquidityRemoved { mint, .. } => Some((*mint, None)),
                     };
-                    if let Some(mint) = mint_opt {
+                    if let Some((mint, dex_opt)) = mint_and_dex {
                         let mut tracked = ctx.tracked_mints.write();
                         if tracked.insert(mint) {
-                            // push updated list to geyser listener (resubscribe)
+                            // Push updated list to geyser listener (resubscribe)
                             let updated: Vec<Pubkey> = tracked.iter().copied().collect();
                             let _ = ctx.tracked_mints_tx.send(updated);
 
-                            // Proactively fetch mint account once to emit TokenMintInfo.
-                            // (Mint accounts are usually static, so Geyser may never send an update.)
-                            let rpc = rpc.clone();
-                            let ctx_clone = ctx.clone();
-                            let run_id = run_id.to_string();
-                            let mint_info_tx = mint_info_tx.clone();
-                            let slot = tx_update.slot;
-                            tokio::spawn(async move {
-                                match rpc.get_account_retry(&mint).await {
-                                    Ok(acc) => {
-                                        if let Some((decimals, supply, mint_authority, freeze_authority)) =
-                                            try_parse_mint_account(&acc.owner, &acc.data)
-                                        {
-                                            let mint_event = MarketEvent::new(
-                                                "market-data",
-                                                BUILD_VERSION,
-                                                &run_id,
-                                                ctx_clone.next_event_id(),
-                                                "rpc",
-                                                Some(slot),
-                                                MarketEventKind::TokenMintInfo {
-                                                    mint: mint.to_string(),
-                                                    token_program: acc.owner.to_string(),
-                                                    decimals,
-                                                    supply,
-                                                    mint_authority,
-                                                    freeze_authority,
-                                                },
-                                            );
+                            // For Pump.fun/PumpAMM: emit TokenMintInfo immediately with known decimals=6.
+                            // This avoids RPC calls that fail with AccountNotFound on new tokens.
+                            // Geyser will update us if the mint changes (rare for mints).
+                            let is_pump = matches!(dex_opt, Some(DexType::PumpFun | DexType::PumpFunAmm));
+                            if is_pump {
+                                let mint_event = MarketEvent::new(
+                                    "market-data",
+                                    BUILD_VERSION,
+                                    run_id,
+                                    ctx.next_event_id(),
+                                    "geyser_known", // Not RPC - we know pump.fun uses decimals=6
+                                    Some(tx_update.slot),
+                                    MarketEventKind::TokenMintInfo {
+                                        mint: mint.to_string(),
+                                        token_program: spl_token::ID.to_string(), // pump.fun always uses SPL Token
+                                        decimals: 6, // pump.fun tokens ALWAYS have 6 decimals
+                                        supply: 0,   // Unknown, but not critical for trading
+                                        mint_authority: None,
+                                        freeze_authority: None,
+                                    },
+                                );
 
-                                            // Best-effort: if receiver is dropped, ignore.
-                                            let _ = mint_info_tx.send(mint_event);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(mint = %mint, error = %e, "Failed to fetch mint account via RPC for TokenMintInfo");
-                                    }
-                                }
-                            });
+                                // Best-effort: if receiver is dropped, ignore.
+                                let _ = mint_info_tx.send(mint_event);
+                                debug!(mint = %mint, "Emitted TokenMintInfo for pump.fun token (decimals=6, no RPC)");
+                            }
+                            // For other DEXes: Geyser will deliver the mint account when subscribed.
+                            // No RPC call needed - tracked_mints is already sent to Geyser subscriber.
                         }
                     }
                 }
@@ -1126,50 +1116,37 @@ async fn run_geyser_loop(
                     "Pool discovered via Geyser"
                 );
 
-                // Track base mint for metadata fetching
+                // Track base mint for metadata fetching - GEYSER-FIRST: No RPC calls!
                 let mut tracked = ctx.tracked_mints.write();
                 if tracked.insert(pool_event.base_mint) {
                     let updated: Vec<Pubkey> = tracked.iter().copied().collect();
                     let _ = ctx.tracked_mints_tx.send(updated);
 
-                    // Proactively fetch mint account once to emit TokenMintInfo.
-                    let rpc = rpc.clone();
-                    let ctx_clone = ctx.clone();
-                    let run_id = run_id.to_string();
-                    let mint_info_tx = mint_info_tx.clone();
-                    let mint = pool_event.base_mint;
-                    let slot = pool_event.slot;
-                    tokio::spawn(async move {
-                        match rpc.get_account_retry(&mint).await {
-                            Ok(acc) => {
-                                if let Some((decimals, supply, mint_authority, freeze_authority)) =
-                                    try_parse_mint_account(&acc.owner, &acc.data)
-                                {
-                                    let mint_event = MarketEvent::new(
-                                        "market-data",
-                                        BUILD_VERSION,
-                                        &run_id,
-                                        ctx_clone.next_event_id(),
-                                        "rpc",
-                                        Some(slot),
-                                        MarketEventKind::TokenMintInfo {
-                                            mint: mint.to_string(),
-                                            token_program: acc.owner.to_string(),
-                                            decimals,
-                                            supply,
-                                            mint_authority,
-                                            freeze_authority,
-                                        },
-                                    );
-
-                                    let _ = mint_info_tx.send(mint_event);
-                                }
-                            }
-                            Err(e) => {
-                                warn!(mint = %mint, error = %e, "Failed to fetch mint account via RPC for TokenMintInfo");
-                            }
-                        }
-                    });
+                    // For Pump.fun/PumpAMM: emit TokenMintInfo immediately with known decimals=6.
+                    // For other DEXes: Geyser will deliver the mint account when subscribed.
+                    // Note: PoolDexType only has PumpFun (legacy bonding), PumpAMM is detected via transaction parsing
+                    let is_pump = matches!(pool_event.dex_type, PoolDexType::PumpFun);
+                    if is_pump {
+                        let mint_event = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            ctx.next_event_id(),
+                            "geyser_known", // Not RPC - we know pump.fun uses decimals=6
+                            Some(pool_event.slot),
+                            MarketEventKind::TokenMintInfo {
+                                mint: pool_event.base_mint.to_string(),
+                                token_program: spl_token::ID.to_string(), // pump.fun always uses SPL Token
+                                decimals: 6, // pump.fun tokens ALWAYS have 6 decimals
+                                supply: 0,   // Unknown, but not critical for trading
+                                mint_authority: None,
+                                freeze_authority: None,
+                            },
+                        );
+                        let _ = mint_info_tx.send(mint_event);
+                        debug!(mint = %pool_event.base_mint, "Emitted TokenMintInfo for pump.fun token (decimals=6, no RPC)");
+                    }
+                    // For other DEXes: Geyser subscription handles it - no RPC call needed.
                 }
 
                 // Convert to MarketEvent::PoolCreated
