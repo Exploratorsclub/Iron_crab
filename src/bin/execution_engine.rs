@@ -53,6 +53,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ironcrab::config::Config as AppConfig;
+use ironcrab::execution::cache_geyser::{spawn_cache_geyser_task, CacheGeyserConfig};
+use ironcrab::execution::live_pool_cache::{create_shared_cache, SharedLivePoolCache};
 use ironcrab::execution::tx_builder;
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
@@ -813,6 +815,10 @@ struct ExecutionContext {
     // === Address Lookup Table (P0: TX size reduction) ===
     /// Loaded ALT for versioned transactions (reduces TX size by ~60%)
     address_lookup_table: Option<ironcrab::solana::address_lookup_table::LoadedAlt>,
+
+    // === Option C: Live Pool Cache (P0: fresh quotes, no RPC in hot path) ===
+    /// Cache of pool states from Geyser for fresh quote calculation
+    live_pool_cache: Option<Arc<ironcrab::execution::live_pool_cache::LivePoolCache>>,
 
     // Metrics
     intents_received: std::sync::atomic::AtomicU64,
@@ -2632,6 +2638,16 @@ async fn main() -> Result<()> {
         .map(|s| s.kill_switch_active)
         .unwrap_or(false);
 
+    // Option C: Initialize LivePoolCache for zero-RPC quote calculation
+    // This cache is fed by Geyser and used by tx_builder for fresh min_out calculations
+    let live_pool_cache: Option<SharedLivePoolCache> = app_config
+        .as_ref()
+        .and_then(|c| c.solana.geyser_grpc_url.as_ref())
+        .map(|_url| {
+            info!("Initializing LivePoolCache for zero-RPC TX building");
+            create_shared_cache()
+        });
+
     let mut ctx = ExecutionContext {
         run_id: run_id.clone(),
         rpc_url: args.rpc_url.clone(),
@@ -2664,6 +2680,8 @@ async fn main() -> Result<()> {
         rpc: Arc::clone(&rpc),
         // P0: Address Lookup Table for TX size reduction
         address_lookup_table,
+        // Option C: LivePoolCache - for zero-RPC quote calculation
+        live_pool_cache: live_pool_cache.clone(),
         // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
@@ -2692,6 +2710,30 @@ async fn main() -> Result<()> {
     }
 
     let ctx = Arc::new(ctx);
+
+    // Option C: Spawn LivePoolCache Geyser feeder task
+    // This task subscribes to all DEX program accounts and updates the cache in real-time
+    let _cache_geyser_handle = if let Some(ref cache) = live_pool_cache {
+        if let Some(geyser_url) = app_config
+            .as_ref()
+            .and_then(|c| c.solana.geyser_grpc_url.clone())
+        {
+            info!(
+                geyser_url = %geyser_url,
+                "Spawning LivePoolCache Geyser feeder task"
+            );
+            let config = CacheGeyserConfig {
+                geyser_url,
+                subscribe_vaults: true,
+                vault_chunk_size: 500,
+            };
+            Some(spawn_cache_geyser_task(config, cache.clone(), None))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Publish initial gauge values immediately (before the first 30s heartbeat).
     OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
@@ -3740,8 +3782,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
             (tx_plan, plan_hash_str)
         } else {
-            // TODO: Pass LivePoolCache once initialized in main()
-            match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc), None).await {
+            // Option C: Pass LivePoolCache for zero-RPC quote calculation
+            match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc), ctx.live_pool_cache.as_ref()).await {
                 tx_builder::TxPlanOutcome::Planned(plan) => {
                     let plan_hash_str = plan.hash_string();
                     checks.push(CheckResult {
