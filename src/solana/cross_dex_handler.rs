@@ -458,19 +458,42 @@ impl CrossDexHandler {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
 
-        // Estimate token amount from price (SOL/token price -> tokens per SOL input)
+        // Estimate token amount from price
+        // buy_price = SOL per token (e.g., 0.00492)
+        // trade_amount = lamports (e.g., 100_000_000 = 0.1 SOL)
+        // tokens_ui = (trade_amount / 1e9) / buy_price = SOL_amount / buy_price
+        // Most pump/meme tokens use 6 decimals, assume this as default
+        let token_decimals = 6i32;
+        let sol_amount = trade_amount as f64 / 1e9;
         let estimated_tokens = if buy_price > 0.0 {
-            (trade_amount as f64 / buy_price) as u64
+            let tokens_ui = sol_amount / buy_price;
+            (tokens_ui * 10f64.powi(token_decimals)) as u64
         } else {
             0
         };
 
-        // Estimate SOL output from selling tokens
-        let estimated_sol_out = if sell_price > 0.0 {
-            (estimated_tokens as f64 * sell_price) as u64
+        // Estimate SOL output from selling tokens (in lamports)
+        // sell_price = SOL per token
+        // sol_out_ui = tokens_ui * sell_price
+        // sol_out_lamports = sol_out_ui * 1e9
+        let estimated_sol_out = if sell_price > 0.0 && estimated_tokens > 0 {
+            let tokens_ui = estimated_tokens as f64 / 10f64.powi(token_decimals);
+            let sol_out_ui = tokens_ui * sell_price;
+            (sol_out_ui * 1e9) as u64
         } else {
             0
         };
+        
+        debug!(
+            buy_price,
+            sell_price,
+            trade_amount,
+            sol_amount,
+            estimated_tokens,
+            estimated_sol_out,
+            token_decimals,
+            "Cross-DEX quote calculation (assuming {} decimals)", token_decimals
+        );
 
         let buy_quote = Quote {
             amount_out: estimated_tokens,
