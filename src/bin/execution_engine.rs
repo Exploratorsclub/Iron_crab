@@ -3462,9 +3462,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         )),
     });
 
-    // Check: Trade profitable after fees (BUY only)
-    // For SELL exits (incl. liquidations), the intent is not expected to be profitable-after-fees.
-    if intent.side == TradeSide::Buy {
+    // Check: Trade profitable after fees (ARB only)
+    // For momentum-bot BUY intents, we don't know the profit yet - it's speculative.
+    // For arb-strategy, the expected_roi_bps is known upfront (spread between DEXes).
+    // For SELL exits (incl. liquidations), skip - exits aren't expected to be profitable-after-fees.
+    let is_arb_intent = intent.source == "arb-strategy";
+    if intent.side == TradeSide::Buy && is_arb_intent {
         let (is_profitable, profit_after_fees_bps) = fee_policy.is_profitable_after_fees(&intent);
         if !is_profitable {
             let reason = RejectReason::FeeUnprofitable;
@@ -3489,11 +3492,17 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             )),
         });
     } else {
+        // Skip for momentum-bot (speculative), SELL exits, and other non-arb sources
+        let skip_reason = if intent.side != TradeSide::Buy {
+            "skipped_for_sell"
+        } else {
+            "skipped_for_speculative_buy"
+        };
         checks.push(CheckResult {
             check_name: "fee_profitability".to_string(),
             passed: true,
             reason_code: None,
-            details: Some("skipped_for_sell".to_string()),
+            details: Some(skip_reason.to_string()),
         });
     }
 
