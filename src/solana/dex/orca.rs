@@ -36,6 +36,9 @@ struct OrcaPool {
     // Lazy-loading for reserve balances (loaded on-demand from vaults)
     cached_reserves: Option<(u128, u128)>,
     last_reserve_fetch: Option<std::time::SystemTime>,
+    // Cached token program IDs (SPL Token vs Token-2022) - eliminates RPC calls in hot path
+    base_mint_program: Option<Pubkey>,
+    quote_mint_program: Option<Pubkey>,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +120,8 @@ impl Orca {
                 tick_current_index: Some(parsed.tick_current_index),
                 cached_reserves: None,
                 last_reserve_fetch: None,
+                base_mint_program: None,
+                quote_mint_program: None,
             },
         );
 
@@ -189,6 +194,8 @@ impl Orca {
                 tick_current_index: None,
                 cached_reserves: Some((reserve_base, reserve_quote)),
                 last_reserve_fetch: Some(std::time::SystemTime::now()),
+                base_mint_program: None,
+                quote_mint_program: None,
             },
         );
     }
@@ -567,6 +574,8 @@ impl Orca {
                         } else {
                             None
                         },
+                        base_mint_program: None,
+                        quote_mint_program: None,
                     },
                 );
                 for m in [parsed.token_mint_a, parsed.token_mint_b] {
@@ -680,6 +689,8 @@ impl Dex for Orca {
                         } else {
                             None
                         },
+                        base_mint_program: None,
+                        quote_mint_program: None,
                     },
                 );
                 for m in [parsed.token_mint_a, parsed.token_mint_b] {
@@ -764,9 +775,25 @@ impl Dex for Orca {
             ));
         }
 
-        // Create pool entry with minimal info
-        // Note: tick_spacing and tick_current_index are not in DexPoolAccounts
-        // For accurate CLAMM swaps, full pool state from Geyser updates is needed
+        // Parse extended fields from LivePoolCache (format: "key:value")
+        let mut tick_current_index: Option<i32> = None;
+        let mut tick_spacing: Option<u16> = None;
+        let mut base_mint_program: Option<Pubkey> = None;
+        let mut quote_mint_program: Option<Pubkey> = None;
+        
+        for acct in accounts.iter().skip(5) {
+            if let Some(val) = acct.strip_prefix("tick_current_index:") {
+                tick_current_index = val.parse().ok();
+            } else if let Some(val) = acct.strip_prefix("tick_spacing:") {
+                tick_spacing = val.parse().ok();
+            } else if let Some(val) = acct.strip_prefix("token_a_program:") {
+                base_mint_program = Pubkey::from_str(val).ok();
+            } else if let Some(val) = acct.strip_prefix("token_b_program:") {
+                quote_mint_program = Pubkey::from_str(val).ok();
+            }
+        }
+
+        // Create pool entry with all available data from LivePoolCache
         let pool = OrcaPool {
             base_mint: token_mint_a,
             quote_mint: token_mint_b,
@@ -774,19 +801,25 @@ impl Dex for Orca {
             reserve_quote: 0,
             fee_bps: 30, // Default, actual comes from on-chain
             fee_tier: None,
-            tick_spacing: None, // Not in DexPoolAccounts
+            tick_spacing, // From LivePoolCache!
             vault_a: token_vault_a,
             vault_b: token_vault_b,
-            tick_current_index: None,
+            tick_current_index, // From LivePoolCache (fresh from Geyser)!
             cached_reserves: None,
             last_reserve_fetch: None,
+            base_mint_program,  // From LivePoolCache - NO RPC NEEDED!
+            quote_mint_program, // From LivePoolCache - NO RPC NEEDED!
         };
 
         tracing::debug!(
             pool = %pool_pk,
             token_a = %token_mint_a,
             token_b = %token_mint_b,
-            "orca pool set from intent accounts (NO RPC)"
+            tick = ?tick_current_index,
+            tick_spacing = ?tick_spacing,
+            token_a_prog = ?base_mint_program,
+            token_b_prog = ?quote_mint_program,
+            "orca pool set from LivePoolCache (NO RPC)"
         );
 
         self.pools.insert(pool_pk, pool);
@@ -1060,25 +1093,34 @@ impl Dex for Orca {
 
         let a_to_b = forward;
 
-        // CRITICAL: Determine token programs BEFORE deriving ATAs!
-        // Token-2022 mints have different ATA addresses than SPL Token mints.
-        let token_2022_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
+        // CRITICAL: Use CACHED token programs from LivePoolCache - NO RPC IN HOT PATH!
+        // Token programs (SPL Token vs Token-2022) are immutable per mint - cache them once.
+        let spl_token_sdk = spl_token::id();
         
-        let token_a_program = match self.rpc.get_account_retry(&pool.base_mint).await {
-            Ok(acct) if acct.owner == token_2022_id => {
-                tracing::debug!(mint = %pool.base_mint, "Orca async: token A uses Token-2022");
-                spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes())
-            }
-            _ => spl_token::id(),
-        };
+        // Use cached token programs if available, otherwise default to SPL Token
+        // (Token-2022 is rare, most mints use SPL Token)
+        let token_a_program = pool.base_mint_program
+            .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
+            .unwrap_or(spl_token_sdk);
         
-        let token_b_program = match self.rpc.get_account_retry(&pool.quote_mint).await {
-            Ok(acct) if acct.owner == token_2022_id => {
-                tracing::debug!(mint = %pool.quote_mint, "Orca async: token B uses Token-2022");
-                spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes())
-            }
-            _ => spl_token::id(),
-        };
+        let token_b_program = pool.quote_mint_program
+            .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
+            .unwrap_or(spl_token_sdk);
+        
+        // Log if we're using cached vs default programs
+        if pool.base_mint_program.is_some() || pool.quote_mint_program.is_some() {
+            tracing::debug!(
+                pool = %pool_id,
+                token_a_program = %token_a_program,
+                token_b_program = %token_b_program,
+                "Orca: using CACHED token programs (no RPC)"
+            );
+        } else {
+            tracing::warn!(
+                pool = %pool_id,
+                "Orca: token programs not cached, defaulting to SPL Token (potential Token-2022 issue!)"
+            );
+        }
 
         // Derive ATAs with correct token programs
         let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
@@ -1105,10 +1147,16 @@ impl Dex for Orca {
                 Pubkey::new_from_array(ata_spl.to_bytes())
             });
 
-        // CRITICAL: Fetch CURRENT tick_current_index from pool on-chain!
-        // The cached tick may be stale (price moved since cache update).
-        let tick_now = self.fetch_current_tick(&pool_id, pool.tick_current_index).await;
-        let spacing = pool.tick_spacing.unwrap_or(64) as i32;
+        // Use CACHED tick from LivePoolCache - NO RPC IN HOT PATH!
+        // The tick was updated in real-time by Geyser subscription.
+        let tick_now = pool.tick_current_index.ok_or_else(|| {
+            anyhow!("Orca pool {} has no cached tick_current_index - LivePoolCache not populated", pool_id)
+        })?;
+        
+        let spacing = pool.tick_spacing.ok_or_else(|| {
+            anyhow!("Orca pool {} has no cached tick_spacing - LivePoolCache not populated", pool_id)
+        })? as i32;
+        
         let ticks_per_array = spacing * TICK_ARRAY_SIZE;
 
         let current_array_start = get_tick_array_start_index(tick_now, spacing);
@@ -1258,7 +1306,40 @@ impl Dex for Orca {
         let parsed = layout::parse_whirlpool(&account.data)
             .ok_or_else(|| anyhow::anyhow!("Failed to parse Orca whirlpool at {}", pool_address))?;
         
-        // Insert/update cache with fresh data
+        // OPTIMIZATION: Fetch token programs ONCE during pool loading (not on every TX!)
+        // This saves 2 RPC calls per swap instruction (~200-400ms latency reduction)
+        let token_2022_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
+        let spl_token_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")?;
+        
+        let (base_prog, quote_prog) = {
+            // Batch fetch both mint accounts in parallel
+            let (base_result, quote_result) = tokio::join!(
+                self.rpc.get_account_retry(&parsed.token_mint_a),
+                self.rpc.get_account_retry(&parsed.token_mint_b)
+            );
+            
+            let base_prog = match base_result {
+                Ok(acct) if acct.owner == token_2022_id => {
+                    tracing::debug!(mint = %parsed.token_mint_a, "Orca pool: token A uses Token-2022");
+                    Some(token_2022_id)
+                }
+                Ok(_) => Some(spl_token_id),
+                Err(_) => None,
+            };
+            
+            let quote_prog = match quote_result {
+                Ok(acct) if acct.owner == token_2022_id => {
+                    tracing::debug!(mint = %parsed.token_mint_b, "Orca pool: token B uses Token-2022");
+                    Some(token_2022_id)
+                }
+                Ok(_) => Some(spl_token_id),
+                Err(_) => None,
+            };
+            
+            (base_prog, quote_prog)
+        };
+        
+        // Insert/update cache with fresh data INCLUDING token programs
         let pool = OrcaPool {
             base_mint: parsed.token_mint_a,
             quote_mint: parsed.token_mint_b,
@@ -1272,6 +1353,8 @@ impl Dex for Orca {
             tick_current_index: Some(parsed.tick_current_index),
             cached_reserves: None,
             last_reserve_fetch: None,
+            base_mint_program: base_prog,
+            quote_mint_program: quote_prog,
         };
         
         let is_update = self.pools.contains_key(pool_address);

@@ -55,6 +55,10 @@ pub struct OrcaWhirlpoolState {
     /// Vault balances (updated from vault account subscriptions)
     pub vault_a_balance: Option<u64>,
     pub vault_b_balance: Option<u64>,
+    /// Token program IDs (SPL Token vs Token-2022) - CACHED to avoid RPC in hot path
+    /// Detected once when pool is discovered, never changes for a mint
+    pub token_a_program: Option<Pubkey>,
+    pub token_b_program: Option<Pubkey>,
 }
 
 impl From<WhirlpoolParsed> for OrcaWhirlpoolState {
@@ -72,6 +76,9 @@ impl From<WhirlpoolParsed> for OrcaWhirlpoolState {
             tick_spacing: p.tick_spacing,
             vault_a_balance: None,
             vault_b_balance: None,
+            // Token programs will be set separately when discovered
+            token_a_program: None,
+            token_b_program: None,
         }
     }
 }

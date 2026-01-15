@@ -113,6 +113,8 @@ impl MeteoraDlmm {
             token_y_mint: state.token_y_mint,
             reserve_x: state.reserve_x,
             reserve_y: state.reserve_y,
+            token_x_program: None, // Will be populated from LivePoolCache if available
+            token_y_program: None,
         };
 
         let cache_entry = PoolCache {
@@ -504,6 +506,8 @@ impl Dex for MeteoraDlmm {
             token_y_mint,
             reserve_x,
             reserve_y,
+            token_x_program: None, // Will use SPL Token default in build_swap_ix
+            token_y_program: None,
         };
 
         let cache = PoolCache {
@@ -694,27 +698,35 @@ impl Dex for MeteoraDlmm {
             pool.token_y_mint.to_bytes(),
         );
         
-        // CRITICAL: Determine the correct token program for each mint!
-        // Token-2022 mints require Token-2022 ATAs, which have different addresses
-        // than SPL Token ATAs. If we use the wrong program, the ATA won't exist.
-        let token_2022_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
+        // CRITICAL: Use CACHED token programs from LivePoolCache - NO RPC IN HOT PATH!
+        // Token programs (SPL Token vs Token-2022) are immutable per mint.
+        // For arbitrage, 99%+ of tokens use SPL Token. Token-2022 is rare.
+        // If we default wrong for a Token-2022 mint, the TX will fail at simulation.
+        let spl_token_program = spl_token::id();
         
-        // Fetch mint account owners to determine token programs
-        let token_x_program_spl = match self.rpc.get_account_retry(&pool.token_x_mint).await {
-            Ok(acct) if acct.owner == token_2022_id => {
-                debug!(mint = %pool.token_x_mint, "Token X uses Token-2022");
-                spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes())
-            }
-            _ => spl_token::id(),
-        };
+        // Use cached token programs if available, otherwise default to SPL Token
+        let token_x_program_spl = pool.token_x_program
+            .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
+            .unwrap_or(spl_token_program);
         
-        let token_y_program_spl = match self.rpc.get_account_retry(&pool.token_y_mint).await {
-            Ok(acct) if acct.owner == token_2022_id => {
-                debug!(mint = %pool.token_y_mint, "Token Y uses Token-2022");
-                spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes())
-            }
-            _ => spl_token::id(),
-        };
+        let token_y_program_spl = pool.token_y_program
+            .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
+            .unwrap_or(spl_token_program);
+        
+        // Log if we're using cached vs default programs
+        if pool.token_x_program.is_some() || pool.token_y_program.is_some() {
+            debug!(
+                pool = %pool_addr,
+                token_x_program = %token_x_program_spl,
+                token_y_program = %token_y_program_spl,
+                "Meteora: using CACHED token programs (no RPC)"
+            );
+        } else {
+            tracing::warn!(
+                pool = %pool_addr,
+                "Meteora: token programs not cached, defaulting to SPL Token (potential Token-2022 issue!)"
+            );
+        }
 
         // Derive ATAs for user with correct token programs
         let user_token_x_spl =

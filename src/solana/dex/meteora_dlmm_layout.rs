@@ -35,6 +35,11 @@ pub struct DlmmPool {
     /// Reserve Y vault (32 bytes)
     /// At offset 0xB8 (184 decimal)
     pub reserve_y: Pubkey,
+    
+    /// Cached token program IDs (SPL Token vs Token-2022)
+    /// These are NOT in the on-chain account - populated from LivePoolCache
+    pub token_x_program: Option<Pubkey>,
+    pub token_y_program: Option<Pubkey>,
 }
 
 impl DlmmPool {
@@ -83,6 +88,9 @@ impl DlmmPool {
             token_y_mint,
             reserve_x,
             reserve_y,
+            // Token programs are not in on-chain data - populated from LivePoolCache
+            token_x_program: None,
+            token_y_program: None,
         })
     }
 

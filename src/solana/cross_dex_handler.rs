@@ -297,7 +297,7 @@ impl CrossDexHandler {
                 }
             }
             ("orca", CachedPoolState::Orca(orca_state)) => {
-                let accounts = vec![
+                let mut accounts = vec![
                     pool_pk.to_string(),
                     orca_state.token_mint_a.to_string(),
                     orca_state.token_mint_b.to_string(),
@@ -305,12 +305,22 @@ impl CrossDexHandler {
                     orca_state.token_vault_b.to_string(),
                     format!("sqrt_price:{}", orca_state.sqrt_price),
                     format!("tick_current_index:{}", orca_state.tick_current_index),
+                    format!("tick_spacing:{}", orca_state.tick_spacing),
                 ];
+                // CRITICAL: Pass cached token programs to avoid RPC in hot path!
+                if let Some(prog_a) = orca_state.token_a_program {
+                    accounts.push(format!("token_a_program:{}", prog_a));
+                }
+                if let Some(prog_b) = orca_state.token_b_program {
+                    accounts.push(format!("token_b_program:{}", prog_b));
+                }
                 if connector.set_pool_from_accounts(&pool_pk.to_string(), &accounts).is_ok() {
                     info!(
                         pool = %pool_pk,
                         dex = %dex,
                         tick = orca_state.tick_current_index,
+                        token_a_program = ?orca_state.token_a_program,
+                        token_b_program = ?orca_state.token_b_program,
                         "Injected pool state from LivePoolCache (no RPC)"
                     );
                     return true;
