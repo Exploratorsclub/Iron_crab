@@ -440,6 +440,79 @@ impl LivePoolCache {
         self.vault_to_pool.iter().map(|e| *e.key()).collect()
     }
 
+    /// Get all tracked mint addresses (for Geyser subscription to detect token programs)
+    /// Returns unique mints from all cached pools
+    pub fn get_tracked_mints(&self) -> Vec<Pubkey> {
+        use std::collections::HashSet;
+        let mut mints = HashSet::new();
+        
+        for entry in self.pools.iter() {
+            match &entry.value().state {
+                CachedPoolState::Orca(s) => {
+                    mints.insert(s.token_mint_a);
+                    mints.insert(s.token_mint_b);
+                }
+                CachedPoolState::Meteora(s) => {
+                    mints.insert(s.token_x_mint);
+                    mints.insert(s.token_y_mint);
+                }
+                CachedPoolState::RaydiumAmm(s) => {
+                    mints.insert(s.base_mint);
+                    mints.insert(s.quote_mint);
+                }
+                CachedPoolState::RaydiumCpmm(s) => {
+                    mints.insert(s.token_0_mint);
+                    mints.insert(s.token_1_mint);
+                }
+                CachedPoolState::PumpFun(s) => {
+                    mints.insert(s.token_mint);
+                }
+                CachedPoolState::PumpAmm(s) => {
+                    mints.insert(s.base_mint);
+                    mints.insert(s.quote_mint);
+                }
+            }
+        }
+        
+        mints.into_iter().collect()
+    }
+
+    /// Update token program for a mint (called when Geyser receives mint account update)
+    /// The owner of a mint account IS the token program (SPL Token or Token-2022)
+    pub fn update_mint_program(&self, mint: &Pubkey, token_program: Pubkey) {
+        // Update all pools that reference this mint
+        for mut entry in self.pools.iter_mut() {
+            let updated = match &mut entry.value_mut().state {
+                CachedPoolState::Orca(s) => {
+                    let mut changed = false;
+                    if s.token_mint_a == *mint && s.token_a_program != Some(token_program) {
+                        s.token_a_program = Some(token_program);
+                        changed = true;
+                    }
+                    if s.token_mint_b == *mint && s.token_b_program != Some(token_program) {
+                        s.token_b_program = Some(token_program);
+                        changed = true;
+                    }
+                    changed
+                }
+                CachedPoolState::Meteora(_) => {
+                    // TODO: Add token_x_program/token_y_program to MeteoraState
+                    false
+                }
+                _ => false, // Other DEXes don't need Token-2022 detection yet
+            };
+            
+            if updated {
+                tracing::debug!(
+                    mint = %mint,
+                    token_program = %token_program,
+                    pool = %entry.key(),
+                    "LivePoolCache: updated token program for mint"
+                );
+            }
+        }
+    }
+
     // ========================================================================
     // Stats
     // ========================================================================

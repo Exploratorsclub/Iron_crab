@@ -54,6 +54,8 @@ const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMPFUN_AMM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 #[cfg(not(windows))]
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+#[cfg(not(windows))]
+const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 /// Configuration for the cache Geyser subscription
 #[derive(Clone)]
@@ -161,6 +163,7 @@ async fn run_cache_subscription(
     ];
 
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+    let token_2022_program = Pubkey::from_str(TOKEN_2022_PROGRAM).unwrap();
 
     // Get initial vault list from cache
     let mut current_vaults: Vec<Pubkey> = if config.subscribe_vaults {
@@ -169,8 +172,12 @@ async fn run_cache_subscription(
         vec![]
     };
 
+    // Get initial mint list from cache (for token program detection)
+    let mut current_mints: Vec<Pubkey> = cache.get_tracked_mints();
+
     let mut pool_update_count = 0u64;
     let mut vault_update_count = 0u64;
+    let mut mint_update_count = 0u64;
     let mut last_stats_log = std::time::Instant::now();
 
     loop {
@@ -205,6 +212,22 @@ async fn run_cache_subscription(
             }
         }
 
+        // Subscribe to specific mint accounts (for token program detection)
+        // The owner of a mint account IS the token program (SPL Token or Token-2022)
+        if !current_mints.is_empty() {
+            for (chunk_idx, chunk) in current_mints.chunks(config.vault_chunk_size).enumerate() {
+                accounts_filter.insert(
+                    format!("mints_{}", chunk_idx),
+                    SubscribeRequestFilterAccounts {
+                        account: chunk.iter().map(|p| p.to_string()).collect(),
+                        owner: vec![],
+                        filters: vec![],
+                        nonempty_txn_signature: None,
+                    },
+                );
+            }
+        }
+
         let request = SubscribeRequest {
             accounts: accounts_filter,
             slots: HashMap::new(),
@@ -228,7 +251,8 @@ async fn run_cache_subscription(
         info!(
             dex_count = dex_programs.len(),
             vault_count = current_vaults.len(),
-            "cache_geyser: subscribed to Geyser"
+            mint_count = current_mints.len(),
+            "cache_geyser: subscribed to Geyser (pools + vaults + mints)"
         );
 
         loop {
@@ -240,6 +264,7 @@ async fn run_cache_subscription(
                     vaults = stats.vault_mappings,
                     pool_updates = pool_update_count,
                     vault_updates = vault_update_count,
+                    mint_updates = mint_update_count,
                     hit_rate = format!("{:.1}%", stats.hit_rate() * 100.0),
                     "cache_geyser: stats"
                 );
@@ -278,9 +303,27 @@ async fn run_cache_subscription(
                                             Err(_) => continue,
                                         };
                                         let slot = account_update.slot;
+                                        let data_len = account_info.data.len();
 
-                                        // Is this a token account (vault balance update)?
-                                        if owner == token_program && account_info.data.len() == 165 {
+                                        // Is this a MINT account? (82 bytes, owned by Token Program or Token-2022)
+                                        // The owner of the mint account IS the token program!
+                                        if data_len == 82 && (owner == token_program || owner == token_2022_program) {
+                                            // This mint uses the token program indicated by `owner`
+                                            cache.update_mint_program(&pubkey, owner);
+                                            mint_update_count += 1;
+
+                                            if mint_update_count % 100 == 0 || owner == token_2022_program {
+                                                debug!(
+                                                    mint = %pubkey,
+                                                    token_program = %owner,
+                                                    is_token_2022 = (owner == token_2022_program),
+                                                    total = mint_update_count,
+                                                    "cache_geyser: mint token program detected"
+                                                );
+                                            }
+                                        }
+                                        // Is this a token account (vault balance update)? 165 bytes
+                                        else if data_len == 165 && (owner == token_program || owner == token_2022_program) {
                                             // SPL Token account: parse balance at offset 64
                                             if let Ok(balance_bytes) = account_info.data[64..72].try_into() {
                                                 let balance = u64::from_le_bytes(balance_bytes);
@@ -333,6 +376,19 @@ async fn run_cache_subscription(
                                 "cache_geyser: vault list changed, resubscribing"
                             );
                             current_vaults = vaults;
+                            
+                            // Also refresh mint list when vault list changes
+                            // (new pools discovered = new mints to track)
+                            let new_mints = cache.get_tracked_mints();
+                            if new_mints.len() != current_mints.len() {
+                                info!(
+                                    old_mint_count = current_mints.len(),
+                                    new_mint_count = new_mints.len(),
+                                    "cache_geyser: mint list also changed"
+                                );
+                                current_mints = new_mints;
+                            }
+                            
                             break; // Break inner loop to resubscribe
                         }
                     }
