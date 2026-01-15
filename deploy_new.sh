@@ -112,6 +112,14 @@ install_service "control-plane"
 install_service "trades-server"
 sudo cp "$SYSTEMD_SRC_DIR/ironcrab.target" "$SYSTEMD_DIR/"
 
+# Cleanup legacy services that conflict with new ones
+if systemctl list-unit-files trades_server.service >/dev/null 2>&1; then
+    log_warn "Removing legacy trades_server.service (replaced by trades-server.service)"
+    sudo systemctl stop trades_server.service 2>/dev/null || true
+    sudo systemctl disable trades_server.service 2>/dev/null || true
+    sudo rm -f "$SYSTEMD_DIR/trades_server.service"
+fi
+
 sudo systemctl daemon-reload
 
 # -----------------------------------------------------------------------------
