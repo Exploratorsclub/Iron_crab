@@ -2620,8 +2620,10 @@ impl Dex for PumpFunAmmDex {
             AccountMeta::new_readonly(pool.coin_creator_vault_authority, false), // 18
             // NOTE: global_volume_accumulator and user_vol are NOT in actual on-chain swap TXs!
             // Removed to match observed transaction structure (21 accounts total).
-            AccountMeta::new_readonly(pool.fee_config, false), // 19
-            AccountMeta::new_readonly(pool.fee_program, false), // 20
+            // CRITICAL: Use global fee_config constant instead of pool.fee_config
+            // (pool.fee_config may be AMM-owned, but we need Fee Program-owned account)
+            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(), false), // 19
+            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(), false), // 20
         ];
 
         Ok(vec![Instruction {
