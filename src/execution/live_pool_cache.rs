@@ -245,6 +245,11 @@ pub struct LivePoolCache {
     /// Vault to pool mapping (for updating reserves when vault accounts change)
     vault_to_pool: DashMap<Pubkey, (Pubkey, VaultPosition)>,
 
+    /// Mint to token program mapping (SPL Token vs Token-2022)
+    /// The owner of a mint account IS the token program
+    /// This is the source of truth for token_program lookups - NO RPC needed!
+    mint_programs: DashMap<Pubkey, Pubkey>,
+
     /// Stats
     updates_total: AtomicU64,
     cache_hits: AtomicU64,
@@ -273,6 +278,7 @@ impl LivePoolCache {
         Self {
             pools: DashMap::new(),
             vault_to_pool: DashMap::new(),
+            mint_programs: DashMap::new(),
             updates_total: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
@@ -477,10 +483,20 @@ impl LivePoolCache {
         mints.into_iter().collect()
     }
 
+    /// Get the token program for a mint (SPL Token or Token-2022)
+    /// Returns None if the mint has not been seen yet
+    /// This is the GEYSER-FIRST source of truth - NO RPC calls needed!
+    pub fn get_mint_program(&self, mint: &Pubkey) -> Option<Pubkey> {
+        self.mint_programs.get(mint).map(|r| *r)
+    }
+
     /// Update token program for a mint (called when Geyser receives mint account update)
     /// The owner of a mint account IS the token program (SPL Token or Token-2022)
     pub fn update_mint_program(&self, mint: &Pubkey, token_program: Pubkey) {
-        // Update all pools that reference this mint
+        // Store in the central mint_programs map
+        self.mint_programs.insert(*mint, token_program);
+        
+        // Also update pool states that reference this mint (for backwards compat)
         for mut entry in self.pools.iter_mut() {
             let updated = match &mut entry.value_mut().state {
                 CachedPoolState::Orca(s) => {

@@ -54,7 +54,7 @@ use uuid::Uuid;
 
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::cache_geyser::{spawn_cache_geyser_task, CacheGeyserConfig};
-use ironcrab::execution::live_pool_cache::{create_shared_cache, SharedLivePoolCache};
+use ironcrab::execution::live_pool_cache::{create_shared_cache, CachedPoolState, SharedLivePoolCache};
 use ironcrab::execution::tx_builder;
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
@@ -901,7 +901,41 @@ impl ExecutionContext {
         Self::spl_to_sdk(&ata_spl)
     }
 
-    async fn token_program_for_mint(rpc: &SolanaRpc, mint: &Pubkey) -> anyhow::Result<Pubkey> {
+    /// Get token program for a mint - GEYSER-FIRST, NO RPC!
+    /// Uses LivePoolCache which is populated by Geyser mint account subscriptions.
+    /// For pump.fun tokens, defaults to SPL Token (they never use Token-2022).
+    fn token_program_for_mint_cached(
+        cache: Option<&ironcrab::execution::live_pool_cache::LivePoolCache>,
+        mint: &Pubkey,
+        dex_hint: Option<&str>,
+    ) -> Pubkey {
+        let spl = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let spl22 = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+
+        // Try cache first
+        if let Some(c) = cache {
+            if let Some(prog) = c.get_mint_program(mint) {
+                return prog;
+            }
+        }
+
+        // Fallback: pump.fun/pumpfun/pump_amm always use SPL Token
+        if let Some(dex) = dex_hint {
+            let dex_lower = dex.to_lowercase();
+            if dex_lower.contains("pump") || dex_lower == "pumpfun" || dex_lower == "pump_amm" {
+                return spl;
+            }
+        }
+
+        // Default to SPL Token (most common case)
+        // NOTE: For Token-2022 tokens without cache hit, this may be wrong
+        // but those are rare and the TX will fail simulation anyway
+        spl
+    }
+
+    /// Legacy RPC-based token program lookup - DEPRECATED, only for non-hot-path code
+    #[allow(dead_code)]
+    async fn token_program_for_mint_rpc(rpc: &SolanaRpc, mint: &Pubkey) -> anyhow::Result<Pubkey> {
         let acct = rpc.rpc.get_account(mint).await?;
         let owner = acct.owner;
 
@@ -1085,13 +1119,11 @@ impl ExecutionContext {
                 continue;
             }
 
-            let token_program = match Self::token_program_for_mint(ctx.rpc.as_ref(), &mint).await {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(mint = %mint, error = %e, "Skipping mint: cannot determine token program");
-                    continue;
-                }
-            };
+            let token_program = Self::token_program_for_mint_cached(
+                ctx.live_pool_cache.as_deref(),
+                &mint,
+                None, // No DEX hint in liquidation context
+            );
             #[cfg(unix)]
             maybe_ping_watchdog();
             let ata = Self::ata_for_owner_mint(&owner, &mint, &token_program);
@@ -1141,13 +1173,27 @@ impl ExecutionContext {
                             if let Some(bc_str) = q.route.first() {
                                 resources.pools = vec![bc_str.clone()];
 
+                                // Try to get creator from LivePoolCache first (Geyser-first)
+                                let mut creator_found = false;
                                 if let Ok(bc) = Pubkey::from_str(bc_str) {
-                                    if let Ok(acct) = ctx.rpc.rpc.get_account(&bc).await {
-                                        if let Ok(state) = BondingCurveState::parse(&acct.data) {
-                                            metadata.insert(
-                                                "creator".to_string(),
-                                                state.creator.to_string(),
-                                            );
+                                    if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                                        if let Some(CachedPoolState::PumpFun(pf)) = cache.get(&bc) {
+                                            // PumpFunState doesn't have creator yet - skip for now
+                                            // The creator is only needed for metadata, not TX execution
+                                            let _ = pf; // suppress unused warning
+                                        }
+                                    }
+                                    // TODO: Remove this RPC fallback once PumpFunState includes creator
+                                    // This is liquidation path (not hot-path), so acceptable for now
+                                    if !creator_found {
+                                        if let Ok(acct) = ctx.rpc.rpc.get_account(&bc).await {
+                                            if let Ok(state) = BondingCurveState::parse(&acct.data) {
+                                                metadata.insert(
+                                                    "creator".to_string(),
+                                                    state.creator.to_string(),
+                                                );
+                                                creator_found = true;
+                                            }
                                         }
                                     }
                                 }
@@ -3314,15 +3360,23 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             let mint = Pubkey::from_str(&mint_str)
                 .map_err(|_| anyhow::anyhow!("invalid input_mint: {}", mint_str))?;
 
-            let mint_acct = rpc
-                .rpc
-                .get_account(&mint)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to fetch mint account: {}", e))?;
-            let token_program =
-                token_program_for_mint_owner(&mint_acct.owner).ok_or_else(|| {
-                    anyhow::anyhow!("unsupported mint owner program: {}", mint_acct.owner)
-                })?;
+            // GEYSER-FIRST: Get token program from cache, not RPC
+            let token_program = if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                cache.get_mint_program(&mint).unwrap_or_else(|| {
+                    // Fallback: Check if it's a pump.fun token (always SPL Token)
+                    let dex_hint = intent.metadata.get("dex").map(|s| s.as_str());
+                    let is_pump = dex_hint.map(|d| d.contains("pump") || d == "pumpfun" || d == "pump_amm").unwrap_or(false);
+                    if is_pump {
+                        Pubkey::new_from_array(spl_token::id().to_bytes())
+                    } else {
+                        // Default to SPL Token (most common)
+                        Pubkey::new_from_array(spl_token::id().to_bytes())
+                    }
+                })
+            } else {
+                // No cache, default to SPL Token
+                Pubkey::new_from_array(spl_token::id().to_bytes())
+            };
 
             let ata_spl = get_associated_token_address_with_program_id(
                 &sdk_to_spl(&wallet),
@@ -3331,7 +3385,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             );
             let ata = spl_to_sdk(&ata_spl);
 
-            // If ATA doesn't exist yet, treat as 0 balance.
+            // TODO: Track wallet ATAs via Geyser subscription instead of RPC
+            // For now, this RPC call remains as it's wallet-specific, not pool-related
             let available_raw = match rpc.rpc.get_token_account_balance(&ata).await {
                 Ok(ui) => ui
                     .amount

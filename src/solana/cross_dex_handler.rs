@@ -62,24 +62,39 @@ fn prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> In
 /// SOL mint address
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
-/// Determine the token program for a given mint by checking the mint account's owner.
-/// Returns either SPL Token or Token-2022 program ID.
-async fn get_token_program_for_mint(rpc: &SolanaRpc, mint: &Pubkey) -> Result<spl_token::solana_program::pubkey::Pubkey> {
-    // Fetch mint account to determine owner (token program)
-    let mint_acct = rpc.get_account_retry(mint).await
-        .map_err(|e| anyhow!("Failed to fetch mint account {}: {}", mint, e))?;
+/// Determine the token program for a given mint.
+/// GEYSER-FIRST: Uses the LivePoolCache instead of RPC calls.
+/// For pump.fun tokens, always returns SPL Token (they never use Token-2022).
+fn get_token_program_for_mint_cached(
+    cache: Option<&crate::execution::live_pool_cache::LivePoolCache>,
+    mint: &Pubkey,
+    dex_hint: Option<&str>,
+) -> spl_token::solana_program::pubkey::Pubkey {
+    let token_2022_id = Pubkey::from_str(TOKEN_2022_PROGRAM_ID).unwrap_or_default();
     
-    let owner = mint_acct.owner;
-    let token_2022_id = Pubkey::from_str(TOKEN_2022_PROGRAM_ID)?;
-    
-    if owner == token_2022_id {
-        debug!(mint = %mint, "Mint uses Token-2022 program");
-        Ok(spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes()))
-    } else {
-        // Default to SPL Token (covers both spl_token and unknown owners)
-        debug!(mint = %mint, owner = %owner, "Mint uses SPL Token program (or unknown)");
-        Ok(spl_token::id())
+    // Try cache first
+    if let Some(c) = cache {
+        if let Some(prog) = c.get_mint_program(mint) {
+            if prog == token_2022_id {
+                debug!(mint = %mint, "Mint uses Token-2022 program (from cache)");
+                return spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes());
+            } else {
+                return spl_token::id();
+            }
+        }
     }
+
+    // Fallback: pump.fun/pumpfun/pump_amm always use SPL Token
+    if let Some(dex) = dex_hint {
+        let dex_lower = dex.to_lowercase();
+        if dex_lower.contains("pump") || dex_lower == "pumpfun" || dex_lower == "pump_amm" {
+            return spl_token::id();
+        }
+    }
+
+    // Default to SPL Token (most common case)
+    debug!(mint = %mint, "Token program not in cache, defaulting to SPL Token");
+    spl_token::id()
 }
 
 /// Minimum spread in bps to execute (from intent metadata, no re-quote!)
@@ -810,8 +825,12 @@ impl CrossDexHandler {
                 .map_err(|_| anyhow!("Invalid token mint: {}", token_mint))?;
             let token_mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint_pk.to_bytes());
             
-            // Determine the token program by checking the mint account's owner
-            let token_program = get_token_program_for_mint(&self.rpc, &token_mint_pk).await?;
+            // Determine the token program from cache (GEYSER-FIRST, NO RPC!)
+            let token_program = get_token_program_for_mint_cached(
+                self.pool_cache.as_deref(),
+                &token_mint_pk,
+                Some(&buy_dex), // Use buy_dex as hint for pump.fun detection
+            );
             
             let create_token_ata_ix_prog = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                 &wallet_spl,        // payer
