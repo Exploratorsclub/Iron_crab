@@ -1,0 +1,730 @@
+//! Live Pool Cache - Real-time pool state from Geyser for zero-RPC TX building
+//!
+//! This module provides a cache of pool states that is updated in real-time via Geyser.
+//! The goal is to eliminate all RPC calls from the TX-building hot path, reducing
+//! latency from 300-700ms to <50ms.
+//!
+//! # Architecture
+//!
+//! ```text
+//! Geyser gRPC ──► LivePoolCache (DashMap per DEX)
+//!                       │
+//!                       ▼
+//!               tx_builder.rs (reads from cache, no RPC)
+//!                       │
+//!                       ▼
+//!               Fresh quote + TX instructions
+//! ```
+//!
+//! # Supported DEXes
+//!
+//! - Orca Whirlpool: tick_current_index, sqrt_price, liquidity, vaults
+//! - Raydium AMM V4: reserves, fees
+//! - Raydium CPMM: reserves
+//! - Meteora DLMM: active_id, bin_step, reserves
+//! - PumpFun Bonding: virtual reserves
+//! - PumpFun AMM (PumpSwap): reserves, pool accounts
+
+use dashmap::DashMap;
+use solana_sdk::pubkey::Pubkey;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+// Re-export parsers
+use crate::solana::dex::meteora_dlmm_layout::DlmmPool;
+use crate::solana::dex::orca_whirlpool_layout::{self, WhirlpoolParsed};
+
+// ============================================================================
+// DEX-specific cached state structs
+// ============================================================================
+
+/// Orca Whirlpool cached state
+#[derive(Debug, Clone)]
+pub struct OrcaWhirlpoolState {
+    pub token_mint_a: Pubkey,
+    pub token_mint_b: Pubkey,
+    pub token_vault_a: Pubkey,
+    pub token_vault_b: Pubkey,
+    pub tick_current_index: i32,
+    pub sqrt_price: u128,
+    pub liquidity: u128,
+    pub fee_rate: u16,
+    pub tick_spacing: u16,
+    /// Vault balances (updated from vault account subscriptions)
+    pub vault_a_balance: Option<u64>,
+    pub vault_b_balance: Option<u64>,
+}
+
+impl From<WhirlpoolParsed> for OrcaWhirlpoolState {
+    fn from(p: WhirlpoolParsed) -> Self {
+        Self {
+            token_mint_a: p.token_mint_a,
+            token_mint_b: p.token_mint_b,
+            token_vault_a: p.token_vault_a,
+            token_vault_b: p.token_vault_b,
+            tick_current_index: p.tick_current_index,
+            sqrt_price: p.sqrt_price,
+            liquidity: p.liquidity,
+            fee_rate: p.fee_rate,
+            tick_spacing: p.tick_spacing,
+            vault_a_balance: None,
+            vault_b_balance: None,
+        }
+    }
+}
+
+/// Raydium AMM V4 cached state
+#[derive(Debug, Clone)]
+pub struct RaydiumAmmState {
+    pub base_mint: Pubkey,
+    pub quote_mint: Pubkey,
+    pub coin_vault: Pubkey,
+    pub pc_vault: Pubkey,
+    pub base_decimals: u8,
+    pub quote_decimals: u8,
+    /// Vault balances
+    pub coin_reserve: Option<u64>,
+    pub pc_reserve: Option<u64>,
+    /// Serum/OpenBook market (statisch, ändert sich nie)
+    pub market_id: Pubkey,
+    /// Serum accounts (bids, asks, event_queue) - werden einmal geladen
+    pub serum_bids: Option<Pubkey>,
+    pub serum_asks: Option<Pubkey>,
+    pub serum_event_queue: Option<Pubkey>,
+}
+
+/// Raydium CPMM cached state
+#[derive(Debug, Clone)]
+pub struct RaydiumCpmmState {
+    pub token_0_mint: Pubkey,
+    pub token_1_mint: Pubkey,
+    pub token_0_vault: Pubkey,
+    pub token_1_vault: Pubkey,
+    pub reserve_0: Option<u64>,
+    pub reserve_1: Option<u64>,
+}
+
+/// Meteora DLMM cached state
+#[derive(Debug, Clone)]
+pub struct MeteoraState {
+    pub token_x_mint: Pubkey,
+    pub token_y_mint: Pubkey,
+    pub reserve_x: Pubkey,
+    pub reserve_y: Pubkey,
+    pub active_id: i32,
+    pub bin_step: u16,
+    /// Vault reserves
+    pub reserve_x_balance: Option<u64>,
+    pub reserve_y_balance: Option<u64>,
+}
+
+impl From<DlmmPool> for MeteoraState {
+    fn from(p: DlmmPool) -> Self {
+        Self {
+            token_x_mint: p.token_x_mint,
+            token_y_mint: p.token_y_mint,
+            reserve_x: p.reserve_x,
+            reserve_y: p.reserve_y,
+            active_id: p.active_id,
+            bin_step: p.bin_step,
+            reserve_x_balance: None,
+            reserve_y_balance: None,
+        }
+    }
+}
+
+/// PumpFun Bonding Curve cached state
+#[derive(Debug, Clone)]
+pub struct PumpFunState {
+    pub token_mint: Pubkey,
+    pub bonding_curve: Pubkey,
+    pub associated_bonding_curve: Pubkey,
+    pub virtual_sol_reserves: u64,
+    pub virtual_token_reserves: u64,
+    pub real_sol_reserves: u64,
+    pub real_token_reserves: u64,
+    pub complete: bool,
+}
+
+/// PumpFun AMM (PumpSwap) cached state
+#[derive(Debug, Clone)]
+pub struct PumpAmmState {
+    pub base_mint: Pubkey,
+    pub quote_mint: Pubkey,
+    pub pool_base_token_account: Pubkey,
+    pub pool_quote_token_account: Pubkey,
+    pub base_reserve: Option<u64>,
+    pub quote_reserve: Option<u64>,
+    /// Full list of accounts needed for swap instruction
+    pub pool_accounts: Vec<Pubkey>,
+}
+
+// ============================================================================
+// Unified cached pool state enum
+// ============================================================================
+
+/// Cached pool state for any supported DEX
+#[derive(Debug, Clone)]
+pub enum CachedPoolState {
+    Orca(OrcaWhirlpoolState),
+    RaydiumAmm(RaydiumAmmState),
+    RaydiumCpmm(RaydiumCpmmState),
+    Meteora(MeteoraState),
+    PumpFun(PumpFunState),
+    PumpAmm(PumpAmmState),
+}
+
+impl CachedPoolState {
+    /// Get the DEX name for logging/metrics
+    pub fn dex_name(&self) -> &'static str {
+        match self {
+            Self::Orca(_) => "orca",
+            Self::RaydiumAmm(_) => "raydium",
+            Self::RaydiumCpmm(_) => "raydium_cpmm",
+            Self::Meteora(_) => "meteora_dlmm",
+            Self::PumpFun(_) => "pumpfun",
+            Self::PumpAmm(_) => "pump_amm",
+        }
+    }
+}
+
+// ============================================================================
+// Cache entry with metadata
+// ============================================================================
+
+/// Cache entry with update timestamp and slot
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    pub state: CachedPoolState,
+    pub slot: u64,
+    pub updated_at: Instant,
+}
+
+impl CacheEntry {
+    pub fn new(state: CachedPoolState, slot: u64) -> Self {
+        Self {
+            state,
+            slot,
+            updated_at: Instant::now(),
+        }
+    }
+
+    /// Age in milliseconds since last update
+    pub fn age_ms(&self) -> u64 {
+        self.updated_at.elapsed().as_millis() as u64
+    }
+
+    /// Check if cache entry is stale (older than threshold)
+    pub fn is_stale(&self, max_age_ms: u64) -> bool {
+        self.age_ms() > max_age_ms
+    }
+}
+
+// ============================================================================
+// Main cache struct
+// ============================================================================
+
+/// Live Pool Cache - maintains real-time pool state from Geyser
+///
+/// Thread-safe via DashMap, designed for concurrent reads from TX builder
+/// and writes from Geyser subscription task.
+pub struct LivePoolCache {
+    /// Pool states by pool address
+    pools: DashMap<Pubkey, CacheEntry>,
+
+    /// Vault to pool mapping (for updating reserves when vault accounts change)
+    vault_to_pool: DashMap<Pubkey, (Pubkey, VaultPosition)>,
+
+    /// Stats
+    updates_total: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+
+    /// Max age before considering entry stale (default: 10 seconds)
+    max_age_ms: u64,
+}
+
+/// Which vault position (A/B or X/Y or 0/1) this vault represents
+#[derive(Debug, Clone, Copy)]
+pub enum VaultPosition {
+    A, // Orca vault_a, Raydium coin_vault, Meteora reserve_x
+    B, // Orca vault_b, Raydium pc_vault, Meteora reserve_y
+}
+
+impl Default for LivePoolCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LivePoolCache {
+    /// Create a new empty cache
+    pub fn new() -> Self {
+        Self {
+            pools: DashMap::new(),
+            vault_to_pool: DashMap::new(),
+            updates_total: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            max_age_ms: 10_000, // 10 seconds default
+        }
+    }
+
+    /// Create cache with custom max age
+    pub fn with_max_age_ms(max_age_ms: u64) -> Self {
+        Self {
+            max_age_ms,
+            ..Self::new()
+        }
+    }
+
+    // ========================================================================
+    // Read API
+    // ========================================================================
+
+    /// Get cached pool state (returns None if not cached)
+    pub fn get(&self, pool: &Pubkey) -> Option<CachedPoolState> {
+        if let Some(entry) = self.pools.get(pool) {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            Some(entry.state.clone())
+        } else {
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// Get cached pool state with slot and age info
+    pub fn get_with_metadata(&self, pool: &Pubkey) -> Option<(CachedPoolState, u64, u64)> {
+        if let Some(entry) = self.pools.get(pool) {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            Some((entry.state.clone(), entry.slot, entry.age_ms()))
+        } else {
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// Check if pool is in cache
+    pub fn contains(&self, pool: &Pubkey) -> bool {
+        self.pools.contains_key(pool)
+    }
+
+    /// Get cache size
+    pub fn len(&self) -> usize {
+        self.pools.len()
+    }
+
+    /// Check if cache is empty
+    pub fn is_empty(&self) -> bool {
+        self.pools.is_empty()
+    }
+
+    // ========================================================================
+    // Write API (called from Geyser subscription task)
+    // ========================================================================
+
+    /// Update or insert pool state
+    pub fn upsert(&self, pool: Pubkey, state: CachedPoolState, slot: u64) {
+        // Register vault mappings for reserve updates
+        self.register_vaults(&pool, &state);
+
+        self.pools.insert(pool, CacheEntry::new(state, slot));
+        self.updates_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Update vault balance for a pool
+    pub fn update_vault_balance(&self, vault: &Pubkey, balance: u64, slot: u64) {
+        if let Some(mapping) = self.vault_to_pool.get(vault) {
+            let (pool_addr, position) = *mapping;
+            if let Some(mut entry) = self.pools.get_mut(&pool_addr) {
+                // Only update if slot is newer
+                if slot >= entry.slot {
+                    match &mut entry.state {
+                        CachedPoolState::Orca(ref mut s) => match position {
+                            VaultPosition::A => s.vault_a_balance = Some(balance),
+                            VaultPosition::B => s.vault_b_balance = Some(balance),
+                        },
+                        CachedPoolState::RaydiumAmm(ref mut s) => match position {
+                            VaultPosition::A => s.coin_reserve = Some(balance),
+                            VaultPosition::B => s.pc_reserve = Some(balance),
+                        },
+                        CachedPoolState::RaydiumCpmm(ref mut s) => match position {
+                            VaultPosition::A => s.reserve_0 = Some(balance),
+                            VaultPosition::B => s.reserve_1 = Some(balance),
+                        },
+                        CachedPoolState::Meteora(ref mut s) => match position {
+                            VaultPosition::A => s.reserve_x_balance = Some(balance),
+                            VaultPosition::B => s.reserve_y_balance = Some(balance),
+                        },
+                        CachedPoolState::PumpAmm(ref mut s) => match position {
+                            VaultPosition::A => s.base_reserve = Some(balance),
+                            VaultPosition::B => s.quote_reserve = Some(balance),
+                        },
+                        CachedPoolState::PumpFun(_) => {
+                            // PumpFun bonding curve has virtual reserves in the account itself
+                        }
+                    }
+                    entry.slot = slot;
+                    entry.updated_at = Instant::now();
+                }
+            }
+        }
+    }
+
+    /// Register vault → pool mappings for reserve updates
+    fn register_vaults(&self, pool: &Pubkey, state: &CachedPoolState) {
+        match state {
+            CachedPoolState::Orca(s) => {
+                self.vault_to_pool
+                    .insert(s.token_vault_a, (*pool, VaultPosition::A));
+                self.vault_to_pool
+                    .insert(s.token_vault_b, (*pool, VaultPosition::B));
+            }
+            CachedPoolState::RaydiumAmm(s) => {
+                self.vault_to_pool
+                    .insert(s.coin_vault, (*pool, VaultPosition::A));
+                self.vault_to_pool
+                    .insert(s.pc_vault, (*pool, VaultPosition::B));
+            }
+            CachedPoolState::RaydiumCpmm(s) => {
+                self.vault_to_pool
+                    .insert(s.token_0_vault, (*pool, VaultPosition::A));
+                self.vault_to_pool
+                    .insert(s.token_1_vault, (*pool, VaultPosition::B));
+            }
+            CachedPoolState::Meteora(s) => {
+                self.vault_to_pool
+                    .insert(s.reserve_x, (*pool, VaultPosition::A));
+                self.vault_to_pool
+                    .insert(s.reserve_y, (*pool, VaultPosition::B));
+            }
+            CachedPoolState::PumpAmm(s) => {
+                self.vault_to_pool
+                    .insert(s.pool_base_token_account, (*pool, VaultPosition::A));
+                self.vault_to_pool
+                    .insert(s.pool_quote_token_account, (*pool, VaultPosition::B));
+            }
+            CachedPoolState::PumpFun(_) => {
+                // No vault accounts to register
+            }
+        }
+    }
+
+    // ========================================================================
+    // Maintenance
+    // ========================================================================
+
+    /// Remove stale entries (older than max_age_ms)
+    pub fn evict_stale(&self) -> usize {
+        let before = self.pools.len();
+        self.pools.retain(|_, entry| !entry.is_stale(self.max_age_ms));
+        let evicted = before.saturating_sub(self.pools.len());
+        if evicted > 0 {
+            tracing::debug!(evicted, "LivePoolCache: evicted stale entries");
+        }
+        evicted
+    }
+
+    /// Get all tracked vault addresses (for Geyser subscription)
+    pub fn get_tracked_vaults(&self) -> Vec<Pubkey> {
+        self.vault_to_pool.iter().map(|e| *e.key()).collect()
+    }
+
+    // ========================================================================
+    // Stats
+    // ========================================================================
+
+    /// Get cache statistics
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            pool_count: self.pools.len(),
+            vault_mappings: self.vault_to_pool.len(),
+            updates_total: self.updates_total.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.cache_misses.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Cache statistics
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    pub pool_count: usize,
+    pub vault_mappings: usize,
+    pub updates_total: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+}
+
+impl CacheStats {
+    /// Cache hit rate (0.0 - 1.0)
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.cache_hits + self.cache_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.cache_hits as f64 / total as f64
+        }
+    }
+}
+
+// ============================================================================
+// Parsers (re-use existing parsers from geyser_pool_discovery)
+// ============================================================================
+
+/// Parse Geyser account data into CachedPoolState
+pub fn parse_pool_account(owner: &Pubkey, data: &[u8]) -> Option<CachedPoolState> {
+    // Known DEX program IDs
+    const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+    const RAYDIUM_CPMM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
+    const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+    const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+    const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+    const PUMPFUN_AMM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+
+    let owner_str = owner.to_string();
+
+    match owner_str.as_str() {
+        ORCA_WHIRLPOOL => parse_orca_whirlpool(data),
+        RAYDIUM_AMM_V4 => parse_raydium_amm(data),
+        RAYDIUM_CPMM => parse_raydium_cpmm(data),
+        METEORA_DLMM => parse_meteora_dlmm(data),
+        PUMPFUN_PROGRAM => parse_pumpfun_bonding(data),
+        PUMPFUN_AMM => parse_pumpamm_pool(data),
+        _ => None,
+    }
+}
+
+fn parse_orca_whirlpool(data: &[u8]) -> Option<CachedPoolState> {
+    let parsed = orca_whirlpool_layout::parse_whirlpool(data)?;
+    Some(CachedPoolState::Orca(OrcaWhirlpoolState::from(parsed)))
+}
+
+fn parse_raydium_amm(data: &[u8]) -> Option<CachedPoolState> {
+    // Raydium AMM v4 account layout: 752 bytes
+    if data.len() != 752 {
+        return None;
+    }
+
+    // Offset 0: status (u64)
+    let status = u64::from_le_bytes(data[0..8].try_into().ok()?);
+    if status == 0 {
+        return None;
+    }
+
+    // Offset 32: coin_decimals, Offset 40: pc_decimals
+    let coin_decimals = u64::from_le_bytes(data[32..40].try_into().ok()?) as u8;
+    let pc_decimals = u64::from_le_bytes(data[40..48].try_into().ok()?) as u8;
+
+    // Offset 336: coin_vault, Offset 368: pc_vault
+    let coin_vault = Pubkey::new_from_array(data[336..368].try_into().ok()?);
+    let pc_vault = Pubkey::new_from_array(data[368..400].try_into().ok()?);
+
+    // Offset 400: coin_mint (base), Offset 432: pc_mint (quote)
+    let base_mint = Pubkey::new_from_array(data[400..432].try_into().ok()?);
+    let quote_mint = Pubkey::new_from_array(data[432..464].try_into().ok()?);
+
+    // Offset 464: market_id (Serum/OpenBook)
+    let market_id = Pubkey::new_from_array(data[464..496].try_into().ok()?);
+
+    Some(CachedPoolState::RaydiumAmm(RaydiumAmmState {
+        base_mint,
+        quote_mint,
+        coin_vault,
+        pc_vault,
+        base_decimals: coin_decimals,
+        quote_decimals: pc_decimals,
+        coin_reserve: None,
+        pc_reserve: None,
+        market_id,
+        serum_bids: None,
+        serum_asks: None,
+        serum_event_queue: None,
+    }))
+}
+
+fn parse_raydium_cpmm(data: &[u8]) -> Option<CachedPoolState> {
+    // CPMM pool: 1024 bytes
+    if data.len() != 1024 {
+        return None;
+    }
+
+    let status = data[8];
+    if status == 0 {
+        return None;
+    }
+
+    // Offset 73: token_0_mint, 105: token_1_mint
+    let token_0_mint = Pubkey::new_from_array(data[73..105].try_into().ok()?);
+    let token_1_mint = Pubkey::new_from_array(data[105..137].try_into().ok()?);
+
+    // Offset 137: token_0_vault, 169: token_1_vault
+    let token_0_vault = Pubkey::new_from_array(data[137..169].try_into().ok()?);
+    let token_1_vault = Pubkey::new_from_array(data[169..201].try_into().ok()?);
+
+    Some(CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+        token_0_mint,
+        token_1_mint,
+        token_0_vault,
+        token_1_vault,
+        reserve_0: None,
+        reserve_1: None,
+    }))
+}
+
+fn parse_meteora_dlmm(data: &[u8]) -> Option<CachedPoolState> {
+    // LB Pair: 904 bytes
+    if data.len() != 904 {
+        return None;
+    }
+
+    let parsed = DlmmPool::parse(data).ok()?;
+    Some(CachedPoolState::Meteora(MeteoraState::from(parsed)))
+}
+
+fn parse_pumpfun_bonding(data: &[u8]) -> Option<CachedPoolState> {
+    // PumpFun bonding curve: varies, but key fields at known offsets
+    // Layout: 8 bytes discriminator + fields
+    if data.len() < 128 {
+        return None;
+    }
+
+    // Offset 8: virtual_token_reserves (u64)
+    let virtual_token_reserves = u64::from_le_bytes(data[8..16].try_into().ok()?);
+    // Offset 16: virtual_sol_reserves (u64)
+    let virtual_sol_reserves = u64::from_le_bytes(data[16..24].try_into().ok()?);
+    // Offset 24: real_token_reserves (u64)
+    let real_token_reserves = u64::from_le_bytes(data[24..32].try_into().ok()?);
+    // Offset 32: real_sol_reserves (u64)
+    let real_sol_reserves = u64::from_le_bytes(data[32..40].try_into().ok()?);
+    // Offset 40: token_total_supply (skip)
+    // Offset 48: complete (bool)
+    let complete = data.get(48).map(|&b| b != 0).unwrap_or(false);
+
+    // Offset 49: mint (Pubkey)
+    let token_mint = if data.len() >= 81 {
+        Pubkey::new_from_array(data[49..81].try_into().ok()?)
+    } else {
+        return None;
+    };
+
+    // Bonding curve and associated are derived PDAs, we don't have them here
+    // They need to be provided from the caller or derived
+    Some(CachedPoolState::PumpFun(PumpFunState {
+        token_mint,
+        bonding_curve: Pubkey::default(), // Will be set by caller
+        associated_bonding_curve: Pubkey::default(),
+        virtual_sol_reserves,
+        virtual_token_reserves,
+        real_sol_reserves,
+        real_token_reserves,
+        complete,
+    }))
+}
+
+fn parse_pumpamm_pool(data: &[u8]) -> Option<CachedPoolState> {
+    // PumpAMM pool: 211 bytes (based on observed data)
+    if data.len() < 200 {
+        return None;
+    }
+
+    // Offset 8: pool_bump (u8)
+    // Offset 9: index (u16)
+    // Offset 11: creator (Pubkey, 32 bytes)
+    // Offset 43: base_mint (Pubkey, 32 bytes)
+    let base_mint = Pubkey::new_from_array(data[43..75].try_into().ok()?);
+    // Offset 75: quote_mint (Pubkey, 32 bytes)
+    let quote_mint = Pubkey::new_from_array(data[75..107].try_into().ok()?);
+    // Offset 107: lp_mint (Pubkey)
+    // Offset 139: pool_base_token_account (Pubkey, 32 bytes)
+    let pool_base_token_account = Pubkey::new_from_array(data[139..171].try_into().ok()?);
+    // Offset 171: pool_quote_token_account (Pubkey, 32 bytes)
+    let pool_quote_token_account = Pubkey::new_from_array(data[171..203].try_into().ok()?);
+
+    Some(CachedPoolState::PumpAmm(PumpAmmState {
+        base_mint,
+        quote_mint,
+        pool_base_token_account,
+        pool_quote_token_account,
+        base_reserve: None,
+        quote_reserve: None,
+        pool_accounts: vec![], // Will be populated from DexPoolAccounts event
+    }))
+}
+
+// ============================================================================
+// Thread-safe shared cache type
+// ============================================================================
+
+/// Shared cache reference (Arc wrapper for convenience)
+pub type SharedLivePoolCache = Arc<LivePoolCache>;
+
+/// Create a new shared cache
+pub fn create_shared_cache() -> SharedLivePoolCache {
+    Arc::new(LivePoolCache::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_basic_operations() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+
+        // Initially empty
+        assert!(cache.get(&pool).is_none());
+        assert!(!cache.contains(&pool));
+
+        // Insert
+        let state = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: Pubkey::new_unique(),
+            token_1_mint: Pubkey::new_unique(),
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: Pubkey::new_unique(),
+            reserve_0: Some(1_000_000),
+            reserve_1: Some(2_000_000),
+        });
+
+        cache.upsert(pool, state.clone(), 100);
+
+        // Now present
+        assert!(cache.contains(&pool));
+        assert!(cache.get(&pool).is_some());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_cache_stats() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+
+        // Miss
+        let _ = cache.get(&pool);
+
+        let stats = cache.stats();
+        assert_eq!(stats.cache_misses, 1);
+        assert_eq!(stats.cache_hits, 0);
+
+        // Insert and hit
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: Pubkey::new_unique(),
+                token_1_mint: Pubkey::new_unique(),
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            100,
+        );
+        let _ = cache.get(&pool);
+
+        let stats = cache.stats();
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.updates_total, 1);
+    }
+}
