@@ -215,7 +215,7 @@ impl MeteoraDlmmSwapBuilder {
         user: &Pubkey,
         amount_in: u64,
         min_amount_out: u64,
-        _direction: SwapDirection,
+        direction: SwapDirection,
         active_id: i32,
     ) -> Result<Instruction> {
         ensure!(amount_in > 0, "Amount in must be positive");
@@ -245,8 +245,8 @@ impl MeteoraDlmmSwapBuilder {
         // 1. bin_array_bitmap_extension (optional, use program_id if not needed)
         // 2. reserve_x (writable)
         // 3. reserve_y (writable)
-        // 4. user_token_in (writable)
-        // 5. user_token_out (writable)
+        // 4. user_token_in (writable) - depends on swap direction!
+        // 5. user_token_out (writable) - depends on swap direction!
         // 6. token_x_mint
         // 7. token_y_mint
         // 8. oracle (writable, derived PDA)
@@ -257,6 +257,15 @@ impl MeteoraDlmmSwapBuilder {
         // 13. event_authority (derived PDA)
         // 14. program
         // 15+ bin_arrays (writable, remaining accounts)
+
+        // CRITICAL: Accounts 4 and 5 are user_token_in and user_token_out, NOT x/y!
+        // The order depends on swap direction:
+        // - XtoY (sell Token for SOL): in=token_x, out=token_y
+        // - YtoX (buy Token with SOL): in=token_y (wSOL), out=token_x (Token)
+        let (user_token_in, user_token_out) = match direction {
+            SwapDirection::XtoY => (user_token_x, user_token_y),
+            SwapDirection::YtoX => (user_token_y, user_token_x),
+        };
 
         // Derive oracle PDA: seeds = ["oracle", lb_pair]
         let (oracle, _) = Pubkey::find_program_address(
@@ -275,8 +284,8 @@ impl MeteoraDlmmSwapBuilder {
             AccountMeta::new_readonly(bin_array_bitmap_extension, false), // 1: bitmap extension (optional)
             AccountMeta::new(*reserve_x, false),    // 2: Reserve X (writable)
             AccountMeta::new(*reserve_y, false),    // 3: Reserve Y (writable)
-            AccountMeta::new(*user_token_x, false), // 4: User token X (writable)
-            AccountMeta::new(*user_token_y, false), // 5: User token Y (writable)
+            AccountMeta::new(*user_token_in, false), // 4: User token IN (writable)
+            AccountMeta::new(*user_token_out, false), // 5: User token OUT (writable)
             AccountMeta::new_readonly(*token_x_mint, false), // 6: Token X mint
             AccountMeta::new_readonly(*token_y_mint, false), // 7: Token Y mint
             AccountMeta::new(oracle, false),        // 8: Oracle PDA (WRITABLE!)
@@ -313,7 +322,7 @@ impl MeteoraDlmmSwapBuilder {
         user: &Pubkey,
         amount_in: u64,
         min_amount_out: u64,
-        _direction: SwapDirection,
+        direction: SwapDirection,
         active_id_from_intent: i32,
         _bin_step: u16,
     ) -> Result<Instruction> {
@@ -383,13 +392,22 @@ impl MeteoraDlmmSwapBuilder {
         data.extend_from_slice(&min_amount_out.to_le_bytes());
 
         // Build account list (matching official IDL order)
+        // CRITICAL: Accounts 4 and 5 are user_token_in and user_token_out, NOT x/y!
+        // The order depends on swap direction:
+        // - XtoY (sell Token for SOL): in=token_x, out=token_y
+        // - YtoX (buy Token with SOL): in=token_y (wSOL), out=token_x (Token)
+        let (user_token_in, user_token_out) = match direction {
+            SwapDirection::XtoY => (user_token_x, user_token_y),
+            SwapDirection::YtoX => (user_token_y, user_token_x),
+        };
+        
         let mut accounts = vec![
             AccountMeta::new(*lb_pair, false),      // 0: LB Pair (writable)
             AccountMeta::new_readonly(bin_array_bitmap_extension, false), // 1: bitmap extension (required if exists!)
             AccountMeta::new(*reserve_x, false),    // 2: Reserve X (writable)
             AccountMeta::new(*reserve_y, false),    // 3: Reserve Y (writable)
-            AccountMeta::new(*user_token_x, false), // 4: User token X (writable)
-            AccountMeta::new(*user_token_y, false), // 5: User token Y (writable)
+            AccountMeta::new(*user_token_in, false), // 4: User token IN (writable) - depends on direction!
+            AccountMeta::new(*user_token_out, false), // 5: User token OUT (writable) - depends on direction!
             AccountMeta::new_readonly(*token_x_mint, false), // 6: Token X mint
             AccountMeta::new_readonly(*token_y_mint, false), // 7: Token Y mint
             AccountMeta::new(oracle, false),        // 8: Oracle PDA (WRITABLE!)
