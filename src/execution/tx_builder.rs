@@ -182,33 +182,27 @@ fn dex_hint_from_intent(intent: &TradeIntent) -> Result<DexHint, UnsupportedTxPl
     }
 }
 
-fn min_out_raw_from_intent(intent: &TradeIntent) -> Result<u64, UnsupportedTxPlan> {
+/// Try to get min_out from intent. Returns None if not provided.
+fn min_out_raw_from_intent(intent: &TradeIntent) -> Option<u64> {
+    // First check typed execution field
     if let Some(execution) = intent.execution.as_ref() {
         if let Some(min_out) = execution.min_out.as_ref() {
-            return Ok(min_out.raw);
+            if min_out.raw > 0 {
+                return Some(min_out.raw);
+            }
         }
     }
 
     // Legacy fallback (stringly-typed metadata)
-    // NOTE: We keep this for backward compatibility, but new producers should
-    // use intent.execution.min_out.
-    let min_out_raw = match intent.metadata.get("min_out_raw") {
-        Some(v) => v,
-        None => {
-            return Err(UnsupportedTxPlan {
-                reason: RejectReason::UnsupportedIntent,
-                details: "missing execution.min_out and metadata.min_out_raw (required for deterministic tx plan)".to_string(),
-            })
+    if let Some(min_out_str) = intent.metadata.get("min_out_raw") {
+        if let Ok(v) = min_out_str.parse::<u64>() {
+            if v > 0 {
+                return Some(v);
+            }
         }
-    };
-
-    match min_out_raw.parse() {
-        Ok(v) => Ok(v),
-        Err(e) => Err(UnsupportedTxPlan {
-            reason: RejectReason::InvalidIntent,
-            details: format!("invalid metadata.min_out_raw (u64): {e}"),
-        }),
     }
+
+    None
 }
 
 /// Fetch Orca Whirlpool state from RPC (fallback when cache miss)
@@ -288,14 +282,45 @@ pub async fn build_tx_plan(
         });
     }
 
-    // Strategy must provide min_out for deterministic planning.
-    // - For Pump.fun BUY: min token out
-    // - For Pump.fun SELL: min SOL out (lamports)
-    // - For Orca: min output amount in raw base units of output mint
+    // Get min_out from intent, or calculate fresh from cache if not provided
+    // This is the core of Option C: execution-engine calculates min_out from live cache
     let min_out: u64 = match min_out_raw_from_intent(intent) {
-        Ok(v) => v,
-        Err(e) => {
-            return TxPlanOutcome::Unsupported(e);
+        Some(v) => {
+            tracing::debug!(min_out = v, "tx_plan: using min_out from intent");
+            v
+        }
+        None => {
+            // No min_out in intent - try to calculate from cache
+            if let Some(cache) = cache {
+                match super::quote_calculator::calculate_fresh_min_out(cache, intent) {
+                    Ok(Some(fresh_min_out)) => {
+                        tracing::info!(
+                            fresh_min_out,
+                            amount_in = intent.required_capital.raw,
+                            slippage_bps = intent.max_slippage_bps,
+                            "tx_plan: calculated fresh min_out from cache"
+                        );
+                        fresh_min_out
+                    }
+                    Ok(None) => {
+                        return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                            reason: RejectReason::UnsupportedIntent,
+                            details: "no min_out in intent and cache calculation returned None (pool not cached or zero output)".to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                            reason: RejectReason::UnsupportedIntent,
+                            details: format!("no min_out in intent and cache calculation failed: {e}"),
+                        });
+                    }
+                }
+            } else {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: "missing execution.min_out and no cache available for fresh calculation".to_string(),
+                });
+            }
         }
     };
 
@@ -767,9 +792,9 @@ mod tests {
             min_out: Some(ExplicitAmount::new(999, 9)),
         });
 
-        let parsed = super::min_out_raw_from_intent(&intent).unwrap();
+        let parsed = super::min_out_raw_from_intent(&intent);
 
-        assert_eq!(parsed, 999);
+        assert_eq!(parsed, Some(999));
     }
 
     #[test]
@@ -780,8 +805,15 @@ mod tests {
             .metadata
             .insert("min_out_raw".to_string(), "456".to_string());
 
-        let parsed = super::min_out_raw_from_intent(&intent).unwrap();
+        let parsed = super::min_out_raw_from_intent(&intent);
 
-        assert_eq!(parsed, 456);
+        assert_eq!(parsed, Some(456));
+    }
+
+    #[test]
+    fn min_out_returns_none_when_missing() {
+        let intent = base_intent();
+        let parsed = super::min_out_raw_from_intent(&intent);
+        assert_eq!(parsed, None);
     }
 }
