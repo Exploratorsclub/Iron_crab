@@ -335,7 +335,7 @@ async fn compute_intent_fills_best_effort(
 
     // Return wallet SOL delta (5th tuple element) unless gated by noise
     let wallet_sol_delta = if !lamport_noise {
-        Some(payer_delta_lamports as i128)
+        Some(payer_delta_lamports)
     } else {
         None
     };
@@ -910,7 +910,7 @@ impl ExecutionContext {
         dex_hint: Option<&str>,
     ) -> Pubkey {
         let spl = Pubkey::new_from_array(spl_token::id().to_bytes());
-        let spl22 = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+        let _spl22 = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
 
         // Try cache first
         if let Some(c) = cache {
@@ -1174,7 +1174,7 @@ impl ExecutionContext {
                                 resources.pools = vec![bc_str.clone()];
 
                                 // Try to get creator from LivePoolCache first (Geyser-first)
-                                let mut creator_found = false;
+                                let mut _creator_found = false;
                                 if let Ok(bc) = Pubkey::from_str(bc_str) {
                                     if let Some(cache) = ctx.live_pool_cache.as_ref() {
                                         if let Some(CachedPoolState::PumpFun(pf)) = cache.get(&bc) {
@@ -1185,14 +1185,14 @@ impl ExecutionContext {
                                     }
                                     // TODO: Remove this RPC fallback once PumpFunState includes creator
                                     // This is liquidation path (not hot-path), so acceptable for now
-                                    if !creator_found {
+                                    if !_creator_found {
                                         if let Ok(acct) = ctx.rpc.rpc.get_account(&bc).await {
                                             if let Ok(state) = BondingCurveState::parse(&acct.data) {
                                                 metadata.insert(
                                                     "creator".to_string(),
                                                     state.creator.to_string(),
                                                 );
-                                                creator_found = true;
+                                                _creator_found = true;
                                             }
                                         }
                                     }
@@ -2324,6 +2324,7 @@ fn spl_to_sdk(pk: &spl_token::solana_program::pubkey::Pubkey) -> Pubkey {
     Pubkey::new_from_array(pk.to_bytes())
 }
 
+#[allow(dead_code)]
 fn token_program_for_mint_owner(owner: &Pubkey) -> Option<Pubkey> {
     let spl_token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
     let spl_token_2022_program = Pubkey::new_from_array(spl_token_2022::id().to_bytes());

@@ -20,6 +20,9 @@
 //! - Sign or send transactions
 //! - Directly call RPC/Geyser (gets data via MarketEvents)
 
+// Allow items after test module - functions are organized by logical grouping
+#![allow(clippy::items_after_test_module)]
+
 use anyhow::Result;
 use clap::Parser;
 use std::collections::{HashMap, HashSet};
@@ -2682,7 +2685,7 @@ impl MomentumContext {
                 // === Exit Strategy ===
                 "hard_stop_loss_pct" => {
                     if let Some(v) = value.as_f64() {
-                        if v >= 0.0 && v <= 100.0 {
+                        if (0.0..=100.0).contains(&v) {
                             config.hard_stop_loss_pct = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -2695,7 +2698,7 @@ impl MomentumContext {
                 }
                 "trailing_stop_pct" => {
                     if let Some(v) = value.as_f64() {
-                        if v >= 0.0 && v <= 100.0 {
+                        if (0.0..=100.0).contains(&v) {
                             config.trailing_stop_pct = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -3488,6 +3491,7 @@ async fn generate_and_publish_buy_intent(
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

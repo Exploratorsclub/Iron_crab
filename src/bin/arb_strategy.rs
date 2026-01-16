@@ -19,7 +19,7 @@ use parking_lot::RwLock;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -85,7 +85,7 @@ impl Default for ArbConfig {
     }
 }
 
-fn load_initial_arb_config(config_path: &PathBuf) -> ArbConfig {
+fn load_initial_arb_config(config_path: &Path) -> ArbConfig {
     let mut cfg = ArbConfig::default();
 
     let app_cfg = match AppConfig::load(config_path) {
@@ -179,6 +179,7 @@ struct Args {
 // ============================================================================
 
 /// Tracks a pool's price/liquidity state
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct PoolState {
     pool_address: String,
@@ -384,11 +385,10 @@ impl TokenArbTracker {
         // Gross profit = trade_amount * spread_pct
         let gross_profit = max_trade_sol * (spread / Decimal::from(10000));
         // Convert to lamports using proper Decimal methods
-        let gross_profit_lamports = ((gross_profit * Decimal::from(1_000_000_000u64))
+        let gross_profit_lamports = (gross_profit * Decimal::from(1_000_000_000u64))
             .round()
             .to_u64()
-            .unwrap_or(0))
-        .min(u64::MAX);
+            .unwrap_or(0);
 
         // Net profit after tx costs
         let net_profit = gross_profit_lamports.saturating_sub(config.est_tx_cost_lamports);
@@ -502,6 +502,7 @@ struct ArbContext {
 }
 
 /// Cached vault balances from PoolStateUpdate events
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct VaultBalanceCache {
     reserve_base: u64,
@@ -510,6 +511,7 @@ struct VaultBalanceCache {
 }
 
 /// Cached bin array data from BinArrayUpdate events
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct BinArrayCache {
     bins: Vec<BinData>,
@@ -822,6 +824,7 @@ impl ArbContext {
     }
 
     /// Update price from trade event
+    #[allow(clippy::too_many_arguments)]
     fn handle_trade(
         &self,
         pool_address: &str,

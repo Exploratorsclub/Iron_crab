@@ -35,9 +35,11 @@ async fn test_pumpfun_build_buy_ix_pure_derivation() {
         .await
         .expect("build_swap_ix_async_with_slippage");
 
-    assert_eq!(ixs.len(), 1, "expected exactly one instruction");
+    // Expect 2 instructions: ATA creation (idempotent) + pump.fun swap
+    assert_eq!(ixs.len(), 2, "expected ATA creation + pump.fun instruction");
 
-    let ix = &ixs[0];
+    // The second instruction is the pump.fun BUY
+    let ix = &ixs[1];
     assert_eq!(
         ix.program_id,
         Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
@@ -118,13 +120,15 @@ async fn test_tx_builder_supports_pumpfun_sell_pure_derivation() {
         }
     };
 
+    // Expect 2 instructions: ATA creation (idempotent) + pump.fun SELL
     assert_eq!(
         plan.instructions.len(),
-        1,
-        "expected exactly one instruction"
+        2,
+        "expected ATA creation + pump.fun instruction"
     );
 
-    let ix = &plan.instructions[0];
+    // The second instruction is the pump.fun SELL
+    let ix = &plan.instructions[1];
     assert_eq!(
         ix.program_id,
         Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")

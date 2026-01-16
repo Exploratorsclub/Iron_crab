@@ -435,6 +435,7 @@ mod tests {
             real_sol_reserves: 0,
             real_token_reserves: 793_100_000_000_000,
             complete: false,
+            creator: Pubkey::new_unique(),
         };
 
         // Buy with 1 SOL
@@ -455,6 +456,7 @@ mod tests {
             real_sol_reserves: 0,
             real_token_reserves: 793_100_000_000_000,
             complete: false,
+            creator: Pubkey::new_unique(),
         };
 
         // Sell 100M tokens

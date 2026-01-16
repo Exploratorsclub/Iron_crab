@@ -35,7 +35,7 @@ fn test_config_update_roundtrip() {
     // Deserialize back
     let parsed: ConfigUpdate = serde_json::from_str(&json).expect("deserialize ConfigUpdate");
 
-    assert_eq!(parsed.component, "execution-engine");
+    assert_eq!(parsed.target_component, "execution-engine");
     assert_eq!(parsed.config.len(), 3);
     assert_eq!(
         parsed
@@ -205,7 +205,7 @@ fn test_config_update_component_filtering() {
     for component in components {
         let update = ConfigUpdate::new("test", "test-build", "test-run", component, HashMap::new());
 
-        // Each binary should check: if update.component == "my-component"
-        assert_eq!(update.component, component);
+        // Each binary should check: if update.target_component == "my-component"
+        assert_eq!(update.target_component, component);
     }
 }

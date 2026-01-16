@@ -726,11 +726,8 @@ fn test_fee_policy_profitability() {
 
     let (is_profitable_marginal, _) = policy.is_profitable_after_fees(&intent_marginal);
     // Fee might eat into profit for small trades with low ROI
-    // The exact result depends on fee calculation, but we test that it computes
-    assert!(
-        is_profitable_marginal || !is_profitable_marginal,
-        "Should compute profitability"
-    );
+    // The exact result depends on fee calculation, but we verify it computes without panic
+    let _ = is_profitable_marginal; // Just verify computation completed
 }
 
 /// P1: Test FeePolicy serialization roundtrip

@@ -54,7 +54,7 @@ const DEFAULT_TOTAL_FEE_BPS: u32 = 125;
 
 // Helius can aggressively rate limit across the entire API key. Keep JSON-RPC calls serialized
 // and spaced out process-wide (not per `PumpFunAmmDex` instance).
-static HELIUS_THROTTLES: Lazy<DashMap<String, Arc<HeliusThrottle>>> = Lazy::new(|| DashMap::new());
+static HELIUS_THROTTLES: Lazy<DashMap<String, Arc<HeliusThrottle>>> = Lazy::new(DashMap::new);
 
 #[derive(Debug)]
 struct HeliusThrottle {
@@ -82,6 +82,7 @@ fn anchor_disc(ix_name: &str) -> [u8; 8] {
     disc
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct PumpAmmPoolStatic {
     pool_market: Pubkey,
@@ -631,7 +632,7 @@ impl PumpFunAmmDex {
             else {
                 continue;
             };
-            let Some(b64) = data_arr.get(0).and_then(|v| v.as_str()) else {
+            let Some(b64) = data_arr.first().and_then(|v| v.as_str()) else {
                 continue;
             };
             let Ok(acc_data) = BASE64_STD.decode(b64) else {
@@ -1179,22 +1180,18 @@ impl PumpFunAmmDex {
                 .unwrap_or_default()
         } else {
             // Fallback: try deriving fee_config PDA from Fee Program
-            match self
-                .derive_existing_pda(
-                    fee_program,
-                    &[
-                        vec![b"fee_config".to_vec(), global_config.to_bytes().to_vec()],
-                        vec![b"fee_config".to_vec(), pool_market.to_bytes().to_vec()],
-                        vec![b"fee_config".to_vec()],
-                        vec![b"fees".to_vec(), global_config.to_bytes().to_vec()],
-                        vec![b"fees".to_vec(), pool_market.to_bytes().to_vec()],
-                    ],
-                )
-                .await?
-            {
-                Some(v) => v,
-                None => Pubkey::default(),
-            }
+            self.derive_existing_pda(
+                fee_program,
+                &[
+                    vec![b"fee_config".to_vec(), global_config.to_bytes().to_vec()],
+                    vec![b"fee_config".to_vec(), pool_market.to_bytes().to_vec()],
+                    vec![b"fee_config".to_vec()],
+                    vec![b"fees".to_vec(), global_config.to_bytes().to_vec()],
+                    vec![b"fees".to_vec(), pool_market.to_bytes().to_vec()],
+                ],
+            )
+            .await?
+            .unwrap_or_default()
         };
 
         let global_volume_accumulator = if !program_owned_accounts.is_empty() {
@@ -1205,33 +1202,29 @@ impl PumpFunAmmDex {
             sorted.last().map(|m| m.address).unwrap_or_default()
         } else {
             // Fallback: try deriving from AMM program
-            match self
-                .derive_existing_pda(
-                    pump_amm_program,
-                    &[
-                        vec![
-                            b"global_volume_accumulator".to_vec(),
-                            global_config.to_bytes().to_vec(),
-                        ],
-                        vec![
-                            b"global_volume_accumulator".to_vec(),
-                            pool_market.to_bytes().to_vec(),
-                        ],
-                        vec![
-                            b"volume_accumulator".to_vec(),
-                            global_config.to_bytes().to_vec(),
-                        ],
-                        vec![
-                            b"volume_accumulator".to_vec(),
-                            pool_market.to_bytes().to_vec(),
-                        ],
+            self.derive_existing_pda(
+                pump_amm_program,
+                &[
+                    vec![
+                        b"global_volume_accumulator".to_vec(),
+                        global_config.to_bytes().to_vec(),
                     ],
-                )
-                .await?
-            {
-                Some(v) => v,
-                None => Pubkey::default(),
-            }
+                    vec![
+                        b"global_volume_accumulator".to_vec(),
+                        pool_market.to_bytes().to_vec(),
+                    ],
+                    vec![
+                        b"volume_accumulator".to_vec(),
+                        global_config.to_bytes().to_vec(),
+                    ],
+                    vec![
+                        b"volume_accumulator".to_vec(),
+                        pool_market.to_bytes().to_vec(),
+                    ],
+                ],
+            )
+            .await?
+            .unwrap_or_default()
         };
 
         if fee_config == Pubkey::default() || global_volume_accumulator == Pubkey::default() {

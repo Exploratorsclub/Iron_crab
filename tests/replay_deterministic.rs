@@ -132,7 +132,7 @@ fn make_decision(intent: &TradeIntent, sequence_num: u64) -> DecisionRecord {
             success: true,
             error_code: None,
             logs_preview: Some(format!("Simulated at seq {}", sequence_num)),
-            compute_units_consumed: Some(150_000 + (sequence_num * 100) as u64),
+            compute_units_consumed: Some(150_000 + sequence_num * 100),
         };
         (DecisionOutcome::Sent, None, Some(sim))
     };
@@ -187,7 +187,7 @@ fn read_decisions_from_jsonl(path: &std::path::Path) -> Vec<DecisionRecord> {
 
     reader
         .lines()
-        .filter_map(|line| line.ok())
+        .map_while(Result::ok)
         .filter_map(|line| serde_json::from_str(&line).ok())
         .collect()
 }
@@ -240,7 +240,7 @@ fn test_decision_record_roundtrip() {
 
 #[test]
 fn test_replay_determinism() {
-    let test_cases = vec![
+    let test_cases = [
         (1, TradingRegime::Early, 50_000_000),
         (2, TradingRegime::Early, 200_000_000),
         (3, TradingRegime::Established, 10_000_000),

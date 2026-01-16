@@ -6,10 +6,7 @@
 //! Golden fixtures are stored in tests/fixtures/golden_replays/
 //! Any intentional change to decision logic must update these fixtures.
 
-use ironcrab::ipc::{
-    CheckResult, DecisionOutcome, DecisionRecord, ExplicitAmount, IntentOrigin, IntentTier,
-    RecordHeader, SimulationResult, TradeIntent, TradeResources, TradeSide, TradingRegime,
-};
+use ironcrab::ipc::{DecisionOutcome, IntentOrigin, TradeIntent, TradingRegime};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -27,7 +24,7 @@ fn load_intents(fixture_name: &str) -> Vec<TradeIntent> {
 
     BufReader::new(file)
         .lines()
-        .filter_map(|line| line.ok())
+        .map_while(Result::ok)
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             serde_json::from_str(&line).unwrap_or_else(|e| {
@@ -49,7 +46,7 @@ fn load_expected_decisions(fixture_name: &str) -> Vec<GoldenDecision> {
 
     BufReader::new(file)
         .lines()
-        .filter_map(|line| line.ok())
+        .map_while(Result::ok)
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             serde_json::from_str(&line).unwrap_or_else(|e| {
@@ -61,6 +58,7 @@ fn load_expected_decisions(fixture_name: &str) -> Vec<GoldenDecision> {
 
 /// Simplified decision structure for golden comparison
 /// (doesn't need all header fields, just the important ones)
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize)]
 struct GoldenDecision {
     decision_id: String,
@@ -72,6 +70,7 @@ struct GoldenDecision {
     outcome: DecisionOutcome,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize)]
 struct GoldenCheck {
     check_name: String,
@@ -312,20 +311,11 @@ impl Default for TestConfig {
     }
 }
 
+#[derive(Default)]
 struct TestState {
     processed_intents: HashSet<String>,
     open_positions: usize,
     daily_loss_lamports: i64,
-}
-
-impl Default for TestState {
-    fn default() -> Self {
-        Self {
-            processed_intents: HashSet::new(),
-            open_positions: 0,
-            daily_loss_lamports: 0,
-        }
-    }
 }
 
 /// Compare a generated decision against the golden expected decision

@@ -761,7 +761,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     let coin_creator_vault_authority = update.instruction_accounts[18];
     // v2 format: no global_volume_accumulator in TX!
     let fee_config = update.instruction_accounts[19];
-    let fee_program = update.instruction_accounts[20];
+    let _fee_program = update.instruction_accounts[20];
 
     let amount_in = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
     let _min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
@@ -873,11 +873,7 @@ fn calculate_token_balance_change(
             let pre_amount = pre.ui_token_amount.amount.parse::<u64>().ok()?;
 
             // Calculate absolute change
-            let change = if post_amount > pre_amount {
-                post_amount - pre_amount // Tokens received
-            } else {
-                pre_amount - post_amount // Tokens sent
-            };
+            let change = post_amount.abs_diff(pre_amount);
 
             if change > max_change {
                 max_change = change;

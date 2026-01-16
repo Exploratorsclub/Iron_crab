@@ -86,4 +86,13 @@ pub trait Dex: Send + Sync {
         // Default: call sync version
         self.build_swap_ix(input_mint, output_mint, amount_in, min_out)
     }
+
+    /// Cache additional data needed for building swap instructions (e.g., creator for PumpFun).
+    /// This is called from cross_dex_handler BEFORE build_swap_ix_async to inject
+    /// Geyser-sourced data, eliminating RPC calls in the hot path.
+    ///
+    /// Default implementation is a no-op. Override for DEXes that need cached data.
+    fn cache_extra_data(&self, _key: &str, _value: &str) {
+        // Default: no-op
+    }
 }

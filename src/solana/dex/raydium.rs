@@ -304,9 +304,9 @@ impl Raydium {
         // Try to derive serum vault signer (market_program_id not in cache, use OpenBook default)
         let openbook_v1 =
             Pubkey::from_str("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX").ok();
-        let serum_vault_signer = openbook_v1.and_then(|prog| {
+        let serum_vault_signer = openbook_v1.map(|prog| {
             let (v, _) = Self::derive_serum_vault_signer(&market_id, &prog);
-            Some(v)
+            v
         });
 
         // Create SimplePool entry from cached state

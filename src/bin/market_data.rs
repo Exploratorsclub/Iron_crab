@@ -13,6 +13,10 @@
 //! - Sign or send transactions
 //! - Make trading decisions
 
+// Allow holding locks across await - RwLock reads are fast and this simplifies the code.
+// TODO: Refactor to use explicit clone-before-await pattern if this causes contention.
+#![allow(clippy::await_holding_lock)]
+
 use anyhow::Result;
 use clap::Parser;
 use solana_sdk::pubkey::Pubkey;
@@ -67,6 +71,7 @@ const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
 /// Market data configuration (hot-reloadable via NATS)
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct MarketDataConfig {
     /// Enable Raydium AMM V4 discovery. Default: true
@@ -517,7 +522,7 @@ async fn run_geyser_loop(
         GeyserPoolDiscovery::new(geyser_url.to_string(), program_ids.clone(), rpc.clone());
 
     // Spawn pool discovery task
-    let pool_discovery_handle = tokio::spawn(async move {
+    let _pool_discovery_handle = tokio::spawn(async move {
         if let Err(e) = pool_discovery.start().await {
             error!(error = %e, "GeyserPoolDiscovery crashed");
         }
@@ -653,10 +658,12 @@ async fn run_geyser_loop(
 
                 // Vault account updates → emit PoolStateUpdate (Geyser-based reserve balances)
                 // This eliminates the need for RPC calls to fetch vault balances.
-                if (account_update.owner.to_bytes() == spl_token::ID.to_bytes()
-                    || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes())
+                if account_update.owner.to_bytes() == spl_token::ID.to_bytes()
+                    || account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes()
                 {
-                    if let Some(vault_info) = ctx.tracked_vaults.read().get(&account_update.pubkey).cloned() {
+                    // Clone data from lock scope to avoid holding lock across await
+                    let vault_info_opt = ctx.tracked_vaults.read().get(&account_update.pubkey).cloned();
+                    if let Some(vault_info) = vault_info_opt {
                         // Parse token account to get balance
                         if let Some(balance) = try_parse_token_account_balance(&account_update.data) {
                             // Check if balance changed (avoid spamming unchanged updates)

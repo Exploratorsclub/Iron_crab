@@ -38,6 +38,7 @@ pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const CPMM_POOL_ACCOUNT_SIZE: usize = 1024;
 
 /// Cached pool state
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct PoolCache {
     address: Pubkey,
@@ -172,7 +173,8 @@ impl RaydiumCpmm {
     }
 
     /// Get pool snapshot for a specific address
-    pub fn get_pool(&self, address: &Pubkey) -> Option<PoolCache> {
+    #[allow(dead_code)]
+    fn get_pool(&self, address: &Pubkey) -> Option<PoolCache> {
         self.pools.get(address).map(|entry| entry.clone())
     }
 
@@ -368,11 +370,11 @@ impl Dex for RaydiumCpmm {
                     // Add to mint index
                     self.mint_index
                         .entry(pool.token_0_mint)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(pubkey);
                     self.mint_index
                         .entry(pool.token_1_mint)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(pubkey);
 
                     debug!(
@@ -468,11 +470,11 @@ impl Dex for RaydiumCpmm {
         // Update mint index
         self.mint_index
             .entry(token_0_mint)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(pool_pk);
         self.mint_index
             .entry(token_1_mint)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(pool_pk);
 
         Ok(())

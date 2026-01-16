@@ -351,6 +351,23 @@ impl CrossDexHandler {
                 );
                 return true;
             }
+            ("pumpfun", CachedPoolState::PumpFun(pf_state)) => {
+                // PumpFun bonding curve - cache the creator in the DEX connector
+                // The connector needs the creator to build swap instructions without RPC
+                if pf_state.creator != Pubkey::default() {
+                    // Try to downcast and cache the creator
+                    // Note: We can't directly access PumpFunDex through Arc<dyn Dex>
+                    // So we store the creator in a side map that we'll use later
+                    info!(
+                        pool = %pool_pk,
+                        dex = %dex,
+                        creator = %pf_state.creator,
+                        token_mint = %pf_state.token_mint,
+                        "PumpFun pool in cache with creator"
+                    );
+                    return true;
+                }
+            }
             _ => {
                 debug!(
                     pool = %pool_pk,
@@ -361,6 +378,12 @@ impl CrossDexHandler {
         }
 
         false
+    }
+
+    /// Get PumpFun creator from LivePoolCache for a bonding curve
+    /// Returns None if not found or not a PumpFun pool
+    fn get_pumpfun_creator_from_cache(&self, bonding_curve: &Pubkey) -> Option<Pubkey> {
+        self.pool_cache.as_ref()?.get_pumpfun_creator(bonding_curve)
     }
 
     /// Validate a cross-DEX arbitrage opportunity using INTENT DATA ONLY
@@ -909,6 +932,29 @@ impl CrossDexHandler {
             );
         }
 
+        // ====================================================================
+        // GEYSER-FIRST: Inject cached creators for PumpFun before building IX
+        // This eliminates RPC calls in build_swap_ix_async
+        // ====================================================================
+        let token_mint_pk = Pubkey::from_str(token_mint)
+            .map_err(|_| anyhow!("Invalid token mint: {}", token_mint))?;
+        
+        // For PumpFun bonding curve: derive bonding_curve and get creator from cache
+        if buy_dex == "pumpfun" {
+            let (bonding_curve, _) = crate::solana::dex::pumpfun::PumpFunDex::derive_bonding_curve_static(&token_mint_pk);
+            if let Some(creator) = self.get_pumpfun_creator_from_cache(&bonding_curve) {
+                buy_connector.cache_extra_data(
+                    &format!("creator:{}", token_mint),
+                    &creator.to_string(),
+                );
+                debug!(
+                    token_mint = %token_mint,
+                    creator = %creator,
+                    "Injected PumpFun creator from LivePoolCache for buy (GEYSER-FIRST)"
+                );
+            }
+        }
+
         // Use async build to support DEXes that need it (PumpFun, etc.)
         let buy_instructions = buy_connector
             .build_swap_ix_async(SOL_MINT, token_mint, buy_amount_in, buy_min_out)
@@ -967,6 +1013,24 @@ impl CrossDexHandler {
             }
         }
 
+        // ====================================================================
+        // GEYSER-FIRST: Inject cached creators for PumpFun SELL before building IX
+        // ====================================================================
+        if sell_dex == "pumpfun" {
+            let (bonding_curve, _) = crate::solana::dex::pumpfun::PumpFunDex::derive_bonding_curve_static(&token_mint_pk);
+            if let Some(creator) = self.get_pumpfun_creator_from_cache(&bonding_curve) {
+                sell_connector.cache_extra_data(
+                    &format!("creator:{}", token_mint),
+                    &creator.to_string(),
+                );
+                debug!(
+                    token_mint = %token_mint,
+                    creator = %creator,
+                    "Injected PumpFun creator from LivePoolCache for sell (GEYSER-FIRST)"
+                );
+            }
+        }
+
         // IMPORTANT: sell the guaranteed minimum tokens (buy_min_out), not the optimistic
         // quoted output. Otherwise the second leg may fail due to insufficient token balance.
         let sell_instructions = sell_connector
@@ -978,7 +1042,7 @@ impl CrossDexHandler {
         // - 2x CreateIdempotent ATA (~20k CU each)
         // - 1x System Transfer (~300 CU)
         // - 1x SyncNative (~1k CU)
-        let ata_count = ata_creation_instructions.len();
+        let _ata_count = ata_creation_instructions.len();
         let mut combined_buy_instructions = ata_creation_instructions;
         combined_buy_instructions.extend(buy_instructions);
 

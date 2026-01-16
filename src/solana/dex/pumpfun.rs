@@ -4,6 +4,7 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use dashmap::DashMap;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -161,6 +162,10 @@ pub struct PumpFunDex {
     event_authority: Pubkey,
     /// User authority (wallet)
     user_authority: Option<Pubkey>,
+    /// Cached creators for bonding curves (populated from LivePoolCache)
+    /// Key: token_mint, Value: creator pubkey
+    /// This eliminates the need for RPC calls to fetch creator during build_swap_ix
+    cached_creators: DashMap<Pubkey, Pubkey>,
 }
 
 impl PumpFunDex {
@@ -172,6 +177,7 @@ impl PumpFunDex {
             fee_recipient: Pubkey::from_str(PUMPFUN_FEE_RECIPIENT)?,
             event_authority: Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY)?,
             user_authority: None,
+            cached_creators: DashMap::new(),
         })
     }
 
@@ -179,9 +185,27 @@ impl PumpFunDex {
         self.user_authority = Some(authority);
     }
 
+    /// Cache a creator for a token mint (called from LivePoolCache/cross_dex_handler)
+    /// This eliminates the need for RPC calls during build_swap_ix
+    pub fn cache_creator(&self, token_mint: Pubkey, creator: Pubkey) {
+        self.cached_creators.insert(token_mint, creator);
+    }
+
+    /// Get cached creator for a token mint
+    pub fn get_cached_creator(&self, token_mint: &Pubkey) -> Option<Pubkey> {
+        self.cached_creators.get(token_mint).map(|r| *r)
+    }
+
     /// Derive bonding curve PDA for a token mint
     pub fn derive_bonding_curve(&self, token_mint: &Pubkey) -> (Pubkey, u8) {
-        Pubkey::find_program_address(&[b"bonding-curve", token_mint.as_ref()], &self.program_id)
+        Self::derive_bonding_curve_static(token_mint)
+    }
+
+    /// Static version of derive_bonding_curve (can be called without instance)
+    /// Useful for cross_dex_handler to derive bonding curve before injecting creator
+    pub fn derive_bonding_curve_static(token_mint: &Pubkey) -> (Pubkey, u8) {
+        let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).expect("valid pumpfun program id");
+        Pubkey::find_program_address(&[b"bonding-curve", token_mint.as_ref()], &program_id)
     }
 
     /// Derive associated bonding curve token account (holds real token reserves).
@@ -205,22 +229,12 @@ impl PumpFunDex {
         (Pubkey::new_from_array(ata_spl.to_bytes()), 0)
     }
 
-    async fn token_program_for_mint(&self, token_mint: &Pubkey) -> Result<Pubkey> {
-        let acct = self.rpc.get_account_retry(token_mint).await?;
-        let owner = acct.owner;
-
-        let spl_token = Pubkey::new_from_array(spl_token::id().to_bytes());
-        let spl_token_2022 = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
-
-        if owner == spl_token {
-            Ok(spl_token)
-        } else if owner == spl_token_2022 {
-            Ok(spl_token_2022)
-        } else {
-            Err(anyhow!(
-                "pump.fun: mint owner is neither spl-token nor spl-token-2022: {owner}"
-            ))
-        }
+    /// Returns the token program for a pump.fun mint.
+    /// Pump.fun tokens are ALWAYS SPL Token (never Token-2022).
+    /// This is a synchronous function - no RPC needed.
+    fn token_program_for_mint(&self, _token_mint: &Pubkey) -> Pubkey {
+        // Pump.fun tokens are ALWAYS SPL Token - this is a protocol invariant
+        Pubkey::new_from_array(spl_token::id().to_bytes())
     }
 
     /// Derive creator vault PDA (NEW in Pump.fun protocol update)
@@ -827,6 +841,22 @@ impl Dex for PumpFunDex {
         Vec::new()
     }
 
+    /// Cache extra data for building swap instructions (GEYSER-FIRST).
+    /// For PumpFun, we cache the creator for a token mint.
+    /// Format: key = "creator:<token_mint>", value = "<creator_pubkey>"
+    fn cache_extra_data(&self, key: &str, value: &str) {
+        if let Some(mint_str) = key.strip_prefix("creator:") {
+            if let (Ok(mint), Ok(creator)) = (Pubkey::from_str(mint_str), Pubkey::from_str(value)) {
+                self.cache_creator(mint, creator);
+                debug!(
+                    token_mint = %mint,
+                    creator = %creator,
+                    "PumpFun: cached creator from Geyser data"
+                );
+            }
+        }
+    }
+
     /// Override the async build for PumpFun - routes to the real async implementation
     async fn build_swap_ix_async(
         &self,
@@ -895,32 +925,42 @@ impl PumpFunDex {
         };
 
         let token_mint = Pubkey::from_str(token_mint_str)?;
-        let token_program_sdk = self.token_program_for_mint(&token_mint).await?;
+        let token_program_sdk = self.token_program_for_mint(&token_mint);
         let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
         let (associated_bonding_curve, _bump2) =
             self.derive_associated_bonding_curve(&bonding_curve, &token_mint, &token_program_sdk);
 
-        // Prefer creator from a trusted Geyser event (strategy-provided).
-        // Fallback: parse creator from the on-chain bonding curve state.
-        let creator = match fallback_creator {
-            Some(c) => {
-                info!(
-                    token_mint = %token_mint_str,
-                    creator = %c,
-                    "pump.fun: using creator from producer"
-                );
-                c
-            }
-            None => {
-                let acct = self.rpc.get_account_retry(&bonding_curve).await?;
-                let state = BondingCurveState::parse(&acct.data)?;
-                info!(
-                    token_mint = %token_mint_str,
-                    creator = %state.creator,
-                    "pump.fun: parsed creator from bonding curve state"
-                );
-                state.creator
-            }
+        // Creator resolution priority (GEYSER-FIRST):
+        // 1. Explicit fallback_creator (from Geyser event/intent)
+        // 2. Cached creator (from LivePoolCache via cache_creator())
+        // 3. RPC fallback (DEPRECATED - should not happen in production)
+        let creator = if let Some(c) = fallback_creator {
+            debug!(
+                token_mint = %token_mint_str,
+                creator = %c,
+                "pump.fun: using creator from producer"
+            );
+            c
+        } else if let Some(c) = self.get_cached_creator(&token_mint) {
+            debug!(
+                token_mint = %token_mint_str,
+                creator = %c,
+                "pump.fun: using creator from cache (GEYSER-FIRST)"
+            );
+            c
+        } else {
+            // RPC FALLBACK - This path should NOT be hit in production!
+            // If we're here, it means the LivePoolCache did not have the creator.
+            warn!(
+                token_mint = %token_mint_str,
+                bonding_curve = %bonding_curve,
+                "pump.fun: FALLBACK to RPC for creator - this indicates a cache miss!"
+            );
+            let acct = self.rpc.get_account_retry(&bonding_curve).await?;
+            let state = BondingCurveState::parse(&acct.data)?;
+            // Cache for future use
+            self.cached_creators.insert(token_mint, state.creator);
+            state.creator
         };
 
         let user = self

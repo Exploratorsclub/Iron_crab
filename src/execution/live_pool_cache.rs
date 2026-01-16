@@ -154,6 +154,8 @@ pub struct PumpFunState {
     pub real_sol_reserves: u64,
     pub real_token_reserves: u64,
     pub complete: bool,
+    /// Creator of the token (parsed from bonding curve account at offset 49-80)
+    pub creator: Pubkey,
 }
 
 /// PumpFun AMM (PumpSwap) cached state
@@ -490,6 +492,21 @@ impl LivePoolCache {
         self.mint_programs.get(mint).map(|r| *r)
     }
 
+    /// Get the creator from a PumpFun bonding curve cached state
+    /// Returns None if the bonding curve is not cached or is not a PumpFun pool
+    /// This is the GEYSER-FIRST source of truth - NO RPC calls needed!
+    pub fn get_pumpfun_creator(&self, bonding_curve: &Pubkey) -> Option<Pubkey> {
+        if let Some(entry) = self.pools.get(bonding_curve) {
+            if let CachedPoolState::PumpFun(state) = &entry.state {
+                // Only return if creator is not default (was actually parsed)
+                if state.creator != Pubkey::default() {
+                    return Some(state.creator);
+                }
+            }
+        }
+        None
+    }
+
     /// Update token program for a mint (called when Geyser receives mint account update)
     /// The owner of a mint account IS the token program (SPL Token or Token-2022)
     pub fn update_mint_program(&self, mint: &Pubkey, token_program: Pubkey) {
@@ -682,9 +699,9 @@ fn parse_meteora_dlmm(data: &[u8]) -> Option<CachedPoolState> {
 }
 
 fn parse_pumpfun_bonding(data: &[u8]) -> Option<CachedPoolState> {
-    // PumpFun bonding curve: varies, but key fields at known offsets
+    // PumpFun bonding curve: 81+ bytes
     // Layout: 8 bytes discriminator + fields
-    if data.len() < 128 {
+    if data.len() < 81 {
         return None;
     }
 
@@ -700,17 +717,16 @@ fn parse_pumpfun_bonding(data: &[u8]) -> Option<CachedPoolState> {
     // Offset 48: complete (bool)
     let complete = data.get(48).map(|&b| b != 0).unwrap_or(false);
 
-    // Offset 49: mint (Pubkey)
-    let token_mint = if data.len() >= 81 {
-        Pubkey::new_from_array(data[49..81].try_into().ok()?)
-    } else {
-        return None;
-    };
+    // Offset 49: creator (Pubkey, 32 bytes) - BEFORE mint in bonding curve layout
+    let creator = Pubkey::new_from_array(data[49..81].try_into().ok()?);
+
+    // NOTE: token_mint is NOT in bonding curve data - it's derived from the bonding_curve pubkey
+    // The caller must set token_mint and bonding_curve after parsing
 
     // Bonding curve and associated are derived PDAs, we don't have them here
     // They need to be provided from the caller or derived
     Some(CachedPoolState::PumpFun(PumpFunState {
-        token_mint,
+        token_mint: Pubkey::default(), // Will be set by caller from bonding_curve derivation
         bonding_curve: Pubkey::default(), // Will be set by caller
         associated_bonding_curve: Pubkey::default(),
         virtual_sol_reserves,
@@ -718,6 +734,7 @@ fn parse_pumpfun_bonding(data: &[u8]) -> Option<CachedPoolState> {
         real_sol_reserves,
         real_token_reserves,
         complete,
+        creator,
     }))
 }
 

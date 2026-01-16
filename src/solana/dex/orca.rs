@@ -21,6 +21,7 @@ use super::orca_whirlpool_layout as layout;
 use dashmap::DashMap;
 use solana_sdk::pubkey::Pubkey;
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct OrcaPool {
     base_mint: Pubkey,
@@ -250,6 +251,7 @@ impl Orca {
     /// Using the wrong tick leads to wrong tick array calculation → Error 6023.
     ///
     /// If we can't fetch the pool, we fall back to the cached tick (or 0).
+    #[allow(dead_code)]
     async fn fetch_current_tick(&self, pool_id: &Pubkey, fallback_tick: Option<i32>) -> i32 {
         let fallback = fallback_tick.unwrap_or(0);
         

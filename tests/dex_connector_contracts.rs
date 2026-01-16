@@ -7,6 +7,8 @@
 //!
 //! These tests use mock/simulated pools to verify connector logic without RPC.
 
+#![allow(unexpected_cfgs)]
+
 use ironcrab::backtest::market::{CfmAdapter, CfmPool, MarketAdapter};
 
 // ============================================================================

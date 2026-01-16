@@ -27,7 +27,7 @@ async fn test_cpmm_wsol_useless_pool() {
 
     let pools = cpmm.list_pools();
     println!("   ✅ Found {} CPMM pools", pools.len());
-    assert!(pools.len() > 0, "Should find at least one CPMM pool");
+    assert!(!pools.is_empty(), "Should find at least one CPMM pool");
 
     // Step 2: Test quote (WSOL -> USELESS) to verify pool exists and is functional
     let test_pool_id = "Q2sPHPdUWFMg7M7wwrQKLrn619cAucfRsmhVJffodSp";
