@@ -660,7 +660,17 @@ impl CrossDexHandler {
             // Try to get fresh quote from LivePoolCache
             let buy_pool_pk = Pubkey::from_str(&pools[0]).ok();
             let fresh_min_out = buy_pool_pk.and_then(|pk| {
-                let (state, _slot, age_ms) = cache.get_with_metadata(&pk)?;
+                let cache_result = cache.get_with_metadata(&pk);
+                if cache_result.is_none() {
+                    debug!(
+                        pool = %pk,
+                        buy_dex = %buy_dex,
+                        cache_size = cache.len(),
+                        "LivePoolCache MISS - pool not found in cache, using validation quote"
+                    );
+                    return None;
+                }
+                let (state, _slot, age_ms) = cache_result?;
                 
                 // Don't use stale data (>10 seconds)
                 if age_ms > 10_000 {
