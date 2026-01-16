@@ -1218,6 +1218,14 @@ async fn run_geyser_loop(
                     if let Some(bin_step) = pool_event.bin_step {
                         accounts.push(format!("bin_step:{}", bin_step));
                     }
+                    // Orca Whirlpool: add tick_current_index and tick_spacing as tagged values
+                    // Format: "tick_current_index:<value>" and "tick_spacing:<value>"
+                    if let Some(tick) = pool_event.tick_current_index {
+                        accounts.push(format!("tick_current_index:{}", tick));
+                    }
+                    if let Some(spacing) = pool_event.tick_spacing {
+                        accounts.push(format!("tick_spacing:{}", spacing));
+                    }
 
                     let accounts_event = MarketEvent::new(
                         "market-data",

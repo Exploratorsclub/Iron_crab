@@ -20,6 +20,11 @@ All notable changes to this project will be documented in this file.
 - Token-2022 ATA creation failures in cross-DEX arbitrage (was defaulting to SPL Token)
 - Meteora DLMM swaps no longer require RPC calls during execution
 - **Meteora DLMM `bin_array_bitmap_extension` error (3007)**: Fixed "AccountOwnedByWrongProgram" errors by using `program_id` as placeholder for optional bitmap extension (per official Meteora SDK pattern)
+- **Orca Whirlpool UNSUPPORTED_INTENT errors**: Fixed missing `tick_current_index` and `tick_spacing` in Orca pools:
+  - Added `tick_current_index: Option<i32>` and `tick_spacing: Option<u16>` fields to `PoolData` and `PoolDiscoveryEvent` structs
+  - `parse_orca_pool()` now extracts these values from Whirlpool account data
+  - `market_data` now includes Orca tick fields in `DexPoolAccounts` events (format: `tick_current_index:<value>`, `tick_spacing:<value>`)
+  - Enables zero-RPC Orca swap building via LivePoolCache
 
 ## [0.3.1-dev] - 2025-09-04
 ### Added

@@ -189,6 +189,8 @@ impl GeyserPoolDiscovery {
             discovered_at_ms,
             active_id: pool_data.active_id,
             bin_step: pool_data.bin_step,
+            tick_current_index: pool_data.tick_current_index,
+            tick_spacing: pool_data.tick_spacing,
         })
     }
 
@@ -294,6 +296,8 @@ impl GeyserPoolDiscovery {
                     discovered_at_ms,
                     active_id: None,
                     bin_step: None,
+                    tick_current_index: None,
+                    tick_spacing: None,
                 })
             }
             DexType::RaydiumAmmV4
@@ -365,6 +369,8 @@ impl GeyserPoolDiscovery {
             pc_vault: Some(pc_vault),
             active_id: None,
             bin_step: None,
+            tick_current_index: None,
+            tick_spacing: None,
         })
     }
 
@@ -439,6 +445,8 @@ impl GeyserPoolDiscovery {
             pc_vault: Some(pc_vault),
             active_id: None,
             bin_step: None,
+            tick_current_index: None,
+            tick_spacing: None,
         })
     }
 
@@ -514,6 +522,8 @@ impl GeyserPoolDiscovery {
             pc_vault: Some(pc_vault),
             active_id: Some(parsed.active_id),
             bin_step: Some(parsed.bin_step),
+            tick_current_index: None,
+            tick_spacing: None,
         })
     }
 
@@ -545,6 +555,9 @@ impl GeyserPoolDiscovery {
             pc_vault: Some(parsed.token_vault_b),
             active_id: None,
             bin_step: None,
+            // Orca-specific: tick_current_index and tick_spacing from parsed whirlpool
+            tick_current_index: Some(parsed.tick_current_index),
+            tick_spacing: Some(parsed.tick_spacing),
         })
     }
 
@@ -620,6 +633,8 @@ impl GeyserPoolDiscovery {
             pc_vault: None,
             active_id: None,
             bin_step: None,
+            tick_current_index: None,
+            tick_spacing: None,
         })
     }
 }
@@ -668,6 +683,10 @@ pub struct PoolDiscoveryEvent {
     pub active_id: Option<i32>,
     /// Meteora DLMM: bin step (price step between bins in bps)
     pub bin_step: Option<u16>,
+    /// Orca Whirlpool: tick_current_index (current price tick)
+    pub tick_current_index: Option<i32>,
+    /// Orca Whirlpool: tick_spacing
+    pub tick_spacing: Option<u16>,
 }
 
 struct PoolData {
@@ -682,4 +701,8 @@ struct PoolData {
     active_id: Option<i32>,
     /// Meteora DLMM: bin step (price step between bins in bps)
     bin_step: Option<u16>,
+    /// Orca Whirlpool: tick_current_index (current price tick)
+    tick_current_index: Option<i32>,
+    /// Orca Whirlpool: tick_spacing
+    tick_spacing: Option<u16>,
 }

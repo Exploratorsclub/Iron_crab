@@ -137,9 +137,9 @@ fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Res
 ```
 
 **Hinweise:**
-- Meteora DLMM: bin_step/active_id nicht in DexPoolAccounts, verwendet Defaults
+- Meteora DLMM: ✅ bin_step/active_id jetzt in DexPoolAccounts via `active_id:<value>`, `bin_step:<value>` Format
 - Raydium AMM V4: Serum-Accounts nicht in DexPoolAccounts, IX-Building braucht ggf. RPC
-- Orca: tick_spacing/tick_current_index nicht in DexPoolAccounts
+- Orca: ✅ tick_spacing/tick_current_index jetzt in DexPoolAccounts via `tick_current_index:<value>`, `tick_spacing:<value>` Format
 - pump_amm: vollständig (12-14 Accounts aus Trade-TX)
 
 **Erwartetes Ergebnis:** `cross_dex_handler.rs` kann `set_pool_from_accounts()` für alle DEXes aufrufen ✅
