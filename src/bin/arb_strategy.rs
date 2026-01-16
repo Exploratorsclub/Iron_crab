@@ -206,6 +206,8 @@ struct TokenArbTracker {
     /// Pool accounts by pool_address (from DexPoolAccounts events)
     /// Key: pool_address, Value: accounts vec
     pool_accounts: HashMap<String, Vec<String>>,
+    /// Token program for base_mint (SPL Token or Token-2022), from TokenMintInfo event
+    token_program: Option<String>,
     /// Last intent generated time
     last_intent_time: Option<Instant>,
 }
@@ -216,6 +218,7 @@ impl TokenArbTracker {
             base_mint: base_mint.to_string(),
             pools_by_dex: HashMap::new(),
             pool_accounts: HashMap::new(),
+            token_program: None,
             last_intent_time: None,
         }
     }
@@ -228,6 +231,11 @@ impl TokenArbTracker {
     /// Get DEX pool accounts for a pool
     fn get_pool_accounts(&self, pool_address: &str) -> Option<&Vec<String>> {
         self.pool_accounts.get(pool_address)
+    }
+
+    /// Set token program (from TokenMintInfo event)
+    fn set_token_program(&mut self, token_program: &str) {
+        self.token_program = Some(token_program.to_string());
     }
 
     /// Add or update a pool for this token
@@ -736,6 +744,32 @@ impl ArbContext {
         }
     }
 
+    /// Handle TokenMintInfo event - cache token program (SPL Token or Token-2022)
+    /// This is passed through to execution-engine in TradeIntent.resources.token_program
+    /// so execution-engine can create ATAs with the correct program.
+    fn handle_token_mint_info(&self, mint: &str, token_program: &str) {
+        let mut trackers = self.trackers.write();
+        if let Some(tracker) = trackers.get_mut(mint) {
+            tracker.set_token_program(token_program);
+            debug!(
+                mint = %mint,
+                token_program = %token_program,
+                is_token_2022 = token_program.contains("TokenzQd"),
+                "TokenMintInfo: token program cached in tracker"
+            );
+        } else {
+            // Create tracker if it doesn't exist yet (we may receive TokenMintInfo before pool events)
+            let mut tracker = TokenArbTracker::new(mint);
+            tracker.set_token_program(token_program);
+            trackers.insert(mint.to_string(), tracker);
+            debug!(
+                mint = %mint,
+                token_program = %token_program,
+                "TokenMintInfo: new tracker created with token program"
+            );
+        }
+    }
+
     /// Handle PoolStateUpdate event - cache vault balances from Geyser
     /// This eliminates RPC calls to fetch vault balances during quoting.
     fn handle_pool_state_update(
@@ -885,6 +919,7 @@ impl ArbContext {
                 base_mint: mint.to_string(),
                 pools_by_dex: HashMap::new(),
                 pool_accounts: HashMap::new(),
+                token_program: None,
                 last_intent_time: None,
             }
         });
@@ -962,6 +997,12 @@ impl ArbContext {
             (None, None)
         }
     }
+
+    /// Get token program for a mint (from TokenMintInfo cache)
+    fn get_token_program_for_mint(&self, mint: &str) -> Option<String> {
+        let trackers = self.trackers.read();
+        trackers.get(mint).and_then(|t| t.token_program.clone())
+    }
 }
 
 // ============================================================================
@@ -1025,11 +1066,16 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     all_accounts.push(format!("sell_pool_accounts_start:{}", sell_accts.len()));
     all_accounts.extend(sell_accts.iter().cloned());
 
+    // Get token program from cache (from TokenMintInfo event)
+    // This avoids IncorrectProgramId errors when creating ATAs for Token-2022 tokens
+    let token_program = ctx.get_token_program_for_mint(&opp.base_mint);
+    
     let resources = TradeResources {
         input_mint: "So11111111111111111111111111111111111111112".to_string(),
         output_mint: opp.base_mint.clone(),
         pools: vec![opp.buy_pool.clone(), opp.sell_pool.clone()],
         accounts: all_accounts,
+        token_program: token_program.clone(),
     };
 
     // Both pools have accounts - no RPC fallback needed
@@ -1040,6 +1086,7 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
         sell_dex = %opp.sell_dex,
         buy_accounts_len = buy_accts.len(),
         sell_accounts_len = sell_accts.len(),
+        token_program = ?token_program,
         "Arb intent has complete pool accounts (GEYSER-FIRST compliant)"
     );
 
@@ -1481,6 +1528,16 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             update_slot,
         } => {
             ctx.handle_bin_array_update(pool_address, *bin_array_index, bins.clone(), *update_slot);
+            None
+        }
+
+        // Handle TokenMintInfo - cache token program (SPL Token vs Token-2022) for ATA creation
+        MarketEventKind::TokenMintInfo {
+            mint,
+            token_program,
+            ..
+        } => {
+            ctx.handle_token_mint_info(mint, token_program);
             None
         }
 

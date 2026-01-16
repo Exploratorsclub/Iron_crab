@@ -1,6 +1,6 @@
-# IronCrab – Solana‑First Tradingbot (Rust)
+﻿# IronCrab – Solana‑First Tradingbot (Rust)
 
-Version: **0.3.1-dev** (Agave / Solana 3.x)
+Version: **0.3.2-dev** (Agave / Solana 3.x)
 
 Dieses Repository befindet sich in einem **Debuggable-First Architektur-Umbau** (Multi-Prozess, deterministisch, intent-only). Der Validator (Agave 3.x) läuft co-located für minimale Latenz.
 
@@ -15,8 +15,42 @@ Dieses Repository befindet sich in einem **Debuggable-First Architektur-Umbau** 
 - **Single-Signer**: Nur die Execution Engine signiert/sendet.
 - **Intent-only**: Strategien/Worker erzeugen nur `TradeIntent`s.
 - **Simulate-gated**: Simulation-fail ⇒ niemals senden (insb. Arbitrage).
-- **Decision Records**: Jede Entscheidung ist forensisch nachvollziehbar.
+- **Decision Records**: Jede Entscheidung ist forensisch nachvollziehbar.- **GEYSER-FIRST**: Keine RPC-Calls im Hot Path – alle Daten aus Geyser.
 
+## GEYSER-FIRST Architecture
+
+**Kernprinzip:** Alle Echtzeit-Daten kommen aus Geyser gRPC (<10ms Latenz). RPC ist nur Fallback für historische Daten oder Bootstrap.
+
+### Token Program Detection (Token-2022 Support)
+
+Token-Programm (SPL Token vs Token-2022) wird über Geyser erkannt und im Intent mitgesendet:
+
+```
+market-data (Geyser)
+    → TokenMintInfo Event (token_program = owner of mint account)
+    → NATS
+    → arb-strategy (speichert in TokenArbTracker)
+    → TradeIntent.resources.token_program
+    → NATS
+    → execution-engine (nutzt für ATA-Erstellung)
+```
+
+**Priority für Token Program Detection:**
+1. Intent-provided (`TradeResources.token_program`) – höchste Priorität
+2. LivePoolCache (Geyser-basiert)
+3. DEX hint (pump.fun → immer SPL Token)
+4. Default: SPL Token
+
+### DEX-spezifische GEYSER-FIRST Implementation
+
+| DEX | Discovery | Pool State | Swaps | Status |
+|-----|-----------|------------|-------|--------|
+| Raydium AMM | Geyser Account | Geyser Account | Sync | ✅ |
+| Raydium CPMM | Geyser Account | Geyser Account | Sync | ✅ |
+| Orca Whirlpool | Geyser Account | Geyser Account | Sync | ✅ |
+| Meteora DLMM | Geyser Account | Geyser + PDA derivation | Sync (bin arrays via PDA) | ✅ |
+| PumpFun | Geyser TX | Geyser TX | Sync | ✅ |
+| PumpSwap | Geyser TX | Geyser Account | Sync | ✅ |
 ## Target Architecture (High-Level)
 
 Kernaussage: Kein „klassischer Sniper“ (kein „alle neuen Mints sofort kaufen“). Stattdessen: Data Plane lädt/normalisiert Markt-Daten einmal; Momentum-Policy erzeugt Intents; Execution Engine führt deterministisch aus.

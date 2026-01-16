@@ -171,6 +171,7 @@ fn create_test_intent(seq: u64, regime: TradingRegime, capital_lamports: u64) ->
             output_mint: format!("TestToken{:03}", seq % 100),
             pools: vec![format!("Pool{:03}", seq % 50)],
             accounts: vec![],
+            token_program: None,
         },
         100,
         200,

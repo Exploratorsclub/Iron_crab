@@ -3468,6 +3468,7 @@ async fn generate_and_publish_buy_intent(
             output_mint: signal.mint.to_string(),
             pools: vec![signal.pool.to_string()],
             accounts: dex_accounts,
+            token_program: None, // Momentum-bot doesn't need Token-2022 support yet
         },
         50, // Expected ROI: 0.5%
         max_slippage,
@@ -4271,6 +4272,7 @@ async fn generate_and_publish_exit_intent(
                     Vec::new()
                 }
             },
+            token_program: None, // Momentum-bot doesn't need Token-2022 support yet
         },
         0, // No expected ROI for exits
         max_slippage,

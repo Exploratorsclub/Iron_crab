@@ -175,6 +175,7 @@ fn test_trade_intent_required_fields() {
             output_mint: "TOKEN".to_string(),
             pools: vec!["Pool1".to_string()],
             accounts: vec![],
+            token_program: None,
         },
         50,  // expected_roi_bps
         100, // max_slippage_bps

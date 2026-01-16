@@ -827,6 +827,7 @@ mod tests {
                 output_mint: "out".to_string(),
                 pools: vec!["pool".to_string()],
                 accounts: vec![],
+                token_program: None,
             },
             0,
             0,

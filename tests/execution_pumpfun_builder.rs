@@ -96,6 +96,7 @@ async fn test_tx_builder_supports_pumpfun_sell_pure_derivation() {
             output_mint: sol_mint.to_string(),
             pools: vec!["pumpfun".to_string()],
             accounts: vec![],
+            token_program: None,
         },
         0,
         500,

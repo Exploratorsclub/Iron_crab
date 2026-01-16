@@ -369,6 +369,7 @@ async fn main() -> anyhow::Result<()> {
             output_mint: SOL_MINT.to_string(),
             pools: vec![],
             accounts: vec![task.token_account.to_string()],
+            token_program: Some(task.token_program.to_string()),
         };
 
         let mut min_out_sol: Option<u64> = None;

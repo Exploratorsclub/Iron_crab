@@ -719,6 +719,13 @@ pub struct TradeResources {
     pub pools: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub accounts: Vec<String>,
+    /// Token program for output_mint (SPL Token or Token-2022).
+    /// If set, execution-engine uses this directly (NO cache lookup needed).
+    /// Format: base58-encoded pubkey string.
+    /// - SPL Token: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+    /// - Token-2022: "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub token_program: Option<String>,
 }
 
 // ============================================================================
@@ -886,6 +893,7 @@ impl TradeIntent {
                 output_mint,
                 pools: vec![],
                 accounts: vec![],
+                token_program: None,
             },
             expected_roi_bps,
             max_slippage_bps,
@@ -1454,6 +1462,7 @@ mod tests {
                 output_mint: "TokenMint123".to_string(),
                 pools: vec!["Pool123".to_string()],
                 accounts: vec![],
+                token_program: None,
             },
             50,  // 0.5% expected ROI
             100, // 1% max slippage

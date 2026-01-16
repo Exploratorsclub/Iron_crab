@@ -206,14 +206,44 @@ Strategies (momentum-bot, arb-strategy) receive event
 
 RPC should ONLY be used for:
 1. **Token Metadata**: Symbol, Name, Decimals (not available in Geyser)
-2. **Vault Balances**: If not subscribed via Geyser Account Updates
-3. **Historical Backfill**: Loading past data for analysis
-4. **Emergency Fallback**: If Geyser stream disconnects
+2. **Historical Backfill**: Loading past data for analysis
+3. **Emergency Fallback**: If Geyser stream disconnects
 
 **Never use RPC for:**
 - Pool discovery (use `GeyserPoolDiscovery`)
 - Real-time pool updates (use Geyser Account Updates)
 - Transaction monitoring (use Geyser TX Updates)
+- Token program detection (use `TokenMintInfo` events or mint account owner)
+- Vault balances (use Geyser Account Updates)
+
+### 4.6 Token Program Detection (Token-2022 Support)
+
+**Problem:** Token-2022 tokens require a different token program ID for ATA creation.
+Using the wrong program results in `IncorrectProgramId` errors.
+
+**Solution:** Token program is detected via Geyser and passed through the Intent:
+
+```
+Geyser Account Update (Mint account, 82 bytes)
+    ↓
+account.owner = Token Program (SPL or Token-2022)
+    ↓
+cache_geyser.rs calls cache.update_mint_program(&mint, owner)
+    ↓
+market-data publishes MarketEvent::TokenMintInfo { token_program, ... }
+    ↓
+arb-strategy stores in TokenArbTracker.token_program
+    ↓
+create_arb_intent() sets TradeIntent.resources.token_program
+    ↓
+execution-engine uses for ATA creation (no cache lookup needed!)
+```
+
+**Priority for Token Program Detection (in cross_dex_handler):**
+1. `TradeIntent.resources.token_program` (from strategy, highest trust)
+2. `LivePoolCache.get_mint_program()` (Geyser-populated)
+3. DEX hint (pump.fun/pumpfun → always SPL Token)
+4. Default: SPL Token (most common case)
 
 ---
 

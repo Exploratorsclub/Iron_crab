@@ -1151,6 +1151,7 @@ impl ExecutionContext {
                 output_mint: sol_mint.to_string(),
                 pools: vec![],
                 accounts: vec![ta_pubkey.to_string()],
+                token_program: Some(token_program.to_string()),
             };
 
             let mut min_out_sol: Option<u64> = None;
@@ -3104,6 +3105,7 @@ fn create_test_intent(run_id: &str) -> TradeIntent {
             output_mint: "TestToken123".to_string(),
             pools: vec!["TestPool456".to_string()],
             accounts: vec![],
+            token_program: None, // Test tokens use SPL Token by default
         },
         100, // 1% expected ROI
         200, // 2% max slippage
