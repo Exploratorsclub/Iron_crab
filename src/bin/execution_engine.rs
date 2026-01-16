@@ -2778,12 +2778,24 @@ async fn main() -> Result<()> {
                 geyser_url = %geyser_url,
                 "Spawning LivePoolCache Geyser feeder task"
             );
+
+            // Subscribe to vault updates so Geyser can resubscribe when new vaults are discovered
+            let vault_updates_rx = cache.subscribe_vault_updates();
+            info!(
+                initial_vaults = vault_updates_rx.borrow().len(),
+                "Subscribed to vault update notifications"
+            );
+
             let config = CacheGeyserConfig {
                 geyser_url,
                 subscribe_vaults: true,
                 vault_chunk_size: 500,
             };
-            Some(spawn_cache_geyser_task(config, cache.clone(), None))
+            Some(spawn_cache_geyser_task(
+                config,
+                cache.clone(),
+                Some(vault_updates_rx),
+            ))
         } else {
             None
         }

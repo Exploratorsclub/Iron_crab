@@ -4,6 +4,12 @@
 //! The goal is to eliminate all RPC calls from the TX-building hot path, reducing
 //! latency from 300-700ms to <50ms.
 //!
+//! # Vault Subscription
+//!
+//! The cache tracks vault accounts and notifies subscribers when new vaults are discovered.
+//! This is necessary because vault accounts are SPL Token accounts owned by the Token Program,
+//! not the DEX program, so they need explicit subscription in Geyser.
+//!
 //! # Architecture
 //!
 //! ```text
@@ -26,10 +32,12 @@
 //! - PumpFun AMM (PumpSwap): reserves, pool accounts
 
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::watch;
 
 // Re-export parsers
 use crate::solana::dex::meteora_dlmm_layout::DlmmPool;
@@ -259,6 +267,13 @@ pub struct LivePoolCache {
 
     /// Max age before considering entry stale (default: 10 seconds)
     max_age_ms: u64,
+
+    /// Watch channel sender for vault list updates
+    /// Triggered when new vaults are discovered so Geyser can resubscribe
+    vault_update_tx: Mutex<Option<watch::Sender<Vec<Pubkey>>>>,
+
+    /// Count of vaults at last notification (to avoid spamming)
+    last_notified_vault_count: AtomicU64,
 }
 
 /// Which vault position (A/B or X/Y or 0/1) this vault represents
@@ -285,6 +300,8 @@ impl LivePoolCache {
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             max_age_ms: 10_000, // 10 seconds default
+            vault_update_tx: Mutex::new(None),
+            last_notified_vault_count: AtomicU64::new(0),
         }
     }
 
@@ -426,6 +443,9 @@ impl LivePoolCache {
                 // No vault accounts to register
             }
         }
+
+        // Notify subscribers if vault count increased significantly
+        self.notify_vault_update();
     }
 
     // ========================================================================
@@ -441,6 +461,37 @@ impl LivePoolCache {
             tracing::debug!(evicted, "LivePoolCache: evicted stale entries");
         }
         evicted
+    }
+
+    /// Subscribe to vault list updates.
+    /// Returns a receiver that will be notified when new vaults are discovered.
+    /// The Geyser subscription task should use this to resubscribe when vaults change.
+    pub fn subscribe_vault_updates(&self) -> watch::Receiver<Vec<Pubkey>> {
+        let initial_vaults = self.get_tracked_vaults();
+        let (tx, rx) = watch::channel(initial_vaults);
+        *self.vault_update_tx.lock() = Some(tx);
+        rx
+    }
+
+    /// Notify vault update subscribers (called when new vaults are registered)
+    fn notify_vault_update(&self) {
+        let current_count = self.vault_to_pool.len() as u64;
+        let last_count = self.last_notified_vault_count.load(Ordering::Relaxed);
+
+        // Only notify if vault count increased by at least 10 (avoid spamming)
+        if current_count > last_count + 10 {
+            if let Some(tx) = self.vault_update_tx.lock().as_ref() {
+                let vaults = self.get_tracked_vaults();
+                let _ = tx.send(vaults);
+                self.last_notified_vault_count
+                    .store(current_count, Ordering::Relaxed);
+                tracing::debug!(
+                    old_count = last_count,
+                    new_count = current_count,
+                    "LivePoolCache: notified vault update subscribers"
+                );
+            }
+        }
     }
 
     /// Get all tracked vault addresses (for Geyser subscription)
