@@ -1,14 +1,19 @@
 //! Meteora DLMM swap instruction builder
 //!
-//! Builds swap instructions for Meteora's Dynamic Liquidity Market Maker.
-//! Handles bin array discovery and proper account ordering.
+//! GEYSER-FIRST: Builds swap instructions using only cached data from Geyser.
+//! NO RPC CALLS IN HOT PATH!
+//!
+//! The active_id and pool state come from LivePoolCache (Geyser subscription).
+//! Bin array PDAs are derived deterministically - if they don't exist,
+//! TX simulation will fail with a clear error.
 //!
 //! Key accounts:
-//! - `bin_array_bitmap_extension`: Optional PDA for pools with extended price range
+//! - `bin_array_bitmap_extension`: PDA for pools (always derived, no RPC check)
 //!   Seeds: ["bitmap_extension", lb_pair.as_ref()]
-//!   Required when pool liquidity spans > 512 bin arrays (rare for most pools)
+//! - `bin_arrays`: PDAs derived from active_id (3 arrays: active-1, active, active+1)
+//!   Seeds: ["bin_array", lb_pair.as_ref(), &index.to_le_bytes()]
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{ensure, Result};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -16,12 +21,8 @@ use solana_sdk::{
 use std::str::FromStr;
 use std::sync::Arc;
 
-use super::meteora_bin_array_layout::BinArray;
 use crate::solana::rpc::SolanaRpc;
-use solana_account_decoder::UiAccountEncoding;
-use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
-use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 /// SPL Token program ID
 pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -42,8 +43,9 @@ pub enum SwapDirection {
     YtoX,
 }
 
-/// Builder for Meteora DLMM swap instructions
+/// Builder for Meteora DLMM swap instructions (GEYSER-FIRST: no RPC in hot path)
 pub struct MeteoraDlmmSwapBuilder {
+    #[allow(dead_code)] // RPC kept for potential future use outside hot path
     rpc: Arc<SolanaRpc>,
 }
 
@@ -65,56 +67,43 @@ impl MeteoraDlmmSwapBuilder {
         Ok(pda)
     }
 
-    /// Fetch the CURRENT active_id from the pool account on-chain.
+    /// Derive bin array PDAs for a given active_id (GEYSER-FIRST: no RPC!)
     ///
-    /// This is critical because the Intent's active_id may be stale -
-    /// prices can move between Intent creation and execution.
-    /// Using the wrong active_id leads to fetching wrong bin_arrays → Error 3005.
+    /// Instead of checking which bin arrays exist via RPC, we simply derive
+    /// all potentially needed bin array PDAs and include them in the TX.
+    /// The Solana runtime will validate them. If a bin array doesn't exist,
+    /// the TX simulation will fail with a clear error - that's fine!
     ///
-    /// If we can't fetch the pool, we fall back to the Intent's active_id.
-    async fn fetch_current_active_id(&self, lb_pair: &Pubkey, fallback_active_id: i32) -> Result<i32> {
-        // LB Pair account layout: active_id is at offset 0x30 (48 decimal), 4 bytes i32 LE
-        const ACTIVE_ID_OFFSET: usize = 0x30;
-        const MIN_ACCOUNT_SIZE: usize = ACTIVE_ID_OFFSET + 4;
-
-        match self.rpc.get_account_retry(lb_pair).await {
-            Ok(account) => {
-                if account.data.len() >= MIN_ACCOUNT_SIZE {
-                    let active_id_bytes: [u8; 4] = account.data[ACTIVE_ID_OFFSET..ACTIVE_ID_OFFSET + 4]
-                        .try_into()
-                        .map_err(|_| anyhow!("Failed to read active_id bytes from pool"))?;
-                    let current_active_id = i32::from_le_bytes(active_id_bytes);
-                    
-                    if current_active_id != fallback_active_id {
-                        info!(
-                            pool = %lb_pair,
-                            intent_active_id = fallback_active_id,
-                            current_active_id = current_active_id,
-                            delta = current_active_id - fallback_active_id,
-                            "Meteora: active_id changed since Intent creation - using current on-chain value"
-                        );
-                    }
-                    
-                    Ok(current_active_id)
-                } else {
-                    warn!(
-                        pool = %lb_pair,
-                        account_size = account.data.len(),
-                        required_size = MIN_ACCOUNT_SIZE,
-                        "Meteora: pool account too small to read active_id, using Intent fallback"
-                    );
-                    Ok(fallback_active_id)
-                }
-            }
-            Err(e) => {
-                warn!(
-                    pool = %lb_pair,
-                    error = %e,
-                    "Meteora: failed to fetch pool for current active_id, using Intent fallback"
-                );
-                Ok(fallback_active_id)
-            }
+    /// Why this is correct:
+    /// - Geyser provides real-time active_id updates (faster than RPC)
+    /// - Bin array PDAs are deterministic (seed = [b"bin_array", lb_pair, index])
+    /// - Including a non-existent PDA causes simulation failure (not silent error)
+    /// - 3 bin arrays (active-1, active, active+1) cover typical swap ranges
+    pub fn derive_bin_arrays_for_active_id(lb_pair: &Pubkey, active_id: i32) -> Result<Vec<Pubkey>> {
+        let active_array_index = Self::bin_id_to_bin_array_index(active_id);
+        
+        // Include active + adjacent bin arrays to handle edge cases
+        let indices: Vec<i64> = vec![
+            active_array_index - 1,
+            active_array_index,
+            active_array_index + 1,
+        ];
+        
+        let mut bin_arrays = Vec::with_capacity(3);
+        for index in indices {
+            let pda = Self::derive_bin_array_pda(lb_pair, index)?;
+            bin_arrays.push(pda);
         }
+        
+        debug!(
+            pool = %lb_pair,
+            active_id = active_id,
+            active_array_index = active_array_index,
+            bin_arrays_count = bin_arrays.len(),
+            "Meteora: derived bin array PDAs (GEYSER-FIRST, no RPC)"
+        );
+        
+        Ok(bin_arrays)
     }
 
     /// Build a swap instruction for Meteora DLMM
@@ -237,10 +226,13 @@ impl MeteoraDlmmSwapBuilder {
 
     /// Build a swap instruction with bin array accounts
     ///
-    /// This is the full version that fetches and includes bin array accounts.
-    /// Required for production swaps.
+    /// GEYSER-FIRST: This method uses the active_id from the LivePoolCache (via Geyser)
+    /// and derives bin array PDAs deterministically. NO RPC CALLS IN HOT PATH!
+    ///
+    /// The active_id from Geyser is MORE CURRENT than RPC (push vs pull).
+    /// Bin arrays are derived PDAs - if one doesn't exist, simulation will fail cleanly.
     #[allow(clippy::too_many_arguments)]
-    pub async fn build_swap_with_bins(
+    pub fn build_swap_with_bins_sync(
         &self,
         lb_pair: &Pubkey,
         reserve_x: &Pubkey,
@@ -253,7 +245,7 @@ impl MeteoraDlmmSwapBuilder {
         amount_in: u64,
         min_amount_out: u64,
         direction: SwapDirection,
-        active_id_from_intent: i32,
+        active_id: i32,
         _bin_step: u16,
     ) -> Result<Instruction> {
         ensure!(amount_in > 0, "Amount in must be positive");
@@ -262,43 +254,21 @@ impl MeteoraDlmmSwapBuilder {
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
         let token_program = Pubkey::from_str(TOKEN_PROGRAM)?;
 
-        // CRITICAL: Fetch CURRENT active_id from pool on-chain!
-        // The Intent's active_id may be stale (price moved since Intent creation).
-        // If we use stale active_id, we fetch wrong bin_arrays → Error 3005.
-        let active_id = self.fetch_current_active_id(lb_pair, active_id_from_intent).await?;
-
-        // GEYSER-FIRST: Always derive and use the bitmap extension PDA.
-        // The bitmap_extension account at index 1 is ALWAYS REQUIRED by Meteora DLMM.
-        // Error 6036 (BitmapExtensionAccountIsNotProvided) occurs if we pass program_id.
-        // Even if the account doesn't exist on-chain, we must pass the valid PDA -
-        // the program will check validity and handle accordingly.
-        let bin_array_bitmap_extension = Self::derive_bitmap_extension_pda(lb_pair)
-            .unwrap_or(program_id);
-        
-        debug!(
-            pool = %lb_pair,
-            bitmap_extension = %bin_array_bitmap_extension,
-            "Meteora: using derived bitmap extension PDA (no RPC check)"
-        );
-
-        // Fetch bin arrays for this pool (direct PDA derivation)
-        let bin_arrays = self.fetch_bin_arrays_direct(lb_pair, active_id).await?;
-        
-        // Meteora DLMM requires at least 1 bin array to be present
-        if bin_arrays.is_empty() {
-            return Err(anyhow!(
-                "No bin arrays found for pool {} (active_id={}). \
-                 Bin array PDAs might not exist on-chain yet.",
-                lb_pair, active_id
-            ));
-        }
-
+        // GEYSER-FIRST: Use active_id directly from LivePoolCache (no RPC!)
+        // The Geyser subscription provides real-time updates - more current than RPC.
         debug!(
             pool = %lb_pair,
             active_id = active_id,
-            bin_arrays_count = bin_arrays.len(),
-            "Meteora: fetched bin arrays for swap"
+            "Meteora: using active_id from Geyser cache (GEYSER-FIRST)"
         );
+
+        // Derive bitmap extension PDA (no RPC check needed)
+        let bin_array_bitmap_extension = Self::derive_bitmap_extension_pda(lb_pair)
+            .unwrap_or(program_id);
+
+        // Derive bin array PDAs (GEYSER-FIRST: no RPC to check existence!)
+        // If a bin array doesn't exist, the TX simulation will fail with a clear error.
+        let bin_arrays = Self::derive_bin_arrays_for_active_id(lb_pair, active_id)?;
 
         // Derive oracle PDA
         let (oracle, _) = Pubkey::find_program_address(
@@ -357,166 +327,6 @@ impl MeteoraDlmmSwapBuilder {
             accounts,
             data,
         })
-    }
-
-    /// Fetch bin array accounts for a pool (DEPRECATED - use fetch_bin_arrays_direct)
-    ///
-    /// Meteora DLMM stores bins in "Bin Array" accounts. Each bin array contains
-    /// a range of bins (typically 70 bins per array). We need to find which
-    /// bin arrays contain the active bins for our swap.
-    ///
-    /// # Arguments
-    /// * `lb_pair` - The LB Pair (pool) pubkey
-    /// * `active_id` - Current active bin ID
-    /// * `bin_step` - Bin step for price calculation
-    ///
-    /// # Returns
-    /// Vector of BinArray structs containing bin data
-    pub async fn fetch_bin_arrays(
-        &self,
-        lb_pair: &Pubkey,
-        active_id: i32,
-        bin_step: u16,
-    ) -> Result<Vec<BinArray>> {
-        let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
-
-        // Calculate which bin arrays we need based on active_id
-        // We fetch ±3 arrays around the active bin to handle larger swaps
-        let active_array_index = Self::bin_id_to_bin_array_index(active_id);
-        let array_indices: Vec<i64> = (active_array_index - 3..=active_array_index + 3).collect();
-
-        let mut bin_arrays = Vec::new();
-
-        // Method 1: Direct PDA derivation (faster, but needs all possible indices)
-        // We try to fetch known PDAs directly
-        for index in &array_indices {
-            let pda = Self::derive_bin_array_pda(lb_pair, *index)?;
-
-            if let Ok(account) = self.rpc.get_account_retry(&pda).await {
-                if account.data.len() >= 56 {
-                    if let Ok(bin_array) = BinArray::parse(&account.data, bin_step) {
-                        bin_arrays.push(bin_array);
-                    }
-                }
-            }
-        }
-
-        // Method 2: getProgramAccounts with memcmp filter (slower, but comprehensive)
-        // Only use if direct fetches didn't return enough data
-        if bin_arrays.len() < 2 {
-            // Filter for bin arrays belonging to this lb_pair
-            // lb_pair is at offset 24 in bin array account
-            let memcmp = Memcmp::new(
-                24, // offset of lb_pair in BinArray
-                MemcmpEncodedBytes::Base58(lb_pair.to_string()),
-            );
-
-            let config = RpcProgramAccountsConfig {
-                filters: Some(vec![RpcFilterType::Memcmp(memcmp)]),
-                account_config: RpcAccountInfoConfig {
-                    encoding: Some(UiAccountEncoding::Base64),
-                    data_slice: None,
-                    commitment: None,
-                    min_context_slot: None,
-                },
-                with_context: None,
-                sort_results: None,
-            };
-
-            if let Ok(accounts) = self
-                .rpc
-                .get_program_accounts_with_config_retry(&program_id, config)
-                .await
-            {
-                for (_pubkey, account) in accounts {
-                    if let Ok(bin_array) = BinArray::parse(&account.data, bin_step) {
-                        // Only include arrays near the active bin
-                        if (bin_array.index - active_array_index).abs() <= 3 {
-                            bin_arrays.push(bin_array);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(bin_arrays)
-    }
-
-    /// Fetch bin arrays by direct PDA derivation (more reliable than getProgramAccounts)
-    ///
-    /// This method derives bin array PDAs directly from the active_id and fetches them
-    /// via individual getAccount calls. This is more reliable than getProgramAccounts
-    /// which can be rate-limited or return incomplete results.
-    ///
-    /// We fetch bin arrays for indices [active_index - 1, active_index, active_index + 1]
-    /// to cover typical swap ranges. All three are needed because:
-    /// 1. active_id might be at the edge of a bin array
-    /// 2. Swaps can cross multiple bin arrays depending on liquidity distribution
-    /// 3. Meteora DLMM requires all touched bin arrays to be present
-    pub async fn fetch_bin_arrays_direct(
-        &self,
-        lb_pair: &Pubkey,
-        active_id: i32,
-    ) -> Result<Vec<Pubkey>> {
-        let active_array_index = Self::bin_id_to_bin_array_index(active_id);
-
-        // Fetch active + adjacent bin arrays to handle swaps that cross array boundaries.
-        // This is critical for Meteora - if the swap touches a bin array not included,
-        // we get Error 3005 (AccountNotEnoughKeys).
-        let indices_to_check: Vec<i64> = vec![
-            active_array_index - 1,
-            active_array_index,
-            active_array_index + 1,
-        ];
-
-        let mut found_arrays: Vec<Pubkey> = Vec::new();
-
-        for index in indices_to_check {
-            let pda = Self::derive_bin_array_pda(lb_pair, index)?;
-
-            match self.rpc.get_account_retry(&pda).await {
-                Ok(account) => {
-                    // Bin array accounts are typically ~10KB+
-                    if account.data.len() >= 100 {
-                        debug!(
-                            pool = %lb_pair,
-                            bin_array_index = index,
-                            pda = %pda,
-                            "Found bin array on-chain"
-                        );
-                        found_arrays.push(pda);
-                    }
-                }
-                Err(_) => {
-                    // Bin array doesn't exist - this is normal for arrays outside liquidity range
-                    debug!(
-                        pool = %lb_pair,
-                        bin_array_index = index,
-                        "Bin array not found on-chain (expected if outside liquidity range)"
-                    );
-                }
-            }
-        }
-
-        if found_arrays.is_empty() {
-            warn!(
-                pool = %lb_pair,
-                active_id = active_id,
-                active_array_index = active_array_index,
-                "No bin arrays found - pool might have no liquidity at current price"
-            );
-        } else {
-            info!(
-                pool = %lb_pair,
-                active_id = active_id,
-                active_array_index = active_array_index,
-                found_count = found_arrays.len(),
-                bin_arrays = ?found_arrays,
-                "Meteora: fetched bin arrays for swap"
-            );
-        }
-
-        Ok(found_arrays)
     }
 
     /// Derive bin array PDA for a given bin array index

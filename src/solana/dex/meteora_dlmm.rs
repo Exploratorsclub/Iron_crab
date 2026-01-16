@@ -614,22 +614,21 @@ impl Dex for MeteoraDlmm {
         _amount_in: u64,
         _min_out: u64,
     ) -> Result<Vec<Instruction>> {
-        // Meteora DLMM requires async build (for bin array fetching).
-        // Use build_swap_ix_async instead.
+        // Meteora DLMM requires bin arrays - use build_swap_ix_async instead.
         Err(anyhow!(
-            "meteora_dlmm: use build_swap_ix_async (requires bin array fetching)"
+            "meteora_dlmm: use build_swap_ix_async (sync wrapper for bin array derivation)"
         ))
     }
 
-    /// Async version that properly fetches bin arrays.
+    /// GEYSER-FIRST: Build swap instruction with bin arrays (NO RPC CALLS!)
     ///
     /// Meteora DLMM swaps require multiple bin_array accounts as "remaining accounts".
-    /// The exact bin arrays needed depend on the active_id and swap size.
-    /// This async method uses `build_swap_with_bins()` which fetches the correct
-    /// bin arrays from chain.
+    /// This method uses `build_swap_with_bins_sync()` which:
+    /// - Uses active_id from LivePoolCache (Geyser subscription - more current than RPC!)
+    /// - Derives bin array PDAs deterministically (no RPC to check existence)
+    /// - If a bin array doesn't exist, TX simulation will fail with clear error
     ///
-    /// NOTE: Pool data (active_id, bin_step) comes from DexPoolAccounts event
-    /// which is populated by market-data from Geyser. No RPC calls in hot path.
+    /// All pool data (active_id, bin_step, reserves) comes from Geyser via LivePoolCache.
     async fn build_swap_ix_async(
         &self,
         input_mint: &str,
@@ -759,11 +758,11 @@ impl Dex for MeteoraDlmm {
             "meteora_dlmm: building swap with user ATAs"
         );
 
-        // Build swap instruction WITH bin arrays (async)
-        // Uses active_id and bin_step from DexPoolAccounts (via set_pool_from_accounts)
+        // Build swap instruction with bin arrays (GEYSER-FIRST: sync, no RPC!)
+        // Uses active_id and bin_step from LivePoolCache (via Geyser subscription)
         let swap_builder = MeteoraDlmmSwapBuilder::new(self.rpc.clone());
         let ix = swap_builder
-            .build_swap_with_bins(
+            .build_swap_with_bins_sync(
                 &pool_addr,
                 &pool.reserve_x,
                 &pool.reserve_y,
@@ -777,8 +776,7 @@ impl Dex for MeteoraDlmm {
                 direction,
                 pool.active_id,
                 pool.bin_step,
-            )
-            .await?;
+            )?;
 
         Ok(vec![ix])
     }
