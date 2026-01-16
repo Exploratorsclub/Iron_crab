@@ -766,7 +766,7 @@ impl CrossDexHandler {
         let sell_pool = intent.metadata.get("sell_pool").cloned().unwrap_or_default();
 
         // Debug: log pool addresses for troubleshooting fresh quote calculation
-        debug!(
+        info!(
             buy_pool = %buy_pool,
             sell_pool = %sell_pool,
             buy_pool_empty = buy_pool.is_empty(),
