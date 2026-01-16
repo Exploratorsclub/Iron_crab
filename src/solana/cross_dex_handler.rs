@@ -662,7 +662,7 @@ impl CrossDexHandler {
             let fresh_min_out = buy_pool_pk.and_then(|pk| {
                 let cache_result = cache.get_with_metadata(&pk);
                 if cache_result.is_none() {
-                    debug!(
+                    info!(
                         pool = %pk,
                         buy_dex = %buy_dex,
                         cache_size = cache.len(),
