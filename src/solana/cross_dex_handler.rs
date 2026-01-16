@@ -761,16 +761,142 @@ impl CrossDexHandler {
             return Err(anyhow!("buy_min_out=0 (cannot build safe arb)"));
         }
 
-        // Sell leg: min SOL out
-        let sell_min_out = sell_quote
-            .amount_out
-            .saturating_mul(10000 - slippage_bps as u64)
-            / 10000;
-
-        // Get pool addresses from intent metadata (provided by arb-strategy)
+        // Get pool addresses from intent metadata early (needed for fresh quote)
         let buy_pool = intent.metadata.get("buy_pool").cloned().unwrap_or_default();
         let sell_pool = intent.metadata.get("sell_pool").cloned().unwrap_or_default();
-        
+
+        // =======================================================================
+        // FRESH SELL QUOTE FROM LIVEPOOL CACHE (Token -> SOL)
+        // =======================================================================
+        // The sell_quote from validation uses arb-strategy's quote, which may be stale.
+        // We compute a fresh quote using the ACTUAL tokens we'll receive from the buy leg
+        // (buy_min_out), not the optimistic quoted amount.
+        let sell_min_out = if let Some(ref cache) = self.pool_cache {
+            let sell_pool_pk = Pubkey::from_str(&sell_pool).ok();
+            let fresh_sell_min_out = sell_pool_pk.and_then(|pk| {
+                let cache_result = cache.get_with_metadata(&pk);
+                if cache_result.is_none() {
+                    info!(
+                        pool = %pk,
+                        sell_dex = %sell_dex,
+                        cache_size = cache.len(),
+                        "LivePoolCache MISS - sell pool not found, using validation quote"
+                    );
+                    return None;
+                }
+                let (state, _slot, age_ms) = cache_result?;
+                
+                // Don't use stale data (>10 seconds)
+                if age_ms > 10_000 {
+                    debug!(
+                        pool = %pk,
+                        age_ms,
+                        "LivePoolCache too stale for fresh sell quote, using validation quote"
+                    );
+                    return None;
+                }
+                
+                // Calculate sell quote: Token -> SOL
+                // IMPORTANT: We're selling buy_min_out tokens (what we'll actually get from buy)
+                let amount_out = match state {
+                    CachedPoolState::PumpAmm(ref s) => {
+                        // Pump AMM: constant product with ~0.25% fee (25bps)
+                        let reserve_in = s.base_reserve? as u128;   // Token reserve
+                        let reserve_out = s.quote_reserve? as u128; // SOL reserve
+                        if reserve_in == 0 || reserve_out == 0 {
+                            return None;
+                        }
+                        let amount_in = buy_min_out as u128;
+                        // 0.25% fee = 9975/10000
+                        let amount_after_fee = amount_in * 9975 / 10000;
+                        let k = reserve_in * reserve_out;
+                        let new_reserve_in = reserve_in + amount_after_fee;
+                        let new_reserve_out = k / new_reserve_in;
+                        Some(reserve_out.saturating_sub(new_reserve_out) as u64)
+                    }
+                    CachedPoolState::Meteora(ref s) => {
+                        // Meteora DLMM Token -> SOL
+                        let reserve_in = s.reserve_x_balance? as u128;  // Token
+                        let reserve_out = s.reserve_y_balance? as u128; // SOL
+                        if reserve_in == 0 || reserve_out == 0 {
+                            return None;
+                        }
+                        let amount_in = buy_min_out as u128;
+                        let amount_after_fee = amount_in * 9970 / 10000;
+                        let k = reserve_in * reserve_out;
+                        let new_reserve_in = reserve_in + amount_after_fee;
+                        let new_reserve_out = k / new_reserve_in;
+                        let raw_out = reserve_out.saturating_sub(new_reserve_out) as u64;
+                        // DLMM bins - apply 15% extra buffer
+                        Some(raw_out.saturating_mul(85) / 100)
+                    }
+                    CachedPoolState::Orca(ref s) => {
+                        // Orca Token -> SOL
+                        let reserve_in = s.vault_a_balance? as u128;  // Token
+                        let reserve_out = s.vault_b_balance? as u128; // SOL
+                        if reserve_in == 0 || reserve_out == 0 {
+                            return None;
+                        }
+                        let amount_in = buy_min_out as u128;
+                        let amount_after_fee = amount_in * 9970 / 10000;
+                        let k = reserve_in * reserve_out;
+                        let new_reserve_in = reserve_in + amount_after_fee;
+                        let new_reserve_out = k / new_reserve_in;
+                        let raw_out = reserve_out.saturating_sub(new_reserve_out) as u64;
+                        // Concentrated liquidity - apply 10% extra buffer
+                        Some(raw_out.saturating_mul(90) / 100)
+                    }
+                    CachedPoolState::PumpFun(ref s) => {
+                        // PumpFun bonding curve Token -> SOL
+                        let reserve_in = s.real_token_reserves as u128;
+                        let reserve_out = s.virtual_sol_reserves as u128;
+                        if reserve_in == 0 || reserve_out == 0 {
+                            return None;
+                        }
+                        let amount_in = buy_min_out as u128;
+                        // 1% fee = 9900/10000
+                        let amount_after_fee = amount_in * 9900 / 10000;
+                        let k = reserve_in * reserve_out;
+                        let new_reserve_in = reserve_in + amount_after_fee;
+                        let new_reserve_out = k / new_reserve_in;
+                        Some(reserve_out.saturating_sub(new_reserve_out) as u64)
+                    }
+                    _ => None, // Other DEXes use validation quote
+                }?;
+                
+                // Apply slippage
+                let min_out = quote_calculator::apply_slippage(amount_out, slippage_bps);
+                info!(
+                    pool = %pk,
+                    dex = %sell_dex,
+                    token_in = buy_min_out,
+                    amount_out,
+                    min_out,
+                    age_ms,
+                    validation_amount_out = sell_quote.amount_out,
+                    "Fresh sell quote from LivePoolCache (replaces stale validation quote)"
+                );
+                Some(min_out)
+            });
+            
+            match fresh_sell_min_out {
+                Some(min_out) if min_out > 0 => min_out,
+                _ => {
+                    // Fallback to validation quote
+                    sell_quote
+                        .amount_out
+                        .saturating_mul(10000 - slippage_bps as u64)
+                        / 10000
+                }
+            }
+        } else {
+            // No cache available, use validation quote
+            sell_quote
+                .amount_out
+                .saturating_mul(10000 - slippage_bps as u64)
+                / 10000
+        };
+
         // =======================================================================
         // Parse pool accounts from intent.resources.accounts (NO RPC!)
         // Format from arb-strategy: "buy_pool_accounts_start:N" followed by N accounts,
