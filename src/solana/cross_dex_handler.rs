@@ -810,9 +810,22 @@ impl CrossDexHandler {
                 let amount_out = match state {
                     CachedPoolState::PumpAmm(ref s) => {
                         // Pump AMM: constant product with ~0.25% fee (25bps)
-                        let reserve_in = s.base_reserve? as u128;   // Token reserve
-                        let reserve_out = s.quote_reserve? as u128; // SOL reserve
+                        let reserve_in = match s.base_reserve {
+                            Some(r) => r as u128,
+                            None => {
+                                info!(pool = %pk, dex = %sell_dex, "LivePoolCache HIT but base_reserve is None");
+                                return None;
+                            }
+                        };
+                        let reserve_out = match s.quote_reserve {
+                            Some(r) => r as u128,
+                            None => {
+                                info!(pool = %pk, dex = %sell_dex, "LivePoolCache HIT but quote_reserve is None");
+                                return None;
+                            }
+                        };
                         if reserve_in == 0 || reserve_out == 0 {
+                            info!(pool = %pk, dex = %sell_dex, reserve_in, reserve_out, "LivePoolCache HIT but reserves are zero");
                             return None;
                         }
                         let amount_in = buy_min_out as u128;
@@ -825,9 +838,22 @@ impl CrossDexHandler {
                     }
                     CachedPoolState::Meteora(ref s) => {
                         // Meteora DLMM Token -> SOL
-                        let reserve_in = s.reserve_x_balance? as u128;  // Token
-                        let reserve_out = s.reserve_y_balance? as u128; // SOL
+                        let reserve_in = match s.reserve_x_balance {
+                            Some(r) => r as u128,
+                            None => {
+                                info!(pool = %pk, dex = %sell_dex, "LivePoolCache HIT but reserve_x_balance is None (Meteora)");
+                                return None;
+                            }
+                        };
+                        let reserve_out = match s.reserve_y_balance {
+                            Some(r) => r as u128,
+                            None => {
+                                info!(pool = %pk, dex = %sell_dex, "LivePoolCache HIT but reserve_y_balance is None (Meteora)");
+                                return None;
+                            }
+                        };
                         if reserve_in == 0 || reserve_out == 0 {
+                            info!(pool = %pk, dex = %sell_dex, reserve_in, reserve_out, "LivePoolCache HIT but reserves are zero (Meteora)");
                             return None;
                         }
                         let amount_in = buy_min_out as u128;
@@ -841,9 +867,22 @@ impl CrossDexHandler {
                     }
                     CachedPoolState::Orca(ref s) => {
                         // Orca Token -> SOL
-                        let reserve_in = s.vault_a_balance? as u128;  // Token
-                        let reserve_out = s.vault_b_balance? as u128; // SOL
+                        let reserve_in = match s.vault_a_balance {
+                            Some(r) => r as u128,
+                            None => {
+                                info!(pool = %pk, dex = %sell_dex, "LivePoolCache HIT but vault_a_balance is None (Orca)");
+                                return None;
+                            }
+                        };
+                        let reserve_out = match s.vault_b_balance {
+                            Some(r) => r as u128,
+                            None => {
+                                info!(pool = %pk, dex = %sell_dex, "LivePoolCache HIT but vault_b_balance is None (Orca)");
+                                return None;
+                            }
+                        };
                         if reserve_in == 0 || reserve_out == 0 {
+                            info!(pool = %pk, dex = %sell_dex, reserve_in, reserve_out, "LivePoolCache HIT but reserves are zero (Orca)");
                             return None;
                         }
                         let amount_in = buy_min_out as u128;
@@ -860,6 +899,7 @@ impl CrossDexHandler {
                         let reserve_in = s.real_token_reserves as u128;
                         let reserve_out = s.virtual_sol_reserves as u128;
                         if reserve_in == 0 || reserve_out == 0 {
+                            info!(pool = %pk, dex = %sell_dex, reserve_in, reserve_out, "LivePoolCache HIT but reserves are zero (PumpFun)");
                             return None;
                         }
                         let amount_in = buy_min_out as u128;
@@ -870,8 +910,14 @@ impl CrossDexHandler {
                         let new_reserve_out = k / new_reserve_in;
                         Some(reserve_out.saturating_sub(new_reserve_out) as u64)
                     }
-                    _ => None, // Other DEXes use validation quote
-                }?;
+                    _ => {
+                        info!(pool = %pk, sell_dex = %sell_dex, state_type = %state.dex_name(), "LivePoolCache HIT but DEX type not supported for fresh quote");
+                        None
+                    }
+                };
+                
+                // amount_out is None if cache had pool but couldn't calculate quote
+                let amount_out = amount_out?;
                 
                 // Apply slippage
                 let min_out = quote_calculator::apply_slippage(amount_out, slippage_bps);
