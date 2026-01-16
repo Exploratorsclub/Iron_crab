@@ -2746,6 +2746,14 @@ async fn main() -> Result<()> {
         let user_pk = ctx.treasury.as_ref().map(|t| t.pubkey());
         let mut handler =
             CrossDexHandler::new(Arc::clone(&ctx.rpc), user_pk).with_rpc_url(ctx.rpc_url.clone());
+        
+        // P0 FIX: Inject LivePoolCache for fresh Geyser-based quotes in build_swap_plan()
+        // Without this, CrossDexHandler falls back to stale arb-strategy price metadata!
+        if let Some(ref cache) = live_pool_cache {
+            handler = handler.with_pool_cache(Arc::clone(cache));
+            info!("CrossDexHandler: LivePoolCache injected for fresh Geyser quotes");
+        }
+        
         match handler.init_dexes().await {
             Ok(()) => {
                 ctx.cross_dex_handler = Some(Arc::new(handler));
