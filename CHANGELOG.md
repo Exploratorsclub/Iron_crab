@@ -19,6 +19,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - Token-2022 ATA creation failures in cross-DEX arbitrage (was defaulting to SPL Token)
 - Meteora DLMM swaps no longer require RPC calls during execution
+- **Meteora DLMM `bin_array_bitmap_extension` error (3007)**: Fixed "AccountOwnedByWrongProgram" errors by using `program_id` as placeholder for optional bitmap extension (per official Meteora SDK pattern)
 
 ## [0.3.1-dev] - 2025-09-04
 ### Added

@@ -262,9 +262,18 @@ impl MeteoraDlmmSwapBuilder {
             "Meteora: using active_id from Geyser cache (GEYSER-FIRST)"
         );
 
-        // Derive bitmap extension PDA (no RPC check needed)
-        let bin_array_bitmap_extension = Self::derive_bitmap_extension_pda(lb_pair)
-            .unwrap_or(program_id);
+        // bin_array_bitmap_extension is OPTIONAL in Meteora DLMM.
+        // Per official Meteora SDK pattern: use program_id when extension doesn't exist.
+        // See: https://github.com/MeteoraAg/dlmm-sdk cli/src/instructions/swap_exact_in.rs
+        //   bitmap_extension.map(|_| key).or(Some(dlmm::ID))
+        //
+        // If we pass a derived PDA that doesn't exist on-chain, Anchor will fail with:
+        //   "AccountOwnedByWrongProgram" (error 3007) because non-existent PDAs
+        //   are owned by System Program, not DLMM Program.
+        //
+        // SAFE DEFAULT: Use program_id (pools with extended price range are rare for new tokens)
+        // TODO: Track bitmap extension existence in LivePoolCache via Geyser for full accuracy
+        let bin_array_bitmap_extension = program_id;
 
         // Derive bin array PDAs (GEYSER-FIRST: no RPC to check existence!)
         // If a bin array doesn't exist, the TX simulation will fail with a clear error.
