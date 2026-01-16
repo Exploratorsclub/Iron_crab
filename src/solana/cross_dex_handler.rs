@@ -772,39 +772,20 @@ impl CrossDexHandler {
                 );
             }
         } else if !buy_pool.is_empty() {
-            // No accounts in intent
-            // For pump_amm: REJECT (DexPoolAccounts required per TARGET_ARCHITECTURE.md)
-            // For meteora_dlmm/orca: Try LivePoolCache first, then RPC fallback
-            if buy_dex == "pump_amm" {
+            // No accounts in intent - check LivePoolCache
+            // GEYSER-FIRST (TARGET_ARCHITECTURE.md §4.5): NO RPC in hot path!
+            // If Geyser hasn't delivered the data, RPC won't have it either (same validator).
+            let pool_pk = Pubkey::from_str(&buy_pool)
+                .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
+            
+            if !self.try_inject_from_cache(&buy_dex, &pool_pk, buy_connector) {
+                // Cache miss = REJECT. No RPC fallback.
+                // The arb-strategy should not have generated this intent without DexPoolAccounts.
                 return Err(anyhow!(
-                    "buy pool {} has no accounts in intent - pump_amm requires DexPoolAccounts",
-                    buy_pool
+                    "GEYSER_CACHE_MISS: buy pool {} ({}) not in cache and no accounts in intent. \
+                     arb-strategy should require DexPoolAccounts before generating intents.",
+                    buy_pool, buy_dex
                 ));
-            } else {
-                let pool_pk = Pubkey::from_str(&buy_pool)
-                    .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
-                
-                // Option C: Try LivePoolCache first (no RPC!)
-                if !self.try_inject_from_cache(&buy_dex, &pool_pk, buy_connector) {
-                    // Cache miss - fall back to single getAccount RPC
-                    info!(
-                        pool = %buy_pool,
-                        dex = %buy_dex,
-                        "LivePoolCache miss for buy pool, using RPC fallback"
-                    );
-                    match buy_connector.load_pool_by_address(&pool_pk).await {
-                        Ok(()) => {
-                            info!(
-                                pool = %buy_pool,
-                                dex = %buy_dex,
-                                "Successfully loaded buy pool via RPC"
-                            );
-                        }
-                        Err(e) => {
-                            return Err(anyhow!("Failed to load buy pool {} via RPC: {}", buy_pool, e));
-                        }
-                    }
-                }
             }
         }
 
@@ -977,39 +958,20 @@ impl CrossDexHandler {
                 );
             }
         } else if !sell_pool.is_empty() {
-            // No accounts in intent
-            // For pump_amm: REJECT (DexPoolAccounts required per TARGET_ARCHITECTURE.md)
-            // For meteora_dlmm/orca: Try LivePoolCache first, then RPC fallback
-            if sell_dex == "pump_amm" {
+            // No accounts in intent - check LivePoolCache
+            // GEYSER-FIRST (TARGET_ARCHITECTURE.md §4.5): NO RPC in hot path!
+            // If Geyser hasn't delivered the data, RPC won't have it either (same validator).
+            let pool_pk = Pubkey::from_str(&sell_pool)
+                .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;
+            
+            if !self.try_inject_from_cache(&sell_dex, &pool_pk, sell_connector) {
+                // Cache miss = REJECT. No RPC fallback.
+                // The arb-strategy should not have generated this intent without DexPoolAccounts.
                 return Err(anyhow!(
-                    "sell pool {} has no accounts in intent - pump_amm requires DexPoolAccounts",
-                    sell_pool
+                    "GEYSER_CACHE_MISS: sell pool {} ({}) not in cache and no accounts in intent. \
+                     arb-strategy should require DexPoolAccounts before generating intents.",
+                    sell_pool, sell_dex
                 ));
-            } else {
-                let pool_pk = Pubkey::from_str(&sell_pool)
-                    .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;
-                
-                // Option C: Try LivePoolCache first (no RPC!)
-                if !self.try_inject_from_cache(&sell_dex, &pool_pk, sell_connector) {
-                    // Cache miss - fall back to single getAccount RPC
-                    info!(
-                        pool = %sell_pool,
-                        dex = %sell_dex,
-                        "LivePoolCache miss for sell pool, using RPC fallback"
-                    );
-                    match sell_connector.load_pool_by_address(&pool_pk).await {
-                        Ok(()) => {
-                            info!(
-                                pool = %sell_pool,
-                                dex = %sell_dex,
-                                "Successfully loaded sell pool via RPC"
-                            );
-                        }
-                        Err(e) => {
-                            return Err(anyhow!("Failed to load sell pool {} via RPC: {}", sell_pool, e));
-                        }
-                    }
-                }
             }
         }
 

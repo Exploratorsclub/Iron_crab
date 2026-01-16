@@ -969,52 +969,61 @@ impl ArbContext {
 // ============================================================================
 
 /// Creates an arb intent from the opportunity.
-/// Returns None if pump_amm is used but required DexPoolAccounts are missing.
+/// Returns None if required DexPoolAccounts are missing for ANY pool.
+///
+/// GEYSER-FIRST PRINCIPLE (TARGET_ARCHITECTURE.md §4.5):
+/// - NO RPC calls in hot path
+/// - DexPoolAccounts must be available for BOTH buy and sell pools
+/// - If Geyser hasn't delivered the data, RPC won't have it either (same validator)
+/// - Missing data = REJECT intent, don't try RPC fallback
 fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeIntent> {
     let config = ctx.config.read();
 
     // Get pool accounts from DexPoolAccounts events (NO RPC needed in execution-engine!)
     let (buy_accounts, sell_accounts) = ctx.get_pool_accounts_for_arb(opp);
     
-    // pump_amm requires DexPoolAccounts per TARGET_ARCHITECTURE.md
-    // Reject early if pump_amm is used but accounts are missing (saves roundtrip to execution-engine)
-    if opp.buy_dex == "pump_amm" && buy_accounts.is_none() {
-        warn!(
+    // GEYSER-FIRST: Require DexPoolAccounts for BOTH pools
+    // This eliminates RPC fallback in execution-engine hot path.
+    // If Geyser hasn't delivered the pool data yet, we reject early.
+    if buy_accounts.is_none() {
+        debug!(
             buy_pool = %opp.buy_pool,
             buy_dex = %opp.buy_dex,
             mint = %opp.base_mint,
-            "Rejecting arb: pump_amm buy pool missing DexPoolAccounts"
+            spread_bps = opp.spread_bps,
+            "Rejecting arb: buy pool missing DexPoolAccounts (GEYSER-FIRST)"
         );
         ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if opp.sell_dex == "pump_amm" && sell_accounts.is_none() {
-        warn!(
+    if sell_accounts.is_none() {
+        debug!(
             sell_pool = %opp.sell_pool,
             sell_dex = %opp.sell_dex,
             mint = %opp.base_mint,
-            "Rejecting arb: pump_amm sell pool missing DexPoolAccounts"
+            spread_bps = opp.spread_bps,
+            "Rejecting arb: sell pool missing DexPoolAccounts (GEYSER-FIRST)"
         );
         ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
         return None;
     }
+    
+    // Both pools have accounts - safe to proceed
+    let buy_accts = buy_accounts.unwrap();
+    let sell_accts = sell_accounts.unwrap();
     
     // Combine accounts: buy pool accounts + sell pool accounts
     // Format: buy accounts are prefixed with "buy:" and sell with "sell:" for disambiguation
     // execution-engine will parse these to build instructions without RPC
     let mut all_accounts = Vec::new();
     
-    if let Some(buy_accts) = &buy_accounts {
-        // Store buy accounts with marker
-        all_accounts.push(format!("buy_pool_accounts_start:{}", buy_accts.len()));
-        all_accounts.extend(buy_accts.iter().cloned());
-    }
-    
-    if let Some(sell_accts) = &sell_accounts {
-        // Store sell accounts with marker
-        all_accounts.push(format!("sell_pool_accounts_start:{}", sell_accts.len()));
-        all_accounts.extend(sell_accts.iter().cloned());
-    }
+    // Store buy accounts with marker
+    all_accounts.push(format!("buy_pool_accounts_start:{}", buy_accts.len()));
+    all_accounts.extend(buy_accts.iter().cloned());
+
+    // Store sell accounts with marker
+    all_accounts.push(format!("sell_pool_accounts_start:{}", sell_accts.len()));
+    all_accounts.extend(sell_accts.iter().cloned());
 
     let resources = TradeResources {
         input_mint: "So11111111111111111111111111111111111111112".to_string(),
@@ -1023,16 +1032,16 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
         accounts: all_accounts,
     };
 
-    // Log warning if non-pump_amm accounts missing (execution-engine will use RPC fallback)
-    if buy_accounts.is_none() || sell_accounts.is_none() {
-        debug!(
-            buy_pool = %opp.buy_pool,
-            sell_pool = %opp.sell_pool,
-            buy_accounts_present = buy_accounts.is_some(),
-            sell_accounts_present = sell_accounts.is_some(),
-            "Arb intent missing some pool accounts - execution-engine will use RPC fallback"
-        );
-    }
+    // Both pools have accounts - no RPC fallback needed
+    debug!(
+        buy_pool = %opp.buy_pool,
+        sell_pool = %opp.sell_pool,
+        buy_dex = %opp.buy_dex,
+        sell_dex = %opp.sell_dex,
+        buy_accounts_len = buy_accts.len(),
+        sell_accounts_len = sell_accts.len(),
+        "Arb intent has complete pool accounts (GEYSER-FIRST compliant)"
+    );
 
     let mut intent = TradeIntent::new(
         "arb-strategy",

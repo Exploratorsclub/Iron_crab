@@ -1459,12 +1459,26 @@ impl MomentumContext {
         infos.insert(mint.to_string(), info);
     }
 
+    /// Returns true if the DEX requires DexPoolAccounts in Intent.resources.accounts
+    /// for deterministic TX building (no RPC in hot path).
+    ///
+    /// DEXes that need accounts:
+    /// - pump_amm/pumpswap: Always requires 14 accounts (pool, vaults, mints, etc.)
+    /// - meteora_dlmm: Needs lb_pair, vaults, mints, active_id, bin_step, bitmap_extension
+    /// - raydium: Needs AMM accounts (less critical - has LivePoolCache fallback)
+    /// - orca: Needs whirlpool accounts (less critical - has LivePoolCache fallback)
     fn dex_requires_pool_accounts(dex: &str) -> bool {
-        dex.eq_ignore_ascii_case("PumpFunAmm")
-            || dex.eq_ignore_ascii_case("pump_amm")
-            || dex.eq_ignore_ascii_case("PumpSwap")
-            || dex.eq_ignore_ascii_case("pumpswap")
-            || dex.eq_ignore_ascii_case("pump-amm")
+        let dex_lower = dex.to_ascii_lowercase();
+        matches!(
+            dex_lower.as_str(),
+            "pumpfunamm"
+                | "pump_amm"
+                | "pumpswap"
+                | "pump-amm"
+                | "meteora_dlmm"
+                | "meteora-dlmm"
+                | "meteoradlmm"
+        )
     }
 
     fn try_get_dex_pool_accounts_for_mint(&self, mint: &str) -> Option<Vec<String>> {
@@ -1486,18 +1500,43 @@ impl MomentumContext {
         quote_mint: &str,
         accounts: &[String],
     ) {
-        // For PumpFunAmm this must be deterministic: 14 accounts, and accounts[0] must match pool_address.
-        if accounts.len() != 14 {
+        // Validate account format based on DEX type
+        // - pump_amm/pumpswap: exactly 14 accounts
+        // - meteora_dlmm: at least 3 (pool, token_x_mint, token_y_mint) + optional vaults + tagged values
+        // - other DEXes: at least 3 accounts
+        let dex_lower = dex.to_ascii_lowercase();
+        let is_pump_amm = dex_lower == "pump_amm"
+            || dex_lower == "pumpfunamm"
+            || dex_lower == "pumpswap"
+            || dex_lower == "pump-amm";
+
+        // PumpSwap always requires exactly 14 accounts; all other DEXes need at least 3
+        let min_accounts = if is_pump_amm { 14 } else { 3 };
+
+        if accounts.len() < min_accounts {
             warn!(
                 dex = %dex,
                 pool = %pool_address,
                 base = %base_mint,
                 quote = %quote_mint,
                 accounts_len = accounts.len(),
-                "DexPoolAccounts ignored: expected 14 accounts"
+                min_required = min_accounts,
+                "DexPoolAccounts ignored: insufficient accounts"
             );
             return;
         }
+
+        // For pump_amm: enforce exactly 14 accounts
+        if is_pump_amm && accounts.len() != 14 {
+            warn!(
+                dex = %dex,
+                pool = %pool_address,
+                accounts_len = accounts.len(),
+                "DexPoolAccounts ignored: pump_amm requires exactly 14 accounts"
+            );
+            return;
+        }
+
         if accounts.first().map(|s| s.as_str()) != Some(pool_address) {
             warn!(
                 dex = %dex,
@@ -1541,6 +1580,7 @@ impl MomentumContext {
                 mint = %token_mint,
                 pool = %pool_address,
                 dex = %dex,
+                accounts_len = accounts.len(),
                 "DexPoolAccounts applied to tracker"
             );
         }
@@ -3322,19 +3362,50 @@ async fn generate_and_publish_buy_intent(
             );
             anyhow::bail!("cannot generate intent: missing DexPoolAccounts")
         };
-        if accounts.len() != 14
-            || accounts.first().map(|s| s.as_str()) != Some(signal.pool.as_str())
-        {
+
+        // Validate accounts[0] matches the pool address
+        if accounts.first().map(|s| s.as_str()) != Some(signal.pool.as_str()) {
+            warn!(
+                mint = %signal.mint,
+                pool = %signal.pool,
+                dex = %signal.dex,
+                first = ?accounts.first(),
+                "Skipping BUY intent: invalid DexPoolAccounts (accounts[0] != pool)"
+            );
+            anyhow::bail!("cannot generate intent: invalid DexPoolAccounts")
+        }
+
+        // Validate minimum account count based on DEX
+        // - pump_amm: exactly 14 accounts
+        // - meteora_dlmm: at least 3 (pool, mints) + optional tagged values
+        let dex_lower = signal.dex.to_ascii_lowercase();
+        let is_pump_amm = dex_lower == "pump_amm"
+            || dex_lower == "pumpfunamm"
+            || dex_lower == "pumpswap"
+            || dex_lower == "pump-amm";
+
+        if is_pump_amm && accounts.len() != 14 {
             warn!(
                 mint = %signal.mint,
                 pool = %signal.pool,
                 dex = %signal.dex,
                 accounts_len = accounts.len(),
-                first = ?accounts.first(),
-                "Skipping BUY intent: invalid DexPoolAccounts (expected len=14 and accounts[0]==pool)"
+                "Skipping BUY intent: pump_amm requires exactly 14 accounts"
             );
             anyhow::bail!("cannot generate intent: invalid DexPoolAccounts")
         }
+
+        if accounts.len() < 3 {
+            warn!(
+                mint = %signal.mint,
+                pool = %signal.pool,
+                dex = %signal.dex,
+                accounts_len = accounts.len(),
+                "Skipping BUY intent: DexPoolAccounts needs at least 3 entries"
+            );
+            anyhow::bail!("cannot generate intent: invalid DexPoolAccounts")
+        }
+
         accounts
     } else {
         Vec::new()
