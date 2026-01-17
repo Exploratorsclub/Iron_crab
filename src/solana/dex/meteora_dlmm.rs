@@ -48,6 +48,9 @@ pub struct MeteoraDlmm {
     pools: Arc<DashMap<Pubkey, PoolCache>>,
     mint_index: Arc<DashMap<Pubkey, Vec<Pubkey>>>, // mint -> pool addresses
     user_authority: parking_lot::RwLock<Option<Pubkey>>,
+    /// Extra data cache for GEYSER-FIRST compliance (e.g., token programs for Token-2022)
+    /// Key: "token_program:<mint>" -> Value: token program ID
+    extra_data: Arc<DashMap<String, String>>,
 }
 
 impl MeteoraDlmm {
@@ -57,6 +60,7 @@ impl MeteoraDlmm {
             pools: Arc::new(DashMap::new()),
             mint_index: Arc::new(DashMap::new()),
             user_authority: parking_lot::RwLock::new(None),
+            extra_data: Arc::new(DashMap::new()),
         }
     }
 
@@ -697,33 +701,57 @@ impl Dex for MeteoraDlmm {
             pool.token_y_mint.to_bytes(),
         );
         
-        // CRITICAL: Use CACHED token programs from LivePoolCache - NO RPC IN HOT PATH!
+        // CRITICAL: Use CACHED token programs from extra_data - NO RPC IN HOT PATH!
         // Token programs (SPL Token vs Token-2022) are immutable per mint.
+        // cross_dex_handler caches these via cache_extra_data("token_program:<mint>", program_id)
         // For arbitrage, 99%+ of tokens use SPL Token. Token-2022 is rare.
         // If we default wrong for a Token-2022 mint, the TX will fail at simulation.
         let spl_token_program = spl_token::id();
+        let token_2022_id = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+            Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+                .unwrap_or_default()
+                .to_bytes(),
+        );
         
-        // Use cached token programs if available, otherwise default to SPL Token
-        let token_x_program_spl = pool.token_x_program
+        // Priority 1: Check extra_data cache (populated by cross_dex_handler from Intent)
+        // Priority 2: Use pool.token_x_program / pool.token_y_program (if populated from DexPoolAccounts)
+        // Priority 3: Default to SPL Token
+        let token_x_key = format!("token_program:{}", pool.token_x_mint);
+        let token_y_key = format!("token_program:{}", pool.token_y_mint);
+        
+        let token_x_program_spl = self.extra_data.get(&token_x_key)
+            .and_then(|v| Pubkey::from_str(v.value()).ok())
             .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
+            .or_else(|| pool.token_x_program.map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes())))
             .unwrap_or(spl_token_program);
         
-        let token_y_program_spl = pool.token_y_program
+        let token_y_program_spl = self.extra_data.get(&token_y_key)
+            .and_then(|v| Pubkey::from_str(v.value()).ok())
             .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
+            .or_else(|| pool.token_y_program.map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes())))
             .unwrap_or(spl_token_program);
         
-        // Log if we're using cached vs default programs
-        if pool.token_x_program.is_some() || pool.token_y_program.is_some() {
-            debug!(
+        // Log which source we're using for token programs
+        let x_from_cache = self.extra_data.contains_key(&token_x_key);
+        let y_from_cache = self.extra_data.contains_key(&token_y_key);
+        let x_is_2022 = token_x_program_spl == token_2022_id;
+        let y_is_2022 = token_y_program_spl == token_2022_id;
+        
+        if x_from_cache || y_from_cache || x_is_2022 || y_is_2022 {
+            info!(
                 pool = %pool_addr,
                 token_x_program = %token_x_program_spl,
                 token_y_program = %token_y_program_spl,
-                "Meteora: using CACHED token programs (no RPC)"
+                x_from_cache,
+                y_from_cache,
+                x_is_token_2022 = x_is_2022,
+                y_is_token_2022 = y_is_2022,
+                "Meteora: using token programs (GEYSER-FIRST)"
             );
         } else {
-            tracing::warn!(
+            debug!(
                 pool = %pool_addr,
-                "Meteora: token programs not cached, defaulting to SPL Token (potential Token-2022 issue!)"
+                "Meteora: defaulting to SPL Token for both mints (most common case)"
             );
         }
 
@@ -788,6 +816,20 @@ impl Dex for MeteoraDlmm {
             pairs.push((pool.token_x_mint.to_string(), pool.token_y_mint.to_string()));
         }
         pairs
+    }
+
+    /// Cache extra data for GEYSER-FIRST compliance.
+    /// Used by cross_dex_handler to pass Token-2022 program info.
+    ///
+    /// Supported keys:
+    /// - "token_program:<mint>" -> token program ID (SPL Token or Token-2022)
+    fn cache_extra_data(&self, key: &str, value: &str) {
+        debug!(
+            key = %key,
+            value = %value,
+            "meteora_dlmm: caching extra data"
+        );
+        self.extra_data.insert(key.to_string(), value.to_string());
     }
 }
 

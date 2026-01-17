@@ -916,6 +916,28 @@ impl CrossDexHandler {
         let buy_amount_in = trade_amount;
 
         // ====================================================================
+        // Determine token program BEFORE ATA creation and DEX injection
+        // This is used for:
+        // 1. ATA creation (must use correct program for Token-2022)
+        // 2. DEX connectors (Meteora DLMM needs this for swap IX building)
+        // ====================================================================
+        let token_mint_pk = Pubkey::from_str(token_mint)
+            .map_err(|_| anyhow!("Invalid token mint: {}", token_mint))?;
+        
+        // Determine the token program:
+        // 1. From Intent (arb-strategy sends this via TokenMintInfo)
+        // 2. From cache (Geyser-populated)
+        // 3. From DEX hint
+        // 4. Default to SPL Token
+        let token_program = get_token_program_for_mint_cached(
+            self.pool_cache.as_deref(),
+            &token_mint_pk,
+            Some(&buy_dex), // Use buy_dex as hint for pump.fun detection
+            intent.resources.token_program.as_deref(), // From Intent (GEYSER-FIRST)
+        );
+        let token_program_sdk = Pubkey::new_from_array(token_program.to_bytes());
+
+        // ====================================================================
         // Create ATAs for BOTH tokens involved in the swap (idempotent)
         // 
         // Orca Whirlpool requires ATAs for token_owner_account_a AND token_owner_account_b.
@@ -947,27 +969,14 @@ impl CrossDexHandler {
             
             // 2. Create Token ATA (for the token being bought/sold)
             //    MUST use the correct token program (SPL Token OR Token-2022)
-            let token_mint_pk = Pubkey::from_str(token_mint)
-                .map_err(|_| anyhow!("Invalid token mint: {}", token_mint))?;
+            //    Note: token_program was determined above (before this block)
             let token_mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint_pk.to_bytes());
-            
-            // Determine the token program:
-            // 1. From Intent (arb-strategy sends this via TokenMintInfo)
-            // 2. From cache (Geyser-populated)
-            // 3. From DEX hint
-            // 4. Default to SPL Token
-            let token_program = get_token_program_for_mint_cached(
-                self.pool_cache.as_deref(),
-                &token_mint_pk,
-                Some(&buy_dex), // Use buy_dex as hint for pump.fun detection
-                intent.resources.token_program.as_deref(), // From Intent (GEYSER-FIRST)
-            );
             
             let create_token_ata_ix_prog = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                 &wallet_spl,        // payer
                 &wallet_spl,        // owner  
                 &token_mint_spl,    // token mint
-                &token_program,     // token program (dynamically determined!)
+                &token_program,     // token program (dynamically determined above!)
             );
             let token_ata_ix = prog_ix_to_sdk(create_token_ata_ix_prog);
             
@@ -976,7 +985,7 @@ impl CrossDexHandler {
                 token_mint = %token_mint,
                 wsol_mint = %SOL_MINT,
                 wallet = %wallet,
-                token_program = %Pubkey::new_from_array(token_program.to_bytes()),
+                token_program = %token_program_sdk,
                 token_ata_ix_accounts_count = token_ata_ix.accounts.len(),
                 token_ata_ix_last_account = %token_ata_ix.accounts.last().map(|a| a.pubkey.to_string()).unwrap_or_default(),
                 "Token ATA creation instruction built"
@@ -1041,11 +1050,17 @@ impl CrossDexHandler {
         }
 
         // ====================================================================
-        // GEYSER-FIRST: Inject cached creators for PumpFun before building IX
+        // GEYSER-FIRST: Inject cached data for IX building
         // This eliminates RPC calls in build_swap_ix_async
         // ====================================================================
-        let token_mint_pk = Pubkey::from_str(token_mint)
-            .map_err(|_| anyhow!("Invalid token mint: {}", token_mint))?;
+        
+        // Inject Token-2022 program info for all DEXes that need it (Meteora DLMM, Orca, etc.)
+        // The token_program was already determined above for ATA creation.
+        // We cache it with key "token_program:<mint>" so DEX connectors can use it.
+        buy_connector.cache_extra_data(
+            &format!("token_program:{}", token_mint),
+            &token_program_sdk.to_string(),
+        );
         
         // For PumpFun bonding curve: derive bonding_curve and get creator from cache
         if buy_dex == "pumpfun" {
@@ -1073,6 +1088,12 @@ impl CrossDexHandler {
             .dexes
             .get(&sell_dex)
             .ok_or_else(|| anyhow!("Unknown sell DEX: {}", sell_dex))?;
+        
+        // Inject Token-2022 program info for sell DEX as well
+        sell_connector.cache_extra_data(
+            &format!("token_program:{}", token_mint),
+            &token_program_sdk.to_string(),
+        );
 
         // Set sell pool from intent accounts (NO RPC!)
         if let Some(ref accts) = sell_accounts {
