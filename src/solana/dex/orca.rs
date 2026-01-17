@@ -970,32 +970,44 @@ impl Dex for Orca {
         //   - First array must contain current tick
         //   - Subsequent arrays are at HIGHER tick indices
         //
-        // The key insight: the FIRST tick array must always be the one containing
-        // the current tick, then we extend in the direction of the swap.
+        // IMPORTANT (Error 6023 fix): The cached tick_current_index may be STALE!
+        // If the price moved since the cache was updated, the tick may now be in a
+        // different array. To handle this, we provide arrays on BOTH sides of the
+        // current array, giving us tolerance for small price movements:
+        //
+        //   tick_array_0 = one array BEFORE current (lower ticks)
+        //   tick_array_1 = current array (contains cached tick)
+        //   tick_array_2 = one array AFTER current (higher ticks)
+        //
+        // This way, if the tick moved slightly in either direction, we still have
+        // the correct array in our set. The swap will use whichever arrays it needs.
+        //
+        // Note: For large swaps that traverse multiple arrays in one direction,
+        // this centered approach may not have enough range. But for our typical
+        // arbitrage amounts (0.1 SOL), this is more than sufficient.
+        let s_prev = current_array_start - ticks_per_array;  // Previous array (lower ticks)
+        let s_curr = current_array_start;                     // Current array
+        let s_next = current_array_start + ticks_per_array;   // Next array (higher ticks)
+        
         let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) = if a_to_b {
             // A->B: price decreases, ticks decrease
-            // Start from current tick's array, then lower arrays
-            let s0 = current_array_start;
-            let s1 = s0 - ticks_per_array;
-            let s2 = s1 - ticks_per_array;
+            // Put previous array first (where swap will likely end up),
+            // then current, then we include next for tolerance
             (
-                derive_tick_array_pda(&pool_id, s0),
-                derive_tick_array_pda(&pool_id, s1),
-                derive_tick_array_pda(&pool_id, s2),
-                s0, s1, s2,
+                derive_tick_array_pda(&pool_id, s_prev),  // Lower ticks (swap direction)
+                derive_tick_array_pda(&pool_id, s_curr),  // Current 
+                derive_tick_array_pda(&pool_id, s_next),  // Higher ticks (tolerance buffer)
+                s_prev, s_curr, s_next,
             )
         } else {
             // B->A: price increases, ticks increase
-            // Start from current tick's array, then higher arrays
-            // BUT: if current tick is at the boundary, we may need the previous array too
-            let s0 = current_array_start;
-            let s1 = s0 + ticks_per_array;
-            let s2 = s1 + ticks_per_array;
+            // Put next array first (where swap will likely end up),
+            // then current, then we include prev for tolerance
             (
-                derive_tick_array_pda(&pool_id, s0),
-                derive_tick_array_pda(&pool_id, s1),
-                derive_tick_array_pda(&pool_id, s2),
-                s0, s1, s2,
+                derive_tick_array_pda(&pool_id, s_next),  // Higher ticks (swap direction)
+                derive_tick_array_pda(&pool_id, s_curr),  // Current
+                derive_tick_array_pda(&pool_id, s_prev),  // Lower ticks (tolerance buffer)
+                s_next, s_curr, s_prev,
             )
         };
 
