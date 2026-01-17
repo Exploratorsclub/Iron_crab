@@ -675,13 +675,15 @@ pub async fn build_tx_plan(
             });
         }
 
+        // Use async version - Meteora DLMM requires bin array derivation
         let ixs = match meteora
-            .build_swap_ix(
+            .build_swap_ix_async(
                 &intent.resources.input_mint,
                 &intent.resources.output_mint,
                 intent.required_capital.raw,
                 min_out,
             )
+            .await
         {
             Ok(ixs) => ixs,
             Err(e) => {
