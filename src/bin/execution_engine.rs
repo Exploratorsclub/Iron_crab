@@ -2472,14 +2472,15 @@ async fn main() -> Result<()> {
     }
 
     // P1: Setup Jito client for atomic bundle execution
+    // CRITICAL: Use ALL regions in parallel for lowest latency and highest success rate
     let jito_client = if exec_config.jito_enabled && !args.dry_run {
-        let region =
-            JitoRegion::from_str(&exec_config.jito_region).unwrap_or(JitoRegion::Frankfurt);
-        let client = JitoClient::new(vec![region], exec_config.jito_tip_lamports);
+        // Use all 5 Jito regions in parallel - bundles are deduplicated by signature
+        let regions = JitoRegion::all();
+        let client = JitoClient::new(regions.clone(), exec_config.jito_tip_lamports);
         info!(
-            region = %exec_config.jito_region,
+            regions = ?regions.iter().map(|r| r.url()).collect::<Vec<_>>(),
             tip_lamports = %exec_config.jito_tip_lamports,
-            "Jito client initialized for atomic bundle execution"
+            "Jito client initialized with ALL regions for parallel submission"
         );
         Some(client)
     } else {
