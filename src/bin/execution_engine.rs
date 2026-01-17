@@ -4058,19 +4058,78 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 ixs.push(ix.clone());
             }
 
-            let tx = Transaction::new_signed_with_payer(
-                &ixs,
-                Some(&wallet_pubkey),
-                &[signer],
-                blockhash,
-            );
+            // Use VersionedTransaction with ALT if available, otherwise legacy Transaction
+            // This fixes Jito -32602 "could not be decoded" errors for ALT transactions
+            let send_result = if let Some(ref alt) = ctx.address_lookup_table {
+                // Build versioned transaction with ALT
+                // AddressLookupTableAccount, v0, VersionedMessage already imported at top
+                use solana_sdk::transaction::VersionedTransaction;
+                
+                // Convert LoadedAlt to AddressLookupTableAccount for v0::Message::try_compile
+                let alt_account = AddressLookupTableAccount {
+                    key: alt.address,
+                    addresses: alt.accounts.clone(),
+                };
+                
+                match v0::Message::try_compile(
+                    &wallet_pubkey,
+                    &ixs,
+                    &[alt_account],
+                    blockhash,
+                ) {
+                    Ok(v0_message) => {
+                        let versioned_msg = VersionedMessage::V0(v0_message);
+                        match VersionedTransaction::try_new(versioned_msg, &[signer]) {
+                            Ok(versioned_tx) => {
+                                info!(
+                                    intent_id = %intent.intent_id,
+                                    alt_address = %alt.address,
+                                    alt_accounts = alt.accounts.len(),
+                                    "Submitting versioned transaction with ALT to Jito"
+                                );
+                                jito_client.send_versioned_bundle(&[versioned_tx]).await
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "VersionedTransaction signing failed, using legacy");
+                                let tx = Transaction::new_signed_with_payer(
+                                    &ixs,
+                                    Some(&wallet_pubkey),
+                                    &[signer],
+                                    blockhash,
+                                );
+                                jito_client.send_bundle(&[tx]).await
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Fallback to legacy if ALT compile fails
+                        warn!(error = %e, "ALT message compile failed, using legacy transaction");
+                        let tx = Transaction::new_signed_with_payer(
+                            &ixs,
+                            Some(&wallet_pubkey),
+                            &[signer],
+                            blockhash,
+                        );
+                        jito_client.send_bundle(&[tx]).await
+                    }
+                }
+            } else {
+                // Legacy transaction (no ALT)
+                let tx = Transaction::new_signed_with_payer(
+                    &ixs,
+                    Some(&wallet_pubkey),
+                    &[signer],
+                    blockhash,
+                );
+                jito_client.send_bundle(&[tx]).await
+            };
 
             if let Some(tip_lamports) = bundle_tip_lamports {
                 JITO_TIP_LAMPORTS_TOTAL.fetch_add(tip_lamports, Ordering::Relaxed);
             }
             JITO_BUNDLES_SUBMITTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 
-            match jito_client.send_bundle(&[tx]).await {
+            match send_result {
                 Ok(bid) => {
                     TX_SEND_SUCCESS_TOTAL.fetch_add(1, Ordering::Relaxed);
                     sent_anything = true;

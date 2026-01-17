@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    transaction::Transaction,
+    transaction::{Transaction, VersionedTransaction},
 };
 use std::str::FromStr;
 
@@ -283,6 +283,91 @@ impl JitoClient {
                                 message = %err.message,
                                 region = ?region,
                                 "Jito bundle error"
+                            );
+                            last_error = Some(anyhow!("Jito error {}: {}", err.code, err.message));
+                        }
+                    }
+                    Err(e) => {
+                        warn!(?e, region = ?region, "Failed to parse Jito response");
+                        last_error = Some(e.into());
+                    }
+                },
+                Err(e) => {
+                    warn!(?e, region = ?region, "Failed to connect to Jito block engine");
+                    last_error = Some(e.into());
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("All Jito regions failed")))
+    }
+
+    /// Submit a bundle of versioned transactions to Jito
+    ///
+    /// Use this for transactions with Address Lookup Tables (ALTs).
+    /// Jito supports versioned transactions since v2.
+    ///
+    /// # Arguments
+    /// * `transactions` - Signed versioned transactions to submit as a bundle
+    ///
+    /// # Returns
+    /// Bundle ID if successful
+    pub async fn send_versioned_bundle(&self, transactions: &[VersionedTransaction]) -> Result<String> {
+        if transactions.is_empty() {
+            return Err(anyhow!("Cannot submit empty bundle"));
+        }
+
+        // Serialize versioned transactions to base58
+        // VersionedTransaction serializes differently from legacy Transaction
+        let serialized: Vec<String> = transactions
+            .iter()
+            .map(|tx| {
+                bs58::encode(bincode::serialize(tx).expect("Failed to serialize versioned tx")).into_string()
+            })
+            .collect();
+
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: 1,
+            method: "sendBundle".to_string(),
+            params: vec![serialized],
+        };
+
+        // Try each region in order
+        let mut last_error = None;
+        for region in &self.regions {
+            let url = format!("{}/api/v1/bundles", region.url());
+            debug!(
+                "Submitting versioned bundle to Jito {} ({} txs)",
+                region.url(),
+                transactions.len()
+            );
+
+            match self
+                .http_client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(response) => match response.json::<BundleResponse>().await {
+                    Ok(bundle_resp) => {
+                        if let Some(bundle_id) = bundle_resp.result {
+                            info!(
+                                bundle_id = %bundle_id,
+                                region = ?region,
+                                tx_count = transactions.len(),
+                                "Jito versioned bundle submitted successfully"
+                            );
+                            return Ok(bundle_id);
+                        }
+                        if let Some(err) = bundle_resp.error {
+                            warn!(
+                                code = err.code,
+                                message = %err.message,
+                                region = ?region,
+                                "Jito versioned bundle error"
                             );
                             last_error = Some(anyhow!("Jito error {}: {}", err.code, err.message));
                         }
