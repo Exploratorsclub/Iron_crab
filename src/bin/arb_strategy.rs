@@ -139,7 +139,10 @@ const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 // Maximum reasonable spread before considering it a data error
 const MAX_REASONABLE_SPREAD_BPS: i64 = 1000; // 10%
 const STABLECOIN_MAX_SPREAD_BPS: i64 = 200; // 2% for stablecoins
-const MAX_PRICE_AGE_SECS: u64 = 10; // 10s max price staleness
+/// Geyser connection is considered broken if no MarketEvent received for this duration.
+/// This is NOT about individual pool staleness - it's about connection health.
+/// If Geyser is connected but a pool has no updates, the data IS current (pool is inactive).
+const GEYSER_CONNECTION_TIMEOUT_SECS: u64 = 30;
 const MIN_TRADE_VOLUME_LAMPORTS: u64 = 100_000; // 0.0001 SOL minimum (filter dust)
 
 fn is_known_dex_label(dex: &str) -> bool {
@@ -328,22 +331,13 @@ impl TokenArbTracker {
             return None;
         }
 
-        // Filter 2: Check price staleness
-        let now = Instant::now();
-        let buy_age = now.duration_since(buy_pool.last_update).as_secs();
-        let sell_age = now.duration_since(sell_pool.last_update).as_secs();
-        if buy_age > MAX_PRICE_AGE_SECS || sell_age > MAX_PRICE_AGE_SECS {
-            debug!(
-                mint = %self.base_mint,
-                buy_age_secs = buy_age,
-                sell_age_secs = sell_age,
-                max_age = MAX_PRICE_AGE_SECS,
-                "Arb check rejected: stale price data"
-            );
-            return None;
-        }
+        // NOTE: Per-pool staleness check REMOVED.
+        // Geyser streams directly from validator - if pool has no updates, that means:
+        // - Pool is inactive (no trades/events), data IS current
+        // - RPC would have same or older data
+        // Geyser connection health is checked globally in ArbContext::is_geyser_connection_healthy()
 
-        // Filter 3: Sanity check for unrealistic spreads
+        // Filter 2: Sanity check for unrealistic spreads
         let max_spread = if self.base_mint == USDC_MINT || self.base_mint == USDT_MINT {
             STABLECOIN_MAX_SPREAD_BPS
         } else {
@@ -498,6 +492,14 @@ struct ArbContext {
     data_quality_rejects: AtomicU64,
 
     // =========================================================================
+    // Geyser Connection Health
+    // =========================================================================
+    /// Last time we received any MarketEvent from NATS (market-data → Geyser).
+    /// Used to detect Geyser connection failures. If no events for 30s, assume broken.
+    /// This is different from per-pool staleness: inactive pools are still "fresh" data.
+    last_market_event: RwLock<Instant>,
+
+    // =========================================================================
     // Geyser-based Pool State Cache (from PoolStateUpdate / BinArrayUpdate)
     // =========================================================================
     /// Vault balances cache: pool_address → (reserve_base, reserve_quote, update_slot)
@@ -530,6 +532,17 @@ impl ArbContext {
     fn next_intent_id(&self) -> String {
         let n = self.intent_counter.fetch_add(1, Ordering::Relaxed);
         format!("arb-{}-{:06}", &self.run_id[..8], n)
+    }
+
+    /// Check if the Geyser connection is healthy.
+    /// Returns true if we received a MarketEvent within GEYSER_CONNECTION_TIMEOUT_SECS.
+    ///
+    /// This is different from per-pool staleness:
+    /// - Geyser streams directly from validator, no updates = pool inactive (data IS current)
+    /// - If NO events at all, Geyser/NATS connection is broken
+    fn is_geyser_connection_healthy(&self) -> bool {
+        let last_event = *self.last_market_event.read();
+        last_event.elapsed().as_secs() < GEYSER_CONNECTION_TIMEOUT_SECS
     }
 
     /// P1: Apply config update from control-plane (Runtime Configuration via UI)
@@ -967,6 +980,17 @@ impl ArbContext {
         pool.last_update = Instant::now();
         info!(pool = %pool_address, mint = %mint, dex = %pool.dex, price = %price, "Pool price updated");
 
+        // Global Geyser connection health check (replaces per-pool staleness)
+        // If no MarketEvents received for 30s, connection is broken - don't trade
+        if !self.is_geyser_connection_healthy() {
+            warn!(
+                mint = %mint,
+                timeout_secs = GEYSER_CONNECTION_TIMEOUT_SECS,
+                "Arb rejected: Geyser connection unhealthy (no events received)"
+            );
+            return None;
+        }
+
         // Check for arbitrage opportunity
         if let Some(opp) = tracker.check_arbitrage(&config) {
             // Check cooldown
@@ -1252,6 +1276,7 @@ async fn main() -> Result<()> {
         intent_counter: AtomicU64::new(0),
         zero_amount_trades: AtomicU64::new(0),
         data_quality_rejects: AtomicU64::new(0),
+        last_market_event: RwLock::new(Instant::now()),
         vault_balances: RwLock::new(HashMap::new()),
         bin_arrays: RwLock::new(HashMap::new()),
     });
@@ -1423,6 +1448,9 @@ async fn main() -> Result<()> {
 
 /// Handle a single MarketEvent
 async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<TradeIntent> {
+    // Update Geyser connection health timestamp on every event
+    *ctx.last_market_event.write() = Instant::now();
+
     // Debug: Log event type to verify Trade events are arriving
     match &event.kind {
         MarketEventKind::Trade {

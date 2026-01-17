@@ -526,9 +526,18 @@ impl CrossDexHandler {
             .unwrap_or(0);
         let strategy_profit = intent
             .metadata
-            .get("expected_profit_lamports")
+            .get("estimated_profit_lamports")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
+        
+        // Get buy_price from intent metadata (SOL per token)
+        // This is needed to compute expected token output for sell leg
+        let buy_price_str = intent
+            .metadata
+            .get("buy_price")
+            .cloned()
+            .unwrap_or_else(|| "0".to_string());
+        let buy_price: f64 = buy_price_str.parse().unwrap_or(0.0);
 
         info!(
             buy_dex = %buy_dex,
@@ -536,14 +545,37 @@ impl CrossDexHandler {
             buy_pool = %buy_pool,
             sell_pool = %sell_pool,
             trade_amount,
+            buy_price,
             strategy_spread_bps,
             strategy_profit,
             "OPTION B: Trusting arb-strategy spread (simulation will validate)"
         );
 
-        // Build placeholder quotes for build_swap_plan (values not used for min_out anymore)
+        // Calculate expected token output from buy leg
+        // buy_price = SOL per token → tokens_out = sol_in / buy_price
+        // If buy_price is 0 or invalid, use a conservative estimate
+        let expected_tokens_out: u64 = if buy_price > 0.0 {
+            // trade_amount is in lamports (1e9), buy_price is SOL/token
+            // tokens = lamports / 1e9 / buy_price * 1e6 (assuming 6 decimals for pump tokens)
+            let sol_amount = trade_amount as f64 / 1_000_000_000.0;
+            let tokens = sol_amount / buy_price;
+            // Convert to token smallest unit (6 decimals for pump.fun tokens)
+            (tokens * 1_000_000.0) as u64
+        } else {
+            // Fallback: can't compute without price, use trade_amount as estimate
+            // This will likely fail simulation but provides a reasonable default
+            warn!(
+                buy_price,
+                trade_amount,
+                "buy_price missing or zero, using trade_amount as token estimate"
+            );
+            trade_amount
+        };
+
+        // Build quotes for build_swap_plan
+        // buy_quote.amount_out is used as sell_amount_in for the sell leg
         let buy_quote = Quote {
-            amount_out: 1, // Placeholder - simulation will show real output
+            amount_out: expected_tokens_out, // Expected token output from buy
             price_impact_bps: 0,
             route: vec![buy_pool.clone()],
             fee_bps: 30,
