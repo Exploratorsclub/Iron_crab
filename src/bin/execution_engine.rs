@@ -3906,6 +3906,16 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // === P1: Check if bundle required for atomic execution ===
     let requires_bundle = intent.requires_bundle();
 
+    // Debug: Log bundle requirement and send_enabled status
+    info!(
+        intent_id = %intent.intent_id,
+        requires_bundle = %requires_bundle,
+        send_enabled = %config.send_enabled,
+        jito_configured = %ctx.jito_client.is_some(),
+        bundle_tip_in_intent = ?intent.bundle_tip_lamports,
+        "Bundle requirement check"
+    );
+
     let wallet_pubkey = ctx
         .wallet_pubkey
         .expect("wallet_pubkey must be present after successful planning");
@@ -3931,6 +3941,11 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         let tip_lamports = intent
             .bundle_tip_lamports
             .unwrap_or(config.jito_tip_lamports);
+        info!(
+            intent_id = %intent.intent_id,
+            tip_lamports = %tip_lamports,
+            "Building Jito tip instruction for bundle"
+        );
         let jito_client = ctx
             .jito_client
             .as_ref()
@@ -3938,6 +3953,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
         match jito_client.build_tip_instruction(&wallet_pubkey, tip_lamports) {
             Ok(ix) => {
+                info!(
+                    intent_id = %intent.intent_id,
+                    tip_lamports = %tip_lamports,
+                    tip_account = %ix.accounts[0].pubkey,
+                    "✅ Tip instruction built successfully"
+                );
                 bundle_tip_ix = Some(ix);
                 bundle_tip_lamports = Some(tip_lamports);
             }
@@ -3953,6 +3974,13 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
             }
         }
+    } else {
+        info!(
+            intent_id = %intent.intent_id,
+            requires_bundle = %requires_bundle,
+            send_enabled = %config.send_enabled,
+            "⚠️ NOT building tip instruction (condition not met)"
+        );
     }
 
     let tx_plan_for_sim = if let Some(ref ix) = bundle_tip_ix {
