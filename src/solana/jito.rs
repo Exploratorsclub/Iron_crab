@@ -248,58 +248,105 @@ impl JitoClient {
             params: vec![serialized],
         };
 
-        // Try each region in order
-        let mut last_error = None;
-        for region in &self.regions {
-            let url = format!("{}/api/v1/bundles", region.url());
-            debug!(
-                "Submitting bundle to Jito {} ({} txs)",
-                region.url(),
-                transactions.len()
-            );
+        // Submit to ALL regions in PARALLEL for lowest latency
+        // Jito bundles are idempotent (deduplicated by tx signature hash)
+        // so parallel submission is safe and recommended
+        self.submit_to_all_regions_parallel(&request, transactions.len(), "legacy").await
+    }
 
-            match self
-                .http_client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .json(&request)
-                .send()
-                .await
-            {
-                Ok(response) => match response.json::<BundleResponse>().await {
-                    Ok(bundle_resp) => {
-                        if let Some(bundle_id) = bundle_resp.result {
-                            info!(
-                                bundle_id = %bundle_id,
-                                region = ?region,
-                                tx_count = transactions.len(),
-                                "Jito bundle submitted successfully"
-                            );
-                            return Ok(bundle_id);
+    /// Internal helper: submit request to all regions in parallel, return first success
+    async fn submit_to_all_regions_parallel(
+        &self,
+        request: &JsonRpcRequest<Vec<Vec<String>>>,
+        tx_count: usize,
+        tx_type: &str,
+    ) -> Result<String> {
+        use futures::future::join_all;
+
+        let futures: Vec<_> = self.regions.iter().map(|region| {
+            let url = format!("{}/api/v1/bundles", region.url());
+            let client = self.http_client.clone();
+            let request_clone = serde_json::to_string(request).expect("serialize request");
+            let region_clone = *region;
+            
+            async move {
+                debug!(
+                    "Submitting {} bundle to Jito {} ({} txs)",
+                    tx_type,
+                    region_clone.url(),
+                    tx_count
+                );
+
+                let result = client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .body(request_clone)
+                    .send()
+                    .await;
+
+                match result {
+                    Ok(response) => match response.json::<BundleResponse>().await {
+                        Ok(bundle_resp) => {
+                            if let Some(bundle_id) = bundle_resp.result {
+                                info!(
+                                    bundle_id = %bundle_id,
+                                    region = ?region_clone,
+                                    tx_count,
+                                    tx_type,
+                                    "Jito bundle submitted successfully"
+                                );
+                                return Ok(bundle_id);
+                            }
+                            if let Some(err) = bundle_resp.error {
+                                // Rate limit errors are common, only debug log them
+                                if err.code == -32097 {
+                                    debug!(
+                                        code = err.code,
+                                        message = %err.message,
+                                        region = ?region_clone,
+                                        "Jito region rate limited"
+                                    );
+                                } else {
+                                    warn!(
+                                        code = err.code,
+                                        message = %err.message,
+                                        region = ?region_clone,
+                                        "Jito bundle error"
+                                    );
+                                }
+                                Err(anyhow!("Jito error {}: {}", err.code, err.message))
+                            } else {
+                                Err(anyhow!("Jito returned neither result nor error"))
+                            }
                         }
-                        if let Some(err) = bundle_resp.error {
-                            warn!(
-                                code = err.code,
-                                message = %err.message,
-                                region = ?region,
-                                "Jito bundle error"
-                            );
-                            last_error = Some(anyhow!("Jito error {}: {}", err.code, err.message));
+                        Err(e) => {
+                            warn!(?e, region = ?region_clone, "Failed to parse Jito response");
+                            Err(e.into())
                         }
-                    }
+                    },
                     Err(e) => {
-                        warn!(?e, region = ?region, "Failed to parse Jito response");
-                        last_error = Some(e.into());
+                        warn!(?e, region = ?region_clone, "Failed to connect to Jito block engine");
+                        Err(e.into())
                     }
-                },
-                Err(e) => {
-                    warn!(?e, region = ?region, "Failed to connect to Jito block engine");
-                    last_error = Some(e.into());
                 }
+            }
+        }).collect();
+
+        // Wait for all requests to complete
+        let results = join_all(futures).await;
+
+        // Return first success, or collect all errors
+        let mut errors = Vec::new();
+        for result in results {
+            match result {
+                Ok(bundle_id) => return Ok(bundle_id),
+                Err(e) => errors.push(e),
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow!("All Jito regions failed")))
+        // All failed - return combined error
+        let error_summary: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+        Err(anyhow!("All Jito regions failed: {}", error_summary.join("; ")))
     }
 
     /// Submit a bundle of versioned transactions to Jito
@@ -333,58 +380,10 @@ impl JitoClient {
             params: vec![serialized],
         };
 
-        // Try each region in order
-        let mut last_error = None;
-        for region in &self.regions {
-            let url = format!("{}/api/v1/bundles", region.url());
-            debug!(
-                "Submitting versioned bundle to Jito {} ({} txs)",
-                region.url(),
-                transactions.len()
-            );
-
-            match self
-                .http_client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .json(&request)
-                .send()
-                .await
-            {
-                Ok(response) => match response.json::<BundleResponse>().await {
-                    Ok(bundle_resp) => {
-                        if let Some(bundle_id) = bundle_resp.result {
-                            info!(
-                                bundle_id = %bundle_id,
-                                region = ?region,
-                                tx_count = transactions.len(),
-                                "Jito versioned bundle submitted successfully"
-                            );
-                            return Ok(bundle_id);
-                        }
-                        if let Some(err) = bundle_resp.error {
-                            warn!(
-                                code = err.code,
-                                message = %err.message,
-                                region = ?region,
-                                "Jito versioned bundle error"
-                            );
-                            last_error = Some(anyhow!("Jito error {}: {}", err.code, err.message));
-                        }
-                    }
-                    Err(e) => {
-                        warn!(?e, region = ?region, "Failed to parse Jito response");
-                        last_error = Some(e.into());
-                    }
-                },
-                Err(e) => {
-                    warn!(?e, region = ?region, "Failed to connect to Jito block engine");
-                    last_error = Some(e.into());
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| anyhow!("All Jito regions failed")))
+        // Submit to ALL regions in PARALLEL for lowest latency
+        // Jito bundles are idempotent (deduplicated by tx signature hash)
+        // so parallel submission is safe and recommended
+        self.submit_to_all_regions_parallel(&request, transactions.len(), "versioned").await
     }
 
     /// Check bundle status
