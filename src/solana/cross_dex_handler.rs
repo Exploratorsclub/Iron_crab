@@ -560,7 +560,20 @@ impl CrossDexHandler {
             let sol_amount = trade_amount as f64 / 1_000_000_000.0;
             let tokens = sol_amount / buy_price;
             // Convert to token smallest unit (6 decimals for pump.fun tokens)
-            (tokens * 1_000_000.0) as u64
+            // Apply 3% safety margin to account for fees, slippage, and price impact
+            // The actual buy output may be slightly less than expected due to:
+            // - DEX swap fees (~0.25-1%)
+            // - Price impact from trade size
+            // - Price movement between quote and execution
+            let raw_tokens = (tokens * 1_000_000.0) as u64;
+            let with_safety = (raw_tokens as f64 * 0.97) as u64;
+            info!(
+                raw_tokens,
+                with_safety,
+                safety_margin_pct = 3,
+                "Applied safety margin to expected_tokens_out"
+            );
+            with_safety
         } else {
             // Fallback: can't compute without price, use trade_amount as estimate
             // This will likely fail simulation but provides a reasonable default
@@ -575,7 +588,7 @@ impl CrossDexHandler {
         // Build quotes for build_swap_plan
         // buy_quote.amount_out is used as sell_amount_in for the sell leg
         let buy_quote = Quote {
-            amount_out: expected_tokens_out, // Expected token output from buy
+            amount_out: expected_tokens_out, // Expected token output from buy (with safety margin)
             price_impact_bps: 0,
             route: vec![buy_pool.clone()],
             fee_bps: 30,
