@@ -786,11 +786,9 @@ impl CrossDexHandler {
         intent: &TradeIntent,
         validation: &CrossDexValidation,
     ) -> Result<CrossDexSwapPlan> {
-        // NOTE: buy_quote/sell_quote are available in validation but NOT used for min_out
-        // calculation anymore. We use min_out=1 for atomic arb bundles (Option B).
-        // They're still validated by validate_cross_dex_intent() before we get here.
-        // sell_quote.amount_out is used for expected_output_sol_lamports estimate (logging only).
-        let _buy_quote = validation
+        // buy_quote.amount_out is the expected token output from buy leg
+        // This is used as amount_in for the sell leg
+        let buy_quote = validation
             .buy_quote
             .as_ref()
             .ok_or_else(|| anyhow!("No buy quote for swap plan"))?;
@@ -1122,10 +1120,28 @@ impl CrossDexHandler {
             }
         }
 
-        // IMPORTANT: sell the guaranteed minimum tokens (buy_min_out), not the optimistic
-        // quoted output. Otherwise the second leg may fail due to insufficient token balance.
+        // ====================================================================
+        // SELL AMOUNT: Use expected token output from buy leg (buy_quote.amount_out)
+        // ====================================================================
+        // For atomic arb bundles:
+        // - Buy leg: SOL → Token (receives buy_quote.amount_out tokens)
+        // - Sell leg: Token → SOL (sells those tokens)
+        //
+        // The sell_amount_in should be the EXPECTED buy output, not the minimum.
+        // If buy gets more tokens than expected, we still only sell the expected amount.
+        // If buy gets fewer tokens, the sell will fail (no tokens to sell).
+        // This is intentional: the simulation will catch this case.
+        let sell_amount_in = buy_quote.amount_out;
+        
+        info!(
+            sell_amount_in,
+            buy_quote_amount_out = buy_quote.amount_out,
+            sell_min_out,
+            "Building sell instruction with expected buy output as amount_in"
+        );
+
         let sell_instructions = sell_connector
-            .build_swap_ix_async(token_mint, SOL_MINT, buy_min_out, sell_min_out)
+            .build_swap_ix_async(token_mint, SOL_MINT, sell_amount_in, sell_min_out)
             .await?;
 
         // Combine: ATA creation + wrap SOL (if any) + buy swap + sell swap
