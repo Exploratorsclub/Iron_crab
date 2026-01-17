@@ -4,18 +4,18 @@
 //!
 //! - Pool Discovery gehört NUR in market-data (Data Plane)
 //! - execution-engine macht KEINE RPC-basierte Pool Discovery
-//! - Quote-Berechnungen werden von arb-strategy gemacht (hat Geyser-Daten)
-//! - execution-engine verwendet Intent-Daten für Validierung
+//! - **GEYSER-FIRST: Quotes werden aus LivePoolCache berechnet (Geyser-fed)**
+//! - arb-strategy liefert nur Pool-Adressen und DEX-Typ
 //! - Nur `build_swap_ix()` darf RPC verwenden (für Instruction Building)
 //!
 //! Handles arbitrage intents by:
-//! 1. Validating intent data (TTL, spread from arb-strategy)
-//! 2. Building swap instructions using DEX connectors
-//! 3. Creating atomic Jito bundle
+//! 1. **Computing fresh quotes from LivePoolCache (Geyser data)**
+//! 2. Validating spread and profitability with fresh data
+//! 3. Building swap instructions using DEX connectors
+//! 4. Creating atomic Jito bundle
 //!
 //! **NICHT** zuständig für:
 //! - Pool Discovery (das macht market-data via Geyser)
-//! - Quote-Berechnung (das macht arb-strategy)
 //! - RPC getProgramAccounts calls
 
 use anyhow::{anyhow, Result};
@@ -407,14 +407,14 @@ impl CrossDexHandler {
         self.pool_cache.as_ref()?.get_pumpfun_creator(bonding_curve)
     }
 
-    /// Validate a cross-DEX arbitrage opportunity using INTENT DATA ONLY
+    /// Validate a cross-DEX arbitrage opportunity using LIVEPOOL CACHE (GEYSER-FED)
     ///
     /// **ARCHITECTURE COMPLIANCE (TARGET_ARCHITECTURE.md Section 4.2):**
-    /// - NO RPC calls for quotes (arb-strategy already computed them via Geyser data)
-    /// - Uses spread_bps, estimated_profit_lamports from intent metadata
-    /// - Only validates: TTL, spread threshold, profit threshold
+    /// - **GEYSER-FIRST: Quotes computed fresh from LivePoolCache reserves**
+    /// - NO stale price data from arb-strategy intent metadata
+    /// - Validates spread and profit with real-time Geyser data
     ///
-    /// arb-strategy is the SOURCE OF TRUTH for price/quote data.
+    /// LivePoolCache is the SOURCE OF TRUTH for reserve data.
     pub async fn validate_arb_opportunity(
         &self,
         intent: &TradeIntent,
@@ -432,22 +432,12 @@ impl CrossDexHandler {
             });
         }
 
-        // Extract data from intent metadata (computed by arb-strategy via Geyser)
+        // Extract DEX types from intent metadata
         let buy_dex = intent.metadata.get("buy_dex").cloned().unwrap_or_default();
         let sell_dex = intent.metadata.get("sell_dex").cloned().unwrap_or_default();
-        
-        // Parse spread and profit from intent - arb-strategy computed these
-        let spread_bps: i64 = intent
-            .metadata
-            .get("spread_bps")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(intent.expected_roi_bps as i64);
-            
-        let estimated_profit: i64 = intent
-            .metadata
-            .get("estimated_profit_lamports")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let buy_pool = &pools[0];
+        let sell_pool = &pools[1];
+        let trade_amount = intent.required_capital.raw;
 
         // Verify DEX names are known
         if !buy_dex.is_empty() && !self.dexes.contains_key(&buy_dex) {
@@ -455,9 +445,9 @@ impl CrossDexHandler {
                 is_valid: false,
                 buy_quote: None,
                 sell_quote: None,
-                actual_spread_bps: spread_bps,
-                estimated_profit_lamports: estimated_profit,
-                reject_reason: Some(format!("Unknown buy DEX: {} (not registered for IX building)", buy_dex)),
+                actual_spread_bps: 0,
+                estimated_profit_lamports: 0,
+                reject_reason: Some(format!("Unknown buy DEX: {}", buy_dex)),
             });
         }
 
@@ -466,19 +456,145 @@ impl CrossDexHandler {
                 is_valid: false,
                 buy_quote: None,
                 sell_quote: None,
-                actual_spread_bps: spread_bps,
-                estimated_profit_lamports: estimated_profit,
-                reject_reason: Some(format!("Unknown sell DEX: {} (not registered for IX building)", sell_dex)),
+                actual_spread_bps: 0,
+                estimated_profit_lamports: 0,
+                reject_reason: Some(format!("Unknown sell DEX: {}", sell_dex)),
             });
         }
 
-        debug!(
+        // ====================================================================
+        // GEYSER-FIRST: Compute quotes from LivePoolCache reserves
+        // ====================================================================
+        let cache = match &self.pool_cache {
+            Some(c) => c,
+            None => {
+                return Ok(CrossDexValidation {
+                    is_valid: false,
+                    buy_quote: None,
+                    sell_quote: None,
+                    actual_spread_bps: 0,
+                    estimated_profit_lamports: 0,
+                    reject_reason: Some("LivePoolCache not available (GEYSER-FIRST violation)".to_string()),
+                });
+            }
+        };
+
+        // Parse pool addresses
+        let buy_pool_pk = Pubkey::from_str(buy_pool)
+            .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
+        let sell_pool_pk = Pubkey::from_str(sell_pool)
+            .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;
+
+        // Get fresh pool state from cache
+        let buy_state = cache.get_with_metadata(&buy_pool_pk);
+        let sell_state = cache.get_with_metadata(&sell_pool_pk);
+
+        if buy_state.is_none() {
+            return Ok(CrossDexValidation {
+                is_valid: false,
+                buy_quote: None,
+                sell_quote: None,
+                actual_spread_bps: 0,
+                estimated_profit_lamports: 0,
+                reject_reason: Some(format!("Buy pool {} not in LivePoolCache", buy_pool)),
+            });
+        }
+
+        if sell_state.is_none() {
+            return Ok(CrossDexValidation {
+                is_valid: false,
+                buy_quote: None,
+                sell_quote: None,
+                actual_spread_bps: 0,
+                estimated_profit_lamports: 0,
+                reject_reason: Some(format!("Sell pool {} not in LivePoolCache", sell_pool)),
+            });
+        }
+
+        let (buy_cached, _buy_slot, buy_age_ms) = buy_state.unwrap();
+        let (sell_cached, _sell_slot, sell_age_ms) = sell_state.unwrap();
+
+        // Reject stale data (>5 seconds)
+        const MAX_CACHE_AGE_MS: u64 = 5000;
+        if buy_age_ms > MAX_CACHE_AGE_MS || sell_age_ms > MAX_CACHE_AGE_MS {
+            return Ok(CrossDexValidation {
+                is_valid: false,
+                buy_quote: None,
+                sell_quote: None,
+                actual_spread_bps: 0,
+                estimated_profit_lamports: 0,
+                reject_reason: Some(format!(
+                    "Cache data too stale: buy={}ms sell={}ms (max={}ms)",
+                    buy_age_ms, sell_age_ms, MAX_CACHE_AGE_MS
+                )),
+            });
+        }
+
+        // Calculate BUY quote: SOL -> Token
+        let buy_result = self.compute_buy_quote_from_cache(&buy_cached, &buy_dex, trade_amount);
+        let (tokens_out, buy_reserve_sol, buy_reserve_token) = match buy_result {
+            Some(r) => r,
+            None => {
+                return Ok(CrossDexValidation {
+                    is_valid: false,
+                    buy_quote: None,
+                    sell_quote: None,
+                    actual_spread_bps: 0,
+                    estimated_profit_lamports: 0,
+                    reject_reason: Some(format!(
+                        "Cannot compute buy quote from cache: dex={} pool={}",
+                        buy_dex, buy_pool
+                    )),
+                });
+            }
+        };
+
+        // Calculate SELL quote: Token -> SOL
+        let sell_result = self.compute_sell_quote_from_cache(&sell_cached, &sell_dex, tokens_out);
+        let (sol_out, sell_reserve_sol, sell_reserve_token) = match sell_result {
+            Some(r) => r,
+            None => {
+                return Ok(CrossDexValidation {
+                    is_valid: false,
+                    buy_quote: None,
+                    sell_quote: None,
+                    actual_spread_bps: 0,
+                    estimated_profit_lamports: 0,
+                    reject_reason: Some(format!(
+                        "Cannot compute sell quote from cache: dex={} pool={}",
+                        sell_dex, sell_pool
+                    )),
+                });
+            }
+        };
+
+        // Calculate actual spread and profit
+        let gross_profit = sol_out as i64 - trade_amount as i64;
+        let net_profit = gross_profit - tx_cost_lamports as i64;
+        let spread_bps = if trade_amount > 0 {
+            (gross_profit * 10000) / trade_amount as i64
+        } else {
+            0
+        };
+
+        info!(
             buy_dex = %buy_dex,
             sell_dex = %sell_dex,
-            spread_bps = spread_bps,
-            estimated_profit = estimated_profit,
-            tx_cost = tx_cost_lamports,
-            "Validating cross-DEX arb from intent metadata (no RPC re-quote)"
+            buy_pool = %buy_pool,
+            sell_pool = %sell_pool,
+            trade_amount,
+            tokens_out,
+            sol_out,
+            spread_bps,
+            gross_profit,
+            net_profit,
+            buy_age_ms,
+            sell_age_ms,
+            buy_reserve_sol,
+            buy_reserve_token,
+            sell_reserve_sol,
+            sell_reserve_token,
+            "GEYSER-FIRST: Fresh arb validation from LivePoolCache"
         );
 
         // Validate spread threshold
@@ -488,16 +604,15 @@ impl CrossDexHandler {
                 buy_quote: None,
                 sell_quote: None,
                 actual_spread_bps: spread_bps,
-                estimated_profit_lamports: estimated_profit,
+                estimated_profit_lamports: gross_profit,
                 reject_reason: Some(format!(
-                    "Spread too low: {}bps < {}bps minimum",
+                    "Fresh spread too low: {}bps < {}bps minimum",
                     spread_bps, MIN_EXECUTION_SPREAD_BPS
                 )),
             });
         }
 
         // Validate profit after tx costs
-        let net_profit = estimated_profit - tx_cost_lamports as i64;
         if net_profit <= 0 {
             return Ok(CrossDexValidation {
                 is_valid: false,
@@ -506,95 +621,36 @@ impl CrossDexHandler {
                 actual_spread_bps: spread_bps,
                 estimated_profit_lamports: net_profit,
                 reject_reason: Some(format!(
-                    "Not profitable after tx costs: {} - {} = {} lamports",
-                    estimated_profit, tx_cost_lamports, net_profit
+                    "Not profitable with fresh quotes: {} - {} = {} lamports",
+                    gross_profit, tx_cost_lamports, net_profit
                 )),
             });
         }
 
-        // Create placeholder quotes from intent metadata
-        // These are used by build_swap_plan for slippage calculation
-        let trade_amount = intent.required_capital.raw;
-        let buy_price: f64 = intent
-            .metadata
-            .get("buy_price")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
-        let sell_price: f64 = intent
-            .metadata
-            .get("sell_price")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
-
-        // Estimate token amount from price
-        // buy_price = SOL per token (e.g., 0.00492)
-        // trade_amount = lamports (e.g., 100_000_000 = 0.1 SOL)
-        // tokens_ui = (trade_amount / 1e9) / buy_price = SOL_amount / buy_price
-        // Most pump/meme tokens use 6 decimals, assume this as default
-        let token_decimals = 6i32;
-        let sol_amount = trade_amount as f64 / 1e9;
-        let estimated_tokens = if buy_price > 0.0 {
-            let tokens_ui = sol_amount / buy_price;
-            (tokens_ui * 10f64.powi(token_decimals)) as u64
-        } else {
-            0
-        };
-
-        // Estimate SOL output from selling tokens (in lamports)
-        // sell_price = SOL per token
-        // sol_out_ui = tokens_ui * sell_price
-        // sol_out_lamports = sol_out_ui * 1e9
-        let estimated_sol_out = if sell_price > 0.0 && estimated_tokens > 0 {
-            let tokens_ui = estimated_tokens as f64 / 10f64.powi(token_decimals);
-            let sol_out_ui = tokens_ui * sell_price;
-            (sol_out_ui * 1e9) as u64
-        } else {
-            0
-        };
-        
-        debug!(
-            buy_price,
-            sell_price,
-            trade_amount,
-            sol_amount,
-            estimated_tokens,
-            estimated_sol_out,
-            token_decimals,
-            "Cross-DEX quote calculation (assuming {} decimals)", token_decimals
-        );
-
+        // Build quotes for build_swap_plan
         let buy_quote = Quote {
-            amount_out: estimated_tokens,
+            amount_out: tokens_out,
             price_impact_bps: 0,
-            route: vec![pools[0].clone()],
-            fee_bps: 30, // Default estimate
-            in_reserve: 0,
-            out_reserve: 0,
+            route: vec![buy_pool.clone()],
+            fee_bps: 30,
+            in_reserve: buy_reserve_sol as u128,
+            out_reserve: buy_reserve_token as u128,
             input_mint: SOL_MINT.to_string(),
             output_mint: intent.resources.output_mint.clone(),
             tick_spacing: None,
         };
 
         let sell_quote = Quote {
-            amount_out: estimated_sol_out,
+            amount_out: sol_out,
             price_impact_bps: 0,
-            route: vec![pools[1].clone()],
+            route: vec![sell_pool.clone()],
             fee_bps: 30,
-            in_reserve: 0,
-            out_reserve: 0,
+            in_reserve: sell_reserve_token as u128,
+            out_reserve: sell_reserve_sol as u128,
             input_mint: intent.resources.output_mint.clone(),
             output_mint: SOL_MINT.to_string(),
             tick_spacing: None,
         };
-
-        info!(
-            spread_bps = spread_bps,
-            estimated_profit = estimated_profit,
-            net_profit = net_profit,
-            buy_dex = %buy_dex,
-            sell_dex = %sell_dex,
-            "Cross-DEX arb validation PASSED (using intent data, no RPC)"
-        );
 
         Ok(CrossDexValidation {
             is_valid: true,
@@ -604,6 +660,204 @@ impl CrossDexHandler {
             estimated_profit_lamports: net_profit,
             reject_reason: None,
         })
+    }
+
+    /// Compute BUY quote (SOL -> Token) from cached pool state
+    /// Returns (tokens_out, reserve_sol, reserve_token) or None if cannot compute
+    fn compute_buy_quote_from_cache(
+        &self,
+        state: &CachedPoolState,
+        _dex: &str,
+        sol_in_lamports: u64,
+    ) -> Option<(u64, u64, u64)> {
+        let amount_in = sol_in_lamports as u128;
+
+        match state {
+            CachedPoolState::PumpAmm(s) => {
+                let reserve_sol = s.quote_reserve? as u128; // quote = SOL
+                let reserve_token = s.base_reserve? as u128; // base = Token
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                // Constant product with 0.25% fee
+                let amount_after_fee = amount_in * 9975 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_sol = reserve_sol + amount_after_fee;
+                let new_reserve_token = k / new_reserve_sol;
+                let tokens_out = reserve_token.saturating_sub(new_reserve_token) as u64;
+                Some((tokens_out, reserve_sol as u64, reserve_token as u64))
+            }
+            CachedPoolState::Meteora(s) => {
+                let reserve_sol = s.reserve_y_balance? as u128;
+                let reserve_token = s.reserve_x_balance? as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                // DLMM approximation with 0.30% fee + 20% buffer for bin concentration
+                let amount_after_fee = amount_in * 9970 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_sol = reserve_sol + amount_after_fee;
+                let new_reserve_token = k / new_reserve_sol;
+                let raw_out = reserve_token.saturating_sub(new_reserve_token) as u64;
+                let tokens_out = raw_out.saturating_mul(80) / 100; // 20% buffer for DLMM
+                Some((tokens_out, reserve_sol as u64, reserve_token as u64))
+            }
+            CachedPoolState::Orca(s) => {
+                let reserve_sol = s.vault_b_balance? as u128;
+                let reserve_token = s.vault_a_balance? as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                // Concentrated liquidity approximation with 0.30% fee + 15% buffer
+                let amount_after_fee = amount_in * 9970 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_sol = reserve_sol + amount_after_fee;
+                let new_reserve_token = k / new_reserve_sol;
+                let raw_out = reserve_token.saturating_sub(new_reserve_token) as u64;
+                let tokens_out = raw_out.saturating_mul(85) / 100; // 15% buffer
+                Some((tokens_out, reserve_sol as u64, reserve_token as u64))
+            }
+            CachedPoolState::RaydiumAmm(s) => {
+                let reserve_sol = s.pc_reserve.unwrap_or(0) as u128;
+                let reserve_token = s.coin_reserve.unwrap_or(0) as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                // Constant product with 0.25% fee
+                let amount_after_fee = amount_in * 9975 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_sol = reserve_sol + amount_after_fee;
+                let new_reserve_token = k / new_reserve_sol;
+                let tokens_out = reserve_token.saturating_sub(new_reserve_token) as u64;
+                Some((tokens_out, reserve_sol as u64, reserve_token as u64))
+            }
+            CachedPoolState::RaydiumCpmm(s) => {
+                let reserve_sol = s.reserve_1.unwrap_or(0) as u128;
+                let reserve_token = s.reserve_0.unwrap_or(0) as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                // CPMM with 0.25% fee
+                let amount_after_fee = amount_in * 9975 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_sol = reserve_sol + amount_after_fee;
+                let new_reserve_token = k / new_reserve_sol;
+                let tokens_out = reserve_token.saturating_sub(new_reserve_token) as u64;
+                Some((tokens_out, reserve_sol as u64, reserve_token as u64))
+            }
+            CachedPoolState::PumpFun(s) => {
+                // PumpFun bonding curve uses virtual reserves
+                let reserve_sol = s.virtual_sol_reserves as u128;
+                let reserve_token = s.virtual_token_reserves as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                // Bonding curve with 1% fee
+                let amount_after_fee = amount_in * 9900 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_sol = reserve_sol + amount_after_fee;
+                let new_reserve_token = k / new_reserve_sol;
+                let tokens_out = reserve_token.saturating_sub(new_reserve_token) as u64;
+                Some((tokens_out, reserve_sol as u64, reserve_token as u64))
+            }
+        }
+    }
+
+    /// Compute SELL quote (Token -> SOL) from cached pool state
+    /// Returns (sol_out, reserve_sol, reserve_token) or None if cannot compute
+    fn compute_sell_quote_from_cache(
+        &self,
+        state: &CachedPoolState,
+        _dex: &str,
+        tokens_in: u64,
+    ) -> Option<(u64, u64, u64)> {
+        let amount_in = tokens_in as u128;
+
+        match state {
+            CachedPoolState::PumpAmm(s) => {
+                let reserve_token = s.base_reserve? as u128;
+                let reserve_sol = s.quote_reserve? as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                // Constant product with 0.25% fee
+                let amount_after_fee = amount_in * 9975 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_token = reserve_token + amount_after_fee;
+                let new_reserve_sol = k / new_reserve_token;
+                let sol_out = reserve_sol.saturating_sub(new_reserve_sol) as u64;
+                Some((sol_out, reserve_sol as u64, reserve_token as u64))
+            }
+            CachedPoolState::Meteora(s) => {
+                let reserve_token = s.reserve_x_balance? as u128;
+                let reserve_sol = s.reserve_y_balance? as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                // DLMM approximation with 0.30% fee + 20% buffer
+                let amount_after_fee = amount_in * 9970 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_token = reserve_token + amount_after_fee;
+                let new_reserve_sol = k / new_reserve_token;
+                let raw_out = reserve_sol.saturating_sub(new_reserve_sol) as u64;
+                let sol_out = raw_out.saturating_mul(80) / 100;
+                Some((sol_out, reserve_sol as u64, reserve_token as u64))
+            }
+            CachedPoolState::Orca(s) => {
+                let reserve_token = s.vault_a_balance? as u128;
+                let reserve_sol = s.vault_b_balance? as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                // Concentrated liquidity approximation with 15% buffer
+                let amount_after_fee = amount_in * 9970 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_token = reserve_token + amount_after_fee;
+                let new_reserve_sol = k / new_reserve_token;
+                let raw_out = reserve_sol.saturating_sub(new_reserve_sol) as u64;
+                let sol_out = raw_out.saturating_mul(85) / 100;
+                Some((sol_out, reserve_sol as u64, reserve_token as u64))
+            }
+            CachedPoolState::RaydiumAmm(s) => {
+                let reserve_token = s.coin_reserve.unwrap_or(0) as u128;
+                let reserve_sol = s.pc_reserve.unwrap_or(0) as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                let amount_after_fee = amount_in * 9975 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_token = reserve_token + amount_after_fee;
+                let new_reserve_sol = k / new_reserve_token;
+                let sol_out = reserve_sol.saturating_sub(new_reserve_sol) as u64;
+                Some((sol_out, reserve_sol as u64, reserve_token as u64))
+            }
+            CachedPoolState::RaydiumCpmm(s) => {
+                let reserve_token = s.reserve_0.unwrap_or(0) as u128;
+                let reserve_sol = s.reserve_1.unwrap_or(0) as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                let amount_after_fee = amount_in * 9975 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_token = reserve_token + amount_after_fee;
+                let new_reserve_sol = k / new_reserve_token;
+                let sol_out = reserve_sol.saturating_sub(new_reserve_sol) as u64;
+                Some((sol_out, reserve_sol as u64, reserve_token as u64))
+            }
+            CachedPoolState::PumpFun(s) => {
+                let reserve_token = s.virtual_token_reserves as u128;
+                let reserve_sol = s.virtual_sol_reserves as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                let amount_after_fee = amount_in * 9900 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_token = reserve_token + amount_after_fee;
+                let new_reserve_sol = k / new_reserve_token;
+                let sol_out = reserve_sol.saturating_sub(new_reserve_sol) as u64;
+                Some((sol_out, reserve_sol as u64, reserve_token as u64))
+            }
+        }
     }
 
     /// Build swap instructions for cross-DEX arbitrage
