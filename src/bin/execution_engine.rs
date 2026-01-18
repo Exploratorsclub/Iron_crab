@@ -351,6 +351,10 @@ async fn compute_intent_fills_best_effort(
     )
 }
 
+/// DEPRECATED: This function is no longer used in the multi-process architecture.
+/// Wallet scanning is now handled by market-data (Data Plane), not execution-engine.
+/// Kept for potential debugging/manual inspection only.
+#[allow(dead_code)]
 async fn discover_wallet_open_positions(rpc: &SolanaRpc, owner: Pubkey) -> anyhow::Result<usize> {
     let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")?;
     let token_2022_program_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
@@ -2617,26 +2621,10 @@ async fn main() -> Result<()> {
     };
 
     // P1: Determine initial values from snapshot (DoD K)
-    // Best-effort wallet discovery so open_positions reflects actual holdings after restart.
-    let discovered_positions = match wallet_pubkey {
-        Some(owner) => match discover_wallet_open_positions(&rpc, owner).await {
-            Ok(n) => {
-                info!(
-                    wallet_open_positions = n,
-                    "Discovered open positions from wallet token accounts"
-                );
-                Some(n)
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to discover wallet open positions; falling back to snapshot");
-                None
-            }
-        },
-        None => {
-            warn!("No wallet pubkey available; skipping wallet open-position discovery");
-            None
-        }
-    };
+    // Architecture: execution-engine does NOT scan wallet via RPC (that's market-data's job).
+    // Positions are tracked purely from snapshot + ExecutionResults.
+    // If reconciliation is needed after manual sales/transfers, use market-data's
+    // WalletBalanceSnapshot events consumed by momentum-bot (strategy plane).
 
     let (
         initial_day,
@@ -2653,7 +2641,7 @@ async fn main() -> Result<()> {
                 decision_counter = snap.decision_counter,
                 "Restored same-day state from snapshot"
             );
-            let positions = discovered_positions.unwrap_or(snap.open_positions);
+            let positions = snap.open_positions;
             (
                 chrono::NaiveDate::parse_from_str(&snap.day, "%Y-%m-%d")
                     .unwrap_or_else(|_| chrono::Utc::now().date_naive()),
@@ -2668,8 +2656,9 @@ async fn main() -> Result<()> {
                 old_day = %snap.day,
                 "New day detected, resetting daily loss but keeping ID counters"
             );
-            // New day: daily loss resets, but wallet holdings may persist.
-            let positions = discovered_positions.unwrap_or(0);
+            // New day: daily loss resets. Positions should be 0 if all were closed,
+            // or restored from previous snapshot if holdings persist.
+            let positions = 0; // Reset positions on new day (clean slate)
             (
                 chrono::Utc::now().date_naive(),
                 0, // Reset daily loss
@@ -2679,11 +2668,11 @@ async fn main() -> Result<()> {
             )
         }
     } else {
-        // Fresh start
+        // Fresh start (no snapshot)
         (
             chrono::Utc::now().date_naive(),
             0,
-            discovered_positions.unwrap_or(0),
+            0, // No positions on fresh start
             0,
             0,
         )
