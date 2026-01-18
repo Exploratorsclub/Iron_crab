@@ -308,6 +308,22 @@ impl TokenArbTracker {
             return None;
         }
 
+        // TEMPORARY FIX: Disable Orca Whirlpool until full Geyser pool state tracking
+        // Error 6023 (InvalidTickArraySequence) occurs when:
+        // - Tick arrays don't exist on-chain (new/inactive pools)
+        // - Pool tick changes between quote and swap (tick crossing)
+        // - Cached pool state is stale
+        // Code in orca.rs is correct, but we need real-time tick array validation via Geyser
+        if buy_pool.dex == "orca" || sell_pool.dex == "orca" {
+            debug!(
+                mint = %self.base_mint,
+                buy_dex = %buy_pool.dex,
+                sell_dex = %sell_pool.dex,
+                "Arb check rejected: Orca disabled (waiting for Geyser pool state tracking)"
+            );
+            return None;
+        }
+
         let buy_price = buy_pool.last_price.unwrap();
         let sell_price = sell_pool.last_price.unwrap();
 
