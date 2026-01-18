@@ -99,13 +99,17 @@ fi
 # -----------------------------------------------------------------------------
 log_info "Configuring wallet pubkey for position reconciliation..."
 if [ -f "$HOME/.config/solana/id.json" ]; then
-    WALLET_PUBKEY=$(.venv/bin/python3 -c "
-import json, sys
-from solana.keypair import Keypair
+    # Ensure solders is installed for keypair handling
+    .venv/bin/pip install -q solders >/dev/null 2>&1 || true
+    
+    WALLET_PUBKEY=$(.venv/bin/python3 <<'EOF' 2>/dev/null || echo ""
+import json
+from solders.keypair import Keypair
 with open('$HOME/.config/solana/id.json') as f:
-    kp = Keypair.from_secret_key(bytes(json.load(f)))
-print(str(kp.public_key))
-" 2>/dev/null || echo "")
+    kp = Keypair.from_bytes(bytes(json.load(f)))
+print(str(kp.pubkey()))
+EOF
+)
     
     if [ -n "$WALLET_PUBKEY" ]; then
         log_info "Wallet pubkey: $WALLET_PUBKEY"
