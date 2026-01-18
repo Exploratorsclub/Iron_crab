@@ -90,23 +90,36 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             token_mint = record.get('token_mint', 'unknown')
             
             # Determine action from fill amounts
-            # If fill_in has tokens (>1e6 raw), it's a SELL
-            # If fill_out has tokens, it's a BUY
+            # BUY: fill_out contains tokens (>0), fill_in may be unavailable (partial status)
+            # SELL: fill_in contains tokens (>0), fill_out may be unavailable
             fill_in_raw = fill_in.get('raw', 0)
             fill_in_decimals = fill_in.get('decimals', 9)
             fill_out_raw = fill_out.get('raw', 0)
             fill_out_decimals = fill_out.get('decimals', 9)
             
-            # Heuristic: tokens have 6-9 decimals, SOL has 9
-            # If fill_in has high decimals and large raw, it's tokens (SELL)
-            is_sell = fill_in_decimals <= 9 and fill_in_raw > 1_000_000
+            # Better heuristic: Check which side has tokens (non-zero raw amount with 6-9 decimals)
+            # SOL/WSOL always has 9 decimals, tokens typically 6-9
+            has_fill_out = fill_out_raw > 0 and fill_out_decimals in [6, 7, 8, 9]
+            has_fill_in = fill_in_raw > 0 and fill_in_decimals in [6, 7, 8, 9]
             
-            if is_sell:
+            # If fill_out has value and fill_in doesn't (or is WSOL-sized), it's likely a BUY
+            # Default to BUY if uncertain (most common case for momentum-bot)
+            if has_fill_out and fill_out_decimals <= 9:
+                # If fill_out is much larger than typical SOL amounts, it's tokens (BUY)
+                if fill_out_raw > 1_000_000 or not has_fill_in:
+                    action = "BUY"
+                    amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
+                else:
+                    # Both have values - compare magnitudes
+                    action = "SELL" if fill_in_raw > fill_out_raw else "BUY"
+                    amount_tokens = fill_in_raw / (10 ** fill_in_decimals) if action == "SELL" else fill_out_raw / (10 ** fill_out_decimals)
+            elif has_fill_in:
                 action = "SELL"
                 amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
             else:
+                # No fills available - default to BUY with 0 amount
                 action = "BUY"
-                amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
+                amount_tokens = 0.0
             
             # Prefer wallet_sol_delta_lamports (actual SOL change) over WSOL token amounts
             if wallet_sol_delta_lamports is not None:
