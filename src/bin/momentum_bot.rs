@@ -1397,6 +1397,32 @@ struct EntrySignal {
     reason: String,
 }
 
+/// Information about a pool for multi-pool routing
+#[derive(Debug, Clone)]
+struct PoolInfo {
+    pool_address: String,
+    dex: String,
+    dex_pool_accounts: Option<Vec<String>>,
+    first_seen_slot: u64,
+    last_trade_slot: u64,
+    last_trade_ratio: Option<f64>, // SOL per token (for quotes)
+    last_updated: std::time::Instant,
+}
+
+impl PoolInfo {
+    fn new(pool_address: String, dex: String, slot: u64) -> Self {
+        Self {
+            pool_address,
+            dex,
+            dex_pool_accounts: None,
+            first_seen_slot: slot,
+            last_trade_slot: slot,
+            last_trade_ratio: None,
+            last_updated: std::time::Instant::now(),
+        }
+    }
+}
+
 /// Runtime context for momentum-bot
 struct MomentumContext {
     run_id: String,
@@ -1421,6 +1447,8 @@ struct MomentumContext {
     positions: parking_lot::RwLock<HashMap<String, PositionTracker>>,
     /// Pending intents awaiting execution results (intent_id -> PendingIntent)
     pending_intents: parking_lot::RwLock<HashMap<String, PendingIntent>>,
+    /// Multi-pool registry: All known pools per mint (mint -> Vec<PoolInfo>)
+    mint_pools: parking_lot::RwLock<HashMap<String, Vec<PoolInfo>>>,
     /// Stats
     tokens_tracked: std::sync::atomic::AtomicU64,
     tokens_blacklisted: std::sync::atomic::AtomicU64,
@@ -1457,6 +1485,147 @@ impl MomentumContext {
         );
         let mut infos = self.mint_infos.write();
         infos.insert(mint.to_string(), info);
+    }
+
+    /// Register or update a pool in the multi-pool registry
+    fn register_pool(&self, mint: &str, pool_address: &str, dex: &str, slot: u64) {
+        let mut pools = self.mint_pools.write();
+        let pool_list = pools.entry(mint.to_string()).or_insert_with(Vec::new);
+        
+        // Check if pool already exists
+        if let Some(existing) = pool_list.iter_mut().find(|p| p.pool_address == pool_address) {
+            // Update last_trade_slot
+            if slot > existing.last_trade_slot {
+                existing.last_trade_slot = slot;
+                existing.last_updated = std::time::Instant::now();
+            }
+        } else {
+            // New pool for this mint
+            pool_list.push(PoolInfo::new(pool_address.to_string(), dex.to_string(), slot));
+            debug!(
+                mint = %mint,
+                pool = %pool_address,
+                dex = %dex,
+                total_pools = pool_list.len(),
+                "📍 Pool registered in multi-pool registry"
+            );
+        }
+    }
+
+    /// Update pool trade data (ratio + slot)
+    fn update_pool_trade_data(&self, mint: &str, pool_address: &str, sol_amount: u64, token_amount: u64, slot: u64) {
+        let mut pools = self.mint_pools.write();
+        if let Some(pool_list) = pools.get_mut(mint) {
+            if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pool_address) {
+                // Calculate SOL per token ratio
+                if token_amount > 0 {
+                    pool_info.last_trade_ratio = Some(sol_amount as f64 / token_amount as f64);
+                }
+                pool_info.last_trade_slot = slot;
+                pool_info.last_updated = std::time::Instant::now();
+            }
+        }
+    }
+
+    /// Update pool accounts (for swap instruction building)
+    fn update_pool_accounts(&self, mint: &str, pool_address: &str, accounts: Vec<String>) {
+        let mut pools = self.mint_pools.write();
+        if let Some(pool_list) = pools.get_mut(mint) {
+            if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pool_address) {
+                pool_info.dex_pool_accounts = Some(accounts);
+                pool_info.last_updated = std::time::Instant::now();
+            }
+        }
+    }
+
+    /// Find best pool for selling tokens (highest SOL output)
+    /// Returns (pool_address, dex, accounts, expected_sol_out, alternatives_checked)
+    fn find_best_sell_pool(
+        &self,
+        mint: &str,
+        token_amount: u64,
+        original_pool: &str,
+    ) -> Result<(String, String, Vec<String>, f64, usize)> {
+        let pools = self.mint_pools.read();
+        let candidates = pools
+            .get(mint)
+            .ok_or_else(|| anyhow::anyhow!("No pools known for mint {}", mint))?;
+
+        let now = std::time::Instant::now();
+        let max_age = std::time::Duration::from_secs(300); // Only use pools with trades in last 5min
+
+        // Filter: must have dex_pool_accounts AND recent trade data
+        let valid: Vec<_> = candidates
+            .iter()
+            .filter(|p| {
+                p.dex_pool_accounts.is_some()
+                    && p.last_trade_ratio.is_some()
+                    && now.duration_since(p.last_updated) < max_age
+            })
+            .collect();
+
+        if valid.is_empty() {
+            anyhow::bail!("No pools with recent trade data and accounts available");
+        }
+
+        // Quote each pool using cached last_trade_ratio
+        let mut quotes: Vec<_> = valid
+            .iter()
+            .filter_map(|p| {
+                p.last_trade_ratio.map(|ratio| {
+                    let expected_sol = (token_amount as f64) * ratio;
+                    (
+                        p.pool_address.clone(),
+                        p.dex.clone(),
+                        p.dex_pool_accounts.clone().unwrap(),
+                        expected_sol,
+                    )
+                })
+            })
+            .collect();
+
+        if quotes.is_empty() {
+            anyhow::bail!("No pools with valid quotes");
+        }
+
+        let alternatives_checked = quotes.len();
+
+        // Sort by expected SOL output (descending)
+        quotes.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+        let best = &quotes[0];
+        let best_pool = &best.0;
+        let expected_sol = best.3;
+
+        // Log if we're switching pools
+        if best_pool != original_pool && alternatives_checked > 1 {
+            let original_quote = quotes
+                .iter()
+                .find(|q| q.0 == original_pool)
+                .map(|q| q.3)
+                .unwrap_or(0.0);
+
+            if original_quote > 0.0 {
+                let improvement_pct = ((expected_sol / original_quote) - 1.0) * 100.0;
+                info!(
+                    mint = %mint,
+                    original_pool = %original_pool,
+                    best_pool = %best_pool,
+                    best_dex = %best.1,
+                    improvement_pct = %format!("{:.2}%", improvement_pct),
+                    alternatives = alternatives_checked,
+                    "🎯 Switching to better pool for exit"
+                );
+            }
+        }
+
+        Ok((
+            best.0.clone(),
+            best.1.clone(),
+            best.2.clone(),
+            expected_sol,
+            alternatives_checked,
+        ))
     }
 
     /// Returns true if the DEX requires DexPoolAccounts in Intent.resources.accounts
@@ -3241,6 +3410,7 @@ async fn main() -> Result<()> {
         token_trackers: parking_lot::RwLock::new(HashMap::new()),
         positions: parking_lot::RwLock::new(recovered_positions),
         pending_intents: parking_lot::RwLock::new(HashMap::new()),
+        mint_pools: parking_lot::RwLock::new(HashMap::new()),
         tokens_tracked: std::sync::atomic::AtomicU64::new(0),
         tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
         intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -4002,6 +4172,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -4245,6 +4416,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -4341,6 +4513,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -4405,6 +4578,7 @@ mod tests {
             token_trackers: parking_lot::RwLock::new(HashMap::new()),
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -4440,8 +4614,8 @@ mod tests {
 async fn generate_and_publish_exit_intent(
     ctx: &MomentumContext,
     mint: &str,
-    pool: &str,
-    dex: &str,
+    original_pool: &str,
+    original_dex: &str,
     exit_type: &str,
     reason: &str,
     token_amount: u64,
@@ -4450,6 +4624,37 @@ async fn generate_and_publish_exit_intent(
 
     // SOL as output (selling tokens for SOL)
     let sol_mint = "So11111111111111111111111111111111111111112";
+
+    // === MULTI-POOL ROUTING: Find best pool for exit ===
+    let (pool, dex, pool_accounts, expected_sol, alternatives_checked) = match ctx
+        .find_best_sell_pool(mint, token_amount, original_pool)
+    {
+        Ok(result) => result,
+        Err(e) => {
+            // Fallback to original pool if multi-pool routing fails
+            warn!(
+                mint = %mint,
+                original_pool = %original_pool,
+                error = %e,
+                "⚠️  Multi-pool routing failed, using original pool"
+            );
+
+            // Get accounts for original pool
+            let accounts = ctx
+                .try_get_dex_pool_accounts_for_mint(mint)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("cannot generate exit intent: missing DexPoolAccounts")
+                })?;
+
+            (
+                original_pool.to_string(),
+                original_dex.to_string(),
+                accounts,
+                0.0,      // Unknown expected
+                0_usize,  // No alternatives checked
+            )
+        }
+    };
 
     // Decimals depend on the token. Prefer decimals from the open position (which was seeded
     // from MarketEventKind::TokenMintInfo), fall back to mint_infos cache.
@@ -4572,25 +4777,8 @@ async fn generate_and_publish_exit_intent(
             input_mint: mint.to_string(),      // Selling tokens
             output_mint: sol_mint.to_string(), // Receiving SOL
             pools: vec![pool.to_string()],
-            accounts: {
-                let requires = MomentumContext::dex_requires_pool_accounts(dex);
-                if requires {
-                    let accounts =
-                        ctx.try_get_dex_pool_accounts_for_mint(mint)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "cannot generate exit intent: missing DexPoolAccounts"
-                                )
-                            })?;
-                    if accounts.len() != 14 || accounts.first().map(|s| s.as_str()) != Some(pool) {
-                        anyhow::bail!("cannot generate exit intent: invalid DexPoolAccounts")
-                    }
-                    accounts
-                } else {
-                    Vec::new()
-                }
-            },
-            token_program: None, // Momentum-bot doesn't need Token-2022 support yet
+            accounts: pool_accounts, // Already validated from find_best_sell_pool
+            token_program: None,     // Momentum-bot doesn't need Token-2022 support yet
         },
         0, // No expected ROI for exits
         max_slippage,
@@ -4612,6 +4800,23 @@ async fn generate_and_publish_exit_intent(
     intent
         .metadata
         .insert("reason_code".to_string(), reason_code.to_string());
+    
+    // Multi-pool routing metadata
+    intent.metadata.insert(
+        "multi_pool_alternatives_checked".to_string(),
+        alternatives_checked.to_string(),
+    );
+    intent.metadata.insert(
+        "multi_pool_original_pool".to_string(),
+        original_pool.to_string(),
+    );
+    if expected_sol > 0.0 {
+        intent.metadata.insert(
+            "multi_pool_expected_sol".to_string(),
+            format!("{:.9}", expected_sol / 1e9),
+        );
+    }
+    
     intent
         .metadata
         .insert("reason_detail".to_string(), reason.to_string());
@@ -4632,7 +4837,7 @@ async fn generate_and_publish_exit_intent(
     }
 
     // Register pending intent BEFORE publishing
-    ctx.register_sell_intent(&intent_id, mint, pool, dex, token_amount);
+    ctx.register_sell_intent(&intent_id, mint, &pool, &dex, token_amount);
 
     info!(
         intent_id = %intent.intent_id,
@@ -4680,6 +4885,9 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
         } => {
             let slot = event.slot.unwrap_or(0);
             ctx.record_pool_seen(pool_address, slot);
+
+            // Register pool in multi-pool registry
+            ctx.register_pool(base_mint, pool_address, dex, slot);
 
             let liq_sol = initial_liquidity_sol
                 .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
@@ -4733,6 +4941,9 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
         } => {
             ctx.record_pool_seen(pool_address, event.slot.unwrap_or(0));
             ctx.record_dex_pool_accounts(dex, pool_address, base_mint, quote_mint, accounts);
+            
+            // Update pool accounts in multi-pool registry
+            ctx.update_pool_accounts(base_mint, pool_address, accounts.clone());
         }
 
         MarketEventKind::Trade {
@@ -4796,6 +5007,9 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             let sol_lamports = *sol_amount;
             let token_raw = *token_amount;
             let sig = signature.clone().unwrap_or_default();
+
+            // Update trade data in multi-pool registry
+            ctx.update_pool_trade_data(mint, pool_address, sol_lamports, token_raw, event.slot.unwrap_or(0));
 
             // Check if this trader is the dev wallet and record dev behavior
             let is_dev = {
