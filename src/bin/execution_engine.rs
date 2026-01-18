@@ -4083,8 +4083,25 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             };
 
             let mut ixs = tx_plan.instructions.clone();
+            info!(
+                intent_id = %intent.intent_id,
+                original_ix_count = %tx_plan.instructions.len(),
+                bundle_tip_present = %bundle_tip_ix.is_some(),
+                "Preparing transaction for Jito bundle"
+            );
             if let Some(ref ix) = bundle_tip_ix {
                 ixs.push(ix.clone());
+                info!(
+                    intent_id = %intent.intent_id,
+                    final_ix_count = %ixs.len(),
+                    tip_program = %ix.program_id,
+                    "✅ Tip instruction added to transaction"
+                );
+            } else {
+                warn!(
+                    intent_id = %intent.intent_id,
+                    "⚠️ No tip instruction to add - bundle will fail!"
+                );
             }
 
             // Use VersionedTransaction with ALT if available, otherwise legacy Transaction
