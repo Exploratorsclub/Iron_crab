@@ -455,7 +455,8 @@ impl LivePoolCache {
     /// Remove stale entries (older than max_age_ms)
     pub fn evict_stale(&self) -> usize {
         let before = self.pools.len();
-        self.pools.retain(|_, entry| !entry.is_stale(self.max_age_ms));
+        self.pools
+            .retain(|_, entry| !entry.is_stale(self.max_age_ms));
         let evicted = before.saturating_sub(self.pools.len());
         if evicted > 0 {
             tracing::debug!(evicted, "LivePoolCache: evicted stale entries");
@@ -504,7 +505,7 @@ impl LivePoolCache {
     pub fn get_tracked_mints(&self) -> Vec<Pubkey> {
         use std::collections::HashSet;
         let mut mints = HashSet::new();
-        
+
         for entry in self.pools.iter() {
             match &entry.value().state {
                 CachedPoolState::Orca(s) => {
@@ -532,7 +533,7 @@ impl LivePoolCache {
                 }
             }
         }
-        
+
         mints.into_iter().collect()
     }
 
@@ -563,7 +564,7 @@ impl LivePoolCache {
     pub fn update_mint_program(&self, mint: &Pubkey, token_program: Pubkey) {
         // Store in the central mint_programs map
         self.mint_programs.insert(*mint, token_program);
-        
+
         // Also update pool states that reference this mint (for backwards compat)
         for mut entry in self.pools.iter_mut() {
             let updated = match &mut entry.value_mut().state {
@@ -585,7 +586,7 @@ impl LivePoolCache {
                 }
                 _ => false, // Other DEXes don't need Token-2022 detection yet
             };
-            
+
             if updated {
                 tracing::debug!(
                     mint = %mint,

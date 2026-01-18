@@ -141,7 +141,7 @@ impl Orca {
             pools_count = self.pools.len(),
             "Orca find_pool searching for pair"
         );
-        
+
         for p in self.pools.iter() {
             let forward = p.base_mint == *input && p.quote_mint == *output;
             let reverse = p.base_mint == *output && p.quote_mint == *input;
@@ -162,7 +162,7 @@ impl Orca {
                 return Some((*p.key(), forward, p.clone()));
             }
         }
-        
+
         tracing::warn!(
             input = %input,
             output = %output,
@@ -254,16 +254,17 @@ impl Orca {
     #[allow(dead_code)]
     async fn fetch_current_tick(&self, pool_id: &Pubkey, fallback_tick: Option<i32>) -> i32 {
         let fallback = fallback_tick.unwrap_or(0);
-        
+
         match self.rpc.get_account_retry(pool_id).await {
             Ok(account) => {
                 if account.data.len() >= layout::MIN_WHIRLPOOL_ACCOUNT_LEN {
                     // Read tick_current_index at offset 81 (i32 LE)
-                    let tick_bytes: [u8; 4] = account.data[layout::OFF_TICK_CURRENT..layout::OFF_TICK_CURRENT + 4]
+                    let tick_bytes: [u8; 4] = account.data
+                        [layout::OFF_TICK_CURRENT..layout::OFF_TICK_CURRENT + 4]
                         .try_into()
                         .unwrap_or([0; 4]);
                     let current_tick = i32::from_le_bytes(tick_bytes);
-                    
+
                     if current_tick != fallback {
                         tracing::info!(
                             pool = %pool_id,
@@ -273,7 +274,7 @@ impl Orca {
                             "Orca: tick changed since cache - using fresh on-chain value"
                         );
                     }
-                    
+
                     current_tick
                 } else {
                     tracing::warn!(
@@ -621,105 +622,105 @@ impl Dex for Orca {
 
         #[cfg(feature = "rpc_fallback")]
         {
-        use solana_account_decoder::UiAccountEncoding;
-        use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
-        use solana_client::rpc_filter::RpcFilterType;
-        use solana_sdk::pubkey::Pubkey;
-        use std::str::FromStr;
-        tracing::trace!("orca.refresh_pools() whirlpool fetch");
-        let program_id = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM)
-            .map_err(|_| anyhow!("invalid whirlpool program id"))?;
-        // DataSize filter (broad window) to reduce traffic
-        let size_filter = RpcFilterType::DataSize(WHIRLPOOL_ACCOUNT_MAX_SIZE as u64);
-        let filters = Some(vec![size_filter]);
-        let acc_cfg = RpcAccountInfoConfig {
-            encoding: Some(UiAccountEncoding::Base64),
-            data_slice: None,
-            commitment: None,
-            min_context_slot: None,
-        };
-        let cfg = RpcProgramAccountsConfig {
-            filters,
-            account_config: acc_cfg,
-            with_context: None,
-            sort_results: None,
-        };
-        let accounts = self
-            .rpc
-            .get_program_accounts_with_config_retry(&program_id, cfg)
-            .await?;
-        let mut added = 0u32;
-        let mut total_accounts = 0u32;
-        let mut parsed_ok = 0u32;
-        let mut zero_reserve = 0u32;
-        self.mint_index.clear();
-        for (addr, acc) in accounts.into_iter().take(5000) {
-            // safety limit
-            total_accounts += 1;
-            if acc.data.len() < WHIRLPOOL_ACCOUNT_MIN_SIZE
-                || acc.data.len() > WHIRLPOOL_ACCOUNT_MAX_SIZE
-            {
-                continue;
-            }
-            if let Some(parsed) = layout::parse_whirlpool(&acc.data) {
-                parsed_ok += 1;
-                // SKIP vault fetching during initial refresh (too slow - 5000+ RPC calls!)
-                // Reserves will be loaded on-demand when needed for quotes
-                let reserves = (0u128, 0u128);
-                zero_reserve += 1;
-                let id = addr;
-                self.pools.insert(
-                    id,
-                    OrcaPool {
-                        base_mint: parsed.token_mint_a,
-                        quote_mint: parsed.token_mint_b,
-                        reserve_base: reserves.0,
-                        reserve_quote: reserves.1,
-                        fee_bps: parsed.fee_rate as u32,
-                        fee_tier: None,
-                        tick_spacing: Some(parsed.tick_spacing),
-                        vault_a: parsed.token_vault_a,
-                        vault_b: parsed.token_vault_b,
-                        tick_current_index: Some(parsed.tick_current_index),
-                        cached_reserves: if reserves.0 > 0 || reserves.1 > 0 {
-                            Some(reserves)
-                        } else {
-                            None
-                        },
-                        last_reserve_fetch: if reserves.0 > 0 || reserves.1 > 0 {
-                            Some(std::time::SystemTime::now())
-                        } else {
-                            None
-                        },
-                        base_mint_program: None,
-                        quote_mint_program: None,
-                    },
-                );
-                for m in [parsed.token_mint_a, parsed.token_mint_b] {
-                    self.mint_index
-                        .entry(m)
-                        .or_insert_with(|| Vec::with_capacity(2))
-                        .push(id);
+            use solana_account_decoder::UiAccountEncoding;
+            use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+            use solana_client::rpc_filter::RpcFilterType;
+            use solana_sdk::pubkey::Pubkey;
+            use std::str::FromStr;
+            tracing::trace!("orca.refresh_pools() whirlpool fetch");
+            let program_id = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM)
+                .map_err(|_| anyhow!("invalid whirlpool program id"))?;
+            // DataSize filter (broad window) to reduce traffic
+            let size_filter = RpcFilterType::DataSize(WHIRLPOOL_ACCOUNT_MAX_SIZE as u64);
+            let filters = Some(vec![size_filter]);
+            let acc_cfg = RpcAccountInfoConfig {
+                encoding: Some(UiAccountEncoding::Base64),
+                data_slice: None,
+                commitment: None,
+                min_context_slot: None,
+            };
+            let cfg = RpcProgramAccountsConfig {
+                filters,
+                account_config: acc_cfg,
+                with_context: None,
+                sort_results: None,
+            };
+            let accounts = self
+                .rpc
+                .get_program_accounts_with_config_retry(&program_id, cfg)
+                .await?;
+            let mut added = 0u32;
+            let mut total_accounts = 0u32;
+            let mut parsed_ok = 0u32;
+            let mut zero_reserve = 0u32;
+            self.mint_index.clear();
+            for (addr, acc) in accounts.into_iter().take(5000) {
+                // safety limit
+                total_accounts += 1;
+                if acc.data.len() < WHIRLPOOL_ACCOUNT_MIN_SIZE
+                    || acc.data.len() > WHIRLPOOL_ACCOUNT_MAX_SIZE
+                {
+                    continue;
                 }
-                added += 1;
+                if let Some(parsed) = layout::parse_whirlpool(&acc.data) {
+                    parsed_ok += 1;
+                    // SKIP vault fetching during initial refresh (too slow - 5000+ RPC calls!)
+                    // Reserves will be loaded on-demand when needed for quotes
+                    let reserves = (0u128, 0u128);
+                    zero_reserve += 1;
+                    let id = addr;
+                    self.pools.insert(
+                        id,
+                        OrcaPool {
+                            base_mint: parsed.token_mint_a,
+                            quote_mint: parsed.token_mint_b,
+                            reserve_base: reserves.0,
+                            reserve_quote: reserves.1,
+                            fee_bps: parsed.fee_rate as u32,
+                            fee_tier: None,
+                            tick_spacing: Some(parsed.tick_spacing),
+                            vault_a: parsed.token_vault_a,
+                            vault_b: parsed.token_vault_b,
+                            tick_current_index: Some(parsed.tick_current_index),
+                            cached_reserves: if reserves.0 > 0 || reserves.1 > 0 {
+                                Some(reserves)
+                            } else {
+                                None
+                            },
+                            last_reserve_fetch: if reserves.0 > 0 || reserves.1 > 0 {
+                                Some(std::time::SystemTime::now())
+                            } else {
+                                None
+                            },
+                            base_mint_program: None,
+                            quote_mint_program: None,
+                        },
+                    );
+                    for m in [parsed.token_mint_a, parsed.token_mint_b] {
+                        self.mint_index
+                            .entry(m)
+                            .or_insert_with(|| Vec::with_capacity(2))
+                            .push(id);
+                    }
+                    added += 1;
+                }
             }
-        }
 
-        // Update pools_total metric
-        crate::metrics::ORCA_POOLS_TOTAL.store(
-            self.pools.len() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+            // Update pools_total metric
+            crate::metrics::ORCA_POOLS_TOTAL.store(
+                self.pools.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
-        tracing::info!(
-            total_accounts,
-            parsed_ok,
-            zero_reserve,
-            added,
-            total = self.pools.len(),
-            "orca.refresh_pools() done"
-        );
-        Ok(())
+            tracing::info!(
+                total_accounts,
+                parsed_ok,
+                zero_reserve,
+                added,
+                total = self.pools.len(),
+                "orca.refresh_pools() done"
+            );
+            Ok(())
         } // end #[cfg(feature = "rpc_fallback")]
     }
 
@@ -737,7 +738,7 @@ impl Dex for Orca {
     /// - accounts[4] = pc_vault (token_vault_b)
     fn set_pool_from_accounts(&self, pool_address: &str, accounts: &[String]) -> Result<()> {
         use std::str::FromStr;
-        
+
         // Minimum required: pool_address, base_mint, quote_mint
         if accounts.len() < 3 {
             return Err(anyhow!(
@@ -782,7 +783,7 @@ impl Dex for Orca {
         let mut tick_spacing: Option<u16> = None;
         let mut base_mint_program: Option<Pubkey> = None;
         let mut quote_mint_program: Option<Pubkey> = None;
-        
+
         for acct in accounts.iter().skip(5) {
             if let Some(val) = acct.strip_prefix("tick_current_index:") {
                 tick_current_index = val.parse().ok();
@@ -929,16 +930,22 @@ impl Dex for Orca {
                 .get(mint)
                 .map(|v| *v)
                 .unwrap_or_else(|| {
-                    let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
-                    let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(mint.to_bytes());
-                    let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-                        &owner_spl, &mint_spl, &spl_token::id()
+                    let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+                        authority.to_bytes(),
                     );
+                    let mint_spl =
+                        spl_token::solana_program::pubkey::Pubkey::new_from_array(mint.to_bytes());
+                    let ata_spl =
+                        spl_associated_token_account::get_associated_token_address_with_program_id(
+                            &owner_spl,
+                            &mint_spl,
+                            &spl_token::id(),
+                        );
                     Pubkey::new_from_array(ata_spl.to_bytes())
                 })
         };
 
-        let token_owner_account_a = derive_ata(&pool.base_mint);  // Always token A
+        let token_owner_account_a = derive_ata(&pool.base_mint); // Always token A
         let token_owner_account_b = derive_ata(&pool.quote_mint); // Always token B
 
         // Tick arrays for the swap range
@@ -947,10 +954,10 @@ impl Dex for Orca {
         let spacing = pool.tick_spacing.unwrap_or(64) as i32;
         let tick_now = pool.tick_current_index.unwrap_or(0);
         let ticks_per_array = spacing * TICK_ARRAY_SIZE;
-        
+
         // Calculate the start index of the tick array containing current tick
         let current_array_start = get_tick_array_start_index(tick_now, spacing);
-        
+
         // Log tick array calculation for debugging
         tracing::debug!(
             pool = %pool_id,
@@ -961,12 +968,12 @@ impl Dex for Orca {
             a_to_b = a_to_b,
             "orca: calculating tick arrays for swap"
         );
-        
+
         // CRITICAL: Tick array sequence depends on swap direction
         // For a_to_b swaps: price goes DOWN, ticks DECREASE
         //   - First array must contain current tick
         //   - Subsequent arrays are at LOWER tick indices
-        // For b_to_a swaps: price goes UP, ticks INCREASE  
+        // For b_to_a swaps: price goes UP, ticks INCREASE
         //   - First array must contain current tick
         //   - Subsequent arrays are at HIGHER tick indices
         //
@@ -985,10 +992,10 @@ impl Dex for Orca {
         // Note: For large swaps that traverse multiple arrays in one direction,
         // this centered approach may not have enough range. But for our typical
         // arbitrage amounts (0.1 SOL), this is more than sufficient.
-        let s_prev = current_array_start - ticks_per_array;  // Previous array (lower ticks)
-        let s_curr = current_array_start;                     // Current array
-        let s_next = current_array_start + ticks_per_array;   // Next array (higher ticks)
-        
+        let s_prev = current_array_start - ticks_per_array; // Previous array (lower ticks)
+        let s_curr = current_array_start; // Current array
+        let s_next = current_array_start + ticks_per_array; // Next array (higher ticks)
+
         // CRITICAL FIX: Orca Whirlpool requires tick_array_0 to contain the CURRENT tick!
         // The swap then traverses through tick_array_1 and tick_array_2 in the swap direction.
         // Previous code incorrectly put the "destination" array first, causing 6023 errors.
@@ -1006,22 +1013,26 @@ impl Dex for Orca {
             // tick_array_2 = previous-1 (even lower ticks - continued swap direction)
             let s_prev2 = s_prev - ticks_per_array;
             (
-                derive_tick_array_pda(&pool_id, s_curr),   // Current - MUST be first
-                derive_tick_array_pda(&pool_id, s_prev),   // Lower ticks (swap direction)
-                derive_tick_array_pda(&pool_id, s_prev2),  // Even lower (continued swap)
-                s_curr, s_prev, s_prev2,
+                derive_tick_array_pda(&pool_id, s_curr), // Current - MUST be first
+                derive_tick_array_pda(&pool_id, s_prev), // Lower ticks (swap direction)
+                derive_tick_array_pda(&pool_id, s_prev2), // Even lower (continued swap)
+                s_curr,
+                s_prev,
+                s_prev2,
             )
         } else {
             // B->A: price increases, ticks increase
             // tick_array_0 = current (contains current tick)
-            // tick_array_1 = next (higher ticks - swap direction)  
+            // tick_array_1 = next (higher ticks - swap direction)
             // tick_array_2 = next+1 (even higher ticks - continued swap direction)
             let s_next2 = s_next + ticks_per_array;
             (
-                derive_tick_array_pda(&pool_id, s_curr),   // Current - MUST be first
-                derive_tick_array_pda(&pool_id, s_next),   // Higher ticks (swap direction)
-                derive_tick_array_pda(&pool_id, s_next2),  // Even higher (continued swap)
-                s_curr, s_next, s_next2,
+                derive_tick_array_pda(&pool_id, s_curr), // Current - MUST be first
+                derive_tick_array_pda(&pool_id, s_next), // Higher ticks (swap direction)
+                derive_tick_array_pda(&pool_id, s_next2), // Even higher (continued swap)
+                s_curr,
+                s_next,
+                s_next2,
             )
         };
 
@@ -1047,11 +1058,11 @@ impl Dex for Orca {
         // - a_to_b: bool
         let mut data = Vec::with_capacity(8 + 8 + 8 + 16 + 1 + 1);
         data.extend_from_slice(&SWAP_DISCRIMINATOR);
-        data.extend_from_slice(&_amount_in.to_le_bytes());       // amount (exact input)
-        data.extend_from_slice(&_min_out.to_le_bytes());         // other_amount_threshold (min output)
-        data.extend_from_slice(&0u128.to_le_bytes());            // sqrt_price_limit (0 = no limit)
-        data.push(1u8);                                           // amount_specified_is_input = true
-        data.push(if a_to_b { 1u8 } else { 0u8 });               // a_to_b
+        data.extend_from_slice(&_amount_in.to_le_bytes()); // amount (exact input)
+        data.extend_from_slice(&_min_out.to_le_bytes()); // other_amount_threshold (min output)
+        data.extend_from_slice(&0u128.to_le_bytes()); // sqrt_price_limit (0 = no limit)
+        data.push(1u8); // amount_specified_is_input = true
+        data.push(if a_to_b { 1u8 } else { 0u8 }); // a_to_b
 
         let program_id =
             Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).map_err(|_| anyhow!("orca program id"))?;
@@ -1070,17 +1081,61 @@ impl Dex for Orca {
         // 10. oracle (readonly)
         let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
         let accounts = vec![
-            AM { pubkey: token_program, is_signer: false, is_writable: false },
-            AM { pubkey: authority, is_signer: true, is_writable: false },
-            AM { pubkey: pool_id, is_signer: false, is_writable: true },
-            AM { pubkey: token_owner_account_a, is_signer: false, is_writable: true },
-            AM { pubkey: pool.vault_a, is_signer: false, is_writable: true },
-            AM { pubkey: token_owner_account_b, is_signer: false, is_writable: true },
-            AM { pubkey: pool.vault_b, is_signer: false, is_writable: true },
-            AM { pubkey: tick_array_0, is_signer: false, is_writable: true },
-            AM { pubkey: tick_array_1, is_signer: false, is_writable: true },
-            AM { pubkey: tick_array_2, is_signer: false, is_writable: true },
-            AM { pubkey: oracle, is_signer: false, is_writable: false },
+            AM {
+                pubkey: token_program,
+                is_signer: false,
+                is_writable: false,
+            },
+            AM {
+                pubkey: authority,
+                is_signer: true,
+                is_writable: false,
+            },
+            AM {
+                pubkey: pool_id,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: token_owner_account_a,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: pool.vault_a,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: token_owner_account_b,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: pool.vault_b,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: tick_array_0,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: tick_array_1,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: tick_array_2,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: oracle,
+                is_signer: false,
+                is_writable: false,
+            },
         ];
 
         Ok(vec![Instruction {
@@ -1091,7 +1146,7 @@ impl Dex for Orca {
     }
 
     /// Async version that fetches current tick_current_index from chain
-    /// 
+    ///
     /// CRITICAL: The cached tick_current_index may be stale (price moved since cache update).
     /// Using stale tick leads to wrong tick array calculation → Error 6023 (InvalidTickArraySequence).
     /// This async version fetches the CURRENT tick from the pool on-chain.
@@ -1124,17 +1179,19 @@ impl Dex for Orca {
         // CRITICAL: Use CACHED token programs from LivePoolCache - NO RPC IN HOT PATH!
         // Token programs (SPL Token vs Token-2022) are immutable per mint - cache them once.
         let spl_token_sdk = spl_token::id();
-        
+
         // Use cached token programs if available, otherwise default to SPL Token
         // (Token-2022 is rare, most mints use SPL Token)
-        let token_a_program = pool.base_mint_program
+        let token_a_program = pool
+            .base_mint_program
             .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
             .unwrap_or(spl_token_sdk);
-        
-        let token_b_program = pool.quote_mint_program
+
+        let token_b_program = pool
+            .quote_mint_program
             .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
             .unwrap_or(spl_token_sdk);
-        
+
         // Log if we're using cached vs default programs
         if pool.base_mint_program.is_some() || pool.quote_mint_program.is_some() {
             tracing::debug!(
@@ -1151,44 +1208,63 @@ impl Dex for Orca {
         }
 
         // Derive ATAs with correct token programs
-        let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
-        
-        let token_owner_account_a = self.user_token_accounts
+        let owner_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
+
+        let token_owner_account_a = self
+            .user_token_accounts
             .get(&pool.base_mint)
             .map(|v| *v)
             .unwrap_or_else(|| {
-                let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(pool.base_mint.to_bytes());
-                let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-                    &owner_spl, &mint_spl, &token_a_program
+                let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+                    pool.base_mint.to_bytes(),
                 );
+                let ata_spl =
+                    spl_associated_token_account::get_associated_token_address_with_program_id(
+                        &owner_spl,
+                        &mint_spl,
+                        &token_a_program,
+                    );
                 Pubkey::new_from_array(ata_spl.to_bytes())
             });
-            
-        let token_owner_account_b = self.user_token_accounts
+
+        let token_owner_account_b = self
+            .user_token_accounts
             .get(&pool.quote_mint)
             .map(|v| *v)
             .unwrap_or_else(|| {
-                let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(pool.quote_mint.to_bytes());
-                let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-                    &owner_spl, &mint_spl, &token_b_program
+                let mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+                    pool.quote_mint.to_bytes(),
                 );
+                let ata_spl =
+                    spl_associated_token_account::get_associated_token_address_with_program_id(
+                        &owner_spl,
+                        &mint_spl,
+                        &token_b_program,
+                    );
                 Pubkey::new_from_array(ata_spl.to_bytes())
             });
 
         // Use CACHED tick from LivePoolCache - NO RPC IN HOT PATH!
         // The tick was updated in real-time by Geyser subscription.
         let tick_now = pool.tick_current_index.ok_or_else(|| {
-            anyhow!("Orca pool {} has no cached tick_current_index - LivePoolCache not populated", pool_id)
+            anyhow!(
+                "Orca pool {} has no cached tick_current_index - LivePoolCache not populated",
+                pool_id
+            )
         })?;
-        
+
         let spacing = pool.tick_spacing.ok_or_else(|| {
-            anyhow!("Orca pool {} has no cached tick_spacing - LivePoolCache not populated", pool_id)
+            anyhow!(
+                "Orca pool {} has no cached tick_spacing - LivePoolCache not populated",
+                pool_id
+            )
         })? as i32;
-        
+
         let ticks_per_array = spacing * TICK_ARRAY_SIZE;
 
         let current_array_start = get_tick_array_start_index(tick_now, spacing);
-        
+
         // Calculate position within current tick array (0 to ticks_per_array-1)
         let position_in_array = (tick_now - current_array_start).abs();
         let array_boundary_margin = ticks_per_array / 4; // 25% margin from boundary
@@ -1205,7 +1281,7 @@ impl Dex for Orca {
         );
 
         // IMPROVED: Select tick arrays to handle price movement in EITHER direction.
-        // 
+        //
         // Problem: Between fetch_current_tick() and simulation, price may move.
         // If we only select arrays in the swap direction, we fail with Error 6023.
         //
@@ -1218,30 +1294,40 @@ impl Dex for Orca {
         let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) = {
             let s0 = current_array_start;
             // Primary direction based on swap type
-            let s_primary = if a_to_b { s0 - ticks_per_array } else { s0 + ticks_per_array };
+            let s_primary = if a_to_b {
+                s0 - ticks_per_array
+            } else {
+                s0 + ticks_per_array
+            };
             // Opposite direction to handle price reversal
-            let s_opposite = if a_to_b { s0 + ticks_per_array } else { s0 - ticks_per_array };
-            
+            let s_opposite = if a_to_b {
+                s0 + ticks_per_array
+            } else {
+                s0 - ticks_per_array
+            };
+
             // If tick is near the boundary in primary direction, extend further in that direction
             let near_low_boundary = position_in_array < array_boundary_margin;
             let near_high_boundary = position_in_array > (ticks_per_array - array_boundary_margin);
-            
+
             let (s1, s2) = if a_to_b && near_low_boundary {
                 // A→B swap, tick near low boundary - extend further in decreasing direction
                 (s_primary, s_primary - ticks_per_array)
             } else if !a_to_b && near_high_boundary {
-                // B→A swap, tick near high boundary - extend further in increasing direction  
+                // B→A swap, tick near high boundary - extend further in increasing direction
                 (s_primary, s_primary + ticks_per_array)
             } else {
                 // Normal case: cover both directions
                 (s_primary, s_opposite)
             };
-            
+
             (
                 derive_tick_array_pda(&pool_id, s0),
                 derive_tick_array_pda(&pool_id, s1),
                 derive_tick_array_pda(&pool_id, s2),
-                s0, s1, s2,
+                s0,
+                s1,
+                s2,
             )
         };
 
@@ -1264,24 +1350,69 @@ impl Dex for Orca {
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_out.to_le_bytes());
         data.extend_from_slice(&0u128.to_le_bytes()); // sqrt_price_limit = no limit
-        data.push(1u8);                               // amount_specified_is_input = true
-        data.push(if a_to_b { 1u8 } else { 0u8 });   // a_to_b
+        data.push(1u8); // amount_specified_is_input = true
+        data.push(if a_to_b { 1u8 } else { 0u8 }); // a_to_b
 
-        let program_id = Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).map_err(|_| anyhow!("orca program id"))?;
+        let program_id =
+            Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).map_err(|_| anyhow!("orca program id"))?;
         let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
 
         let accounts = vec![
-            AM { pubkey: token_program, is_signer: false, is_writable: false },
-            AM { pubkey: authority, is_signer: true, is_writable: false },
-            AM { pubkey: pool_id, is_signer: false, is_writable: true },
-            AM { pubkey: token_owner_account_a, is_signer: false, is_writable: true },
-            AM { pubkey: pool.vault_a, is_signer: false, is_writable: true },
-            AM { pubkey: token_owner_account_b, is_signer: false, is_writable: true },
-            AM { pubkey: pool.vault_b, is_signer: false, is_writable: true },
-            AM { pubkey: tick_array_0, is_signer: false, is_writable: true },
-            AM { pubkey: tick_array_1, is_signer: false, is_writable: true },
-            AM { pubkey: tick_array_2, is_signer: false, is_writable: true },
-            AM { pubkey: oracle, is_signer: false, is_writable: false },
+            AM {
+                pubkey: token_program,
+                is_signer: false,
+                is_writable: false,
+            },
+            AM {
+                pubkey: authority,
+                is_signer: true,
+                is_writable: false,
+            },
+            AM {
+                pubkey: pool_id,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: token_owner_account_a,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: pool.vault_a,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: token_owner_account_b,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: pool.vault_b,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: tick_array_0,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: tick_array_1,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: tick_array_2,
+                is_signer: false,
+                is_writable: true,
+            },
+            AM {
+                pubkey: oracle,
+                is_signer: false,
+                is_writable: false,
+            },
         ];
 
         Ok(vec![Instruction {
@@ -1320,32 +1451,32 @@ impl Dex for Orca {
             cached = self.pools.contains_key(pool_address),
             "Fetching Orca whirlpool via RPC getAccount (always refresh for tick accuracy)"
         );
-        
+
         // Fetch pool account via single getAccount RPC call
         let account = self.rpc.get_account_retry(pool_address).await?;
-        
+
         tracing::debug!(
             pool = %pool_address,
             data_len = account.data.len(),
             "Orca pool account fetched, parsing whirlpool layout"
         );
-        
+
         // Parse whirlpool layout
         let parsed = layout::parse_whirlpool(&account.data)
             .ok_or_else(|| anyhow::anyhow!("Failed to parse Orca whirlpool at {}", pool_address))?;
-        
+
         // OPTIMIZATION: Fetch token programs ONCE during pool loading (not on every TX!)
         // This saves 2 RPC calls per swap instruction (~200-400ms latency reduction)
         let token_2022_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
         let spl_token_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")?;
-        
+
         let (base_prog, quote_prog) = {
             // Batch fetch both mint accounts in parallel
             let (base_result, quote_result) = tokio::join!(
                 self.rpc.get_account_retry(&parsed.token_mint_a),
                 self.rpc.get_account_retry(&parsed.token_mint_b)
             );
-            
+
             let base_prog = match base_result {
                 Ok(acct) if acct.owner == token_2022_id => {
                     tracing::debug!(mint = %parsed.token_mint_a, "Orca pool: token A uses Token-2022");
@@ -1354,7 +1485,7 @@ impl Dex for Orca {
                 Ok(_) => Some(spl_token_id),
                 Err(_) => None,
             };
-            
+
             let quote_prog = match quote_result {
                 Ok(acct) if acct.owner == token_2022_id => {
                     tracing::debug!(mint = %parsed.token_mint_b, "Orca pool: token B uses Token-2022");
@@ -1363,10 +1494,10 @@ impl Dex for Orca {
                 Ok(_) => Some(spl_token_id),
                 Err(_) => None,
             };
-            
+
             (base_prog, quote_prog)
         };
-        
+
         // Insert/update cache with fresh data INCLUDING token programs
         let pool = OrcaPool {
             base_mint: parsed.token_mint_a,
@@ -1384,10 +1515,10 @@ impl Dex for Orca {
             base_mint_program: base_prog,
             quote_mint_program: quote_prog,
         };
-        
+
         let is_update = self.pools.contains_key(pool_address);
         self.pools.insert(*pool_address, pool.clone());
-        
+
         // Update mint index only for new pools (avoid duplicates)
         if !is_update {
             self.mint_index
@@ -1399,7 +1530,7 @@ impl Dex for Orca {
                 .or_default()
                 .push(*pool_address);
         }
-        
+
         tracing::info!(
             pool = %pool_address,
             base_mint = %pool.base_mint,
@@ -1411,7 +1542,7 @@ impl Dex for Orca {
             "Orca whirlpool {} successfully",
             if is_update { "refreshed" } else { "loaded" }
         );
-        
+
         Ok(())
     }
 }
@@ -1433,7 +1564,11 @@ impl Orca {
 const TICK_ARRAY_SIZE: i32 = 88; // Number of ticks per TickArray
 
 fn derive_tick_array_pda(pool: &Pubkey, start_tick_index: i32) -> Pubkey {
-    let seeds: &[&[u8]] = &[b"tick_array", pool.as_ref(), &start_tick_index.to_le_bytes()];
+    let seeds: &[&[u8]] = &[
+        b"tick_array",
+        pool.as_ref(),
+        &start_tick_index.to_le_bytes(),
+    ];
     Pubkey::find_program_address(seeds, &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap()).0
 }
 

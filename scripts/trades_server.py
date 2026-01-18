@@ -42,43 +42,10 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(trades).encode())
     
     def read_recent_trades(self, limit: int) -> list:
-        """Read last N trades from execution_results JSONL files and join with decisions for mint"""
+        """Read last N trades from execution_results JSONL files (mint now included in execution records)"""
         trades = []
-        decision_cache = {}  # Cache decision records by decision_id
         
-        # Load decision records first (for mint lookup)
-        for days_ago in [0, 1, 2]:
-            date = (datetime.now() - timedelta(days=days_ago)).strftime("%Y%m%d")
-            decisions_path = Path(TRADE_LOG_DIR) / "decisions" / f"decision_records-{date}.jsonl"
-            
-            if decisions_path.exists():
-                try:
-                    with open(decisions_path, 'r') as f:
-                        for line in f:
-                            if not line.strip():
-                                continue
-                            try:
-                                dec = json.loads(line)
-                                decision_id = dec.get("decision_id")
-                                if decision_id and dec.get("outcome") == "Confirmed":
-                                    # Extract mint from capital_lock check details
-                                    mint = None
-                                    for check in dec.get("checks", []):
-                                        if check.get("check_name") == "capital_lock":
-                                            details = check.get("details", "")
-                                            if details.startswith("token:"):
-                                                mint = details[6:]  # Remove "token:" prefix
-                                                break
-                                    
-                                    decision_cache[decision_id] = {
-                                        "mint": mint
-                                    }
-                            except json.JSONDecodeError:
-                                continue
-                except Exception:
-                    pass
-        
-        # Now read execution results
+        # Read execution results directly (no join needed - mint is in the record)
         for days_ago in [0, 1, 2]:
             date = (datetime.now() - timedelta(days=days_ago)).strftime("%Y%m%d")
             jsonl_path = EXECUTIONS_DIR / f"execution_results-{date}.jsonl"
@@ -95,9 +62,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                             record = json.loads(line)
                             # Only include confirmed/successful executions
                             if record.get('status') == 'Confirmed':
-                                decision_id = record.get('decision_id')
-                                decision_data = decision_cache.get(decision_id, {})
-                                trade = self.parse_execution_result(record, decision_data)
+                                trade = self.parse_execution_result(record)
                                 if trade:
                                     trades.append(trade)
                         except json.JSONDecodeError:
@@ -109,7 +74,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         trades.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
         return trades[:limit]
     
-    def parse_execution_result(self, record: dict, decision_data: dict) -> dict:
+    def parse_execution_result(self, record: dict) -> dict:
         """Parse execution_results JSONL record into Grafana-compatible trade format"""
         try:
             # Extract data from execution result
@@ -120,6 +85,9 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             
             # NEW: Get actual wallet SOL delta (includes all fees)
             wallet_sol_delta_lamports = record.get('wallet_sol_delta_lamports')
+            
+            # NEW: Get token_mint directly from execution record (no decision join needed)
+            token_mint = record.get('token_mint', 'unknown')
             
             # Determine action from fill amounts
             # If fill_in has tokens (>1e6 raw), it's a SELL
@@ -136,11 +104,9 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             if is_sell:
                 action = "SELL"
                 amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
-                token_mint = decision_data.get("mint", "unknown")
             else:
                 action = "BUY"
                 amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
-                token_mint = decision_data.get("mint", "unknown")
             
             # Prefer wallet_sol_delta_lamports (actual SOL change) over WSOL token amounts
             if wallet_sol_delta_lamports is not None:

@@ -8,7 +8,7 @@
 //! ```ignore
 //! let cache = create_shared_cache();
 //! let handle = spawn_cache_geyser_task(geyser_url, cache.clone());
-//! 
+//!
 //! // Use cache in TX builder
 //! let state = cache.get(&pool_address)?;
 //! ```
@@ -23,9 +23,9 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
-use tracing::{error, info};
 #[cfg(not(windows))]
 use tracing::{debug, warn};
+use tracing::{error, info};
 
 #[cfg(not(windows))]
 use futures::StreamExt;
@@ -376,7 +376,7 @@ async fn run_cache_subscription(
                                 "cache_geyser: vault list changed, resubscribing"
                             );
                             current_vaults = vaults;
-                            
+
                             // Also refresh mint list when vault list changes
                             // (new pools discovered = new mints to track)
                             let new_mints = cache.get_tracked_mints();
@@ -388,7 +388,7 @@ async fn run_cache_subscription(
                                 );
                                 current_mints = new_mints;
                             }
-                            
+
                             break; // Break inner loop to resubscribe
                         }
                     }

@@ -373,6 +373,7 @@ fn test_execution_result_required_fields() {
         "dec-001".to_string(),
         "intent-001".to_string(),
         "momentum-bot".to_string(),
+        Some("So11111111111111111111111111111111111111112".to_string()),
         Some("5abcdef123456...".to_string()),
         None,
     )
@@ -441,6 +442,7 @@ fn test_execution_result_fill_unavailable_reason_roundtrip() {
         "dec-002".to_string(),
         "intent-002".to_string(),
         "momentum-bot".to_string(),
+        Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string()),
         Some("5abcdef123456...".to_string()),
         None,
     )
@@ -540,6 +542,7 @@ fn test_id_correlation() {
         decision_id.to_string(),
         intent_id.to_string(),
         "test-strategy".to_string(),
+        Some("So11111111111111111111111111111111111111112".to_string()),
         None,
         None,
     );

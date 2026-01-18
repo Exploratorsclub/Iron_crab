@@ -21,10 +21,7 @@ use ironcrab::wallet::Treasury;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::{
-    pubkey::Pubkey,
-    transaction::Transaction,
-};
+use solana_sdk::{pubkey::Pubkey, transaction::Transaction};
 use std::str::FromStr;
 use tracing::{info, warn};
 
@@ -110,10 +107,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!(
-        count = addresses_to_add.len(),
-        "Addresses to add to ALT"
-    );
+    info!(count = addresses_to_add.len(), "Addresses to add to ALT");
 
     let alt_address = if let Some(alt_str) = &args.alt_address {
         // Extend existing ALT
@@ -137,10 +131,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
 
-        info!(
-            new_count = new_addresses.len(),
-            "New addresses to add"
-        );
+        info!(new_count = new_addresses.len(), "New addresses to add");
 
         if !args.dry_run {
             // Extend in batches (max 30 addresses per extend instruction due to TX size)
@@ -160,7 +151,10 @@ async fn main() -> Result<()> {
                 info!(signature = %sig, added = chunk.len(), "Extended ALT");
             }
         } else {
-            info!("DRY RUN - would extend ALT with {} addresses", new_addresses.len());
+            info!(
+                "DRY RUN - would extend ALT with {} addresses",
+                new_addresses.len()
+            );
         }
 
         alt_pubkey
@@ -173,10 +167,12 @@ async fn main() -> Result<()> {
         if !args.dry_run {
             // Get the slot with processed commitment for most current slot
             // The ALT program requires a slot within the last ~150 slots (slot hashes sysvar)
-            let fresh_slot = rpc.get_slot_with_commitment(CommitmentConfig::processed()).await?;
-            
+            let fresh_slot = rpc
+                .get_slot_with_commitment(CommitmentConfig::processed())
+                .await?;
+
             info!(fresh_slot = fresh_slot, "Got current slot for ALT creation");
-            
+
             let (create_ix, alt_pubkey) = create_alt_instructions(&authority, fresh_slot)?;
 
             info!(alt_address = %alt_pubkey, slot = fresh_slot, "Creating new ALT");
@@ -201,7 +197,7 @@ async fn main() -> Result<()> {
             };
             let sig = rpc.send_transaction_with_config(&tx, config).await?;
             info!(signature = %sig, "Sent ALT creation TX (awaiting confirmation)");
-            
+
             // Wait for confirmation with retries
             let mut confirmed = false;
             for attempt in 1..=10 {
@@ -223,7 +219,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            
+
             if !confirmed {
                 anyhow::bail!("ALT creation TX not confirmed after 10 attempts");
             }
@@ -247,12 +243,16 @@ async fn main() -> Result<()> {
                 let sig = rpc.send_and_confirm_transaction(&tx).await?;
                 info!(signature = %sig, added = chunk.len(), "Extended ALT");
             }
-            
+
             alt_pubkey
         } else {
             // Dry run - derive ALT address from current slot for preview
             let (_, alt_pubkey) = create_alt_instructions(&authority, slot)?;
-            info!("DRY RUN - would create ALT at {} with {} addresses", alt_pubkey, addresses_to_add.len());
+            info!(
+                "DRY RUN - would create ALT at {} with {} addresses",
+                alt_pubkey,
+                addresses_to_add.len()
+            );
             alt_pubkey
         }
     };

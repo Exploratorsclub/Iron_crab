@@ -54,7 +54,9 @@ use uuid::Uuid;
 
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::cache_geyser::{spawn_cache_geyser_task, CacheGeyserConfig};
-use ironcrab::execution::live_pool_cache::{create_shared_cache, CachedPoolState, SharedLivePoolCache};
+use ironcrab::execution::live_pool_cache::{
+    create_shared_cache, CachedPoolState, SharedLivePoolCache,
+};
 use ironcrab::execution::tx_builder;
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
@@ -1188,7 +1190,8 @@ impl ExecutionContext {
                                     // This is liquidation path (not hot-path), so acceptable for now
                                     if !_creator_found {
                                         if let Ok(acct) = ctx.rpc.rpc.get_account(&bc).await {
-                                            if let Ok(state) = BondingCurveState::parse(&acct.data) {
+                                            if let Ok(state) = BondingCurveState::parse(&acct.data)
+                                            {
                                                 metadata.insert(
                                                     "creator".to_string(),
                                                     state.creator.to_string(),
@@ -2428,7 +2431,9 @@ async fn main() -> Result<()> {
     };
 
     // Jito settings from [execution_engine] section (preferred) or [sniper] section (legacy fallback)
-    let exec_eng_cfg = app_config.as_ref().and_then(|c| c.execution_engine.as_ref());
+    let exec_eng_cfg = app_config
+        .as_ref()
+        .and_then(|c| c.execution_engine.as_ref());
     let sniper_cfg = app_config.as_ref().and_then(|c| c.sniper.as_ref());
 
     // Setup config - read Jito settings: prefer [execution_engine] section, fallback to [sniper]
@@ -2494,10 +2499,13 @@ async fn main() -> Result<()> {
 
     // P0: Load Address Lookup Table for transaction size reduction
     // Required for cross-DEX arbitrage (transactions > 1232 bytes without ALT)
-    let address_lookup_table = if let Some(alt_addr_str) = exec_eng_cfg.and_then(|e| e.address_lookup_table.as_ref()) {
+    let address_lookup_table = if let Some(alt_addr_str) =
+        exec_eng_cfg.and_then(|e| e.address_lookup_table.as_ref())
+    {
         match solana_sdk::pubkey::Pubkey::from_str(alt_addr_str) {
             Ok(alt_pubkey) => {
-                match ironcrab::solana::address_lookup_table::load_alt(&rpc.rpc, &alt_pubkey).await {
+                match ironcrab::solana::address_lookup_table::load_alt(&rpc.rpc, &alt_pubkey).await
+                {
                     Ok(loaded_alt) => {
                         info!(
                             alt_address = %alt_pubkey,
@@ -2747,14 +2755,14 @@ async fn main() -> Result<()> {
         let user_pk = ctx.treasury.as_ref().map(|t| t.pubkey());
         let mut handler =
             CrossDexHandler::new(Arc::clone(&ctx.rpc), user_pk).with_rpc_url(ctx.rpc_url.clone());
-        
+
         // P0 FIX: Inject LivePoolCache for fresh Geyser-based quotes in build_swap_plan()
         // Without this, CrossDexHandler falls back to stale arb-strategy price metadata!
         if let Some(ref cache) = live_pool_cache {
             handler = handler.with_pool_cache(Arc::clone(cache));
             info!("CrossDexHandler: LivePoolCache injected for fresh Geyser quotes");
         }
-        
+
         match handler.init_dexes().await {
             Ok(()) => {
                 ctx.cross_dex_handler = Some(Arc::new(handler));
@@ -3389,7 +3397,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 cache.get_mint_program(&mint).unwrap_or_else(|| {
                     // Fallback: Check if it's a pump.fun token (always SPL Token)
                     let dex_hint = intent.metadata.get("dex").map(|s| s.as_str());
-                    let is_pump = dex_hint.map(|d| d.contains("pump") || d == "pumpfun" || d == "pump_amm").unwrap_or(false);
+                    let is_pump = dex_hint
+                        .map(|d| d.contains("pump") || d == "pumpfun" || d == "pump_amm")
+                        .unwrap_or(false);
                     if is_pump {
                         Pubkey::new_from_array(spl_token::id().to_bytes())
                     } else {
@@ -3871,7 +3881,14 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             (tx_plan, plan_hash_str)
         } else {
             // Option C: Pass LivePoolCache for zero-RPC quote calculation
-            match tx_builder::build_tx_plan(&intent, wallet_pubkey, Arc::clone(&ctx.rpc), ctx.live_pool_cache.as_ref()).await {
+            match tx_builder::build_tx_plan(
+                &intent,
+                wallet_pubkey,
+                Arc::clone(&ctx.rpc),
+                ctx.live_pool_cache.as_ref(),
+            )
+            .await
+            {
                 tx_builder::TxPlanOutcome::Planned(plan) => {
                     let plan_hash_str = plan.hash_string();
                     checks.push(CheckResult {
@@ -4110,19 +4127,14 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 // Build versioned transaction with ALT
                 // AddressLookupTableAccount, v0, VersionedMessage already imported at top
                 use solana_sdk::transaction::VersionedTransaction;
-                
+
                 // Convert LoadedAlt to AddressLookupTableAccount for v0::Message::try_compile
                 let alt_account = AddressLookupTableAccount {
                     key: alt.address,
                     addresses: alt.accounts.clone(),
                 };
-                
-                match v0::Message::try_compile(
-                    &wallet_pubkey,
-                    &ixs,
-                    &[alt_account],
-                    blockhash,
-                ) {
+
+                match v0::Message::try_compile(&wallet_pubkey, &ixs, &[alt_account], blockhash) {
                     Ok(v0_message) => {
                         let versioned_msg = VersionedMessage::V0(v0_message);
                         match VersionedTransaction::try_new(versioned_msg, &[signer]) {
@@ -4521,6 +4533,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 (None, bundle_id.clone())
             };
 
+            // Extract token_mint from intent (BUY: output_mint, SELL: input_mint)
+            let token_mint = match intent.side {
+                TradeSide::Buy => Some(intent.resources.output_mint.clone()),
+                TradeSide::Sell => Some(intent.resources.input_mint.clone()),
+            };
+
             let mut exec = ExecutionResult::new_sent(
                 "execution-engine",
                 BUILD_VERSION,
@@ -4529,6 +4547,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 decision_id.clone(),
                 intent.intent_id.clone(),
                 intent.source.clone(),
+                token_mint,
                 signature,
                 bundle_id,
             );
@@ -4747,57 +4766,65 @@ async fn simulate_transaction(
     use solana_sdk::transaction::VersionedTransaction;
 
     // Build Versioned Transaction with ALT if available
-    let tx_result: Result<VersionedTransaction, String> = if let Some(ref alt) = ctx.address_lookup_table {
-        // Use v0 message with ALT for size reduction
-        let alt_account = AddressLookupTableAccount {
-            key: alt.address,
-            addresses: alt.accounts.clone(),
-        };
+    let tx_result: Result<VersionedTransaction, String> =
+        if let Some(ref alt) = ctx.address_lookup_table {
+            // Use v0 message with ALT for size reduction
+            let alt_account = AddressLookupTableAccount {
+                key: alt.address,
+                addresses: alt.accounts.clone(),
+            };
 
-        // Get a recent blockhash for v0 message compilation
-        let blockhash = match ctx.rpc.rpc.get_latest_blockhash().await {
-            Ok(bh) => bh,
-            Err(e) => {
-                return SimulationResult {
-                    success: false,
-                    error_code: Some(format!("rpc_error:blockhash:{e}")),
-                    logs_preview: None,
-                    compute_units_consumed: None,
-                };
-            }
-        };
+            // Get a recent blockhash for v0 message compilation
+            let blockhash = match ctx.rpc.rpc.get_latest_blockhash().await {
+                Ok(bh) => bh,
+                Err(e) => {
+                    return SimulationResult {
+                        success: false,
+                        error_code: Some(format!("rpc_error:blockhash:{e}")),
+                        logs_preview: None,
+                        compute_units_consumed: None,
+                    };
+                }
+            };
 
-        match v0::Message::try_compile(&wallet_pubkey, &plan.instructions, &[alt_account], blockhash) {
-            Ok(message) => {
-                let versioned_message = VersionedMessage::V0(message);
-                // Create unsigned versioned transaction
-                Ok(VersionedTransaction {
-                    signatures: vec![solana_sdk::signature::Signature::default()],
-                    message: versioned_message,
-                })
+            match v0::Message::try_compile(
+                &wallet_pubkey,
+                &plan.instructions,
+                &[alt_account],
+                blockhash,
+            ) {
+                Ok(message) => {
+                    let versioned_message = VersionedMessage::V0(message);
+                    // Create unsigned versioned transaction
+                    Ok(VersionedTransaction {
+                        signatures: vec![solana_sdk::signature::Signature::default()],
+                        message: versioned_message,
+                    })
+                }
+                Err(e) => Err(format!("v0_compile_error:{e}")),
             }
-            Err(e) => Err(format!("v0_compile_error:{e}")),
-        }
-    } else {
-        // Fallback to legacy transaction (will fail if too large)
-        let blockhash = match ctx.rpc.rpc.get_latest_blockhash().await {
-            Ok(bh) => bh,
-            Err(e) => {
-                return SimulationResult {
-                    success: false,
-                    error_code: Some(format!("rpc_error:blockhash:{e}")),
-                    logs_preview: None,
-                    compute_units_consumed: None,
-                };
-            }
+        } else {
+            // Fallback to legacy transaction (will fail if too large)
+            let blockhash = match ctx.rpc.rpc.get_latest_blockhash().await {
+                Ok(bh) => bh,
+                Err(e) => {
+                    return SimulationResult {
+                        success: false,
+                        error_code: Some(format!("rpc_error:blockhash:{e}")),
+                        logs_preview: None,
+                        compute_units_consumed: None,
+                    };
+                }
+            };
+            let message = solana_sdk::message::Message::new_with_blockhash(
+                &plan.instructions,
+                Some(&wallet_pubkey),
+                &blockhash,
+            );
+            Ok(VersionedTransaction::from(Transaction::new_unsigned(
+                message,
+            )))
         };
-        let message = solana_sdk::message::Message::new_with_blockhash(
-            &plan.instructions,
-            Some(&wallet_pubkey),
-            &blockhash,
-        );
-        Ok(VersionedTransaction::from(Transaction::new_unsigned(message)))
-    };
 
     let tx = match tx_result {
         Ok(tx) => tx,
@@ -4893,8 +4920,13 @@ async fn send_transaction_rpc(
             addresses: alt.accounts.clone(),
         };
 
-        let message = v0::Message::try_compile(&wallet_pubkey, &plan.instructions, &[alt_account], blockhash)
-            .map_err(|e| format!("v0_compile_error:{e}"))?;
+        let message = v0::Message::try_compile(
+            &wallet_pubkey,
+            &plan.instructions,
+            &[alt_account],
+            blockhash,
+        )
+        .map_err(|e| format!("v0_compile_error:{e}"))?;
 
         let versioned_message = VersionedMessage::V0(message);
         VersionedTransaction::try_new(versioned_message, &[signer])

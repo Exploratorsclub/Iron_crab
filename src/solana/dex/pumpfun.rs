@@ -866,7 +866,8 @@ impl Dex for PumpFunDex {
         min_out: u64,
     ) -> Result<Vec<Instruction>> {
         // Use the impl-block async method (not trait method)
-        PumpFunDex::build_swap_ix_async(self, input_mint, output_mint, amount_in, min_out, None).await
+        PumpFunDex::build_swap_ix_async(self, input_mint, output_mint, amount_in, min_out, None)
+            .await
     }
 }
 

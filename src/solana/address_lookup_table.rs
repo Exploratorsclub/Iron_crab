@@ -13,17 +13,13 @@
 
 use anyhow::{anyhow, Context, Result};
 use solana_address_lookup_table_interface::{
-    instruction as alt_instruction,
-    state::AddressLookupTable,
+    instruction as alt_instruction, state::AddressLookupTable,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_message::{v0, AddressLookupTableAccount, VersionedMessage};
 use solana_sdk::{
-    instruction::Instruction,
-    pubkey::Pubkey,
-    signature::Signer,
-    transaction::VersionedTransaction,
+    instruction::Instruction, pubkey::Pubkey, signature::Signer, transaction::VersionedTransaction,
 };
 use std::str::FromStr;
 use tracing::info;
@@ -32,49 +28,42 @@ use tracing::info;
 /// These are used in almost every transaction.
 pub const COMMON_ACCOUNTS: &[&str] = &[
     // ===== System Programs =====
-    "11111111111111111111111111111111",                      // System Program
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",          // Token Program
-    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",         // Associated Token Program
-    "ComputeBudget111111111111111111111111111111",          // Compute Budget Program
-    "SysvarRent111111111111111111111111111111111",          // Rent Sysvar
-    "SysvarC1ock11111111111111111111111111111111",          // Clock Sysvar
-    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",          // Token-2022 Program
-    
+    "11111111111111111111111111111111", // System Program
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // Token Program
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", // Associated Token Program
+    "ComputeBudget111111111111111111111111111111", // Compute Budget Program
+    "SysvarRent111111111111111111111111111111111", // Rent Sysvar
+    "SysvarC1ock11111111111111111111111111111111", // Clock Sysvar
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", // Token-2022 Program
     // ===== Mints =====
-    "So11111111111111111111111111111111111111112",          // Wrapped SOL
-    
+    "So11111111111111111111111111111111111111112", // Wrapped SOL
     // ===== Meteora DLMM =====
-    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",          // Meteora DLMM Program
-    "D1ZN9Wj1fRSUQfCjhvnu1hqDMT7hzjzBBpi12nVniYD6",         // Meteora Event Authority PDA
-    
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo", // Meteora DLMM Program
+    "D1ZN9Wj1fRSUQfCjhvnu1hqDMT7hzjzBBpi12nVniYD6", // Meteora Event Authority PDA
     // ===== PumpSwap AMM =====
-    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",          // PumpSwap AMM Program
-    "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",          // PumpSwap Fee Program
-    "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw",         // PumpSwap Fee Config (common)
-    "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg",        // PumpSwap Global Config
-    
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", // PumpSwap AMM Program
+    "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ", // PumpSwap Fee Program
+    "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw", // PumpSwap Fee Config (common)
+    "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg", // PumpSwap Global Config
     // ===== Pump.fun Bonding Curve =====
-    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",          // Pump.fun Bonding Program
-    "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf",         // Pump.fun Global Account
-    "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM",         // Pump.fun Fee Account
-    
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", // Pump.fun Bonding Program
+    "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf", // Pump.fun Global Account
+    "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM", // Pump.fun Fee Account
     // ===== Orca Whirlpool =====
-    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",          // Orca Whirlpool Program
-    
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", // Orca Whirlpool Program
     // ===== Raydium =====
-    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",         // Raydium AMM V4
-    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",         // Raydium CPMM
-    "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h",        // Raydium AMM Authority
-    
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", // Raydium AMM V4
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", // Raydium CPMM
+    "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h", // Raydium AMM Authority
     // ===== Jito Tip Accounts (for bundle tips) =====
-    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",         // Jito Tip Account 1
-    "HFqU5x63VTqvQss8hp11i4bVmyBkEr7SrFKerWRx5Qdr",         // Jito Tip Account 2
-    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",         // Jito Tip Account 3
-    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",         // Jito Tip Account 4
-    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",         // Jito Tip Account 5
-    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",         // Jito Tip Account 6
-    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",         // Jito Tip Account 7
-    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",         // Jito Tip Account 8
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5", // Jito Tip Account 1
+    "HFqU5x63VTqvQss8hp11i4bVmyBkEr7SrFKerWRx5Qdr", // Jito Tip Account 2
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY", // Jito Tip Account 3
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49", // Jito Tip Account 4
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh", // Jito Tip Account 5
+    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt", // Jito Tip Account 6
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL", // Jito Tip Account 7
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT", // Jito Tip Account 8
 ];
 
 /// Loaded ALT data for use in transaction building.
@@ -128,7 +117,8 @@ pub fn create_alt_instructions(
     authority: &Pubkey,
     recent_slot: u64,
 ) -> Result<(Instruction, Pubkey)> {
-    let (ix, alt_address) = alt_instruction::create_lookup_table(*authority, *authority, recent_slot);
+    let (ix, alt_address) =
+        alt_instruction::create_lookup_table(*authority, *authority, recent_slot);
     Ok((ix, alt_address))
 }
 
@@ -179,10 +169,7 @@ pub fn build_versioned_transaction(
 }
 
 /// Estimate the size reduction from using an ALT.
-pub fn estimate_size_reduction(
-    instructions: &[Instruction],
-    alt: &LoadedAlt,
-) -> (usize, usize) {
+pub fn estimate_size_reduction(instructions: &[Instruction], alt: &LoadedAlt) -> (usize, usize) {
     let mut accounts_in_alt = 0;
     let mut total_unique_accounts = std::collections::HashSet::new();
 

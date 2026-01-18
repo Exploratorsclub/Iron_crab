@@ -251,7 +251,8 @@ impl JitoClient {
         // Submit to ALL regions in PARALLEL for lowest latency
         // Jito bundles are idempotent (deduplicated by tx signature hash)
         // so parallel submission is safe and recommended
-        self.submit_to_all_regions_parallel(&request, transactions.len(), "legacy").await
+        self.submit_to_all_regions_parallel(&request, transactions.len(), "legacy")
+            .await
     }
 
     /// Internal helper: submit request to all regions in parallel, return first success
@@ -268,7 +269,7 @@ impl JitoClient {
             let client = self.http_client.clone();
             let request_clone = serde_json::to_string(request).expect("serialize request");
             let region_clone = *region;
-            
+
             async move {
                 debug!(
                     "Submitting {} bundle to Jito {} ({} txs)",
@@ -346,7 +347,10 @@ impl JitoClient {
 
         // All failed - return combined error
         let error_summary: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
-        Err(anyhow!("All Jito regions failed: {}", error_summary.join("; ")))
+        Err(anyhow!(
+            "All Jito regions failed: {}",
+            error_summary.join("; ")
+        ))
     }
 
     /// Submit a bundle of versioned transactions to Jito
@@ -359,7 +363,10 @@ impl JitoClient {
     ///
     /// # Returns
     /// Bundle ID if successful
-    pub async fn send_versioned_bundle(&self, transactions: &[VersionedTransaction]) -> Result<String> {
+    pub async fn send_versioned_bundle(
+        &self,
+        transactions: &[VersionedTransaction],
+    ) -> Result<String> {
         if transactions.is_empty() {
             return Err(anyhow!("Cannot submit empty bundle"));
         }
@@ -369,7 +376,8 @@ impl JitoClient {
         let serialized: Vec<String> = transactions
             .iter()
             .map(|tx| {
-                bs58::encode(bincode::serialize(tx).expect("Failed to serialize versioned tx")).into_string()
+                bs58::encode(bincode::serialize(tx).expect("Failed to serialize versioned tx"))
+                    .into_string()
             })
             .collect();
 
@@ -383,7 +391,8 @@ impl JitoClient {
         // Submit to ALL regions in PARALLEL for lowest latency
         // Jito bundles are idempotent (deduplicated by tx signature hash)
         // so parallel submission is safe and recommended
-        self.submit_to_all_regions_parallel(&request, transactions.len(), "versioned").await
+        self.submit_to_all_regions_parallel(&request, transactions.len(), "versioned")
+            .await
     }
 
     /// Check bundle status

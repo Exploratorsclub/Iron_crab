@@ -302,8 +302,7 @@ impl Raydium {
         let (amm_auth, _) = Self::derive_amm_authority();
 
         // Try to derive serum vault signer (market_program_id not in cache, use OpenBook default)
-        let openbook_v1 =
-            Pubkey::from_str("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX").ok();
+        let openbook_v1 = Pubkey::from_str("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX").ok();
         let serum_vault_signer = openbook_v1.map(|prog| {
             let (v, _) = Self::derive_serum_vault_signer(&market_id, &prog);
             v
@@ -757,157 +756,160 @@ impl Dex for Raydium {
 
         #[cfg(feature = "rpc_fallback")]
         {
-        use crate::metrics::{RAYDIUM_POOLS_LOADED, RAYDIUM_POOLS_SKIPPED_INVALID};
-        use std::time::{Duration, SystemTime};
-        tracing::trace!("raydium.refresh_pools() start");
-        let acc_cfg = RpcAccountInfoConfig {
-            encoding: Some(UiAccountEncoding::Base64),
-            data_slice: None,
-            commitment: None,
-            min_context_slot: None,
-        };
-        let cfg = RpcProgramAccountsConfig {
-            filters: Some(Self::pool_filters()),
-            account_config: acc_cfg,
-            with_context: None,
-            sort_results: None,
-        };
-        let program_id = Pubkey::from_str(RAYDIUM_AMM_V4)?;
-        let accounts = self
-            .rpc
-            .get_program_accounts_with_config_retry(&program_id, cfg)
-            .await?;
-        tracing::info!(
-            program = %program_id,
-            fetched = accounts.len(),
-            "raydium.refresh_pools fetched program accounts"
-        );
-        // Collect decodable pool state + raw bytes for fee extraction
-        let mut decoded: Vec<(reader::PoolV4, Vec<u8>)> = Vec::with_capacity(accounts.len());
-        let mut wrong_size = 0u32;
-        for (addr, acc) in &accounts {
-            if acc.data.len() == reader::LIQ_STATE_V4_SIZE {
-                if let Ok(p) = reader::PoolV4::decode(*addr, &acc.data) {
-                    if let Err(e) = Self::validate_pool_state(&p) {
-                        tracing::debug!(pool = %p.address, error = %e, "skip invalid raydium pool");
-                        RAYDIUM_POOLS_SKIPPED_INVALID
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    } else {
-                        decoded.push((p, acc.data.clone()));
-                    }
-                }
-            } else {
-                wrong_size += 1;
-            }
-        }
-        tracing::info!(
-            decoded = decoded.len(),
-            wrong_size,
-            "raydium.refresh_pools decoded candidate pools"
-        );
-
-        // Don't fetch vault balances upfront - use lazy-loading like Orca
-        // Reserves will be fetched on-demand when pools are evaluated for quotes
-        tracing::info!(
-            decoded = decoded.len(),
-            "raydium.refresh_pools decoded pools (reserves lazy-loaded)"
-        );
-
-        // Insert/update pools with zero reserves (will be fetched on-demand)
-        let mut loaded = 0u32;
-        for (p, _) in decoded {
-            // Raydium AMM v4 uses a hardcoded fee of 25 basis points (0.25%)
-            // The fee structure is fixed in the program, not stored per-pool
-            let fee_bps = 25u32;
-            let (amm_auth, _) = Self::derive_amm_authority();
-            // Serum market is optional in modern Raydium v4 - try to fetch if available, but don't skip if missing
-            let (
-                serum_bids,
-                serum_asks,
-                serum_event_queue,
-                serum_base_vault,
-                serum_quote_vault,
-                serum_vault_signer,
-            ) = if p.market_id != Pubkey::default() && p.market_program_id != Pubkey::default() {
-                // Try to fetch and parse Serum market accounts
-                match self.rpc.rpc.get_account(&p.market_id).await {
-                    Ok(acct) => match Self::parse_serum_market_accounts(&acct.data) {
-                        Some((b, a, e, bv, qv)) => {
-                            let (v, _) =
-                                Self::derive_serum_vault_signer(&p.market_id, &p.market_program_id);
-                            (b, a, e, bv, qv, Some(v))
+            use crate::metrics::{RAYDIUM_POOLS_LOADED, RAYDIUM_POOLS_SKIPPED_INVALID};
+            use std::time::{Duration, SystemTime};
+            tracing::trace!("raydium.refresh_pools() start");
+            let acc_cfg = RpcAccountInfoConfig {
+                encoding: Some(UiAccountEncoding::Base64),
+                data_slice: None,
+                commitment: None,
+                min_context_slot: None,
+            };
+            let cfg = RpcProgramAccountsConfig {
+                filters: Some(Self::pool_filters()),
+                account_config: acc_cfg,
+                with_context: None,
+                sort_results: None,
+            };
+            let program_id = Pubkey::from_str(RAYDIUM_AMM_V4)?;
+            let accounts = self
+                .rpc
+                .get_program_accounts_with_config_retry(&program_id, cfg)
+                .await?;
+            tracing::info!(
+                program = %program_id,
+                fetched = accounts.len(),
+                "raydium.refresh_pools fetched program accounts"
+            );
+            // Collect decodable pool state + raw bytes for fee extraction
+            let mut decoded: Vec<(reader::PoolV4, Vec<u8>)> = Vec::with_capacity(accounts.len());
+            let mut wrong_size = 0u32;
+            for (addr, acc) in &accounts {
+                if acc.data.len() == reader::LIQ_STATE_V4_SIZE {
+                    if let Ok(p) = reader::PoolV4::decode(*addr, &acc.data) {
+                        if let Err(e) = Self::validate_pool_state(&p) {
+                            tracing::debug!(pool = %p.address, error = %e, "skip invalid raydium pool");
+                            RAYDIUM_POOLS_SKIPPED_INVALID
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            decoded.push((p, acc.data.clone()));
                         }
-                        None => (None, None, None, None, None, None),
-                    },
-                    Err(_) => (None, None, None, None, None, None),
+                    }
+                } else {
+                    wrong_size += 1;
                 }
-            } else {
-                // No Serum market linkage - that's fine
-                (None, None, None, None, None, None)
-            };
-            let obj = SimplePool {
-                base_mint: p.base_mint,
-                quote_mint: p.quote_mint,
-                base_vault: p.base_vault,
-                quote_vault: p.quote_vault,
-                lp_reserve: p.lp_reserve,
-                address: p.address,
-                reserve_base: 0,  // Lazy-loaded on-demand
-                reserve_quote: 0, // Lazy-loaded on-demand
-                fee_bps,
-                last_update: SystemTime::now(),
-                open_orders: Some(p.open_orders),
-                market_id: Some(p.market_id),
-                market_program_id: Some(p.market_program_id),
-                amm_authority: Some(amm_auth),
-                serum_vault_signer,
-                target_orders: p.target_orders,
-                serum_bids,
-                serum_asks,
-                serum_event_queue,
-                serum_base_vault,
-                serum_quote_vault,
-            };
-            self.pools.insert(p.address, obj);
-            RAYDIUM_POOLS_LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            loaded += 1;
-        }
-        // Cleanup stale (>15m)
-        let cutoff = SystemTime::now() - Duration::from_secs(15 * 60);
-        let mut removed = 0u32;
-        self.pools.retain(|_, v| {
-            let keep = v.last_update >= cutoff;
-            if !keep {
-                removed += 1;
             }
-            keep
-        });
-        // Rebuild mint index
-        self.mint_index.clear();
-        for p in self.pools.iter() {
-            self.mint_index
-                .entry(p.base_mint)
-                .or_insert_with(|| Vec::with_capacity(2))
-                .push(p.address);
-            self.mint_index
-                .entry(p.quote_mint)
-                .or_insert_with(|| Vec::with_capacity(2))
-                .push(p.address);
-        }
+            tracing::info!(
+                decoded = decoded.len(),
+                wrong_size,
+                "raydium.refresh_pools decoded candidate pools"
+            );
 
-        // Update pools_total metric
-        crate::metrics::RAYDIUM_POOLS_TOTAL.store(
-            self.pools.len() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+            // Don't fetch vault balances upfront - use lazy-loading like Orca
+            // Reserves will be fetched on-demand when pools are evaluated for quotes
+            tracing::info!(
+                decoded = decoded.len(),
+                "raydium.refresh_pools decoded pools (reserves lazy-loaded)"
+            );
 
-        tracing::info!(
-            pools = self.pools.len(),
-            removed,
-            loaded,
-            "raydium.refresh_pools done"
-        );
-        Ok(())
+            // Insert/update pools with zero reserves (will be fetched on-demand)
+            let mut loaded = 0u32;
+            for (p, _) in decoded {
+                // Raydium AMM v4 uses a hardcoded fee of 25 basis points (0.25%)
+                // The fee structure is fixed in the program, not stored per-pool
+                let fee_bps = 25u32;
+                let (amm_auth, _) = Self::derive_amm_authority();
+                // Serum market is optional in modern Raydium v4 - try to fetch if available, but don't skip if missing
+                let (
+                    serum_bids,
+                    serum_asks,
+                    serum_event_queue,
+                    serum_base_vault,
+                    serum_quote_vault,
+                    serum_vault_signer,
+                ) = if p.market_id != Pubkey::default() && p.market_program_id != Pubkey::default()
+                {
+                    // Try to fetch and parse Serum market accounts
+                    match self.rpc.rpc.get_account(&p.market_id).await {
+                        Ok(acct) => match Self::parse_serum_market_accounts(&acct.data) {
+                            Some((b, a, e, bv, qv)) => {
+                                let (v, _) = Self::derive_serum_vault_signer(
+                                    &p.market_id,
+                                    &p.market_program_id,
+                                );
+                                (b, a, e, bv, qv, Some(v))
+                            }
+                            None => (None, None, None, None, None, None),
+                        },
+                        Err(_) => (None, None, None, None, None, None),
+                    }
+                } else {
+                    // No Serum market linkage - that's fine
+                    (None, None, None, None, None, None)
+                };
+                let obj = SimplePool {
+                    base_mint: p.base_mint,
+                    quote_mint: p.quote_mint,
+                    base_vault: p.base_vault,
+                    quote_vault: p.quote_vault,
+                    lp_reserve: p.lp_reserve,
+                    address: p.address,
+                    reserve_base: 0,  // Lazy-loaded on-demand
+                    reserve_quote: 0, // Lazy-loaded on-demand
+                    fee_bps,
+                    last_update: SystemTime::now(),
+                    open_orders: Some(p.open_orders),
+                    market_id: Some(p.market_id),
+                    market_program_id: Some(p.market_program_id),
+                    amm_authority: Some(amm_auth),
+                    serum_vault_signer,
+                    target_orders: p.target_orders,
+                    serum_bids,
+                    serum_asks,
+                    serum_event_queue,
+                    serum_base_vault,
+                    serum_quote_vault,
+                };
+                self.pools.insert(p.address, obj);
+                RAYDIUM_POOLS_LOADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                loaded += 1;
+            }
+            // Cleanup stale (>15m)
+            let cutoff = SystemTime::now() - Duration::from_secs(15 * 60);
+            let mut removed = 0u32;
+            self.pools.retain(|_, v| {
+                let keep = v.last_update >= cutoff;
+                if !keep {
+                    removed += 1;
+                }
+                keep
+            });
+            // Rebuild mint index
+            self.mint_index.clear();
+            for p in self.pools.iter() {
+                self.mint_index
+                    .entry(p.base_mint)
+                    .or_insert_with(|| Vec::with_capacity(2))
+                    .push(p.address);
+                self.mint_index
+                    .entry(p.quote_mint)
+                    .or_insert_with(|| Vec::with_capacity(2))
+                    .push(p.address);
+            }
+
+            // Update pools_total metric
+            crate::metrics::RAYDIUM_POOLS_TOTAL.store(
+                self.pools.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+
+            tracing::info!(
+                pools = self.pools.len(),
+                removed,
+                loaded,
+                "raydium.refresh_pools done"
+            );
+            Ok(())
         } // end #[cfg(feature = "rpc_fallback")]
     }
 
@@ -1202,7 +1204,7 @@ impl Dex for Raydium {
         if self.pools.iter().any(|p| &p.address == pool_address) {
             return Ok(());
         }
-        
+
         // Use existing load_pool_from_geyser which fetches via single getAccount
         self.load_pool_from_geyser(pool_address).await
     }

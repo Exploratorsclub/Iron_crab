@@ -49,23 +49,23 @@ pub trait Dex: Send + Sync {
     ) -> Result<Vec<Instruction>>;
     /// List available direct trading pairs (unordered; include both directions if symmetric desired).
     fn list_pairs(&self) -> Vec<(String, String)>;
-    
+
     /// Load a specific pool by address into the connector's cache.
-    /// 
+    ///
     /// **DEPRECATED**: This makes RPC calls. Use `set_pool_from_accounts` instead
     /// with accounts from Intent.resources.accounts (from DexPoolAccounts events).
-    /// 
+    ///
     /// Default implementation returns Ok(()) (no-op for DEXes that don't need pre-loading).
     async fn load_pool_by_address(&self, _pool_address: &Pubkey) -> Result<()> {
         Ok(())
     }
-    
+
     /// Set pool data directly from accounts list (NO RPC calls).
-    /// 
+    ///
     /// This is the preferred method for execution-engine. The accounts come from
     /// `Intent.resources.accounts` which were populated by arb-strategy from
     /// `DexPoolAccounts` events (Geyser data).
-    /// 
+    ///
     /// Default implementation returns Ok(()) - override for DEXes that support it.
     fn set_pool_from_accounts(&self, _pool_address: &str, _accounts: &[String]) -> Result<()> {
         Ok(())

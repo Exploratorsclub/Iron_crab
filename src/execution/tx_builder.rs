@@ -37,12 +37,12 @@ fn prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> In
 }
 
 /// Build wrap SOL instructions: CreateATA (idempotent) + Transfer + SyncNative
-/// 
+///
 /// Returns instructions to:
 /// 1. Create WSOL ATA if needed (idempotent)
 /// 2. Transfer native SOL to the WSOL ATA
 /// 3. Sync native balance to token balance
-/// 
+///
 /// This is required for BUY trades (SOL → Token) because DEX connectors
 /// expect WSOL in the ATA, not native SOL.
 fn build_wrap_sol_instructions(wallet_pubkey: Pubkey, amount_lamports: u64) -> Vec<Instruction> {
@@ -50,7 +50,7 @@ fn build_wrap_sol_instructions(wallet_pubkey: Pubkey, amount_lamports: u64) -> V
     let wsol_mint_spl = SplProgramPubkey::new_from_array(wsol_mint.to_bytes());
     let wallet_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
     let token_program_spl = spl_token::id();
-    
+
     // Derive WSOL ATA
     let wsol_ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
         &wallet_spl,
@@ -58,9 +58,9 @@ fn build_wrap_sol_instructions(wallet_pubkey: Pubkey, amount_lamports: u64) -> V
         &token_program_spl,
     );
     let wsol_ata = Pubkey::new_from_array(wsol_ata_spl.to_bytes());
-    
+
     let mut ixs = Vec::with_capacity(3);
-    
+
     // 1. Create WSOL ATA (idempotent - won't fail if exists)
     let create_ata_ix = prog_ix_to_sdk(
         spl_associated_token_account::instruction::create_associated_token_account_idempotent(
@@ -71,7 +71,7 @@ fn build_wrap_sol_instructions(wallet_pubkey: Pubkey, amount_lamports: u64) -> V
         ),
     );
     ixs.push(create_ata_ix);
-    
+
     // 2. Transfer native SOL to WSOL ATA
     // System program transfer: 4-byte discriminator (2u32 LE) + 8-byte lamports (u64 LE)
     let system_program_id = Pubkey::from_str(SYSTEM_PROGRAM_ID).expect("valid system program id");
@@ -97,14 +97,14 @@ fn build_wrap_sol_instructions(wallet_pubkey: Pubkey, amount_lamports: u64) -> V
         },
     };
     ixs.push(transfer_ix);
-    
+
     // 3. Sync native balance to WSOL token balance
     let sync_ix = prog_ix_to_sdk(
         spl_token::instruction::sync_native(&token_program_spl, &wsol_ata_spl)
             .expect("valid sync_native instruction"),
     );
     ixs.push(sync_ix);
-    
+
     ixs
 }
 
@@ -314,14 +314,18 @@ pub async fn build_tx_plan(
                     Err(e) => {
                         return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                             reason: RejectReason::UnsupportedIntent,
-                            details: format!("no min_out in intent and cache calculation failed: {e}"),
+                            details: format!(
+                                "no min_out in intent and cache calculation failed: {e}"
+                            ),
                         });
                     }
                 }
             } else {
                 return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                     reason: RejectReason::UnsupportedIntent,
-                    details: "missing execution.min_out and no cache available for fresh calculation".to_string(),
+                    details:
+                        "missing execution.min_out and no cache available for fresh calculation"
+                            .to_string(),
                 });
             }
         }
@@ -437,14 +441,17 @@ pub async fn build_tx_plan(
 
         // For BUY trades (SOL → Token), prepend wrap SOL instructions
         let final_ixs = if intent.side == TradeSide::Buy {
-            let mut all_ixs = build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
+            let mut all_ixs =
+                build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
             all_ixs.extend(ixs);
             all_ixs
         } else {
             ixs
         };
 
-        return TxPlanOutcome::Planned(TxPlan { instructions: final_ixs });
+        return TxPlanOutcome::Planned(TxPlan {
+            instructions: final_ixs,
+        });
     }
 
     if dex_hint == DexHint::Raydium {
@@ -536,14 +543,17 @@ pub async fn build_tx_plan(
 
         // For BUY trades (SOL → Token), prepend wrap SOL instructions
         let final_ixs = if intent.side == TradeSide::Buy {
-            let mut all_ixs = build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
+            let mut all_ixs =
+                build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
             all_ixs.extend(ixs);
             all_ixs
         } else {
             ixs
         };
 
-        return TxPlanOutcome::Planned(TxPlan { instructions: final_ixs });
+        return TxPlanOutcome::Planned(TxPlan {
+            instructions: final_ixs,
+        });
     }
 
     if dex_hint == DexHint::PumpAmm {
@@ -696,8 +706,9 @@ pub async fn build_tx_plan(
 
         // For BUY trades (SOL → Token), prepend wrap SOL + token ATA instructions
         let final_ixs = if intent.side == TradeSide::Buy {
-            let mut all_ixs = build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
-            
+            let mut all_ixs =
+                build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
+
             // Also create token ATA (for receiving bought tokens)
             let token_mint = Pubkey::from_str(&intent.resources.output_mint).unwrap_or_default();
             let token_mint_spl = SplProgramPubkey::new_from_array(token_mint.to_bytes());
@@ -733,7 +744,9 @@ pub async fn build_tx_plan(
             all_ixs
         };
 
-        return TxPlanOutcome::Planned(TxPlan { instructions: final_ixs });
+        return TxPlanOutcome::Planned(TxPlan {
+            instructions: final_ixs,
+        });
     }
 
     debug_assert_eq!(dex_hint, DexHint::Pumpfun);
@@ -803,7 +816,9 @@ pub async fn build_tx_plan(
         ixs
     };
 
-    TxPlanOutcome::Planned(TxPlan { instructions: final_ixs })
+    TxPlanOutcome::Planned(TxPlan {
+        instructions: final_ixs,
+    })
 }
 
 #[cfg(test)]

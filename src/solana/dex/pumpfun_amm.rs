@@ -2362,7 +2362,7 @@ impl Dex for PumpFunAmmDex {
             )),
         }
     }
-    
+
     /// Set pool data directly from accounts list (NO RPC!)
     ///
     /// Accounts format (v1 from DexPoolAccounts, 14 elements):
@@ -2388,11 +2388,11 @@ impl Dex for PumpFunAmmDex {
                 accounts.len()
             ));
         }
-        
+
         let parse_pubkey = |s: &str, name: &str| -> Result<Pubkey> {
             Pubkey::from_str(s).map_err(|e| anyhow!("Invalid {} pubkey '{}': {}", name, s, e))
         };
-        
+
         let pool_market = parse_pubkey(&accounts[0], "pool_market")?;
         let global_config = parse_pubkey(&accounts[1], "global_config")?;
         let base_mint = parse_pubkey(&accounts[2], "base_mint")?;
@@ -2403,8 +2403,9 @@ impl Dex for PumpFunAmmDex {
         let protocol_fee_recipient_ta = parse_pubkey(&accounts[7], "protocol_fee_recipient_ta")?;
         let event_authority = parse_pubkey(&accounts[8], "event_authority")?;
         let coin_creator_vault_ata = parse_pubkey(&accounts[9], "coin_creator_vault_ata")?;
-        let coin_creator_vault_authority = parse_pubkey(&accounts[10], "coin_creator_vault_authority")?;
-        
+        let coin_creator_vault_authority =
+            parse_pubkey(&accounts[10], "coin_creator_vault_authority")?;
+
         // CRITICAL: v1 format (14 accounts) vs v2 format (12 accounts) have different layouts!
         // v1: [0..10]=common, [11]=global_volume_accumulator, [12]=fee_config, [13]=fee_program
         // v2: [0..10]=common, [11]=fee_config (no volume accumulators)
@@ -2434,7 +2435,7 @@ impl Dex for PumpFunAmmDex {
             );
             (Pubkey::default(), fc, fp)
         };
-        
+
         // Validate pool_address matches accounts[0]
         let expected_pool = parse_pubkey(pool_address, "pool_address")?;
         if expected_pool != pool_market {
@@ -2444,7 +2445,7 @@ impl Dex for PumpFunAmmDex {
                 pool_market
             ));
         }
-        
+
         let pool = PumpAmmPoolStatic {
             pool_market,
             global_config,
@@ -2461,16 +2462,16 @@ impl Dex for PumpFunAmmDex {
             fee_config,
             fee_program,
         };
-        
+
         debug!(
             pool_market = %pool_market,
             base_mint = %base_mint,
             "pump_amm pool set from intent accounts (NO RPC)"
         );
-        
+
         self.pools_by_base.insert(base_mint, pool);
         self.pools_by_market.insert(pool_market, base_mint);
-        
+
         Ok(())
     }
 
@@ -2683,7 +2684,7 @@ impl PumpFunAmmDex {
         let event_authority = pool_accounts[8];
         let coin_creator_vault_ata = pool_accounts[9];
         let coin_creator_vault_authority = pool_accounts[10];
-        
+
         // CRITICAL FIX: Use the global fee_config constant instead of trusting pool_accounts.
         // The fee_config is the SAME for all pools - it's a global account owned by the Fee Program.
         // Observed from successful on-chain SELL (21 accounts) and BUY (23 accounts) transactions.

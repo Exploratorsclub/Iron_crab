@@ -1190,6 +1190,12 @@ pub struct ExecutionResult {
     /// P1: Source strategy/worker for attribution (e.g., "momentum-bot", "arb-strategy")
     pub source: String,
 
+    /// Token mint being traded (for BUY: output_mint, for SELL: input_mint)
+    /// This allows downstream consumers (Grafana, analytics) to identify trades
+    /// without joining with decision records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_mint: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1253,6 +1259,7 @@ impl ExecutionResult {
         decision_id: String,
         intent_id: String,
         source: String,
+        token_mint: Option<String>,
         signature: Option<String>,
         bundle_id: Option<String>,
     ) -> Self {
@@ -1262,6 +1269,7 @@ impl ExecutionResult {
             decision_id,
             intent_id,
             source,
+            token_mint,
             signature,
             bundle_id,
             status: ExecutionStatus::Sent,
@@ -1529,6 +1537,7 @@ mod tests {
             "dec-001".to_string(),
             "intent-001".to_string(),
             "momentum-bot".to_string(),
+            Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string()),
             Some("5abc123...".to_string()),
             None,
         );

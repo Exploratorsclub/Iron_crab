@@ -189,7 +189,7 @@ impl Clone for VaultInfo {
             quote_mint: self.quote_mint,
             is_base_vault: self.is_base_vault,
             last_balance: std::sync::atomic::AtomicU64::new(
-                self.last_balance.load(std::sync::atomic::Ordering::Relaxed)
+                self.last_balance.load(std::sync::atomic::Ordering::Relaxed),
             ),
         }
     }
@@ -995,7 +995,7 @@ async fn run_geyser_loop(
 
                     // Check if this is the FIRST trade for this pool (new pool discovery)
                     let is_first_trade = ctx.known_pump_amm_pools.write().insert(*pool_address);
-                    
+
                     // If first trade, emit PoolCreated FIRST (before DexPoolAccounts)
                     // This ensures arb-strategy sees PoolCreated + DexPoolAccounts together
                     if is_first_trade {
@@ -1200,7 +1200,7 @@ async fn run_geyser_loop(
                         pool_event.base_mint.to_string(),
                         pool_event.quote_mint.to_string(),
                     ];
-                    
+
                     if let Some(coin_vault) = pool_event.coin_vault {
                         accounts.push(coin_vault.to_string());
                     }

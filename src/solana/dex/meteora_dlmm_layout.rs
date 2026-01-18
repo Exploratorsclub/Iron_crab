@@ -35,7 +35,7 @@ pub struct DlmmPool {
     /// Reserve Y vault (32 bytes)
     /// At offset 0xB8 (184 decimal)
     pub reserve_y: Pubkey,
-    
+
     /// Cached token program IDs (SPL Token vs Token-2022)
     /// These are NOT in the on-chain account - populated from LivePoolCache
     pub token_x_program: Option<Pubkey>,

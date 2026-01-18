@@ -804,18 +804,18 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     // Pool static accounts in v2 format (12 accounts, no global_volume_accumulator)
     // See docs/MOMENTUM_V2_SPEC.md section 9.2 and pumpfun_amm.rs build_swap_ix_from_pool_accounts
     let pool_accounts = vec![
-        pool_market,              // [0]
-        global_config,            // [1]
-        base_mint,                // [2]
-        quote_mint,               // [3]
-        pool_base_vault,          // [4]
-        pool_quote_vault,         // [5]
-        protocol_fee_recipient,   // [6]
-        protocol_fee_recipient_ta,// [7]
-        event_authority,          // [8]
-        coin_creator_vault_ata,   // [9]
+        pool_market,                  // [0]
+        global_config,                // [1]
+        base_mint,                    // [2]
+        quote_mint,                   // [3]
+        pool_base_vault,              // [4]
+        pool_quote_vault,             // [5]
+        protocol_fee_recipient,       // [6]
+        protocol_fee_recipient_ta,    // [7]
+        event_authority,              // [8]
+        coin_creator_vault_ata,       // [9]
         coin_creator_vault_authority, // [10]
-        fee_config,               // [11] - v2 format: fee_config is at index 11
+        fee_config,                   // [11] - v2 format: fee_config is at index 11
     ];
 
     debug!(

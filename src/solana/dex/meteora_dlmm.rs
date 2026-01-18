@@ -14,9 +14,9 @@ use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{debug, info};
 #[cfg(feature = "rpc_fallback")]
 use tracing::warn;
+use tracing::{debug, info};
 
 use super::meteora_dlmm_layout::DlmmPool;
 use super::meteora_swap_builder::{MeteoraDlmmSwapBuilder, SwapDirection};
@@ -88,13 +88,17 @@ impl MeteoraDlmm {
     }
 
     /// Inject cached Meteora pool state from LivePoolCache.
-    /// 
+    ///
     /// This allows build_swap_ix to use fresh Geyser-sourced data
     /// instead of making RPC calls. The cached state includes the
     /// current active_id which changes with price.
     ///
     /// Returns Ok(true) if state was injected, Ok(false) if pool already exists.
-    pub fn inject_cached_meteora_state(&self, pool_address: &Pubkey, state: &MeteoraState) -> Result<bool> {
+    pub fn inject_cached_meteora_state(
+        &self,
+        pool_address: &Pubkey,
+        state: &MeteoraState,
+    ) -> Result<bool> {
         // Check if already exists
         if self.pools.contains_key(pool_address) {
             // Update existing entry with fresh active_id
@@ -297,72 +301,72 @@ impl Dex for MeteoraDlmm {
 
         #[cfg(feature = "rpc_fallback")]
         {
-        debug!("Fetching Meteora DLMM pools via getProgramAccounts");
+            debug!("Fetching Meteora DLMM pools via getProgramAccounts");
 
-        let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
+            let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
 
-        // Filter for LB Pair accounts (904 bytes)
-        let config = RpcProgramAccountsConfig {
-            filters: Some(vec![RpcFilterType::DataSize(LB_PAIR_ACCOUNT_SIZE as u64)]),
-            account_config: RpcAccountInfoConfig {
-                encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
-                data_slice: None,
-                commitment: None,
-                min_context_slot: None,
-            },
-            with_context: None,
-            sort_results: None,
-        };
+            // Filter for LB Pair accounts (904 bytes)
+            let config = RpcProgramAccountsConfig {
+                filters: Some(vec![RpcFilterType::DataSize(LB_PAIR_ACCOUNT_SIZE as u64)]),
+                account_config: RpcAccountInfoConfig {
+                    encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                    data_slice: None,
+                    commitment: None,
+                    min_context_slot: None,
+                },
+                with_context: None,
+                sort_results: None,
+            };
 
-        let accounts = self
-            .rpc
-            .get_program_accounts_with_config_retry(&program_id, config)
-            .await?;
+            let accounts = self
+                .rpc
+                .get_program_accounts_with_config_retry(&program_id, config)
+                .await?;
 
-        debug!("Found {} Meteora DLMM pools", accounts.len());
+            debug!("Found {} Meteora DLMM pools", accounts.len());
 
-        for (pubkey, account) in accounts {
-            match DlmmPool::parse(&account.data) {
-                Ok(pool) => {
-                    let cache = PoolCache {
-                        address: pubkey,
-                        pool: pool.clone(),
-                        reserve_x_balance: None,
-                        reserve_y_balance: None,
-                        last_updated: std::time::SystemTime::now(),
-                    };
+            for (pubkey, account) in accounts {
+                match DlmmPool::parse(&account.data) {
+                    Ok(pool) => {
+                        let cache = PoolCache {
+                            address: pubkey,
+                            pool: pool.clone(),
+                            reserve_x_balance: None,
+                            reserve_y_balance: None,
+                            last_updated: std::time::SystemTime::now(),
+                        };
 
-                    self.pools.insert(pubkey, cache);
+                        self.pools.insert(pubkey, cache);
 
-                    // Update mint index
-                    self.mint_index
-                        .entry(pool.token_x_mint)
-                        .or_default()
-                        .push(pubkey);
+                        // Update mint index
+                        self.mint_index
+                            .entry(pool.token_x_mint)
+                            .or_default()
+                            .push(pubkey);
 
-                    self.mint_index
-                        .entry(pool.token_y_mint)
-                        .or_default()
-                        .push(pubkey);
+                        self.mint_index
+                            .entry(pool.token_y_mint)
+                            .or_default()
+                            .push(pubkey);
 
-                    debug!(
-                        "Loaded DLMM pool {}: {}/{} (bin_step={})",
-                        pubkey, pool.token_x_mint, pool.token_y_mint, pool.bin_step
-                    );
-                }
-                Err(e) => {
-                    warn!("Failed to parse DLMM pool {}: {}", pubkey, e);
+                        debug!(
+                            "Loaded DLMM pool {}: {}/{} (bin_step={})",
+                            pubkey, pool.token_x_mint, pool.token_y_mint, pool.bin_step
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse DLMM pool {}: {}", pubkey, e);
+                    }
                 }
             }
-        }
 
-        debug!(
-            "Meteora DLMM refresh complete: {} pools, {} mints",
-            self.pools.len(),
-            self.mint_index.len()
-        );
+            debug!(
+                "Meteora DLMM refresh complete: {} pools, {} mints",
+                self.pools.len(),
+                self.mint_index.len()
+            );
 
-        Ok(())
+            Ok(())
         } // end #[cfg(feature = "rpc_fallback")]
     }
 
@@ -375,10 +379,7 @@ impl Dex for MeteoraDlmm {
     async fn load_pool_by_address(&self, pool_address: &Pubkey) -> Result<()> {
         // Check if already cached
         if self.pools.contains_key(pool_address) {
-            debug!(
-                "Meteora DLMM pool {} already in cache",
-                pool_address
-            );
+            debug!("Meteora DLMM pool {} already in cache", pool_address);
             return Ok(());
         }
 
@@ -456,7 +457,7 @@ impl Dex for MeteoraDlmm {
         };
 
         let pool_pk = parse_pubkey(pool_address, "pool_address")?;
-        
+
         // accounts[1] and accounts[2] are token_x_mint and token_y_mint in ORIGINAL lb_pair order
         let token_x_mint = parse_pubkey(&accounts[1], "token_x_mint")?;
         let token_y_mint = parse_pubkey(&accounts[2], "token_y_mint")?;
@@ -488,7 +489,7 @@ impl Dex for MeteoraDlmm {
         // Parse tagged values (active_id, bin_step) from remaining accounts
         let mut active_id: i32 = 0;
         let mut bin_step: u16 = 10; // Default
-        
+
         for account in accounts.iter().skip(3) {
             if let Some(value) = account.strip_prefix("active_id:") {
                 if let Ok(v) = value.parse::<i32>() {
@@ -692,15 +693,12 @@ impl Dex for MeteoraDlmm {
             .ok_or_else(|| anyhow!("meteora_dlmm user_authority not set"))?;
 
         // Convert to spl_token Pubkey type for ATA derivation
-        let owner_spl =
-            spl_token::solana_program::pubkey::Pubkey::new_from_array(user.to_bytes());
-        let token_x_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
-            pool.token_x_mint.to_bytes(),
-        );
-        let token_y_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
-            pool.token_y_mint.to_bytes(),
-        );
-        
+        let owner_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(user.to_bytes());
+        let token_x_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(pool.token_x_mint.to_bytes());
+        let token_y_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(pool.token_y_mint.to_bytes());
+
         // CRITICAL: Use CACHED token programs from extra_data - NO RPC IN HOT PATH!
         // Token programs (SPL Token vs Token-2022) are immutable per mint.
         // cross_dex_handler caches these via cache_extra_data("token_program:<mint>", program_id)
@@ -712,31 +710,43 @@ impl Dex for MeteoraDlmm {
                 .unwrap_or_default()
                 .to_bytes(),
         );
-        
+
         // Priority 1: Check extra_data cache (populated by cross_dex_handler from Intent)
         // Priority 2: Use pool.token_x_program / pool.token_y_program (if populated from DexPoolAccounts)
         // Priority 3: Default to SPL Token
         let token_x_key = format!("token_program:{}", pool.token_x_mint);
         let token_y_key = format!("token_program:{}", pool.token_y_mint);
-        
-        let token_x_program_spl = self.extra_data.get(&token_x_key)
+
+        let token_x_program_spl = self
+            .extra_data
+            .get(&token_x_key)
             .and_then(|v| Pubkey::from_str(v.value()).ok())
             .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
-            .or_else(|| pool.token_x_program.map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes())))
+            .or_else(|| {
+                pool.token_x_program.map(|p| {
+                    spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes())
+                })
+            })
             .unwrap_or(spl_token_program);
-        
-        let token_y_program_spl = self.extra_data.get(&token_y_key)
+
+        let token_y_program_spl = self
+            .extra_data
+            .get(&token_y_key)
             .and_then(|v| Pubkey::from_str(v.value()).ok())
             .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
-            .or_else(|| pool.token_y_program.map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes())))
+            .or_else(|| {
+                pool.token_y_program.map(|p| {
+                    spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes())
+                })
+            })
             .unwrap_or(spl_token_program);
-        
+
         // Log which source we're using for token programs
         let x_from_cache = self.extra_data.contains_key(&token_x_key);
         let y_from_cache = self.extra_data.contains_key(&token_y_key);
         let x_is_2022 = token_x_program_spl == token_2022_id;
         let y_is_2022 = token_y_program_spl == token_2022_id;
-        
+
         if x_from_cache || y_from_cache || x_is_2022 || y_is_2022 {
             info!(
                 pool = %pool_addr,
@@ -789,22 +799,21 @@ impl Dex for MeteoraDlmm {
         // Build swap instruction with bin arrays (GEYSER-FIRST: sync, no RPC!)
         // Uses active_id and bin_step from LivePoolCache (via Geyser subscription)
         let swap_builder = MeteoraDlmmSwapBuilder::new(self.rpc.clone());
-        let ix = swap_builder
-            .build_swap_with_bins_sync(
-                &pool_addr,
-                &pool.reserve_x,
-                &pool.reserve_y,
-                &user_token_x,
-                &user_token_y,
-                &pool.token_x_mint,
-                &pool.token_y_mint,
-                &user,
-                amount_in,
-                min_out,
-                direction,
-                pool.active_id,
-                pool.bin_step,
-            )?;
+        let ix = swap_builder.build_swap_with_bins_sync(
+            &pool_addr,
+            &pool.reserve_x,
+            &pool.reserve_y,
+            &user_token_x,
+            &user_token_y,
+            &pool.token_x_mint,
+            &pool.token_y_mint,
+            &user,
+            amount_in,
+            min_out,
+            direction,
+            pool.active_id,
+            pool.bin_step,
+        )?;
 
         Ok(vec![ix])
     }

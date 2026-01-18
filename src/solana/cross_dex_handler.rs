@@ -74,7 +74,7 @@ fn get_token_program_for_mint_cached(
     intent_token_program: Option<&str>,
 ) -> spl_token::solana_program::pubkey::Pubkey {
     let token_2022_id = Pubkey::from_str(TOKEN_2022_PROGRAM_ID).unwrap_or_default();
-    
+
     // Priority 1: Use intent-provided token_program (GEYSER-FIRST: arb-strategy already has this info)
     if let Some(prog_str) = intent_token_program {
         if let Ok(prog) = Pubkey::from_str(prog_str) {
@@ -84,20 +84,24 @@ fn get_token_program_for_mint_cached(
                     token_program = %prog_str,
                     "Using Token-2022 program from Intent"
                 );
-                return spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes());
+                return spl_token::solana_program::pubkey::Pubkey::new_from_array(
+                    token_2022_id.to_bytes(),
+                );
             } else {
                 debug!(mint = %mint, "Using SPL Token program from Intent");
                 return spl_token::id();
             }
         }
     }
-    
+
     // Priority 2: Try cache (Geyser-populated)
     if let Some(c) = cache {
         if let Some(prog) = c.get_mint_program(mint) {
             if prog == token_2022_id {
                 debug!(mint = %mint, "Mint uses Token-2022 program (from cache)");
-                return spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022_id.to_bytes());
+                return spl_token::solana_program::pubkey::Pubkey::new_from_array(
+                    token_2022_id.to_bytes(),
+                );
             } else {
                 return spl_token::id();
             }
@@ -118,7 +122,7 @@ fn get_token_program_for_mint_cached(
 }
 
 /// Result of Cross-DEX arbitrage validation
-/// 
+///
 /// NOTE: buy_quote/sell_quote are constructed from Intent metadata,
 /// NOT from RPC calls. arb-strategy is the source of truth for quotes.
 #[derive(Debug)]
@@ -187,7 +191,7 @@ impl CrossDexHandler {
     }
 
     /// Initialize DEX connectors
-    /// 
+    ///
     /// NOTE: These connectors are used ONLY for build_swap_ix().
     /// They should NOT be used for quote_exact_in() or pool discovery.
     /// Pool data comes from arb-strategy via Intent metadata.
@@ -210,11 +214,7 @@ impl CrossDexHandler {
 
         // Initialize PumpSwap AMM (pump_amm) - for build_swap_ix() only
         if let Some(ref rpc_url) = self.rpc_url {
-            let mut pump_amm = PumpFunAmmDex::new(
-                Arc::clone(&self.rpc),
-                rpc_url.clone(),
-                None,
-            );
+            let mut pump_amm = PumpFunAmmDex::new(Arc::clone(&self.rpc), rpc_url.clone(), None);
             if let Some(pk) = self.wallet_pubkey {
                 pump_amm.set_user_authority(pk);
             }
@@ -244,18 +244,21 @@ impl CrossDexHandler {
 
         Ok(())
     }
-    
+
     /// Parse pool accounts from intent.resources.accounts
-    /// 
+    ///
     /// Format from arb-strategy:
     /// - "buy_pool_accounts_start:N" followed by N account strings
     /// - "sell_pool_accounts_start:M" followed by M account strings
-    /// 
+    ///
     /// Returns (buy_accounts, sell_accounts)
-    fn parse_pool_accounts_from_intent(&self, accounts: &[String]) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    fn parse_pool_accounts_from_intent(
+        &self,
+        accounts: &[String],
+    ) -> (Option<Vec<String>>, Option<Vec<String>>) {
         let mut buy_accounts: Option<Vec<String>> = None;
         let mut sell_accounts: Option<Vec<String>> = None;
-        
+
         let mut i = 0;
         while i < accounts.len() {
             if let Some(rest) = accounts[i].strip_prefix("buy_pool_accounts_start:") {
@@ -276,7 +279,7 @@ impl CrossDexHandler {
             }
             i += 1;
         }
-        
+
         (buy_accounts, sell_accounts)
     }
 
@@ -315,7 +318,10 @@ impl CrossDexHandler {
                     format!("active_id:{}", meteora_state.active_id),
                     format!("bin_step:{}", meteora_state.bin_step),
                 ];
-                if connector.set_pool_from_accounts(&pool_pk.to_string(), &accounts).is_ok() {
+                if connector
+                    .set_pool_from_accounts(&pool_pk.to_string(), &accounts)
+                    .is_ok()
+                {
                     info!(
                         pool = %pool_pk,
                         dex = %dex,
@@ -343,7 +349,10 @@ impl CrossDexHandler {
                 if let Some(prog_b) = orca_state.token_b_program {
                     accounts.push(format!("token_b_program:{}", prog_b));
                 }
-                if connector.set_pool_from_accounts(&pool_pk.to_string(), &accounts).is_ok() {
+                if connector
+                    .set_pool_from_accounts(&pool_pk.to_string(), &accounts)
+                    .is_ok()
+                {
                     info!(
                         pool = %pool_pk,
                         dex = %dex,
@@ -529,7 +538,7 @@ impl CrossDexHandler {
             .get("estimated_profit_lamports")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
-        
+
         // Get buy_price from intent metadata (SOL per token)
         // This is needed to compute expected token output for sell leg
         let buy_price_str = intent
@@ -579,8 +588,7 @@ impl CrossDexHandler {
             // This will likely fail simulation but provides a reasonable default
             warn!(
                 buy_price,
-                trade_amount,
-                "buy_price missing or zero, using trade_amount as token estimate"
+                trade_amount, "buy_price missing or zero, using trade_amount as token estimate"
             );
             trade_amount
         };
@@ -896,7 +904,11 @@ impl CrossDexHandler {
 
         // Get pool addresses from intent metadata (needed for instruction building)
         let buy_pool = intent.metadata.get("buy_pool").cloned().unwrap_or_default();
-        let sell_pool = intent.metadata.get("sell_pool").cloned().unwrap_or_default();
+        let sell_pool = intent
+            .metadata
+            .get("sell_pool")
+            .cloned()
+            .unwrap_or_default();
 
         // Debug: log pool addresses for troubleshooting
         info!(
@@ -912,8 +924,9 @@ impl CrossDexHandler {
         // Format from arb-strategy: "buy_pool_accounts_start:N" followed by N accounts,
         // then "sell_pool_accounts_start:M" followed by M accounts.
         // =======================================================================
-        let (buy_accounts, sell_accounts) = self.parse_pool_accounts_from_intent(&intent.resources.accounts);
-        
+        let (buy_accounts, sell_accounts) =
+            self.parse_pool_accounts_from_intent(&intent.resources.accounts);
+
         debug!(
             buy_pool = %buy_pool,
             sell_pool = %sell_pool,
@@ -944,14 +957,15 @@ impl CrossDexHandler {
             // If Geyser hasn't delivered the data, RPC won't have it either (same validator).
             let pool_pk = Pubkey::from_str(&buy_pool)
                 .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
-            
+
             if !self.try_inject_from_cache(&buy_dex, &pool_pk, buy_connector) {
                 // Cache miss = REJECT. No RPC fallback.
                 // The arb-strategy should not have generated this intent without DexPoolAccounts.
                 return Err(anyhow!(
                     "GEYSER_CACHE_MISS: buy pool {} ({}) not in cache and no accounts in intent. \
                      arb-strategy should require DexPoolAccounts before generating intents.",
-                    buy_pool, buy_dex
+                    buy_pool,
+                    buy_dex
                 ));
             }
         }
@@ -968,7 +982,7 @@ impl CrossDexHandler {
         // ====================================================================
         let token_mint_pk = Pubkey::from_str(token_mint)
             .map_err(|_| anyhow!("Invalid token mint: {}", token_mint))?;
-        
+
         // Determine the token program:
         // 1. From Intent (arb-strategy sends this via TokenMintInfo)
         // 2. From cache (Geyser-populated)
@@ -984,7 +998,7 @@ impl CrossDexHandler {
 
         // ====================================================================
         // Create ATAs for BOTH tokens involved in the swap (idempotent)
-        // 
+        //
         // Orca Whirlpool requires ATAs for token_owner_account_a AND token_owner_account_b.
         // - token_owner_account_a = User's ATA for pool.token_mint_a (often WSOL)
         // - token_owner_account_b = User's ATA for pool.token_mint_b (the token)
@@ -997,13 +1011,15 @@ impl CrossDexHandler {
         // ====================================================================
         let mut ata_creation_instructions = Vec::new();
         if let Some(wallet) = self.wallet_pubkey {
-            let wallet_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(wallet.to_bytes());
-            
+            let wallet_spl =
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(wallet.to_bytes());
+
             // 1. Create WSOL ATA (WSOL always uses SPL Token, not Token-2022)
-            let wsol_mint_pk = Pubkey::from_str(SOL_MINT)
-                .map_err(|_| anyhow!("Invalid WSOL mint"))?;
-            let wsol_mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(wsol_mint_pk.to_bytes());
-            
+            let wsol_mint_pk =
+                Pubkey::from_str(SOL_MINT).map_err(|_| anyhow!("Invalid WSOL mint"))?;
+            let wsol_mint_spl =
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(wsol_mint_pk.to_bytes());
+
             let create_wsol_ata_ix_prog = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                 &wallet_spl,        // payer
                 &wallet_spl,        // owner  
@@ -1011,12 +1027,13 @@ impl CrossDexHandler {
                 &spl_token::id(),   // token program (WSOL is always SPL Token)
             );
             ata_creation_instructions.push(prog_ix_to_sdk(create_wsol_ata_ix_prog));
-            
+
             // 2. Create Token ATA (for the token being bought/sold)
             //    MUST use the correct token program (SPL Token OR Token-2022)
             //    Note: token_program was determined above (before this block)
-            let token_mint_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint_pk.to_bytes());
-            
+            let token_mint_spl =
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint_pk.to_bytes());
+
             let create_token_ata_ix_prog = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                 &wallet_spl,        // payer
                 &wallet_spl,        // owner  
@@ -1024,7 +1041,7 @@ impl CrossDexHandler {
                 &token_program,     // token program (dynamically determined above!)
             );
             let token_ata_ix = prog_ix_to_sdk(create_token_ata_ix_prog);
-            
+
             // Log the actual instruction accounts for debugging Token-2022 issues
             info!(
                 token_mint = %token_mint,
@@ -1035,9 +1052,9 @@ impl CrossDexHandler {
                 token_ata_ix_last_account = %token_ata_ix.accounts.last().map(|a| a.pubkey.to_string()).unwrap_or_default(),
                 "Token ATA creation instruction built"
             );
-            
+
             ata_creation_instructions.push(token_ata_ix);
-            
+
             // ====================================================================
             // WRAP SOL: Transfer native SOL → WSOL ATA and sync
             //
@@ -1051,7 +1068,7 @@ impl CrossDexHandler {
                 &wsol_mint_spl,
             );
             let wsol_ata_sdk = Pubkey::new_from_array(wsol_ata.to_bytes());
-            
+
             // Transfer native SOL to WSOL ATA
             // System program transfer: 4-byte discriminator (2u32) + 8-byte lamports
             let system_program_id = Pubkey::from_str("11111111111111111111111111111111")
@@ -1079,14 +1096,13 @@ impl CrossDexHandler {
                 },
             };
             ata_creation_instructions.push(transfer_ix);
-            
+
             // Sync native balance to WSOL token balance
-            let sync_native_ix_prog = spl_token::instruction::sync_native(
-                &spl_token::id(),
-                &wsol_ata,
-            ).map_err(|e| anyhow!("Failed to create sync_native instruction: {}", e))?;
+            let sync_native_ix_prog =
+                spl_token::instruction::sync_native(&spl_token::id(), &wsol_ata)
+                    .map_err(|e| anyhow!("Failed to create sync_native instruction: {}", e))?;
             ata_creation_instructions.push(prog_ix_to_sdk(sync_native_ix_prog));
-            
+
             info!(
                 wsol_ata = %wsol_ata_sdk,
                 amount = buy_amount_in,
@@ -1098,7 +1114,7 @@ impl CrossDexHandler {
         // GEYSER-FIRST: Inject cached data for IX building
         // This eliminates RPC calls in build_swap_ix_async
         // ====================================================================
-        
+
         // Inject Token-2022 program info for all DEXes that need it (Meteora DLMM, Orca, etc.)
         // The token_program was already determined above for ATA creation.
         // We cache it with key "token_program:<mint>" so DEX connectors can use it.
@@ -1106,15 +1122,16 @@ impl CrossDexHandler {
             &format!("token_program:{}", token_mint),
             &token_program_sdk.to_string(),
         );
-        
+
         // For PumpFun bonding curve: derive bonding_curve and get creator from cache
         if buy_dex == "pumpfun" {
-            let (bonding_curve, _) = crate::solana::dex::pumpfun::PumpFunDex::derive_bonding_curve_static(&token_mint_pk);
-            if let Some(creator) = self.get_pumpfun_creator_from_cache(&bonding_curve) {
-                buy_connector.cache_extra_data(
-                    &format!("creator:{}", token_mint),
-                    &creator.to_string(),
+            let (bonding_curve, _) =
+                crate::solana::dex::pumpfun::PumpFunDex::derive_bonding_curve_static(
+                    &token_mint_pk,
                 );
+            if let Some(creator) = self.get_pumpfun_creator_from_cache(&bonding_curve) {
+                buy_connector
+                    .cache_extra_data(&format!("creator:{}", token_mint), &creator.to_string());
                 debug!(
                     token_mint = %token_mint,
                     creator = %creator,
@@ -1133,7 +1150,7 @@ impl CrossDexHandler {
             .dexes
             .get(&sell_dex)
             .ok_or_else(|| anyhow!("Unknown sell DEX: {}", sell_dex))?;
-        
+
         // Inject Token-2022 program info for sell DEX as well
         sell_connector.cache_extra_data(
             &format!("token_program:{}", token_mint),
@@ -1156,14 +1173,15 @@ impl CrossDexHandler {
             // If Geyser hasn't delivered the data, RPC won't have it either (same validator).
             let pool_pk = Pubkey::from_str(&sell_pool)
                 .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;
-            
+
             if !self.try_inject_from_cache(&sell_dex, &pool_pk, sell_connector) {
                 // Cache miss = REJECT. No RPC fallback.
                 // The arb-strategy should not have generated this intent without DexPoolAccounts.
                 return Err(anyhow!(
                     "GEYSER_CACHE_MISS: sell pool {} ({}) not in cache and no accounts in intent. \
                      arb-strategy should require DexPoolAccounts before generating intents.",
-                    sell_pool, sell_dex
+                    sell_pool,
+                    sell_dex
                 ));
             }
         }
@@ -1172,12 +1190,13 @@ impl CrossDexHandler {
         // GEYSER-FIRST: Inject cached creators for PumpFun SELL before building IX
         // ====================================================================
         if sell_dex == "pumpfun" {
-            let (bonding_curve, _) = crate::solana::dex::pumpfun::PumpFunDex::derive_bonding_curve_static(&token_mint_pk);
-            if let Some(creator) = self.get_pumpfun_creator_from_cache(&bonding_curve) {
-                sell_connector.cache_extra_data(
-                    &format!("creator:{}", token_mint),
-                    &creator.to_string(),
+            let (bonding_curve, _) =
+                crate::solana::dex::pumpfun::PumpFunDex::derive_bonding_curve_static(
+                    &token_mint_pk,
                 );
+            if let Some(creator) = self.get_pumpfun_creator_from_cache(&bonding_curve) {
+                sell_connector
+                    .cache_extra_data(&format!("creator:{}", token_mint), &creator.to_string());
                 debug!(
                     token_mint = %token_mint,
                     creator = %creator,
@@ -1198,7 +1217,7 @@ impl CrossDexHandler {
         // If buy gets fewer tokens, the sell will fail (no tokens to sell).
         // This is intentional: the simulation will catch this case.
         let sell_amount_in = buy_quote.amount_out;
-        
+
         info!(
             sell_amount_in,
             buy_quote_amount_out = buy_quote.amount_out,

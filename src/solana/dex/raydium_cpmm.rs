@@ -319,76 +319,76 @@ impl Dex for RaydiumCpmm {
 
         #[cfg(feature = "rpc_fallback")]
         {
-        debug!("Fetching Raydium CPMM pools via getProgramAccounts");
+            debug!("Fetching Raydium CPMM pools via getProgramAccounts");
 
-        let program_id = Pubkey::from_str(RAYDIUM_CPMM_PROGRAM)?;
+            let program_id = Pubkey::from_str(RAYDIUM_CPMM_PROGRAM)?;
 
-        // Filter for CPMM pool accounts
-        let config = RpcProgramAccountsConfig {
-            filters: Some(vec![RpcFilterType::DataSize(CPMM_POOL_ACCOUNT_SIZE as u64)]),
-            account_config: RpcAccountInfoConfig {
-                encoding: Some(UiAccountEncoding::Base64),
-                data_slice: None,
-                commitment: None,
-                min_context_slot: None,
-            },
-            with_context: None,
-            sort_results: None,
-        };
+            // Filter for CPMM pool accounts
+            let config = RpcProgramAccountsConfig {
+                filters: Some(vec![RpcFilterType::DataSize(CPMM_POOL_ACCOUNT_SIZE as u64)]),
+                account_config: RpcAccountInfoConfig {
+                    encoding: Some(UiAccountEncoding::Base64),
+                    data_slice: None,
+                    commitment: None,
+                    min_context_slot: None,
+                },
+                with_context: None,
+                sort_results: None,
+            };
 
-        let accounts = self
-            .rpc
-            .get_program_accounts_with_config_retry(&program_id, config)
-            .await?;
+            let accounts = self
+                .rpc
+                .get_program_accounts_with_config_retry(&program_id, config)
+                .await?;
 
-        debug!("Found {} Raydium CPMM pools", accounts.len());
+            debug!("Found {} Raydium CPMM pools", accounts.len());
 
-        // Clear old pools and index
-        self.pools.clear();
-        self.mint_index.clear();
+            // Clear old pools and index
+            self.pools.clear();
+            self.mint_index.clear();
 
-        for (pubkey, account) in accounts {
-            match CpmmPool::parse(&account.data) {
-                Ok(pool) => {
-                    // Create cache entry
-                    let cache = PoolCache {
-                        address: pubkey,
-                        token_0_mint: pool.token_0_mint,
-                        token_1_mint: pool.token_1_mint,
-                        token_0_vault: pool.token_0_vault,
-                        token_1_vault: pool.token_1_vault,
-                        lp_mint: pool.lp_mint,
-                        reserve_0: 0,
-                        reserve_1: 0,
-                        fee_bps: (pool.fee_rate / 100) as u32, // Convert to bps
-                        last_updated: std::time::SystemTime::now(),
-                    };
+            for (pubkey, account) in accounts {
+                match CpmmPool::parse(&account.data) {
+                    Ok(pool) => {
+                        // Create cache entry
+                        let cache = PoolCache {
+                            address: pubkey,
+                            token_0_mint: pool.token_0_mint,
+                            token_1_mint: pool.token_1_mint,
+                            token_0_vault: pool.token_0_vault,
+                            token_1_vault: pool.token_1_vault,
+                            lp_mint: pool.lp_mint,
+                            reserve_0: 0,
+                            reserve_1: 0,
+                            fee_bps: (pool.fee_rate / 100) as u32, // Convert to bps
+                            last_updated: std::time::SystemTime::now(),
+                        };
 
-                    // Add to pool cache
-                    self.pools.insert(pubkey, cache.clone());
+                        // Add to pool cache
+                        self.pools.insert(pubkey, cache.clone());
 
-                    // Add to mint index
-                    self.mint_index
-                        .entry(pool.token_0_mint)
-                        .or_default()
-                        .push(pubkey);
-                    self.mint_index
-                        .entry(pool.token_1_mint)
-                        .or_default()
-                        .push(pubkey);
+                        // Add to mint index
+                        self.mint_index
+                            .entry(pool.token_0_mint)
+                            .or_default()
+                            .push(pubkey);
+                        self.mint_index
+                            .entry(pool.token_1_mint)
+                            .or_default()
+                            .push(pubkey);
 
-                    debug!(
-                        "Loaded CPMM pool: {} ({}/{})",
-                        pubkey, pool.token_0_mint, pool.token_1_mint
-                    );
-                }
-                Err(e) => {
-                    warn!("Failed to parse CPMM pool {}: {}", pubkey, e);
+                        debug!(
+                            "Loaded CPMM pool: {} ({}/{})",
+                            pubkey, pool.token_0_mint, pool.token_1_mint
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse CPMM pool {}: {}", pubkey, e);
+                    }
                 }
             }
-        }
 
-        Ok(())
+            Ok(())
         } // end #[cfg(feature = "rpc_fallback")]
     }
 

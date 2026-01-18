@@ -228,7 +228,8 @@ impl TokenArbTracker {
 
     /// Store DEX pool accounts (from DexPoolAccounts event)
     fn set_pool_accounts(&mut self, pool_address: &str, accounts: Vec<String>) {
-        self.pool_accounts.insert(pool_address.to_string(), accounts);
+        self.pool_accounts
+            .insert(pool_address.to_string(), accounts);
     }
 
     /// Get DEX pool accounts for a pool
@@ -834,10 +835,7 @@ impl ArbContext {
         let mut cache = self.bin_arrays.write();
         let pool_cache = cache.entry(pool_address.to_string()).or_default();
         let bins_count = bins.len();
-        pool_cache.insert(
-            bin_array_index,
-            BinArrayCache { bins, update_slot },
-        );
+        pool_cache.insert(bin_array_index, BinArrayCache { bins, update_slot });
         debug!(
             pool = %pool_address,
             bin_array_index,
@@ -859,15 +857,12 @@ impl ArbContext {
     /// Get cached bin arrays for a Meteora DLMM pool (returns None if not cached)
     #[allow(dead_code)]
     fn get_bin_arrays(&self, pool_address: &str) -> Option<HashMap<i64, Vec<BinData>>> {
-        self.bin_arrays
-            .read()
-            .get(pool_address)
-            .map(|arrays| {
-                arrays
-                    .iter()
-                    .map(|(idx, cache)| (*idx, cache.bins.clone()))
-                    .collect()
-            })
+        self.bin_arrays.read().get(pool_address).map(|arrays| {
+            arrays
+                .iter()
+                .map(|(idx, cache)| (*idx, cache.bins.clone()))
+                .collect()
+        })
     }
 
     /// Update price from trade event
@@ -1011,7 +1006,10 @@ impl ArbContext {
 
     /// Get pool accounts for both buy and sell pools
     /// Returns (buy_accounts, sell_accounts) if available
-    fn get_pool_accounts_for_arb(&self, opp: &ArbOpportunity) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    fn get_pool_accounts_for_arb(
+        &self,
+        opp: &ArbOpportunity,
+    ) -> (Option<Vec<String>>, Option<Vec<String>>) {
         let trackers = self.trackers.read();
         if let Some(tracker) = trackers.get(&opp.base_mint) {
             let buy_accounts = tracker.get_pool_accounts(&opp.buy_pool).cloned();
@@ -1046,7 +1044,7 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
 
     // Get pool accounts from DexPoolAccounts events (NO RPC needed in execution-engine!)
     let (buy_accounts, sell_accounts) = ctx.get_pool_accounts_for_arb(opp);
-    
+
     // GEYSER-FIRST: Require DexPoolAccounts for BOTH pools
     // This eliminates RPC fallback in execution-engine hot path.
     // If Geyser hasn't delivered the pool data yet, we reject early.
@@ -1072,16 +1070,16 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
         ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    
+
     // Both pools have accounts - safe to proceed
     let buy_accts = buy_accounts.unwrap();
     let sell_accts = sell_accounts.unwrap();
-    
+
     // Combine accounts: buy pool accounts + sell pool accounts
     // Format: buy accounts are prefixed with "buy:" and sell with "sell:" for disambiguation
     // execution-engine will parse these to build instructions without RPC
     let mut all_accounts = Vec::new();
-    
+
     // Store buy accounts with marker
     all_accounts.push(format!("buy_pool_accounts_start:{}", buy_accts.len()));
     all_accounts.extend(buy_accts.iter().cloned());
@@ -1093,7 +1091,7 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     // Get token program from cache (from TokenMintInfo event)
     // This avoids IncorrectProgramId errors when creating ATAs for Token-2022 tokens
     let token_program = ctx.get_token_program_for_mint(&opp.base_mint);
-    
+
     let resources = TradeResources {
         input_mint: "So11111111111111111111111111111111111111112".to_string(),
         output_mint: opp.base_mint.clone(),
@@ -1544,7 +1542,13 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             update_slot,
             ..
         } => {
-            ctx.handle_pool_state_update(pool_address, dex, *reserve_base, *reserve_quote, *update_slot);
+            ctx.handle_pool_state_update(
+                pool_address,
+                dex,
+                *reserve_base,
+                *reserve_quote,
+                *update_slot,
+            );
             None
         }
 

@@ -22,7 +22,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::solana::rpc::SolanaRpc;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// SPL Token program ID
 pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -55,15 +55,13 @@ impl MeteoraDlmmSwapBuilder {
     }
 
     /// Derive the bin_array_bitmap_extension PDA for a pool
-    /// 
+    ///
     /// This account is required for pools with extended price range (liquidity across > 512 arrays).
     /// Seeds: ["bitmap_extension", lb_pair.as_ref()]
     pub fn derive_bitmap_extension_pda(lb_pair: &Pubkey) -> Result<Pubkey> {
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
-        let (pda, _bump) = Pubkey::find_program_address(
-            &[b"bitmap_extension", lb_pair.as_ref()],
-            &program_id,
-        );
+        let (pda, _bump) =
+            Pubkey::find_program_address(&[b"bitmap_extension", lb_pair.as_ref()], &program_id);
         Ok(pda)
     }
 
@@ -79,22 +77,25 @@ impl MeteoraDlmmSwapBuilder {
     /// - Bin array PDAs are deterministic (seed = [b"bin_array", lb_pair, index])
     /// - Including a non-existent PDA causes simulation failure (not silent error)
     /// - 3 bin arrays (active-1, active, active+1) cover typical swap ranges
-    pub fn derive_bin_arrays_for_active_id(lb_pair: &Pubkey, active_id: i32) -> Result<Vec<Pubkey>> {
+    pub fn derive_bin_arrays_for_active_id(
+        lb_pair: &Pubkey,
+        active_id: i32,
+    ) -> Result<Vec<Pubkey>> {
         let active_array_index = Self::bin_id_to_bin_array_index(active_id);
-        
+
         // Include active + adjacent bin arrays to handle edge cases
         let indices: Vec<i64> = vec![
             active_array_index - 1,
             active_array_index,
             active_array_index + 1,
         ];
-        
+
         let mut bin_arrays = Vec::with_capacity(3);
         for index in indices {
             let pda = Self::derive_bin_array_pda(lb_pair, index)?;
             bin_arrays.push(pda);
         }
-        
+
         debug!(
             pool = %lb_pair,
             active_id = active_id,
@@ -102,7 +103,7 @@ impl MeteoraDlmmSwapBuilder {
             bin_arrays_count = bin_arrays.len(),
             "Meteora: derived bin array PDAs (GEYSER-FIRST, no RPC)"
         );
-        
+
         Ok(bin_arrays)
     }
 
@@ -187,34 +188,29 @@ impl MeteoraDlmmSwapBuilder {
         };
 
         // Derive oracle PDA: seeds = ["oracle", lb_pair]
-        let (oracle, _) = Pubkey::find_program_address(
-            &[b"oracle", lb_pair.as_ref()],
-            &program_id,
-        );
+        let (oracle, _) = Pubkey::find_program_address(&[b"oracle", lb_pair.as_ref()], &program_id);
 
         // Derive event_authority PDA: seeds = ["__event_authority"]
-        let (event_authority, _) = Pubkey::find_program_address(
-            &[b"__event_authority"],
-            &program_id,
-        );
+        let (event_authority, _) =
+            Pubkey::find_program_address(&[b"__event_authority"], &program_id);
 
         let accounts = vec![
-            AccountMeta::new(*lb_pair, false),      // 0: LB Pair (writable)
+            AccountMeta::new(*lb_pair, false), // 0: LB Pair (writable)
             AccountMeta::new_readonly(bin_array_bitmap_extension, false), // 1: bitmap extension (optional)
-            AccountMeta::new(*reserve_x, false),    // 2: Reserve X (writable)
-            AccountMeta::new(*reserve_y, false),    // 3: Reserve Y (writable)
+            AccountMeta::new(*reserve_x, false),                          // 2: Reserve X (writable)
+            AccountMeta::new(*reserve_y, false),                          // 3: Reserve Y (writable)
             AccountMeta::new(*user_token_in, false), // 4: User token IN (writable)
             AccountMeta::new(*user_token_out, false), // 5: User token OUT (writable)
             AccountMeta::new_readonly(*token_x_mint, false), // 6: Token X mint
             AccountMeta::new_readonly(*token_y_mint, false), // 7: Token Y mint
-            AccountMeta::new(oracle, false),        // 8: Oracle PDA (WRITABLE!)
+            AccountMeta::new(oracle, false),         // 8: Oracle PDA (WRITABLE!)
             AccountMeta::new_readonly(program_id, false), // 9: host_fee_in (optional, use program_id)
-            AccountMeta::new_readonly(*user, true), // 10: User (signer)
+            AccountMeta::new_readonly(*user, true),       // 10: User (signer)
             AccountMeta::new_readonly(token_program, false), // 11: token_x_program
             AccountMeta::new_readonly(token_program, false), // 12: token_y_program
             AccountMeta::new_readonly(event_authority, false), // 13: Event authority
             AccountMeta::new_readonly(program_id, false), // 14: Program ID
-            AccountMeta::new(bin_array_pda, false), // 15: Bin array (writable)
+            AccountMeta::new(bin_array_pda, false),       // 15: Bin array (writable)
         ];
 
         Ok(Instruction {
@@ -256,10 +252,12 @@ impl MeteoraDlmmSwapBuilder {
 
         // GEYSER-FIRST: Use active_id directly from LivePoolCache (no RPC!)
         // The Geyser subscription provides real-time updates - more current than RPC.
-        debug!(
+        let active_array_index = Self::bin_id_to_bin_array_index(active_id);
+        info!(
             pool = %lb_pair,
             active_id = active_id,
-            "Meteora: using active_id from Geyser cache (GEYSER-FIRST)"
+            active_array_index = active_array_index,
+            "Meteora: building swap with active_id from Geyser cache (GEYSER-FIRST)"
         );
 
         // bin_array_bitmap_extension is OPTIONAL in Meteora DLMM.
@@ -279,17 +277,22 @@ impl MeteoraDlmmSwapBuilder {
         // If a bin array doesn't exist, the TX simulation will fail with a clear error.
         let bin_arrays = Self::derive_bin_arrays_for_active_id(lb_pair, active_id)?;
 
-        // Derive oracle PDA
-        let (oracle, _) = Pubkey::find_program_address(
-            &[b"oracle", lb_pair.as_ref()],
-            &program_id,
+        // Log the derived bin arrays for debugging
+        info!(
+            pool = %lb_pair,
+            bin_array_count = bin_arrays.len(),
+            bin_array_0 = %bin_arrays.get(0).map(|p| p.to_string()).unwrap_or_default(),
+            bin_array_1 = %bin_arrays.get(1).map(|p| p.to_string()).unwrap_or_default(),
+            bin_array_2 = %bin_arrays.get(2).map(|p| p.to_string()).unwrap_or_default(),
+            "Meteora: derived bin array PDAs (may not exist on-chain!)"
         );
 
+        // Derive oracle PDA
+        let (oracle, _) = Pubkey::find_program_address(&[b"oracle", lb_pair.as_ref()], &program_id);
+
         // Derive event_authority PDA
-        let (event_authority, _) = Pubkey::find_program_address(
-            &[b"__event_authority"],
-            &program_id,
-        );
+        let (event_authority, _) =
+            Pubkey::find_program_address(&[b"__event_authority"], &program_id);
 
         // Build instruction data
         let mut data = Vec::with_capacity(24);
@@ -306,19 +309,19 @@ impl MeteoraDlmmSwapBuilder {
             SwapDirection::XtoY => (user_token_x, user_token_y),
             SwapDirection::YtoX => (user_token_y, user_token_x),
         };
-        
+
         let mut accounts = vec![
-            AccountMeta::new(*lb_pair, false),      // 0: LB Pair (writable)
+            AccountMeta::new(*lb_pair, false), // 0: LB Pair (writable)
             AccountMeta::new_readonly(bin_array_bitmap_extension, false), // 1: bitmap extension (required if exists!)
-            AccountMeta::new(*reserve_x, false),    // 2: Reserve X (writable)
-            AccountMeta::new(*reserve_y, false),    // 3: Reserve Y (writable)
+            AccountMeta::new(*reserve_x, false),                          // 2: Reserve X (writable)
+            AccountMeta::new(*reserve_y, false),                          // 3: Reserve Y (writable)
             AccountMeta::new(*user_token_in, false), // 4: User token IN (writable) - depends on direction!
             AccountMeta::new(*user_token_out, false), // 5: User token OUT (writable) - depends on direction!
             AccountMeta::new_readonly(*token_x_mint, false), // 6: Token X mint
             AccountMeta::new_readonly(*token_y_mint, false), // 7: Token Y mint
-            AccountMeta::new(oracle, false),        // 8: Oracle PDA (WRITABLE!)
+            AccountMeta::new(oracle, false),          // 8: Oracle PDA (WRITABLE!)
             AccountMeta::new_readonly(program_id, false), // 9: host_fee_in (optional)
-            AccountMeta::new_readonly(*user, true), // 10: User (signer)
+            AccountMeta::new_readonly(*user, true),   // 10: User (signer)
             AccountMeta::new_readonly(token_program, false), // 11: token_x_program
             AccountMeta::new_readonly(token_program, false), // 12: token_y_program
             AccountMeta::new_readonly(event_authority, false), // 13: Event authority
@@ -366,7 +369,7 @@ impl MeteoraDlmmSwapBuilder {
     /// - bin_id = -1:  -1 / 70 = 0       (wrong! integer division truncates toward zero)
     pub fn bin_id_to_bin_array_index(bin_id: i32) -> i64 {
         const BIN_ARRAY_SIZE: i32 = 70; // Meteora default
-        // Use div_euclid for floor division (handles negative numbers correctly)
+                                        // Use div_euclid for floor division (handles negative numbers correctly)
         bin_id.div_euclid(BIN_ARRAY_SIZE) as i64
     }
 }
