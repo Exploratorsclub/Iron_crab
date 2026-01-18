@@ -346,8 +346,10 @@ async fn publish_wallet_snapshot(
 ) -> Result<()> {
     use solana_client::rpc_request::TokenAccountsFilter;
 
-    let token_program = spl_token::id();
-    let token_2022_program = spl_token_2022::id();
+    let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        .expect("valid token program");
+    let token_2022_program = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+        .expect("valid token-2022 program");
     let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
         .expect("valid sol mint");
 
