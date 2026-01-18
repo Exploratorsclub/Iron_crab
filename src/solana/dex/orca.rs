@@ -989,25 +989,39 @@ impl Dex for Orca {
         let s_curr = current_array_start;                     // Current array
         let s_next = current_array_start + ticks_per_array;   // Next array (higher ticks)
         
+        // CRITICAL FIX: Orca Whirlpool requires tick_array_0 to contain the CURRENT tick!
+        // The swap then traverses through tick_array_1 and tick_array_2 in the swap direction.
+        // Previous code incorrectly put the "destination" array first, causing 6023 errors.
+        //
+        // Correct order per Orca SDK:
+        // - tick_array_0: MUST contain current tick (s_curr)
+        // - tick_array_1, tick_array_2: in swap direction
+        //
+        // For a_to_b (price decreases, ticks decrease): curr, prev, prev-1
+        // For b_to_a (price increases, ticks increase): curr, next, next+1
         let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) = if a_to_b {
             // A->B: price decreases, ticks decrease
-            // Put previous array first (where swap will likely end up),
-            // then current, then we include next for tolerance
+            // tick_array_0 = current (contains current tick)
+            // tick_array_1 = previous (lower ticks - swap direction)
+            // tick_array_2 = previous-1 (even lower ticks - continued swap direction)
+            let s_prev2 = s_prev - ticks_per_array;
             (
-                derive_tick_array_pda(&pool_id, s_prev),  // Lower ticks (swap direction)
-                derive_tick_array_pda(&pool_id, s_curr),  // Current 
-                derive_tick_array_pda(&pool_id, s_next),  // Higher ticks (tolerance buffer)
-                s_prev, s_curr, s_next,
+                derive_tick_array_pda(&pool_id, s_curr),   // Current - MUST be first
+                derive_tick_array_pda(&pool_id, s_prev),   // Lower ticks (swap direction)
+                derive_tick_array_pda(&pool_id, s_prev2),  // Even lower (continued swap)
+                s_curr, s_prev, s_prev2,
             )
         } else {
             // B->A: price increases, ticks increase
-            // Put next array first (where swap will likely end up),
-            // then current, then we include prev for tolerance
+            // tick_array_0 = current (contains current tick)
+            // tick_array_1 = next (higher ticks - swap direction)  
+            // tick_array_2 = next+1 (even higher ticks - continued swap direction)
+            let s_next2 = s_next + ticks_per_array;
             (
-                derive_tick_array_pda(&pool_id, s_next),  // Higher ticks (swap direction)
-                derive_tick_array_pda(&pool_id, s_curr),  // Current
-                derive_tick_array_pda(&pool_id, s_prev),  // Lower ticks (tolerance buffer)
-                s_next, s_curr, s_prev,
+                derive_tick_array_pda(&pool_id, s_curr),   // Current - MUST be first
+                derive_tick_array_pda(&pool_id, s_next),   // Higher ticks (swap direction)
+                derive_tick_array_pda(&pool_id, s_next2),  // Even higher (continued swap)
+                s_curr, s_next, s_next2,
             )
         };
 
