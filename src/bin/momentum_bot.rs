@@ -2851,6 +2851,175 @@ impl MomentumContext {
     }
 }
 
+/// Recover open positions from execution_results JSONL after restart
+///
+/// P0: Critical for preventing "forgotten" tokens that never get sold.
+/// Reads recent execution_results (last 7 days) and reconstructs PositionTracker
+/// for any confirmed BUYs without matching SELLs.
+async fn recover_positions_from_jsonl(
+    log_dir: &PathBuf,
+) -> Result<HashMap<String, PositionTracker>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let mut positions: HashMap<String, PositionTracker> = HashMap::new();
+    let executions_dir = log_dir.parent().unwrap_or(log_dir).join("executions");
+
+    if !executions_dir.exists() {
+        info!("No executions directory found, skipping position recovery");
+        return Ok(positions);
+    }
+
+    info!(
+        dir = %executions_dir.display(),
+        "Scanning execution_results for open positions..."
+    );
+
+    // Track all BUYs and SELLs by mint
+    let mut buys_by_mint: HashMap<String, Vec<ExecutionResult>> = HashMap::new();
+    let mut sells: HashSet<String> = HashSet::new(); // mints that have been sold
+
+    // Scan last 7 days of execution results
+    let today = chrono::Utc::now().date_naive();
+    for days_ago in 0..7 {
+        let date = (today - chrono::Duration::days(days_ago))
+            .format("%Y%m%d")
+            .to_string();
+        let jsonl_path = executions_dir.join(format!("execution_results-{}.jsonl", date));
+
+        if !jsonl_path.exists() {
+            continue;
+        }
+
+        let file = File::open(&jsonl_path)?;
+        let reader = BufReader::new(file);
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let exec: ExecutionResult = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            // Only process momentum-bot executions
+            if exec.source != "momentum-bot" {
+                continue;
+            }
+
+            // Only process confirmed executions
+            if exec.status != ExecutionStatus::Confirmed {
+                continue;
+            }
+
+            // Get token_mint (if available - new schema)
+            let mint = if let Some(ref m) = exec.token_mint {
+                m.clone()
+            } else {
+                // Old schema without token_mint - skip
+                continue;
+            };
+
+            // Determine BUY vs SELL from fill amounts
+            let is_buy = exec.fill_out.is_some() && exec.fill_out.as_ref().unwrap().raw > 0;
+            let is_sell = exec.fill_in.is_some() && exec.fill_in.as_ref().unwrap().raw > 100_000;
+
+            if is_sell {
+                // SELL confirmed - mark this mint as closed
+                sells.insert(mint.clone());
+                // Remove from open buys
+                buys_by_mint.remove(&mint);
+            } else if is_buy {
+                // Only track if not already sold
+                if !sells.contains(&mint) {
+                    buys_by_mint.entry(mint.clone()).or_default().push(exec);
+                }
+            }
+        }
+    }
+
+    // Now reconstruct PositionTracker for each open BUY
+    for (mint, execs) in buys_by_mint.iter() {
+        // Take the most recent BUY for this mint
+        if let Some(exec) = execs.last() {
+            let fill_out = match exec.fill_out.as_ref() {
+                Some(f) => f,
+                None => {
+                    warn!(mint = %mint, "BUY execution missing fill_out, skipping");
+                    continue;
+                }
+            };
+
+            let token_amount = fill_out.raw;
+            let token_decimals = fill_out.decimals;
+
+            // Best-effort: estimate SOL invested and entry price
+            let sol_invested = exec
+                .fill_in
+                .as_ref()
+                .map(|f| f.raw)
+                .or_else(|| exec.wallet_sol_delta_lamports.map(|d| d.abs() as u64))
+                .unwrap_or(1_000_000_000); // Fallback: 1 SOL
+
+            let sol_ui = sol_invested as f64 / 1e9;
+            let tok_ui = token_amount as f64 / 10f64.powi(token_decimals as i32);
+            let entry_price = if sol_ui > 0.0 { tok_ui / sol_ui } else { 1.0 };
+
+            // Estimate entry time from timestamp (ms)
+            let entry_time_estimate = chrono::DateTime::from_timestamp_millis(exec.header.ts_unix_ms as i64)
+                .map(|dt| {
+                    let elapsed = chrono::Utc::now().signed_duration_since(dt);
+                    Instant::now() - Duration::from_secs(elapsed.num_seconds().max(0) as u64)
+                })
+                .unwrap_or_else(Instant::now);
+
+            // We don't have pool/dex from execution_results (only mint)
+            // Use placeholder values - exits will still work based on time/price
+            let pool = format!("unknown_pool_{}", &mint[..8]);
+            let dex = "unknown".to_string();
+
+            let mut tracker = PositionTracker::new(
+                mint,
+                &pool,
+                &dex,
+                entry_price,
+                token_decimals,
+                token_amount,
+                sol_invested,
+            );
+
+            // Override entry_time to match actual trade time
+            tracker.entry_time = entry_time_estimate;
+            tracker.current_price = entry_price; // Will update from market events
+
+            info!(
+                mint = %mint,
+                token_amount_ui = %tok_ui,
+                entry_price = %entry_price,
+                sol_invested_ui = %sol_ui,
+                age_secs = %(Instant::now() - entry_time_estimate).as_secs(),
+                "🔄 Position recovered from JSONL"
+            );
+
+            positions.insert(mint.clone(), tracker);
+        }
+    }
+
+    if positions.is_empty() {
+        info!("No open positions found in execution_results");
+    } else {
+        info!(
+            recovered_positions = positions.len(),
+            "Position recovery complete"
+        );
+    }
+
+    Ok(positions)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -2957,6 +3126,16 @@ async fn main() -> Result<()> {
 
     info!(log_dir = %log_dir.display(), "JSONL writer initialized");
 
+    // === P0: Recover open positions from execution_results JSONL ===
+    // Critical: Prevents "forgotten" tokens after restarts
+    let recovered_positions = match recover_positions_from_jsonl(&log_dir).await {
+        Ok(positions) => positions,
+        Err(e) => {
+            warn!(error = %e, "Failed to recover positions from JSONL, starting with empty state");
+            HashMap::new()
+        }
+    };
+
     // Setup NATS
     let nats = if args.dry_run {
         info!("Dry-run mode: NATS publishing disabled");
@@ -2984,7 +3163,7 @@ async fn main() -> Result<()> {
         pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
         mint_infos: parking_lot::RwLock::new(HashMap::new()),
         token_trackers: parking_lot::RwLock::new(HashMap::new()),
-        positions: parking_lot::RwLock::new(HashMap::new()),
+        positions: parking_lot::RwLock::new(recovered_positions),
         pending_intents: parking_lot::RwLock::new(HashMap::new()),
         tokens_tracked: std::sync::atomic::AtomicU64::new(0),
         tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
