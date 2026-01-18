@@ -4122,17 +4122,21 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 "✅ Tip instruction added to Jito bundle transaction"
             );
 
-            // Use VersionedTransaction with ALT if available, otherwise legacy Transaction
-            // This fixes Jito -32602 "could not be decoded" errors for ALT transactions
-            let send_result = if let Some(ref alt) = ctx.address_lookup_table {
+            // CRITICAL: For Jito bundles, ALWAYS use legacy transactions (no ALT).
+            // Reason: v0::Message::try_compile can deduplicate accounts or merge readonly/writable flags,
+            // which may cause the tip account to lose its is_writable=true flag.
+            // Jito requires the tip account to be write-locked, so we use legacy transactions to
+            // ensure account metadata is preserved exactly as specified.
+            let send_result = if false {
+                // ALT path disabled for bundles - keeping code for reference
                 // Build versioned transaction with ALT
                 // AddressLookupTableAccount, v0, VersionedMessage already imported at top
                 use solana_sdk::transaction::VersionedTransaction;
 
                 // Convert LoadedAlt to AddressLookupTableAccount for v0::Message::try_compile
                 let alt_account = AddressLookupTableAccount {
-                    key: alt.address,
-                    addresses: alt.accounts.clone(),
+                    key: ctx.address_lookup_table.as_ref().unwrap().address,
+                    addresses: ctx.address_lookup_table.as_ref().unwrap().accounts.clone(),
                 };
 
                 match v0::Message::try_compile(&wallet_pubkey, &ixs, &[alt_account], blockhash) {
@@ -4142,9 +4146,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                             Ok(versioned_tx) => {
                                 info!(
                                     intent_id = %intent.intent_id,
-                                    alt_address = %alt.address,
-                                    alt_accounts = alt.accounts.len(),
-                                    "Submitting versioned transaction with ALT to Jito"
+                                    "Submitting versioned transaction with ALT to Jito (ALT path disabled, this should not run)"
                                 );
                                 jito_client.send_versioned_bundle(&[versioned_tx]).await
                             }
@@ -4173,7 +4175,11 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     }
                 }
             } else {
-                // Legacy transaction (no ALT)
+                // Legacy transaction (ALWAYS used for Jito bundles to preserve tip account is_writable)
+                info!(
+                    intent_id = %intent.intent_id,
+                    "Using legacy transaction for Jito bundle (ensures tip account write-lock)"
+                );
                 let tx = Transaction::new_signed_with_payer(
                     &ixs,
                     Some(&wallet_pubkey),
