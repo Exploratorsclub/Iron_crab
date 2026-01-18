@@ -2864,6 +2864,7 @@ async fn recover_positions_from_jsonl(
 
     let mut positions: HashMap<String, PositionTracker> = HashMap::new();
     let executions_dir = log_dir.parent().unwrap_or(log_dir).join("executions");
+    let intents_dir = log_dir.parent().unwrap_or(log_dir).join("intents");
 
     if !executions_dir.exists() {
         info!("No executions directory found, skipping position recovery");
@@ -2874,6 +2875,36 @@ async fn recover_positions_from_jsonl(
         dir = %executions_dir.display(),
         "Scanning execution_results for open positions..."
     );
+
+    // Build intent_id -> TradeIntent lookup for old executions without token_mint
+    let mut intent_lookup: HashMap<String, serde_json::Value> = HashMap::new();
+    if intents_dir.exists() {
+        let today = chrono::Utc::now().date_naive();
+        for days_ago in 0..7 {
+            let date = (today - chrono::Duration::days(days_ago))
+                .format("%Y%m%d")
+                .to_string();
+            let intents_path = intents_dir.join(format!("trade_intents-{}.jsonl", date));
+            
+            if !intents_path.exists() {
+                continue;
+            }
+
+            if let Ok(file) = File::open(&intents_path) {
+                let reader = BufReader::new(file);
+                for line in reader.lines() {
+                    if let Ok(line) = line {
+                        if let Ok(intent) = serde_json::from_str::<serde_json::Value>(&line) {
+                            if let Some(intent_id) = intent.get("intent_id").and_then(|v| v.as_str()) {
+                                intent_lookup.insert(intent_id.to_string(), intent);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        info!(cached_intents = intent_lookup.len(), "Built intent lookup for position recovery");
+    }
 
     // Track all BUYs and SELLs by mint
     let mut buys_by_mint: HashMap<String, Vec<ExecutionResult>> = HashMap::new();
@@ -2915,12 +2946,38 @@ async fn recover_positions_from_jsonl(
                 continue;
             }
 
-            // Get token_mint (if available - new schema)
+            // Get token_mint (from new schema or fallback to intent lookup)
             let mint = if let Some(ref m) = exec.token_mint {
                 m.clone()
             } else {
-                // Old schema without token_mint - skip
-                continue;
+                // Old schema - try to get mint from intent
+                let mint_from_intent = if let Some(intent) = intent_lookup.get(&exec.intent_id) {
+                    // Determine BUY vs SELL from fill amounts first
+                    let has_fill_out = exec.fill_out.is_some() && exec.fill_out.as_ref().unwrap().raw > 0;
+                    
+                    if has_fill_out {
+                        // BUY: output_mint is the token
+                        intent
+                            .get("resources")
+                            .and_then(|r| r.get("output_mint"))
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string())
+                    } else {
+                        // SELL: input_mint is the token
+                        intent
+                            .get("resources")
+                            .and_then(|r| r.get("input_mint"))
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string())
+                    }
+                } else {
+                    None
+                };
+                
+                match mint_from_intent {
+                    Some(m) => m,
+                    None => continue, // Skip if we can't determine mint
+                }
             };
 
             // Determine BUY vs SELL from fill amounts
