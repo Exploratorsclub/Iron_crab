@@ -95,6 +95,34 @@ fi
 .venv/bin/pip install -q -r control_plane/requirements.txt
 
 # -----------------------------------------------------------------------------
+# 3.5. Configure Wallet Pubkey for Position Reconciliation
+# -----------------------------------------------------------------------------
+log_info "Configuring wallet pubkey for position reconciliation..."
+if [ -f "$HOME/.config/solana/id.json" ]; then
+    WALLET_PUBKEY=$(.venv/bin/python3 -c "
+import json, sys
+from solana.keypair import Keypair
+with open('$HOME/.config/solana/id.json') as f:
+    kp = Keypair.from_secret_key(bytes(json.load(f)))
+print(str(kp.public_key))
+" 2>/dev/null || echo "")
+    
+    if [ -n "$WALLET_PUBKEY" ]; then
+        log_info "Wallet pubkey: $WALLET_PUBKEY"
+        sudo mkdir -p /etc/systemd/system/market-data.service.d/
+        sudo tee /etc/systemd/system/market-data.service.d/wallet.conf > /dev/null <<EOF
+[Service]
+Environment="IRONCRAB_WALLET_PUBKEY=$WALLET_PUBKEY"
+EOF
+        log_info "market-data will publish wallet balance snapshot at startup"
+    else
+        log_warn "Could not extract wallet pubkey (position reconciliation disabled)"
+    fi
+else
+    log_warn "No wallet keypair found at ~/.config/solana/id.json (position reconciliation disabled)"
+fi
+
+# -----------------------------------------------------------------------------
 # 4. Install systemd services
 # -----------------------------------------------------------------------------
 install_service() {
