@@ -4180,12 +4180,20 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     intent_id = %intent.intent_id,
                     "Using legacy transaction for Jito bundle (ensures tip account write-lock)"
                 );
-                let tx = Transaction::new_signed_with_payer(
-                    &ixs,
-                    Some(&wallet_pubkey),
-                    &[signer],
-                    blockhash,
+                
+                // Build transaction manually to ensure proper serialization for Jito
+                use solana_sdk::message::Message;
+                let message = Message::new(&ixs, Some(&wallet_pubkey));
+                let mut tx = Transaction::new_unsigned(message);
+                tx.sign(&[signer], blockhash);
+                
+                info!(
+                    intent_id = %intent.intent_id,
+                    is_signed = tx.is_signed(),
+                    signature_count = tx.signatures.len(),
+                    "Transaction signed for Jito bundle"
                 );
+                
                 jito_client.send_bundle(&[tx]).await
             };
 
