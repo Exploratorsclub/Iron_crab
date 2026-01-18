@@ -3247,6 +3247,29 @@ async fn main() -> Result<()> {
         exits_generated: std::sync::atomic::AtomicU64::new(0),
     });
 
+    // === CRITICAL: Check for immediate exits after position recovery ===
+    // Recovered positions might already violate max_hold_time or stop-loss
+    // This ensures we don't wait for a MarketEvent that may never come
+    {
+        let exits = ctx.check_for_exits();
+        for (mint, pool, dex, exit_type, reason, token_amount) in exits {
+            info!(
+                mint = %mint,
+                pool = %pool,
+                exit_type = %exit_type,
+                reason = %reason,
+                token_amount = token_amount,
+                "🚨 IMMEDIATE EXIT SIGNAL (recovered position)"
+            );
+
+            if let Err(e) = generate_and_publish_exit_intent(&ctx, &mint, &pool, &dex, &exit_type, &reason, token_amount).await {
+                error!(error = %e, mint = %mint, "Failed to generate/publish immediate exit intent");
+            } else {
+                ctx.exits_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     // === Main Loop: Process MarketEvents from NATS ===
     info!("Entering main event loop");
 
