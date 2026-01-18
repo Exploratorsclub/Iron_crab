@@ -344,8 +344,7 @@ async fn publish_wallet_snapshot(
     rpc: &SolanaRpc,
     wallet: &Pubkey,
 ) -> Result<()> {
-    use solana_client::rpc_filter::RpcFilterType;
-    use solana_sdk::program_pack::Pack;
+    use solana_client::rpc_request::TokenAccountsFilter;
 
     let token_program = spl_token::id();
     let token_2022_program = spl_token_2022::id();
@@ -364,7 +363,7 @@ async fn publish_wallet_snapshot(
             .rpc
             .get_token_accounts_by_owner(
                 wallet,
-                solana_client::rpc_filter::TokenAccountsFilter::ProgramId(program_id),
+                TokenAccountsFilter::ProgramId(program_id.clone()),
             )
             .await
         {
@@ -422,10 +421,14 @@ async fn publish_wallet_snapshot(
 
             non_zero_accounts += 1;
 
+            let event_id = format!("wallet_snapshot_{}", mint);
             let event = MarketEvent::new(
                 "market-data",
                 BUILD_VERSION,
                 &ctx.run_id,
+                event_id,
+                "wallet_scan",
+                None, // No slot for RPC-based snapshot
                 MarketEventKind::WalletBalanceSnapshot {
                     mint: mint.to_string(),
                     balance_raw,
