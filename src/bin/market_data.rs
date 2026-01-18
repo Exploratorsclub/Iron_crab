@@ -363,7 +363,7 @@ async fn publish_wallet_snapshot(
             .rpc
             .get_token_accounts_by_owner(
                 wallet,
-                TokenAccountsFilter::ProgramId(program_id.clone()),
+                TokenAccountsFilter::ProgramId(program_id),
             )
             .await
         {
