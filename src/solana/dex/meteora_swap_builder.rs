@@ -227,6 +227,9 @@ impl MeteoraDlmmSwapBuilder {
     ///
     /// The active_id from Geyser is MORE CURRENT than RPC (push vs pull).
     /// Bin arrays are derived PDAs - if one doesn't exist, simulation will fail cleanly.
+    ///
+    /// CRITICAL: token_x_program and token_y_program must match the actual token programs
+    /// of the mints (SPL Token or Token-2022). Mismatch causes InvalidAccountData errors.
     #[allow(clippy::too_many_arguments)]
     pub fn build_swap_with_bins_sync(
         &self,
@@ -237,6 +240,8 @@ impl MeteoraDlmmSwapBuilder {
         user_token_y: &Pubkey,
         token_x_mint: &Pubkey,
         token_y_mint: &Pubkey,
+        token_x_program: &Pubkey,
+        token_y_program: &Pubkey,
         user: &Pubkey,
         amount_in: u64,
         min_amount_out: u64,
@@ -248,7 +253,21 @@ impl MeteoraDlmmSwapBuilder {
         ensure!(min_amount_out > 0, "Min amount out must be positive");
 
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
-        let token_program = Pubkey::from_str(TOKEN_PROGRAM)?;
+
+        // Log token programs being used (important for Token-2022 debugging)
+        let token_2022_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
+        let x_is_2022 = token_x_program == &token_2022_id;
+        let y_is_2022 = token_y_program == &token_2022_id;
+        if x_is_2022 || y_is_2022 {
+            info!(
+                pool = %lb_pair,
+                token_x_program = %token_x_program,
+                token_y_program = %token_y_program,
+                x_is_token_2022 = x_is_2022,
+                y_is_token_2022 = y_is_2022,
+                "Meteora Swap Builder: using Token-2022 programs"
+            );
+        }
 
         // GEYSER-FIRST: Use active_id directly from LivePoolCache (no RPC!)
         // The Geyser subscription provides real-time updates - more current than RPC.
@@ -322,8 +341,8 @@ impl MeteoraDlmmSwapBuilder {
             AccountMeta::new(oracle, false),          // 8: Oracle PDA (WRITABLE!)
             AccountMeta::new_readonly(program_id, false), // 9: host_fee_in (optional)
             AccountMeta::new_readonly(*user, true),   // 10: User (signer)
-            AccountMeta::new_readonly(token_program, false), // 11: token_x_program
-            AccountMeta::new_readonly(token_program, false), // 12: token_y_program
+            AccountMeta::new_readonly(*token_x_program, false), // 11: token_x_program (SPL Token OR Token-2022)
+            AccountMeta::new_readonly(*token_y_program, false), // 12: token_y_program (SPL Token OR Token-2022)
             AccountMeta::new_readonly(event_authority, false), // 13: Event authority
             AccountMeta::new_readonly(program_id, false), // 14: Program ID
         ];

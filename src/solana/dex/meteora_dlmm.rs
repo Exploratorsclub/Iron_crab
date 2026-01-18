@@ -798,7 +798,13 @@ impl Dex for MeteoraDlmm {
 
         // Build swap instruction with bin arrays (GEYSER-FIRST: sync, no RPC!)
         // Uses active_id and bin_step from LivePoolCache (via Geyser subscription)
+        // CRITICAL: Pass actual token programs (SPL Token or Token-2022) for correct ATA handling
         let swap_builder = MeteoraDlmmSwapBuilder::new(self.rpc.clone());
+        
+        // Convert spl_token Pubkeys back to solana_sdk Pubkeys for builder
+        let token_x_program_sdk = Pubkey::new_from_array(token_x_program_spl.to_bytes());
+        let token_y_program_sdk = Pubkey::new_from_array(token_y_program_spl.to_bytes());
+        
         let ix = swap_builder.build_swap_with_bins_sync(
             &pool_addr,
             &pool.reserve_x,
@@ -807,6 +813,8 @@ impl Dex for MeteoraDlmm {
             &user_token_y,
             &pool.token_x_mint,
             &pool.token_y_mint,
+            &token_x_program_sdk,
+            &token_y_program_sdk,
             &user,
             amount_in,
             min_out,

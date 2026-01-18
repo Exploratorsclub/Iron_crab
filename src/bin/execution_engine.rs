@@ -4088,27 +4088,39 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 }
             };
 
+            // CRITICAL: Jito bundles REQUIRE tip instruction
+            // If no tip instruction present, reject intent immediately
+            let tip_ix = match bundle_tip_ix {
+                Some(ref ix) => ix,
+                None => {
+                    let reason = RejectReason::InternalError;
+                    checks.push(CheckResult {
+                        check_name: "bundle_tip_required".to_string(),
+                        passed: false,
+                        reason_code: Some(reason.to_string()),
+                        details: Some("Jito bundle requires tip instruction but none present".to_string()),
+                    });
+                    ctx.record_intent_rejected();
+                    INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    ctx.lock_manager.release_locks(&intent.intent_id);
+                    warn!(
+                        intent_id = %intent.intent_id,
+                        "❌ Bundle requires tip instruction but none present - rejecting"
+                    );
+                    return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+                }
+            };
+
             let mut ixs = tx_plan.instructions.clone();
+            ixs.push(tip_ix.clone());
             info!(
                 intent_id = %intent.intent_id,
                 original_ix_count = %tx_plan.instructions.len(),
-                bundle_tip_present = %bundle_tip_ix.is_some(),
-                "Preparing transaction for Jito bundle"
+                final_ix_count = %ixs.len(),
+                tip_program = %tip_ix.program_id,
+                tip_account = %tip_ix.accounts[0].pubkey,
+                "✅ Tip instruction added to Jito bundle transaction"
             );
-            if let Some(ref ix) = bundle_tip_ix {
-                ixs.push(ix.clone());
-                info!(
-                    intent_id = %intent.intent_id,
-                    final_ix_count = %ixs.len(),
-                    tip_program = %ix.program_id,
-                    "✅ Tip instruction added to transaction"
-                );
-            } else {
-                warn!(
-                    intent_id = %intent.intent_id,
-                    "⚠️ No tip instruction to add - bundle will fail!"
-                );
-            }
 
             // Use VersionedTransaction with ALT if available, otherwise legacy Transaction
             // This fixes Jito -32602 "could not be decoded" errors for ALT transactions
