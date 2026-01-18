@@ -3033,10 +3033,29 @@ async fn recover_positions_from_jsonl(
                 })
                 .unwrap_or_else(Instant::now);
 
-            // We don't have pool/dex from execution_results (only mint)
-            // Use placeholder values - exits will still work based on time/price
-            let pool = format!("unknown_pool_{}", &mint[..8]);
-            let dex = "unknown".to_string();
+            // Try to get pool/dex from original intent (if we have it cached)
+            let (pool, dex) = if let Some(intent) = intent_lookup.get(&exec.intent_id) {
+                let pool_from_intent = intent
+                    .get("resources")
+                    .and_then(|r| r.get("pools"))
+                    .and_then(|p| p.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("unknown_pool_{}", &mint[..12]));
+                
+                let dex_from_intent = intent
+                    .get("metadata")
+                    .and_then(|m| m.get("dex"))
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                
+                (pool_from_intent, dex_from_intent)
+            } else {
+                // Fallback: use placeholder (will work for exits but routing might fail)
+                (format!("unknown_pool_{}", &mint[..12]), "unknown".to_string())
+            };
 
             let mut tracker = PositionTracker::new(
                 mint,
