@@ -4438,19 +4438,59 @@ async fn generate_and_publish_exit_intent(
     };
 
     let (last_sol_lamports, last_token_amount) = match last_trade_ratio_opt {
-        Some(v) => v,
+        Some((sol, tok)) => {
+            debug!(
+                mint = %mint,
+                sol_lamports = sol,
+                token_amount = tok,
+                "Using cached trade ratio for exit"
+            );
+            (sol, tok)
+        }
         None => {
+            // CRITICAL FIX: For exits, ALWAYS allow selling even without MarketEvent data
+            // Use position entry data or fallback to minimal safe ratio
             warn!(
                 mint = %mint,
                 pool = %pool,
                 dex = %dex,
                 exit_type = %exit_type,
                 reason = %reason,
-                "Skipping SELL intent: no usable trade ratio yet (need sol_amount+token_amount)"
+                "⚠️  No cached trade ratio - using fallback for emergency exit"
             );
-            anyhow::bail!(
-                "cannot generate exit intent: no usable trade ratio yet (need sol_amount+token_amount)"
-            )
+
+            // Try to get from open position (entry price * token amount)
+            let positions = ctx.positions.read();
+            if let Some(pos) = positions.get(mint) {
+                // Use position's current price estimate
+                // entry_price is tokens_per_sol, so: sol_needed = token_amount / entry_price
+                let sol_estimate = if pos.entry_price > 0.0 {
+                    let token_ui = token_amount as f64 / 10f64.powi(token_decimals as i32);
+                    let sol_ui = token_ui / pos.entry_price;
+                    (sol_ui * 1e9) as u64
+                } else {
+                    // Absolute fallback: assume 1 token = 0.0000001 SOL (very pessimistic)
+                    100_000 // 0.0001 SOL minimum
+                };
+                
+                info!(
+                    mint = %mint,
+                    sol_estimate_lamports = sol_estimate,
+                    token_amount = token_amount,
+                    entry_price = pos.entry_price,
+                    "💡 Using position entry price for exit ratio (emergency mode)"
+                );
+                
+                (sol_estimate, token_amount)
+            } else {
+                // ABSOLUTE LAST RESORT: Assume worst-case ratio to force sell
+                // Better to sell at terrible price than hold forever
+                warn!(
+                    mint = %mint,
+                    "🆘 EMERGENCY EXIT MODE: No position data, using minimal ratio"
+                );
+                (100_000, token_amount) // Assume 0.0001 SOL minimum out
+            }
         }
     };
 
