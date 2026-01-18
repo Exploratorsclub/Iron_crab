@@ -330,6 +330,140 @@ fn try_parse_token_account_balance(data: &[u8]) -> Option<u64> {
     }
 }
 
+/// Publish wallet token balance snapshot for position reconciliation.
+///
+/// Called once at market-data startup to provide momentum-bot with current wallet state.
+/// This allows momentum-bot to reconcile positions after restarts, detecting:
+/// - Manual sales via Phantom/Jupiter (no ExecutionResult)
+/// - Emergency liquidations via UI
+/// - External transfers
+///
+/// NO periodic refresh - wallet changes come via ExecutionResults in normal operation.
+async fn publish_wallet_snapshot(
+    ctx: &MarketDataContext,
+    rpc: &SolanaRpc,
+    wallet: &Pubkey,
+) -> Result<()> {
+    use solana_client::rpc_filter::RpcFilterType;
+    use solana_sdk::program_pack::Pack;
+
+    let token_program = spl_token::id();
+    let token_2022_program = spl_token_2022::id();
+    let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+        .expect("valid sol mint");
+
+    let mut total_accounts = 0usize;
+    let mut non_zero_accounts = 0usize;
+
+    // Scan both SPL Token and Token-2022 programs
+    for (program_id, program_name) in [
+        (token_program, "SPL Token"),
+        (token_2022_program, "Token-2022"),
+    ] {
+        let accounts = match rpc
+            .rpc
+            .get_token_accounts_by_owner(
+                wallet,
+                solana_client::rpc_filter::TokenAccountsFilter::ProgramId(program_id),
+            )
+            .await
+        {
+            Ok(accounts) => accounts,
+            Err(e) => {
+                warn!(error = %e, program = program_name, "Failed to fetch token accounts");
+                continue;
+            }
+        };
+
+        total_accounts += accounts.len();
+
+        for account in accounts {
+            // Parse JSON to extract mint and balance
+            let parsed = match account.account.data {
+                solana_account_decoder::UiAccountData::Json(parsed) => parsed,
+                _ => continue,
+            };
+
+            let serde_json::Value::Object(root) = parsed.parsed else {
+                continue;
+            };
+
+            let Some(info) = root.get("info").and_then(|v| v.as_object()) else {
+                continue;
+            };
+
+            // Extract mint
+            let Some(mint_str) = info.get("mint").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(mint) = Pubkey::from_str(mint_str) else {
+                continue;
+            };
+
+            // Extract balance
+            let Some(token_amount) = info.get("tokenAmount").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let Some(amount_str) = token_amount.get("amount").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(balance_raw) = amount_str.parse::<u64>() else {
+                continue;
+            };
+            let decimals = token_amount
+                .get("decimals")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(6) as u8;
+
+            // Skip zero balances and SOL/WSOL
+            if balance_raw == 0 || mint == sol_mint {
+                continue;
+            }
+
+            non_zero_accounts += 1;
+
+            let event = MarketEvent::new(
+                "market-data",
+                BUILD_VERSION,
+                &ctx.run_id,
+                MarketEventKind::WalletBalanceSnapshot {
+                    mint: mint.to_string(),
+                    balance_raw,
+                    decimals,
+                    token_program: program_id.to_string(),
+                },
+            );
+
+            // Publish to NATS
+            if let Some(ref nats) = ctx.nats {
+                if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
+                    warn!(error = %e, mint = %mint, "Failed to publish WalletBalanceSnapshot");
+                }
+            }
+
+            // Log to JSONL
+            if let Err(e) = ctx.jsonl_writer.write(&event) {
+                warn!(error = %e, "Failed to write WalletBalanceSnapshot to JSONL");
+            }
+
+            debug!(
+                mint = %mint,
+                balance_raw = balance_raw,
+                program = program_name,
+                "Published WalletBalanceSnapshot"
+            );
+        }
+    }
+
+    info!(
+        total_accounts = total_accounts,
+        non_zero_accounts = non_zero_accounts,
+        "✅ Wallet snapshot published for position reconciliation"
+    );
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -499,6 +633,23 @@ async fn run_geyser_loop(
         std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string()); // Local validator/private RPC preferred
     let rpc = Arc::new(SolanaRpc::new(&rpc_url));
     info!(rpc_url = %rpc_url, "Initialized RPC client for metadata/fallback");
+
+    // === P0: Wallet Balance Snapshot (Position Reconciliation) ===
+    // Publish current wallet state once at startup to reconcile positions after restarts.
+    // Handles: manual sales, emergency liquidations, external transfers.
+    // NO periodic refresh - wallet changes come via ExecutionResults.
+    if let Ok(wallet_pubkey_str) = std::env::var("IRONCRAB_WALLET_PUBKEY") {
+        if let Ok(wallet_pubkey) = Pubkey::from_str(&wallet_pubkey_str) {
+            info!(wallet = %wallet_pubkey, "📸 Publishing wallet balance snapshot for position reconciliation");
+            if let Err(e) = publish_wallet_snapshot(&ctx, &rpc, &wallet_pubkey).await {
+                warn!(error = %e, "Failed to publish wallet snapshot (continuing anyway)");
+            }
+        } else {
+            warn!("IRONCRAB_WALLET_PUBKEY is set but not a valid pubkey");
+        }
+    } else {
+        info!("IRONCRAB_WALLET_PUBKEY not set, skipping wallet snapshot");
+    }
 
     // Mint metadata fetch pipeline:
     // - We add mints to `tracked_mints` when we see them via tx/pool discovery.

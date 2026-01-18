@@ -275,6 +275,29 @@ pub enum MarketEventKind {
     TransactionDetected { signature: String, program: String },
 
     // =========================================================================
+    // Wallet State Tracking (P0: Position Reconciliation)
+    // =========================================================================
+    /// Wallet token balance snapshot (published by market-data at startup)
+    ///
+    /// Used for position reconciliation after restarts to detect:
+    /// - Manual sales via external wallets (Phantom, Jupiter, etc.)
+    /// - Emergency liquidations via UI
+    /// - External transfers
+    ///
+    /// Published once at market-data startup for all non-zero token accounts.
+    /// NO periodic refresh (wallet changes come via ExecutionResults).
+    WalletBalanceSnapshot {
+        /// Token mint address
+        mint: String,
+        /// Current balance (raw units)
+        balance_raw: u64,
+        /// Token decimals for UI conversion
+        decimals: u8,
+        /// Token program (SPL Token or Token-2022)
+        token_program: String,
+    },
+
+    // =========================================================================
     // Wallet Tracking Events (P1: Smart Money / Insider Detection)
     // =========================================================================
     /// Known wallet activity detected (smart money, insider, dev)

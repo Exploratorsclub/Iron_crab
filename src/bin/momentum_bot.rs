@@ -54,6 +54,9 @@ use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 /// NATS topic for config reload (P1: Runtime Configuration via UI)
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
 
+/// NATS topic for control commands (position cleanup, etc.)
+const TOPIC_CONTROL_COMMANDS: &str = "ironcrab.control.commands";
+
 // P1 Crash Isolation: Systemd Watchdog support
 #[cfg(unix)]
 use sd_notify::NotifyState;
@@ -3506,6 +3509,22 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Subscribe to Control Commands (manual position cleanup, etc.)
+    let mut control_subscription = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_CONTROL_COMMANDS).await {
+            Ok(sub) => {
+                info!(topic = TOPIC_CONTROL_COMMANDS, "Subscribed to Control Commands");
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to Control Commands");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Heartbeat and stats tracking
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut strategy_interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -3556,6 +3575,58 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to deserialize MarketEvent");
+                        }
+                    }
+                }
+            }
+
+            // P1: Handle Control Commands (manual position cleanup, etc.)
+            msg = async {
+                if let Some(ref mut sub) = control_subscription {
+                    sub.next().await
+                } else {
+                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
+                }
+            } => {
+                if let Some(nats_msg) = msg {
+                    ironcrab::metrics::record_activity();
+                    NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    
+                    #[derive(serde::Deserialize)]
+                    struct ControlCommand {
+                        action: String,
+                        #[serde(default)]
+                        mint: Option<String>,
+                    }
+                    
+                    match serde_json::from_slice::<ControlCommand>(&nats_msg.payload) {
+                        Ok(cmd) => {
+                            match cmd.action.as_str() {
+                                "close_position" => {
+                                    if let Some(mint) = cmd.mint {
+                                        let mut positions = ctx.positions.write();
+                                        if positions.remove(&mint).is_some() {
+                                            info!(
+                                                mint = %mint,
+                                                "✅ Position manually closed via control command"
+                                            );
+                                        } else {
+                                            warn!(
+                                                mint = %mint,
+                                                "⚠️ Position not found for manual close"
+                                            );
+                                        }
+                                    } else {
+                                        warn!("close_position command missing 'mint' field");
+                                    }
+                                }
+                                _ => {
+                                    warn!(action = %cmd.action, "Unknown control command");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to deserialize ControlCommand");
                         }
                     }
                 }
@@ -5133,6 +5204,50 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
 
         MarketEventKind::SlotUpdate { current_slot } => {
             debug!(current_slot, "Slot update");
+        }
+
+        MarketEventKind::WalletBalanceSnapshot {
+            mint,
+            balance_raw,
+            ..
+        } => {
+            // P0: Position Reconciliation after restart
+            // Published by market-data at startup to sync wallet state with position tracking.
+            // Handles: manual sales, emergency liquidations, external transfers.
+            
+            if *balance_raw == 0 {
+                // Remove ghost position if wallet balance is zero
+                let mut positions = ctx.positions.write();
+                if positions.remove(mint).is_some() {
+                    info!(
+                        mint = %mint,
+                        "🧹 Position auto-closed: WalletBalanceSnapshot shows balance=0 (manual sale or external transfer)"
+                    );
+                } else {
+                    debug!(
+                        mint = %mint,
+                        "WalletBalanceSnapshot: balance=0 but no position tracked (OK)"
+                    );
+                }
+            } else {
+                // Position exists in wallet - verify we're tracking it
+                let positions = ctx.positions.read();
+                if positions.contains_key(mint) {
+                    debug!(
+                        mint = %mint,
+                        balance_raw = *balance_raw,
+                        "✅ WalletBalanceSnapshot: position verified in wallet"
+                    );
+                } else {
+                    // Wallet has tokens but we're not tracking a position
+                    // This is OK - could be from pre-restart manual buy or airdrop
+                    debug!(
+                        mint = %mint,
+                        balance_raw = *balance_raw,
+                        "WalletBalanceSnapshot: tokens in wallet but no position tracked (manual buy or airdrop)"
+                    );
+                }
+            }
         }
 
         _ => {
