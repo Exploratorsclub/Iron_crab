@@ -27,7 +27,13 @@ pub const TOPIC_CONTROL_RESPONSES: &str = "ironcrab.v1.control_responses";
 pub const TOPIC_DECISION_RECORDS: &str = "ironcrab.v1.decision_records";
 
 /// Pool cache updates from market-data (Single Source of Truth)
+/// NOTE: For JetStream persistence, use subject-per-pool pattern from jetstream.rs
 pub const TOPIC_POOL_CACHE_UPDATES: &str = "ironcrab.v1.pool_cache_updates";
+
+/// JetStream subject pattern for pool cache (subject-per-pool for automatic compaction)
+/// Each pool gets its own subject: ironcrab.pool_cache.{pool_address}
+/// This allows JetStream to keep only the latest state per pool (max_messages_per_subject=1)
+pub const TOPIC_POOL_CACHE_PATTERN: &str = "ironcrab.pool_cache.*";
 
 /// Get all topics for subscription
 pub fn all_topics() -> Vec<&'static str> {

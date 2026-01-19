@@ -39,6 +39,7 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_POOL_CACHE_UPDATES, TOPIC_TRADE_INTENTS};
+use ironcrab::nats::{STREAM_NAME, pool_subject, slave_consumer_config};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// Build version for decision records
@@ -1229,6 +1230,85 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     Some(intent)
 }
 
+/// Bootstrap known_pools from JetStream (state recovery after restart)
+///
+/// This function pulls the last PoolCacheUpdate for each pool from JetStream,
+/// giving arb-strategy immediate awareness of all parseable pools. After bootstrap,
+/// the SLAVE subscribes to incremental updates via regular NATS subscription.
+///
+/// # Arguments
+///
+/// * `nats_client` - Connected NATS client
+/// * `known_pools` - HashSet to populate with pool addresses
+///
+/// # Returns
+///
+/// Number of pools recovered from JetStream
+async fn bootstrap_known_pools_from_jetstream(
+    nats_client: &NatsClient,
+    known_pools: &RwLock<HashSet<String>>,
+) -> Result<usize> {
+    use async_nats::jetstream;
+    use futures::StreamExt;
+
+    info!("SLAVE CACHE BOOTSTRAP: Pulling known pools from JetStream...");
+
+    let jetstream = jetstream::new(nats_client.client().clone());
+
+    // Get or create stream (idempotent)
+    let stream = match jetstream.get_stream(STREAM_NAME).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, stream = STREAM_NAME, "JetStream stream not found (market-data may not be running)");
+            return Ok(0);
+        }
+    };
+
+    // Create ephemeral consumer with LastPerSubject deliver policy
+    let consumer_config = slave_consumer_config();
+    let consumer = stream.create_consumer(consumer_config).await?;
+
+    let mut messages = consumer.messages().await?;
+    let mut pools_recovered = 0;
+
+    // Pull all messages (one per pool with LastPerSubject)
+    while let Some(msg) = messages.next().await {
+        let msg = msg?;
+
+        // Deserialize PoolCacheUpdate
+        let pool_update: PoolCacheUpdate = match serde_json::from_slice(&msg.payload) {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(error = %e, "Failed to deserialize PoolCacheUpdate from JetStream");
+                msg.ack().await.map_err(|e| anyhow::anyhow!("Ack error: {}", e))?;
+                continue;
+            }
+        };
+
+        // Add pool to known_pools
+        match pool_update.update_type {
+            ironcrab::ipc::PoolCacheUpdateType::PoolDiscovered | ironcrab::ipc::PoolCacheUpdateType::BalanceUpdated => {
+                let mut pools = known_pools.write();
+                pools.insert(pool_update.pool_address.clone());
+                pools_recovered += 1;
+                debug!(
+                    pool = %pool_update.pool_address,
+                    dex = %pool_update.dex,
+                    "SLAVE CACHE BOOTSTRAP: Recovered pool from JetStream"
+                );
+            }
+            ironcrab::ipc::PoolCacheUpdateType::PoolRemoved => {
+                // Skip removed pools during bootstrap
+            }
+        }
+
+        msg.ack().await.map_err(|e| anyhow::anyhow!("Ack error: {}", e))?;
+    }
+
+    info!(pools_recovered, "SLAVE CACHE BOOTSTRAP: Complete (known_pools populated)");
+    Ok(pools_recovered)
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -1320,6 +1400,19 @@ async fn main() -> Result<()> {
         bin_arrays: RwLock::new(HashMap::new()),
         known_pools: RwLock::new(HashSet::new()),
     });
+
+    // Bootstrap known_pools from JetStream (state recovery after restart)
+    if let Some(ref nats_client) = ctx.nats {
+        match bootstrap_known_pools_from_jetstream(nats_client, &ctx.known_pools).await {
+            Ok(pools_recovered) => {
+                info!(pools_recovered, "SLAVE CACHE: known_pools recovered from JetStream");
+                POOLS_TRACKED_GAUGE.store(pools_recovered as u64, Ordering::Relaxed);
+            }
+            Err(e) => {
+                warn!(error = %e, "SLAVE CACHE: JetStream bootstrap failed (will rely on incremental updates)");
+            }
+        }
+    }
 
     // Subscribe to MarketEvents
     let market_subscription = if let Some(ref nats) = ctx.nats {

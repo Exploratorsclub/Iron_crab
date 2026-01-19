@@ -12,10 +12,10 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
 use tracing::warn;
 
-#[cfg(feature = "nats")]
+
 use tracing::{error, info};
 
-#[cfg(feature = "nats")]
+
 use async_nats;
 
 /// NATS client configuration
@@ -61,7 +61,7 @@ impl NatsConfig {
 // Real NATS implementation (feature-gated)
 // ============================================================================
 
-#[cfg(feature = "nats")]
+
 pub struct NatsClient {
     config: NatsConfig,
     client: Option<async_nats::Client>,
@@ -69,7 +69,7 @@ pub struct NatsClient {
     messages_dropped: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(feature = "nats")]
+
 impl NatsClient {
     pub fn new(config: NatsConfig) -> Self {
         Self {
@@ -156,6 +156,66 @@ impl NatsClient {
         Ok(NatsSubscription { subscriber })
     }
 
+    /// Get reference to underlying NATS client for JetStream operations
+    pub fn client(&self) -> &async_nats::Client {
+        self.client
+            .as_ref()
+            .expect("client() called on disconnected NatsClient")
+    }
+
+    /// Publish to JetStream with subject-per-pool pattern
+    ///
+    /// This uses JetStream for persistent state recovery. Messages are published
+    /// with a timeout to prevent blocking on backpressure.
+    ///
+    /// # Arguments
+    ///
+    /// * `subject` - JetStream subject (e.g., `ironcrab.pool_cache.{pool_address}`)
+    /// * `msg` - Message to serialize and publish
+    ///
+    /// # Returns
+    ///
+    /// Ok(true) if published successfully, Ok(false) if dropped due to timeout
+    pub async fn jetstream_publish<T: Serialize>(
+        &self,
+        subject: &str,
+        msg: &T,
+    ) -> anyhow::Result<bool> {
+        let Some(ref client) = self.client else {
+            self.messages_dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(false);
+        };
+
+        let json = serde_json::to_vec(msg)?;
+        let jetstream = async_nats::jetstream::new(client.clone());
+
+        match tokio::time::timeout(
+            self.config.publish_timeout,
+            jetstream.publish(subject.to_string(), json.into()),
+        )
+        .await
+        {
+            Ok(Ok(_ack)) => {
+                self.messages_published
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(true)
+            }
+            Ok(Err(e)) => {
+                error!(error = %e, subject, "JetStream publish error");
+                self.messages_dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(false)
+            }
+            Err(_) => {
+                warn!(subject, "JetStream publish timeout (backpressure)");
+                self.messages_dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(false)
+            }
+        }
+    }
+
     pub fn stats(&self) -> (u64, u64) {
         (
             self.messages_published
@@ -166,12 +226,12 @@ impl NatsClient {
     }
 }
 
-#[cfg(feature = "nats")]
+
 pub struct NatsSubscription {
     subscriber: async_nats::Subscriber,
 }
 
-#[cfg(feature = "nats")]
+
 impl NatsSubscription {
     pub async fn next(&mut self) -> Option<NatsMessage> {
         self.subscriber.next().await.map(|msg| NatsMessage {
@@ -181,123 +241,12 @@ impl NatsSubscription {
     }
 }
 
-#[cfg(feature = "nats")]
+
+
 use futures::StreamExt;
 
 // ============================================================================
-// Stub NATS implementation (no feature)
-// ============================================================================
-
-#[cfg(not(feature = "nats"))]
-pub struct NatsClient {
-    config: NatsConfig,
-    connected: bool,
-    messages_published: std::sync::atomic::AtomicU64,
-    messages_dropped: std::sync::atomic::AtomicU64,
-}
-
-#[cfg(not(feature = "nats"))]
-impl NatsClient {
-    /// Create a new NATS client (stub - does not actually connect)
-    pub fn new(config: NatsConfig) -> Self {
-        Self {
-            config,
-            connected: false,
-            messages_published: std::sync::atomic::AtomicU64::new(0),
-            messages_dropped: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    /// Connect to NATS server
-    ///
-    /// Note: This is a stub. Compile with --features nats for real NATS.
-    pub async fn connect(&mut self) -> anyhow::Result<()> {
-        warn!(
-            url = %self.config.url,
-            "NATS connect (stub) - compile with --features nats for real NATS"
-        );
-        self.connected = true;
-        Ok(())
-    }
-
-    /// Check if connected
-    pub fn is_connected(&self) -> bool {
-        self.connected
-    }
-
-    /// Publish a message (JSON serialized)
-    ///
-    /// Returns Ok(true) if published, Ok(false) if dropped due to backpressure.
-    pub async fn publish<T: Serialize>(&self, topic: &str, msg: &T) -> anyhow::Result<bool> {
-        if !self.connected {
-            self.messages_dropped
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(false);
-        }
-
-        let json = serde_json::to_vec(msg)?;
-
-        // Stub: just log and count
-        tracing::debug!(topic, bytes = json.len(), "NATS publish (stub)");
-
-        self.messages_published
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(true)
-    }
-
-    /// Request/reply pattern
-    pub async fn request<T: Serialize, R: DeserializeOwned>(
-        &self,
-        _topic: &str,
-        _msg: &T,
-    ) -> anyhow::Result<R> {
-        if !self.connected {
-            anyhow::bail!("NATS not connected");
-        }
-
-        // Stub: cannot actually do request/reply without real NATS
-        anyhow::bail!("NATS request/reply requires --features nats")
-    }
-
-    /// Subscribe to a topic (returns a stub receiver)
-    pub async fn subscribe(&self, topic: &str) -> anyhow::Result<NatsSubscription> {
-        if !self.connected {
-            anyhow::bail!("NATS not connected");
-        }
-
-        tracing::debug!(topic, "NATS subscribe (stub)");
-        Ok(NatsSubscription {
-            topic: topic.to_string(),
-        })
-    }
-
-    /// Get publish statistics
-    pub fn stats(&self) -> (u64, u64) {
-        (
-            self.messages_published
-                .load(std::sync::atomic::Ordering::Relaxed),
-            self.messages_dropped
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
-    }
-}
-
-#[cfg(not(feature = "nats"))]
-pub struct NatsSubscription {
-    pub topic: String,
-}
-
-#[cfg(not(feature = "nats"))]
-impl NatsSubscription {
-    /// Receive next message (stub - always returns None after timeout)
-    pub async fn next(&mut self) -> Option<NatsMessage> {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        None
-    }
-}
-
-// ============================================================================
-// Common types (both implementations)
+// Common types
 // ============================================================================
 
 /// NATS message wrapper
@@ -310,34 +259,5 @@ impl NatsMessage {
     /// Deserialize payload
     pub fn deserialize<T: DeserializeOwned>(&self) -> anyhow::Result<T> {
         Ok(serde_json::from_slice(&self.payload)?)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_nats_client_stub() {
-        let config = NatsConfig::default();
-        let mut client = NatsClient::new(config);
-
-        // Initially not connected
-        assert!(!client.is_connected());
-
-        // Connect (stub)
-        client.connect().await.unwrap();
-        assert!(client.is_connected());
-
-        // Publish (stub)
-        let result = client
-            .publish("test.topic", &serde_json::json!({"key": "value"}))
-            .await
-            .unwrap();
-        assert!(result);
-
-        let (published, dropped) = client.stats();
-        assert_eq!(published, 1);
-        assert_eq!(dropped, 0);
     }
 }

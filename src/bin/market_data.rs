@@ -37,7 +37,7 @@ use ironcrab::metrics::{
     serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
     NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
-use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS, TOPIC_POOL_CACHE_UPDATES};
+use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS, TOPIC_POOL_CACHE_UPDATES, pool_subject, ensure_pool_cache_stream};
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
@@ -544,6 +544,16 @@ async fn main() -> Result<()> {
             None
         } else {
             info!(url = %args.nats_url, "Connected to NATS");
+            
+            // Initialize JetStream stream for PoolCacheUpdates (persistent state)
+            if let Err(e) = ensure_pool_cache_stream(client.client()).await {
+                error!(error = %e, "Failed to create/update JetStream POOL_CACHE stream");
+                error!("PoolCacheUpdates will not persist across restarts!");
+                error!("Check that nats-server is running with -js flag");
+            } else {
+                info!("JetStream POOL_CACHE stream ready for persistent state recovery");
+            }
+            
             Some(client)
         }
     };
@@ -884,7 +894,7 @@ async fn run_geyser_loop(
                                     // MASTER CACHE: Update vault balance in LivePoolCache
                                     ctx.live_pool_cache.update_vault_balance(&account_update.pubkey, balance, account_update.slot);
 
-                                    // Publish PoolCacheUpdate::BalanceUpdated to NATS
+                                    // Publish PoolCacheUpdate::BalanceUpdated to JetStream (persistent state)
                                     if let Some(ref nats) = ctx.nats {
                                         let balance_update = PoolCacheUpdate::new_balance_updated(
                                             "market-data",
@@ -898,11 +908,13 @@ async fn run_geyser_loop(
                                             final_quote,
                                             account_update.slot,
                                         );
-                                        if let Err(e) = nats.publish(TOPIC_POOL_CACHE_UPDATES, &balance_update).await {
-                                            warn!(error = %e, "Failed to publish PoolCacheUpdate::BalanceUpdated to NATS");
+                                        let subject = pool_subject(&vault_info.pool_address.to_string());
+                                        if let Err(e) = nats.jetstream_publish(&subject, &balance_update).await {
+                                            warn!(error = %e, "Failed to publish PoolCacheUpdate::BalanceUpdated to JetStream");
                                             NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                                         } else {
                                             NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                            info!(pool = %vault_info.pool_address, slot = account_update.slot, "MASTER CACHE: Published PoolCacheUpdate::BalanceUpdated to JetStream");
                                         }
                                     }
 
@@ -1035,7 +1047,7 @@ async fn run_geyser_loop(
                         }
                     };
 
-                    // Publish PoolCacheUpdate to NATS for execution-engine to mirror
+                    // Publish PoolCacheUpdate to JetStream for execution-engine to mirror (persistent state)
                     if let Some(ref nats) = ctx.nats {
                         let pool_update = PoolCacheUpdate::new_pool_discovered(
                             "market-data",
@@ -1050,12 +1062,13 @@ async fn run_geyser_loop(
                             Some(0), // liquidity_lamports not available from account data
                             account_update.slot,
                         );
-                        if let Err(e) = nats.publish(TOPIC_POOL_CACHE_UPDATES, &pool_update).await {
-                            warn!(error = %e, "Failed to publish PoolCacheUpdate to NATS");
+                        let subject = pool_subject(&account_update.pubkey.to_string());
+                        if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
+                            warn!(error = %e, "Failed to publish PoolCacheUpdate to JetStream");
                             NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                         } else {
                             NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            info!(pool = %account_update.pubkey, dex = %cached_state.dex_name(), slot = account_update.slot, "MASTER CACHE: Published PoolCacheUpdate::PoolDiscovered");
+                            info!(pool = %account_update.pubkey, dex = %cached_state.dex_name(), slot = account_update.slot, "MASTER CACHE: Published PoolCacheUpdate::PoolDiscovered to JetStream");
                         }
                     }
                 }
