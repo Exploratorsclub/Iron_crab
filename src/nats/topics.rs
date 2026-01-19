@@ -26,6 +26,9 @@ pub const TOPIC_CONTROL_RESPONSES: &str = "ironcrab.v1.control_responses";
 /// Decision records (for audit/debug)
 pub const TOPIC_DECISION_RECORDS: &str = "ironcrab.v1.decision_records";
 
+/// Pool cache updates from market-data (Single Source of Truth)
+pub const TOPIC_POOL_CACHE_UPDATES: &str = "ironcrab.v1.pool_cache_updates";
+
 /// Get all topics for subscription
 pub fn all_topics() -> Vec<&'static str> {
     vec![
@@ -35,6 +38,7 @@ pub fn all_topics() -> Vec<&'static str> {
         TOPIC_CONTROL_REQUESTS,
         TOPIC_CONTROL_RESPONSES,
         TOPIC_DECISION_RECORDS,
+        TOPIC_POOL_CACHE_UPDATES,
     ]
 }
 

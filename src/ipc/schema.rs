@@ -1573,3 +1573,138 @@ mod tests {
         assert_eq!(parsed.status, ExecutionStatus::Sent);
     }
 }
+
+// ============================================================================
+// Pool Cache Updates (for market-data → execution-engine propagation)
+// ============================================================================
+
+/// Pool cache update type
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PoolCacheUpdateType {
+    /// New pool discovered
+    PoolDiscovered,
+    /// Existing pool balance updated
+    BalanceUpdated,
+    /// Pool removed/closed
+    PoolRemoved,
+}
+
+/// Pool metadata for cache propagation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolCacheUpdate {
+    #[serde(flatten)]
+    pub header: RecordHeader,
+    
+    /// Type of update
+    pub update_type: PoolCacheUpdateType,
+    
+    /// Pool address (base58 string)
+    pub pool_address: String,
+    
+    /// DEX identifier (raydium, orca, meteora_dlmm, meteora_cpmm, pump_amm)
+    pub dex: String,
+    
+    /// Base mint address
+    pub base_mint: String,
+    
+    /// Quote mint address
+    pub quote_mint: String,
+    
+    /// Base token reserve (raw amount)
+    pub base_reserve: u64,
+    
+    /// Quote token reserve (raw amount)
+    pub quote_reserve: u64,
+    
+    /// Liquidity in lamports (for filtering/sorting)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liquidity_lamports: Option<u64>,
+    
+    /// Geyser slot when update occurred
+    pub geyser_slot: u64,
+    
+    /// Additional DEX-specific metadata (JSON string)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, String>>,
+}
+
+impl PoolCacheUpdate {
+    pub fn new_pool_discovered(
+        component: &str,
+        build: &str,
+        run_id: &str,
+        pool_address: String,
+        dex: String,
+        base_mint: String,
+        quote_mint: String,
+        base_reserve: u64,
+        quote_reserve: u64,
+        liquidity_lamports: Option<u64>,
+        geyser_slot: u64,
+    ) -> Self {
+        Self {
+            header: RecordHeader::new(component, build, run_id),
+            update_type: PoolCacheUpdateType::PoolDiscovered,
+            pool_address,
+            dex,
+            base_mint,
+            quote_mint,
+            base_reserve,
+            quote_reserve,
+            liquidity_lamports,
+            geyser_slot,
+            metadata: None,
+        }
+    }
+
+    pub fn new_balance_updated(
+        component: &str,
+        build: &str,
+        run_id: &str,
+        pool_address: String,
+        dex: String,
+        base_mint: String,
+        quote_mint: String,
+        base_reserve: u64,
+        quote_reserve: u64,
+        geyser_slot: u64,
+    ) -> Self {
+        Self {
+            header: RecordHeader::new(component, build, run_id),
+            update_type: PoolCacheUpdateType::BalanceUpdated,
+            pool_address,
+            dex,
+            base_mint,
+            quote_mint,
+            base_reserve,
+            quote_reserve,
+            liquidity_lamports: None,
+            geyser_slot,
+            metadata: None,
+        }
+    }
+
+    pub fn new_pool_removed(
+        component: &str,
+        build: &str,
+        run_id: &str,
+        pool_address: String,
+        dex: String,
+        geyser_slot: u64,
+    ) -> Self {
+        Self {
+            header: RecordHeader::new(component, build, run_id),
+            update_type: PoolCacheUpdateType::PoolRemoved,
+            pool_address,
+            dex,
+            base_mint: String::new(),
+            quote_mint: String::new(),
+            base_reserve: 0,
+            quote_reserve: 0,
+            liquidity_lamports: None,
+            geyser_slot,
+            metadata: None,
+        }
+    }
+}

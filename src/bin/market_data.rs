@@ -31,12 +31,13 @@ use uuid::Uuid;
 use ironcrab::config::WalletTrackerCfg;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, MarketEvent, MarketEventKind,
+    PoolCacheUpdate,
 };
 use ironcrab::metrics::{
     serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
     NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
-use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS};
+use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS, TOPIC_POOL_CACHE_UPDATES};
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
@@ -54,6 +55,9 @@ use spl_token_2022::extension::StateWithExtensions;
 const TOPIC_CONFIG_RELOAD: &str = "ironcrab.control.config.reload";
 use ironcrab::solana::geyser_listener::GeyserListener;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
+
+// LivePoolCache - MASTER Cache (Single Source of Truth)
+use ironcrab::execution::live_pool_cache::{parse_pool_account, CachedPoolState, LivePoolCache};
 
 // P1 Crash Isolation: Systemd Watchdog support
 #[cfg(unix)]
@@ -165,6 +169,10 @@ struct MarketDataContext {
     tracked_bin_arrays: parking_lot::RwLock<std::collections::HashMap<Pubkey, BinArrayInfo>>,
     /// Channel to notify GeyserListener when tracked bin arrays change (triggers resubscribe).
     tracked_bin_arrays_tx: watch::Sender<Vec<Pubkey>>,
+
+    /// MASTER LivePoolCache - Single Source of Truth for all pool state.
+    /// Updated via Geyser events and propagated to execution-engine via NATS.
+    live_pool_cache: Arc<LivePoolCache>,
 }
 
 /// Information about a tracked vault account
@@ -568,6 +576,7 @@ async fn main() -> Result<()> {
         tracked_vaults_tx,
         tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_bin_arrays_tx,
+        live_pool_cache: Arc::new(LivePoolCache::new()),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -872,6 +881,32 @@ async fn run_geyser_loop(
 
                                 // Only emit if we have at least one non-zero balance
                                 if final_base > 0 || final_quote > 0 {
+                                    // MASTER CACHE: Update vault balance in LivePoolCache
+                                    ctx.live_pool_cache.update_vault_balance(&account_update.pubkey, balance, account_update.slot);
+
+                                    // Publish PoolCacheUpdate::BalanceUpdated to NATS
+                                    if let Some(ref nats) = ctx.nats {
+                                        let balance_update = PoolCacheUpdate::new_balance_updated(
+                                            "market-data",
+                                            BUILD_VERSION,
+                                            run_id,
+                                            vault_info.pool_address.to_string(),
+                                            vault_info.dex.clone(),
+                                            vault_info.base_mint.to_string(),
+                                            vault_info.quote_mint.to_string(),
+                                            final_base,
+                                            final_quote,
+                                            account_update.slot,
+                                        );
+                                        if let Err(e) = nats.publish(TOPIC_POOL_CACHE_UPDATES, &balance_update).await {
+                                            warn!(error = %e, "Failed to publish PoolCacheUpdate::BalanceUpdated to NATS");
+                                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                        } else {
+                                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+
+                                    // Publish MarketEvent::PoolStateUpdate (existing logic for strategies)
                                     let state_event = MarketEvent::new(
                                         "market-data",
                                         BUILD_VERSION,
@@ -973,7 +1008,59 @@ async fn run_geyser_loop(
                     }
                 }
 
-                // Try to parse as DEX pool event
+                // MASTER CACHE: Try to parse as DEX pool state and upsert into LivePoolCache
+                if let Some(cached_state) = parse_pool_account(&account_update.owner, &account_update.data) {
+                    // Update MASTER LivePoolCache (Single Source of Truth)
+                    ctx.live_pool_cache.upsert(account_update.pubkey, cached_state.clone(), account_update.slot);
+
+                    // Extract mint and reserve info from cached_state for PoolCacheUpdate
+                    let (base_mint, quote_mint, base_reserve, quote_reserve) = match &cached_state {
+                        CachedPoolState::Orca(s) => {
+                            (s.token_mint_a, s.token_mint_b, s.vault_a_balance.unwrap_or(0), s.vault_b_balance.unwrap_or(0))
+                        }
+                        CachedPoolState::RaydiumAmm(s) => {
+                            (s.base_mint, s.quote_mint, s.coin_reserve.unwrap_or(0), s.pc_reserve.unwrap_or(0))
+                        }
+                        CachedPoolState::RaydiumCpmm(s) => {
+                            (s.token_0_mint, s.token_1_mint, s.reserve_0.unwrap_or(0), s.reserve_1.unwrap_or(0))
+                        }
+                        CachedPoolState::Meteora(s) => {
+                            (s.token_x_mint, s.token_y_mint, s.reserve_x_balance.unwrap_or(0), s.reserve_y_balance.unwrap_or(0))
+                        }
+                        CachedPoolState::PumpAmm(s) => {
+                            (s.base_mint, s.quote_mint, s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
+                        }
+                        CachedPoolState::PumpFun(s) => {
+                            (s.token_mint, Pubkey::default(), s.virtual_token_reserves, s.virtual_sol_reserves)
+                        }
+                    };
+
+                    // Publish PoolCacheUpdate to NATS for execution-engine to mirror
+                    if let Some(ref nats) = ctx.nats {
+                        let pool_update = PoolCacheUpdate::new_pool_discovered(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            account_update.pubkey.to_string(),
+                            cached_state.dex_name().to_string(),
+                            base_mint.to_string(),
+                            quote_mint.to_string(),
+                            base_reserve,
+                            quote_reserve,
+                            Some(0), // liquidity_lamports not available from account data
+                            account_update.slot,
+                        );
+                        if let Err(e) = nats.publish(TOPIC_POOL_CACHE_UPDATES, &pool_update).await {
+                            warn!(error = %e, "Failed to publish PoolCacheUpdate to NATS");
+                            NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            debug!(pool = %account_update.pubkey, dex = %cached_state.dex_name(), "Published PoolCacheUpdate::PoolDiscovered");
+                        }
+                    }
+                }
+
+                // Try to parse as DEX pool event (for MarketEvents - existing logic)
                 let event_kind = if let Some(parsed) = parse_account_update(&account_update) {
                     debug!(
                         slot = account_update.slot,
