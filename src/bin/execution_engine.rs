@@ -3056,29 +3056,84 @@ async fn main() -> Result<()> {
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
-    // Wrap subscriptions in Option for ownership
-    let mut intent_sub_opt = intent_subscription;
-    let mut config_sub_opt = config_subscription;
+    // Use channels to bridge NATS subscriptions to the main select! loop
+    // This prevents message loss when one branch is busy
+    let (intent_tx, mut intent_rx) = tokio::sync::mpsc::channel::<TradeIntent>(100);
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ControlRequest>(10);
+    let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<ConfigUpdate>(10);
 
-    // Subscribe to ControlRequests (KillSwitch + liquidation)
-    let control_subscription = if let Some(ref nats) = ctx.nats {
+    // Spawn dedicated task for TradeIntents subscription
+    if let Some(mut intent_sub) = intent_subscription {
+        let tx = intent_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = intent_sub.next().await {
+                match msg.deserialize::<TradeIntent>() {
+                    Ok(intent) => {
+                        if tx.send(intent).await.is_err() {
+                            warn!("TradeIntent channel closed, stopping subscription");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to deserialize TradeIntent");
+                    }
+                }
+            }
+        });
+    }
+
+    // Spawn dedicated task for ConfigUpdate subscription
+    if let Some(mut config_sub) = config_subscription {
+        let tx = config_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = config_sub.next().await {
+                match msg.deserialize::<ConfigUpdate>() {
+                    Ok(update) => {
+                        if tx.send(update).await.is_err() {
+                            warn!("ConfigUpdate channel closed, stopping subscription");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to deserialize ConfigUpdate");
+                    }
+                }
+            }
+        });
+    }
+
+    // Spawn dedicated task for ControlRequests subscription
+    if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_CONTROL_REQUESTS).await {
-            Ok(sub) => {
+            Ok(mut control_sub) => {
                 info!(
                     topic = TOPIC_CONTROL_REQUESTS,
                     "Subscribed to ControlRequests"
                 );
-                Some(sub)
+                let tx = control_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(msg) = control_sub.next().await {
+                        info!("Received raw ControlRequest message from NATS");
+                        match msg.deserialize::<ControlRequest>() {
+                            Ok(req) => {
+                                info!(target = %req.target, kind = ?req.kind, "Parsed ControlRequest, forwarding to main loop");
+                                if tx.send(req).await.is_err() {
+                                    warn!("ControlRequest channel closed, stopping subscription");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to deserialize ControlRequest");
+                            }
+                        }
+                    }
+                });
             }
             Err(e) => {
                 warn!(error = %e, "Failed to subscribe to ControlRequests");
-                None
             }
         }
-    } else {
-        None
-    };
-    let mut control_sub_opt = control_subscription;
+    }
 
     // Subscribe to PoolCacheUpdates from JetStream (Single Source of Truth)
     let pool_cache_consumer = if let Some(ref nats) = ctx.nats {
@@ -3116,124 +3171,84 @@ async fn main() -> Result<()> {
 
     loop {
         tokio::select! {
-            // NATS subscription: receive TradeIntents
-            Some(msg) = async {
-                if let Some(ref mut sub) = intent_sub_opt {
-                    sub.next().await
-                } else {
-                    None
-                }
-            } => {
-                match msg.deserialize::<TradeIntent>() {
-                    Ok(intent) => {
-                        info!(intent_id = %intent.intent_id, source = %intent.source, "Received TradeIntent from NATS");
-                        if let Err(e) = process_intent(&ctx, intent).await {
-                            error!(error = %e, "Failed to process intent");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to deserialize TradeIntent");
-                    }
+            // Receive TradeIntents from channel (buffered from dedicated subscription task)
+            Some(intent) = intent_rx.recv() => {
+                info!(intent_id = %intent.intent_id, source = %intent.source, "Received TradeIntent from NATS");
+                if let Err(e) = process_intent(&ctx, intent).await {
+                    error!(error = %e, "Failed to process intent");
                 }
             }
 
-            // P1: NATS subscription: receive Config Updates (Runtime Configuration)
-            Some(msg) = async {
-                if let Some(ref mut sub) = config_sub_opt {
-                    sub.next().await
+            // Receive Config Updates from channel
+            Some(update) = config_rx.recv() => {
+                // Only process if targeted at execution-engine
+                if update.target_component == "execution-engine" {
+                    info!(
+                        component = %update.target_component,
+                        keys = ?update.config.keys().collect::<Vec<_>>(),
+                        "Received Config Update from control-plane"
+                    );
+                    let response = ctx.apply_config_update(&update);
+                    info!(
+                        status = ?response.status,
+                        applied = ?response.applied_keys,
+                        rejected = ?response.rejected_keys,
+                        "Config update processed"
+                    );
                 } else {
-                    None
-                }
-            } => {
-                match msg.deserialize::<ConfigUpdate>() {
-                    Ok(update) => {
-                        // Only process if targeted at execution-engine
-                        if update.target_component == "execution-engine" {
-                            info!(
-                                component = %update.target_component,
-                                keys = ?update.config.keys().collect::<Vec<_>>(),
-                                "Received Config Update from control-plane"
-                            );
-                            let response = ctx.apply_config_update(&update);
-                            info!(
-                                status = ?response.status,
-                                applied = ?response.applied_keys,
-                                rejected = ?response.rejected_keys,
-                                "Config update processed"
-                            );
-                        } else {
-                            debug!(component = %update.target_component, "Ignoring config update for other component");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to deserialize ConfigUpdate");
-                    }
+                    debug!(component = %update.target_component, "Ignoring config update for other component");
                 }
             }
 
-            // NATS subscription: receive ControlRequests (KillSwitch + liquidation)
-            Some(msg) = async {
-                if let Some(ref mut sub) = control_sub_opt {
-                    sub.next().await
+            // Receive ControlRequests from channel (KillSwitch + liquidation)
+            Some(req) = control_rx.recv() => {
+                info!(target = %req.target, kind = ?req.kind, "Received ControlRequest from channel");
+                if req.target != "execution-engine" && req.target != "all" {
+                    debug!(target = %req.target, "Ignoring ControlRequest for other target");
                 } else {
-                    None
-                }
-            } => {
-                info!("Received ControlRequest message from NATS");
-                match msg.deserialize::<ControlRequest>() {
-                    Ok(req) => {
-                        info!(target = %req.target, kind = ?req.kind, "Parsed ControlRequest successfully");
-                        if req.target != "execution-engine" && req.target != "all" {
-                            debug!(target = %req.target, "Ignoring ControlRequest for other target");
-                        } else {
-                            let request_id = req.request_id.clone();
-                            match req.kind {
-                                ControlRequestKind::KillSwitch { active, reason, liquidate_positions, max_slippage_bps, ttl_ms } => {
-                                    ctx.kill_switch_active.store(active, Ordering::Relaxed);
-                                    info!(active, liquidate_positions, reason = ?reason, "Kill switch updated");
+                    let request_id = req.request_id.clone();
+                    match req.kind {
+                        ControlRequestKind::KillSwitch { active, reason, liquidate_positions, max_slippage_bps, ttl_ms } => {
+                            ctx.kill_switch_active.store(active, Ordering::Relaxed);
+                            info!(active, liquidate_positions, reason = ?reason, "Kill switch updated");
 
-                                    // Persist immediately so restarts don't silently drop the kill switch.
-                                    if let Err(e) = ctx.save_state() {
-                                        warn!(error = %e, "Failed to persist state after kill switch update");
-                                    }
+                            // Persist immediately so restarts don't silently drop the kill switch.
+                            if let Err(e) = ctx.save_state() {
+                                warn!(error = %e, "Failed to persist state after kill switch update");
+                            }
 
-                                    if active && liquidate_positions {
-                                        let slippage = max_slippage_bps.unwrap_or(9900);
-                                        let ttl = ttl_ms.unwrap_or(60_000);
-                                        ExecutionContext::run_liquidation_job(
-                                            Arc::clone(&ctx),
-                                            slippage,
-                                            ttl,
-                                            reason,
-                                        )
-                                        .await;
-                                    }
-                                }
-                                ControlRequestKind::ResetKillSwitch => {
-                                    ctx.kill_switch_active.store(false, Ordering::Relaxed);
-                                    info!("Kill switch reset");
-
-                                    // Persist immediately so restarts don't re-enable a previously active kill switch.
-                                    if let Err(e) = ctx.save_state() {
-                                        warn!(error = %e, "Failed to persist state after kill switch reset");
-                                    }
-                                }
-                                ControlRequestKind::BurnTokenAccounts { owner_pubkey, token_accounts, close_accounts, reason } => {
-                                    ExecutionContext::run_manual_burn_job(
-                                        Arc::clone(&ctx),
-                                        request_id,
-                                        owner_pubkey,
-                                        token_accounts,
-                                        close_accounts,
-                                        reason,
-                                    )
-                                    .await;
-                                }
+                            if active && liquidate_positions {
+                                let slippage = max_slippage_bps.unwrap_or(9900);
+                                let ttl = ttl_ms.unwrap_or(60_000);
+                                ExecutionContext::run_liquidation_job(
+                                    Arc::clone(&ctx),
+                                    slippage,
+                                    ttl,
+                                    reason,
+                                )
+                                .await;
                             }
                         }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to deserialize ControlRequest");
+                        ControlRequestKind::ResetKillSwitch => {
+                            ctx.kill_switch_active.store(false, Ordering::Relaxed);
+                            info!("Kill switch reset");
+
+                            // Persist immediately so restarts don't re-enable a previously active kill switch.
+                            if let Err(e) = ctx.save_state() {
+                                warn!(error = %e, "Failed to persist state after kill switch reset");
+                            }
+                        }
+                        ControlRequestKind::BurnTokenAccounts { owner_pubkey, token_accounts, close_accounts, reason } => {
+                            ExecutionContext::run_manual_burn_job(
+                                Arc::clone(&ctx),
+                                request_id,
+                                owner_pubkey,
+                                token_accounts,
+                                close_accounts,
+                                reason,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
