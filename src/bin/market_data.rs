@@ -1055,7 +1055,7 @@ async fn run_geyser_loop(
                             NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                         } else {
                             NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            debug!(pool = %account_update.pubkey, dex = %cached_state.dex_name(), "Published PoolCacheUpdate::PoolDiscovered");
+                            info!(pool = %account_update.pubkey, dex = %cached_state.dex_name(), slot = account_update.slot, "MASTER CACHE: Published PoolCacheUpdate::PoolDiscovered");
                         }
                     }
                 }

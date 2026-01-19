@@ -2956,12 +2956,13 @@ async fn main() -> Result<()> {
                         if let Some(ref cache) = ctx.live_pool_cache {
                             match update.update_type {
                                 PoolCacheUpdateType::PoolDiscovered => {
-                                    debug!(
+                                    info!(
                                         pool = %update.pool_address,
                                         dex = %update.dex,
                                         base_reserve = update.base_reserve,
                                         quote_reserve = update.quote_reserve,
-                                        "PoolCacheUpdate::PoolDiscovered - syncing to local cache"
+                                        slot = update.geyser_slot,
+                                        "SLAVE CACHE: Received PoolCacheUpdate::PoolDiscovered"
                                     );
                                     // Pool state will come via subsequent account updates
                                     // For now we just log - actual parsing requires full account data
@@ -2969,12 +2970,12 @@ async fn main() -> Result<()> {
                                 PoolCacheUpdateType::BalanceUpdated => {
                                     // Parse pool address
                                     if let Ok(pool_pk) = Pubkey::from_str(&update.pool_address) {
-                                        debug!(
+                                        info!(
                                             pool = %pool_pk,
                                             base_reserve = update.base_reserve,
                                             quote_reserve = update.quote_reserve,
                                             slot = update.geyser_slot,
-                                            "PoolCacheUpdate::BalanceUpdated - updating reserves in local cache"
+                                            "SLAVE CACHE: Received PoolCacheUpdate::BalanceUpdated"
                                         );
                                         
                                         // Update pool reserves in cache
