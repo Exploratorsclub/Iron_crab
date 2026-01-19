@@ -1258,57 +1258,66 @@ impl ExecutionContext {
             }
 
             // Fallback to Pump.fun AMM (PumpSwap).
+            // Timeout: pump_amm discovery can scan up to 100 pages of tx history, which can hang
+            // on tokens with no pump_amm pool. Use a 10s timeout for liquidation safety.
             if min_out_sol.is_none() {
-                match pump_amm
-                    .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
-                    .await
-                {
-                    Ok(Some(q)) => {
-                        #[cfg(unix)]
-                        maybe_ping_watchdog();
+                let pump_amm_quote = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    pump_amm.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in),
+                )
+                .await;
+                match pump_amm_quote {
+                    Err(_timeout) => {
+                        quote_attempts.push("pump_amm=timeout (10s)".to_string());
+                    }
+                    Ok(inner) => match inner {
+                        Ok(Some(q)) => {
+                            #[cfg(unix)]
+                            maybe_ping_watchdog();
 
-                        if let Some(pool_id) = q.route.first().cloned() {
-                            match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
-                                Ok(Some(accounts)) => {
-                                    metadata.insert("dex".to_string(), "pump_amm".to_string());
-                                    resources.pools = vec![pool_id.clone()];
-                                    resources.accounts =
-                                        accounts.into_iter().map(|p| p.to_string()).collect();
-                                    min_out_sol = Some(Self::apply_slippage_min_out(
-                                        q.amount_out,
-                                        max_slippage_bps,
-                                    ));
-                                    quote_attempts.push(format!(
-                                        "pump_amm=ok amount_out={} pool={} accounts_len={}",
-                                        q.amount_out,
-                                        resources
-                                            .pools
-                                            .first()
-                                            .map(|s| s.as_str())
-                                            .unwrap_or("<none>"),
-                                        resources.accounts.len()
-                                    ));
-                                }
-                                Ok(None) => {
-                                    warn!(mint = %mint, "pump_amm quote returned route, but pool accounts not found; skipping pump_amm");
-                                    quote_attempts.push(format!(
-                                        "pump_amm=skip no_pool_accounts amount_out={} pool={}",
-                                        q.amount_out, pool_id
-                                    ));
-                                }
-                                Err(e) => {
-                                    warn!(mint = %mint, error = %e, "pump_amm pool account discovery failed; skipping pump_amm");
-                                    quote_attempts.push(format!("pump_amm=err_discovery {e}"));
+                            if let Some(pool_id) = q.route.first().cloned() {
+                                match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
+                                    Ok(Some(accounts)) => {
+                                        metadata.insert("dex".to_string(), "pump_amm".to_string());
+                                        resources.pools = vec![pool_id.clone()];
+                                        resources.accounts =
+                                            accounts.into_iter().map(|p| p.to_string()).collect();
+                                        min_out_sol = Some(Self::apply_slippage_min_out(
+                                            q.amount_out,
+                                            max_slippage_bps,
+                                        ));
+                                        quote_attempts.push(format!(
+                                            "pump_amm=ok amount_out={} pool={} accounts_len={}",
+                                            q.amount_out,
+                                            resources
+                                                .pools
+                                                .first()
+                                                .map(|s| s.as_str())
+                                                .unwrap_or("<none>"),
+                                            resources.accounts.len()
+                                        ));
+                                    }
+                                    Ok(None) => {
+                                        warn!(mint = %mint, "pump_amm quote returned route, but pool accounts not found; skipping pump_amm");
+                                        quote_attempts.push(format!(
+                                            "pump_amm=skip no_pool_accounts amount_out={} pool={}",
+                                            q.amount_out, pool_id
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        warn!(mint = %mint, error = %e, "pump_amm pool account discovery failed; skipping pump_amm");
+                                        quote_attempts.push(format!("pump_amm=err_discovery {e}"));
+                                    }
                                 }
                             }
                         }
-                    }
-                    Ok(None) => {
-                        quote_attempts.push("pump_amm=none".to_string());
-                    }
-                    Err(e) => {
-                        quote_attempts.push(format!("pump_amm=err {e:#}"));
-                    }
+                        Ok(None) => {
+                            quote_attempts.push("pump_amm=none".to_string());
+                        }
+                        Err(e) => {
+                            quote_attempts.push(format!("pump_amm=err {e:#}"));
+                        }
+                    },
                 }
             }
 
