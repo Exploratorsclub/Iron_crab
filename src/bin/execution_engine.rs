@@ -4232,7 +4232,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 info!(
                     intent_id = %intent.intent_id,
                     tip_lamports = %tip_lamports,
-                    tip_account = %ix.accounts[0].pubkey,
+                    tip_account = %ix.accounts[1].pubkey,
                     "✅ Tip instruction built successfully"
                 );
                 bundle_tip_ix = Some(ix);
@@ -4388,7 +4388,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 original_ix_count = %tx_plan.instructions.len(),
                 final_ix_count = %ixs.len(),
                 tip_program = %tip_ix.program_id,
-                tip_account = %tip_ix.accounts[0].pubkey,
+                tip_account = %tip_ix.accounts[1].pubkey,
                 "✅ Tip instruction added to Jito bundle transaction"
             );
 
@@ -4404,8 +4404,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 // AddressLookupTableAccount, v0, VersionedMessage already imported at top
                 use solana_sdk::transaction::VersionedTransaction;
 
-                // Get the tip account from the tip instruction
-                let tip_account = tip_ix.accounts[0].pubkey;
+                // Get the tip account from the tip instruction (accounts[1] is the recipient, accounts[0] is payer)
+                let tip_account = tip_ix.accounts[1].pubkey;
                 
                 // Filter out Jito tip account from ALT to preserve its writable flag
                 let original_count = alt.accounts.len();
