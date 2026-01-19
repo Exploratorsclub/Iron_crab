@@ -354,6 +354,14 @@ impl LivePoolCache {
         self.pools.is_empty()
     }
 
+    /// Iterate over all cached pools (returns pool address and state)
+    /// Useful for liquidation to find all pools of a specific DEX type.
+    pub fn iter(&self) -> impl Iterator<Item = (Pubkey, CachedPoolState)> + '_ {
+        self.pools
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().state.clone()))
+    }
+
     // ========================================================================
     // Write API (called from Geyser subscription task)
     // ========================================================================

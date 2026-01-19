@@ -81,6 +81,7 @@ use ironcrab::nats::{
     STREAM_NAME, slave_consumer_config,
 };
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
+use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
 use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use ironcrab::solana::dex::raydium::Raydium;
@@ -1019,6 +1020,8 @@ impl ExecutionContext {
 
         // Initialize DEX connectors for quote discovery.
         let raydium = Raydium::new(Arc::clone(&ctx.rpc));
+        let mut meteora = MeteoraDlmm::new(Arc::clone(&ctx.rpc));
+        meteora.set_user_authority(owner);
         let pump_amm = PumpFunAmmDex::new(
             Arc::clone(&ctx.rpc),
             ctx.rpc_url.clone(),
@@ -1027,13 +1030,23 @@ impl ExecutionContext {
         let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc)) {
             Ok(p) => Some(p),
             Err(e) => {
-                warn!(error = %e, "Failed to init PumpFunDex; continuing with Raydium only");
+                warn!(error = %e, "Failed to init PumpFunDex; continuing with other DEXes");
                 None
             }
         };
 
         if let Err(e) = raydium.refresh_pools().await {
             warn!(error = %e, "Raydium refresh_pools failed; liquidation may miss routes");
+        }
+        // Meteora: inject cached pools from Geyser LivePoolCache (NO RPC needed!)
+        // The pools are already cached from market-data via Geyser subscription.
+        if let Some(ref cache) = ctx.live_pool_cache {
+            for (pool_addr, state) in cache.iter() {
+                if let CachedPoolState::Meteora(ref ms) = state {
+                    let _ = meteora.inject_cached_meteora_state(&pool_addr, ms);
+                }
+            }
+            info!(meteora_pools = meteora.list_pools().len(), "Meteora: injected pools from LivePoolCache (GEYSER-FIRST)");
         }
         #[cfg(unix)]
         maybe_ping_watchdog();
@@ -1325,6 +1338,36 @@ impl ExecutionContext {
                     }
                     Err(e) => {
                         quote_attempts.push(format!("raydium=err {e:#}"));
+                    }
+                }
+            }
+
+            // Fallback to Meteora DLMM.
+            if min_out_sol.is_none() {
+                match meteora
+                    .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
+                    .await
+                {
+                    Ok(Some(q)) => {
+                        #[cfg(unix)]
+                        maybe_ping_watchdog();
+
+                        if let Some(pool_id) = q.route.first().cloned() {
+                            metadata.insert("dex".to_string(), "meteora_dlmm".to_string());
+                            resources.pools = vec![pool_id.clone()];
+                            min_out_sol =
+                                Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
+                            quote_attempts.push(format!(
+                                "meteora=ok amount_out={} pool={}",
+                                q.amount_out, pool_id
+                            ));
+                        }
+                    }
+                    Ok(None) => {
+                        quote_attempts.push("meteora=none".to_string());
+                    }
+                    Err(e) => {
+                        quote_attempts.push(format!("meteora=err {e:#}"));
                     }
                 }
             }
