@@ -760,28 +760,27 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     
     // BUY vs SELL differ after account 15:
     // BUY: [16]=global_volume_accumulator, [17]=coin_creator_vault_ata, [18]=coin_creator_vault_authority,
-    //      [19]=user_volume, [20]=fee_config, [21]=fee_program, [22]=program_id
+    //      [19]=user_volume, [20]=fee_config (pool-specific PDA), [21]=fee_program, [22]=program_id
     // SELL: [16]=program_id, [17]=coin_creator_vault_ata, [18]=coin_creator_vault_authority,
-    //       [19]=fee_config, [20]=fee_program
-    let (global_volume_accumulator, coin_creator_vault_ata, coin_creator_vault_authority, fee_config, fee_program) = if is_buy {
-        // BUY: 23 accounts - has global_volume_accumulator
-        (
-            update.instruction_accounts[16],
-            update.instruction_accounts[17],
-            update.instruction_accounts[18],
-            update.instruction_accounts[20],
-            update.instruction_accounts[21],
-        )
+    //       [19]=fee_config (pool-specific PDA), [20]=fee_program
+    //
+    // CRITICAL: Transaction fee_config accounts are pool-specific PDAs (AMM-owned).
+    // We must use global constants instead:
+    //   - PUMPFUN_AMM_FEE_CONFIG = 5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx
+    //   - PUMPFUN_AMM_FEE_PROGRAM_ID = pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ
+    let global_volume_accumulator = if is_buy {
+        update.instruction_accounts[16]
     } else {
-        // SELL: 21 accounts - no global_volume_accumulator (use default)
-        (
-            Pubkey::default(),
-            update.instruction_accounts[17],
-            update.instruction_accounts[18],
-            update.instruction_accounts[19],
-            update.instruction_accounts[20],
-        )
+        Pubkey::default()
     };
+    let coin_creator_vault_ata = update.instruction_accounts[17];
+    let coin_creator_vault_authority = update.instruction_accounts[18];
+    
+    // Use global fee constants (NOT transaction accounts which are pool-specific PDAs)
+    let fee_config = Pubkey::from_str("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx")
+        .expect("hardcoded PUMPFUN_AMM_FEE_CONFIG");
+    let fee_program = Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
+        .expect("hardcoded PUMPFUN_AMM_FEE_PROGRAM_ID");
 
     let amount_in = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
     let _min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
