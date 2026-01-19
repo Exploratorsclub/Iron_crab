@@ -175,9 +175,39 @@ impl MeteoraDlmm {
             .get(pool_addr)
             .ok_or_else(|| anyhow!("Pool not found: {}", pool_addr))?;
 
-        let reserve_x = pool.pool.reserve_x;
-        let reserve_y = pool.pool.reserve_y;
+        let mut reserve_x = pool.pool.reserve_x;
+        let mut reserve_y = pool.pool.reserve_y;
         drop(pool);
+
+        // If vault addresses are invalid (zero/default), re-fetch pool account to get real addresses.
+        // This can happen when pool was loaded from minimal NATS PoolCacheUpdate without vault info.
+        if reserve_x == Pubkey::default() || reserve_y == Pubkey::default() {
+            debug!(
+                pool = %pool_addr,
+                "Vault addresses are default/zero, fetching pool account to get real vault addresses"
+            );
+            if let Ok(acc) = self.rpc.rpc.get_account(pool_addr).await {
+                if let Ok(parsed) = DlmmPool::parse(&acc.data) {
+                    reserve_x = parsed.reserve_x;
+                    reserve_y = parsed.reserve_y;
+                    // Update cache with real vault addresses
+                    if let Some(mut entry) = self.pools.get_mut(pool_addr) {
+                        entry.pool.reserve_x = reserve_x;
+                        entry.pool.reserve_y = reserve_y;
+                        entry.pool.active_id = parsed.active_id;
+                        entry.pool.bin_step = parsed.bin_step;
+                        debug!(
+                            pool = %pool_addr,
+                            reserve_x = %reserve_x,
+                            reserve_y = %reserve_y,
+                            active_id = parsed.active_id,
+                            bin_step = parsed.bin_step,
+                            "Updated pool cache with real vault addresses from RPC"
+                        );
+                    }
+                }
+            }
+        }
 
         // Fetch token account balances
         let acc_x = self.rpc.get_account_retry(&reserve_x).await.ok();
