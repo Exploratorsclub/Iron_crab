@@ -738,9 +738,10 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         return None;
     };
 
-    // Observed account order from on-chain PumpFun AMM swap TX (21 accounts total):
+    // Observed account order from on-chain PumpFun AMM swap TX:
+    // BUY: 23 accounts (includes global_volume_accumulator + user_volume)
+    // SELL: 21 accounts (no volume accumulators)
     // See src/solana/dex/pumpfun_amm.rs build_swap_ix_from_pool_accounts for reference.
-    // NOTE: global_volume_accumulator is NOT in the TX - it's only a PDA.
     let pool_market = update.instruction_accounts[0];
     let user = update.instruction_accounts[1];
     let trader = update.account_keys.first().copied().unwrap_or(user);
@@ -756,12 +757,31 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     let protocol_fee_recipient_ta = update.instruction_accounts[10];
     // instruction_accounts[11..14] = spl_token, spl_token, system, ata_program (readonly)
     let event_authority = update.instruction_accounts[15];
-    // instruction_accounts[16] = program_id (readonly)
-    let coin_creator_vault_ata = update.instruction_accounts[17];
-    let coin_creator_vault_authority = update.instruction_accounts[18];
-    // v2 format: no global_volume_accumulator in TX!
-    let fee_config = update.instruction_accounts[19];
-    let _fee_program = update.instruction_accounts[20];
+    
+    // BUY vs SELL differ after account 15:
+    // BUY: [16]=global_volume_accumulator, [17]=coin_creator_vault_ata, [18]=coin_creator_vault_authority,
+    //      [19]=user_volume, [20]=fee_config, [21]=fee_program, [22]=program_id
+    // SELL: [16]=program_id, [17]=coin_creator_vault_ata, [18]=coin_creator_vault_authority,
+    //       [19]=fee_config, [20]=fee_program
+    let (global_volume_accumulator, coin_creator_vault_ata, coin_creator_vault_authority, fee_config, fee_program) = if is_buy {
+        // BUY: 23 accounts - has global_volume_accumulator
+        (
+            update.instruction_accounts[16],
+            update.instruction_accounts[17],
+            update.instruction_accounts[18],
+            update.instruction_accounts[20],
+            update.instruction_accounts[21],
+        )
+    } else {
+        // SELL: 21 accounts - no global_volume_accumulator (use default)
+        (
+            Pubkey::default(),
+            update.instruction_accounts[17],
+            update.instruction_accounts[18],
+            update.instruction_accounts[19],
+            update.instruction_accounts[20],
+        )
+    };
 
     let amount_in = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
     let _min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
@@ -801,8 +821,9 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         (sol_received, amount_in)
     };
 
-    // Pool static accounts in v2 format (12 accounts, no global_volume_accumulator)
+    // Pool static accounts in v1 format (14 accounts, includes global_volume_accumulator)
     // See docs/MOMENTUM_V2_SPEC.md section 9.2 and pumpfun_amm.rs build_swap_ix_from_pool_accounts
+    // For SELL, global_volume_accumulator will be Pubkey::default() (not needed)
     let pool_accounts = vec![
         pool_market,                  // [0]
         global_config,                // [1]
@@ -815,7 +836,9 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         event_authority,              // [8]
         coin_creator_vault_ata,       // [9]
         coin_creator_vault_authority, // [10]
-        fee_config,                   // [11] - v2 format: fee_config is at index 11
+        global_volume_accumulator,    // [11] - v1 format: for BUY this is real, for SELL it's default
+        fee_config,                   // [12]
+        fee_program,                  // [13]
     ];
 
     debug!(
