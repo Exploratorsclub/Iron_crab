@@ -132,6 +132,7 @@ pub fn slave_consumer_config() -> jetstream::consumer::pull::Config {
         deliver_policy: jetstream::consumer::DeliverPolicy::LastPerSubject,
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
         max_ack_pending: 1000,
+        filter_subject: "ironcrab.pool_cache.>".to_string(), // Required for LastPerSubject
         ..Default::default()
     }
 }
