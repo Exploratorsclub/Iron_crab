@@ -18,7 +18,7 @@ use clap::Parser;
 use parking_lot::RwLock;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -29,8 +29,8 @@ use uuid::Uuid;
 use ironcrab::config::Config as AppConfig;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
-    IntentTier, MarketEvent, MarketEventKind, TradeIntent, TradeResources, TradeSide,
-    TradingRegime,
+    IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate, TradeIntent, TradeResources,
+    TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
     serve_metrics, ARB_REJECTED_MISSING_ACCOUNTS, ARB_TRIANGLE_OPPORTUNITIES,
@@ -38,7 +38,7 @@ use ironcrab::metrics::{
     NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
-use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
+use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_POOL_CACHE_UPDATES, TOPIC_TRADE_INTENTS};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// Build version for decision records
@@ -249,12 +249,28 @@ impl TokenArbTracker {
 
     /// Check for arbitrage opportunity between DEXes
     /// Returns: Option<(buy_dex, sell_dex, spread_bps, estimated_profit_lamports)>
-    fn check_arbitrage(&self, config: &ArbConfig) -> Option<ArbOpportunity> {
+    fn check_arbitrage(&self, config: &ArbConfig, known_pools: &HashSet<String>) -> Option<ArbOpportunity> {
         // Need at least 2 DEXes with prices
         let pools_with_price: Vec<_> = self
             .pools_by_dex
             .values()
-            .filter(|p| p.last_price.is_some() && is_known_dex_label(&p.dex))
+            .filter(|p| {
+                let has_price = p.last_price.is_some();
+                let is_known_dex = is_known_dex_label(&p.dex);
+                let in_master_cache = known_pools.contains(&p.pool_address);
+                
+                // Log when pool is filtered out due to not being in MASTER cache
+                if has_price && is_known_dex && !in_master_cache {
+                    debug!(
+                        pool = %p.pool_address,
+                        dex = %p.dex,
+                        mint = %self.base_mint,
+                        "Pool filtered: not in market-data MASTER cache (parse_pool_account failed)"
+                    );
+                }
+                
+                has_price && is_known_dex && in_master_cache
+            })
             .collect();
 
         if pools_with_price.len() < 2 {
@@ -526,6 +542,14 @@ struct ArbContext {
     /// Meteora DLMM Bin Arrays cache: pool_address → bin_array_index → bins
     /// Updated from BinArrayUpdate events (via market-data Geyser subscription)
     bin_arrays: RwLock<HashMap<String, HashMap<i64, BinArrayCache>>>,
+
+    // =========================================================================
+    // SLAVE Cache: Known Pools from market-data MASTER (Single Source of Truth)
+    // =========================================================================
+    /// Set of pool addresses that exist in market-data MASTER LivePoolCache.
+    /// Updated from PoolCacheUpdate::PoolDiscovered/PoolRemoved events.
+    /// ONLY generate intents for pools in this set - ensures execution-engine can execute them.
+    known_pools: RwLock<HashSet<String>>,
 }
 
 /// Cached vault balances from PoolStateUpdate events
@@ -1002,8 +1026,9 @@ impl ArbContext {
             return None;
         }
 
-        // Check for arbitrage opportunity
-        if let Some(opp) = tracker.check_arbitrage(&config) {
+        // Check for arbitrage opportunity (with known_pools filter)
+        let known_pools = self.known_pools.read();
+        if let Some(opp) = tracker.check_arbitrage(&config, &known_pools) {
             // Check cooldown
             let cooldown = Duration::from_millis(config.intent_cooldown_ms);
             if let Some(last_time) = tracker.last_intent_time {
@@ -1293,6 +1318,7 @@ async fn main() -> Result<()> {
         last_market_event: RwLock::new(Instant::now()),
         vault_balances: RwLock::new(HashMap::new()),
         bin_arrays: RwLock::new(HashMap::new()),
+        known_pools: RwLock::new(HashSet::new()),
     });
 
     // Subscribe to MarketEvents
@@ -1327,6 +1353,22 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Subscribe to PoolCacheUpdates (SLAVE sync from market-data MASTER)
+    let pool_cache_subscription = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_POOL_CACHE_UPDATES).await {
+            Ok(sub) => {
+                info!(topic = TOPIC_POOL_CACHE_UPDATES, "Subscribed to PoolCacheUpdates (SLAVE cache sync from market-data MASTER)");
+                Some(sub)
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to subscribe to PoolCacheUpdates");
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+
     // Main event loop
     info!("Entering main event loop");
 
@@ -1335,6 +1377,7 @@ async fn main() -> Result<()> {
 
     let mut market_sub = market_subscription;
     let mut cfg_sub = config_subscription;
+    let mut pool_cache_sub = pool_cache_subscription;
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(60));
 
     loop {
@@ -1418,6 +1461,41 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // PoolCacheUpdates (SLAVE sync from market-data MASTER)
+            msg = async {
+                if let Some(ref mut sub) = pool_cache_sub {
+                    sub.next().await
+                } else {
+                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
+                }
+            } => {
+                if let Some(nats_msg) = msg {
+                    NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    match serde_json::from_slice::<PoolCacheUpdate>(&nats_msg.payload) {
+                        Ok(update) => {
+                            use ironcrab::ipc::PoolCacheUpdateType;
+                            match update.update_type {
+                                PoolCacheUpdateType::PoolDiscovered => {
+                                    ctx.known_pools.write().insert(update.pool_address.clone());
+                                    debug!(pool = %update.pool_address, dex = %update.dex, "SLAVE CACHE: Pool added to known_pools");
+                                }
+                                PoolCacheUpdateType::PoolRemoved => {
+                                    ctx.known_pools.write().remove(&update.pool_address);
+                                    debug!(pool = %update.pool_address, "SLAVE CACHE: Pool removed from known_pools");
+                                }
+                                PoolCacheUpdateType::BalanceUpdated => {
+                                    // Balance updates don't affect pool existence, just state
+                                    debug!(pool = %update.pool_address, "SLAVE CACHE: Balance update received");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to deserialize PoolCacheUpdate");
+                        }
+                    }
+                }
+            }
+
             // Heartbeat
             _ = heartbeat_interval.tick() => {
                 let (records, bytes) = ctx.jsonl_writer.stats();
@@ -1425,6 +1503,8 @@ async fn main() -> Result<()> {
                 let multi_dex_tokens = trackers.values()
                     .filter(|t| t.pools_by_dex.len() >= 2)
                     .count();
+
+                let known_pools_count = ctx.known_pools.read().len();
 
                 // Prometheus: publish current gauges for this process
                 POOLS_TRACKED_GAUGE.store(ctx.pools_tracked.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -1435,6 +1515,7 @@ async fn main() -> Result<()> {
                     pools_tracked = ctx.pools_tracked.load(Ordering::Relaxed),
                     tokens_tracked = trackers.len(),
                     multi_dex_tokens = multi_dex_tokens,
+                    known_pools = known_pools_count,
                     opportunities_found = ctx.opportunities_found.load(Ordering::Relaxed),
                     intents_generated = ctx.intents_generated.load(Ordering::Relaxed),
                     intents_written = records,
@@ -1442,7 +1523,7 @@ async fn main() -> Result<()> {
                     // Data quality metrics
                     zero_amount_trades = ctx.zero_amount_trades.load(Ordering::Relaxed),
                     data_quality_rejects = ctx.data_quality_rejects.load(Ordering::Relaxed),
-                    "arb-strategy heartbeat"
+                    "arb-strategy heartbeat (SLAVE cache sync from market-data MASTER)"
                 );
             }
 
