@@ -2575,7 +2575,7 @@ impl Dex for PumpFunAmmDex {
             .as_ref()
             .map(|u| u.user_quote_ta)
             .unwrap_or_else(|| Self::derive_ata_with_program(user, pool.quote_mint, quote_token_program));
-        let _user_vol = user_acc
+        let user_volume = user_acc
             .as_ref()
             .map(|u| u.user_volume_accumulator)
             .unwrap_or_else(|| {
@@ -2589,8 +2589,10 @@ impl Dex for PumpFunAmmDex {
         };
         let data = Self::build_ix_data(disc, amount_in, min_out);
 
-        // Account ordering is taken from an observed on-chain Pump.fun AMM swap transaction.
-        let metas = vec![
+        // Account ordering differs between BUY (23 accounts) and SELL (21 accounts).
+        // Reference: observed on-chain Pump.fun AMM swap transactions.
+        // BUY includes global_volume_accumulator (#16) and user_volume (#19), SELL does not.
+        let mut metas = vec![
             AccountMeta::new(pool.pool_market, false),            // 0
             AccountMeta::new(user, true),                         // 1
             AccountMeta::new_readonly(pool.global_config, false), // 2
@@ -2613,16 +2615,25 @@ impl Dex for PumpFunAmmDex {
                 false,
             ), // 14
             AccountMeta::new_readonly(pool.event_authority, false), // 15
-            AccountMeta::new_readonly(program_id, false),           // 16
-            AccountMeta::new(pool.coin_creator_vault_ata, false),   // 17
-            AccountMeta::new_readonly(pool.coin_creator_vault_authority, false), // 18
-            // NOTE: global_volume_accumulator and user_vol are NOT in actual on-chain swap TXs!
-            // Removed to match observed transaction structure (21 accounts total).
-            // CRITICAL: Use global fee_config constant instead of pool.fee_config
-            // (pool.fee_config may be AMM-owned, but we need Fee Program-owned account)
-            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(), false), // 19
-            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(), false), // 20
         ];
+
+        if is_buy {
+            // BUY: accounts 16-22 (23 total)
+            metas.push(AccountMeta::new(pool.global_volume_accumulator, false)); // 16
+            metas.push(AccountMeta::new(pool.coin_creator_vault_ata, false));    // 17
+            metas.push(AccountMeta::new_readonly(pool.coin_creator_vault_authority, false)); // 18
+            metas.push(AccountMeta::new(user_volume, false));                    // 19
+            metas.push(AccountMeta::new_readonly(pool.fee_config, false));       // 20
+            metas.push(AccountMeta::new_readonly(pool.fee_program, false));      // 21
+            metas.push(AccountMeta::new_readonly(program_id, false));            // 22
+        } else {
+            // SELL: accounts 16-20 (21 total) - no volume accumulators
+            metas.push(AccountMeta::new_readonly(program_id, false));            // 16
+            metas.push(AccountMeta::new(pool.coin_creator_vault_ata, false));    // 17
+            metas.push(AccountMeta::new_readonly(pool.coin_creator_vault_authority, false)); // 18
+            metas.push(AccountMeta::new_readonly(pool.fee_config, false));       // 19
+            metas.push(AccountMeta::new_readonly(pool.fee_program, false));      // 20
+        }
 
         Ok(vec![Instruction {
             program_id,
