@@ -87,6 +87,33 @@ impl MeteoraDlmm {
             .unwrap_or_default()
     }
 
+    /// Get pool accounts in DexPoolAccounts format for a given pool address.
+    ///
+    /// Returns accounts in the format expected by `set_pool_from_accounts`:
+    /// - accounts[0] = pool_address (lb_pair)
+    /// - accounts[1] = token_x_mint
+    /// - accounts[2] = token_y_mint
+    /// - accounts[3] = reserve_x (token_x vault)
+    /// - accounts[4] = reserve_y (token_y vault)
+    /// - accounts[5] = "active_id:<value>"
+    /// - accounts[6] = "bin_step:<value>"
+    ///
+    /// Returns None if pool is not cached.
+    pub fn get_pool_accounts(&self, pool_address: &Pubkey) -> Option<Vec<String>> {
+        self.pools.get(pool_address).map(|entry| {
+            let pool = &entry.pool;
+            vec![
+                pool_address.to_string(),
+                pool.token_x_mint.to_string(),
+                pool.token_y_mint.to_string(),
+                pool.reserve_x.to_string(),
+                pool.reserve_y.to_string(),
+                format!("active_id:{}", pool.active_id),
+                format!("bin_step:{}", pool.bin_step),
+            ]
+        })
+    }
+
     /// Inject cached Meteora pool state from LivePoolCache.
     ///
     /// This allows build_swap_ix to use fresh Geyser-sourced data

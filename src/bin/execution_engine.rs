@@ -1362,14 +1362,29 @@ impl ExecutionContext {
                         maybe_ping_watchdog();
 
                         if let Some(pool_id) = q.route.first().cloned() {
-                            metadata.insert("dex".to_string(), "meteora_dlmm".to_string());
-                            resources.pools = vec![pool_id.clone()];
-                            min_out_sol =
-                                Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
-                            quote_attempts.push(format!(
-                                "meteora=ok amount_out={} pool={}",
-                                q.amount_out, pool_id
-                            ));
+                            // Get DexPoolAccounts for the pool (required by build_tx_plan)
+                            if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
+                                if let Some(pool_accounts) = meteora.get_pool_accounts(&pool_pk) {
+                                    metadata.insert("dex".to_string(), "meteora_dlmm".to_string());
+                                    resources.pools = vec![pool_id.clone()];
+                                    resources.accounts = pool_accounts;
+                                    min_out_sol = Some(Self::apply_slippage_min_out(
+                                        q.amount_out,
+                                        max_slippage_bps,
+                                    ));
+                                    quote_attempts.push(format!(
+                                        "meteora=ok amount_out={} pool={} accounts_len={}",
+                                        q.amount_out,
+                                        pool_id,
+                                        resources.accounts.len()
+                                    ));
+                                } else {
+                                    quote_attempts.push(format!(
+                                        "meteora=skip no_pool_accounts amount_out={} pool={}",
+                                        q.amount_out, pool_id
+                                    ));
+                                }
+                            }
                         }
                     }
                     Ok(None) => {
