@@ -141,6 +141,8 @@ pub struct PumpFunAmmDex {
     // Index by pool_market address (for load_pool_by_address)
     pools_by_market: DashMap<Pubkey, Pubkey>, // pool_market -> base_mint
     user_accounts: DashMap<(Pubkey, Pubkey), PumpAmmUserAccounts>, // (pool_market, user)
+    // Extra cached data (e.g., token_program:<mint> → program_id)
+    cached_data: DashMap<String, String>,
 }
 
 impl PumpFunAmmDex {
@@ -164,6 +166,7 @@ impl PumpFunAmmDex {
             pools_by_base: DashMap::new(),
             pools_by_market: DashMap::new(),
             user_accounts: DashMap::new(),
+            cached_data: DashMap::new(),
         }
     }
 
@@ -2250,29 +2253,9 @@ impl PumpFunAmmDex {
     }
 
     fn derive_ata(owner: Pubkey, mint: Pubkey) -> Pubkey {
-        let owner_spl = SplProgramPubkey::new_from_array(owner.to_bytes());
-        let mint_spl = SplProgramPubkey::new_from_array(mint.to_bytes());
-        // ALWAYS use SPL Token Program ID - Pump.fun AMM (PumpSwap) only supports SPL Token, not Token-2022
-        // If a Token-2022 mint somehow appears, the swap will fail at instruction validation
-        let token_program = spl_token::id();
-        let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-            &owner_spl,
-            &mint_spl,
-            &token_program,
-        );
-        Pubkey::new_from_array(ata_spl.to_bytes())
-    }
-
-    fn derive_ata_with_program_checked(owner: Pubkey, mint: Pubkey, token_program: Pubkey) -> Pubkey {
-        let owner_spl = SplProgramPubkey::new_from_array(owner.to_bytes());
-        let mint_spl = SplProgramPubkey::new_from_array(mint.to_bytes());
-        let token_program_spl = SplProgramPubkey::new_from_array(token_program.to_bytes());
-        let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-            &owner_spl,
-            &mint_spl,
-            &token_program_spl,
-        );
-        Pubkey::new_from_array(ata_spl.to_bytes())
+        // Default to SPL Token if no specific program provided
+        let spl_token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+        Self::derive_ata_with_program(owner, mint, spl_token_program)
     }
 }
 
@@ -2577,14 +2560,21 @@ impl Dex for PumpFunAmmDex {
             .user_accounts
             .get(&(pool.pool_market, user))
             .map(|v| v.clone());
+        // Get token program from cache for correct ATA derivation (Token-2022 support)
+        let base_token_program = self.cached_data
+            .get(&format!("token_program:{}", pool.base_mint))
+            .and_then(|v| Pubkey::from_str(&v).ok())
+            .unwrap_or_else(|| Pubkey::new_from_array(spl_token::id().to_bytes()));
+        let quote_token_program = Pubkey::new_from_array(spl_token::id().to_bytes()); // WSOL always uses SPL Token
+
         let user_base_ta = user_acc
             .as_ref()
             .map(|u| u.user_base_ta)
-            .unwrap_or_else(|| Self::derive_ata(user, pool.base_mint));
+            .unwrap_or_else(|| Self::derive_ata_with_program(user, pool.base_mint, base_token_program));
         let user_quote_ta = user_acc
             .as_ref()
             .map(|u| u.user_quote_ta)
-            .unwrap_or_else(|| Self::derive_ata(user, pool.quote_mint));
+            .unwrap_or_else(|| Self::derive_ata_with_program(user, pool.quote_mint, quote_token_program));
         let _user_vol = user_acc
             .as_ref()
             .map(|u| u.user_volume_accumulator)
@@ -2643,6 +2633,10 @@ impl Dex for PumpFunAmmDex {
 
     fn list_pairs(&self) -> Vec<(String, String)> {
         Vec::new()
+    }
+
+    fn cache_extra_data(&self, key: &str, value: &str) {
+        self.cached_data.insert(key.to_string(), value.to_string());
     }
 }
 
