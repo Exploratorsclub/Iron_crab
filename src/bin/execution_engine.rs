@@ -3179,8 +3179,10 @@ async fn main() -> Result<()> {
                     None
                 }
             } => {
+                info!("Received ControlRequest message from NATS");
                 match msg.deserialize::<ControlRequest>() {
                     Ok(req) => {
+                        info!(target = %req.target, kind = ?req.kind, "Parsed ControlRequest successfully");
                         if req.target != "execution-engine" && req.target != "all" {
                             debug!(target = %req.target, "Ignoring ControlRequest for other target");
                         } else {
