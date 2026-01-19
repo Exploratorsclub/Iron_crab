@@ -4393,18 +4393,42 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             );
 
             // Use ALT if available to reduce transaction size (Jito bundles can exceed 1232 byte limit without ALT)
-            // The Jito tip account is a dedicated account that should NOT be in the ALT, so no dedupe risk.
-            // v0::Message::try_compile will preserve the tip account's is_writable flag since it's unique.
+            // CRITICAL: Jito tip account MUST be writable in the final transaction.
+            // If the tip account is in the ALT, v0::Message::try_compile will reference it via lookup,
+            // but the v0 Message format cannot specify writable flags for lookup accounts.
+            // This causes Jito rejection: "Bundles must write lock at least one tip account".
+            // Solution: Filter tip account out of ALT before compiling v0 Message.
             let send_result = if let Some(ref alt) = ctx.address_lookup_table {
                 // ALT path enabled for bundles to reduce TX size
                 // Build versioned transaction with ALT
                 // AddressLookupTableAccount, v0, VersionedMessage already imported at top
                 use solana_sdk::transaction::VersionedTransaction;
 
+                // Get the tip account from the tip instruction
+                let tip_account = tip_ix.accounts[0].pubkey;
+                
+                // Filter out Jito tip account from ALT to preserve its writable flag
+                let original_count = alt.accounts.len();
+                let filtered_accounts: Vec<Pubkey> = alt
+                    .accounts
+                    .iter()
+                    .filter(|&addr| *addr != tip_account)
+                    .copied()
+                    .collect();
+                
+                if filtered_accounts.len() < original_count {
+                    info!(
+                        intent_id = %intent.intent_id,
+                        tip_account = %tip_account,
+                        removed_count = %(original_count - filtered_accounts.len()),
+                        "Removed Jito tip account from ALT to preserve writable flag"
+                    );
+                }
+
                 // Convert LoadedAlt to AddressLookupTableAccount for v0::Message::try_compile
                 let alt_account = AddressLookupTableAccount {
-                    key: ctx.address_lookup_table.as_ref().unwrap().address,
-                    addresses: ctx.address_lookup_table.as_ref().unwrap().accounts.clone(),
+                    key: alt.address,
+                    addresses: filtered_accounts,
                 };
 
                 match v0::Message::try_compile(&wallet_pubkey, &ixs, &[alt_account], blockhash) {
