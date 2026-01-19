@@ -2252,11 +2252,25 @@ impl PumpFunAmmDex {
     fn derive_ata(owner: Pubkey, mint: Pubkey) -> Pubkey {
         let owner_spl = SplProgramPubkey::new_from_array(owner.to_bytes());
         let mint_spl = SplProgramPubkey::new_from_array(mint.to_bytes());
+        // ALWAYS use SPL Token Program ID - Pump.fun AMM (PumpSwap) only supports SPL Token, not Token-2022
+        // If a Token-2022 mint somehow appears, the swap will fail at instruction validation
         let token_program = spl_token::id();
         let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
             &owner_spl,
             &mint_spl,
             &token_program,
+        );
+        Pubkey::new_from_array(ata_spl.to_bytes())
+    }
+
+    fn derive_ata_with_program_checked(owner: Pubkey, mint: Pubkey, token_program: Pubkey) -> Pubkey {
+        let owner_spl = SplProgramPubkey::new_from_array(owner.to_bytes());
+        let mint_spl = SplProgramPubkey::new_from_array(mint.to_bytes());
+        let token_program_spl = SplProgramPubkey::new_from_array(token_program.to_bytes());
+        let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_spl,
+            &mint_spl,
+            &token_program_spl,
         );
         Pubkey::new_from_array(ata_spl.to_bytes())
     }

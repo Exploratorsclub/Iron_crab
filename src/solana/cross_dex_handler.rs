@@ -997,6 +997,21 @@ impl CrossDexHandler {
         let token_program_sdk = Pubkey::new_from_array(token_program.to_bytes());
 
         // ====================================================================
+        // CRITICAL: Pump.fun AMM (PumpSwap) does NOT support Token-2022
+        // If this is a Token-2022 mint and we're using pump_amm, reject immediately
+        // ====================================================================
+        let token_2022_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+        if token_program_sdk == token_2022_id && (buy_dex == "pump_amm" || sell_dex == "pump_amm") {
+            return Err(anyhow!(
+                "Pump.fun AMM does not support Token-2022. Token {} uses Token-2022 program, cannot route through pump_amm. \
+                 buy_dex={}, sell_dex={}",
+                token_mint,
+                buy_dex,
+                sell_dex
+            ));
+        }
+
+        // ====================================================================
         // Create ATAs for BOTH tokens involved in the swap (idempotent)
         //
         // Orca Whirlpool requires ATAs for token_owner_account_a AND token_owner_account_b.
