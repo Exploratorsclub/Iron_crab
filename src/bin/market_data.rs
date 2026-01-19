@@ -1465,6 +1465,46 @@ async fn run_geyser_loop(
                     }
                 }
 
+                // Emit DevWalletIdentified for Pump.fun pools where we know the creator
+                // This enables momentum-bot to populate metadata.creator for intent building
+                if pool_event.dex_type == PoolDexType::PumpFun {
+                    if let Some(creator) = pool_event.creator {
+                        let dev_event = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            ctx.next_event_id(),
+                            "geyser_pool_discovery",
+                            Some(pool_event.slot),
+                            MarketEventKind::DevWalletIdentified {
+                                mint: pool_event.base_mint.to_string(),
+                                dev_wallet: creator.to_string(),
+                                // Supply percentage not computed (would need extra on-chain reads)
+                                supply_percentage: 0.0,
+                            },
+                        );
+
+                        if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
+                            error!(error = %e, "Failed to write dev wallet event to JSONL");
+                        }
+
+                        if let Some(ref nats) = ctx.nats {
+                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &dev_event).await {
+                                warn!(error = %e, "Failed to publish dev wallet event to NATS");
+                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                info!(
+                                    mint = %pool_event.base_mint,
+                                    creator = %creator,
+                                    "✅ DevWalletIdentified emitted for pump.fun pool"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // Emit DexPoolAccounts for all DEXes that have vault information
                 // This enables arb-strategy to have pool accounts BEFORE first trade
                 if pool_event.coin_vault.is_some() || pool_event.pc_vault.is_some() {
