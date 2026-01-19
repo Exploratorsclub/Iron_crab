@@ -1268,41 +1268,63 @@ async fn bootstrap_known_pools_from_jetstream(
     let consumer_config = slave_consumer_config();
     let consumer = stream.create_consumer(consumer_config).await?;
 
-    let mut messages = consumer.messages().await?;
     let mut pools_recovered = 0;
+    let batch_size = 1000; // Fetch up to 1000 messages per batch
 
-    // Pull all messages (one per pool with LastPerSubject)
-    while let Some(msg) = messages.next().await {
-        let msg = msg?;
+    // Fetch all available messages in batches until exhausted
+    loop {
+        let mut messages = consumer.fetch().max_messages(batch_size).messages().await?;
+        let mut batch_count = 0;
 
-        // Deserialize PoolCacheUpdate
-        let pool_update: PoolCacheUpdate = match serde_json::from_slice(&msg.payload) {
-            Ok(u) => u,
-            Err(e) => {
-                warn!(error = %e, "Failed to deserialize PoolCacheUpdate from JetStream");
-                msg.ack().await.map_err(|e| anyhow::anyhow!("Ack error: {}", e))?;
-                continue;
+        while let Some(msg) = messages.next().await {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "Error fetching message from JetStream");
+                    continue;
+                }
+            };
+
+            batch_count += 1;
+
+            // Deserialize PoolCacheUpdate
+            let pool_update: PoolCacheUpdate = match serde_json::from_slice(&msg.payload) {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(error = %e, "Failed to deserialize PoolCacheUpdate from JetStream");
+                    if let Err(ack_err) = msg.ack().await {
+                        warn!(error = %ack_err, "Failed to ack message");
+                    }
+                    continue;
+                }
+            };
+
+            // Add pool to known_pools
+            match pool_update.update_type {
+                ironcrab::ipc::PoolCacheUpdateType::PoolDiscovered | ironcrab::ipc::PoolCacheUpdateType::BalanceUpdated => {
+                    let mut pools = known_pools.write();
+                    pools.insert(pool_update.pool_address.clone());
+                    pools_recovered += 1;
+                    debug!(
+                        pool = %pool_update.pool_address,
+                        dex = %pool_update.dex,
+                        "SLAVE CACHE BOOTSTRAP: Recovered pool from JetStream"
+                    );
+                }
+                ironcrab::ipc::PoolCacheUpdateType::PoolRemoved => {
+                    // Skip removed pools during bootstrap
+                }
             }
-        };
 
-        // Add pool to known_pools
-        match pool_update.update_type {
-            ironcrab::ipc::PoolCacheUpdateType::PoolDiscovered | ironcrab::ipc::PoolCacheUpdateType::BalanceUpdated => {
-                let mut pools = known_pools.write();
-                pools.insert(pool_update.pool_address.clone());
-                pools_recovered += 1;
-                debug!(
-                    pool = %pool_update.pool_address,
-                    dex = %pool_update.dex,
-                    "SLAVE CACHE BOOTSTRAP: Recovered pool from JetStream"
-                );
-            }
-            ironcrab::ipc::PoolCacheUpdateType::PoolRemoved => {
-                // Skip removed pools during bootstrap
+            if let Err(ack_err) = msg.ack().await {
+                warn!(error = %ack_err, "Failed to ack message");
             }
         }
 
-        msg.ack().await.map_err(|e| anyhow::anyhow!("Ack error: {}", e))?;
+        // If we got fewer messages than batch_size, we've exhausted the stream
+        if batch_count < batch_size {
+            break;
+        }
     }
 
     info!(pools_recovered, "SLAVE CACHE BOOTSTRAP: Complete (known_pools populated)");
