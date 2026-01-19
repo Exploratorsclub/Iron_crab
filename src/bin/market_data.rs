@@ -1047,7 +1047,7 @@ async fn run_geyser_loop(
                         }
                     };
 
-                    // Publish PoolCacheUpdate to JetStream for execution-engine to mirror (persistent state)
+                    // Publish PoolCacheUpdate to JetStream (Single Source of Truth for pool state)
                     if let Some(ref nats) = ctx.nats {
                         let pool_update = PoolCacheUpdate::new_pool_discovered(
                             "market-data",
@@ -1068,7 +1068,6 @@ async fn run_geyser_loop(
                             NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                         } else {
                             NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            info!(pool = %account_update.pubkey, dex = %cached_state.dex_name(), slot = account_update.slot, "MASTER CACHE: Published PoolCacheUpdate::PoolDiscovered to JetStream");
                         }
                     }
                 }
