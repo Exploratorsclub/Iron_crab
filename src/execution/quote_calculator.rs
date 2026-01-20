@@ -14,7 +14,7 @@
 //! ```
 
 use super::live_pool_cache::{
-    CachedPoolState, MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState, RaydiumAmmState,
+    CachedPoolState, MeteoraCpmmState, MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState, RaydiumAmmState,
     RaydiumCpmmState, SharedLivePoolCache,
 };
 use crate::ipc::{TradeIntent, TradeSide};
@@ -74,6 +74,9 @@ pub fn calculate_fresh_min_out(
             calculate_raydium_cpmm_quote(s, amount_in, intent, is_buy)
         }
         CachedPoolState::Meteora(s) => calculate_meteora_quote(s, amount_in, intent, is_buy),
+        CachedPoolState::MeteoraCpmm(s) => {
+            calculate_meteora_cpmm_quote(s, amount_in, intent, is_buy)
+        }
         CachedPoolState::PumpFun(s) => calculate_pumpfun_quote(s, amount_in, is_buy),
         CachedPoolState::PumpAmm(s) => calculate_pumpamm_quote(s, amount_in, intent, is_buy),
     };
@@ -309,6 +312,52 @@ fn calculate_meteora_quote(
 
     // Use constant product as approximation
     let amount_out = (amount_after_fee * reserve_out) / (reserve_in + amount_after_fee);
+
+    Ok(amount_out as u64)
+}
+
+/// Calculate Meteora CPMM (DAMM V2) quote using constant product formula
+///
+/// This is simpler than DLMM - uses standard x*y=k formula.
+fn calculate_meteora_cpmm_quote(
+    state: &MeteoraCpmmState,
+    amount_in: u64,
+    intent: &TradeIntent,
+    _is_buy: bool,
+) -> Result<u64> {
+    // Determine direction
+    let input_mint = Pubkey::from_str(&intent.resources.input_mint)?;
+    let is_token_0_input = input_mint == state.token_0_mint;
+
+    // Get reserves
+    let (reserve_in, reserve_out) = if is_token_0_input {
+        (state.reserve_0 as u128, state.reserve_1 as u128)
+    } else {
+        (state.reserve_1 as u128, state.reserve_0 as u128)
+    };
+
+    if reserve_in == 0 || reserve_out == 0 {
+        return Err(anyhow!(
+            "meteora_cpmm: missing reserves (in={}, out={})",
+            reserve_in,
+            reserve_out
+        ));
+    }
+
+    // Meteora CPMM default fee is 0.25% = 25 bps
+    let fee_bps: u128 = 25;
+    let amount_in_u128 = amount_in as u128;
+    let fee_multiplier = 10000 - fee_bps;
+
+    // amount_out = (reserve_out * amount_in * fee_multiplier) / (reserve_in * 10000 + amount_in * fee_multiplier)
+    let numerator = reserve_out * amount_in_u128 * fee_multiplier;
+    let denominator = reserve_in * 10000 + amount_in_u128 * fee_multiplier;
+
+    if denominator == 0 {
+        return Err(anyhow!("meteora_cpmm: denominator is zero"));
+    }
+
+    let amount_out = numerator / denominator;
 
     Ok(amount_out as u64)
 }

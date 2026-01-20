@@ -134,6 +134,7 @@ impl GeyserPoolDiscovery {
             "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C" => DexType::RaydiumCpmm,
             "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" => DexType::OrcaWhirlpool,
             "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo" => DexType::MeteoraDlmm,
+            "cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D" => DexType::MeteoraCpmm,
             "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" => {
                 // Pump.fun: TX-based discovery is faster and simpler
                 // We don't need account updates for Pump.fun anymore
@@ -154,6 +155,7 @@ impl GeyserPoolDiscovery {
             DexType::RaydiumCpmm => Self::parse_raydium_cpmm_pool(&update.data),
             DexType::OrcaWhirlpool => Self::parse_orca_pool(&update.data),
             DexType::MeteoraDlmm => Self::parse_meteora_dlmm_pool(&update.data),
+            DexType::MeteoraCpmm => Self::parse_meteora_cpmm_pool(&update.data),
             DexType::PumpFun => {
                 // Should never reach here due to early return above
                 return None;
@@ -303,7 +305,8 @@ impl GeyserPoolDiscovery {
             DexType::RaydiumAmmV4
             | DexType::RaydiumCpmm
             | DexType::OrcaWhirlpool
-            | DexType::MeteoraDlmm => {
+            | DexType::MeteoraDlmm
+            | DexType::MeteoraCpmm => {
                 // Raydium/Orca/Meteora: TX-based discovery not implemented yet
                 // We use account-based discovery for these (more efficient)
                 None
@@ -527,6 +530,67 @@ impl GeyserPoolDiscovery {
         })
     }
 
+    /// Parse Meteora CPMM pool account (DAMM V2 - 397 bytes)
+    /// Source: Meteora CPMM program (cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D)
+    ///
+    /// This is simpler than DLMM - uses standard constant product x*y=k formula.
+    fn parse_meteora_cpmm_pool(data: &[u8]) -> Option<PoolData> {
+        use crate::solana::dex::meteora_cpmm_layout::{CpmmPool, CPMM_POOL_SIZE};
+
+        // Meteora CPMM pool account size: 397 bytes
+        if data.len() < CPMM_POOL_SIZE {
+            tracing::debug!(
+                len = data.len(),
+                expected = CPMM_POOL_SIZE,
+                "geyser_pool_discovery: ignoring Meteora CPMM account (wrong size)"
+            );
+            return None;
+        }
+
+        let parsed = CpmmPool::parse(data).ok()?;
+
+        // Sanity check: mints should not be zero
+        if parsed.token_0_mint.to_bytes() == [0u8; 32]
+            || parsed.token_1_mint.to_bytes() == [0u8; 32]
+        {
+            tracing::debug!("geyser_pool_discovery: Meteora CPMM pool has zero mints");
+            return None;
+        }
+
+        // Check pool is active (status < 2)
+        if !parsed.is_active() {
+            tracing::debug!(
+                status = parsed.status,
+                "geyser_pool_discovery: Meteora CPMM pool is not active"
+            );
+            return None;
+        }
+
+        tracing::info!(
+            token_0 = %parsed.token_0_mint,
+            token_1 = %parsed.token_1_mint,
+            decimals_0 = parsed.mint_0_decimals,
+            decimals_1 = parsed.mint_1_decimals,
+            "geyser_pool_discovery: Meteora CPMM pool parsed"
+        );
+
+        // For CPMM, we use token_0 as base and token_1 as quote
+        // The actual reserves will be fetched from vaults
+        Some(PoolData {
+            base_mint: parsed.token_0_mint,
+            quote_mint: parsed.token_1_mint,
+            base_decimals: parsed.mint_0_decimals,
+            quote_decimals: parsed.mint_1_decimals,
+            liquidity_lamports: 5_000_000_000, // 5 SOL default, will be updated from vaults
+            coin_vault: Some(parsed.token_0_vault),
+            pc_vault: Some(parsed.token_1_vault),
+            active_id: None,
+            bin_step: None,
+            tick_current_index: None,
+            tick_spacing: None,
+        })
+    }
+
     /// Parse Orca Whirlpool account
     fn parse_orca_pool(data: &[u8]) -> Option<PoolData> {
         // Use existing orca_whirlpool_layout parser
@@ -645,6 +709,7 @@ pub enum DexType {
     RaydiumCpmm,
     OrcaWhirlpool,
     MeteoraDlmm,
+    MeteoraCpmm,
     PumpFun,
 }
 
@@ -658,6 +723,7 @@ impl std::fmt::Display for DexType {
             DexType::RaydiumCpmm => write!(f, "raydium_cpmm"),
             DexType::OrcaWhirlpool => write!(f, "orca"),
             DexType::MeteoraDlmm => write!(f, "meteora_dlmm"),
+            DexType::MeteoraCpmm => write!(f, "meteora_cpmm"),
             DexType::PumpFun => write!(f, "pumpfun"),
         }
     }

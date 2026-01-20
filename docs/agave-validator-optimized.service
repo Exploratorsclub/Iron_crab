@@ -37,6 +37,9 @@ ExecStart=/usr/local/bin/agave-validator \
   --account-index-include-key 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P \
   --account-index-include-key pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA \
   --account-index-include-key LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo \
+  --account-index-include-key cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D \
+  --account-index-include-key A5RH5EVEkUnEfpWvz7b94NqzsforWk63mLcujoXVKiHs \
+  --account-index-include-key Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM \
   --accounts-db-cache-limit-mb 327680 \
   --accounts-index-scan-results-limit-mb 16384 \
   --enable-rpc-transaction-history \

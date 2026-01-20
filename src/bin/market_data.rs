@@ -73,6 +73,7 @@ const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+const METEORA_CPMM: &str = "cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D";
 
 /// Market data configuration (hot-reloadable via NATS)
 #[allow(dead_code)]
@@ -88,6 +89,8 @@ struct MarketDataConfig {
     enable_pumpfun: bool,
     /// Enable Meteora DLMM discovery. Default: true
     enable_meteora_dlmm: bool,
+    /// Enable Meteora CPMM discovery. Default: true
+    enable_meteora_cpmm: bool,
     /// Max events per second rate limit. Default: 10000
     max_events_per_sec: u32,
 }
@@ -100,6 +103,7 @@ impl Default for MarketDataConfig {
             enable_orca: true,
             enable_pumpfun: true,
             enable_meteora_dlmm: true,
+            enable_meteora_cpmm: true,
             max_events_per_sec: 10_000,
         }
     }
@@ -690,6 +694,7 @@ async fn run_geyser_loop(
         Pubkey::from_str(PUMPFUN_PROGRAM).expect("valid pumpfun pubkey"),
         Pubkey::from_str(PUMPFUN_AMM_PROGRAM).expect("valid pumpfun amm pubkey"),
         Pubkey::from_str(METEORA_DLMM).expect("valid meteora dlmm pubkey"),
+        Pubkey::from_str(METEORA_CPMM).expect("valid meteora cpmm pubkey"),
     ];
 
     // Initialize Geyser-based pool discovery (PRIMARY method for pool discovery)
@@ -1044,6 +1049,9 @@ async fn run_geyser_loop(
                         }
                         CachedPoolState::PumpFun(s) => {
                             (s.token_mint, Pubkey::default(), s.virtual_token_reserves, s.virtual_sol_reserves)
+                        }
+                        CachedPoolState::MeteoraCpmm(s) => {
+                            (s.token_0_mint, s.token_1_mint, s.reserve_0, s.reserve_1)
                         }
                     };
 

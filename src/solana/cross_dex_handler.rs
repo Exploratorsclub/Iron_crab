@@ -234,6 +234,16 @@ impl CrossDexHandler {
             .insert("meteora_dlmm".to_string(), Arc::new(meteora));
         info!("Initialized Meteora DLMM connector (for IX building only)");
 
+        // Initialize Meteora CPMM - for build_swap_ix() only
+        // Data comes from Geyser via set_pool_from_accounts, no RPC in hot path
+        let mut meteora_cpmm = crate::solana::dex::meteora_cpmm::MeteoraCpmm::new();
+        if let Some(pk) = self.wallet_pubkey {
+            meteora_cpmm.set_user_authority(pk);
+        }
+        self.dexes
+            .insert("meteora_cpmm".to_string(), Arc::new(meteora_cpmm));
+        info!("Initialized Meteora CPMM connector (for IX building only)");
+
         // Initialize Orca Whirlpool - for build_swap_ix() only
         let orca = Orca::new(Arc::clone(&self.rpc));
         if let Some(pk) = self.wallet_pubkey {
@@ -373,6 +383,35 @@ impl CrossDexHandler {
                     "Raydium pool in cache (injection via tx_builder)"
                 );
                 return true;
+            }
+            ("meteora_cpmm", CachedPoolState::MeteoraCpmm(cpmm_state)) => {
+                // Meteora CPMM - inject via set_pool_from_accounts
+                let accounts = vec![
+                    pool_pk.to_string(),
+                    cpmm_state.token_0_mint.to_string(),
+                    cpmm_state.token_1_mint.to_string(),
+                    cpmm_state.token_0_vault.to_string(),
+                    cpmm_state.token_1_vault.to_string(),
+                    cpmm_state.amm_config.to_string(),
+                    cpmm_state.observation_key.to_string(),
+                    format!("reserve_0:{}", cpmm_state.reserve_0),
+                    format!("reserve_1:{}", cpmm_state.reserve_1),
+                ];
+                if connector
+                    .set_pool_from_accounts(&pool_pk.to_string(), &accounts)
+                    .is_ok()
+                {
+                    info!(
+                        pool = %pool_pk,
+                        dex = %dex,
+                        token_0 = %cpmm_state.token_0_mint,
+                        token_1 = %cpmm_state.token_1_mint,
+                        reserve_0 = cpmm_state.reserve_0,
+                        reserve_1 = cpmm_state.reserve_1,
+                        "Injected Meteora CPMM pool state from LivePoolCache (no RPC)"
+                    );
+                    return true;
+                }
             }
             ("pumpfun", CachedPoolState::PumpFun(pf_state)) => {
                 // PumpFun bonding curve - cache the creator in the DEX connector
@@ -728,6 +767,21 @@ impl CrossDexHandler {
                 let tokens_out = reserve_token.saturating_sub(new_reserve_token) as u64;
                 Some((tokens_out, reserve_sol as u64, reserve_token as u64))
             }
+            CachedPoolState::MeteoraCpmm(s) => {
+                // Meteora CPMM: mint_0 = token, mint_1 = WSOL (SOL in, token out)
+                let reserve_sol = s.reserve_1 as u128;
+                let reserve_token = s.reserve_0 as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                // CPMM with 0.25% fee
+                let amount_after_fee = amount_in * 9975 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_sol = reserve_sol + amount_after_fee;
+                let new_reserve_token = k / new_reserve_sol;
+                let tokens_out = reserve_token.saturating_sub(new_reserve_token) as u64;
+                Some((tokens_out, reserve_sol as u64, reserve_token as u64))
+            }
         }
     }
 
@@ -820,6 +874,21 @@ impl CrossDexHandler {
                     return None;
                 }
                 let amount_after_fee = amount_in * 9900 / 10000;
+                let k = reserve_sol * reserve_token;
+                let new_reserve_token = reserve_token + amount_after_fee;
+                let new_reserve_sol = k / new_reserve_token;
+                let sol_out = reserve_sol.saturating_sub(new_reserve_sol) as u64;
+                Some((sol_out, reserve_sol as u64, reserve_token as u64))
+            }
+            CachedPoolState::MeteoraCpmm(s) => {
+                // Meteora CPMM: mint_0 = token, mint_1 = WSOL (token in, SOL out)
+                let reserve_token = s.reserve_0 as u128;
+                let reserve_sol = s.reserve_1 as u128;
+                if reserve_sol == 0 || reserve_token == 0 {
+                    return None;
+                }
+                // CPMM with 0.25% fee
+                let amount_after_fee = amount_in * 9975 / 10000;
                 let k = reserve_sol * reserve_token;
                 let new_reserve_token = reserve_token + amount_after_fee;
                 let new_reserve_sol = k / new_reserve_token;

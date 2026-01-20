@@ -4,6 +4,8 @@ use solana_sdk::instruction::Instruction;
 
 pub mod meteora_bin_array_layout;
 pub mod meteora_bin_walker;
+pub mod meteora_cpmm;
+pub mod meteora_cpmm_layout;
 pub mod meteora_dlmm;
 pub mod meteora_dlmm_layout;
 pub mod meteora_swap_builder;

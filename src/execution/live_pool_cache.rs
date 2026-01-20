@@ -179,6 +179,24 @@ pub struct PumpAmmState {
     pub pool_accounts: Vec<Pubkey>,
 }
 
+/// Meteora CPMM (DAMM V2) cached state
+#[derive(Debug, Clone)]
+pub struct MeteoraCpmmState {
+    pub token_0_mint: Pubkey,
+    pub token_1_mint: Pubkey,
+    pub token_0_vault: Pubkey,
+    pub token_1_vault: Pubkey,
+    pub amm_config: Pubkey,
+    pub observation_key: Pubkey,
+    pub token_0_program: Pubkey,
+    pub token_1_program: Pubkey,
+    pub reserve_0: u64,
+    pub reserve_1: u64,
+    pub mint_0_decimals: u8,
+    pub mint_1_decimals: u8,
+    pub status: u8,
+}
+
 // ============================================================================
 // Unified cached pool state enum
 // ============================================================================
@@ -190,6 +208,7 @@ pub enum CachedPoolState {
     RaydiumAmm(RaydiumAmmState),
     RaydiumCpmm(RaydiumCpmmState),
     Meteora(MeteoraState),
+    MeteoraCpmm(MeteoraCpmmState),
     PumpFun(PumpFunState),
     PumpAmm(PumpAmmState),
 }
@@ -202,6 +221,7 @@ impl CachedPoolState {
             Self::RaydiumAmm(_) => "raydium",
             Self::RaydiumCpmm(_) => "raydium_cpmm",
             Self::Meteora(_) => "meteora_dlmm",
+            Self::MeteoraCpmm(_) => "meteora_cpmm",
             Self::PumpFun(_) => "pumpfun",
             Self::PumpAmm(_) => "pump_amm",
         }
@@ -399,6 +419,10 @@ impl LivePoolCache {
                             VaultPosition::A => s.reserve_x_balance = Some(balance),
                             VaultPosition::B => s.reserve_y_balance = Some(balance),
                         },
+                        CachedPoolState::MeteoraCpmm(ref mut s) => match position {
+                            VaultPosition::A => s.reserve_0 = balance,
+                            VaultPosition::B => s.reserve_1 = balance,
+                        },
                         CachedPoolState::PumpAmm(ref mut s) => match position {
                             VaultPosition::A => s.base_reserve = Some(balance),
                             VaultPosition::B => s.quote_reserve = Some(balance),
@@ -440,6 +464,12 @@ impl LivePoolCache {
                     .insert(s.reserve_x, (*pool, VaultPosition::A));
                 self.vault_to_pool
                     .insert(s.reserve_y, (*pool, VaultPosition::B));
+            }
+            CachedPoolState::MeteoraCpmm(s) => {
+                self.vault_to_pool
+                    .insert(s.token_0_vault, (*pool, VaultPosition::A));
+                self.vault_to_pool
+                    .insert(s.token_1_vault, (*pool, VaultPosition::B));
             }
             CachedPoolState::PumpAmm(s) => {
                 self.vault_to_pool
@@ -523,6 +553,10 @@ impl LivePoolCache {
                 CachedPoolState::Meteora(s) => {
                     mints.insert(s.token_x_mint);
                     mints.insert(s.token_y_mint);
+                }
+                CachedPoolState::MeteoraCpmm(s) => {
+                    mints.insert(s.token_0_mint);
+                    mints.insert(s.token_1_mint);
                 }
                 CachedPoolState::RaydiumAmm(s) => {
                     mints.insert(s.base_mint);
@@ -655,6 +689,7 @@ pub fn parse_pool_account(owner: &Pubkey, data: &[u8]) -> Option<CachedPoolState
     const RAYDIUM_CPMM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
     const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
     const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+    const METEORA_CPMM: &str = "cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D";
     const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
     const PUMPFUN_AMM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 
@@ -665,6 +700,7 @@ pub fn parse_pool_account(owner: &Pubkey, data: &[u8]) -> Option<CachedPoolState
         RAYDIUM_AMM_V4 => parse_raydium_amm(data),
         RAYDIUM_CPMM => parse_raydium_cpmm(data),
         METEORA_DLMM => parse_meteora_dlmm(data),
+        METEORA_CPMM => parse_meteora_cpmm(data),
         PUMPFUN_PROGRAM => parse_pumpfun_bonding(data),
         PUMPFUN_AMM => parse_pumpamm_pool(data),
         _ => None,
@@ -756,6 +792,38 @@ fn parse_meteora_dlmm(data: &[u8]) -> Option<CachedPoolState> {
 
     let parsed = DlmmPool::parse(data).ok()?;
     Some(CachedPoolState::Meteora(MeteoraState::from(parsed)))
+}
+
+fn parse_meteora_cpmm(data: &[u8]) -> Option<CachedPoolState> {
+    use crate::solana::dex::meteora_cpmm_layout::{CpmmPool, CPMM_POOL_SIZE};
+
+    // Meteora CPMM pool: 397 bytes
+    if data.len() < CPMM_POOL_SIZE {
+        return None;
+    }
+
+    let parsed = CpmmPool::parse(data).ok()?;
+
+    // Skip inactive pools
+    if !parsed.is_active() {
+        return None;
+    }
+
+    Some(CachedPoolState::MeteoraCpmm(MeteoraCpmmState {
+        token_0_mint: parsed.token_0_mint,
+        token_1_mint: parsed.token_1_mint,
+        token_0_vault: parsed.token_0_vault,
+        token_1_vault: parsed.token_1_vault,
+        amm_config: parsed.amm_config,
+        observation_key: parsed.observation_key,
+        token_0_program: parsed.token_0_program,
+        token_1_program: parsed.token_1_program,
+        reserve_0: 0, // Will be updated from vault balance
+        reserve_1: 0, // Will be updated from vault balance
+        mint_0_decimals: parsed.mint_0_decimals,
+        mint_1_decimals: parsed.mint_1_decimals,
+        status: parsed.status,
+    }))
 }
 
 fn parse_pumpfun_bonding(data: &[u8]) -> Option<CachedPoolState> {
