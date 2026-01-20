@@ -30,6 +30,15 @@ pub const TOPIC_DECISION_RECORDS: &str = "ironcrab.v1.decision_records";
 /// NOTE: For JetStream persistence, use subject-per-pool pattern from jetstream.rs
 pub const TOPIC_POOL_CACHE_UPDATES: &str = "ironcrab.v1.pool_cache_updates";
 
+/// Wallet balance updates from market-data (for WsolManager in execution-engine)
+/// Subject per wallet: ironcrab.v1.wallet_balance.{wallet_address}
+pub const TOPIC_WALLET_BALANCE_PREFIX: &str = "ironcrab.v1.wallet_balance";
+
+/// Helper function to build wallet balance topic for a specific wallet
+pub fn wallet_balance_topic(wallet: &str) -> String {
+    format!("{}.{}", TOPIC_WALLET_BALANCE_PREFIX, wallet)
+}
+
 /// JetStream subject pattern for pool cache (subject-per-pool for automatic compaction)
 /// Each pool gets its own subject: ironcrab.pool_cache.{pool_address}
 /// This allows JetStream to keep only the latest state per pool (max_messages_per_subject=1)

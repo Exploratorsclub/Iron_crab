@@ -29,15 +29,16 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ironcrab::config::WalletTrackerCfg;
+use ironcrab::execution::wsol_manager::WalletBalanceUpdate;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, MarketEvent, MarketEventKind,
-    PoolCacheUpdate,
+    PoolCacheUpdate, RecordHeader,
 };
 use ironcrab::metrics::{
     serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
     NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
-use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS, TOPIC_POOL_CACHE_UPDATES, pool_subject, ensure_pool_cache_stream};
+use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS, pool_subject, ensure_pool_cache_stream, wallet_balance_topic};
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
@@ -177,6 +178,58 @@ struct MarketDataContext {
     /// MASTER LivePoolCache - Single Source of Truth for all pool state.
     /// Updated via Geyser events and propagated to execution-engine via NATS.
     live_pool_cache: Arc<LivePoolCache>,
+
+    /// === WsolManager Support: Wallet Balance Tracking ===
+    /// Wallet pubkey to track for balance updates (for WsolManager in execution-engine).
+    /// Set via IRONCRAB_WALLET_PUBKEY env var.
+    tracked_wallet: Option<TrackedWallet>,
+    /// Channel to notify GeyserListener when tracked wallet accounts change.
+    /// NOTE: We keep the Sender alive even though we don't use it after initial send,
+    /// because dropping it would close the Receiver used by the merge task.
+    #[allow(dead_code)]
+    tracked_wallet_tx: watch::Sender<Vec<Pubkey>>,
+}
+
+/// Tracked wallet info for WsolManager balance updates
+#[derive(Debug)]
+struct TrackedWallet {
+    /// The wallet pubkey (owner)
+    wallet: Pubkey,
+    /// WSOL ATA address
+    wsol_ata: Pubkey,
+    /// Last known SOL balance (lamports)
+    last_sol_balance: std::sync::atomic::AtomicU64,
+    /// Last known WSOL balance (lamports)
+    last_wsol_balance: std::sync::atomic::AtomicU64,
+}
+
+/// WSOL Mint address constant
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Associated Token Program ID
+const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+
+impl TrackedWallet {
+    fn new(wallet: Pubkey) -> Self {
+        // Compute WSOL ATA using known derivation
+        let wsol_mint = Pubkey::from_str(WSOL_MINT).expect("valid wsol mint");
+        let ata_program = Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID).expect("valid ata program id");
+        // Manual ATA derivation to avoid Pubkey type mismatch with spl_associated_token_account
+        let (ata, _bump) = Pubkey::find_program_address(
+            &[
+                wallet.as_ref(),
+                spl_token::ID.as_ref(),
+                wsol_mint.as_ref(),
+            ],
+            &ata_program,
+        );
+        Self {
+            wallet,
+            wsol_ata: ata,
+            last_sol_balance: std::sync::atomic::AtomicU64::new(0),
+            last_wsol_balance: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
 }
 
 /// Information about a tracked vault account
@@ -575,6 +628,31 @@ async fn main() -> Result<()> {
     let (tracked_mints_tx, tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
     let (tracked_vaults_tx, tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
     let (tracked_bin_arrays_tx, tracked_bin_arrays_rx) = watch::channel(Vec::<Pubkey>::new());
+    let (tracked_wallet_tx, tracked_wallet_rx) = watch::channel(Vec::<Pubkey>::new());
+
+    // === WsolManager Support: Setup wallet balance tracking ===
+    let tracked_wallet = if let Ok(wallet_pubkey_str) = std::env::var("IRONCRAB_WALLET_PUBKEY") {
+        match Pubkey::from_str(&wallet_pubkey_str) {
+            Ok(wallet_pubkey) => {
+                let tracked = TrackedWallet::new(wallet_pubkey);
+                info!(
+                    wallet = %wallet_pubkey,
+                    wsol_ata = %tracked.wsol_ata,
+                    "WalletBalance tracking enabled for WsolManager"
+                );
+                // Send initial tracked accounts (wallet + WSOL ATA)
+                let _ = tracked_wallet_tx.send(vec![wallet_pubkey, tracked.wsol_ata]);
+                Some(tracked)
+            }
+            Err(_) => {
+                warn!("IRONCRAB_WALLET_PUBKEY is set but not a valid pubkey");
+                None
+            }
+        }
+    } else {
+        debug!("IRONCRAB_WALLET_PUBKEY not set, WalletBalance tracking disabled");
+        None
+    };
 
     let ctx = Arc::new(MarketDataContext {
         run_id: run_id.clone(),
@@ -591,6 +669,8 @@ async fn main() -> Result<()> {
         tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_bin_arrays_tx,
         live_pool_cache: Arc::new(LivePoolCache::new()),
+        tracked_wallet,
+        tracked_wallet_tx,
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -635,6 +715,7 @@ async fn main() -> Result<()> {
             tracked_mints_rx,
             tracked_vaults_rx,
             tracked_bin_arrays_rx,
+            tracked_wallet_rx,
         )
         .await?;
     }
@@ -655,6 +736,7 @@ async fn run_geyser_loop(
     tracked_mints_rx: watch::Receiver<Vec<Pubkey>>,
     tracked_vaults_rx: watch::Receiver<Vec<Pubkey>>,
     tracked_bin_arrays_rx: watch::Receiver<Vec<Pubkey>>,
+    tracked_wallet_rx: watch::Receiver<Vec<Pubkey>>,
 ) -> Result<()> {
     // Initialize RPC client for fallback/metadata (prefer local RPC, fallback to Helius)
     let rpc_url =
@@ -708,13 +790,14 @@ async fn run_geyser_loop(
         }
     });
 
-    // Merge tracked_mints, tracked_vaults, and tracked_bin_arrays into a single combined channel.
+    // Merge tracked_mints, tracked_vaults, tracked_bin_arrays, and tracked_wallet into a single combined channel.
     // GeyserListener will subscribe to all accounts in the combined list.
     let (combined_tracked_tx, combined_tracked_rx) = watch::channel(Vec::<Pubkey>::new());
     {
         let mut mints_rx = tracked_mints_rx;
         let mut vaults_rx = tracked_vaults_rx;
         let mut bin_arrays_rx = tracked_bin_arrays_rx;
+        let mut wallet_rx = tracked_wallet_rx;
         let combined_tx = combined_tracked_tx;
         tokio::spawn(async move {
             loop {
@@ -722,14 +805,17 @@ async fn run_geyser_loop(
                     _ = mints_rx.changed() => {}
                     _ = vaults_rx.changed() => {}
                     _ = bin_arrays_rx.changed() => {}
+                    _ = wallet_rx.changed() => {}
                 }
                 // Merge all lists
                 let mints: Vec<Pubkey> = mints_rx.borrow().clone();
                 let vaults: Vec<Pubkey> = vaults_rx.borrow().clone();
                 let bin_arrays: Vec<Pubkey> = bin_arrays_rx.borrow().clone();
+                let wallet_accounts: Vec<Pubkey> = wallet_rx.borrow().clone();
                 let mut combined: Vec<Pubkey> = mints;
                 combined.extend(vaults);
                 combined.extend(bin_arrays);
+                combined.extend(wallet_accounts);
                 combined.sort();
                 combined.dedup();
                 let _ = combined_tx.send(combined);
@@ -794,6 +880,63 @@ async fn run_geyser_loop(
             Ok(account_update) = account_rx.recv() => {
                 account_count += 1;
                 ironcrab::metrics::record_activity();
+
+                // === WsolManager Support: Wallet Balance Updates ===
+                // Track SOL (native) and WSOL (ATA) balance changes for WsolManager
+                if let Some(ref tracked_wallet) = ctx.tracked_wallet {
+                    let is_wallet_account = account_update.pubkey == tracked_wallet.wallet;
+                    let is_wsol_ata = account_update.pubkey == tracked_wallet.wsol_ata;
+
+                    if is_wallet_account || is_wsol_ata {
+                        // Parse balance based on account type
+                        let (new_sol, new_wsol, balance_changed) = if is_wallet_account {
+                            // Native SOL account - balance is in lamports field
+                            let lamports = account_update.lamports;
+                            let prev = tracked_wallet.last_sol_balance.swap(lamports, Ordering::Relaxed);
+                            let wsol = tracked_wallet.last_wsol_balance.load(Ordering::Relaxed);
+                            (lamports, Some(wsol), lamports != prev)
+                        } else {
+                            // WSOL ATA - parse token account balance
+                            if let Some(balance) = try_parse_token_account_balance(&account_update.data) {
+                                let prev = tracked_wallet.last_wsol_balance.swap(balance, Ordering::Relaxed);
+                                let sol = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
+                                (sol, Some(balance), balance != prev)
+                            } else {
+                                continue; // Failed to parse, skip
+                            }
+                        };
+
+                        if balance_changed {
+                            let wallet_str = tracked_wallet.wallet.to_string();
+                            let update = WalletBalanceUpdate {
+                                header: RecordHeader::new("market-data", BUILD_VERSION, &run_id),
+                                wallet: wallet_str.clone(),
+                                sol_lamports: new_sol,
+                                wsol_lamports: new_wsol,
+                                slot: account_update.slot,
+                            };
+
+                            debug!(
+                                wallet = %wallet_str,
+                                sol_lamports = new_sol,
+                                wsol_lamports = ?new_wsol,
+                                slot = account_update.slot,
+                                "WalletBalanceUpdate: publishing to NATS"
+                            );
+
+                            // Publish to NATS on wallet-specific topic
+                            if let Some(ref nats) = ctx.nats {
+                                let topic = wallet_balance_topic(&wallet_str);
+                                if let Err(e) = nats.publish(&topic, &update).await {
+                                    warn!(error = %e, "Failed to publish WalletBalanceUpdate to NATS");
+                                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Tracked mint updates (Token mint authority/freeze info)
                 if (account_update.owner.to_bytes() == spl_token::ID.to_bytes()

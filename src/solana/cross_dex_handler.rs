@@ -1066,14 +1066,14 @@ impl CrossDexHandler {
         let token_program_sdk = Pubkey::new_from_array(token_program.to_bytes());
 
         // ====================================================================
-        // Create ATAs for BOTH tokens involved in the swap (idempotent)
+        // Create Token ATA (idempotent) - only for the token being traded
         //
-        // Orca Whirlpool requires ATAs for token_owner_account_a AND token_owner_account_b.
-        // - token_owner_account_a = User's ATA for pool.token_mint_a (often WSOL)
-        // - token_owner_account_b = User's ATA for pool.token_mint_b (the token)
+        // NOTE: WSOL ATA creation REMOVED - WsolManager guarantees WSOL ATA exists
+        // and has sufficient balance. This saves ~20k CU per arb TX.
         //
-        // For SOL→Token swaps: We need WSOL ATA (for input) AND Token ATA (for output).
-        // Without both, Orca fails with AnchorError AccountNotInitialized (3012).
+        // Token ATA is still needed because:
+        // - First arb of a new token needs the ATA
+        // - Idempotent = no-op if exists (~2k CU), only costs when creating (~20k CU)
         //
         // IMPORTANT: For Token-2022 mints, we MUST use the Token-2022 program ID,
         // otherwise ATA creation fails with IncorrectProgramId.
@@ -1083,23 +1083,8 @@ impl CrossDexHandler {
             let wallet_spl =
                 spl_token::solana_program::pubkey::Pubkey::new_from_array(wallet.to_bytes());
 
-            // 1. Create WSOL ATA (WSOL always uses SPL Token, not Token-2022)
-            let wsol_mint_pk =
-                Pubkey::from_str(SOL_MINT).map_err(|_| anyhow!("Invalid WSOL mint"))?;
-            let wsol_mint_spl =
-                spl_token::solana_program::pubkey::Pubkey::new_from_array(wsol_mint_pk.to_bytes());
-
-            let create_wsol_ata_ix_prog = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                &wallet_spl,        // payer
-                &wallet_spl,        // owner  
-                &wsol_mint_spl,     // WSOL mint
-                &spl_token::id(),   // token program (WSOL is always SPL Token)
-            );
-            ata_creation_instructions.push(prog_ix_to_sdk(create_wsol_ata_ix_prog));
-
-            // 2. Create Token ATA (for the token being bought/sold)
-            //    MUST use the correct token program (SPL Token OR Token-2022)
-            //    Note: token_program was determined above (before this block)
+            // Create Token ATA (for the token being bought/sold)
+            // MUST use the correct token program (SPL Token OR Token-2022)
             let token_mint_spl =
                 spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint_pk.to_bytes());
 
@@ -1111,72 +1096,14 @@ impl CrossDexHandler {
             );
             let token_ata_ix = prog_ix_to_sdk(create_token_ata_ix_prog);
 
-            // Log the actual instruction accounts for debugging Token-2022 issues
-            info!(
+            debug!(
                 token_mint = %token_mint,
-                wsol_mint = %SOL_MINT,
                 wallet = %wallet,
                 token_program = %token_program_sdk,
-                token_ata_ix_accounts_count = token_ata_ix.accounts.len(),
-                token_ata_ix_last_account = %token_ata_ix.accounts.last().map(|a| a.pubkey.to_string()).unwrap_or_default(),
-                "Token ATA creation instruction built"
+                "Token ATA creation instruction built (WSOL ATA handled by WsolManager)"
             );
 
             ata_creation_instructions.push(token_ata_ix);
-
-            // ====================================================================
-            // WRAP SOL: Transfer native SOL → WSOL ATA and sync
-            //
-            // DEXes like Meteora DLMM and Orca require WSOL (SPL token) in the ATA,
-            // not native SOL. We must:
-            // 1. Transfer native SOL from wallet to WSOL ATA
-            // 2. Call SyncNative to update the WSOL balance
-            // ====================================================================
-            let wsol_ata = spl_associated_token_account::get_associated_token_address(
-                &wallet_spl,
-                &wsol_mint_spl,
-            );
-            let wsol_ata_sdk = Pubkey::new_from_array(wsol_ata.to_bytes());
-
-            // Transfer native SOL to WSOL ATA
-            // System program transfer: 4-byte discriminator (2u32) + 8-byte lamports
-            let system_program_id = Pubkey::from_str("11111111111111111111111111111111")
-                .expect("valid system program id");
-            let transfer_ix = Instruction {
-                program_id: system_program_id,
-                accounts: vec![
-                    AccountMeta {
-                        pubkey: wallet,
-                        is_signer: true,
-                        is_writable: true,
-                    },
-                    AccountMeta {
-                        pubkey: wsol_ata_sdk,
-                        is_signer: false,
-                        is_writable: true,
-                    },
-                ],
-                data: {
-                    // System transfer instruction: 4-byte enum index (2u32 LE) + 8-byte lamports (u64 LE)
-                    let mut d = Vec::with_capacity(4 + 8);
-                    d.extend_from_slice(&2u32.to_le_bytes()); // Transfer discriminator (4 bytes!)
-                    d.extend_from_slice(&buy_amount_in.to_le_bytes());
-                    d
-                },
-            };
-            ata_creation_instructions.push(transfer_ix);
-
-            // Sync native balance to WSOL token balance
-            let sync_native_ix_prog =
-                spl_token::instruction::sync_native(&spl_token::id(), &wsol_ata)
-                    .map_err(|e| anyhow!("Failed to create sync_native instruction: {}", e))?;
-            ata_creation_instructions.push(prog_ix_to_sdk(sync_native_ix_prog));
-
-            info!(
-                wsol_ata = %wsol_ata_sdk,
-                amount = buy_amount_in,
-                "Added wrap SOL instructions (transfer + sync_native)"
-            );
         }
 
         // ====================================================================
@@ -1298,21 +1225,19 @@ impl CrossDexHandler {
             .build_swap_ix_async(token_mint, SOL_MINT, sell_amount_in, sell_min_out)
             .await?;
 
-        // Combine: ATA creation + wrap SOL (if any) + buy swap + sell swap
+        // Combine: Token ATA creation (optional) + buy swap + sell swap
         // Instructions in ata_creation_instructions:
-        // - 2x CreateIdempotent ATA (~20k CU each)
-        // - 1x System Transfer (~300 CU)
-        // - 1x SyncNative (~1k CU)
-        let _ata_count = ata_creation_instructions.len();
+        // - 1x CreateIdempotent Token ATA (~2k CU if exists, ~20k CU if new)
+        // NOTE: WSOL ATA creation REMOVED - WsolManager guarantees it exists.
+        // NOTE: wrap SOL (Transfer + SyncNative) REMOVED - WsolManager handles this.
         let mut combined_buy_instructions = ata_creation_instructions;
         combined_buy_instructions.extend(buy_instructions);
 
         // Estimate compute units:
-        // - 2x ATA create ~25k each = 50k
-        // - 1x Transfer + SyncNative ~2k
+        // - 1x Token ATA create ~20k (often no-op ~2k)
         // - 2x swap ~200k each = 400k
-        // Total ~452k, round up to 500k for safety
-        let total_cu = 500_000_u32;
+        // Total ~420k, round up to 450k for safety
+        let total_cu = 450_000_u32;
 
         Ok(CrossDexSwapPlan {
             buy_instructions: combined_buy_instructions,

@@ -116,6 +116,59 @@ pub struct ExecutionEngineCfg {
     /// Create with: cargo run --bin setup-alt
     #[serde(default)]
     pub address_lookup_table: Option<String>,
+    /// WSOL Manager Configuration
+    #[serde(default)]
+    pub wsol_manager: Option<WsolManagerCfg>,
+}
+
+/// WSOL Manager Configuration
+/// Maintains WSOL balance for efficient arbitrage transactions.
+/// Professional bots don't wrap/unwrap in the arb TX itself.
+/// TOML section: [execution_engine.wsol_manager]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsolManagerCfg {
+    /// Enable WSOL management. Default: true
+    #[serde(default = "default_wsol_enabled")]
+    pub enabled: bool,
+    /// Minimum WSOL balance in SOL. Below this triggers wrap.
+    #[serde(default = "default_wsol_min")]
+    pub min_wsol_sol: f64,
+    /// Target WSOL balance in SOL after wrap.
+    #[serde(default = "default_wsol_target")]
+    pub target_wsol_sol: f64,
+    /// Maximum WSOL balance in SOL. Above this triggers unwrap.
+    #[serde(default = "default_wsol_max")]
+    pub max_wsol_sol: f64,
+    /// Minimum native SOL to keep (rent + buffer). Default: 0.1 SOL
+    #[serde(default = "default_wsol_min_native")]
+    pub min_native_sol: f64,
+    /// Cooldown between wrap/unwrap operations in seconds. Default: 30
+    #[serde(default = "default_wsol_cooldown")]
+    pub cooldown_secs: u64,
+    /// Dry-run mode: log actions but don't send TX. Default: false
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+fn default_wsol_enabled() -> bool { true }
+fn default_wsol_min() -> f64 { 0.5 }
+fn default_wsol_target() -> f64 { 1.0 }
+fn default_wsol_max() -> f64 { 2.0 }
+fn default_wsol_min_native() -> f64 { 0.1 }
+fn default_wsol_cooldown() -> u64 { 30 }
+
+impl Default for WsolManagerCfg {
+    fn default() -> Self {
+        Self {
+            enabled: default_wsol_enabled(),
+            min_wsol_sol: default_wsol_min(),
+            target_wsol_sol: default_wsol_target(),
+            max_wsol_sol: default_wsol_max(),
+            min_native_sol: default_wsol_min_native(),
+            cooldown_secs: default_wsol_cooldown(),
+            dry_run: false,
+        }
+    }
 }
 
 /// Wallet Tracker Configuration

@@ -95,6 +95,7 @@ use ironcrab::storage::{
     JsonlWriter, JsonlWriterConfig,
 };
 use ironcrab::wallet::Treasury;
+use ironcrab::execution::wsol_manager::{WsolManager, WsolManagerConfig};
 use spl_token::instruction as spl_ix;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::solana_program::pubkey::Pubkey as SplProgPubkey;
@@ -3053,6 +3054,78 @@ async fn main() -> Result<()> {
     // Publish initial gauge values immediately (before the first 30s heartbeat).
     OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
 
+    // Shutdown channel for background tasks (WsolManager, etc.)
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // === WsolManager: Background WSOL balance maintenance ===
+    // Professional arb bots don't wrap/unwrap in the arb TX itself
+    if let Some(ref treasury) = ctx.treasury {
+        // Get WsolManager config from [execution_engine.wsol_manager] section
+        let wsol_config = exec_eng_cfg
+            .and_then(|e| e.wsol_manager.as_ref())
+            .cloned()
+            .map(|cfg| WsolManagerConfig {
+                enabled: cfg.enabled,
+                min_wsol_sol: cfg.min_wsol_sol,
+                target_wsol_sol: cfg.target_wsol_sol,
+                max_wsol_sol: cfg.max_wsol_sol,
+                min_native_sol: cfg.min_native_sol,
+                cooldown_secs: cfg.cooldown_secs,
+                dry_run: cfg.dry_run || args.dry_run,
+            })
+            .unwrap_or_else(|| WsolManagerConfig {
+                // Defaults with dry_run from args
+                dry_run: args.dry_run,
+                ..Default::default()
+            });
+
+        if wsol_config.enabled {
+            // Create separate NATS connection for WsolManager
+            let nats_url = args.nats_url.clone();
+            let wsol_manager = WsolManager::new(
+                wsol_config.clone(),
+                Arc::new(treasury.clone()),
+                Arc::clone(&ctx.rpc),
+                env!("CARGO_PKG_VERSION"),
+                &run_id,
+            );
+            let shutdown_rx_wsol = shutdown_rx.clone();
+
+            tokio::spawn(async move {
+                // Create separate NATS client for WsolManager
+                let nats_config = NatsConfig::new(&nats_url, "wsol-manager");
+                let mut nats_client = NatsClient::new(nats_config);
+                match nats_client.connect().await {
+                    Ok(()) => {
+                        info!("WsolManager NATS connected");
+                        if let Err(e) = wsol_manager.run(Arc::new(nats_client), shutdown_rx_wsol).await {
+                            error!(error = %e, "WsolManager task failed");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "WsolManager failed to connect to NATS (running without events)");
+                        // Run anyway - will use periodic fallback polling
+                        if let Err(e) = wsol_manager.run_polling_only(shutdown_rx_wsol).await {
+                            error!(error = %e, "WsolManager polling task failed");
+                        }
+                    }
+                }
+            });
+
+            info!(
+                min_wsol = wsol_config.min_wsol_sol,
+                target_wsol = wsol_config.target_wsol_sol,
+                max_wsol = wsol_config.max_wsol_sol,
+                dry_run = wsol_config.dry_run,
+                "WsolManager background task started"
+            );
+        } else {
+            info!("WsolManager disabled by config");
+        }
+    } else {
+        debug!("WsolManager not started (no Treasury)");
+    }
+
     // === Main Loop: Process TradeIntents ===
     info!("Entering main execution loop");
 
@@ -3440,7 +3513,9 @@ async fn main() -> Result<()> {
                 }
             }
             _ = &mut shutdown => {
-                info!("Shutdown signal received");
+                info!("Shutdown signal received, stopping background tasks");
+                // Signal shutdown to background tasks (WsolManager, etc.)
+                let _ = shutdown_tx.send(true);
                 break;
             }
         }
