@@ -1,8 +1,8 @@
 # WSOL Manager & Account Janitor Implementation
 
-**Status**: Phase 1.5 Complete (WsolManager + Arb-TX Optimization)  
+**Status**: Phase 2.4 Complete (AccountJanitor - Close Empty ATAs)  
 **Created**: 2026-01-20  
-**Last Updated**: 2026-01-20
+**Last Updated**: 2026-01-21
 
 ## Motivation
 
@@ -21,10 +21,9 @@ execution-engine
 │   ├── Polling-only fallback (wenn NATS unavailable)
 │   ├── Wrap wenn WSOL < min_wsol
 │   └── Unwrap wenn WSOL > max_wsol (close ATA)
-└── AccountJanitor (tokio task) 🔜 Phase 2
-    ├── Merge dust gleicher Token (alle 5 min)
-    ├── Swap dust → SOL (alle 24h)
-    └── Close empty ATAs (alle 7 Tage)
+└── AccountJanitor (tokio task) ✅ Phase 2.4 IMPLEMENTED
+    ├── Close empty ATAs (configurable interval)
+    └── Future: Merge dust, Swap dust → SOL
 ```
 
 ## Komponenten
@@ -155,41 +154,41 @@ close_ata_max_per_run = 20          # Max ATAs pro Run
 
 ---
 
-### Phase 2: AccountJanitor (Priority: MEDIUM)
+### Phase 2: AccountJanitor (Priority: MEDIUM) - Close ATAs ✅ COMPLETE
 
-#### 2.1 AccountJanitor Core
-- [ ] `src/execution/account_janitor.rs` erstellen
-- [ ] `AccountJanitorConfig` struct
-- [ ] `AccountJanitor` struct mit:
-  - [ ] `new(config, treasury, rpc)` constructor
-  - [ ] `run()` async main loop (timer-based)
-  - [ ] Separate timer für jede Aktion
+#### 2.1 AccountJanitor Core ✅
+- [x] `src/execution/account_janitor.rs` erstellen
+- [x] `AccountJanitorConfig` struct (in `src/config.rs`)
+- [x] `AccountJanitor` struct mit:
+  - [x] `new(config, treasury, rpc)` constructor
+  - [x] `run()` async main loop (timer-based)
+  - [x] Graceful shutdown via watch::channel
 
-#### 2.2 Merge Dust (gleiche Token)
+#### 2.2 Merge Dust (gleiche Token) - FUTURE
 - [ ] `find_duplicate_atas()` - ATAs für gleichen Mint finden
 - [ ] `build_merge_ix()` - Transfer von ATA_2 → ATA_1
 - [ ] `execute_merge()` - TX bauen und senden
 
-#### 2.3 Swap Dust → SOL
+#### 2.3 Swap Dust → SOL - FUTURE (via interne DEX, nicht Jupiter)
 - [ ] `find_dust_tokens()` - Tokens mit kleinem Wert finden
-- [ ] `get_token_value_sol()` - Wert schätzen (via price cache oder Jupiter)
-- [ ] Jupiter Quote API Integration
+- [ ] `get_token_value_sol()` - Wert schätzen via Pool-Quotes
+- [ ] Route über Raydium/Orca/Meteora (existierende DEX-Integration)
 - [ ] `execute_dust_swap()` - Swap TX bauen und senden
+- [ ] **Kein Jupiter** - externe API Dependency vermeiden
 
-#### 2.4 Close Empty ATAs
-- [ ] `find_empty_atas()` - ATAs mit balance == 0
-- [ ] `get_ata_age()` - Wann wurde ATA erstellt (first tx timestamp)
-- [ ] `build_close_ata_ix()` - closeAccount instruction
-- [ ] `execute_close_atas()` - Batch close (max N pro TX)
+#### 2.4 Close Empty ATAs ✅
+- [x] `find_empty_atas()` - ATAs mit balance == 0
+- [x] `estimate_ata_age()` - Alter via getSignaturesForAddress
+- [x] `close_atas()` - Batch close mit closeAccount instruction
+- [x] Configurable: interval, min_age, max_per_run, dry_run
 
-#### 2.5 Integration execution-engine
-- [ ] Config parsing für `[account_janitor]`
-- [ ] AccountJanitor Task spawnen in `main()`
-- [ ] Graceful shutdown handling
+#### 2.5 Integration execution-engine ✅
+- [x] Config parsing für `[execution_engine.account_janitor]`
+- [x] AccountJanitor Task spawnen in `main()`
+- [x] Graceful shutdown handling
 
 #### 2.6 Testing
-- [ ] Unit tests für Janitor logic
-- [ ] Integration test: Timer → Action trigger
+- [x] Unit tests für config defaults
 - [ ] Dry-run test auf Server (log only, no send)
 
 ---
@@ -241,13 +240,13 @@ src/bin/
 
 ## Open Questions
 
-1. **Jupiter Integration**: Eigener HTTP Client oder existierende Lib?
-   - Tendenz: Eigener minimaler Client, nur Quote + Swap Endpoints
+1. ~~**Jupiter Integration**: Eigener HTTP Client oder existierende Lib?~~
+   - **Entscheidung**: Kein Jupiter! Externe API Dependency vermeiden.
+   - Dust Swap über interne DEX-Integration (Raydium/Orca/Meteora)
+   - Wir haben bereits Quote-Funktionen für diese DEXes
 
-2. **ATA Age Detection**: Wie bestimmen wir das Alter einer ATA?
-   - Option A: getSignaturesForAddress → älteste Signature
-   - Option B: Lokale Tracking-Datenbank
-   - Tendenz: Option A (einfacher, keine State)
+2. **ATA Age Detection**: Wie bestimmen wir das Alter einer ATA? ✅ RESOLVED
+   - Lösung: `getSignaturesForAddress` → älteste Signature timestamp
 
 3. **Merge Dust Timing**: Direkt nach Arb oder periodic?
    - Tendenz: Periodic (5 min) - Arb-TX nicht verzögern

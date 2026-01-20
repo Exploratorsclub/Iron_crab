@@ -672,6 +672,106 @@ impl SolanaRpc {
             }
         }
     }
+
+    // ========================================================================
+    // AccountJanitor Support Methods
+    // ========================================================================
+
+    /// Get all token accounts owned by a wallet
+    pub async fn get_token_accounts_by_owner(
+        &self,
+        owner: &Pubkey,
+    ) -> Result<Vec<(Pubkey, solana_sdk::account::Account)>, ClientError> {
+        use solana_account_decoder::UiAccountEncoding;
+        use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+        use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
+
+        let _permit = self.limiter.acquire().await;
+
+        // Filter for token accounts owned by this wallet
+        // Token account layout: mint (32) + owner (32) + ...
+        // Owner is at offset 32
+        let filters = vec![
+            RpcFilterType::DataSize(165), // SPL Token account size
+            RpcFilterType::Memcmp(Memcmp::new(
+                32, // owner offset
+                MemcmpEncodedBytes::Base58(owner.to_string()),
+            )),
+        ];
+
+        let config = RpcProgramAccountsConfig {
+            filters: Some(filters),
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(UiAccountEncoding::Base64),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let token_program = solana_sdk::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+        let accounts = self
+            .rpc
+            .get_program_accounts_with_config(&token_program, config)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "get_token_accounts_by_owner failed");
+                e
+            })?;
+
+        self.limiter.on_success();
+        Ok(accounts)
+    }
+
+    /// Get signatures for an address (for estimating account age)
+    pub async fn get_signatures_for_address(
+        &self,
+        address: &Pubkey,
+        limit: Option<usize>,
+    ) -> Result<Vec<solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature>, ClientError> {
+        use solana_rpc_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+        use solana_commitment_config::CommitmentConfig;
+
+        let _permit = self.limiter.acquire().await;
+
+        let config = GetConfirmedSignaturesForAddress2Config {
+            limit,
+            before: None,
+            until: None,
+            commitment: Some(CommitmentConfig::confirmed()),
+        };
+
+        let sigs = self
+            .rpc
+            .get_signatures_for_address_with_config(address, config)
+            .await
+            .map_err(|e| {
+                tracing::debug!(error = %e, address = %address, "get_signatures_for_address failed");
+                e
+            })?;
+
+        self.limiter.on_success();
+        Ok(sigs)
+    }
+
+    /// Send and confirm a transaction
+    pub async fn send_and_confirm_transaction(
+        &self,
+        tx: &solana_sdk::transaction::Transaction,
+    ) -> Result<Signature, ClientError> {
+        let _permit = self.limiter.acquire().await;
+
+        let sig = self
+            .rpc
+            .send_and_confirm_transaction(tx)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "send_and_confirm_transaction failed");
+                e
+            })?;
+
+        self.limiter.on_success();
+        Ok(sig)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

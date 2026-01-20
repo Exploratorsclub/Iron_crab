@@ -3126,6 +3126,55 @@ async fn main() -> Result<()> {
         debug!("WsolManager not started (no Treasury)");
     }
 
+    // === AccountJanitor: Background cleanup of empty ATAs and dust ===
+    if let Some(ref treasury) = ctx.treasury {
+        use ironcrab::execution::account_janitor::{AccountJanitor, AccountJanitorConfig};
+
+        // Get AccountJanitor config from [execution_engine.account_janitor] section
+        let janitor_config = exec_eng_cfg
+            .and_then(|e| e.account_janitor.as_ref())
+            .cloned()
+            .map(|cfg| AccountJanitorConfig {
+                enabled: cfg.enabled,
+                close_ata_interval_secs: cfg.close_ata_interval_secs,
+                close_ata_min_age_secs: cfg.close_ata_min_age_secs,
+                close_ata_max_per_run: cfg.close_ata_max_per_run,
+                dry_run: cfg.dry_run || args.dry_run,
+            })
+            .unwrap_or_else(|| AccountJanitorConfig {
+                dry_run: args.dry_run,
+                ..Default::default()
+            });
+
+        if janitor_config.enabled {
+            let janitor = AccountJanitor::new(
+                janitor_config.clone(),
+                Arc::new(treasury.clone()),
+                Arc::clone(&ctx.rpc),
+                run_id.clone(),
+            );
+            let shutdown_rx_janitor = shutdown_rx.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = janitor.run(shutdown_rx_janitor).await {
+                    error!(error = %e, "AccountJanitor task failed");
+                }
+            });
+
+            info!(
+                interval_secs = janitor_config.close_ata_interval_secs,
+                min_age_secs = janitor_config.close_ata_min_age_secs,
+                max_per_run = janitor_config.close_ata_max_per_run,
+                dry_run = janitor_config.dry_run,
+                "AccountJanitor background task started"
+            );
+        } else {
+            debug!("AccountJanitor disabled by config");
+        }
+    } else {
+        debug!("AccountJanitor not started (no Treasury)");
+    }
+
     // === Main Loop: Process TradeIntents ===
     info!("Entering main execution loop");
 

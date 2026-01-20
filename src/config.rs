@@ -119,6 +119,9 @@ pub struct ExecutionEngineCfg {
     /// WSOL Manager Configuration
     #[serde(default)]
     pub wsol_manager: Option<WsolManagerCfg>,
+    /// Account Janitor Configuration (cleanup empty ATAs, dust)
+    #[serde(default)]
+    pub account_janitor: Option<AccountJanitorCfg>,
 }
 
 /// WSOL Manager Configuration
@@ -166,6 +169,44 @@ impl Default for WsolManagerCfg {
             max_wsol_sol: default_wsol_max(),
             min_native_sol: default_wsol_min_native(),
             cooldown_secs: default_wsol_cooldown(),
+            dry_run: false,
+        }
+    }
+}
+
+/// Account Janitor Configuration
+/// Cleans up empty ATAs to recover rent, and handles dust tokens.
+/// TOML section: [execution_engine.account_janitor]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountJanitorCfg {
+    /// Enable account janitor. Default: false
+    #[serde(default)]
+    pub enabled: bool,
+    /// Interval for closing empty ATAs in seconds. Default: 3600 (1 hour)
+    #[serde(default = "default_janitor_close_interval")]
+    pub close_ata_interval_secs: u64,
+    /// Minimum age of empty ATA before closing in seconds. Default: 86400 (24h)
+    #[serde(default = "default_janitor_min_age")]
+    pub close_ata_min_age_secs: u64,
+    /// Maximum ATAs to close per run. Default: 10
+    #[serde(default = "default_janitor_max_per_run")]
+    pub close_ata_max_per_run: usize,
+    /// Dry-run mode: log actions but don't send TX. Default: false
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+fn default_janitor_close_interval() -> u64 { 3600 }
+fn default_janitor_min_age() -> u64 { 86400 }
+fn default_janitor_max_per_run() -> usize { 10 }
+
+impl Default for AccountJanitorCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            close_ata_interval_secs: default_janitor_close_interval(),
+            close_ata_min_age_secs: default_janitor_min_age(),
+            close_ata_max_per_run: default_janitor_max_per_run(),
             dry_run: false,
         }
     }
