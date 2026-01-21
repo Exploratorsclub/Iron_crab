@@ -271,10 +271,19 @@ Leitlinie: **Charts/Trends über Zeit** (Latenz, Reject-Rates, PnL/ROI, Queue De
 
 ## K) Performance / Latenz (Architektur §1, §6)
 
-### P2
+### P2 (Future Optimization)
 - [ ] **Hot path allocations**: Kritische Pfade sind allocation-bewusst (Profiling vorhanden).
+  - Bedeutet: Im Trading Hot Path (Intent → Quote → TX Build → Send) keine Heap-Allocations
+  - Tools: `heaptrack`, `dhat`, Custom Allocator
+  - Status: Nicht kritisch ohne <10ms Latenz-Anforderungen
 - [ ] **Slot-to-send Latency**: P50/P95/P99 Ziele sind definiert und in Grafana sichtbar.
-- [ ] **TPU/Relayer Path**: Execution nutzt TPU/Relayer (nicht `sendTransaction`), mit klaren Fallback-Regeln.
+  - Typische Ziele: P50 <100ms, P95 <200ms, P99 <500ms
+  - Messung: Geyser-Slot-Time → TX-Send-Time
+  - Status: Metriken nicht implementiert
+- [ ] **TPU/Relayer Path**: Execution nutzt TPU/Relayer (nicht nur `sendTransaction`), mit klaren Fallback-Regeln.
+  - Aktuell: Jito Bundles (Arb) + RPC sendTransaction (Fallback)
+  - TPU Direct wäre schneller (~50-100ms vs ~200-400ms)
+  - Status: Jito ist ausreichend für Arb; TPU Direct ist optional
 
 ---
 
@@ -326,30 +335,42 @@ Wenn eine neue Funktionalität nicht mindestens erfüllt:
 
 ### Phase 2: Mainnet Dry-Run (2025-12-31) ✅
 - [x] Geyser-Verbindung zum lokalen Validator (Port 10000)
-- [x] Echte Mainnet-Events (Raydium, Orca, PumpFun)
+- [x] Echte Mainnet-Events (Raydium, Orca, PumpFun, Meteora)
 - [x] 250.000+ Market Events pro Tag verarbeitet
 - [x] NATS IPC zwischen allen Services funktioniert
 - [x] Momentum-Bot empfängt Events (12.505+ events_received)
 - [x] Execution-Engine im Dry-Run (keine echten TXs)
 
-### Phase 3: Mainnet Live (2025-12-31) 🔄 In Progress
+### Phase 3: Mainnet Live (2026-01-21) ✅
 - [x] Wallet konfiguriert: `Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM`
-- [x] Balance: 2.32 SOL
 - [x] TX Sending: ENABLED
 - [x] Safety Limits aktiv:
   - Max Trade: 0.01 SOL (10M lamports)
   - Daily Loss Limit: 0.3 SOL (300M lamports)
   - Max Slippage: 3% (300 bps)
-- [ ] Trading-Strategie generiert Intents (in Entwicklung)
-- [ ] Erster erfolgreicher Trade
+- [x] arb-strategy generiert Intents
+- [x] Arb Intents werden verarbeitet (Decision Records)
+- [x] Geyser-First Architecture vollständig implementiert
 
-### Infrastruktur-Status
-| Service | Port | Status | Daten |
-|---------|------|--------|-------|
-| agave-validator | 8899/10000 | ✅ Läuft | Mainnet RPC + Geyser |
-| nats-server | 4222 | ✅ Läuft | IPC Bus |
-| market-data | 9801 | ✅ Läuft | Geyser → MarketEvents |
-| momentum-bot | 9802 | ✅ Läuft | Events → Intents |
-| execution-engine | 9803 | ✅ Läuft | Intents → TXs (Live) |
-| control-plane | 8080 | ✅ Läuft | Monitoring API |
+### Phase 4: Architecture Rebuild (2026-01-21) ✅
+- [x] Multi-Process Architecture (market-data, momentum-bot, arb-strategy, execution-engine)
+- [x] Geyser-basierte Pool Discovery für alle DEXes
+- [x] DexPoolAccounts Events für alle DEXes
+- [x] set_pool_from_accounts() für alle DEX Connectors
+- [x] PoolStateUpdate Events (Vault Balances via Geyser)
+- [x] BinArrayUpdate Events (Meteora Bin Arrays via Geyser)
+- [x] WsolManager (Background WSOL Management)
+- [x] AccountJanitor (Empty ATA Cleanup)
+- [x] Alle Architecture Violations behoben
+
+### Infrastruktur-Status (2026-01-21)
+| Service | Port | Status | Funktion |
+|---------|------|--------|----------|
+| agave-validator | 8899/10000 | ✅ | Mainnet RPC + Geyser |
+| nats-server | 4222 | ✅ | IPC Bus |
+| market-data | 9801 | ✅ | Geyser → MarketEvents |
+| momentum-bot | 9802 | ✅ | Events → Momentum Intents |
+| arb-strategy | 9803 | ✅ | Events → Arb Intents |
+| execution-engine | 9804 | ✅ | Intents → TXs |
+| control-plane | 8080 | ✅ | Monitoring API |
 
