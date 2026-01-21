@@ -90,6 +90,7 @@ use ironcrab::solana::dex_parser::SOL_MINT;
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::solana::token_utils::get_token_decimals_or_default;
+use ironcrab::solana::tx_sender::TxSender;
 use ironcrab::storage::{
     locks::{LockHolder, LockManager, LockResult, ResourceType},
     JsonlWriter, JsonlWriterConfig,
@@ -823,6 +824,10 @@ struct ExecutionContext {
     // === Address Lookup Table (P0: TX size reduction) ===
     /// Loaded ALT for versioned transactions (reduces TX size by ~60%)
     address_lookup_table: Option<ironcrab::solana::address_lookup_table::LoadedAlt>,
+
+    // === P2: TxSender with TPU/Jito/RPC fallback chain ===
+    /// Unified transaction sender with automatic fallback (TPU → Jito → RPC)
+    tx_sender: Option<Arc<TxSender>>,
 
     // === Option C: Live Pool Cache (P0: fresh quotes, no RPC in hot path) ===
     /// Cache of pool states from Geyser for fresh quote calculation
@@ -3016,6 +3021,8 @@ async fn main() -> Result<()> {
         rpc: Arc::clone(&rpc),
         // P0: Address Lookup Table for TX size reduction
         address_lookup_table,
+        // P2: TxSender with fallback chain (initialized below after ctx creation)
+        tx_sender: None,
         // Option C: LivePoolCache - for zero-RPC quote calculation
         live_pool_cache: live_pool_cache.clone(),
         // Metrics
@@ -3049,6 +3056,46 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 warn!(error = %e, "Failed to initialize CrossDexHandler; cross-DEX arb disabled");
+            }
+        }
+    }
+
+    // === P2: TxSender with TPU/Jito/RPC fallback chain ===
+    // Provides unified TX submission with automatic fallback:
+    // TPU Direct (~50-100ms) → RPC (~200-400ms)
+    // Note: Jito bundles are handled separately in the main intent loop for arb transactions
+    {
+        let tx_submission_cfg = exec_eng_cfg
+            .and_then(|e| e.tx_submission.clone())
+            .unwrap_or_default();
+
+        // Derive WebSocket URL from RPC URL for TPU leader schedule
+        let ws_url = ctx
+            .rpc_url
+            .replace("http://", "ws://")
+            .replace("https://", "wss://")
+            .replace(":8899", ":8900"); // Standard WS port
+
+        // TxSender uses blocking RpcClient internally (for TpuClient compatibility)
+        // Create a new blocking RpcClient instance for TxSender
+        let blocking_rpc = Arc::new(solana_client::rpc_client::RpcClient::new(
+            ctx.rpc_url.clone(),
+        ));
+
+        // Note: JitoClient is not passed to TxSender (arb bundles handled separately)
+        // This TxSender is primarily for non-arb momentum trades using TPU → RPC fallback
+        match TxSender::new(blocking_rpc, &ws_url, tx_submission_cfg.clone(), None).await {
+            Ok(sender) => {
+                ctx.tx_sender = Some(Arc::new(sender));
+                info!(
+                    primary = %tx_submission_cfg.primary_method,
+                    fallback = ?tx_submission_cfg.fallback_chain,
+                    tpu_enabled = tx_submission_cfg.tpu_enabled,
+                    "TxSender initialized with fallback chain (TPU \u{2192} RPC)"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to initialize TxSender, will use direct RPC fallback");
             }
         }
     }
@@ -4526,6 +4573,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // Track bundle result for decision record
     let mut bundle_id: Option<String> = None;
     let mut send_signature: Option<String> = None;
+    let mut send_method_used: Option<String> = None;
     let mut sent_anything = false;
     let mut send_failed = false;
 
@@ -4752,26 +4800,29 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 }
             }
         } else {
-            match send_transaction_rpc(
-                ctx,
-                wallet_pubkey,
-                &tx_plan,
-                config.send_skip_preflight,
-                parse_commitment_level_opt(config.send_preflight_commitment.as_deref()),
-            )
-            .await
-            {
-                Ok(sig_str) => {
+            // P2: Use TxSender with fallback chain (TPU → Jito → RPC)
+            // For non-bundle transactions, this provides lower latency via TPU Direct
+            match send_transaction_with_fallback(ctx, wallet_pubkey, &tx_plan, false).await {
+                Ok(result) => {
                     TX_SEND_SUCCESS_TOTAL.fetch_add(1, Ordering::Relaxed);
                     sent_anything = true;
-                    send_signature = Some(sig_str.clone());
+                    send_signature = Some(result.signature.clone());
+                    send_method_used = Some(result.method.clone());
                     checks.push(CheckResult {
                         check_name: "send".to_string(),
                         passed: true,
                         reason_code: None,
-                        details: Some(format!("signature={sig_str}")),
+                        details: Some(format!(
+                            "signature={} method={}",
+                            result.signature, result.method
+                        )),
                     });
-                    info!(intent_id = %intent.intent_id, signature = %sig_str, "Transaction submitted via RPC");
+                    info!(
+                        intent_id = %intent.intent_id,
+                        signature = %result.signature,
+                        method = %result.method,
+                        "Transaction submitted via TxSender"
+                    );
                 }
                 Err(err_msg) => {
                     send_failed = true;
@@ -4807,10 +4858,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             signature: send_signature.clone(),
             bundle_id: bundle_id.clone(),
             sent_at_ms: chrono::Utc::now().timestamp_millis() as u64,
-            send_method: Some(if bundle_id.is_some() {
-                "jito".into()
-            } else {
-                "rpc".into()
+            send_method: send_method_used.or_else(|| {
+                Some(if bundle_id.is_some() {
+                    "jito".into()
+                } else {
+                    "rpc".into()
+                })
             }),
         })
     } else {
@@ -5490,6 +5543,94 @@ async fn send_transaction_rpc(
         .send_transaction_with_config(&tx, config)
         .await
         .map(|sig| sig.to_string())
+        .map_err(|e| format!("rpc_error:{e}"))
+}
+
+/// Send transaction result with method tracking
+struct SendTxResult {
+    signature: String,
+    method: String, // "tpu", "jito", "rpc"
+}
+
+/// Send transaction with TxSender fallback chain (TPU → Jito → RPC).
+///
+/// If TxSender is available and the transaction is NOT bundle-required,
+/// this uses the configured fallback chain. Otherwise falls back to
+/// direct RPC send.
+///
+/// This is the P2 upgrade path for lower-latency TX submission.
+async fn send_transaction_with_fallback(
+    ctx: &ExecutionContext,
+    wallet_pubkey: Pubkey,
+    plan: &tx_builder::TxPlan,
+    require_bundle: bool,
+) -> std::result::Result<SendTxResult, String> {
+    TX_SEND_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+    let treasury = ctx
+        .treasury
+        .as_ref()
+        .ok_or_else(|| "no_signer_configured".to_string())?;
+
+    let signer: &dyn Signer = treasury.signer_ref();
+    let blockhash = ctx
+        .rpc
+        .get_latest_blockhash_retry()
+        .await
+        .map_err(|e| format!("rpc_error:{e}"))?;
+
+    // Build legacy Transaction for TxSender (TxSender handles signing internally for TPU)
+    // Note: We sign here because TxSender.send_with_fallback() expects a signed Transaction
+    let tx = Transaction::new_signed_with_payer(
+        &plan.instructions,
+        Some(&wallet_pubkey),
+        &[signer],
+        blockhash,
+    );
+
+    // If TxSender is available, use it for the fallback chain
+    if let Some(ref tx_sender) = ctx.tx_sender {
+        match tx_sender.send_with_fallback(&tx, require_bundle).await {
+            Ok(result) => {
+                let method_str = result.method.to_string();
+                info!(
+                    signature = %result.signature,
+                    method = %method_str,
+                    bundle_id = ?result.bundle_id,
+                    "TX sent via TxSender"
+                );
+                return Ok(SendTxResult {
+                    signature: result.signature.to_string(),
+                    method: method_str,
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "TxSender failed, falling back to direct RPC");
+                // Fall through to direct RPC below
+            }
+        }
+    }
+
+    // Fallback: Direct RPC send (original behavior)
+    let config = RpcSendTransactionConfig {
+        skip_preflight: true,
+        preflight_commitment: None,
+        encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+        max_retries: None,
+        min_context_slot: None,
+    };
+
+    ctx.rpc
+        .rpc
+        .send_transaction_with_config(
+            &solana_sdk::transaction::VersionedTransaction::from(tx),
+            config,
+        )
+        .await
+        .map(|sig| SendTxResult {
+            signature: sig.to_string(),
+            method: "rpc".into(),
+        })
         .map_err(|e| format!("rpc_error:{e}"))
 }
 
