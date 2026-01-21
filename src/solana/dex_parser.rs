@@ -757,7 +757,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     let protocol_fee_recipient_ta = update.instruction_accounts[10];
     // instruction_accounts[11..14] = spl_token, spl_token, system, ata_program (readonly)
     let event_authority = update.instruction_accounts[15];
-    
+
     // BUY vs SELL differ after account 15:
     // BUY: [16]=global_volume_accumulator, [17]=coin_creator_vault_ata, [18]=coin_creator_vault_authority,
     //      [19]=user_volume, [20]=fee_config (pool-specific PDA), [21]=fee_program, [22]=program_id
@@ -775,7 +775,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     };
     let coin_creator_vault_ata = update.instruction_accounts[17];
     let coin_creator_vault_authority = update.instruction_accounts[18];
-    
+
     // Use global fee constants (NOT transaction accounts which are pool-specific PDAs)
     let fee_config = Pubkey::from_str("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx")
         .expect("hardcoded PUMPFUN_AMM_FEE_CONFIG");
@@ -835,9 +835,9 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         event_authority,              // [8]
         coin_creator_vault_ata,       // [9]
         coin_creator_vault_authority, // [10]
-        global_volume_accumulator,    // [11] - v1 format: for BUY this is real, for SELL it's default
-        fee_config,                   // [12]
-        fee_program,                  // [13]
+        global_volume_accumulator, // [11] - v1 format: for BUY this is real, for SELL it's default
+        fee_config,                // [12]
+        fee_program,               // [13]
     ];
 
     debug!(

@@ -12,9 +12,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
 use tracing::warn;
 
-
 use tracing::{error, info};
-
 
 use async_nats;
 
@@ -61,14 +59,12 @@ impl NatsConfig {
 // Real NATS implementation (feature-gated)
 // ============================================================================
 
-
 pub struct NatsClient {
     config: NatsConfig,
     client: Option<async_nats::Client>,
     messages_published: std::sync::atomic::AtomicU64,
     messages_dropped: std::sync::atomic::AtomicU64,
 }
-
 
 impl NatsClient {
     pub fn new(config: NatsConfig) -> Self {
@@ -226,11 +222,9 @@ impl NatsClient {
     }
 }
 
-
 pub struct NatsSubscription {
     subscriber: async_nats::Subscriber,
 }
-
 
 impl NatsSubscription {
     pub async fn next(&mut self) -> Option<NatsMessage> {
@@ -240,8 +234,6 @@ impl NatsSubscription {
         })
     }
 }
-
-
 
 use futures::StreamExt;
 

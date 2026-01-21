@@ -58,12 +58,13 @@ use ironcrab::execution::live_pool_cache::{
     create_shared_cache, CachedPoolState, SharedLivePoolCache,
 };
 use ironcrab::execution::tx_builder;
+use ironcrab::execution::wsol_manager::{WsolManager, WsolManagerConfig};
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, ExecutionResult, ExecutionStatus, ExplicitAmount, FairnessPolicy, FeePolicy,
     FillStatus, FillUnavailableReason, IntentOrigin, IntentTier, PoolCacheUpdate,
-    PoolCacheUpdateType, RecordHeader, RejectReason, SimulationResult,
-    TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
+    PoolCacheUpdateType, RecordHeader, RejectReason, SimulationResult, TradeExecutionConstraints,
+    TradeIntent, TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind};
 use ironcrab::metrics::{
@@ -76,9 +77,8 @@ use ironcrab::metrics::{
     TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_SUCCESS_TOTAL,
 };
 use ironcrab::nats::{
-    NatsClient, NatsConfig, TOPIC_CONTROL_REQUESTS, TOPIC_DECISION_RECORDS,
-    TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS,
-    STREAM_NAME, slave_consumer_config,
+    slave_consumer_config, NatsClient, NatsConfig, STREAM_NAME, TOPIC_CONTROL_REQUESTS,
+    TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS,
 };
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
@@ -95,7 +95,6 @@ use ironcrab::storage::{
     JsonlWriter, JsonlWriterConfig,
 };
 use ironcrab::wallet::Treasury;
-use ironcrab::execution::wsol_manager::{WsolManager, WsolManagerConfig};
 use spl_token::instruction as spl_ix;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::solana_program::pubkey::Pubkey as SplProgPubkey;
@@ -1047,7 +1046,10 @@ impl ExecutionContext {
                     let _ = meteora.inject_cached_meteora_state(&pool_addr, ms);
                 }
             }
-            info!(meteora_pools = meteora.list_pools().len(), "Meteora: injected pools from LivePoolCache (GEYSER-FIRST)");
+            info!(
+                meteora_pools = meteora.list_pools().len(),
+                "Meteora: injected pools from LivePoolCache (GEYSER-FIRST)"
+            );
         }
         #[cfg(unix)]
         maybe_ping_watchdog();
@@ -2419,10 +2421,11 @@ fn token_program_for_mint_owner(owner: &Pubkey) -> Option<Pubkey> {
 ///
 /// Since PoolCacheUpdate only contains reserves (not full account data), we create
 /// minimal state structures. Full account updates from Geyser will refresh these later.
-fn build_minimal_pool_state(
-    update: &PoolCacheUpdate,
-) -> Option<(Pubkey, CachedPoolState)> {
-    use ironcrab::execution::live_pool_cache::{OrcaWhirlpoolState, RaydiumAmmState, RaydiumCpmmState, MeteoraState, PumpAmmState, PumpFunState};
+fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, CachedPoolState)> {
+    use ironcrab::execution::live_pool_cache::{
+        MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState, RaydiumAmmState,
+        RaydiumCpmmState,
+    };
 
     let pool_addr = match Pubkey::from_str(&update.pool_address) {
         Ok(p) => p,
@@ -2590,7 +2593,8 @@ async fn bootstrap_pool_cache_from_jetstream(
             // Apply update to LivePoolCache
             match pool_update.update_type {
                 PoolCacheUpdateType::PoolDiscovered | PoolCacheUpdateType::BalanceUpdated => {
-                    if let Some((pool_addr, minimal_state)) = build_minimal_pool_state(&pool_update) {
+                    if let Some((pool_addr, minimal_state)) = build_minimal_pool_state(&pool_update)
+                    {
                         // Insert minimal state into LivePoolCache
                         // Full account data from Geyser will refresh this later
                         live_pool_cache.upsert(pool_addr, minimal_state, pool_update.geyser_slot);
@@ -2969,7 +2973,10 @@ async fn main() -> Result<()> {
     if let (Some(ref nats_client), Some(ref cache)) = (&nats, &live_pool_cache) {
         match bootstrap_pool_cache_from_jetstream(nats_client, cache).await {
             Ok(pools_recovered) => {
-                info!(pools_recovered, "SLAVE CACHE: State recovered from JetStream");
+                info!(
+                    pools_recovered,
+                    "SLAVE CACHE: State recovered from JetStream"
+                );
             }
             Err(e) => {
                 warn!(error = %e, "SLAVE CACHE: JetStream bootstrap failed (will rely on incremental updates)");
@@ -3098,7 +3105,10 @@ async fn main() -> Result<()> {
                 match nats_client.connect().await {
                     Ok(()) => {
                         info!("WsolManager NATS connected");
-                        if let Err(e) = wsol_manager.run(Arc::new(nats_client), shutdown_rx_wsol).await {
+                        if let Err(e) = wsol_manager
+                            .run(Arc::new(nats_client), shutdown_rx_wsol)
+                            .await
+                        {
                             error!(error = %e, "WsolManager task failed");
                         }
                     }
@@ -3329,7 +3339,7 @@ async fn main() -> Result<()> {
         use async_nats::jetstream;
 
         let jetstream = jetstream::new(nats.client().clone());
-        
+
         match jetstream.get_stream(STREAM_NAME).await {
             Ok(stream) => {
                 // Create durable consumer for live updates (picks up where bootstrap left off)
@@ -3447,11 +3457,11 @@ async fn main() -> Result<()> {
 
                 // Keep /ready fresh even when no intents flow.
                 ironcrab::metrics::record_activity();
-                
+
                 // Process any available PoolCacheUpdates from JetStream Consumer
                 if let Some(ref mut consumer) = pool_cache_consumer_opt {
                     use futures::StreamExt;
-                    
+
                     // Fetch up to 100 messages per tick (non-blocking batch)
                     match consumer.fetch().max_messages(100).messages().await {
                         Ok(mut messages) => {
@@ -4576,7 +4586,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         check_name: "bundle_tip_required".to_string(),
                         passed: false,
                         reason_code: Some(reason.to_string()),
-                        details: Some("Jito bundle requires tip instruction but none present".to_string()),
+                        details: Some(
+                            "Jito bundle requires tip instruction but none present".to_string(),
+                        ),
                     });
                     ctx.record_intent_rejected();
                     INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -4614,7 +4626,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
                 // Get the tip account from the tip instruction (accounts[1] is the recipient, accounts[0] is payer)
                 let tip_account = tip_ix.accounts[1].pubkey;
-                
+
                 // Filter out Jito tip account from ALT to preserve its writable flag
                 let original_count = alt.accounts.len();
                 let filtered_accounts: Vec<Pubkey> = alt
@@ -4623,7 +4635,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     .filter(|&addr| *addr != tip_account)
                     .copied()
                     .collect();
-                
+
                 if filtered_accounts.len() < original_count {
                     info!(
                         intent_id = %intent.intent_id,
@@ -4682,13 +4694,13 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     intent_id = %intent.intent_id,
                     "Using legacy transaction for Jito bundle (no ALT available)"
                 );
-                
+
                 // Build transaction manually to ensure proper serialization for Jito
                 use solana_sdk::message::Message;
                 let message = Message::new(&ixs, Some(&wallet_pubkey));
                 let mut tx = Transaction::new_unsigned(message);
                 tx.sign(&[signer], blockhash);
-                
+
                 info!(
                     intent_id = %intent.intent_id,
                     is_signed = tx.is_signed(),
@@ -4696,7 +4708,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     message_size = bincode::serialize(&tx).map(|b| b.len()).unwrap_or(0),
                     "Legacy transaction signed for Jito bundle"
                 );
-                
+
                 jito_client.send_bundle(&[tx]).await
             };
 
@@ -4795,6 +4807,11 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             signature: send_signature.clone(),
             bundle_id: bundle_id.clone(),
             sent_at_ms: chrono::Utc::now().timestamp_millis() as u64,
+            send_method: Some(if bundle_id.is_some() {
+                "jito".into()
+            } else {
+                "rpc".into()
+            }),
         })
     } else {
         None

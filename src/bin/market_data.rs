@@ -38,7 +38,10 @@ use ironcrab::metrics::{
     serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
     NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
-use ironcrab::nats::{NatsClient, NatsConfig, TOPIC_MARKET_EVENTS, pool_subject, ensure_pool_cache_stream, wallet_balance_topic};
+use ironcrab::nats::{
+    ensure_pool_cache_stream, pool_subject, wallet_balance_topic, NatsClient, NatsConfig,
+    TOPIC_MARKET_EVENTS,
+};
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
@@ -213,14 +216,11 @@ impl TrackedWallet {
     fn new(wallet: Pubkey) -> Self {
         // Compute WSOL ATA using known derivation
         let wsol_mint = Pubkey::from_str(WSOL_MINT).expect("valid wsol mint");
-        let ata_program = Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID).expect("valid ata program id");
+        let ata_program =
+            Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID).expect("valid ata program id");
         // Manual ATA derivation to avoid Pubkey type mismatch with spl_associated_token_account
         let (ata, _bump) = Pubkey::find_program_address(
-            &[
-                wallet.as_ref(),
-                spl_token::ID.as_ref(),
-                wsol_mint.as_ref(),
-            ],
+            &[wallet.as_ref(), spl_token::ID.as_ref(), wsol_mint.as_ref()],
             &ata_program,
         );
         Self {
@@ -415,8 +415,8 @@ async fn publish_wallet_snapshot(
         .expect("valid token program");
     let token_2022_program = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
         .expect("valid token-2022 program");
-    let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
-        .expect("valid sol mint");
+    let sol_mint =
+        Pubkey::from_str("So11111111111111111111111111111111111111112").expect("valid sol mint");
 
     let mut total_accounts = 0usize;
     let mut non_zero_accounts = 0usize;
@@ -428,10 +428,7 @@ async fn publish_wallet_snapshot(
     ] {
         let accounts = match rpc
             .rpc
-            .get_token_accounts_by_owner(
-                wallet,
-                TokenAccountsFilter::ProgramId(program_id),
-            )
+            .get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(program_id))
             .await
         {
             Ok(accounts) => accounts,
@@ -601,7 +598,7 @@ async fn main() -> Result<()> {
             None
         } else {
             info!(url = %args.nats_url, "Connected to NATS");
-            
+
             // Initialize JetStream stream for PoolCacheUpdates (persistent state)
             if let Err(e) = ensure_pool_cache_stream(client.client()).await {
                 error!(error = %e, "Failed to create/update JetStream POOL_CACHE stream");
@@ -610,7 +607,7 @@ async fn main() -> Result<()> {
             } else {
                 info!("JetStream POOL_CACHE stream ready for persistent state recovery");
             }
-            
+
             Some(client)
         }
     };
@@ -947,7 +944,7 @@ async fn run_geyser_loop(
                         try_parse_mint_account(&account_update.owner, &account_update.data)
                     {
                         let is_token_2022 = account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes();
-                        
+
                         let mint_event = MarketEvent::new(
                             "market-data",
                             BUILD_VERSION,

@@ -81,7 +81,7 @@ impl CpmmPool {
         }
 
         let discriminator: [u8; 8] = data[0..8].try_into()?;
-        
+
         // Verify discriminator (optional, for safety)
         // Note: discriminator may vary, so we just parse without strict check
 

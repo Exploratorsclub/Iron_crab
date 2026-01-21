@@ -7,6 +7,9 @@
 //! - build (string)
 //! - run_id (string/uuid)
 
+// Large IPC message constructors naturally need many params
+#![allow(clippy::too_many_arguments)]
+
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -1007,6 +1010,9 @@ pub struct SendResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bundle_id: Option<String>,
     pub sent_at_ms: u64,
+    /// Method used to send: "tpu", "jito", "rpc"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_method: Option<String>,
 }
 
 /// Final decision outcome
@@ -1595,35 +1601,35 @@ pub enum PoolCacheUpdateType {
 pub struct PoolCacheUpdate {
     #[serde(flatten)]
     pub header: RecordHeader,
-    
+
     /// Type of update
     pub update_type: PoolCacheUpdateType,
-    
+
     /// Pool address (base58 string)
     pub pool_address: String,
-    
+
     /// DEX identifier (raydium, orca, meteora_dlmm, meteora_cpmm, pump_amm)
     pub dex: String,
-    
+
     /// Base mint address
     pub base_mint: String,
-    
+
     /// Quote mint address
     pub quote_mint: String,
-    
+
     /// Base token reserve (raw amount)
     pub base_reserve: u64,
-    
+
     /// Quote token reserve (raw amount)
     pub quote_reserve: u64,
-    
+
     /// Liquidity in lamports (for filtering/sorting)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub liquidity_lamports: Option<u64>,
-    
+
     /// Geyser slot when update occurred
     pub geyser_slot: u64,
-    
+
     /// Additional DEX-specific metadata (JSON string)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,

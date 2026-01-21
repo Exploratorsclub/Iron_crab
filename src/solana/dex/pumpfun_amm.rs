@@ -2561,7 +2561,8 @@ impl Dex for PumpFunAmmDex {
             .get(&(pool.pool_market, user))
             .map(|v| v.clone());
         // Get token program from cache for correct ATA derivation (Token-2022 support)
-        let base_token_program = self.cached_data
+        let base_token_program = self
+            .cached_data
             .get(&format!("token_program:{}", pool.base_mint))
             .and_then(|v| Pubkey::from_str(&v).ok())
             .unwrap_or_else(|| Pubkey::new_from_array(spl_token::id().to_bytes()));
@@ -2570,11 +2571,15 @@ impl Dex for PumpFunAmmDex {
         let user_base_ta = user_acc
             .as_ref()
             .map(|u| u.user_base_ta)
-            .unwrap_or_else(|| Self::derive_ata_with_program(user, pool.base_mint, base_token_program));
+            .unwrap_or_else(|| {
+                Self::derive_ata_with_program(user, pool.base_mint, base_token_program)
+            });
         let user_quote_ta = user_acc
             .as_ref()
             .map(|u| u.user_quote_ta)
-            .unwrap_or_else(|| Self::derive_ata_with_program(user, pool.quote_mint, quote_token_program));
+            .unwrap_or_else(|| {
+                Self::derive_ata_with_program(user, pool.quote_mint, quote_token_program)
+            });
         let user_volume = user_acc
             .as_ref()
             .map(|u| u.user_volume_accumulator)
@@ -2620,19 +2625,25 @@ impl Dex for PumpFunAmmDex {
         if is_buy {
             // BUY: accounts 16-22 (23 total)
             metas.push(AccountMeta::new(pool.global_volume_accumulator, false)); // 16
-            metas.push(AccountMeta::new(pool.coin_creator_vault_ata, false));    // 17
-            metas.push(AccountMeta::new_readonly(pool.coin_creator_vault_authority, false)); // 18
-            metas.push(AccountMeta::new(user_volume, false));                    // 19
-            metas.push(AccountMeta::new_readonly(pool.fee_config, false));       // 20
-            metas.push(AccountMeta::new_readonly(pool.fee_program, false));      // 21
-            metas.push(AccountMeta::new_readonly(program_id, false));            // 22
+            metas.push(AccountMeta::new(pool.coin_creator_vault_ata, false)); // 17
+            metas.push(AccountMeta::new_readonly(
+                pool.coin_creator_vault_authority,
+                false,
+            )); // 18
+            metas.push(AccountMeta::new(user_volume, false)); // 19
+            metas.push(AccountMeta::new_readonly(pool.fee_config, false)); // 20
+            metas.push(AccountMeta::new_readonly(pool.fee_program, false)); // 21
+            metas.push(AccountMeta::new_readonly(program_id, false)); // 22
         } else {
             // SELL: accounts 16-20 (21 total) - no volume accumulators
-            metas.push(AccountMeta::new_readonly(program_id, false));            // 16
-            metas.push(AccountMeta::new(pool.coin_creator_vault_ata, false));    // 17
-            metas.push(AccountMeta::new_readonly(pool.coin_creator_vault_authority, false)); // 18
-            metas.push(AccountMeta::new_readonly(pool.fee_config, false));       // 19
-            metas.push(AccountMeta::new_readonly(pool.fee_program, false));      // 20
+            metas.push(AccountMeta::new_readonly(program_id, false)); // 16
+            metas.push(AccountMeta::new(pool.coin_creator_vault_ata, false)); // 17
+            metas.push(AccountMeta::new_readonly(
+                pool.coin_creator_vault_authority,
+                false,
+            )); // 18
+            metas.push(AccountMeta::new_readonly(pool.fee_config, false)); // 19
+            metas.push(AccountMeta::new_readonly(pool.fee_program, false)); // 20
         }
 
         Ok(vec![Instruction {

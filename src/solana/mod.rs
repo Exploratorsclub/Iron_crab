@@ -18,4 +18,6 @@ pub mod jito;
 pub mod kill_switch;
 pub mod rpc;
 pub mod token_utils;
+pub mod tpu_client;
+pub mod tx_sender;
 pub mod wallet_tracker;

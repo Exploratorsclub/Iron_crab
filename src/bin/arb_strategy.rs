@@ -37,9 +37,9 @@ use ironcrab::metrics::{
     INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
     NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
+use ironcrab::nats::{pool_subject, slave_consumer_config, STREAM_NAME};
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_POOL_CACHE_UPDATES, TOPIC_TRADE_INTENTS};
-use ironcrab::nats::{STREAM_NAME, pool_subject, slave_consumer_config};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// Build version for decision records
@@ -250,7 +250,11 @@ impl TokenArbTracker {
 
     /// Check for arbitrage opportunity between DEXes
     /// Returns: Option<(buy_dex, sell_dex, spread_bps, estimated_profit_lamports)>
-    fn check_arbitrage(&self, config: &ArbConfig, known_pools: &HashSet<String>) -> Option<ArbOpportunity> {
+    fn check_arbitrage(
+        &self,
+        config: &ArbConfig,
+        known_pools: &HashSet<String>,
+    ) -> Option<ArbOpportunity> {
         // Need at least 2 DEXes with prices
         let pools_with_price: Vec<_> = self
             .pools_by_dex
@@ -259,7 +263,7 @@ impl TokenArbTracker {
                 let has_price = p.last_price.is_some();
                 let is_known_dex = is_known_dex_label(&p.dex);
                 let in_master_cache = known_pools.contains(&p.pool_address);
-                
+
                 // Log when pool is filtered out due to not being in MASTER cache
                 if has_price && is_known_dex && !in_master_cache {
                     debug!(
@@ -269,7 +273,7 @@ impl TokenArbTracker {
                         "Pool filtered: not in market-data MASTER cache (parse_pool_account failed)"
                     );
                 }
-                
+
                 has_price && is_known_dex && in_master_cache
             })
             .collect();
@@ -1301,7 +1305,8 @@ async fn bootstrap_known_pools_from_jetstream(
 
             // Add pool to known_pools
             match pool_update.update_type {
-                ironcrab::ipc::PoolCacheUpdateType::PoolDiscovered | ironcrab::ipc::PoolCacheUpdateType::BalanceUpdated => {
+                ironcrab::ipc::PoolCacheUpdateType::PoolDiscovered
+                | ironcrab::ipc::PoolCacheUpdateType::BalanceUpdated => {
                     let mut pools = known_pools.write();
                     pools.insert(pool_update.pool_address.clone());
                     pools_recovered += 1;
@@ -1327,7 +1332,10 @@ async fn bootstrap_known_pools_from_jetstream(
         }
     }
 
-    info!(pools_recovered, "SLAVE CACHE BOOTSTRAP: Complete (known_pools populated)");
+    info!(
+        pools_recovered,
+        "SLAVE CACHE BOOTSTRAP: Complete (known_pools populated)"
+    );
     Ok(pools_recovered)
 }
 
@@ -1427,7 +1435,10 @@ async fn main() -> Result<()> {
     if let Some(ref nats_client) = ctx.nats {
         match bootstrap_known_pools_from_jetstream(nats_client, &ctx.known_pools).await {
             Ok(pools_recovered) => {
-                info!(pools_recovered, "SLAVE CACHE: known_pools recovered from JetStream");
+                info!(
+                    pools_recovered,
+                    "SLAVE CACHE: known_pools recovered from JetStream"
+                );
                 POOLS_TRACKED_GAUGE.store(pools_recovered as u64, Ordering::Relaxed);
             }
             Err(e) => {
@@ -1472,7 +1483,10 @@ async fn main() -> Result<()> {
     let pool_cache_subscription = if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_POOL_CACHE_UPDATES).await {
             Ok(sub) => {
-                info!(topic = TOPIC_POOL_CACHE_UPDATES, "Subscribed to PoolCacheUpdates (SLAVE cache sync from market-data MASTER)");
+                info!(
+                    topic = TOPIC_POOL_CACHE_UPDATES,
+                    "Subscribed to PoolCacheUpdates (SLAVE cache sync from market-data MASTER)"
+                );
                 Some(sub)
             }
             Err(e) => {

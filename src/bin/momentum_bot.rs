@@ -1494,9 +1494,12 @@ impl MomentumContext {
     fn register_pool(&self, mint: &str, pool_address: &str, dex: &str, slot: u64) {
         let mut pools = self.mint_pools.write();
         let pool_list = pools.entry(mint.to_string()).or_insert_with(Vec::new);
-        
+
         // Check if pool already exists
-        if let Some(existing) = pool_list.iter_mut().find(|p| p.pool_address == pool_address) {
+        if let Some(existing) = pool_list
+            .iter_mut()
+            .find(|p| p.pool_address == pool_address)
+        {
             // Update last_trade_slot
             if slot > existing.last_trade_slot {
                 existing.last_trade_slot = slot;
@@ -1504,7 +1507,11 @@ impl MomentumContext {
             }
         } else {
             // New pool for this mint
-            pool_list.push(PoolInfo::new(pool_address.to_string(), dex.to_string(), slot));
+            pool_list.push(PoolInfo::new(
+                pool_address.to_string(),
+                dex.to_string(),
+                slot,
+            ));
             debug!(
                 mint = %mint,
                 pool = %pool_address,
@@ -1516,10 +1523,20 @@ impl MomentumContext {
     }
 
     /// Update pool trade data (ratio + slot)
-    fn update_pool_trade_data(&self, mint: &str, pool_address: &str, sol_amount: u64, token_amount: u64, slot: u64) {
+    fn update_pool_trade_data(
+        &self,
+        mint: &str,
+        pool_address: &str,
+        sol_amount: u64,
+        token_amount: u64,
+        slot: u64,
+    ) {
         let mut pools = self.mint_pools.write();
         if let Some(pool_list) = pools.get_mut(mint) {
-            if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pool_address) {
+            if let Some(pool_info) = pool_list
+                .iter_mut()
+                .find(|p| p.pool_address == pool_address)
+            {
                 // Calculate SOL per token ratio
                 if token_amount > 0 {
                     pool_info.last_trade_ratio = Some(sol_amount as f64 / token_amount as f64);
@@ -1534,7 +1551,10 @@ impl MomentumContext {
     fn update_pool_accounts(&self, mint: &str, pool_address: &str, accounts: Vec<String>) {
         let mut pools = self.mint_pools.write();
         if let Some(pool_list) = pools.get_mut(mint) {
-            if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pool_address) {
+            if let Some(pool_info) = pool_list
+                .iter_mut()
+                .find(|p| p.pool_address == pool_address)
+            {
                 pool_info.dex_pool_accounts = Some(accounts);
                 pool_info.last_updated = std::time::Instant::now();
             }
@@ -3057,7 +3077,7 @@ async fn recover_positions_from_jsonl(
                 .format("%Y%m%d")
                 .to_string();
             let intents_path = intents_dir.join(format!("trade_intents-{}.jsonl", date));
-            
+
             if !intents_path.exists() {
                 continue;
             }
@@ -3067,7 +3087,9 @@ async fn recover_positions_from_jsonl(
                 for line in reader.lines() {
                     if let Ok(line) = line {
                         if let Ok(intent) = serde_json::from_str::<serde_json::Value>(&line) {
-                            if let Some(intent_id) = intent.get("intent_id").and_then(|v| v.as_str()) {
+                            if let Some(intent_id) =
+                                intent.get("intent_id").and_then(|v| v.as_str())
+                            {
                                 intent_lookup.insert(intent_id.to_string(), intent);
                             }
                         }
@@ -3075,7 +3097,10 @@ async fn recover_positions_from_jsonl(
                 }
             }
         }
-        info!(cached_intents = intent_lookup.len(), "Built intent lookup for position recovery");
+        info!(
+            cached_intents = intent_lookup.len(),
+            "Built intent lookup for position recovery"
+        );
     }
 
     // Track all BUYs and SELLs by mint
@@ -3125,8 +3150,9 @@ async fn recover_positions_from_jsonl(
                 // Old schema - try to get mint from intent
                 let mint_from_intent = if let Some(intent) = intent_lookup.get(&exec.intent_id) {
                     // Determine BUY vs SELL from fill amounts first
-                    let has_fill_out = exec.fill_out.is_some() && exec.fill_out.as_ref().unwrap().raw > 0;
-                    
+                    let has_fill_out =
+                        exec.fill_out.is_some() && exec.fill_out.as_ref().unwrap().raw > 0;
+
                     if has_fill_out {
                         // BUY: output_mint is the token
                         intent
@@ -3145,7 +3171,7 @@ async fn recover_positions_from_jsonl(
                 } else {
                     None
                 };
-                
+
                 match mint_from_intent {
                     Some(m) => m,
                     None => continue, // Skip if we can't determine mint
@@ -3198,12 +3224,13 @@ async fn recover_positions_from_jsonl(
             let entry_price = if sol_ui > 0.0 { tok_ui / sol_ui } else { 1.0 };
 
             // Estimate entry time from timestamp (ms)
-            let entry_time_estimate = chrono::DateTime::from_timestamp_millis(exec.header.ts_unix_ms as i64)
-                .map(|dt| {
-                    let elapsed = chrono::Utc::now().signed_duration_since(dt);
-                    Instant::now() - Duration::from_secs(elapsed.num_seconds().max(0) as u64)
-                })
-                .unwrap_or_else(Instant::now);
+            let entry_time_estimate =
+                chrono::DateTime::from_timestamp_millis(exec.header.ts_unix_ms as i64)
+                    .map(|dt| {
+                        let elapsed = chrono::Utc::now().signed_duration_since(dt);
+                        Instant::now() - Duration::from_secs(elapsed.num_seconds().max(0) as u64)
+                    })
+                    .unwrap_or_else(Instant::now);
 
             // Try to get pool/dex from original intent (if we have it cached)
             let (pool, dex) = if let Some(intent) = intent_lookup.get(&exec.intent_id) {
@@ -3215,18 +3242,21 @@ async fn recover_positions_from_jsonl(
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("unknown_pool_{}", &mint[..12]));
-                
+
                 let dex_from_intent = intent
                     .get("metadata")
                     .and_then(|m| m.get("dex"))
                     .and_then(|d| d.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
-                
+
                 (pool_from_intent, dex_from_intent)
             } else {
                 // Fallback: use placeholder (will work for exits but routing might fail)
-                (format!("unknown_pool_{}", &mint[..12]), "unknown".to_string())
+                (
+                    format!("unknown_pool_{}", &mint[..12]),
+                    "unknown".to_string(),
+                )
             };
 
             let mut tracker = PositionTracker::new(
@@ -3435,10 +3465,21 @@ async fn main() -> Result<()> {
                 "🚨 IMMEDIATE EXIT SIGNAL (recovered position)"
             );
 
-            if let Err(e) = generate_and_publish_exit_intent(&ctx, &mint, &pool, &dex, &exit_type, &reason, token_amount).await {
+            if let Err(e) = generate_and_publish_exit_intent(
+                &ctx,
+                &mint,
+                &pool,
+                &dex,
+                &exit_type,
+                &reason,
+                token_amount,
+            )
+            .await
+            {
                 error!(error = %e, mint = %mint, "Failed to generate/publish immediate exit intent");
             } else {
-                ctx.exits_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                ctx.exits_generated
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -3513,7 +3554,10 @@ async fn main() -> Result<()> {
     let mut control_subscription = if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_CONTROL_COMMANDS).await {
             Ok(sub) => {
-                info!(topic = TOPIC_CONTROL_COMMANDS, "Subscribed to Control Commands");
+                info!(
+                    topic = TOPIC_CONTROL_COMMANDS,
+                    "Subscribed to Control Commands"
+                );
                 Some(sub)
             }
             Err(e) => {
@@ -3591,14 +3635,14 @@ async fn main() -> Result<()> {
                 if let Some(nats_msg) = msg {
                     ironcrab::metrics::record_activity();
                     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    
+
                     #[derive(serde::Deserialize)]
                     struct ControlCommand {
                         action: String,
                         #[serde(default)]
                         mint: Option<String>,
                     }
-                    
+
                     match serde_json::from_slice::<ControlCommand>(&nats_msg.payload) {
                         Ok(cmd) => {
                             match cmd.action.as_str() {
@@ -4697,35 +4741,34 @@ async fn generate_and_publish_exit_intent(
     let sol_mint = "So11111111111111111111111111111111111111112";
 
     // === MULTI-POOL ROUTING: Find best pool for exit ===
-    let (pool, dex, pool_accounts, expected_sol, alternatives_checked) = match ctx
-        .find_best_sell_pool(mint, token_amount, original_pool)
-    {
-        Ok(result) => result,
-        Err(e) => {
-            // Fallback to original pool if multi-pool routing fails
-            warn!(
-                mint = %mint,
-                original_pool = %original_pool,
-                error = %e,
-                "⚠️  Multi-pool routing failed, using original pool"
-            );
+    let (pool, dex, pool_accounts, expected_sol, alternatives_checked) =
+        match ctx.find_best_sell_pool(mint, token_amount, original_pool) {
+            Ok(result) => result,
+            Err(e) => {
+                // Fallback to original pool if multi-pool routing fails
+                warn!(
+                    mint = %mint,
+                    original_pool = %original_pool,
+                    error = %e,
+                    "⚠️  Multi-pool routing failed, using original pool"
+                );
 
-            // Get accounts for original pool
-            let accounts = ctx
-                .try_get_dex_pool_accounts_for_mint(mint)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("cannot generate exit intent: missing DexPoolAccounts")
-                })?;
+                // Get accounts for original pool
+                let accounts = ctx
+                    .try_get_dex_pool_accounts_for_mint(mint)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("cannot generate exit intent: missing DexPoolAccounts")
+                    })?;
 
-            (
-                original_pool.to_string(),
-                original_dex.to_string(),
-                accounts,
-                0.0,      // Unknown expected
-                0_usize,  // No alternatives checked
-            )
-        }
-    };
+                (
+                    original_pool.to_string(),
+                    original_dex.to_string(),
+                    accounts,
+                    0.0,     // Unknown expected
+                    0_usize, // No alternatives checked
+                )
+            }
+        };
 
     // Decimals depend on the token. Prefer decimals from the open position (which was seeded
     // from MarketEventKind::TokenMintInfo), fall back to mint_infos cache.
@@ -4790,7 +4833,7 @@ async fn generate_and_publish_exit_intent(
                     // Absolute fallback: assume 1 token = 0.0000001 SOL (very pessimistic)
                     100_000 // 0.0001 SOL minimum
                 };
-                
+
                 info!(
                     mint = %mint,
                     sol_estimate_lamports = sol_estimate,
@@ -4798,7 +4841,7 @@ async fn generate_and_publish_exit_intent(
                     entry_price = pos.entry_price,
                     "💡 Using position entry price for exit ratio (emergency mode)"
                 );
-                
+
                 (sol_estimate, token_amount)
             } else {
                 // ABSOLUTE LAST RESORT: Assume worst-case ratio to force sell
@@ -4871,7 +4914,7 @@ async fn generate_and_publish_exit_intent(
     intent
         .metadata
         .insert("reason_code".to_string(), reason_code.to_string());
-    
+
     // Multi-pool routing metadata
     intent.metadata.insert(
         "multi_pool_alternatives_checked".to_string(),
@@ -4887,7 +4930,7 @@ async fn generate_and_publish_exit_intent(
             format!("{:.9}", expected_sol / 1e9),
         );
     }
-    
+
     intent
         .metadata
         .insert("reason_detail".to_string(), reason.to_string());
@@ -5012,7 +5055,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
         } => {
             ctx.record_pool_seen(pool_address, event.slot.unwrap_or(0));
             ctx.record_dex_pool_accounts(dex, pool_address, base_mint, quote_mint, accounts);
-            
+
             // Update pool accounts in multi-pool registry
             ctx.update_pool_accounts(base_mint, pool_address, accounts.clone());
         }
@@ -5214,7 +5257,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             // P0: Position Reconciliation after restart
             // Published by market-data at startup to sync wallet state with position tracking.
             // Handles: manual sales, emergency liquidations, external transfers.
-            
+
             if *balance_raw == 0 {
                 // Remove ghost position if wallet balance is zero
                 let mut positions = ctx.positions.write();

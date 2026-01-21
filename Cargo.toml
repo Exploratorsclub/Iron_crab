@@ -84,9 +84,15 @@ sd-notify = "0.4"
 # currently fails due to autotools/configure path handling. We therefore keep
 # Yellowstone dependencies non-Windows only. Code that depends on Geyser has
 # Windows stubs that return a clear runtime error.
+#
+# TPU Direct Client is also Linux-only due to QUIC/UDP socket handling differences.
 [target.'cfg(not(windows))'.dependencies]
 yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc.git", branch = "master" }
 yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc.git", branch = "master" }
+# TPU Direct Client (for low-latency TX submission)
+solana-tpu-client = "=3.0.0"
+solana-connection-cache = "=3.0.0"
+solana-quic-client = "=3.0.0"
 
 [features]
 default = []

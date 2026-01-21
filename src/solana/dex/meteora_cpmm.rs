@@ -3,7 +3,7 @@
 //! Implements the Dex trait for Meteora CPMM pools (Constant Product AMM).
 //! This is simpler than DLMM - uses standard x*y=k formula without bins.
 //!
-//! Program ID: cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D
+//! Program ID: cpmmpPPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D
 //!
 //! ## Data Flow (NO RPC in hot path!)
 //!
@@ -12,6 +12,9 @@
 //! 3. **Consumers** (momentum-bot, arb-strategy) receive events and update their local cache
 //! 4. **execution-engine** receives pool data via `Intent.resources.accounts` (from DexPoolAccounts)
 //! 5. **RPC is ONLY used as fallback** for liquidation when cache is empty
+
+// Swap instruction builder naturally needs many params
+#![allow(clippy::too_many_arguments)]
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -176,7 +179,7 @@ impl MeteoraCpmm {
                 .entry(pool.token_1_mint)
                 .or_default()
                 .push(pool_address);
-            
+
             debug!(
                 pool = %pool_address,
                 token_0 = %pool.token_0_mint,
@@ -244,7 +247,10 @@ impl MeteoraCpmm {
     /// Derive the pool authority PDA
     fn derive_pool_authority(pool_address: &Pubkey) -> (Pubkey, u8) {
         let program_id = Pubkey::from_str(METEORA_CPMM_PROGRAM).unwrap();
-        Pubkey::find_program_address(&[b"vault_and_lp_mint_auth_seed", pool_address.as_ref()], &program_id)
+        Pubkey::find_program_address(
+            &[b"vault_and_lp_mint_auth_seed", pool_address.as_ref()],
+            &program_id,
+        )
     }
 
     /// Build swap instruction for Meteora CPMM
@@ -306,19 +312,19 @@ impl MeteoraCpmm {
         // 12. observation_state
 
         let accounts = vec![
-            AccountMeta::new(*user, true),                        // payer (signer)
-            AccountMeta::new_readonly(authority, false),          // authority
-            AccountMeta::new_readonly(pool.amm_config, false),    // amm_config
-            AccountMeta::new(*pool_address, false),               // pool_state
-            AccountMeta::new(*user_source_token, false),          // input_token_account
-            AccountMeta::new(*user_destination_token, false),     // output_token_account
-            AccountMeta::new(input_vault, false),                 // input_vault
-            AccountMeta::new(output_vault, false),                // output_vault
-            AccountMeta::new_readonly(input_program, false),      // input_token_program
-            AccountMeta::new_readonly(output_program, false),     // output_token_program
-            AccountMeta::new_readonly(input_mint, false),         // input_token_mint
-            AccountMeta::new_readonly(output_mint, false),        // output_token_mint
-            AccountMeta::new(pool.observation_key, false),        // observation_state
+            AccountMeta::new(*user, true),                     // payer (signer)
+            AccountMeta::new_readonly(authority, false),       // authority
+            AccountMeta::new_readonly(pool.amm_config, false), // amm_config
+            AccountMeta::new(*pool_address, false),            // pool_state
+            AccountMeta::new(*user_source_token, false),       // input_token_account
+            AccountMeta::new(*user_destination_token, false),  // output_token_account
+            AccountMeta::new(input_vault, false),              // input_vault
+            AccountMeta::new(output_vault, false),             // output_vault
+            AccountMeta::new_readonly(input_program, false),   // input_token_program
+            AccountMeta::new_readonly(output_program, false),  // output_token_program
+            AccountMeta::new_readonly(input_mint, false),      // input_token_mint
+            AccountMeta::new_readonly(output_mint, false),     // output_token_mint
+            AccountMeta::new(pool.observation_key, false),     // observation_state
         ];
 
         Ok(Instruction {
@@ -382,7 +388,8 @@ impl Dex for MeteoraCpmm {
             }
 
             // Calculate output
-            let amount_out = self.calculate_swap_output(amount_in, reserve_in, reserve_out, DEFAULT_FEE_BPS);
+            let amount_out =
+                self.calculate_swap_output(amount_in, reserve_in, reserve_out, DEFAULT_FEE_BPS);
 
             if amount_out == 0 {
                 continue;
@@ -461,11 +468,17 @@ impl Dex for MeteoraCpmm {
             };
 
             // Convert to spl_token pubkeys for ATA derivation
-            let user_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(user.to_bytes());
-            let input_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(input.to_bytes());
-            let output_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(output.to_bytes());
-            let input_program_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(input_program.to_bytes());
-            let output_program_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(output_program.to_bytes());
+            let user_spl =
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(user.to_bytes());
+            let input_spl =
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(input.to_bytes());
+            let output_spl =
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(output.to_bytes());
+            let input_program_spl =
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(input_program.to_bytes());
+            let output_program_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+                output_program.to_bytes(),
+            );
 
             // Derive user token accounts (ATAs) with correct token programs
             let user_source_token_spl =
@@ -483,7 +496,8 @@ impl Dex for MeteoraCpmm {
 
             // Convert back to solana_sdk Pubkey
             let user_source_token = Pubkey::new_from_array(user_source_token_spl.to_bytes());
-            let user_destination_token = Pubkey::new_from_array(user_destination_token_spl.to_bytes());
+            let user_destination_token =
+                Pubkey::new_from_array(user_destination_token_spl.to_bytes());
 
             let ix = self.build_swap_instruction(
                 pool,
@@ -594,8 +608,10 @@ impl Dex for MeteoraCpmm {
             lp_mint: Pubkey::default(),
             token_0_mint,
             token_1_mint,
-            token_0_program: Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap(),
-            token_1_program: Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap(),
+            token_0_program: Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+                .unwrap(),
+            token_1_program: Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+                .unwrap(),
             observation_key,
             auth_bump: 0,
             status: 0,
@@ -656,11 +672,11 @@ mod tests {
     #[test]
     fn test_inject_and_query_pool() {
         let cpmm = MeteoraCpmm::new();
-        
+
         let pool_addr = Pubkey::new_unique();
         let token_0 = Pubkey::new_unique();
         let token_1 = Pubkey::new_unique();
-        
+
         let pool = CpmmPool {
             discriminator: [0u8; 8],
             amm_config: Pubkey::new_unique(),
@@ -685,20 +701,20 @@ mod tests {
             fund_fees_token_1: 0,
             open_time: 0,
         };
-        
+
         // Inject pool
         let is_new = cpmm.inject_pool_state(pool_addr, pool.clone(), 100_000_000, 50_000_000);
         assert!(is_new);
-        
+
         // Query by address
         assert!(cpmm.get_pool(&pool_addr).is_some());
         assert_eq!(cpmm.pool_count(), 1);
-        
+
         // Query by mint
         let pools_for_token_0 = cpmm.pools_for_mint(&token_0);
         assert_eq!(pools_for_token_0.len(), 1);
         assert_eq!(pools_for_token_0[0], pool_addr);
-        
+
         // Second inject is not new
         let is_new2 = cpmm.inject_pool_state(pool_addr, pool, 100_000_000, 50_000_000);
         assert!(!is_new2);

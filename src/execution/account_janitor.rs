@@ -49,7 +49,6 @@ pub struct AccountJanitorConfig {
     /// Dry run mode - log actions but don't execute
     #[serde(default)]
     pub dry_run: bool,
-
     // Future: dust swap settings
     // pub swap_dust_interval_secs: u64,
     // pub swap_dust_min_value_sol: f64,
@@ -288,9 +287,7 @@ impl AccountJanitor {
 
         for (address, account) in token_accounts {
             // Parse token account
-            if let Ok(token_account) =
-                spl_token::state::Account::unpack(&account.data)
-            {
+            if let Ok(token_account) = spl_token::state::Account::unpack(&account.data) {
                 if token_account.amount == 0 {
                     // Get ATA age estimate
                     let age = self.estimate_ata_age(&address).await.ok();
@@ -340,8 +337,9 @@ impl AccountJanitor {
             return Err(anyhow!("No ATAs to close"));
         }
 
-        let wallet_spl =
-            spl_token::solana_program::pubkey::Pubkey::new_from_array(self.wallet_pubkey.to_bytes());
+        let wallet_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+            self.wallet_pubkey.to_bytes(),
+        );
 
         let mut instructions = Vec::with_capacity(atas.len());
 
@@ -355,10 +353,10 @@ impl AccountJanitor {
 
             let close_ix = spl_token::instruction::close_account(
                 &token_program,
-                &ata_spl,      // account to close
-                &wallet_spl,   // destination for rent
-                &wallet_spl,   // owner/authority
-                &[],           // no multisig
+                &ata_spl,    // account to close
+                &wallet_spl, // destination for rent
+                &wallet_spl, // owner/authority
+                &[],         // no multisig
             )?;
 
             instructions.push(prog_ix_to_sdk(close_ix));

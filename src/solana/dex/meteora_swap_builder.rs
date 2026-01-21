@@ -300,7 +300,7 @@ impl MeteoraDlmmSwapBuilder {
         info!(
             pool = %lb_pair,
             bin_array_count = bin_arrays.len(),
-            bin_array_0 = %bin_arrays.get(0).map(|p| p.to_string()).unwrap_or_default(),
+            bin_array_0 = %bin_arrays.first().map(|p| p.to_string()).unwrap_or_default(),
             bin_array_1 = %bin_arrays.get(1).map(|p| p.to_string()).unwrap_or_default(),
             bin_array_2 = %bin_arrays.get(2).map(|p| p.to_string()).unwrap_or_default(),
             "Meteora: derived bin array PDAs (may not exist on-chain!)"
@@ -343,8 +343,8 @@ impl MeteoraDlmmSwapBuilder {
             AccountMeta::new_readonly(*user, true),   // 10: User (signer)
             AccountMeta::new_readonly(*token_x_program, false), // 11: token_x_program (SPL Token OR Token-2022)
             AccountMeta::new_readonly(*token_y_program, false), // 12: token_y_program (SPL Token OR Token-2022)
-            AccountMeta::new_readonly(event_authority, false), // 13: Event authority
-            AccountMeta::new_readonly(program_id, false), // 14: Program ID
+            AccountMeta::new_readonly(event_authority, false),  // 13: Event authority
+            AccountMeta::new_readonly(program_id, false),       // 14: Program ID
         ];
 
         // Add bin array accounts as remaining accounts (writable)

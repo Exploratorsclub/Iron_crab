@@ -727,9 +727,12 @@ impl SolanaRpc {
         &self,
         address: &Pubkey,
         limit: Option<usize>,
-    ) -> Result<Vec<solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature>, ClientError> {
-        use solana_rpc_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+    ) -> Result<
+        Vec<solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature>,
+        ClientError,
+    > {
         use solana_commitment_config::CommitmentConfig;
+        use solana_rpc_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 
         let _permit = self.limiter.acquire().await;
 

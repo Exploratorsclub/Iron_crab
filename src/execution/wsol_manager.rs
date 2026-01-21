@@ -253,7 +253,11 @@ impl WsolManager {
     /// Run the WSOL manager main loop
     ///
     /// Subscribes to wallet balance updates via NATS and maintains WSOL balance.
-    pub async fn run(&self, nats: Arc<NatsClient>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    pub async fn run(
+        &self,
+        nats: Arc<NatsClient>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
         if !self.config.enabled {
             info!("WsolManager disabled by config");
             return Ok(());
@@ -287,7 +291,8 @@ impl WsolManager {
                 // Fallback: subscribe to wildcard and filter
                 use crate::nats::TOPIC_WALLET_BALANCE_PREFIX;
                 warn!(error = %e, topic = %topic, "Failed to subscribe to wallet-specific topic, using wildcard");
-                nats.subscribe(&format!("{}.*", TOPIC_WALLET_BALANCE_PREFIX)).await?
+                nats.subscribe(&format!("{}.*", TOPIC_WALLET_BALANCE_PREFIX))
+                    .await?
             }
         };
 
@@ -295,7 +300,7 @@ impl WsolManager {
 
         // Need mutable subscription for next()
         let mut subscription = subscription;
-        
+
         loop {
             tokio::select! {
                 // Check for shutdown
@@ -337,7 +342,7 @@ impl WsolManager {
     }
 
     /// Run WSOL manager in polling-only mode (without NATS)
-    /// 
+    ///
     /// Useful when NATS is unavailable - will check balances every 30 seconds.
     pub async fn run_polling_only(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         if !self.config.enabled {
@@ -395,14 +400,17 @@ impl WsolManager {
         }
 
         // Update cached balances
-        self.sol_balance.store(update.sol_lamports, Ordering::Relaxed);
+        self.sol_balance
+            .store(update.sol_lamports, Ordering::Relaxed);
         if let Some(wsol) = update.wsol_lamports {
             self.wsol_balance.store(wsol, Ordering::Relaxed);
         }
 
         debug!(
             sol = update.sol_lamports as f64 / LAMPORTS_PER_SOL as f64,
-            wsol = update.wsol_lamports.map(|w| w as f64 / LAMPORTS_PER_SOL as f64),
+            wsol = update
+                .wsol_lamports
+                .map(|w| w as f64 / LAMPORTS_PER_SOL as f64),
             slot = update.slot,
             "Balance update received"
         );
@@ -434,7 +442,9 @@ impl WsolManager {
     /// Get WSOL token account balance
     async fn get_wsol_balance(&self, wsol_mint: &Pubkey) -> Result<u64> {
         let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
-            &spl_token::solana_program::pubkey::Pubkey::new_from_array(self.wallet_pubkey.to_bytes()),
+            &spl_token::solana_program::pubkey::Pubkey::new_from_array(
+                self.wallet_pubkey.to_bytes(),
+            ),
             &spl_token::solana_program::pubkey::Pubkey::new_from_array(wsol_mint.to_bytes()),
             &spl_token::id(),
         );
@@ -566,8 +576,10 @@ impl WsolManager {
                 );
                 self.update_last_action();
                 // Update balances after wrap
-                self.sol_balance.fetch_sub(amount_lamports, Ordering::Relaxed);
-                self.wsol_balance.fetch_add(amount_lamports, Ordering::Relaxed);
+                self.sol_balance
+                    .fetch_sub(amount_lamports, Ordering::Relaxed);
+                self.wsol_balance
+                    .fetch_add(amount_lamports, Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
@@ -614,7 +626,10 @@ impl WsolManager {
 
     /// Build and send wrap transaction
     async fn build_and_send_wrap_tx(&self, amount_lamports: u64) -> Result<Signature> {
-        let (_ata, ixs) = self.treasury.build_wrap_sol_ixs(&self.rpc, amount_lamports).await?;
+        let (_ata, ixs) = self
+            .treasury
+            .build_wrap_sol_ixs(&self.rpc, amount_lamports)
+            .await?;
 
         if ixs.is_empty() {
             return Ok(Signature::default());
@@ -632,7 +647,9 @@ impl WsolManager {
     async fn build_and_send_unwrap_tx(&self) -> Result<Signature> {
         let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
         let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
-            &spl_token::solana_program::pubkey::Pubkey::new_from_array(self.wallet_pubkey.to_bytes()),
+            &spl_token::solana_program::pubkey::Pubkey::new_from_array(
+                self.wallet_pubkey.to_bytes(),
+            ),
             &spl_token::solana_program::pubkey::Pubkey::new_from_array(wsol_mint.to_bytes()),
             &spl_token::id(),
         );
@@ -641,8 +658,12 @@ impl WsolManager {
         let close_ix = spl_token::instruction::close_account(
             &spl_token::id(),
             &ata,
-            &spl_token::solana_program::pubkey::Pubkey::new_from_array(self.wallet_pubkey.to_bytes()),
-            &spl_token::solana_program::pubkey::Pubkey::new_from_array(self.wallet_pubkey.to_bytes()),
+            &spl_token::solana_program::pubkey::Pubkey::new_from_array(
+                self.wallet_pubkey.to_bytes(),
+            ),
+            &spl_token::solana_program::pubkey::Pubkey::new_from_array(
+                self.wallet_pubkey.to_bytes(),
+            ),
             &[],
         )?;
 

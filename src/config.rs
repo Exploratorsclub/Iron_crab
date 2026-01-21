@@ -122,6 +122,94 @@ pub struct ExecutionEngineCfg {
     /// Account Janitor Configuration (cleanup empty ATAs, dust)
     #[serde(default)]
     pub account_janitor: Option<AccountJanitorCfg>,
+    /// TX Submission Configuration (TPU/Jito/RPC fallback)
+    #[serde(default)]
+    pub tx_submission: Option<TxSubmissionCfg>,
+}
+
+/// TX Submission Configuration
+/// Configures how transactions are submitted to the network.
+/// Supports TPU Direct (fastest), Jito Bundles (MEV protection), and RPC (fallback).
+/// TOML section: [execution_engine.tx_submission]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxSubmissionCfg {
+    /// Primary submission method: "tpu", "jito", "rpc"
+    /// TPU Direct is fastest (~50-100ms) but requires validator connectivity.
+    /// Jito provides MEV protection for arbitrage.
+    /// RPC is the fallback (~200-400ms).
+    #[serde(default = "default_tx_primary_method")]
+    pub primary_method: String,
+
+    /// Fallback chain: methods to try if primary fails (in order)
+    /// Example: ["jito", "rpc"]
+    #[serde(default = "default_tx_fallback_chain")]
+    pub fallback_chain: Vec<String>,
+
+    /// Enable TPU Direct submission. Default: true
+    /// Requires validator connectivity (uses RPC for leader schedule).
+    #[serde(default = "default_tpu_enabled")]
+    pub tpu_enabled: bool,
+
+    /// Number of leader slots to fan out to. Default: 2
+    /// Sends to current leader + next N leaders for redundancy.
+    #[serde(default = "default_tpu_fanout_slots")]
+    pub tpu_fanout_slots: u64,
+
+    /// Number of times to forward TX to leaders. Default: 4
+    #[serde(default = "default_tpu_leader_forward_count")]
+    pub tpu_leader_forward_count: u64,
+
+    /// Timeout per method before trying fallback (ms). Default: 2000
+    #[serde(default = "default_tx_method_timeout_ms")]
+    pub method_timeout_ms: u64,
+
+    /// Retries per method before fallback. Default: 2
+    #[serde(default = "default_tx_retries_per_method")]
+    pub retries_per_method: u32,
+
+    /// Skip TPU for bundle-required intents (always use Jito). Default: true
+    #[serde(default = "default_skip_tpu_for_bundles")]
+    pub skip_tpu_for_bundles: bool,
+}
+
+fn default_tx_primary_method() -> String {
+    "tpu".into()
+}
+fn default_tx_fallback_chain() -> Vec<String> {
+    vec!["jito".into(), "rpc".into()]
+}
+fn default_tpu_enabled() -> bool {
+    true
+}
+fn default_tpu_fanout_slots() -> u64 {
+    2
+}
+fn default_tpu_leader_forward_count() -> u64 {
+    4
+}
+fn default_tx_method_timeout_ms() -> u64 {
+    2000
+}
+fn default_tx_retries_per_method() -> u32 {
+    2
+}
+fn default_skip_tpu_for_bundles() -> bool {
+    true
+}
+
+impl Default for TxSubmissionCfg {
+    fn default() -> Self {
+        Self {
+            primary_method: default_tx_primary_method(),
+            fallback_chain: default_tx_fallback_chain(),
+            tpu_enabled: default_tpu_enabled(),
+            tpu_fanout_slots: default_tpu_fanout_slots(),
+            tpu_leader_forward_count: default_tpu_leader_forward_count(),
+            method_timeout_ms: default_tx_method_timeout_ms(),
+            retries_per_method: default_tx_retries_per_method(),
+            skip_tpu_for_bundles: default_skip_tpu_for_bundles(),
+        }
+    }
 }
 
 /// WSOL Manager Configuration
@@ -153,12 +241,24 @@ pub struct WsolManagerCfg {
     pub dry_run: bool,
 }
 
-fn default_wsol_enabled() -> bool { true }
-fn default_wsol_min() -> f64 { 0.5 }
-fn default_wsol_target() -> f64 { 1.0 }
-fn default_wsol_max() -> f64 { 2.0 }
-fn default_wsol_min_native() -> f64 { 0.1 }
-fn default_wsol_cooldown() -> u64 { 30 }
+fn default_wsol_enabled() -> bool {
+    true
+}
+fn default_wsol_min() -> f64 {
+    0.5
+}
+fn default_wsol_target() -> f64 {
+    1.0
+}
+fn default_wsol_max() -> f64 {
+    2.0
+}
+fn default_wsol_min_native() -> f64 {
+    0.1
+}
+fn default_wsol_cooldown() -> u64 {
+    30
+}
 
 impl Default for WsolManagerCfg {
     fn default() -> Self {
@@ -196,9 +296,15 @@ pub struct AccountJanitorCfg {
     pub dry_run: bool,
 }
 
-fn default_janitor_close_interval() -> u64 { 3600 }
-fn default_janitor_min_age() -> u64 { 86400 }
-fn default_janitor_max_per_run() -> usize { 10 }
+fn default_janitor_close_interval() -> u64 {
+    3600
+}
+fn default_janitor_min_age() -> u64 {
+    86400
+}
+fn default_janitor_max_per_run() -> usize {
+    10
+}
 
 impl Default for AccountJanitorCfg {
     fn default() -> Self {

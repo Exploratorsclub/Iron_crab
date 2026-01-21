@@ -65,7 +65,7 @@ pub async fn ensure_pool_cache_stream(client: &async_nats::Client) -> Result<()>
         num_replicas: 1,
         discard: jetstream::stream::DiscardPolicy::Old,
         max_messages_per_subject: 1, // Keep only latest per pool (automatic compaction)
-        allow_rollup: true,           // Enable rollup headers for snapshots
+        allow_rollup: true,          // Enable rollup headers for snapshots
         ..Default::default()
     };
 
@@ -144,7 +144,10 @@ mod tests {
     #[test]
     fn test_pool_subject() {
         let subject = pool_subject("14Nx7vjtSeMVWugP4zUq5EJkD97ZXKRFUCAPhJJ1pump");
-        assert_eq!(subject, "ironcrab.pool_cache.14Nx7vjtSeMVWugP4zUq5EJkD97ZXKRFUCAPhJJ1pump");
+        assert_eq!(
+            subject,
+            "ironcrab.pool_cache.14Nx7vjtSeMVWugP4zUq5EJkD97ZXKRFUCAPhJJ1pump"
+        );
     }
 
     #[test]
