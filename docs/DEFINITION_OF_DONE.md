@@ -287,6 +287,127 @@ Leitlinie: **Charts/Trends über Zeit** (Latenz, Reject-Rates, PnL/ROI, Queue De
 
 ---
 
+## K.1) P2 Performance Roadmap
+
+Diese Sektion dokumentiert den Weg zu professioneller Latenz-Optimierung.
+
+### Aktueller Stand (Januar 2026)
+- **Server**: Frankfurt VPS mit eigenem Non-Voting Validator
+- **Geyser**: Lokal am Validator (<1ms Event-Latenz)
+- **TX Submission**: Jito Bundles (Arb) + RPC sendTransaction (Fallback)
+- **Geschätzte Slot-to-Send**: ~300-500ms (nicht gemessen)
+
+### Phase 1: Metriken & Baseline (Voraussetzung für alles)
+**Ziel:** Verstehen wo die Zeit verloren geht
+
+- [ ] Slot-to-Send Histogram in Prometheus/Grafana
+  ```rust
+  // In execution_engine.rs nach TX Send
+  let latency_ms = now_ms - slot_timestamp_ms;
+  metrics::histogram!("tx_slot_to_send_ms", latency_ms);
+  ```
+- [ ] Breakdown: Geyser-Event → Intent → Lock → Quote → Build → Send
+- [ ] Grafana Dashboard mit P50/P95/P99 Latenz
+
+### Phase 2: Code-Konsolidierung (NATS Optional)
+**Ziel:** Weniger Netzwerk-Hops im Hot Path
+
+Aktuell:
+```
+Geyser → market-data → NATS → arb-strategy → NATS → execution-engine
+        ~~~~~~~~~~~~   ~~~~~               ~~~~~
+        (Process)      (IPC)               (IPC)
+```
+
+Ziel (Single-Process Mode für Arb):
+```
+Geyser → [market-data + arb-strategy + execution-engine in-process]
+```
+
+- [ ] Feature-Flag `--single-process` für latenz-kritische Strategien
+- [ ] NATS nur für Control Plane / Debugging, nicht im Hot Path
+- [ ] In-Process Channels (tokio::mpsc) statt NATS für Arb
+
+### Phase 3: TPU Direct Implementation
+**Ziel:** ~100-200ms statt ~300-400ms
+
+**Voraussetzungen:**
+| Requirement | Dein Setup | Status |
+|-------------|-----------|--------|
+| Eigener Validator | ✅ Non-Voting | Vorhanden |
+| Leader Schedule | Aus Geyser/RPC | Zu implementieren |
+| QUIC Client | solana-tpu-client | Zu implementieren |
+| Stake (optional) | 0 SOL | Ohne Stake funktioniert TPU auch |
+
+**TPU ohne Stake:**
+- ✅ Funktioniert bei normaler Netzwerk-Last (90% der Zeit)
+- ⚠️ Bei Congestion werden gestakte Validators bevorzugt (Stake-weighted QoS)
+- Für Arbitrage oft ausreichend, da Arb-Opportunities selten bei Peak-Congestion
+
+**Implementation:**
+```rust
+use solana_tpu_client::{TpuClient, TpuClientConfig};
+
+// TPU Client verbindet sich automatisch mit aktuellem Leader
+let tpu_client = TpuClient::new(
+    Arc::clone(&rpc_client),
+    &websocket_url,
+    TpuClientConfig::default(),
+)?;
+
+// Sendet direkt an Leader TPU (QUIC)
+tpu_client.send_transaction(&signed_tx);
+```
+
+**Fallback-Strategie:**
+```
+1. TPU Direct (schnellster Pfad)
+2. Jito Bundle (MEV-Protection, wenn Arb)
+3. RPC sendTransaction (Fallback bei TPU-Fehler)
+```
+
+### Phase 4: Server-Migration (Optional)
+**Ziel:** <50ms zum Validator-Cluster
+
+| Standort | Latenz zu Validators | Kosten |
+|----------|---------------------|--------|
+| Frankfurt (aktuell) | ~20-50ms | € |
+| Amsterdam | ~10-30ms | € |
+| US East (Ashburn) | ~5-20ms | €€ |
+| Co-Location | <1ms | €€€€ |
+
+**Empfehlung:** Frankfurt/Amsterdam ist für Retail-Arb ausreichend. Co-Location nur sinnvoll wenn ihr gegen Jump/Wintermute antreten wollt (>$100k/Monat Infrastruktur).
+
+### Phase 5: Voting Validator mit Stake (Optional)
+**Ziel:** Stake-weighted QoS Priority
+
+**Break-Even Rechnung:**
+- Voting Validator Kosten: ~1.1 SOL/Tag (~$200/Tag bei $180/SOL)
+- Stake für merkliche QoS: ~10,000 SOL ($1.8M)
+- Stake-Weighted QoS bringt ~10-20% bessere Inclusion bei Congestion
+
+**Fazit:** Nur sinnvoll für professionelle Trading-Firmen mit >$1M Kapital.
+
+### Realistische Latenz-Ziele
+
+| Phase | Slot-to-Send P50 | Investment |
+|-------|-----------------|------------|
+| Aktuell (Jito + Frankfurt) | ~300-500ms | € |
+| + TPU Direct | ~150-300ms | €€ |
+| + Amsterdam Migration | ~100-200ms | €€ |
+| + Single-Process | ~50-150ms | Code-Arbeit |
+| + Co-Location + Stake | ~10-50ms | €€€€€ |
+
+**Gegen professionelle Market Maker (Jump, Wintermute, etc.):**
+- Sie haben: Co-Location, 100k+ SOL Stake, dedizierte Infra
+- Ihre Latenz: <10ms
+- Strategie: Nicht auf Latenz konkurrieren, sondern auf:
+  - Weniger kompetitive Pairs (Long-Tail Tokens)
+  - Längere Arbitrage-Fenster (Cross-DEX mit illiquiden Pools)
+  - Information Edge (bessere Signale, nicht schnellere Execution)
+
+---
+
 ## L) Process Separation & Binaries (Debuggability / Fault Isolation)
 
 ### P0
