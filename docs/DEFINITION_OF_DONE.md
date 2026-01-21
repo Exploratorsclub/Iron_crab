@@ -344,20 +344,293 @@ Geyser → [market-data + arb-strategy + execution-engine in-process]
 - ⚠️ Bei Congestion werden gestakte Validators bevorzugt (Stake-weighted QoS)
 - Für Arbitrage oft ausreichend, da Arb-Opportunities selten bei Peak-Congestion
 
-**Implementation:**
-```rust
-use solana_tpu_client::{TpuClient, TpuClientConfig};
+#### Schritt 1: Dependencies (Cargo.toml)
 
-// TPU Client verbindet sich automatisch mit aktuellem Leader
-let tpu_client = TpuClient::new(
-    Arc::clone(&rpc_client),
-    &websocket_url,
-    TpuClientConfig::default(),
-)?;
+```toml
+[dependencies]
+# Bereits vorhanden (prüfen ob Version passt):
+solana-client = "2.1"           # RpcClient
+solana-sdk = "2.1"              # Transaction, Keypair, etc.
 
-// Sendet direkt an Leader TPU (QUIC)
-tpu_client.send_transaction(&signed_tx);
+# NEU für TPU Direct:
+solana-tpu-client = "2.1"       # TpuClient, TpuClientConfig
+solana-connection-cache = "2.1" # ConnectionCache für QUIC
 ```
+
+**Hinweis:** Version muss zu deiner Solana-Version passen (aktuell Agave 3.x → Solana SDK 2.x).
+
+#### Schritt 2: Config-Erweiterung (src/config.rs)
+
+```rust
+#[derive(Debug, Clone, Deserialize)]
+pub struct TxSubmissionConfig {
+    /// Primary submission method: "tpu", "jito", "rpc"
+    pub primary_method: String,       // default: "tpu"
+    
+    /// Fallback chain (in order)
+    pub fallback_chain: Vec<String>,  // default: ["jito", "rpc"]
+    
+    /// TPU-specific settings
+    pub tpu_fanout_slots: u64,        // default: 2 (send to next N leaders)
+    pub tpu_leader_forward_count: u64, // default: 4
+    
+    /// Timeout before trying next method
+    pub method_timeout_ms: u64,       // default: 2000
+    
+    /// Retry on each method
+    pub retries_per_method: u32,      // default: 2
+}
+
+impl Default for TxSubmissionConfig {
+    fn default() -> Self {
+        Self {
+            primary_method: "tpu".into(),
+            fallback_chain: vec!["jito".into(), "rpc".into()],
+            tpu_fanout_slots: 2,
+            tpu_leader_forward_count: 4,
+            method_timeout_ms: 2000,
+            retries_per_method: 2,
+        }
+    }
+}
+```
+
+#### Schritt 3: TpuClient Setup (src/solana/tpu_client.rs - NEU)
+
+```rust
+use solana_client::rpc_client::RpcClient;
+use solana_tpu_client::tpu_client::{TpuClient, TpuClientConfig, TpuSenderError};
+use solana_sdk::{signature::Signature, transaction::Transaction};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+pub struct TpuSubmitter {
+    tpu_client: Arc<RwLock<Option<TpuClient>>>,
+    rpc_client: Arc<RpcClient>,
+    ws_url: String,
+    config: TpuClientConfig,
+}
+
+impl TpuSubmitter {
+    pub async fn new(
+        rpc_client: Arc<RpcClient>,
+        ws_url: &str,
+        fanout_slots: u64,
+        leader_forward_count: u64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = TpuClientConfig {
+            fanout_slots,
+            ..TpuClientConfig::default()
+        };
+        
+        // TpuClient erstellen (verbindet sich mit Leader Schedule)
+        let tpu_client = TpuClient::new(
+            Arc::clone(&rpc_client),
+            ws_url,
+            config.clone(),
+        )?;
+        
+        Ok(Self {
+            tpu_client: Arc::new(RwLock::new(Some(tpu_client))),
+            rpc_client,
+            ws_url: ws_url.to_string(),
+            config,
+        })
+    }
+    
+    /// Send transaction via TPU Direct (QUIC)
+    pub async fn send_transaction(&self, tx: &Transaction) -> Result<Signature, TpuSenderError> {
+        let guard = self.tpu_client.read().await;
+        if let Some(client) = guard.as_ref() {
+            // Sendet an aktuelle + nächste Leader (fanout_slots)
+            client.send_transaction(tx)
+        } else {
+            Err(TpuSenderError::Custom("TPU client not initialized".into()))
+        }
+    }
+    
+    /// Reconnect bei Verbindungsproblemen
+    pub async fn reconnect(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut guard = self.tpu_client.write().await;
+        *guard = Some(TpuClient::new(
+            Arc::clone(&self.rpc_client),
+            &self.ws_url,
+            self.config.clone(),
+        )?);
+        Ok(())
+    }
+}
+```
+
+#### Schritt 4: Unified TX Sender (src/solana/tx_sender.rs - NEU)
+
+```rust
+use crate::solana::tpu_client::TpuSubmitter;
+use crate::solana::jito::JitoClient;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{signature::Signature, transaction::Transaction};
+
+pub enum SendMethod {
+    Tpu,
+    Jito,
+    Rpc,
+}
+
+pub struct TxSender {
+    tpu: Option<TpuSubmitter>,
+    jito: Option<JitoClient>,
+    rpc: Arc<RpcClient>,
+    config: TxSubmissionConfig,
+}
+
+impl TxSender {
+    /// Send with automatic fallback chain
+    pub async fn send_with_fallback(
+        &self,
+        tx: &Transaction,
+        require_bundle: bool,  // From TradeIntent
+    ) -> Result<(Signature, SendMethod), SendError> {
+        
+        // Bei Bundle-Requirement: Nur Jito erlaubt
+        if require_bundle {
+            return self.send_via_jito(tx).await
+                .map(|sig| (sig, SendMethod::Jito));
+        }
+        
+        // Normale Fallback-Chain: TPU → Jito → RPC
+        let methods = std::iter::once(self.config.primary_method.as_str())
+            .chain(self.config.fallback_chain.iter().map(|s| s.as_str()));
+        
+        let mut last_error = None;
+        
+        for method in methods {
+            let result = match method {
+                "tpu" => self.send_via_tpu(tx).await.map(|s| (s, SendMethod::Tpu)),
+                "jito" => self.send_via_jito(tx).await.map(|s| (s, SendMethod::Jito)),
+                "rpc" => self.send_via_rpc(tx).await.map(|s| (s, SendMethod::Rpc)),
+                _ => continue,
+            };
+            
+            match result {
+                Ok(r) => {
+                    // Metrik: welche Methode hat funktioniert
+                    metrics::counter!("tx_send_success", 1, "method" => method);
+                    return Ok(r);
+                }
+                Err(e) => {
+                    metrics::counter!("tx_send_fallback", 1, 
+                        "from" => method, 
+                        "reason" => e.to_string()
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+        
+        Err(last_error.unwrap_or(SendError::NoMethodAvailable))
+    }
+    
+    async fn send_via_tpu(&self, tx: &Transaction) -> Result<Signature, SendError> {
+        let tpu = self.tpu.as_ref().ok_or(SendError::MethodNotConfigured("tpu"))?;
+        
+        tokio::time::timeout(
+            Duration::from_millis(self.config.method_timeout_ms),
+            tpu.send_transaction(tx)
+        )
+        .await
+        .map_err(|_| SendError::Timeout("tpu"))?
+        .map_err(|e| SendError::TpuError(e.to_string()))
+    }
+    
+    async fn send_via_jito(&self, tx: &Transaction) -> Result<Signature, SendError> {
+        let jito = self.jito.as_ref().ok_or(SendError::MethodNotConfigured("jito"))?;
+        // ... existing Jito logic
+    }
+    
+    async fn send_via_rpc(&self, tx: &Transaction) -> Result<Signature, SendError> {
+        // ... existing RPC logic
+    }
+}
+```
+
+#### Schritt 5: Integration in Execution Engine
+
+```rust
+// src/bin/execution_engine.rs
+
+// Bei Startup:
+let tx_sender = TxSender::new(
+    rpc_client.clone(),
+    config.solana.ws_url.clone(),
+    config.tx_submission.clone(),
+    jito_client,  // Optional
+).await?;
+
+// Bei TX Send (in process_intent):
+let (signature, method) = tx_sender.send_with_fallback(
+    &signed_tx,
+    intent.require_bundle,
+).await?;
+
+// Decision Record erweitern:
+decision.send_method = Some(format!("{:?}", method));
+```
+
+#### Schritt 6: Config File Update (my_config.server.toml)
+
+```toml
+[tx_submission]
+primary_method = "tpu"           # "tpu" | "jito" | "rpc"
+fallback_chain = ["jito", "rpc"]
+tpu_fanout_slots = 2             # Send to current + next N leaders
+tpu_leader_forward_count = 4
+method_timeout_ms = 2000
+retries_per_method = 2
+```
+
+#### Schritt 7: Metriken für Monitoring
+
+```rust
+// Neue Metriken in src/metrics.rs:
+
+// TX Submission Methode
+metrics::counter!("tx_send_success", "method" => "tpu|jito|rpc");
+metrics::counter!("tx_send_fallback", "from" => "...", "reason" => "...");
+
+// TPU-spezifisch
+metrics::histogram!("tpu_send_latency_ms", latency);
+metrics::counter!("tpu_reconnect_total");
+metrics::gauge!("tpu_leader_slots_ahead", slots);
+
+// Vergleich
+metrics::histogram!("tx_slot_to_confirm_ms", latency, "method" => "tpu|jito|rpc");
+```
+
+#### Checkliste für TPU-Umbau
+
+- [ ] **Cargo.toml**: `solana-tpu-client` + `solana-connection-cache` hinzufügen
+- [ ] **src/config.rs**: `TxSubmissionConfig` struct
+- [ ] **src/solana/tpu_client.rs**: `TpuSubmitter` wrapper (NEU)
+- [ ] **src/solana/tx_sender.rs**: `TxSender` mit Fallback-Chain (NEU)
+- [ ] **src/solana/mod.rs**: Module exportieren
+- [ ] **src/bin/execution_engine.rs**: `TxSender` integrieren
+- [ ] **my_config.server.toml**: `[tx_submission]` Section
+- [ ] **src/ipc/schema.rs**: `send_method` Feld in `DecisionRecord`
+- [ ] **src/metrics.rs**: TPU-Metriken
+- [ ] **Test**: Dry-run mit `primary_method = "rpc"` (kein Risiko)
+- [ ] **Test**: TPU auf Devnet/Testnet
+- [ ] **Deploy**: TPU auf Mainnet mit Monitoring
+
+#### Validator Config: Keine Änderung nötig!
+
+Dein Non-Voting Validator ist bereits korrekt konfiguriert:
+```bash
+--rpc-port 8899              # ✅ Für Leader Schedule / Cluster Info
+--dynamic-port-range 8000-8025  # ✅ TPU Ports
+--tpu-connection-pool-size 1024 # ✅ Genug Connections
+```
+
+Der TPU Client nutzt deinen Validator nur als **Datenquelle** (Leader Schedule, Cluster Nodes), nicht als Sender.
 
 **Fallback-Strategie:**
 ```
