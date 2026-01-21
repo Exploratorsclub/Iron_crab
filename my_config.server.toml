@@ -341,3 +341,15 @@ address_lookup_table = "2J74oVKaviWzVr9gaLDvmBf3VAVVpzy88i3YCnyDwvuX"  # ALT for
 jito_enabled = true                 # Enable Jito bundle submission
 jito_tip_lamports = 100000         # Tip: 0.0001 SOL per bundle (10x higher = much better success rate)
 jito_region = "frankfurt"          # Legacy config - code now uses ALL 5 regions in parallel
+
+# P2: TPU Direct TX Submission (faster than RPC)
+# TPU sends directly to slot leaders via QUIC (~50-100ms vs ~200-400ms RPC)
+[execution_engine.tx_submission]
+primary_method = "tpu"              # "tpu" (fastest), "jito" (MEV protection), "rpc" (fallback)
+fallback_chain = ["rpc"]            # Fallback if primary fails (Jito handled separately for arb)
+tpu_enabled = true                  # Enable TPU Direct
+tpu_fanout_slots = 2                # Send to current + next N leaders
+tpu_leader_forward_count = 4        # Forward count per leader
+method_timeout_ms = 2000            # Timeout per method before fallback
+retries_per_method = 2              # Retries before trying next method
+skip_tpu_for_bundles = true         # Bundles always use Jito (arb atomicity)

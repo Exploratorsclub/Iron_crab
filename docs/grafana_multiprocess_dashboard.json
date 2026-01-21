@@ -290,9 +290,27 @@
     },
     {
       "type": "timeseries",
+      "title": "TX Send Methods",
+      "targets": [
+        { "expr": "rate(tx_send_tpu_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "A", "legendFormat": "TPU Direct" },
+        { "expr": "rate(tx_send_jito_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "B", "legendFormat": "Jito Bundle" },
+        { "expr": "rate(tx_send_rpc_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "C", "legendFormat": "RPC Fallback" }
+      ],
+      "gridPos": {"h":6,"w":8,"x":16,"y":37},
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "TPU Direct" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }] },
+          { "matcher": { "id": "byName", "options": "Jito Bundle" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }] },
+          { "matcher": { "id": "byName", "options": "RPC Fallback" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }] }
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
       "title": "Simulation Failure Rate",
       "targets": [{ "expr": "rate(simulation_failures_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "A", "legendFormat": "sim failures/min" }],
-      "gridPos": {"h":6,"w":8,"x":16,"y":37},
+      "gridPos": {"h":6,"w":8,"x":0,"y":43},
       "fieldConfig": { "defaults": { "unit": "short" } }
     },
     {

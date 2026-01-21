@@ -74,7 +74,8 @@ use ironcrab::metrics::{
     JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
     OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK,
     REJECT_SEND_FAILED, REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL,
-    TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_SUCCESS_TOTAL,
+    TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL,
+    TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL,
 };
 use ironcrab::nats::{
     slave_consumer_config, NatsClient, NatsConfig, STREAM_NAME, TOPIC_CONTROL_REQUESTS,
@@ -4768,6 +4769,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             match send_result {
                 Ok(bid) => {
                     TX_SEND_SUCCESS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    TX_SEND_JITO_TOTAL.fetch_add(1, Ordering::Relaxed);
                     sent_anything = true;
                     bundle_id = Some(bid.clone());
                     checks.push(CheckResult {
@@ -4805,6 +4807,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             match send_transaction_with_fallback(ctx, wallet_pubkey, &tx_plan, false).await {
                 Ok(result) => {
                     TX_SEND_SUCCESS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    // Track send method for Grafana breakdown
+                    match result.method.as_str() {
+                        "tpu" => TX_SEND_TPU_TOTAL.fetch_add(1, Ordering::Relaxed),
+                        "jito" => TX_SEND_JITO_TOTAL.fetch_add(1, Ordering::Relaxed),
+                        _ => TX_SEND_RPC_TOTAL.fetch_add(1, Ordering::Relaxed),
+                    };
                     sent_anything = true;
                     send_signature = Some(result.signature.clone());
                     send_method_used = Some(result.method.clone());

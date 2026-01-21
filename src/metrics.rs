@@ -172,6 +172,10 @@ pub static SIMULATION_FAILURES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::
 // RS-5.1: Real-send lifecycle counters (operator truth)
 pub static TX_SEND_ATTEMPTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_SEND_SUCCESS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// P2: Send method breakdown (TPU Direct vs Jito vs RPC)
+pub static TX_SEND_TPU_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_SEND_JITO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_SEND_RPC_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_CONFIRMED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_CONFIRM_TIMEOUT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static AVAILABLE_SOL_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -733,6 +737,19 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "tx_send_success_total",
         TX_SEND_SUCCESS_TOTAL.load(Ordering::Relaxed)
+    );
+    // P2: Send method breakdown
+    line!(
+        "tx_send_tpu_total",
+        TX_SEND_TPU_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "tx_send_jito_total",
+        TX_SEND_JITO_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "tx_send_rpc_total",
+        TX_SEND_RPC_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "tx_confirmed_total",
