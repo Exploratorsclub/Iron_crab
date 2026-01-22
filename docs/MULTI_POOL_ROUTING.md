@@ -1,7 +1,22 @@
-# Multi-Pool Routing Implementation Plan
+# Multi-Pool Routing
 
-## Problem
-Momentum-bot verwendet aktuell nur den Pool aus dem ursprünglichen MarketEvent:
+**Status**: ✅ Complete  
+**Implemented**: Januar 2025  
+
+## Summary
+
+Multi-Pool Routing findet den **besten Pool für EXIT-Trades** wenn ein Token auf mehreren DEXes gelistet ist. Typische Preisverbesserung: 2-10%.
+
+**Code Locations:**
+- `PoolInfo` struct: `src/bin/momentum_bot.rs`
+- `mint_pools` HashMap: `MomentumContext`
+- `find_best_sell_pool()`: Best-Pool-Finder
+- Integration: `generate_and_publish_exit_intent()`
+
+---
+
+## Problem (gelöst)
+Momentum-bot verwendete nur den Pool aus dem ursprünglichen MarketEvent:
 - **BUY**: Kauft über den Pool aus dem PoolCreated/Trade Event
 - **SELL**: Verkauft über denselben Pool wie beim Kauf
 

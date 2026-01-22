@@ -1,8 +1,12 @@
 # Multi-Hop Arbitrage Implementation
 
-**Status**: Planning  
-**Created**: 2026-01-21  
+**Status**: ❌ Not Started (Planning Only)  
+**Created**: 2025-01-21  
 **Priority**: Medium (nach WsolManager/Janitor stable)
+
+> ⚠️ **Hinweis**: Dieses Dokument beschreibt eine **geplante** Erweiterung.  
+> Es existiert noch **kein Code** für Multi-Hop Arbitrage.  
+> Aktuell läuft nur 2-Hop Arbitrage (WSOL → Token → WSOL).
 
 ## Motivation
 
