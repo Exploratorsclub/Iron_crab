@@ -321,3 +321,33 @@ Erst danach:
 - MEV Workers erweitern
 - Analytics DB
 
+---
+
+## 8) Future Features (nicht implementiert)
+
+### 8.1 Quantile-Based Slippage Learning
+
+**Status:** Entfernt (Januar 2025) – Legacy Code aus Monolith-Phase
+
+**Konzept:** Lernt aus historischen Fills (expected vs actual output) und berechnet P95/P99-basierte Slippage pro Pool statt fester Prozentsätze.
+
+**Warum entfernt:** Das Hauptproblem (stale Quotes, 300-700ms alt) wurde durch LivePoolCache gelöst (Option C). Mit frischen Quotes (<50ms) ist statistisches Slippage-Lernen weniger wertvoll.
+
+**Falls später gewünscht:** Neuimplementierung basierend auf:
+```
+ExecutionResult (Confirmed)
+    │  fill_in, fill_out
+    ▼
+Quantile Learning (pro Pool/DEX)
+    │
+    ▼
+QuoteCalculator::apply_slippage() – dynamischer Adjustment
+```
+
+**Referenz:** Git History `src/quantile_impact.rs` (commit vor Januar 2025)
+
+### 8.2 Multi-Hop Arbitrage
+
+**Status:** Planning – siehe `docs/MULTI_HOP_ARBITRAGE.md`
+
+**Konzept:** N-Hop Arbitrage (WSOL → A → B → WSOL) statt 2-Hop.

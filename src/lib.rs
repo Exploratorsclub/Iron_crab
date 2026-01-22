@@ -5,7 +5,6 @@ pub mod execution;
 pub mod ipc;
 pub mod metrics;
 pub mod nats;
-pub mod quantile_impact;
 pub mod solana;
 pub mod storage;
 pub mod tx_fee_parser;
