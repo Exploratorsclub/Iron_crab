@@ -29,6 +29,7 @@ Das Filtering nach DEX Program IDs erfolgt **client-seitig** in `market-data`:
 ```rust
 // DEX Program IDs for client-side filtering
 const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+const RAYDIUM_CPMM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const PUMPFUN_BONDING: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMPSWAP_AMM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
@@ -41,6 +42,7 @@ const METEORA_CPMM: &str = "cpmmpPPPsf4FLyJpqjBnFMVAYkdNrmnHb9Wrt8KLPZC";
 | DEX | Program ID | Pool Discovery |
 |-----|-----------|----------------|
 | Raydium AMM V4 | `675kPX9...` | Geyser Account Updates |
+| Raydium CPMM | `CPMMoo8...` | Geyser Account Updates |
 | Orca Whirlpool | `whirLbM...` | Geyser Account Updates |
 | PumpFun Bonding | `6EF8rre...` | Geyser + Trade-Based |
 | PumpSwap AMM | `pAMMBay...` | Geyser + Trade-Based |
