@@ -527,4 +527,323 @@ mod tests {
         // 10% of pool → ~9.09% out (due to price impact)
         assert_eq!(amount_out, 90909090);
     }
+
+    #[test]
+    fn test_raydium_amm_quote_buy() {
+        // Test Raydium AMM quote for buying token with SOL
+        let wsol_mint = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+
+        let state = RaydiumAmmState {
+            base_mint: token_mint,
+            quote_mint: wsol_mint,
+            coin_vault: Pubkey::new_unique(),
+            pc_vault: Pubkey::new_unique(),
+            base_decimals: 9,
+            quote_decimals: 9,
+            coin_reserve: Some(10_000_000_000_000), // 10K tokens
+            pc_reserve: Some(1_000_000_000_000),    // 1K SOL
+            market_id: Pubkey::new_unique(),
+            serum_bids: None,
+            serum_asks: None,
+            serum_event_queue: None,
+        };
+
+        let intent = create_test_intent(wsol_mint, token_mint, 1_000_000_000); // 1 SOL
+        let amount_out =
+            super::calculate_raydium_amm_quote(&state, 1_000_000_000, &intent, true).unwrap();
+
+        // 1 SOL in 1000 SOL pool → should get ~10 tokens (with fee and price impact)
+        // Expected: ~9.97 tokens (with 0.25% fee and price impact)
+        assert!(amount_out > 9_000_000_000);
+        assert!(amount_out < 11_000_000_000);
+    }
+
+    #[test]
+    fn test_raydium_amm_quote_sell() {
+        // Test Raydium AMM quote for selling token for SOL
+        let wsol_mint = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+
+        let state = RaydiumAmmState {
+            base_mint: token_mint,
+            quote_mint: wsol_mint,
+            coin_vault: Pubkey::new_unique(),
+            pc_vault: Pubkey::new_unique(),
+            base_decimals: 9,
+            quote_decimals: 9,
+            coin_reserve: Some(10_000_000_000_000), // 10K tokens
+            pc_reserve: Some(1_000_000_000_000),    // 1K SOL
+            market_id: Pubkey::new_unique(),
+            serum_bids: None,
+            serum_asks: None,
+            serum_event_queue: None,
+        };
+
+        let intent = create_test_intent(token_mint, wsol_mint, 10_000_000_000); // 10 tokens
+        let amount_out =
+            super::calculate_raydium_amm_quote(&state, 10_000_000_000, &intent, false).unwrap();
+
+        // 10 tokens in 10K token pool → should get ~1 SOL (with fee and price impact)
+        assert!(amount_out > 900_000_000);
+        assert!(amount_out < 1_100_000_000);
+    }
+
+    #[test]
+    fn test_raydium_cpmm_quote() {
+        let token_0 = Pubkey::new_unique();
+        let token_1 = Pubkey::new_unique();
+
+        let state = RaydiumCpmmState {
+            token_0_mint: token_0,
+            token_1_mint: token_1,
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: Pubkey::new_unique(),
+            reserve_0: Some(1_000_000_000_000), // 1000 of token_0
+            reserve_1: Some(2_000_000_000_000), // 2000 of token_1
+        };
+
+        let intent = create_test_intent(token_0, token_1, 10_000_000_000); // 10 token_0
+        let amount_out =
+            super::calculate_raydium_cpmm_quote(&state, 10_000_000_000, &intent, true).unwrap();
+
+        // 10 of token_0 (1% of pool) → ~20 token_1 (minus fee and price impact)
+        assert!(amount_out > 19_000_000_000);
+        assert!(amount_out < 21_000_000_000);
+    }
+
+    #[test]
+    fn test_orca_whirlpool_quote() {
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+
+        let state = OrcaWhirlpoolState {
+            token_mint_a: mint_a,
+            token_mint_b: mint_b,
+            token_vault_a: Pubkey::new_unique(),
+            token_vault_b: Pubkey::new_unique(),
+            tick_current_index: 0,
+            sqrt_price: 1_000_000_000_000, // Roughly 1:1
+            liquidity: 10_000_000_000_000,
+            fee_rate: 3000, // 0.3% (in hundredths of bps)
+            protocol_fee_rate: 300,
+            tick_spacing: 64,
+            vault_a_balance: Some(1_000_000_000_000), // 1000 tokens
+            vault_b_balance: Some(1_000_000_000_000), // 1000 tokens
+            token_a_program: None,
+            token_b_program: None,
+        };
+
+        let intent = create_test_intent(mint_a, mint_b, 10_000_000_000); // 10 token_a
+        let amount_out =
+            super::calculate_orca_quote(&state, 10_000_000_000, &intent, true).unwrap();
+
+        // 10 of token_a → ~10 token_b (minus 0.3% fee and price impact)
+        assert!(amount_out > 9_500_000_000);
+        assert!(amount_out < 10_500_000_000);
+    }
+
+    #[test]
+    fn test_meteora_dlmm_quote() {
+        let token_x = Pubkey::new_unique();
+        let token_y = Pubkey::new_unique();
+
+        let state = MeteoraState {
+            token_x_mint: token_x,
+            token_y_mint: token_y,
+            reserve_x: Pubkey::new_unique(),
+            reserve_y: Pubkey::new_unique(),
+            active_id: 8388608, // Neutral price
+            bin_step: 20,       // 0.2% per bin
+            reserve_x_balance: Some(5_000_000_000_000), // 5000 tokens
+            reserve_y_balance: Some(10_000_000_000_000), // 10000 tokens
+        };
+
+        let intent = create_test_intent(token_x, token_y, 50_000_000_000); // 50 token_x
+        let amount_out =
+            super::calculate_meteora_quote(&state, 50_000_000_000, &intent, true).unwrap();
+
+        // 50 of token_x (1% of pool) → ~100 token_y (2:1 ratio, minus fee)
+        assert!(amount_out > 95_000_000_000);
+        assert!(amount_out < 105_000_000_000);
+    }
+
+    #[test]
+    fn test_meteora_cpmm_quote() {
+        let token_0 = Pubkey::new_unique();
+        let token_1 = Pubkey::new_unique();
+
+        let state = MeteoraCpmmState {
+            token_0_mint: token_0,
+            token_1_mint: token_1,
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: Pubkey::new_unique(),
+            amm_config: Pubkey::new_unique(),
+            observation_key: Pubkey::new_unique(),
+            token_0_program: Pubkey::new_unique(), // Token program pubkey
+            token_1_program: Pubkey::new_unique(), // Token program pubkey
+            reserve_0: 1_000_000_000_000, // 1000 of token_0
+            reserve_1: 2_000_000_000_000, // 2000 of token_1
+            mint_0_decimals: 9,
+            mint_1_decimals: 9,
+            status: 0,
+        };
+
+        let intent = create_test_intent(token_0, token_1, 10_000_000_000); // 10 token_0
+        let amount_out =
+            super::calculate_meteora_cpmm_quote(&state, 10_000_000_000, &intent, true).unwrap();
+
+        // 10 of token_0 → ~20 token_1 (2:1 ratio, minus 0.25% fee)
+        assert!(amount_out > 19_000_000_000);
+        assert!(amount_out < 21_000_000_000);
+    }
+
+    #[test]
+    fn test_pump_amm_quote_buy() {
+        let base_mint = Pubkey::new_unique(); // Token
+        let quote_mint = Pubkey::new_unique(); // WSOL
+
+        let state = PumpAmmState {
+            base_mint,
+            quote_mint,
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(1_000_000_000_000_000), // 1M tokens
+            quote_reserve: Some(50_000_000_000),       // 50 SOL
+            pool_accounts: vec![],
+        };
+
+        // Buy tokens with 1 SOL
+        let intent = create_test_intent(quote_mint, base_mint, 1_000_000_000);
+        let amount_out =
+            super::calculate_pumpamm_quote(&state, 1_000_000_000, &intent, true).unwrap();
+
+        // 1 SOL in 50 SOL pool → ~2% of tokens (minus 1% fee and price impact)
+        assert!(amount_out > 15_000_000_000_000);
+        assert!(amount_out < 25_000_000_000_000);
+    }
+
+    #[test]
+    fn test_pump_amm_quote_sell() {
+        let base_mint = Pubkey::new_unique(); // Token
+        let quote_mint = Pubkey::new_unique(); // WSOL
+
+        let state = PumpAmmState {
+            base_mint,
+            quote_mint,
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(1_000_000_000_000_000), // 1M tokens
+            quote_reserve: Some(50_000_000_000),       // 50 SOL
+            pool_accounts: vec![],
+        };
+
+        // Sell 20K tokens
+        let intent = create_test_intent(base_mint, quote_mint, 20_000_000_000_000);
+        let amount_out =
+            super::calculate_pumpamm_quote(&state, 20_000_000_000_000, &intent, false).unwrap();
+
+        // 20K tokens (2% of pool) → ~1 SOL (minus 1% fee and price impact)
+        assert!(amount_out > 900_000_000);
+        assert!(amount_out < 1_100_000_000);
+    }
+
+    #[test]
+    fn test_zero_reserves_error() {
+        let state = RaydiumCpmmState {
+            token_0_mint: Pubkey::new_unique(),
+            token_1_mint: Pubkey::new_unique(),
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: Pubkey::new_unique(),
+            reserve_0: Some(0), // Zero reserve!
+            reserve_1: Some(1_000_000),
+        };
+
+        let intent = create_test_intent(state.token_0_mint, state.token_1_mint, 1_000_000);
+        let result = super::calculate_raydium_cpmm_quote(&state, 1_000_000, &intent, true);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("missing reserves"));
+    }
+
+    #[test]
+    fn test_pumpfun_complete_bonding_curve_error() {
+        let state = PumpFunState {
+            token_mint: Pubkey::new_unique(),
+            bonding_curve: Pubkey::new_unique(),
+            associated_bonding_curve: Pubkey::new_unique(),
+            virtual_sol_reserves: 30_000_000_000,
+            virtual_token_reserves: 1_000_000_000_000_000,
+            real_sol_reserves: 0,
+            real_token_reserves: 793_100_000_000_000,
+            complete: true, // Migrated!
+            creator: Pubkey::new_unique(),
+        };
+
+        let result = super::calculate_pumpfun_quote(&state, 1_000_000_000, true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("complete"));
+    }
+
+    #[test]
+    fn test_slippage_edge_cases() {
+        // Minimum slippage (1 bps = 0.01%)
+        assert_eq!(apply_slippage(10000, 1), 9999);
+
+        // Large amount
+        assert_eq!(apply_slippage(1_000_000_000_000, 500), 950_000_000_000);
+
+        // Very small amount
+        assert_eq!(apply_slippage(100, 500), 95);
+
+        // 99% slippage (9900 bps)
+        assert_eq!(apply_slippage(1000, 9900), 10);
+
+        // Overflow protection
+        let large = u64::MAX / 2;
+        let result = apply_slippage(large, 500);
+        assert!(result < large);
+    }
+
+    // Helper to create test intents
+    fn create_test_intent(input_mint: Pubkey, output_mint: Pubkey, amount: u64) -> TradeIntent {
+        use crate::ipc::{
+            ExplicitAmount, IntentOrigin, IntentTier, RecordHeader, TradeResources, TradeSide,
+            TradingRegime,
+        };
+
+        TradeIntent {
+            header: RecordHeader::new("test", "0.0.1-test", "test-run-id"),
+            intent_id: "test-intent".to_string(),
+            source: "test".to_string(),
+            tier: IntentTier::Tier1,
+            origin_type: IntentOrigin::StrategyA,
+            deadline_slot: None,
+            ttl_ms: Some(3000),
+            side: TradeSide::Buy,
+            regime: TradingRegime::Established,
+            trigger_event_id: None,
+            require_bundle: None,
+            bundle_tip_lamports: None,
+            hint_compute_units: None,
+            hint_priority_fee_micro_lamports: None,
+            hint_urgency: None,
+            metadata: Default::default(),
+            execution: None,
+            resources: TradeResources {
+                input_mint: input_mint.to_string(),
+                output_mint: output_mint.to_string(),
+                pools: vec![Pubkey::new_unique().to_string()],
+                accounts: vec![],
+                token_program: None,
+            },
+            required_capital: ExplicitAmount {
+                raw: amount,
+                decimals: 9,
+                ui: None,
+            },
+            expected_roi_bps: 100,
+            max_slippage_bps: 500, // 5%
+        }
+    }
 }

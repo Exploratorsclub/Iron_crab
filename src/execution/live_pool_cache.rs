@@ -970,4 +970,264 @@ mod tests {
         assert_eq!(stats.cache_hits, 1);
         assert_eq!(stats.updates_total, 1);
     }
+
+    #[test]
+    fn test_cache_with_metadata() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+
+        let state = CachedPoolState::PumpFun(PumpFunState {
+            token_mint: Pubkey::new_unique(),
+            bonding_curve: Pubkey::new_unique(),
+            associated_bonding_curve: Pubkey::new_unique(),
+            virtual_sol_reserves: 30_000_000_000,
+            virtual_token_reserves: 1_000_000_000_000_000,
+            real_sol_reserves: 0,
+            real_token_reserves: 793_000_000_000_000,
+            complete: false,
+            creator: Pubkey::new_unique(),
+        });
+
+        cache.upsert(pool, state, 12345);
+
+        // Get with metadata
+        let (_, slot, age_ms) = cache.get_with_metadata(&pool).expect("should have entry");
+        assert_eq!(slot, 12345);
+        assert!(age_ms < 1000); // Should be very fresh
+    }
+
+    #[test]
+    fn test_cache_stale_detection() {
+        let cache = LivePoolCache::with_max_age_ms(100); // 100ms max age
+        let pool = Pubkey::new_unique();
+
+        let state = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: Pubkey::new_unique(),
+            token_1_mint: Pubkey::new_unique(),
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: Pubkey::new_unique(),
+            reserve_0: Some(1_000_000),
+            reserve_1: Some(2_000_000),
+        });
+
+        cache.upsert(pool, state, 100);
+
+        // Get entry and check freshness
+        let is_stale = {
+            let entry = cache.pools.get(&pool).expect("should have entry");
+            entry.is_stale(1000)
+        };
+        assert!(!is_stale); // Not stale within 1s
+    }
+
+    #[test]
+    fn test_cache_multiple_dex_types() {
+        let cache = LivePoolCache::new();
+
+        // Orca pool
+        let orca_pool = Pubkey::new_unique();
+        cache.upsert(
+            orca_pool,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: Pubkey::new_unique(),
+                token_mint_b: Pubkey::new_unique(),
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: -32768,
+                sqrt_price: 1_000_000_000_000,
+                liquidity: 5_000_000_000,
+                fee_rate: 3000, // 0.3%
+                protocol_fee_rate: 300,
+                tick_spacing: 64,
+                vault_a_balance: Some(1_000_000_000),
+                vault_b_balance: Some(2_000_000_000),
+                token_a_program: None,
+                token_b_program: None,
+            }),
+            100,
+        );
+
+        // Raydium AMM pool
+        let raydium_pool = Pubkey::new_unique();
+        cache.upsert(
+            raydium_pool,
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                coin_vault: Pubkey::new_unique(),
+                pc_vault: Pubkey::new_unique(),
+                base_decimals: 9,
+                quote_decimals: 6,
+                coin_reserve: Some(10_000_000_000),
+                pc_reserve: Some(50_000_000_000),
+                market_id: Pubkey::new_unique(),
+                serum_bids: None,
+                serum_asks: None,
+                serum_event_queue: None,
+            }),
+            100,
+        );
+
+        // Meteora pool
+        let meteora_pool = Pubkey::new_unique();
+        cache.upsert(
+            meteora_pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: Pubkey::new_unique(),
+                token_y_mint: Pubkey::new_unique(),
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: 8388608,
+                bin_step: 20,
+                reserve_x_balance: Some(5_000_000_000),
+                reserve_y_balance: Some(10_000_000_000),
+            }),
+            100,
+        );
+
+        // PumpAmm pool
+        let pumpamm_pool = Pubkey::new_unique();
+        cache.upsert(
+            pumpamm_pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1_000_000_000_000),
+                quote_reserve: Some(50_000_000_000),
+                pool_accounts: vec![],
+            }),
+            100,
+        );
+
+        // Verify all cached
+        assert_eq!(cache.len(), 4);
+        assert!(cache.contains(&orca_pool));
+        assert!(cache.contains(&raydium_pool));
+        assert!(cache.contains(&meteora_pool));
+        assert!(cache.contains(&pumpamm_pool));
+
+        // Verify DEX names
+        assert_eq!(cache.get(&orca_pool).unwrap().dex_name(), "orca");
+        assert_eq!(cache.get(&raydium_pool).unwrap().dex_name(), "raydium");
+        assert_eq!(cache.get(&meteora_pool).unwrap().dex_name(), "meteora_dlmm");
+        assert_eq!(cache.get(&pumpamm_pool).unwrap().dex_name(), "pump_amm");
+    }
+
+    #[test]
+    fn test_cache_update_overwrites() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+
+        // Insert with old reserves
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: Pubkey::new_unique(),
+                token_1_mint: Pubkey::new_unique(),
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            100,
+        );
+
+        // Update with new reserves
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: Pubkey::new_unique(),
+                token_1_mint: Pubkey::new_unique(),
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: Some(3_000_000),
+                reserve_1: Some(4_000_000),
+            }),
+            101,
+        );
+
+        // Should still be 1 entry
+        assert_eq!(cache.len(), 1);
+
+        // Should have new reserves
+        if let Some(CachedPoolState::RaydiumCpmm(state)) = cache.get(&pool) {
+            assert_eq!(state.reserve_0, Some(3_000_000));
+            assert_eq!(state.reserve_1, Some(4_000_000));
+        } else {
+            panic!("Expected RaydiumCpmm state");
+        }
+    }
+
+    #[test]
+    fn test_vault_to_pool_registered_via_upsert() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let vault_a = Pubkey::new_unique();
+        let vault_b = Pubkey::new_unique();
+
+        // Insert a state with known vaults - vaults are registered in upsert
+        let state = CachedPoolState::Orca(OrcaWhirlpoolState {
+            token_mint_a: Pubkey::new_unique(),
+            token_mint_b: Pubkey::new_unique(),
+            token_vault_a: vault_a,
+            token_vault_b: vault_b,
+            tick_current_index: 0,
+            sqrt_price: 1_000_000_000_000,
+            liquidity: 1_000_000,
+            fee_rate: 3000,
+            protocol_fee_rate: 300,
+            tick_spacing: 64,
+            vault_a_balance: Some(1_000_000),
+            vault_b_balance: Some(2_000_000),
+            token_a_program: None,
+            token_b_program: None,
+        });
+
+        cache.upsert(pool, state, 100);
+
+        // Vaults should now be mapped to pool
+        assert!(cache.vault_to_pool.contains_key(&vault_a));
+        assert!(cache.vault_to_pool.contains_key(&vault_b));
+
+        let (found_pool, pos) = cache.vault_to_pool.get(&vault_a).unwrap().clone();
+        assert_eq!(found_pool, pool);
+        assert!(matches!(pos, VaultPosition::A));
+    }
+
+    #[test]
+    fn test_mint_program_cache_via_lookup() {
+        let cache = LivePoolCache::new();
+
+        // Unknown mint returns None (no RPC fallback in tests)
+        let unknown_mint = Pubkey::new_unique();
+        assert_eq!(cache.get_mint_program(&unknown_mint), None);
+
+        // mint_programs is populated via cache_geyser when mint accounts are seen
+        // Here we just verify the API works
+        assert!(cache.mint_programs.is_empty());
+    }
+
+    #[test]
+    fn test_cache_entry_age() {
+        let state = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: Pubkey::new_unique(),
+            token_1_mint: Pubkey::new_unique(),
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: Pubkey::new_unique(),
+            reserve_0: Some(1_000_000),
+            reserve_1: Some(2_000_000),
+        });
+
+        let entry = CacheEntry::new(state, 100);
+
+        // Should be very fresh
+        assert!(entry.age_ms() < 100);
+        assert!(!entry.is_stale(1000));
+
+        // Sleep briefly and check again
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(entry.age_ms() >= 10);
+    }
 }

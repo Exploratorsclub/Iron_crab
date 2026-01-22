@@ -1,13 +1,13 @@
 # Momentum v2 Spec (Strategy Plane)
 
-## Implementation Status: ✅ ~95% Complete
+## Implementation Status: ✅ Complete
 
-**Last Verified**: Januar 2026
+**Last Verified**: Januar 2025
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Two-Phase Entry (Probe + Scale-In) | ✅ | `probe_buy_pct`, `scale_in_confirm_window_secs` |
-| State Machine | ✅ | Via `TokenTracker` fields (implicit states) |
+| Explicit State Machine | ✅ | `TrackerState` enum with 7 states |
 | Reason Codes | ✅ | `REJECT_*`, `WAIT_*`, `EXIT_*`, `CTO_*` |
 | fill_in/fill_out Position Accounting | ✅ | From `ExecutionResult` |
 | DexPoolAccounts (14 accounts) | ✅ | PumpSwap deterministic routing |
@@ -18,7 +18,6 @@
 | Dev Sell Detection | ✅ | Pre-entry reject, post-entry exit |
 | LP Removal Detection | ✅ | `REJECT_LP_REMOVED` |
 | PendingIntent Tracking | ✅ | Correlation via `intent_id` |
-| Formal State Enum | ❌ | States are implicit in `TokenTracker` fields |
 
 ---
 
@@ -43,7 +42,29 @@ The design goal is: *as early as possible* while filtering common scam/rug patte
 
 ## 2) State Machine
 
-Each token (mint) is tracked with a single state.
+Each token (mint) is tracked with an explicit `TrackerState` enum.
+
+### Implementation: `TrackerState` Enum
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackerState {
+    /// Initial state: Newly discovered token, collecting first trades.
+    Discovery,
+    /// Passed basic filters, waiting for velocity/quality thresholds.
+    Validation,
+    /// Probe buy intent sent, awaiting execution result.
+    ProbeBuyPending { sent_at: Instant },
+    /// Probe buy confirmed, position open with probe amount only.
+    PositionOpenProbe { filled_at: Instant },
+    /// Scale-in intent sent, awaiting execution result.
+    ScaleInPending { sent_at: Instant },
+    /// Full position open (probe + scale-in complete).
+    PositionOpenFull { filled_at: Instant },
+    /// Terminal state: Token rejected (filter fail, execution fail, timeout, etc.)
+    Rejected,
+}
+```
 
 ### States
 - **Discovery**
@@ -57,40 +78,47 @@ Each token (mint) is tracked with a single state.
 
 - **ProbeBuyPending**
   - We have emitted a probe BUY intent and are awaiting its execution result.
-  - We continue monitoring for disqualifying signals.
+  - Carries `sent_at` timestamp for timeout tracking.
 
-- **PositionOpen (Probe)**
+- **PositionOpenProbe**
   - Probe position is open.
+  - Carries `filled_at` timestamp for scale-in window calculation.
   - We gather confirmation signals for Scale-In.
 
 - **ScaleInPending**
   - We have emitted a scale-in BUY intent and are awaiting its execution result.
+  - Carries `sent_at` timestamp for timeout tracking.
 
-- **PositionOpen (Full)**
-  - Full position is open.
+- **PositionOpenFull**
+  - Full position is open (probe + scale-in complete).
+  - Carries `filled_at` timestamp for max hold time calculation.
   - Exit policy is active.
-
-- **CTO_Candidate**
-  - Special pre-entry state used when dev sells early *before* we enter.
-  - We do not hard-reject; we wait for recovery confirmation.
-
-- **ExitPending**
-  - A SELL intent has been emitted; we are awaiting execution result.
 
 - **Rejected**
   - Terminal state for this token tracker (within the tracker TTL).
+  - Accompanied by `blacklist_reason` field explaining why.
 
-### State Transitions (high level)
-- Discovery → Validation
+### State Transitions
+
+```text
+Discovery → Validation → ProbeBuyPending → PositionOpenProbe
+                      ↘                         ↓
+                       Rejected          ScaleInPending → PositionOpenFull
+                                               ↓
+                                           Rejected
+```
+
+- Discovery → Validation (on first signal evaluation)
 - Validation → ProbeBuyPending (when minimal gates pass)
-- Validation → CTO_Candidate (when dev sells early pre-entry, CTO mode enabled)
 - Validation → Rejected (when a hard reject condition occurs)
-- CTO_Candidate → ProbeBuyPending (when CTO recovery confirms)
-- ProbeBuyPending → PositionOpen (Probe) (on buy success)
-- PositionOpen (Probe) → ScaleInPending (on confirmation pass)
-- ScaleInPending → PositionOpen (Full) (on buy success)
-- Any Open state → ExitPending (on exit signal)
-- Any state → Rejected (on LP rug, etc., if configured as hard)
+- ProbeBuyPending → PositionOpenProbe (on buy success)
+- ProbeBuyPending → Rejected (on execution failure/timeout)
+- PositionOpenProbe → ScaleInPending (on confirmation pass within window)
+- PositionOpenProbe → PositionOpenFull (when window expires - probe only)
+- ScaleInPending → PositionOpenFull (on buy success)
+- ScaleInPending → Rejected (on execution failure/timeout)
+
+**Note**: CTO mode and Dump-Recovery are handled as **sub-states within Validation** via additional fields (`cto_started_at`, `dump_observed_at`, `recovery_started_at`), not as separate `TrackerState` variants.
 
 ---
 

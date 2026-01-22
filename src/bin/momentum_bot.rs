@@ -542,6 +542,70 @@ impl PositionTracker {
     }
 }
 
+/// Explicit lifecycle state for token tracking.
+///
+/// State machine transitions:
+/// ```text
+/// Discovery → Validation → ProbeBuyPending → PositionOpenProbe
+///                      ↘                         ↓
+///                       Rejected          ScaleInPending → PositionOpenFull
+///                                                ↓
+///                                            Rejected
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackerState {
+    /// Initial state: Newly discovered token, collecting first trades.
+    Discovery,
+    /// Passed basic filters, waiting for velocity/quality thresholds.
+    Validation,
+    /// Probe buy intent sent, awaiting execution result.
+    ProbeBuyPending { sent_at: Instant },
+    /// Probe buy confirmed, position open with probe amount only.
+    PositionOpenProbe { filled_at: Instant },
+    /// Scale-in intent sent, awaiting execution result.
+    ScaleInPending { sent_at: Instant },
+    /// Full position open (probe + scale-in complete).
+    PositionOpenFull { filled_at: Instant },
+    /// Terminal state: Token rejected (filter fail, execution fail, timeout, etc.)
+    Rejected,
+}
+
+impl Default for TrackerState {
+    fn default() -> Self {
+        Self::Discovery
+    }
+}
+
+impl TrackerState {
+    /// Returns true if in a terminal state (Rejected or fully filled)
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Rejected | Self::PositionOpenFull { .. })
+    }
+
+    /// Returns true if any buy intent has been sent (pending or filled)
+    #[allow(dead_code)] // Useful helper for future usage
+    fn has_entry_started(&self) -> bool {
+        !matches!(self, Self::Discovery | Self::Validation)
+    }
+
+    /// Returns true if probe was filled (position open)
+    #[allow(dead_code)] // Useful helper for future usage
+    fn has_probe_filled(&self) -> bool {
+        matches!(
+            self,
+            Self::PositionOpenProbe { .. }
+                | Self::ScaleInPending { .. }
+                | Self::PositionOpenFull { .. }
+        )
+    }
+
+    /// Returns true if waiting for any execution result
+    #[allow(dead_code)] // Useful helper for future usage
+    fn is_pending_execution(&self) -> bool {
+        matches!(self, Self::ProbeBuyPending { .. } | Self::ScaleInPending { .. })
+    }
+}
+
 /// Tracks token metrics for strategy decisions
 #[derive(Debug, Clone)]
 struct TokenTracker {
@@ -594,15 +658,9 @@ struct TokenTracker {
     cto_started_at: Option<Instant>,
     cto_recovery_confirmed: bool,
 
-    // State
-    /// Entry lifecycle: probe then optional scale-in.
-    probe_sent_at: Option<Instant>,
-    probe_filled_at: Option<Instant>,
-    scale_sent_at: Option<Instant>,
-    scale_filled_at: Option<Instant>,
-    /// Terminal flag: entry complete (scale-in done or abandoned) and no further entry intents.
-    intent_generated: bool,
-    blacklisted: bool, // Failed filters, don't trade
+    /// Explicit lifecycle state (replaces probe_sent_at, probe_filled_at, etc.)
+    state: TrackerState,
+    /// Reason for rejection (only set when state == Rejected)
     blacklist_reason: Option<String>,
 }
 
@@ -643,14 +701,37 @@ impl TokenTracker {
             recovery_started_at: None,
             cto_started_at: None,
             cto_recovery_confirmed: false,
-            probe_sent_at: None,
-            probe_filled_at: None,
-            scale_sent_at: None,
-            scale_filled_at: None,
-            intent_generated: false,
-            blacklisted: false,
+            state: TrackerState::Discovery,
             blacklist_reason: None,
         }
+    }
+
+    // =========================================================================
+    // State transition helpers
+    // =========================================================================
+
+    /// Check if token is rejected (terminal failure state)
+    fn is_rejected(&self) -> bool {
+        matches!(self.state, TrackerState::Rejected)
+    }
+
+    /// Check if entry flow is complete (no more intents should be generated)
+    fn is_entry_complete(&self) -> bool {
+        matches!(
+            self.state,
+            TrackerState::Rejected | TrackerState::PositionOpenFull { .. }
+        )
+    }
+
+    /// Transition to Rejected state with reason
+    fn reject(&mut self, reason: impl Into<String>) {
+        self.state = TrackerState::Rejected;
+        self.blacklist_reason = Some(reason.into());
+    }
+
+    /// Check if tracker was previously not rejected (for metrics)
+    fn was_not_rejected(&self) -> bool {
+        !self.is_rejected()
     }
 
     fn dump_recovery_window_stats_at(
@@ -893,8 +974,7 @@ impl TokenTracker {
 
             // Check for large dump
             if sol_amount > config.max_single_dump_lamports {
-                self.blacklisted = true;
-                self.blacklist_reason = Some(format!(
+                self.reject(format!(
                     "Large dump detected: {} SOL",
                     sol_amount as f64 / 1_000_000_000.0
                 ));
@@ -924,8 +1004,7 @@ impl TokenTracker {
                             );
                         } else {
                             // No CTO mode: hard reject.
-                            self.blacklisted = true;
-                            self.blacklist_reason = Some("REJECT_DEV_SELL_EARLY".to_string());
+                            self.reject("REJECT_DEV_SELL_EARLY");
                             warn!(
                                 mint = %self.mint,
                                 age_secs = age.as_secs(),
@@ -1028,8 +1107,7 @@ impl TokenTracker {
     fn record_lp_removal(&mut self) {
         self.lp_removed = true;
         self.lp_removal_time = Some(Instant::now());
-        self.blacklisted = true;
-        self.blacklist_reason = Some("REJECT_LP_REMOVED".to_string());
+        self.reject("REJECT_LP_REMOVED");
         warn!(mint = %self.mint, "LP removed - blacklisting");
     }
 
@@ -1039,8 +1117,7 @@ impl TokenTracker {
         self.dev_supply_pct = Some(supply_pct);
 
         if supply_pct > config.max_dev_supply_pct {
-            self.blacklisted = true;
-            self.blacklist_reason = Some(format!(
+            self.reject(format!(
                 "REJECT_DEV_SUPPLY_TOO_HIGH: {:.1}% > {:.1}%",
                 supply_pct, config.max_dev_supply_pct
             ));
@@ -1105,16 +1182,13 @@ impl TokenTracker {
         config: &MomentumConfig,
         mint_info: Option<&MintInfo>,
     ) -> (bool, String) {
-        // Already generated or blacklisted
-        if self.intent_generated {
-            return (false, "Already generated intent".to_string());
-        }
-        if self.blacklisted {
+        // Already in terminal state
+        if self.is_entry_complete() {
             return (
                 false,
                 self.blacklist_reason
                     .clone()
-                    .unwrap_or("Blacklisted".to_string()),
+                    .unwrap_or_else(|| "Entry complete".to_string()),
             );
         }
 
@@ -1125,14 +1199,12 @@ impl TokenTracker {
             };
 
             if config.require_mint_authority_renounced && info.mint_authority.is_some() {
-                self.blacklisted = true;
-                self.blacklist_reason = Some("REJECT_MINT_AUTHORITY_NOT_RENOUNCED".to_string());
+                self.reject("REJECT_MINT_AUTHORITY_NOT_RENOUNCED");
                 return (false, "REJECT_MINT_AUTHORITY_NOT_RENOUNCED".to_string());
             }
 
             if config.require_freeze_authority_none && info.freeze_authority.is_some() {
-                self.blacklisted = true;
-                self.blacklist_reason = Some("REJECT_FREEZE_AUTHORITY_SET".to_string());
+                self.reject("REJECT_FREEZE_AUTHORITY_SET");
                 return (false, "REJECT_FREEZE_AUTHORITY_SET".to_string());
             }
         }
@@ -1155,8 +1227,7 @@ impl TokenTracker {
         if metrics.lp_removed {
             FILTER_REJECTED_LIQUIDITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            self.blacklisted = true;
-            self.blacklist_reason = Some("REJECT_LP_REMOVED".to_string());
+            self.reject("REJECT_LP_REMOVED");
             warn!(mint = %self.mint, pool = %self.pool, dex = %self.dex, "🚫 Filter rejected: LP_REMOVED (blacklisted)");
             return (false, "REJECT_LP_REMOVED".to_string());
         }
@@ -1203,21 +1274,16 @@ impl TokenTracker {
         if total_buys >= min_samples && small_buy_ratio > config.small_buy_ratio_cap {
             FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            self.blacklisted = true;
-            self.blacklist_reason = Some(format!(
+            let reason = format!(
                 "REJECT_MICRO_BUY_SPAM: small-buy ratio {:.0}% > {:.0}% (small={}, total={}, min_trade={:.4} SOL)",
                 small_buy_ratio * 100.0,
                 config.small_buy_ratio_cap * 100.0,
                 small_buys,
                 total_buys,
                 config.min_trade_size_lamports as f64 / 1_000_000_000.0
-            ));
-            return (
-                false,
-                self.blacklist_reason
-                    .clone()
-                    .unwrap_or_else(|| "REJECT_MICRO_BUY_SPAM".to_string()),
             );
+            self.reject(reason.clone());
+            return (false, reason);
         }
 
         // Filter 2b: Buyer Quality (anti-bot / concentration)
@@ -1226,61 +1292,43 @@ impl TokenTracker {
         if bq.top1_share > config.top1_buyer_share_cap {
             FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            self.blacklisted = true;
-            self.blacklist_reason = Some(format!(
+            let reason = format!(
                 "REJECT_BOT_CONCENTRATION: top1 share {:.0}% > {:.0}% (buyers={}, buy_vol={:.2} SOL)",
                 bq.top1_share * 100.0,
-                config.top1_buyer_share_cap * 100.0
-                ,
+                config.top1_buyer_share_cap * 100.0,
                 bq.unique_buyers,
                 bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
-            ));
-            return (
-                false,
-                self.blacklist_reason
-                    .clone()
-                    .unwrap_or_else(|| "Buyer concentration too high".to_string()),
             );
+            self.reject(reason.clone());
+            return (false, reason);
         }
 
         if bq.top3_share > config.top3_buyer_share_cap {
             FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            self.blacklisted = true;
-            self.blacklist_reason = Some(format!(
+            let reason = format!(
                 "REJECT_BOT_CONCENTRATION: top3 share {:.0}% > {:.0}% (buyers={}, buy_vol={:.2} SOL)",
                 bq.top3_share * 100.0,
-                config.top3_buyer_share_cap * 100.0
-                ,
+                config.top3_buyer_share_cap * 100.0,
                 bq.unique_buyers,
                 bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
-            ));
-            return (
-                false,
-                self.blacklist_reason
-                    .clone()
-                    .unwrap_or_else(|| "Buyer concentration too high".to_string()),
             );
+            self.reject(reason.clone());
+            return (false, reason);
         }
 
         if bq.repeat_buyer_ratio < config.repeat_buyer_min_ratio {
             FILTER_REJECTED_BUYER_QUALITY.fetch_add(1, Ordering::Relaxed);
             FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            self.blacklisted = true;
-            self.blacklist_reason = Some(format!(
+            let reason = format!(
                 "REJECT_BOT_CONCENTRATION: repeat buyer ratio {:.0}% < {:.0}% (buyers={}, buy_vol={:.2} SOL)",
                 bq.repeat_buyer_ratio * 100.0,
-                config.repeat_buyer_min_ratio * 100.0
-                ,
+                config.repeat_buyer_min_ratio * 100.0,
                 bq.unique_buyers,
                 bq.total_buy_volume_lamports as f64 / 1_000_000_000.0
-            ));
-            return (
-                false,
-                self.blacklist_reason
-                    .clone()
-                    .unwrap_or_else(|| "Repeat buyer ratio too low".to_string()),
             );
+            self.reject(reason.clone());
+            return (false, reason);
         }
 
         // Filter 3: SOL Inflow
@@ -1310,8 +1358,7 @@ impl TokenTracker {
             } else {
                 FILTER_REJECTED_DEV_BEHAVIOR.fetch_add(1, Ordering::Relaxed);
                 FILTER_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                self.blacklisted = true;
-                self.blacklist_reason = Some("REJECT_DEV_SELL_EARLY".to_string());
+                self.reject("REJECT_DEV_SELL_EARLY");
                 return (false, "REJECT_DEV_SELL_EARLY".to_string());
             }
         }
@@ -1406,6 +1453,7 @@ struct PoolInfo {
     pool_address: String,
     dex: String,
     dex_pool_accounts: Option<Vec<String>>,
+    #[allow(dead_code)] // Useful for debugging/forensics
     first_seen_slot: u64,
     last_trade_slot: u64,
     last_trade_ratio: Option<f64>, // SOL per token (for quotes)
@@ -1493,7 +1541,7 @@ impl MomentumContext {
     /// Register or update a pool in the multi-pool registry
     fn register_pool(&self, mint: &str, pool_address: &str, dex: &str, slot: u64) {
         let mut pools = self.mint_pools.write();
-        let pool_list = pools.entry(mint.to_string()).or_insert_with(Vec::new);
+        let pool_list = pools.entry(mint.to_string()).or_default();
 
         // Check if pool already exists
         if let Some(existing) = pool_list
@@ -1801,9 +1849,9 @@ impl MomentumContext {
             if let Some((dev_wallet, supply_pct)) = self.pending_dev_info.read().get(mint).cloned()
             {
                 if let Some(tracker) = trackers.get_mut(mint) {
-                    let was_blacklisted = tracker.blacklisted;
+                    let was_not_rejected = tracker.was_not_rejected();
                     tracker.set_dev_info(&dev_wallet, supply_pct, &config);
-                    if !was_blacklisted && tracker.blacklisted {
+                    if was_not_rejected && tracker.is_rejected() {
                         self.tokens_blacklisted
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -1841,9 +1889,9 @@ impl MomentumContext {
         let config = self.config.read().clone();
         let mut trackers = self.token_trackers.write();
         if let Some(tracker) = trackers.get_mut(mint) {
-            let was_blacklisted = tracker.blacklisted;
+            let was_not_rejected = tracker.was_not_rejected();
             tracker.record_trade(trader, is_buy, sol_amount, token_amount, signature, &config);
-            if !was_blacklisted && tracker.blacklisted {
+            if was_not_rejected && tracker.is_rejected() {
                 self.tokens_blacklisted
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1860,9 +1908,9 @@ impl MomentumContext {
 
         let mut trackers = self.token_trackers.write();
         if let Some(tracker) = trackers.get_mut(mint) {
-            let was_blacklisted = tracker.blacklisted;
+            let was_not_rejected = tracker.was_not_rejected();
             tracker.set_dev_info(dev_wallet, supply_pct, &config);
-            if !was_blacklisted && tracker.blacklisted {
+            if was_not_rejected && tracker.is_rejected() {
                 self.tokens_blacklisted
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1873,9 +1921,9 @@ impl MomentumContext {
     fn record_lp_removal(&self, mint: &str) {
         let mut trackers = self.token_trackers.write();
         if let Some(tracker) = trackers.get_mut(mint) {
-            let was_blacklisted = tracker.blacklisted;
+            let was_not_rejected = tracker.was_not_rejected();
             tracker.record_lp_removal();
-            if !was_blacklisted && tracker.blacklisted {
+            if was_not_rejected && tracker.is_rejected() {
                 self.tokens_blacklisted
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1896,17 +1944,21 @@ impl MomentumContext {
         let scale_sol = config.default_position_lamports.saturating_sub(probe_sol);
 
         for (mint, tracker) in trackers.iter_mut() {
-            if tracker.blacklisted || tracker.intent_generated {
+            // Skip tokens in terminal states
+            if tracker.is_entry_complete() {
                 continue;
             }
 
             let mint_info = mint_infos.get(mint);
 
-            // 1) Probe-buy stage
-            if tracker.probe_sent_at.is_none() {
-                let was_blacklisted = tracker.blacklisted;
+            // 1) Probe-buy stage (Discovery or Validation state)
+            if matches!(
+                tracker.state,
+                TrackerState::Discovery | TrackerState::Validation
+            ) {
+                let was_not_rejected = tracker.was_not_rejected();
                 let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
-                if !was_blacklisted && tracker.blacklisted {
+                if was_not_rejected && tracker.is_rejected() {
                     self.tokens_blacklisted
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1921,10 +1973,14 @@ impl MomentumContext {
                             probe_buy_pct = config.probe_buy_pct,
                             "Entry signal suppressed: probe_sol rounds to 0; increase default_position_lamports or probe_buy_pct"
                         );
-                        tracker.intent_generated = true;
+                        tracker.state = TrackerState::PositionOpenFull {
+                            filled_at: Instant::now(),
+                        };
                         continue;
                     }
-                    tracker.probe_sent_at = Some(Instant::now());
+                    tracker.state = TrackerState::ProbeBuyPending {
+                        sent_at: Instant::now(),
+                    };
                     signals.push(EntrySignal {
                         mint: mint.clone(),
                         pool: tracker.pool.clone(),
@@ -1933,28 +1989,27 @@ impl MomentumContext {
                         kind: EntryKind::Probe,
                         reason: format!("ENTER_PROBE_BUY: {reason}"),
                     });
+                } else {
+                    // Move to validation state if not yet there
+                    if matches!(tracker.state, TrackerState::Discovery) {
+                        tracker.state = TrackerState::Validation;
+                    }
                 }
                 continue;
             }
 
             // 2) Scale-in stage (only after probe fill, within confirm window)
-            if tracker.probe_filled_at.is_some()
-                && tracker.scale_sent_at.is_none()
-                && tracker.scale_filled_at.is_none()
-            {
+            if let TrackerState::PositionOpenProbe { filled_at } = tracker.state {
                 let now = Instant::now();
-                let probe_filled_at = tracker.probe_filled_at.unwrap_or(now);
-                if now.duration_since(probe_filled_at).as_secs()
-                    > config.scale_in_confirm_window_secs
-                {
+                if now.duration_since(filled_at).as_secs() > config.scale_in_confirm_window_secs {
                     // Confirmation window expired: keep probe position only.
-                    tracker.intent_generated = true;
+                    tracker.state = TrackerState::PositionOpenFull { filled_at };
                     continue;
                 }
 
-                let was_blacklisted = tracker.blacklisted;
+                let was_not_rejected = tracker.was_not_rejected();
                 let (should_trade, reason) = tracker.should_generate_intent(&config, mint_info);
-                if !was_blacklisted && tracker.blacklisted {
+                if was_not_rejected && tracker.is_rejected() {
                     self.tokens_blacklisted
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1969,10 +2024,12 @@ impl MomentumContext {
                             probe_buy_pct = config.probe_buy_pct,
                             "Scale-in suppressed: scale_sol is 0 (after probe rounding); increase default_position_lamports or adjust probe_buy_pct"
                         );
-                        tracker.intent_generated = true;
+                        tracker.state = TrackerState::PositionOpenFull { filled_at };
                         continue;
                     }
-                    tracker.scale_sent_at = Some(now);
+                    tracker.state = TrackerState::ScaleInPending {
+                        sent_at: Instant::now(),
+                    };
                     signals.push(EntrySignal {
                         mint: mint.clone(),
                         pool: tracker.pool.clone(),
@@ -1993,7 +2050,7 @@ impl MomentumContext {
         let mut trackers = self.token_trackers.write();
         let cutoff = Duration::from_secs(300); // 5 minutes
         trackers.retain(|_, tracker| {
-            tracker.first_seen.elapsed() < cutoff || !tracker.intent_generated
+            tracker.first_seen.elapsed() < cutoff || !tracker.state.is_terminal()
         });
     }
 
@@ -2300,13 +2357,12 @@ impl MomentumContext {
                             if let Some(tr) = trackers.get_mut(&pending.mint) {
                                 match pending.entry_kind {
                                     Some(EntryKind::ScaleIn) => {
-                                        tr.scale_filled_at = Some(Instant::now());
-                                        tr.intent_generated = true;
+                                        tr.state = TrackerState::PositionOpenFull {
+                                            filled_at: Instant::now(),
+                                        };
                                     }
                                     _ => {
-                                        tr.blacklisted = true;
-                                        tr.blacklist_reason =
-                                            Some("buy_confirmed_missing_fill_out".to_string());
+                                        tr.reject("buy_confirmed_missing_fill_out");
                                     }
                                 }
                             }
@@ -2358,11 +2414,14 @@ impl MomentumContext {
                             if let Some(tr) = trackers.get_mut(&pending.mint) {
                                 match pending.entry_kind {
                                     Some(EntryKind::Probe) => {
-                                        tr.probe_filled_at = Some(Instant::now());
+                                        tr.state = TrackerState::PositionOpenProbe {
+                                            filled_at: Instant::now(),
+                                        };
                                     }
                                     Some(EntryKind::ScaleIn) => {
-                                        tr.scale_filled_at = Some(Instant::now());
-                                        tr.intent_generated = true;
+                                        tr.state = TrackerState::PositionOpenFull {
+                                            filled_at: Instant::now(),
+                                        };
                                     }
                                     None => {}
                                 }
@@ -2406,8 +2465,7 @@ impl MomentumContext {
                 if pending.side == TradeSide::Buy {
                     let mut trackers = self.token_trackers.write();
                     if let Some(tr) = trackers.get_mut(&pending.mint) {
-                        tr.blacklisted = true;
-                        tr.blacklist_reason = Some(format!(
+                        tr.reject(format!(
                             "Entry execution failed ({:?})",
                             pending.entry_kind.unwrap_or(EntryKind::Probe)
                         ));
@@ -2424,8 +2482,7 @@ impl MomentumContext {
                 if pending.side == TradeSide::Buy {
                     let mut trackers = self.token_trackers.write();
                     if let Some(tr) = trackers.get_mut(&pending.mint) {
-                        tr.blacklisted = true;
-                        tr.blacklist_reason = Some(format!(
+                        tr.reject(format!(
                             "Entry execution timeout ({:?})",
                             pending.entry_kind.unwrap_or(EntryKind::Probe)
                         ));
@@ -3049,7 +3106,7 @@ impl MomentumContext {
 /// Reads recent execution_results (last 7 days) and reconstructs PositionTracker
 /// for any confirmed BUYs without matching SELLs.
 async fn recover_positions_from_jsonl(
-    log_dir: &PathBuf,
+    log_dir: &std::path::Path,
 ) -> Result<HashMap<String, PositionTracker>> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
@@ -3084,14 +3141,11 @@ async fn recover_positions_from_jsonl(
 
             if let Ok(file) = File::open(&intents_path) {
                 let reader = BufReader::new(file);
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        if let Ok(intent) = serde_json::from_str::<serde_json::Value>(&line) {
-                            if let Some(intent_id) =
-                                intent.get("intent_id").and_then(|v| v.as_str())
-                            {
-                                intent_lookup.insert(intent_id.to_string(), intent);
-                            }
+                for line in reader.lines().map_while(Result::ok) {
+                    if let Ok(intent) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if let Some(intent_id) = intent.get("intent_id").and_then(|v| v.as_str())
+                        {
+                            intent_lookup.insert(intent_id.to_string(), intent);
                         }
                     }
                 }
@@ -3216,7 +3270,10 @@ async fn recover_positions_from_jsonl(
                 .fill_in
                 .as_ref()
                 .map(|f| f.raw)
-                .or_else(|| exec.wallet_sol_delta_lamports.map(|d| d.abs() as u64))
+                .or_else(|| {
+                    exec.wallet_sol_delta_lamports
+                        .map(|d| d.unsigned_abs() as u64)
+                })
                 .unwrap_or(1_000_000_000); // Fallback: 1 SOL
 
             let sol_ui = sol_invested as f64 / 1e9;
@@ -3887,8 +3944,15 @@ async fn generate_and_publish_buy_intent(
                 let mut trackers = ctx.token_trackers.write();
                 if let Some(tr) = trackers.get_mut(&signal.mint) {
                     match signal.kind {
-                        EntryKind::Probe => tr.probe_sent_at = None,
-                        EntryKind::ScaleIn => tr.scale_sent_at = None,
+                        EntryKind::Probe => tr.state = TrackerState::Validation,
+                        EntryKind::ScaleIn => {
+                            // Revert to probe-filled state
+                            if let TrackerState::ScaleInPending { .. } = tr.state {
+                                tr.state = TrackerState::PositionOpenProbe {
+                                    filled_at: Instant::now(),
+                                };
+                            }
+                        }
                     }
                 }
             }
@@ -3912,8 +3976,14 @@ async fn generate_and_publish_buy_intent(
                 let mut trackers = ctx.token_trackers.write();
                 if let Some(tr) = trackers.get_mut(&signal.mint) {
                     match signal.kind {
-                        EntryKind::Probe => tr.probe_sent_at = None,
-                        EntryKind::ScaleIn => tr.scale_sent_at = None,
+                        EntryKind::Probe => tr.state = TrackerState::Validation,
+                        EntryKind::ScaleIn => {
+                            if let TrackerState::ScaleInPending { .. } = tr.state {
+                                tr.state = TrackerState::PositionOpenProbe {
+                                    filled_at: Instant::now(),
+                                };
+                            }
+                        }
                     }
                 }
             }
@@ -3982,8 +4052,14 @@ async fn generate_and_publish_buy_intent(
                 let mut trackers = ctx.token_trackers.write();
                 if let Some(tr) = trackers.get_mut(&signal.mint) {
                     match signal.kind {
-                        EntryKind::Probe => tr.probe_sent_at = None,
-                        EntryKind::ScaleIn => tr.scale_sent_at = None,
+                        EntryKind::Probe => tr.state = TrackerState::Validation,
+                        EntryKind::ScaleIn => {
+                            if let TrackerState::ScaleInPending { .. } = tr.state {
+                                tr.state = TrackerState::PositionOpenProbe {
+                                    filled_at: Instant::now(),
+                                };
+                            }
+                        }
                     }
                 }
             }
@@ -4314,8 +4390,10 @@ mod tests {
         {
             let mut trackers = ctx.token_trackers.write();
             let t = trackers.get_mut("mint").unwrap();
-            assert!(t.probe_sent_at.is_some());
-            t.probe_filled_at = Some(Instant::now());
+            assert!(matches!(t.state, TrackerState::ProbeBuyPending { .. }));
+            t.state = TrackerState::PositionOpenProbe {
+                filled_at: Instant::now(),
+            };
         }
 
         // Second pass should emit scale-in signal.
@@ -4327,7 +4405,7 @@ mod tests {
         {
             let trackers = ctx.token_trackers.read();
             let t = trackers.get("mint").unwrap();
-            assert!(t.scale_sent_at.is_some());
+            assert!(matches!(t.state, TrackerState::ScaleInPending { .. }));
         }
     }
 
@@ -4422,7 +4500,7 @@ mod tests {
         let (should_trade, reason) = tracker.should_generate_intent(&cfg, None);
         assert!(!should_trade);
         assert_eq!(reason, "REJECT_DEV_SELL_EARLY");
-        assert!(tracker.blacklisted);
+        assert!(tracker.is_rejected());
     }
 
     #[test]
