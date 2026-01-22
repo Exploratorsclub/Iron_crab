@@ -102,6 +102,14 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     established_max_slippage_bps: 'ENTRY: Max slippage for stable pools (bps)',
     default_position_lamports: 'ENTRY: Default position size (lamports, 1e9=1 SOL)',
     
+    // Momentum v2: Probe + Scale-In
+    probe_buy_pct: 'V2 ENTRY: Probe-buy size as fraction (0.25 = 25% of position)',
+    scale_in_confirm_window_secs: 'V2 ENTRY: Seconds after probe to allow scale-in',
+    
+    // Token Safety
+    require_mint_authority_renounced: 'SAFETY: Require mint authority = None before entry',
+    require_freeze_authority_none: 'SAFETY: Require freeze authority = None before entry',
+    
     // Filter 1: Liquidity
     max_dev_supply_pct: 'FILTER 1: Max dev supply percentage (0-100)',
     lp_removal_window_secs: 'FILTER 1: Track LP removals for N seconds',
@@ -120,6 +128,29 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     // Filter 4: Dev Behavior
     dev_early_sell_window_secs: 'FILTER 4: Dev sells in first N secs = bad signal',
     dev_rebuy_positive: 'FILTER 4: Dev rebuy is positive signal (true/false)',
+    
+    // Buyer Quality (Anti-Bot)
+    top1_buyer_share_cap: 'ANTI-BOT: Max share for top-1 buyer (0.35 = 35%)',
+    top3_buyer_share_cap: 'ANTI-BOT: Max combined share for top-3 buyers (0.60 = 60%)',
+    repeat_buyer_min_ratio: 'ANTI-BOT: Min ratio of repeat buyers (0.05 = 5%)',
+    
+    // Micro-Buy Spam Detection
+    min_trade_size_lamports: 'MICRO-BUY: Min trade size to count as real (lamports)',
+    small_buy_ratio_cap: 'MICRO-BUY: Max ratio of small buys (0.85 = 85%)',
+    
+    // Dump-Recovery Gate
+    dump_recovery_window_secs: 'DUMP: Time window to detect dump (seconds)',
+    dump_recovery_min_buy_dominance: 'DUMP: Min buy dominance for recovery (0.55 = 55%)',
+    dump_recovery_min_net_inflow_lamports: 'DUMP: Min net inflow for recovery (lamports)',
+    dump_recovery_min_recovery_secs: 'DUMP: Min seconds of recovery before entry',
+    
+    // CTO Mode (Community Takeover)
+    cto_enabled: 'CTO: Enable CTO mode (wait for recovery after dev sells)',
+    cto_entry_delay_secs: 'CTO: Delay before allowing entry after dev sell (seconds)',
+    cto_confirm_window_secs: 'CTO: Window to confirm recovery (seconds)',
+    cto_min_unique_buyers: 'CTO: Min unique buyers for recovery confirmation',
+    cto_min_buy_dominance: 'CTO: Min buy dominance for recovery (0.55 = 55%)',
+    cto_min_net_inflow_lamports: 'CTO: Min net inflow for recovery (lamports)',
     
     // Exit Strategy
     hard_stop_loss_pct: 'EXIT: Hard stop-loss from entry (%, 15=15%)',
@@ -162,6 +193,14 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
       'established_max_slippage_bps',
       'default_position_lamports',
     ],
+    'V2 Entry (Probe + Scale-In)': [
+      'probe_buy_pct',
+      'scale_in_confirm_window_secs',
+    ],
+    'Token Safety': [
+      'require_mint_authority_renounced',
+      'require_freeze_authority_none',
+    ],
     'Filter 1: Liquidity': [
       'max_dev_supply_pct',
       'lp_removal_window_secs',
@@ -180,6 +219,29 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
     'Filter 4: Dev Behavior': [
       'dev_early_sell_window_secs',
       'dev_rebuy_positive',
+    ],
+    'Anti-Bot (Buyer Quality)': [
+      'top1_buyer_share_cap',
+      'top3_buyer_share_cap',
+      'repeat_buyer_min_ratio',
+    ],
+    'Micro-Buy Spam Detection': [
+      'min_trade_size_lamports',
+      'small_buy_ratio_cap',
+    ],
+    'Dump-Recovery Gate': [
+      'dump_recovery_window_secs',
+      'dump_recovery_min_buy_dominance',
+      'dump_recovery_min_net_inflow_lamports',
+      'dump_recovery_min_recovery_secs',
+    ],
+    'CTO Mode (Community Takeover)': [
+      'cto_enabled',
+      'cto_entry_delay_secs',
+      'cto_confirm_window_secs',
+      'cto_min_unique_buyers',
+      'cto_min_buy_dominance',
+      'cto_min_net_inflow_lamports',
     ],
     'Exit Strategy': [
       'hard_stop_loss_pct',
@@ -229,6 +291,14 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     established_max_slippage_bps: 200,
     default_position_lamports: 5000000, // 0.005 SOL
     
+    // V2 Entry (Probe + Scale-In)
+    probe_buy_pct: 0.25,
+    scale_in_confirm_window_secs: 30,
+    
+    // Token Safety
+    require_mint_authority_renounced: false,
+    require_freeze_authority_none: false,
+    
     // Filter 1: Liquidity
     max_dev_supply_pct: 95.0,
     lp_removal_window_secs: 60,
@@ -247,6 +317,29 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     // Filter 4: Dev Behavior
     dev_early_sell_window_secs: 90,
     dev_rebuy_positive: true,
+    
+    // Anti-Bot (Buyer Quality)
+    top1_buyer_share_cap: 0.35,
+    top3_buyer_share_cap: 0.60,
+    repeat_buyer_min_ratio: 0.05,
+    
+    // Micro-Buy Spam Detection
+    min_trade_size_lamports: 10000000, // 0.01 SOL
+    small_buy_ratio_cap: 0.85,
+    
+    // Dump-Recovery Gate
+    dump_recovery_window_secs: 30,
+    dump_recovery_min_buy_dominance: 0.55,
+    dump_recovery_min_net_inflow_lamports: 1000000000, // 1 SOL
+    dump_recovery_min_recovery_secs: 10,
+    
+    // CTO Mode (Community Takeover)
+    cto_enabled: false,
+    cto_entry_delay_secs: 30,
+    cto_confirm_window_secs: 30,
+    cto_min_unique_buyers: 5,
+    cto_min_buy_dominance: 0.55,
+    cto_min_net_inflow_lamports: 1000000000, // 1 SOL
     
     // Exit Strategy
     hard_stop_loss_pct: 15.0,

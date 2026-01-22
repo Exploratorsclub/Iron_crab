@@ -1,5 +1,27 @@
 # Momentum v2 Spec (Strategy Plane)
 
+## Implementation Status: ✅ ~95% Complete
+
+**Last Verified**: Januar 2026
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Two-Phase Entry (Probe + Scale-In) | ✅ | `probe_buy_pct`, `scale_in_confirm_window_secs` |
+| State Machine | ✅ | Via `TokenTracker` fields (implicit states) |
+| Reason Codes | ✅ | `REJECT_*`, `WAIT_*`, `EXIT_*`, `CTO_*` |
+| fill_in/fill_out Position Accounting | ✅ | From `ExecutionResult` |
+| DexPoolAccounts (14 accounts) | ✅ | PumpSwap deterministic routing |
+| TokenMintInfo Gates | ✅ | `mint_authority`, `freeze_authority` |
+| CTO Mode | ✅ | `cto_enabled`, recovery confirmation |
+| Buyer Quality / Anti-Bot | ✅ | `top1_buyer_share_cap`, `small_buy_ratio_cap` |
+| Exit Policies | ✅ | `hard_stop`, `trailing_stop`, `take_profit`, `max_hold_time` |
+| Dev Sell Detection | ✅ | Pre-entry reject, post-entry exit |
+| LP Removal Detection | ✅ | `REJECT_LP_REMOVED` |
+| PendingIntent Tracking | ✅ | Correlation via `intent_id` |
+| Formal State Enum | ❌ | States are implicit in `TokenTracker` fields |
+
+---
+
 Scope: This document defines the *state machine*, *decision outcomes*, and *reason-coded* rejects/exits for Momentum v2.
 
 Constraints (from repo architecture):
