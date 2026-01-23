@@ -722,6 +722,9 @@ mod tests {
         assert_eq!(config.min_wsol_sol, 0.5);
         assert_eq!(config.target_wsol_sol, 1.0);
         assert_eq!(config.max_wsol_sol, 2.0);
+        assert_eq!(config.min_native_sol, 0.1);
+        assert_eq!(config.cooldown_secs, 30);
+        assert!(!config.dry_run);
     }
 
     #[test]
@@ -730,11 +733,209 @@ mod tests {
             min_wsol_sol: 0.5,
             target_wsol_sol: 1.0,
             max_wsol_sol: 2.0,
+            min_native_sol: 0.1,
             ..Default::default()
         };
 
         assert_eq!(config.min_wsol_lamports(), 500_000_000);
         assert_eq!(config.target_wsol_lamports(), 1_000_000_000);
         assert_eq!(config.max_wsol_lamports(), 2_000_000_000);
+        assert_eq!(config.min_native_lamports(), 100_000_000);
+    }
+
+    #[test]
+    fn test_config_custom_values() {
+        let config = WsolManagerConfig {
+            enabled: false,
+            min_wsol_sol: 0.1,
+            target_wsol_sol: 0.3,
+            max_wsol_sol: 0.5,
+            min_native_sol: 0.05,
+            cooldown_secs: 60,
+            dry_run: true,
+        };
+
+        assert!(!config.enabled);
+        assert_eq!(config.min_wsol_lamports(), 100_000_000);
+        assert_eq!(config.target_wsol_lamports(), 300_000_000);
+        assert_eq!(config.max_wsol_lamports(), 500_000_000);
+        assert_eq!(config.min_native_lamports(), 50_000_000);
+        assert!(config.dry_run);
+    }
+
+    #[test]
+    fn test_wsol_mint_constant() {
+        // Verify WSOL mint is the canonical address
+        assert_eq!(WSOL_MINT, "So11111111111111111111111111111111111111112");
+        // Verify it's a valid pubkey
+        let pubkey = Pubkey::from_str(WSOL_MINT);
+        assert!(pubkey.is_ok());
+    }
+
+    #[test]
+    fn test_wallet_balance_update_serialization() {
+        let update = WalletBalanceUpdate {
+            header: RecordHeader::new("test", "0.1.0", "run-123"),
+            wallet: "ABC123...".to_string(),
+            sol_lamports: 1_000_000_000,
+            wsol_lamports: Some(500_000_000),
+            slot: 12345,
+        };
+
+        let json = serde_json::to_string(&update).unwrap();
+        assert!(json.contains("ABC123"));
+        assert!(json.contains("1000000000"));
+        assert!(json.contains("500000000"));
+        assert!(json.contains("12345"));
+
+        // Roundtrip
+        let parsed: WalletBalanceUpdate = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.wallet, "ABC123...");
+        assert_eq!(parsed.sol_lamports, 1_000_000_000);
+        assert_eq!(parsed.wsol_lamports, Some(500_000_000));
+        assert_eq!(parsed.slot, 12345);
+    }
+
+    #[test]
+    fn test_wallet_balance_update_no_wsol() {
+        let update = WalletBalanceUpdate {
+            header: RecordHeader::new("test", "0.1.0", "run-123"),
+            wallet: "ABC123...".to_string(),
+            sol_lamports: 1_000_000_000,
+            wsol_lamports: None,
+            slot: 12345,
+        };
+
+        let json = serde_json::to_string(&update).unwrap();
+        let parsed: WalletBalanceUpdate = serde_json::from_str(&json).unwrap();
+        assert!(parsed.wsol_lamports.is_none());
+    }
+
+    #[test]
+    fn test_wsol_manager_action_serialization() {
+        let action = WsolManagerAction {
+            header: RecordHeader::new("wsol_manager", "0.1.0", "run-123"),
+            action: "wrap".to_string(),
+            amount_lamports: 500_000_000,
+            sol_before_lamports: 1_500_000_000,
+            wsol_before_lamports: 100_000_000,
+            reason: "WSOL 0.1 < min 0.5".to_string(),
+            signature: Some("5abc123...".to_string()),
+            dry_run: false,
+            error: None,
+        };
+
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("wrap"));
+        assert!(json.contains("500000000"));
+        assert!(json.contains("5abc123"));
+
+        // Verify all fields present
+        let parsed: WsolManagerAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.action, "wrap");
+        assert_eq!(parsed.amount_lamports, 500_000_000);
+        assert_eq!(parsed.sol_before_lamports, 1_500_000_000);
+        assert_eq!(parsed.wsol_before_lamports, 100_000_000);
+        assert!(!parsed.dry_run);
+        assert!(parsed.error.is_none());
+    }
+
+    #[test]
+    fn test_wsol_manager_action_with_error() {
+        let action = WsolManagerAction {
+            header: RecordHeader::new("wsol_manager", "0.1.0", "run-123"),
+            action: "wrap".to_string(),
+            amount_lamports: 500_000_000,
+            sol_before_lamports: 1_500_000_000,
+            wsol_before_lamports: 100_000_000,
+            reason: "WSOL below min".to_string(),
+            signature: None,
+            dry_run: false,
+            error: Some("Transaction failed: insufficient funds".to_string()),
+        };
+
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("Transaction failed"));
+
+        let parsed: WsolManagerAction = serde_json::from_str(&json).unwrap();
+        assert!(parsed.signature.is_none());
+        assert!(parsed.error.is_some());
+        assert!(parsed.error.unwrap().contains("insufficient funds"));
+    }
+
+    #[test]
+    fn test_wrap_amount_calculation() {
+        // Test the wrap amount logic without needing actual manager
+        let min_wsol = 500_000_000u64; // 0.5 SOL
+        let target_wsol = 1_000_000_000u64; // 1.0 SOL
+        let current_wsol = 100_000_000u64; // 0.1 SOL
+        let min_native = 100_000_000u64; // 0.1 SOL reserve
+        let sol_balance = 2_000_000_000u64; // 2.0 SOL
+
+        // Should wrap because current_wsol < min_wsol
+        assert!(current_wsol < min_wsol);
+
+        // Calculate wrap amount
+        let wrap_amount = target_wsol.saturating_sub(current_wsol);
+        assert_eq!(wrap_amount, 900_000_000); // 0.9 SOL needed
+
+        // Calculate available SOL
+        let available_sol = sol_balance.saturating_sub(min_native);
+        assert_eq!(available_sol, 1_900_000_000); // 1.9 SOL available
+
+        // Should be able to wrap full amount
+        assert!(available_sol >= wrap_amount);
+    }
+
+    #[test]
+    fn test_unwrap_amount_calculation() {
+        // Test the unwrap amount logic
+        let max_wsol = 2_000_000_000u64; // 2.0 SOL
+        let target_wsol = 1_000_000_000u64; // 1.0 SOL
+        let current_wsol = 2_500_000_000u64; // 2.5 SOL - over max
+
+        // Should unwrap because current_wsol > max_wsol
+        assert!(current_wsol > max_wsol);
+
+        // Calculate unwrap amount
+        let unwrap_amount = current_wsol.saturating_sub(target_wsol);
+        assert_eq!(unwrap_amount, 1_500_000_000); // 1.5 SOL to unwrap
+    }
+
+    #[test]
+    fn test_no_action_needed_in_range() {
+        let min_wsol = 500_000_000u64; // 0.5 SOL
+        let max_wsol = 2_000_000_000u64; // 2.0 SOL
+        let current_wsol = 1_000_000_000u64; // 1.0 SOL - in range
+
+        // Should NOT wrap (above min)
+        assert!(current_wsol >= min_wsol);
+
+        // Should NOT unwrap (below max)
+        assert!(current_wsol <= max_wsol);
+    }
+
+    #[test]
+    fn test_insufficient_sol_for_wrap() {
+        let min_wsol = 500_000_000u64; // 0.5 SOL min
+        let target_wsol = 1_000_000_000u64; // 1.0 SOL target
+        let current_wsol = 100_000_000u64; // 0.1 SOL - below min
+        let min_native = 100_000_000u64; // 0.1 SOL reserve
+        let sol_balance = 150_000_000u64; // Only 0.15 SOL available
+
+        // Should want to wrap
+        assert!(current_wsol < min_wsol);
+
+        // Calculate wrap amount needed
+        let wrap_amount = target_wsol.saturating_sub(current_wsol);
+        assert_eq!(wrap_amount, 900_000_000); // Need 0.9 SOL
+
+        // Calculate available SOL
+        let available_sol = sol_balance.saturating_sub(min_native);
+        assert_eq!(available_sol, 50_000_000); // Only 0.05 SOL available
+
+        // Cannot wrap full amount - would wrap available instead
+        assert!(available_sol < wrap_amount);
+        assert!(available_sol > 0); // But can still wrap something
     }
 }

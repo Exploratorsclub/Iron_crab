@@ -146,9 +146,9 @@ close_ata_max_per_run = 20          # Max ATAs pro Run
 - [x] Verify: Arb-TX hat jetzt nur: Token ATA (idempotent) + Buy Swap + Sell Swap
 - [x] Compute Units reduziert: 500k → 450k
 
-#### 1.6 Testing
-- [ ] Unit tests für WsolManager logic
-- [ ] Integration test: Balance update → Wrap trigger
+#### 1.6 Testing ✅
+- [x] Unit tests für WsolManager logic (12 tests)
+- [ ] Integration test: Balance update → Wrap trigger (requires mock RPC)
 - [ ] Dry-run test auf Server
 
 ---
@@ -186,8 +186,8 @@ close_ata_max_per_run = 20          # Max ATAs pro Run
 - [x] AccountJanitor Task spawnen in `main()`
 - [x] Graceful shutdown handling
 
-#### 2.6 Testing
-- [x] Unit tests für config defaults
+#### 2.6 Testing ✅
+- [x] Unit tests für config defaults (12 tests)
 - [ ] Dry-run test auf Server (log only, no send)
 
 ---

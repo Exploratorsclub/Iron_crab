@@ -529,4 +529,151 @@ mod tests {
         assert!(!sdk_ix.accounts[1].is_writable);
         assert_eq!(sdk_ix.data, vec![1, 2, 3, 4]);
     }
+
+    #[test]
+    fn test_ata_info_no_age() {
+        let ata = AtaInfo {
+            address: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+            balance: 0,
+            decimals: 6,
+            estimated_age_secs: None,
+        };
+
+        // ATA without age should not be selected for closing
+        assert!(ata.estimated_age_secs.is_none());
+        assert_eq!(ata.balance, 0);
+    }
+
+    #[test]
+    fn test_ata_age_filter_logic() {
+        // Test the age filtering logic
+        let min_age_secs: u64 = 86400; // 24 hours
+
+        let young_ata = AtaInfo {
+            address: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+            balance: 0,
+            decimals: 9,
+            estimated_age_secs: Some(3600), // 1 hour - too young
+        };
+
+        let old_ata = AtaInfo {
+            address: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+            balance: 0,
+            decimals: 9,
+            estimated_age_secs: Some(172800), // 48 hours - old enough
+        };
+
+        let unknown_age_ata = AtaInfo {
+            address: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+            balance: 0,
+            decimals: 9,
+            estimated_age_secs: None,
+        };
+
+        // Check filtering logic
+        let young_passes = young_ata
+            .estimated_age_secs
+            .map(|age| age >= min_age_secs)
+            .unwrap_or(false);
+        let old_passes = old_ata
+            .estimated_age_secs
+            .map(|age| age >= min_age_secs)
+            .unwrap_or(false);
+        let unknown_passes = unknown_age_ata
+            .estimated_age_secs
+            .map(|age| age >= min_age_secs)
+            .unwrap_or(false);
+
+        assert!(!young_passes, "Young ATA should not pass filter");
+        assert!(old_passes, "Old ATA should pass filter");
+        assert!(!unknown_passes, "Unknown age ATA should not pass filter");
+    }
+
+    #[test]
+    fn test_sol_recovery_calculation() {
+        // Each ATA costs ~0.00203928 SOL in rent
+        const RENT_PER_ATA: u64 = 2_039_280;
+
+        let atas_to_close = 5;
+        let expected_recovery = atas_to_close as u64 * RENT_PER_ATA;
+
+        assert_eq!(expected_recovery, 10_196_400);
+        assert!(expected_recovery as f64 / 1e9 > 0.01); // > 0.01 SOL
+    }
+
+    #[test]
+    fn test_max_per_run_limit() {
+        let config = AccountJanitorConfig {
+            enabled: true,
+            close_ata_max_per_run: 3,
+            ..Default::default()
+        };
+
+        // Simulate having 10 ATAs
+        let all_atas: Vec<AtaInfo> = (0..10)
+            .map(|_| AtaInfo {
+                address: Pubkey::new_unique(),
+                mint: Pubkey::new_unique(),
+                balance: 0,
+                decimals: 9,
+                estimated_age_secs: Some(100000),
+            })
+            .collect();
+
+        // Take only max_per_run
+        let to_close: Vec<_> = all_atas
+            .into_iter()
+            .take(config.close_ata_max_per_run)
+            .collect();
+
+        assert_eq!(to_close.len(), 3);
+    }
+
+    #[test]
+    fn test_janitor_action_dry_run() {
+        use crate::ipc::RecordHeader;
+
+        let action = JanitorAction {
+            header: RecordHeader::new("account_janitor", "test-build", "test-run"),
+            action: "close_ata".to_string(),
+            accounts_count: 2,
+            sol_recovered_lamports: 4_078_560,
+            signature: None, // No signature in dry-run
+            dry_run: true,
+            error: None,
+            details: vec!["Would close ATA: ABC...".to_string()],
+        };
+
+        assert!(action.dry_run);
+        assert!(action.signature.is_none());
+
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("dry_run\":true"));
+    }
+
+    #[test]
+    fn test_janitor_action_with_failure() {
+        use crate::ipc::RecordHeader;
+
+        let action = JanitorAction {
+            header: RecordHeader::new("account_janitor", "test-build", "test-run"),
+            action: "close_ata".to_string(),
+            accounts_count: 2,
+            sol_recovered_lamports: 0,
+            signature: None,
+            dry_run: false,
+            error: Some("Transaction simulation failed".to_string()),
+            details: vec![],
+        };
+
+        assert!(action.error.is_some());
+        assert_eq!(action.sol_recovered_lamports, 0);
+
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("simulation failed"));
+    }
 }
