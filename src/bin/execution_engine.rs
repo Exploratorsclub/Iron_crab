@@ -3200,6 +3200,11 @@ async fn main() -> Result<()> {
                 merge_dust_enabled: cfg.merge_dust_enabled,
                 merge_dust_interval_secs: cfg.merge_dust_interval_secs,
                 merge_dust_max_per_run: cfg.merge_dust_max_per_run,
+                swap_dust_enabled: cfg.swap_dust_enabled,
+                swap_dust_interval_secs: cfg.swap_dust_interval_secs,
+                swap_dust_min_value_sol: cfg.swap_dust_min_value_sol,
+                swap_dust_max_slippage_bps: cfg.swap_dust_max_slippage_bps,
+                swap_dust_max_per_run: cfg.swap_dust_max_per_run,
                 dry_run: cfg.dry_run || args.dry_run,
             })
             .unwrap_or_else(|| AccountJanitorConfig {
@@ -3226,6 +3231,7 @@ async fn main() -> Result<()> {
                 interval_secs = janitor_config.close_ata_interval_secs,
                 min_age_secs = janitor_config.close_ata_min_age_secs,
                 max_per_run = janitor_config.close_ata_max_per_run,
+                swap_dust_enabled = janitor_config.swap_dust_enabled,
                 dry_run = janitor_config.dry_run,
                 "AccountJanitor background task started"
             );

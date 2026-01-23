@@ -300,6 +300,21 @@ pub struct AccountJanitorCfg {
     /// Maximum token merges per run. Default: 5
     #[serde(default = "default_janitor_merge_max_per_run")]
     pub merge_dust_max_per_run: usize,
+    /// Enable swap dust feature (swap small balances to SOL). Default: false
+    #[serde(default)]
+    pub swap_dust_enabled: bool,
+    /// Interval for swapping dust tokens to SOL in seconds. Default: 86400 (24h)
+    #[serde(default = "default_janitor_swap_interval")]
+    pub swap_dust_interval_secs: u64,
+    /// Minimum token value in SOL to consider for swap. Default: 0.001 SOL
+    #[serde(default = "default_janitor_swap_min_value")]
+    pub swap_dust_min_value_sol: f64,
+    /// Maximum slippage for dust swaps in bps. Default: 500 (5%)
+    #[serde(default = "default_janitor_swap_slippage")]
+    pub swap_dust_max_slippage_bps: u32,
+    /// Maximum swaps per run. Default: 5
+    #[serde(default = "default_janitor_swap_max_per_run")]
+    pub swap_dust_max_per_run: usize,
     /// Dry-run mode: log actions but don't send TX. Default: false
     #[serde(default)]
     pub dry_run: bool,
@@ -320,6 +335,18 @@ fn default_janitor_merge_interval() -> u64 {
 fn default_janitor_merge_max_per_run() -> usize {
     5
 }
+fn default_janitor_swap_interval() -> u64 {
+    86400 // 24 hours
+}
+fn default_janitor_swap_min_value() -> f64 {
+    0.001 // 0.001 SOL
+}
+fn default_janitor_swap_slippage() -> u32 {
+    500 // 5%
+}
+fn default_janitor_swap_max_per_run() -> usize {
+    5
+}
 
 impl Default for AccountJanitorCfg {
     fn default() -> Self {
@@ -331,6 +358,11 @@ impl Default for AccountJanitorCfg {
             merge_dust_enabled: false,
             merge_dust_interval_secs: default_janitor_merge_interval(),
             merge_dust_max_per_run: default_janitor_merge_max_per_run(),
+            swap_dust_enabled: false,
+            swap_dust_interval_secs: default_janitor_swap_interval(),
+            swap_dust_min_value_sol: default_janitor_swap_min_value(),
+            swap_dust_max_slippage_bps: default_janitor_swap_slippage(),
+            swap_dust_max_per_run: default_janitor_swap_max_per_run(),
             dry_run: false,
         }
     }

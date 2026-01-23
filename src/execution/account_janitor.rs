@@ -22,8 +22,10 @@ use tracing::{debug, info, warn};
 use crate::ipc::RecordHeader;
 use crate::metrics::{
     JANITOR_ACCOUNTS_SCANNED_TOTAL, JANITOR_CLOSE_ATA_TOTAL, JANITOR_MERGE_DUST_TOTAL,
-    JANITOR_SOL_RECOVERED_LAMPORTS, JANITOR_SWEEP_RUNS_TOTAL, JANITOR_TOKENS_MERGED_TOTAL,
+    JANITOR_SOL_RECOVERED_LAMPORTS, JANITOR_SWEEP_RUNS_TOTAL, JANITOR_SWAP_DUST_FAILED,
+    JANITOR_SWAP_DUST_SOL_RECOVERED, JANITOR_SWAP_DUST_TOTAL, JANITOR_TOKENS_MERGED_TOTAL,
 };
+use crate::solana::dex::router::Router;
 use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
 
@@ -63,6 +65,26 @@ pub struct AccountJanitorConfig {
     #[serde(default = "default_merge_dust_max_per_run")]
     pub merge_dust_max_per_run: usize,
 
+    /// Enable swap dust feature (swap small balances to SOL)
+    #[serde(default)]
+    pub swap_dust_enabled: bool,
+
+    /// Interval for swapping dust tokens to SOL (seconds)
+    #[serde(default = "default_swap_dust_interval")]
+    pub swap_dust_interval_secs: u64,
+
+    /// Minimum token value in SOL to consider for swap
+    #[serde(default = "default_swap_dust_min_value")]
+    pub swap_dust_min_value_sol: f64,
+
+    /// Maximum slippage for dust swaps (bps)
+    #[serde(default = "default_swap_dust_slippage")]
+    pub swap_dust_max_slippage_bps: u32,
+
+    /// Maximum swaps per run
+    #[serde(default = "default_swap_dust_max_per_run")]
+    pub swap_dust_max_per_run: usize,
+
     /// Dry run mode - log actions but don't execute
     #[serde(default)]
     pub dry_run: bool,
@@ -95,6 +117,22 @@ fn default_merge_dust_max_per_run() -> usize {
     5
 }
 
+fn default_swap_dust_interval() -> u64 {
+    86400 // 24 hours
+}
+
+fn default_swap_dust_min_value() -> f64 {
+    0.001 // 0.001 SOL
+}
+
+fn default_swap_dust_slippage() -> u32 {
+    500 // 5%
+}
+
+fn default_swap_dust_max_per_run() -> usize {
+    5
+}
+
 impl Default for AccountJanitorConfig {
     fn default() -> Self {
         Self {
@@ -105,6 +143,11 @@ impl Default for AccountJanitorConfig {
             merge_dust_enabled: false,
             merge_dust_interval_secs: default_merge_dust_interval(),
             merge_dust_max_per_run: default_merge_dust_max_per_run(),
+            swap_dust_enabled: false,
+            swap_dust_interval_secs: default_swap_dust_interval(),
+            swap_dust_min_value_sol: default_swap_dust_min_value(),
+            swap_dust_max_slippage_bps: default_swap_dust_slippage(),
+            swap_dust_max_per_run: default_swap_dust_max_per_run(),
             dry_run: false,
         }
     }
@@ -159,6 +202,7 @@ pub struct AccountJanitor {
     config: AccountJanitorConfig,
     treasury: Arc<Treasury>,
     rpc: Arc<SolanaRpc>,
+    router: Option<Arc<Router>>,
     wallet_pubkey: Pubkey,
     run_id: String,
 }
@@ -176,6 +220,26 @@ impl AccountJanitor {
             config,
             treasury,
             rpc,
+            router: None,
+            wallet_pubkey,
+            run_id,
+        }
+    }
+
+    /// Create AccountJanitor with Router for swap_dust feature
+    pub fn with_router(
+        config: AccountJanitorConfig,
+        treasury: Arc<Treasury>,
+        rpc: Arc<SolanaRpc>,
+        router: Arc<Router>,
+        run_id: String,
+    ) -> Self {
+        let wallet_pubkey = treasury.pubkey();
+        Self {
+            config,
+            treasury,
+            rpc,
+            router: Some(router),
             wallet_pubkey,
             run_id,
         }
@@ -195,6 +259,8 @@ impl AccountJanitor {
             max_per_run = self.config.close_ata_max_per_run,
             merge_dust_enabled = self.config.merge_dust_enabled,
             merge_dust_interval_secs = self.config.merge_dust_interval_secs,
+            swap_dust_enabled = self.config.swap_dust_enabled,
+            swap_dust_interval_secs = self.config.swap_dust_interval_secs,
             dry_run = self.config.dry_run,
             "AccountJanitor starting"
         );
@@ -203,10 +269,13 @@ impl AccountJanitor {
             tokio::time::interval(Duration::from_secs(self.config.close_ata_interval_secs));
         let mut merge_interval =
             tokio::time::interval(Duration::from_secs(self.config.merge_dust_interval_secs));
+        let mut swap_interval =
+            tokio::time::interval(Duration::from_secs(self.config.swap_dust_interval_secs));
 
         // Skip first tick (immediate)
         close_interval.tick().await;
         merge_interval.tick().await;
+        swap_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -227,6 +296,14 @@ impl AccountJanitor {
                     if self.config.merge_dust_enabled {
                         if let Err(e) = self.run_merge_duplicate_atas().await {
                             warn!(error = %e, "Failed to merge duplicate ATAs");
+                        }
+                    }
+                }
+
+                _ = swap_interval.tick() => {
+                    if self.config.swap_dust_enabled {
+                        if let Err(e) = self.run_swap_dust_to_sol().await {
+                            warn!(error = %e, "Failed to swap dust to SOL");
                         }
                     }
                 }
@@ -638,6 +715,252 @@ impl AccountJanitor {
 
         Ok(signature)
     }
+
+    // =========================================================================
+    // Swap Dust → SOL
+    // =========================================================================
+
+    /// Find dust tokens and swap them to SOL via internal DEX router
+    async fn run_swap_dust_to_sol(&self) -> Result<()> {
+        info!("AccountJanitor: Starting dust swap scan");
+
+        let router = match &self.router {
+            Some(r) => r,
+            None => {
+                debug!("Router not available, skipping dust swap");
+                return Ok(());
+            }
+        };
+
+        // Find dust tokens with value above threshold
+        let dust_tokens = self.find_dust_tokens().await?;
+
+        if dust_tokens.is_empty() {
+            debug!("No dust tokens found above threshold");
+            return Ok(());
+        }
+
+        info!(
+            count = dust_tokens.len(),
+            "Found dust tokens to potentially swap"
+        );
+
+        // Process max_per_run tokens
+        let to_swap: Vec<_> = dust_tokens
+            .into_iter()
+            .take(self.config.swap_dust_max_per_run)
+            .collect();
+
+        for dust in &to_swap {
+            let result = self.swap_dust_token(router, dust).await;
+
+            // Log action
+            let action = JanitorAction {
+                header: RecordHeader::new("account-janitor", env!("CARGO_PKG_VERSION"), &self.run_id),
+                action: "swap_dust".to_string(),
+                accounts_count: 1,
+                sol_recovered_lamports: result.as_ref().ok().copied().unwrap_or(0),
+                signature: None, // TODO: capture signature from swap
+                dry_run: self.config.dry_run,
+                error: result.as_ref().err().map(|e| e.to_string()),
+                details: vec![
+                    format!("mint: {}", dust.mint),
+                    format!("balance: {}", dust.balance),
+                    format!("decimals: {}", dust.decimals),
+                    format!("estimated_value_sol: {:.6}", dust.estimated_value_sol),
+                ],
+            };
+
+            if self.config.dry_run {
+                info!(
+                    mint = %dust.mint,
+                    balance = dust.balance,
+                    estimated_value_sol = dust.estimated_value_sol,
+                    "[DRY-RUN] Would swap dust token to SOL"
+                );
+            } else {
+                match &result {
+                    Ok(sol_recovered) => {
+                        JANITOR_SWAP_DUST_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        JANITOR_SWAP_DUST_SOL_RECOVERED.fetch_add(*sol_recovered, Ordering::Relaxed);
+
+                        info!(
+                            mint = %dust.mint,
+                            sol_recovered_lamports = sol_recovered,
+                            "Successfully swapped dust token to SOL"
+                        );
+                    }
+                    Err(e) => {
+                        JANITOR_SWAP_DUST_FAILED.fetch_add(1, Ordering::Relaxed);
+
+                        warn!(
+                            error = %e,
+                            mint = %dust.mint,
+                            action = ?action,
+                            "Failed to swap dust token"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Find tokens with small balances that could be swapped to SOL
+    async fn find_dust_tokens(&self) -> Result<Vec<DustTokenInfo>> {
+        let router = match &self.router {
+            Some(r) => r,
+            None => return Ok(vec![]),
+        };
+
+        // Get all token accounts for wallet
+        let token_accounts = self
+            .rpc
+            .get_token_accounts_by_owner(&self.wallet_pubkey)
+            .await?;
+
+        let wsol_mint = "So11111111111111111111111111111111111111112";
+        let mut dust_tokens = Vec::new();
+
+        for (address, account) in token_accounts {
+            if let Ok(token_account) = spl_token::state::Account::unpack(&account.data) {
+                // Skip empty accounts
+                if token_account.amount == 0 {
+                    continue;
+                }
+
+                let mint = Pubkey::new_from_array(token_account.mint.to_bytes());
+                let mint_str = mint.to_string();
+
+                // Skip WSOL (we don't want to swap WSOL to SOL via DEX)
+                if mint_str == wsol_mint {
+                    continue;
+                }
+
+                // Try to get quote to estimate value
+                let quote_result = router
+                    .best_quote_exact_in(&mint_str, wsol_mint, token_account.amount)
+                    .await;
+
+                let (estimated_value_sol, decimals) = match quote_result {
+                    Ok(Some(route_quote)) => {
+                        let value_lamports = route_quote.quote.amount_out;
+                        let value_sol = value_lamports as f64 / 1e9;
+                        (value_sol, 9u8) // Assume 9 decimals for most tokens
+                    }
+                    _ => {
+                        // No quote available, skip this token
+                        debug!(mint = %mint_str, "No quote available for dust token, skipping");
+                        continue;
+                    }
+                };
+
+                // Check if above minimum value threshold
+                if estimated_value_sol >= self.config.swap_dust_min_value_sol {
+                    dust_tokens.push(DustTokenInfo {
+                        address,
+                        mint,
+                        balance: token_account.amount,
+                        decimals,
+                        estimated_value_sol,
+                    });
+                }
+            }
+        }
+
+        // Sort by value (highest first)
+        dust_tokens.sort_by(|a, b| {
+            b.estimated_value_sol
+                .partial_cmp(&a.estimated_value_sol)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(dust_tokens)
+    }
+
+    /// Swap a single dust token to SOL
+    async fn swap_dust_token(
+        &self,
+        router: &Router,
+        dust: &DustTokenInfo,
+    ) -> Result<u64> {
+        if self.config.dry_run {
+            return Ok(0);
+        }
+
+        let wsol_mint = "So11111111111111111111111111111111111111112";
+        let mint_str = dust.mint.to_string();
+
+        // Get fresh quote
+        let route_quote = router
+            .best_quote_exact_in(&mint_str, wsol_mint, dust.balance)
+            .await?
+            .ok_or_else(|| anyhow!("No route found for dust token {}", mint_str))?;
+
+        let expected_out = route_quote.quote.amount_out;
+
+        // Apply slippage
+        let min_out = expected_out
+            .saturating_mul(10000 - self.config.swap_dust_max_slippage_bps as u64)
+            / 10000;
+
+        info!(
+            mint = %mint_str,
+            amount_in = dust.balance,
+            expected_out = expected_out,
+            min_out = min_out,
+            dex_index = route_quote.dex_index,
+            "Building dust swap transaction"
+        );
+
+        // Build swap instructions
+        let dex = &router.dexs()[route_quote.dex_index];
+        let swap_ixs = dex
+            .build_swap_ix_async(&mint_str, wsol_mint, dust.balance, min_out)
+            .await?;
+
+        if swap_ixs.is_empty() {
+            return Err(anyhow!("No swap instructions generated"));
+        }
+
+        // Build and send transaction
+        let recent_blockhash = self.rpc.get_latest_blockhash_retry().await?;
+        let signer = self.treasury.signer_ref();
+
+        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+            &swap_ixs,
+            Some(&self.wallet_pubkey),
+            &[signer],
+            recent_blockhash,
+        );
+
+        let signature = self.rpc.send_and_confirm_transaction(&tx).await?;
+
+        info!(
+            signature = %signature,
+            mint = %mint_str,
+            expected_sol_lamports = expected_out,
+            "Dust swap transaction confirmed"
+        );
+
+        Ok(expected_out)
+    }
+}
+
+/// Information about a dust token candidate for swapping
+#[derive(Debug, Clone)]
+pub struct DustTokenInfo {
+    /// ATA address
+    pub address: Pubkey,
+    /// Token mint
+    pub mint: Pubkey,
+    /// Current balance (raw units)
+    pub balance: u64,
+    /// Token decimals
+    pub decimals: u8,
+    /// Estimated value in SOL
+    pub estimated_value_sol: f64,
 }
 
 // ============================================================================

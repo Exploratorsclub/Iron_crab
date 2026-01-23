@@ -1,8 +1,8 @@
 # WSOL Manager & Account Janitor Implementation
 
-**Status**: Phase 2.2 Complete (Merge Dust)  
+**Status**: Phase 2.3 Complete (Swap Dust → SOL)  
 **Created**: 2026-01-20  
-**Last Updated**: 2026-01-21
+**Last Updated**: 2026-01-23
 
 ## Motivation
 
@@ -170,12 +170,14 @@ close_ata_max_per_run = 20          # Max ATAs pro Run
 - [x] Config: `merge_dust_enabled`, `merge_dust_interval_secs`, `merge_dust_max_per_run`
 - [x] Prometheus metrics: `JANITOR_MERGE_DUST_TOTAL`, `JANITOR_TOKENS_MERGED_TOTAL`
 
-#### 2.3 Swap Dust → SOL - FUTURE (via interne DEX, nicht Jupiter)
-- [ ] `find_dust_tokens()` - Tokens mit kleinem Wert finden
-- [ ] `get_token_value_sol()` - Wert schätzen via Pool-Quotes
-- [ ] Route über Raydium/Orca/Meteora (existierende DEX-Integration)
-- [ ] `execute_dust_swap()` - Swap TX bauen und senden
-- [ ] **Kein Jupiter** - externe API Dependency vermeiden
+#### 2.3 Swap Dust → SOL ✅ COMPLETE (via interne DEX, nicht Jupiter)
+- [x] `find_dust_tokens()` - Tokens mit kleinem Wert finden
+- [x] Wert schätzen via Router `best_quote_exact_in()` → WSOL
+- [x] Route über Raydium/Orca/Meteora (existierende DEX-Integration)
+- [x] `swap_dust_token()` - Swap TX bauen und senden
+- [x] Config: `swap_dust_enabled`, `swap_dust_interval_secs`, `swap_dust_min_value_sol`, `swap_dust_max_slippage_bps`, `swap_dust_max_per_run`
+- [x] Prometheus metrics: `JANITOR_SWAP_DUST_TOTAL`, `JANITOR_SWAP_DUST_SOL_RECOVERED`, `JANITOR_SWAP_DUST_FAILED`
+- [x] **Kein Jupiter** - keine externe API Dependency
 
 #### 2.4 Close Empty ATAs ✅
 - [x] `find_empty_atas()` - ATAs mit balance == 0
