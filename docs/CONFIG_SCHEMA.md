@@ -22,7 +22,7 @@ NATS: ironcrab.control.config.reload
 ### API Usage
 ```bash
 # Update execution-engine config
-curl -X POST http://localhost:8000/config \
+curl -X POST http://localhost:8080/config \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_ADMIN_KEY" \
   -d '{
@@ -45,7 +45,7 @@ Component name: `execution-engine`
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
 | `max_position_size_lamports` | u64 | 500_000_000 | > 0 | Maximum SOL per single position (0.5 SOL) |
-| `max_concurrent_positions` | u32 | 5 | > 0 | Maximum open positions at once |
+| `max_open_positions` | u32 | 5 | > 0 | Maximum open positions at once |
 | `daily_loss_limit_lamports` | u64 | 5_000_000_000 | > 0 | Daily loss limit before auto-kill (5 SOL) |
 | `max_slippage_bps` | u32 | 500 | 1-10000 | Maximum slippage in basis points (5%) |
 
@@ -53,26 +53,14 @@ Component name: `execution-engine`
 
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
-| `simulation_timeout_ms` | u64 | 2000 | 100-30000 | RPC simulation timeout (used for engine-side time budgeting) |
-| `confirm_timeout_ms` | u64 | 30000 | 500-300000 | Confirmation polling timeout after RPC send (`getSignatureStatuses`) |
-| `send_enabled` | bool | false | true/false | If true, engine will sign and submit transactions (requires keys) |
-| `skip_preflight` | bool | true | true/false | Passed to `sendTransaction`. Safe default with simulate-gated execution |
-| `preflight_commitment` | string \| null | null | processed/confirmed/finalized/null | Passed to `sendTransaction` (null = RPC default) |
-
-### Fee Policy
-
-| Key | Type | Default | Range | Description |
-|-----|------|---------|-------|-------------|
-| `max_compute_units` | u32 | 400_000 | > 0 | Maximum compute units per transaction |
-| `max_priority_fee_lamports` | u64 | 10_000_000 | >= 0 | Maximum priority fee (0.01 SOL) |
-| `max_total_fee_lamports` | u64 | 50_000_000 | >= 0 | Maximum total transaction cost (0.05 SOL) |
-| `min_profit_after_fees_lamports` | u64 | 100_000 | >= 0 | Minimum profit to execute (0.0001 SOL) |
+| `simulation_timeout_ms` | u64 | 2000 | 100-30000 | Simulation timeout (ms) |
+| `confirmation_timeout_ms` | u64 | 30000 | 500-300000 | Confirmation timeout after send (ms) |
+| `send_enabled` | bool | false | true/false | If true, engine signs and submits transactions |
 
 ### Validation Rules
 - `max_slippage_bps` must be between 1 and 10000 (0.01% to 100%)
 - All `_lamports` values must be positive integers
-- Fee limits cannot exceed position size limits
-- `send_enabled=true` is rejected if wallet keys are not configured in the execution-engine environment
+- `send_enabled=true` is rejected if wallet keys are not configured
 - `confirm_timeout_ms` must be between 500 and 300000
 - `preflight_commitment` must be one of: processed, confirmed, finalized (or null)
 
@@ -86,8 +74,8 @@ Component name: `momentum-bot`
 
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
-| `early_min_liquidity_sol` | f64 | 5.0 | >= 0 | Minimum pool liquidity for EARLY regime trades |
-| `established_min_liquidity_sol` | f64 | 20.0 | >= 0 | Minimum pool liquidity for ESTABLISHED regime trades |
+| `early_min_liquidity_sol` | f64 | 3.0 | >= 0 | Minimum pool liquidity for EARLY regime trades |
+| `established_min_liquidity_sol` | f64 | 10.0 | >= 0 | Minimum pool liquidity for ESTABLISHED regime trades |
 
 ### Regime Classification
 
@@ -99,14 +87,14 @@ Component name: `momentum-bot`
 
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
-| `early_max_slippage_bps` | u32 | 300 | 1-10000 | Max slippage for EARLY trades (3%) |
-| `established_max_slippage_bps` | u32 | 100 | 1-10000 | Max slippage for ESTABLISHED trades (1%) |
+| `early_max_slippage_bps` | u32 | 500 | 1-10000 | Max slippage for EARLY trades (5%) |
+| `established_max_slippage_bps` | u32 | 200 | 1-10000 | Max slippage for ESTABLISHED trades (2%) |
 
 ### Position Sizing
 
 | Key | Type | Default | Range | Description |
 |-----|------|---------|-------|-------------|
-| `default_position_lamports` | u64 | 100_000_000 | > 0 | Default position size (0.1 SOL) |
+| `default_position_lamports` | u64 | 5_000_000 | > 0 | Default position size (0.005 SOL) |
 
 ### Momentum v2 Entry
 
@@ -157,6 +145,50 @@ Component name: `momentum-bot`
 | `require_mint_authority_renounced` | bool | false | true/false | Require TokenMintInfo.mint_authority == None |
 | `require_freeze_authority_none` | bool | false | true/false | Require TokenMintInfo.freeze_authority == None |
 
+### Filter 1: Liquidity & Dev Supply
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `max_dev_supply_pct` | f64 | 95.0 | 0-100 | Max dev supply percentage before rejecting |
+| `lp_removal_window_secs` | u64 | 60 | > 0 | Track LP removals for N seconds |
+
+### Filter 2: Buyer Velocity
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `min_unique_buyers` | u64 | 3 | > 0 | Minimum unique buyers in window |
+| `buyer_window_secs` | u64 | 120 | > 0 | Time window for buyer tracking (seconds) |
+| `min_trades_per_sec` | f64 | 0.02 | >= 0 | Minimum trades per second for momentum |
+| `min_buy_dominance` | f64 | 0.45 | 0.0-1.0 | Minimum buy ratio (0.45 = 45%) |
+
+### Filter 3: SOL Inflow
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `min_sol_inflow_lamports` | u64 | 500_000_000 | >= 0 | Minimum net SOL inflow (0.5 SOL) |
+| `inflow_window_secs` | u64 | 60 | > 0 | Time window for SOL inflow tracking |
+| `max_single_dump_lamports` | u64 | 20_000_000_000 | > 0 | Max allowed single sell (20 SOL) |
+
+### Filter 4: Dev Behavior
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `dev_early_sell_window_secs` | u64 | 90 | > 0 | Dev sells in first N secs = bad signal |
+| `dev_rebuy_positive` | bool | true | true/false | Dev rebuy is considered positive signal |
+
+### Exit Strategy
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `hard_stop_loss_pct` | f64 | 15.0 | > 0 | Hard stop-loss from entry (15 = 15%) |
+| `trailing_stop_pct` | f64 | 20.0 | > 0 | Trailing stop from ATH (20 = 20%) |
+| `trailing_activation_pct` | f64 | 10.0 | >= 0 | Min profit to activate trailing (10 = 10%) |
+| `take_profit_pct` | f64 | 100.0 | > 0 | Take profit target (100 = 2x) |
+| `max_hold_time_secs` | u64 | 300 | > 0 | Max hold time before forced exit (5 min) |
+| `momentum_exit_buy_ratio` | f64 | 0.4 | 0.0-1.0 | Min buy ratio to stay in position |
+| `momentum_exit_window_secs` | u64 | 30 | > 0 | Check last N seconds for momentum |
+| `momentum_exit_min_trades` | u64 | 5 | > 0 | Min trades needed to evaluate exit |
+
 ### Validation Rules
 - Liquidity values must be >= 0 (0 means disabled)
 - `early_slot_threshold` must be > 0
@@ -164,6 +196,29 @@ Component name: `momentum-bot`
 - `default_position_lamports` must be > 0
 - Percent-like values (`*_pct`, `*_cap`, `*_ratio`, `*_dominance`) must be in [0.0, 1.0]
 - `*_window_secs`, `*_delay_secs`, `*_recovery_secs` must be > 0
+
+---
+
+## Arb Strategy
+
+Component name: `arb-strategy`
+
+### Arbitrage Parameters
+
+| Key | Type | Default | Range | Description |
+|-----|------|---------|-------|-------------|
+| `min_spread_bps` | u32 | 50 | > 0 | Minimum spread between DEX prices (0.5%) |
+| `min_profit_lamports` | u64 | 10_000_000 | > 0 | Min net profit after tx cost (0.01 SOL) |
+| `max_position_lamports` | u64 | 1_000_000_000 | > 0 | Max notional per arb intent (1 SOL) |
+| `est_tx_cost_lamports` | u64 | 50_000 | > 0 | Estimated tx cost for profit gating |
+| `max_slippage_bps` | u32 | 100 | 1-10000 | Max slippage included in intent (1%) |
+| `intent_cooldown_ms` | u64 | 5_000 | > 0 | Cooldown per mint/pair before next intent |
+| `intent_ttl_ms` | u64 | 3_000 | > 0 | Intent time-to-live (ms) |
+
+### Validation Rules
+- `min_spread_bps` must be > 0
+- `min_profit_lamports` must be > `est_tx_cost_lamports`
+- Slippage BPS must be between 1 and 10000
 
 ---
 
@@ -238,7 +293,7 @@ After config updates, monitor:
 If a config change causes issues:
 ```bash
 # Reset to safe defaults
-curl -X POST http://localhost:8000/config \
+curl -X POST http://localhost:8080/config \
   -H "X-API-Key: $ADMIN_KEY" \
   -d '{
     "component": "execution-engine",
@@ -251,7 +306,7 @@ curl -X POST http://localhost:8000/config \
 
 Or use the kill switch:
 ```bash
-curl -X POST http://localhost:8000/kill \
+curl -X POST http://localhost:8080/kill \
   -H "X-API-Key: $ADMIN_KEY" \
   -d '{"reason": "Bad config, rolling back"}'
 ```
