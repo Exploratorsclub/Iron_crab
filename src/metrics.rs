@@ -196,6 +196,19 @@ pub static NATS_MESSAGES_RECEIVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU6
 pub static NATS_RECONNECTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static NATS_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+// --- WsolManager metrics ---
+pub static WSOL_BALANCE_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static WSOL_WRAP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static WSOL_UNWRAP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static WSOL_WRAP_LAMPORTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static WSOL_UNWRAP_LAMPORTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+// --- AccountJanitor metrics ---
+pub static JANITOR_CLOSE_ATA_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static JANITOR_SOL_RECOVERED_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static JANITOR_SWEEP_RUNS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static JANITOR_ACCOUNTS_SCANNED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
 // Global counters (simple, lock-free). For production consider Prometheus exporter.
 pub static QUOTE_REQUESTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static QUOTE_SUCCESSES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -814,6 +827,43 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "nats_errors_total",
         NATS_ERRORS_TOTAL.load(Ordering::Relaxed)
+    );
+
+    // --- WsolManager ---
+    line!(
+        "wsol_balance_lamports",
+        WSOL_BALANCE_LAMPORTS.load(Ordering::Relaxed)
+    );
+    line!("wsol_wrap_total", WSOL_WRAP_TOTAL.load(Ordering::Relaxed));
+    line!(
+        "wsol_unwrap_total",
+        WSOL_UNWRAP_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "wsol_wrap_lamports_total",
+        WSOL_WRAP_LAMPORTS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "wsol_unwrap_lamports_total",
+        WSOL_UNWRAP_LAMPORTS_TOTAL.load(Ordering::Relaxed)
+    );
+
+    // --- AccountJanitor ---
+    line!(
+        "janitor_close_ata_total",
+        JANITOR_CLOSE_ATA_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "janitor_sol_recovered_lamports",
+        JANITOR_SOL_RECOVERED_LAMPORTS.load(Ordering::Relaxed)
+    );
+    line!(
+        "janitor_sweep_runs_total",
+        JANITOR_SWEEP_RUNS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "janitor_accounts_scanned_total",
+        JANITOR_ACCOUNTS_SCANNED_TOTAL.load(Ordering::Relaxed)
     );
 
     // =============================================================================

@@ -653,9 +653,9 @@ mod tests {
             token_y_mint: token_y,
             reserve_x: Pubkey::new_unique(),
             reserve_y: Pubkey::new_unique(),
-            active_id: 8388608, // Neutral price
-            bin_step: 20,       // 0.2% per bin
-            reserve_x_balance: Some(5_000_000_000_000), // 5000 tokens
+            active_id: 8388608,                          // Neutral price
+            bin_step: 20,                                // 0.2% per bin
+            reserve_x_balance: Some(5_000_000_000_000),  // 5000 tokens
             reserve_y_balance: Some(10_000_000_000_000), // 10000 tokens
         };
 
@@ -682,8 +682,8 @@ mod tests {
             observation_key: Pubkey::new_unique(),
             token_0_program: Pubkey::new_unique(), // Token program pubkey
             token_1_program: Pubkey::new_unique(), // Token program pubkey
-            reserve_0: 1_000_000_000_000, // 1000 of token_0
-            reserve_1: 2_000_000_000_000, // 2000 of token_1
+            reserve_0: 1_000_000_000_000,          // 1000 of token_0
+            reserve_1: 2_000_000_000_000,          // 2000 of token_1
             mint_0_decimals: 9,
             mint_1_decimals: 9,
             status: 0,

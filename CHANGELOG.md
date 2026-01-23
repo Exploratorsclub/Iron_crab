@@ -10,6 +10,12 @@ All notable changes to this project will be documented in this file.
 - **AccountJanitor**: Background task for closing empty ATAs and recovering rent
 - **JetStream Integration**: Persistent POOL_CACHE stream for pool state recovery after restarts
 - **TrackedWallet**: Geyser-based wallet balance tracking in market-data binary
+- **Prometheus Metrics** for WsolManager and AccountJanitor:
+  - `wsol_balance_lamports`, `wsol_wrap_total`, `wsol_unwrap_total`
+  - `wsol_wrap_lamports_total`, `wsol_unwrap_lamports_total`
+  - `janitor_close_ata_total`, `janitor_sol_recovered_lamports`
+  - `janitor_sweep_runs_total`, `janitor_accounts_scanned_total`
+- **Multi-Pool Routing BUY Optimization**: `find_best_buy_pool()` for ScaleIn entries, matching SELL optimization
 - Comprehensive unit tests for LivePoolCache (9 tests) and QuoteCalculator (15 tests)
 - `docs/VALIDATOR_SETUP.md`: Consolidated validator deployment guide with optimizations
 

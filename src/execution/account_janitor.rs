@@ -13,12 +13,17 @@ use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use spl_token::solana_program::program_pack::Pack;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::ipc::RecordHeader;
+use crate::metrics::{
+    JANITOR_ACCOUNTS_SCANNED_TOTAL, JANITOR_CLOSE_ATA_TOTAL, JANITOR_SOL_RECOVERED_LAMPORTS,
+    JANITOR_SWEEP_RUNS_TOTAL,
+};
 use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
 
@@ -198,6 +203,8 @@ impl AccountJanitor {
     /// Find and close empty ATAs
     async fn run_close_empty_atas(&self) -> Result<()> {
         info!("AccountJanitor: Starting empty ATA scan");
+        // Update sweep run counter
+        JANITOR_SWEEP_RUNS_TOTAL.fetch_add(1, Ordering::Relaxed);
 
         // Find empty ATAs
         let empty_atas = self.find_empty_atas().await?;
@@ -259,10 +266,15 @@ impl AccountJanitor {
         } else {
             match &result {
                 Ok(sig) => {
+                    // Update Prometheus metrics on success
+                    let sol_recovered = old_enough.len() as u64 * 2_039_280;
+                    JANITOR_CLOSE_ATA_TOTAL.fetch_add(old_enough.len() as u64, Ordering::Relaxed);
+                    JANITOR_SOL_RECOVERED_LAMPORTS.fetch_add(sol_recovered, Ordering::Relaxed);
+
                     info!(
                         signature = %sig,
                         count = old_enough.len(),
-                        sol_recovered = action.sol_recovered_lamports as f64 / 1e9,
+                        sol_recovered = sol_recovered as f64 / 1e9,
                         "Successfully closed empty ATAs"
                     );
                 }
@@ -282,6 +294,9 @@ impl AccountJanitor {
             .rpc
             .get_token_accounts_by_owner(&self.wallet_pubkey)
             .await?;
+
+        // Update scanned accounts metric
+        JANITOR_ACCOUNTS_SCANNED_TOTAL.fetch_add(token_accounts.len() as u64, Ordering::Relaxed);
 
         let mut empty_atas = Vec::new();
 

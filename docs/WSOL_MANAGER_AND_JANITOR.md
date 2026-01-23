@@ -1,6 +1,6 @@
 # WSOL Manager & Account Janitor Implementation
 
-**Status**: Phase 2.4 Complete (AccountJanitor - Close Empty ATAs)  
+**Status**: Phase 3 Complete (Prometheus Metrics)  
 **Created**: 2026-01-20  
 **Last Updated**: 2026-01-21
 
@@ -192,18 +192,22 @@ close_ata_max_per_run = 20          # Max ATAs pro Run
 
 ---
 
-### Phase 3: Monitoring & Observability
+### Phase 3: Monitoring & Observability ✅ COMPLETE
 
-- [ ] Prometheus Metrics:
-  - [ ] `wsol_balance_gauge` - Aktuelle WSOL Balance
-  - [ ] `wsol_wrap_total` - Wrap Counter
-  - [ ] `wsol_unwrap_total` - Unwrap Counter
-  - [ ] `janitor_merge_total` - Merge Counter
-  - [ ] `janitor_swap_total` - Swap Counter
-  - [ ] `janitor_close_ata_total` - Close ATA Counter
-  - [ ] `janitor_sol_recovered_total` - SOL recovered from rent
-- [ ] Logging: Jede Aktion mit Details loggen
-- [ ] DecisionRecords für Wrap/Unwrap/Janitor Aktionen
+- [x] Prometheus Metrics:
+  - [x] `wsol_balance_lamports` - Aktuelle WSOL Balance (gauge)
+  - [x] `wsol_wrap_total` - Wrap Counter
+  - [x] `wsol_unwrap_total` - Unwrap Counter
+  - [x] `wsol_wrap_lamports_total` - Total lamports wrapped
+  - [x] `wsol_unwrap_lamports_total` - Total lamports unwrapped
+  - [x] `janitor_close_ata_total` - Close ATA Counter
+  - [x] `janitor_sol_recovered_lamports` - SOL recovered from rent
+  - [x] `janitor_sweep_runs_total` - Janitor sweep runs
+  - [x] `janitor_accounts_scanned_total` - Total accounts scanned
+- [x] Metrics in `src/metrics.rs` definiert und exportiert
+- [x] Integration in `wsol_manager.rs` und `account_janitor.rs`
+- [ ] Logging: Jede Aktion mit Details loggen (already present via tracing)
+- [ ] DecisionRecords für Wrap/Unwrap/Janitor Aktionen (FUTURE)
 
 ---
 

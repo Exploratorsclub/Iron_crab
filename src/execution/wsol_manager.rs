@@ -40,6 +40,10 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use crate::ipc::RecordHeader;
+use crate::metrics::{
+    WSOL_BALANCE_LAMPORTS, WSOL_UNWRAP_LAMPORTS_TOTAL, WSOL_UNWRAP_TOTAL, WSOL_WRAP_LAMPORTS_TOTAL,
+    WSOL_WRAP_TOTAL,
+};
 use crate::nats::NatsClient;
 use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
@@ -404,6 +408,8 @@ impl WsolManager {
             .store(update.sol_lamports, Ordering::Relaxed);
         if let Some(wsol) = update.wsol_lamports {
             self.wsol_balance.store(wsol, Ordering::Relaxed);
+            // Update Prometheus gauge
+            WSOL_BALANCE_LAMPORTS.store(wsol, Ordering::Relaxed);
         }
 
         debug!(
@@ -578,8 +584,14 @@ impl WsolManager {
                 // Update balances after wrap
                 self.sol_balance
                     .fetch_sub(amount_lamports, Ordering::Relaxed);
-                self.wsol_balance
-                    .fetch_add(amount_lamports, Ordering::Relaxed);
+                let new_wsol = self
+                    .wsol_balance
+                    .fetch_add(amount_lamports, Ordering::Relaxed)
+                    + amount_lamports;
+                // Update Prometheus metrics
+                WSOL_WRAP_TOTAL.fetch_add(1, Ordering::Relaxed);
+                WSOL_WRAP_LAMPORTS_TOTAL.fetch_add(amount_lamports, Ordering::Relaxed);
+                WSOL_BALANCE_LAMPORTS.store(new_wsol, Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
@@ -615,6 +627,10 @@ impl WsolManager {
                 // Update balances after unwrap
                 self.sol_balance.fetch_add(wsol_before, Ordering::Relaxed);
                 self.wsol_balance.store(0, Ordering::Relaxed);
+                // Update Prometheus metrics
+                WSOL_UNWRAP_TOTAL.fetch_add(1, Ordering::Relaxed);
+                WSOL_UNWRAP_LAMPORTS_TOTAL.fetch_add(wsol_before, Ordering::Relaxed);
+                WSOL_BALANCE_LAMPORTS.store(0, Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
