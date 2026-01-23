@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [0.4.0] - 2026-01-23
 ### Added
+- **Multi-Hop Arbitrage Module** (`src/arbitrage/`): N-hop cycle detection for cross-DEX arbitrage
+  - **PoolGraph**: Adjacency-list graph with Top-3 pools per token pair for fallback routing
+  - **PoolRanker**: Probe-based edge ratios (not spot prices), dampened liquidity scoring
+  - **BeamCycleFinder**: Best-First Beam Search with Branch-and-Bound pruning
+  - **Event-Driven Detection**: Triggers on every trade (not interval-based) for minimal latency
+  - **Throttling**: Min price change threshold (0.1%), per-token cooldown (100ms)
+  - **Shadow Mode**: Log opportunities without generating intents (safe rollout)
+  - 24 unit tests covering graph, ranker, cycle finder, and integration
+- **IPC Schema Extensions** for Multi-Hop:
+  - `SwapHop`: Represents one hop in a multi-hop path (pool, dex, input/output mints)
+  - `PoolAlternative`: Fallback pool options per hop for execution resilience
+  - `TradeIntent.swap_path`: Optional multi-hop path with pool alternatives
+  - Helper methods: `is_multi_hop()`, `hop_count()`, `validate_swap_path()`
 - **LivePoolCache**: In-memory pool cache fed by Geyser events with JetStream persistence for state recovery
 - **QuoteCalculator**: Zero-RPC quote calculation for Raydium AMM, Orca Whirlpool, Meteora DLMM
 - **WsolManager**: Event-driven WSOL balance management (wrap/unwrap) via NATS wallet balance updates

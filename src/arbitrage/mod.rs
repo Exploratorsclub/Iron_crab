@@ -1,0 +1,46 @@
+//! Multi-Hop Arbitrage Module
+//!
+//! Implements the Best-First Beam Search algorithm with Branch-and-Bound
+//! for cycle detection in the pool graph.
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌─────────────┐     ┌─────────────┐     ┌─────────────────┐
+//! │  PoolGraph  │────▶│ PoolRanker  │────▶│ BeamCycleFinder │
+//! │ (adjacency) │     │(probe quotes)│     │ (search algo)   │
+//! └─────────────┘     └─────────────┘     └─────────────────┘
+//!                                                  │
+//!                                                  ▼
+//!                                          ┌─────────────┐
+//!                                          │  ArbCycle   │
+//!                                          │ (with alts) │
+//!                                          └─────────────┘
+//! ```
+//!
+//! # Key Design Decisions
+//!
+//! 1. **Probe-based edge ratios** - NOT spot prices! Accounts for fees & curve shape.
+//! 2. **Top-K beam limit** - Proper score-based selection, not First-K.
+//! 3. **Dampened liquidity** - `clamp(liq/baseline, 0.3, 1.5)` instead of `sqrt()`.
+//! 4. **Pool alternatives** - Top-3 pools per hop for execution fallback.
+//!
+//! See `docs/MULTI_HOP_ARBITRAGE.md` for full algorithm design.
+
+pub mod cycle_finder;
+pub mod multi_hop_integration;
+pub mod pool_graph;
+pub mod pool_ranker;
+pub mod types;
+
+// Re-exports for convenient access
+pub use cycle_finder::{BeamCycleFinder, CycleFinderConfig};
+pub use multi_hop_integration::{
+    CachedQuoteProvider, MultiHopArbitrage, MultiHopConfig, MultiHopStats, WSOL_MINT,
+};
+pub use pool_graph::{GraphStats, PoolGraph};
+pub use pool_ranker::{PoolRanker, QuoteProvider, RankerConfig};
+pub use types::{ArbCycle, DexType, ParseDexTypeError, PoolEdge, RankedPool, SearchNode};
+
+#[cfg(any(test, feature = "test_helpers"))]
+pub use pool_ranker::MockQuoteProvider;

@@ -830,6 +830,7 @@ mod tests {
             hint_urgency: None,
             metadata: Default::default(),
             execution: None,
+            swap_path: None,
             resources: TradeResources {
                 input_mint: input_mint.to_string(),
                 output_mint: output_mint.to_string(),

@@ -730,6 +730,19 @@ pub struct TradeIntent {
     /// Backward compatible: older producers omit this field.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub execution: Option<TradeExecutionConstraints>,
+
+    // === Multi-Hop Arbitrage ===
+    /// Multi-hop swap path for N-hop arbitrage cycles.
+    ///
+    /// If present, execution-engine should execute hops sequentially (or atomically via Jito bundle).
+    /// If None, legacy 2-hop routing via `resources.pools` is used.
+    ///
+    /// Semantics:
+    /// - `swap_path[0].input_mint` == base token (usually WSOL)
+    /// - `swap_path[N-1].output_mint` == base token (cycle returns to start)
+    /// - Each hop has `pool_alternatives` for fallback routing
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub swap_path: Option<Vec<SwapHop>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -752,6 +765,106 @@ pub struct TradeResources {
     /// - Token-2022: "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub token_program: Option<String>,
+}
+
+// ============================================================================
+// Multi-Hop Arbitrage Types (for N-hop swap paths)
+// ============================================================================
+
+/// Alternative pool for fallback routing in multi-hop swaps.
+///
+/// When the primary pool fails (slippage, insufficient liquidity, etc.),
+/// execution-engine can try these alternatives in order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PoolAlternative {
+    /// Pool address (base58)
+    pub pool_address: String,
+    /// DEX type identifier (e.g., "raydium_amm_v4", "orca", "meteora_dlmm")
+    pub dex: String,
+    /// Pre-computed expected output for this alternative (may differ from primary).
+    /// Set to 0 if not pre-computed; execution-engine will quote on-the-fly.
+    #[serde(default)]
+    pub expected_output: u64,
+}
+
+/// Single hop in a multi-hop swap path.
+///
+/// Each hop represents one swap operation. For N-hop arbitrage:
+/// - Hop 0: WSOL → Token_A
+/// - Hop 1: Token_A → Token_B
+/// - ...
+/// - Hop N-1: Token_X → WSOL (return to base)
+///
+/// Design notes (from external review):
+/// - `pool_alternatives` contains backup pools for execution fallback
+/// - `expected_output` is from probe quotes, NOT spot price
+/// - execution-engine should re-quote before executing
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SwapHop {
+    /// Primary pool address (best option from cycle finder)
+    pub pool_address: String,
+    /// DEX type identifier
+    pub dex: String,
+    /// Input mint for this hop (base58)
+    pub input_mint: String,
+    /// Output mint for this hop (base58)
+    pub output_mint: String,
+    /// Expected output amount from probe quote (for slippage estimation).
+    /// This is indicative; execution-engine will re-quote with actual amount.
+    pub expected_output: u64,
+    /// Alternative pools for this hop (sorted by preference, best first).
+    /// Used for fallback if primary pool fails.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool_alternatives: Vec<PoolAlternative>,
+}
+
+impl SwapHop {
+    /// Create a new swap hop with primary pool only
+    pub fn new(
+        pool_address: String,
+        dex: String,
+        input_mint: String,
+        output_mint: String,
+        expected_output: u64,
+    ) -> Self {
+        Self {
+            pool_address,
+            dex,
+            input_mint,
+            output_mint,
+            expected_output,
+            pool_alternatives: Vec::new(),
+        }
+    }
+
+    /// Create with alternatives
+    pub fn with_alternatives(
+        pool_address: String,
+        dex: String,
+        input_mint: String,
+        output_mint: String,
+        expected_output: u64,
+        alternatives: Vec<PoolAlternative>,
+    ) -> Self {
+        Self {
+            pool_address,
+            dex,
+            input_mint,
+            output_mint,
+            expected_output,
+            pool_alternatives: alternatives,
+        }
+    }
+
+    /// Check if this hop has fallback options
+    pub fn has_alternatives(&self) -> bool {
+        !self.pool_alternatives.is_empty()
+    }
+
+    /// Get total pool count (primary + alternatives)
+    pub fn pool_count(&self) -> usize {
+        1 + self.pool_alternatives.len()
+    }
 }
 
 // ============================================================================
@@ -881,6 +994,7 @@ impl TradeIntent {
             hint_urgency: None,
             metadata: std::collections::HashMap::new(),
             execution: None,
+            swap_path: None,
         }
     }
 
@@ -974,6 +1088,61 @@ impl TradeIntent {
     /// Get effective urgency level (0=normal if not specified)
     pub fn urgency(&self) -> u8 {
         self.hint_urgency.unwrap_or(0)
+    }
+
+    // === Multi-Hop Helpers ===
+
+    /// Set multi-hop swap path for N-hop arbitrage
+    pub fn with_swap_path(mut self, path: Vec<SwapHop>) -> Self {
+        self.swap_path = Some(path);
+        self
+    }
+
+    /// Check if this is a multi-hop intent
+    pub fn is_multi_hop(&self) -> bool {
+        self.swap_path.as_ref().map(|p| p.len() > 1).unwrap_or(false)
+    }
+
+    /// Get hop count (1 for legacy, N for multi-hop)
+    pub fn hop_count(&self) -> usize {
+        self.swap_path.as_ref().map(|p| p.len()).unwrap_or(1)
+    }
+
+    /// Validate multi-hop path consistency
+    ///
+    /// Returns Err if:
+    /// - Path is empty
+    /// - Hops don't chain correctly (output != next input)
+    /// - Path doesn't form a cycle (first input != last output) when expected
+    pub fn validate_swap_path(&self) -> Result<(), String> {
+        let Some(path) = &self.swap_path else {
+            return Ok(()); // Legacy intent, no path to validate
+        };
+
+        if path.is_empty() {
+            return Err("swap_path is empty".to_string());
+        }
+
+        // Validate hop chaining
+        for i in 0..path.len() - 1 {
+            if path[i].output_mint != path[i + 1].input_mint {
+                return Err(format!(
+                    "hop {} output ({}) != hop {} input ({})",
+                    i, path[i].output_mint, i + 1, path[i + 1].input_mint
+                ));
+            }
+        }
+
+        // For arbitrage cycles, validate that it returns to start
+        if path.len() > 1 && path.first().unwrap().input_mint != path.last().unwrap().output_mint {
+            return Err(format!(
+                "path doesn't form cycle: first input ({}) != last output ({})",
+                path.first().unwrap().input_mint,
+                path.last().unwrap().output_mint
+            ));
+        }
+
+        Ok(())
     }
 }
 

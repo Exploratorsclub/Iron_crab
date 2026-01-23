@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use ironcrab::arbitrage::{MultiHopArbitrage, MultiHopConfig};
 use ironcrab::config::Config as AppConfig;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
@@ -555,6 +556,13 @@ struct ArbContext {
     /// Updated from PoolCacheUpdate::PoolDiscovered/PoolRemoved events.
     /// ONLY generate intents for pools in this set - ensures execution-engine can execute them.
     known_pools: RwLock<HashSet<String>>,
+
+    // =========================================================================
+    // Multi-Hop Arbitrage (Shadow Mode by default)
+    // =========================================================================
+    /// Multi-hop arbitrage engine for N-hop cycle detection.
+    /// Disabled by default (shadow_mode=true). See docs/MULTI_HOP_ARBITRAGE.md
+    multi_hop: MultiHopArbitrage,
 }
 
 /// Cached vault balances from PoolStateUpdate events
@@ -1429,6 +1437,8 @@ async fn main() -> Result<()> {
         vault_balances: RwLock::new(HashMap::new()),
         bin_arrays: RwLock::new(HashMap::new()),
         known_pools: RwLock::new(HashSet::new()),
+        // Multi-hop arbitrage: disabled and shadow mode by default for safe rollout
+        multi_hop: MultiHopArbitrage::new(MultiHopConfig::default()),
     });
 
     // Bootstrap known_pools from JetStream (state recovery after restart)
@@ -1607,10 +1617,27 @@ async fn main() -> Result<()> {
                                 PoolCacheUpdateType::PoolDiscovered => {
                                     ctx.known_pools.write().insert(update.pool_address.clone());
                                     debug!(pool = %update.pool_address, dex = %update.dex, "SLAVE CACHE: Pool added to known_pools");
+
+                                    // Multi-hop: Add pool to graph for N-hop arbitrage detection
+                                    // Liquidity in USD approximated as lamports / 1e9 * SOL_PRICE (assume $150)
+                                    let liquidity_usd = update.liquidity_lamports
+                                        .map(|l| l as f64 / 1e9 * 150.0)
+                                        .unwrap_or(10_000.0); // Default 10k USD if unknown
+                                    ctx.multi_hop.upsert_pool(
+                                        &update.pool_address,
+                                        &update.dex,
+                                        &update.base_mint,
+                                        &update.quote_mint,
+                                        liquidity_usd,
+                                        30, // Default 0.3% fee; TODO: get from metadata
+                                    );
                                 }
                                 PoolCacheUpdateType::PoolRemoved => {
                                     ctx.known_pools.write().remove(&update.pool_address);
                                     debug!(pool = %update.pool_address, "SLAVE CACHE: Pool removed from known_pools");
+
+                                    // Multi-hop: Remove pool from graph
+                                    ctx.multi_hop.remove_pool(&update.pool_address);
                                 }
                                 PoolCacheUpdateType::BalanceUpdated => {
                                     // Balance updates don't affect pool existence, just state
@@ -1634,6 +1661,7 @@ async fn main() -> Result<()> {
                     .count();
 
                 let known_pools_count = ctx.known_pools.read().len();
+                let multi_hop_stats = ctx.multi_hop.stats();
 
                 // Prometheus: publish current gauges for this process
                 POOLS_TRACKED_GAUGE.store(ctx.pools_tracked.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -1652,6 +1680,12 @@ async fn main() -> Result<()> {
                     // Data quality metrics
                     zero_amount_trades = ctx.zero_amount_trades.load(Ordering::Relaxed),
                     data_quality_rejects = ctx.data_quality_rejects.load(Ordering::Relaxed),
+                    // Multi-hop stats
+                    multi_hop_vertices = multi_hop_stats.graph_vertices,
+                    multi_hop_pools = multi_hop_stats.graph_pools,
+                    multi_hop_cycles_found = multi_hop_stats.cycles_found,
+                    multi_hop_profitable = multi_hop_stats.cycles_profitable,
+                    multi_hop_enabled = ctx.multi_hop.is_enabled(),
                     "arb-strategy heartbeat (SLAVE cache sync from market-data MASTER)"
                 );
             }
@@ -1713,6 +1747,53 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             dex,
             ..
         } => {
+            // Multi-hop: Event-driven cycle detection on every trade
+            // This runs in parallel with the existing 2-hop detection
+            if ctx.multi_hop.is_enabled() {
+                // Determine input/output mints based on trade direction
+                let (input_mint, output_mint) = if *is_buy {
+                    // Buy token: SOL -> Token
+                    (NATIVE_SOL_MINT, mint.as_str())
+                } else {
+                    // Sell token: Token -> SOL
+                    (mint.as_str(), NATIVE_SOL_MINT)
+                };
+
+                let multi_hop_intents = ctx.multi_hop.on_pool_price_update(
+                    pool_address,
+                    input_mint,
+                    output_mint,
+                    *sol_amount,
+                    *token_amount,
+                    "arb-strategy",
+                    BUILD_VERSION,
+                    &ctx.run_id,
+                );
+
+                // Publish any multi-hop intents found
+                for intent in multi_hop_intents {
+                    if let Err(e) = ctx.jsonl_writer.write(&intent) {
+                        error!(error = %e, "Failed to write multi-hop intent to JSONL");
+                    }
+                    if let Some(ref nats) = ctx.nats {
+                        if let Err(e) = nats.publish(TOPIC_TRADE_INTENTS, &intent).await {
+                            warn!(error = %e, "Failed to publish multi-hop intent");
+                        } else {
+                            NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            INTENTS_GENERATED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            ctx.intents_generated.fetch_add(1, Ordering::Relaxed);
+                            info!(
+                                intent_id = %intent.intent_id,
+                                hops = intent.hop_count(),
+                                return_bps = intent.expected_roi_bps,
+                                "🎯 Multi-hop arb intent published"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Existing 2-hop arbitrage detection
             if let Some(opp) = ctx.handle_trade(
                 pool_address,
                 mint,

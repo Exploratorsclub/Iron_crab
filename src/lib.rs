@@ -1,3 +1,4 @@
+pub mod arbitrage;
 pub mod audit;
 pub mod config;
 pub mod execution;
