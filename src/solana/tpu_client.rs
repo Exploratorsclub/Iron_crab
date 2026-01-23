@@ -22,11 +22,14 @@
 use anyhow::Result;
 use solana_sdk::{signature::Signature, transaction::Transaction};
 use std::sync::Arc;
-use tracing::warn;
 
 // info! is used on Linux only
 #[cfg(not(windows))]
 use tracing::info;
+
+// warn! is used on Windows only (stub)
+#[cfg(windows)]
+use tracing::warn;
 
 /// Error types specific to TPU submission
 #[derive(Debug, thiserror::Error)]
@@ -113,11 +116,13 @@ impl TpuSubmitter {
             ..TpuClientConfig::default()
         };
 
-        // Create QUIC connection manager
+        // Create QUIC connection manager (Solana 3.0 API)
+        let quic_config = QuicConfig::new()?;
+        let connection_manager = QuicConnectionManager::new_with_connection_config(quic_config);
         let connection_cache = ConnectionCache::<QuicPool, QuicConnectionManager, QuicConfig>::new(
             "ironcrab-tpu",
+            connection_manager,
             solana_connection_cache::connection_cache::DEFAULT_CONNECTION_POOL_SIZE,
-            solana_quic_client::QuicConfig::default(),
         )?;
 
         // Create TPU client with connection cache
@@ -191,10 +196,14 @@ impl TpuSubmitter {
             ..TpuClientConfig::default()
         };
 
+        // Create QUIC connection manager (Solana 3.0 API)
+        let quic_config = QuicConfig::new()
+            .map_err(|e| TpuError::ReconnectFailed(format!("{:?}", e)))?;
+        let connection_manager = QuicConnectionManager::new_with_connection_config(quic_config);
         let connection_cache = ConnectionCache::<QuicPool, QuicConnectionManager, QuicConfig>::new(
             "ironcrab-tpu",
+            connection_manager,
             solana_connection_cache::connection_cache::DEFAULT_CONNECTION_POOL_SIZE,
-            solana_quic_client::QuicConfig::default(),
         )
         .map_err(|e| TpuError::ReconnectFailed(format!("{:?}", e)))?;
 
