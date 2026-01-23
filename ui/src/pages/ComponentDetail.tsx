@@ -88,6 +88,16 @@ const RELEVANT_METRICS: Record<string, string[]> = {
     'intents_rejected_total',
     'tx_confirmed_total',
     'simulation_failures_total',
+    // WSOL Manager metrics
+    'wsol_balance_lamports',
+    'wsol_wrap_total',
+    'wsol_unwrap_total',
+    // Account Janitor metrics
+    'janitor_close_ata_total',
+    'janitor_sol_recovered_lamports',
+    'janitor_merge_dust_total',
+    'janitor_swap_dust_total',
+    'janitor_swap_dust_sol_recovered_lamports',
   ],
 }
 
@@ -191,6 +201,31 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     simulation_timeout_ms: 'Ops: Simulation timeout (ms)',
     confirmation_timeout_ms: 'Ops: Confirmation timeout (ms)',
     send_enabled: 'Ops: If true, engine sends txs; if false, simulate-gated only',
+    // WSOL Manager
+    wsol_enabled: 'WSOL: Enable automatic WSOL management',
+    wsol_min_wsol_sol: 'WSOL: Wrap trigger - wrap when WSOL below this (SOL)',
+    wsol_target_wsol_sol: 'WSOL: Target WSOL balance after wrap (SOL)',
+    wsol_max_wsol_sol: 'WSOL: Unwrap trigger - unwrap when WSOL above this (SOL)',
+    wsol_min_native_sol: 'WSOL: Reserve native SOL for rent (SOL)',
+    wsol_cooldown_secs: 'WSOL: Cooldown between wrap/unwrap actions (seconds)',
+    wsol_dry_run: 'WSOL: Dry-run mode (log only, no TX)',
+    // Account Janitor
+    janitor_enabled: 'JANITOR: Enable account cleanup background task',
+    janitor_dry_run: 'JANITOR: Dry-run mode (log only, no TX)',
+    // Close ATAs
+    janitor_close_ata_interval_secs: 'CLOSE ATA: Interval for closing empty ATAs (seconds)',
+    janitor_close_ata_min_age_secs: 'CLOSE ATA: Min age before closing empty ATA (seconds)',
+    janitor_close_ata_max_per_run: 'CLOSE ATA: Max ATAs to close per run',
+    // Merge Dust
+    janitor_merge_dust_enabled: 'MERGE: Enable merging duplicate ATAs for same token',
+    janitor_merge_dust_interval_secs: 'MERGE: Interval for merge runs (seconds)',
+    janitor_merge_dust_max_per_run: 'MERGE: Max tokens to merge per run',
+    // Swap Dust
+    janitor_swap_dust_enabled: 'SWAP: Enable swapping dust tokens to SOL',
+    janitor_swap_dust_interval_secs: 'SWAP: Interval for swap runs (seconds)',
+    janitor_swap_dust_min_value_sol: 'SWAP: Min token value to swap (SOL)',
+    janitor_swap_dust_max_slippage_bps: 'SWAP: Max slippage for dust swaps (bps)',
+    janitor_swap_dust_max_per_run: 'SWAP: Max tokens to swap per run',
   },
 }
 
@@ -303,6 +338,34 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
       'confirmation_timeout_ms',
       'send_enabled',
     ],
+    'WSOL Manager': [
+      'wsol_enabled',
+      'wsol_min_wsol_sol',
+      'wsol_target_wsol_sol',
+      'wsol_max_wsol_sol',
+      'wsol_min_native_sol',
+      'wsol_cooldown_secs',
+      'wsol_dry_run',
+    ],
+    'Janitor: Close ATAs': [
+      'janitor_enabled',
+      'janitor_close_ata_interval_secs',
+      'janitor_close_ata_min_age_secs',
+      'janitor_close_ata_max_per_run',
+    ],
+    'Janitor: Merge Dust': [
+      'janitor_merge_dust_enabled',
+      'janitor_merge_dust_interval_secs',
+      'janitor_merge_dust_max_per_run',
+    ],
+    'Janitor: Swap Dust → SOL': [
+      'janitor_swap_dust_enabled',
+      'janitor_swap_dust_interval_secs',
+      'janitor_swap_dust_min_value_sol',
+      'janitor_swap_dust_max_slippage_bps',
+      'janitor_swap_dust_max_per_run',
+      'janitor_dry_run',
+    ],
   },
 }
 
@@ -406,6 +469,28 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     simulation_timeout_ms: 2_000,
     confirmation_timeout_ms: 30_000,
     send_enabled: false,
+    // WSOL Manager defaults
+    wsol_enabled: false,
+    wsol_min_wsol_sol: 0.5,
+    wsol_target_wsol_sol: 1.0,
+    wsol_max_wsol_sol: 2.0,
+    wsol_min_native_sol: 0.1,
+    wsol_cooldown_secs: 30,
+    wsol_dry_run: false,
+    // Account Janitor defaults
+    janitor_enabled: false,
+    janitor_dry_run: false,
+    janitor_close_ata_interval_secs: 3600,
+    janitor_close_ata_min_age_secs: 86400,
+    janitor_close_ata_max_per_run: 10,
+    janitor_merge_dust_enabled: false,
+    janitor_merge_dust_interval_secs: 300,
+    janitor_merge_dust_max_per_run: 5,
+    janitor_swap_dust_enabled: false,
+    janitor_swap_dust_interval_secs: 86400,
+    janitor_swap_dust_min_value_sol: 0.001,
+    janitor_swap_dust_max_slippage_bps: 500,
+    janitor_swap_dust_max_per_run: 5,
   },
 }
 
