@@ -231,8 +231,12 @@ Component name: `market-data`
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enable_raydium` | bool | true | Enable Raydium AMM V4 pool discovery |
+| `enable_raydium_cpmm` | bool | true | Enable Raydium CPMM (concentrated liquidity) discovery |
 | `enable_orca` | bool | true | Enable Orca Whirlpool discovery |
 | `enable_pumpfun` | bool | true | Enable PumpFun bonding curve discovery |
+| `enable_pumpswap` | bool | true | Enable PumpSwap AMM (graduated tokens) discovery |
+| `enable_meteora_dlmm` | bool | true | Enable Meteora DLMM (dynamic AMM) discovery |
+| `enable_meteora_cpmm` | bool | true | Enable Meteora CPMM discovery |
 
 ### Rate Limiting
 

@@ -89,8 +89,10 @@ struct MarketDataConfig {
     enable_raydium_cpmm: bool,
     /// Enable Orca discovery. Default: true
     enable_orca: bool,
-    /// Enable PumpFun discovery. Default: true
+    /// Enable PumpFun bonding curve discovery. Default: true
     enable_pumpfun: bool,
+    /// Enable PumpSwap AMM (post-bonding) discovery. Default: true
+    enable_pumpswap: bool,
     /// Enable Meteora DLMM discovery. Default: true
     enable_meteora_dlmm: bool,
     /// Enable Meteora CPMM discovery. Default: true
@@ -106,6 +108,7 @@ impl Default for MarketDataConfig {
             enable_raydium_cpmm: true,
             enable_orca: true,
             enable_pumpfun: true,
+            enable_pumpswap: true,
             enable_meteora_dlmm: true,
             enable_meteora_cpmm: true,
             max_events_per_sec: 10_000,
@@ -295,6 +298,15 @@ impl MarketDataContext {
                         rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                     }
                 }
+                "enable_raydium_cpmm" => {
+                    if let Some(v) = value.as_bool() {
+                        config.enable_raydium_cpmm = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
                 "enable_orca" => {
                     if let Some(v) = value.as_bool() {
                         config.enable_orca = v;
@@ -307,6 +319,33 @@ impl MarketDataContext {
                 "enable_pumpfun" => {
                     if let Some(v) = value.as_bool() {
                         config.enable_pumpfun = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "enable_pumpswap" => {
+                    if let Some(v) = value.as_bool() {
+                        config.enable_pumpswap = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "enable_meteora_dlmm" => {
+                    if let Some(v) = value.as_bool() {
+                        config.enable_meteora_dlmm = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "enable_meteora_cpmm" => {
+                    if let Some(v) = value.as_bool() {
+                        config.enable_meteora_cpmm = v;
                         applied.push(key.clone());
                         info!(key = %key, new_value = %v, "Config updated");
                     } else {

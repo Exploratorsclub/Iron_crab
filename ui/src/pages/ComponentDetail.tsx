@@ -93,6 +93,18 @@ const RELEVANT_METRICS: Record<string, string[]> = {
 
 // Config field descriptions (for tooltips/help text)
 const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
+  'market-data': {
+    // DEX Discovery Toggles
+    enable_raydium: 'DEX: Enable Raydium AMM V4 pool discovery',
+    enable_raydium_cpmm: 'DEX: Enable Raydium CPMM (concentrated liquidity) discovery',
+    enable_orca: 'DEX: Enable Orca Whirlpool discovery',
+    enable_pumpfun: 'DEX: Enable PumpFun bonding curve discovery',
+    enable_pumpswap: 'DEX: Enable PumpSwap AMM (graduated tokens) discovery',
+    enable_meteora_dlmm: 'DEX: Enable Meteora DLMM (dynamic AMM) discovery',
+    enable_meteora_cpmm: 'DEX: Enable Meteora CPMM discovery',
+    // Rate Limiting
+    max_events_per_sec: 'RATE: Max MarketEvents per second (throttle)',
+  },
   'momentum-bot': {
     // Entry Filters
     early_min_liquidity_sol: 'ENTRY: Min liquidity for early-stage tokens (SOL)',
@@ -184,6 +196,20 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
 
 // Config parameter grouping (for better UI structure)
 const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
+  'market-data': {
+    'DEX Discovery': [
+      'enable_raydium',
+      'enable_raydium_cpmm',
+      'enable_orca',
+      'enable_pumpfun',
+      'enable_pumpswap',
+      'enable_meteora_dlmm',
+      'enable_meteora_cpmm',
+    ],
+    'Rate Limiting': [
+      'max_events_per_sec',
+    ],
+  },
   'momentum-bot': {
     'Entry Filters': [
       'early_min_liquidity_sol',
@@ -360,7 +386,18 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     intent_cooldown_ms: 5_000,
     intent_ttl_ms: 3_000,
   },
-  'market-data': {},
+  'market-data': {
+    // DEX Discovery Toggles
+    enable_raydium: true,
+    enable_raydium_cpmm: true,
+    enable_orca: true,
+    enable_pumpfun: true,
+    enable_pumpswap: true,
+    enable_meteora_dlmm: true,
+    enable_meteora_cpmm: true,
+    // Rate Limiting
+    max_events_per_sec: 10_000,
+  },
   'execution-engine': {
     max_position_size_lamports: 500_000_000,
     daily_loss_limit_lamports: 5_000_000_000,
