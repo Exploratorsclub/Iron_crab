@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-01-23
+### Added
+- **LivePoolCache**: In-memory pool cache fed by Geyser events with JetStream persistence for state recovery
+- **QuoteCalculator**: Zero-RPC quote calculation for Raydium AMM, Orca Whirlpool, Meteora DLMM
+- **WsolManager**: Event-driven WSOL balance management (wrap/unwrap) via NATS wallet balance updates
+- **AccountJanitor**: Background task for closing empty ATAs and recovering rent
+- **JetStream Integration**: Persistent POOL_CACHE stream for pool state recovery after restarts
+- **TrackedWallet**: Geyser-based wallet balance tracking in market-data binary
+- Comprehensive unit tests for LivePoolCache (9 tests) and QuoteCalculator (15 tests)
+- `docs/VALIDATOR_SETUP.md`: Consolidated validator deployment guide with optimizations
+
+### Changed
+- **Multi-Process Architecture**: Fully migrated from monolith to 6 independent services:
+  - `execution-engine` (port 9804): Intent processing, TX building, signing, sending
+  - `momentum-bot` (port 9802): Momentum strategy, TradeIntent generation
+  - `market-data` (port 9801): Geyser ingest, pool discovery, MarketEvents publishing
+  - `arb-strategy` (port 9803): Cross-DEX arbitrage detection
+  - `control-plane` (port 8080): FastAPI dashboard, risk controls
+  - `trades-server` (port 9899): Trade history API
+- **NATS IPC**: All inter-process communication via NATS pub/sub (versioned topics `ironcrab.v1.*`)
+- **Systemd Orchestration**: `ironcrab.target` orchestrates all services with proper dependencies
+- **Arb-TX Optimization**: Removed WSOL wrap from swap plan (~21k CU saved per TX)
+- Validator config: Ledger 100M slots, 320GB cache, 16GB scan buffer, 9 account index keys
+
+### Removed
+- **Backtest Module**: Deleted entire `src/backtest/` directory (10 files), `backtest_driver.rs`, `recorder.rs`
+- **Legacy Scripts**: Removed `run.ps1`, `run.sh`, `backtest.ps1`, `backtest.sh`
+- **Obsolete Docs**: Deleted `BACKTESTING.md`, `TRADE_PARSING_STATUS.md`, `QUANTILE_SLIPPAGE.md`, `REAL_SEND_*.md`, `MULTI_POOL_ROUTING_IMPLEMENTATION.md`
+- **Dead Code**: Removed `refresh_pools_replay()` from Raydium/Orca DEX connectors, `quantile_impact.rs`
+
+### Fixed
+- Token-2022 ATA creation in cross-DEX arbitrage
+- Meteora DLMM bin_array_bitmap_extension errors (AccountOwnedByWrongProgram)
+- Orca Whirlpool missing tick_current_index/tick_spacing fields
+
+### Documentation
+- Updated `TARGET_ARCHITECTURE.md` with JetStream, LivePoolCache, metrics ports
+- Rewrote `RUNBOOK_PROD.md` for multi-process operations
+- Rewrote `SCRIPTS_README.md` with current deploy/monitoring scripts
+- Consolidated `VALIDATOR_SETUP.md` (merged optimization deployment guide)
+
 ## [0.3.2-dev] - 2026-01-16
 ### Added
 - **Token-2022 Support via Intent**: `TradeResources.token_program` field allows strategies to pass token program info directly in intents, avoiding `IncorrectProgramId` errors for Token-2022 tokens.

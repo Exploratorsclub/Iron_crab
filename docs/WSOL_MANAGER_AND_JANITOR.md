@@ -88,11 +88,10 @@ enabled = true
 merge_dust_interval_secs = 300      # 5 min
 merge_dust_min_value_sol = 0.001    # Nur wenn > 0.001 SOL wert
 
-# Swap dust → SOL
+# Swap dust → SOL (via interne DEX-Integration)
 swap_dust_interval_secs = 86400     # 24h
 swap_dust_min_value_sol = 0.01      # Nur wenn > 0.01 SOL wert
 swap_dust_max_slippage_bps = 500    # 5% max slippage
-swap_dust_use_jupiter = true        # Jupiter API für beste Route
 
 # Close empty ATAs
 close_ata_interval_secs = 604800    # 7 Tage
@@ -262,7 +261,6 @@ src/bin/
 Keine neuen crates nötig, alles bereits vorhanden:
 - `solana-sdk` - TX Building
 - `spl-token` - Token Instructions
-- `reqwest` - Jupiter API (falls benötigt)
 - `tokio` - Async runtime
 
 ---

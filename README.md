@@ -1,17 +1,18 @@
 ﻿# IronCrab – Solana‑First Tradingbot (Rust)
 
-Version: **0.3.2-dev** (Agave / Solana 3.x)
+Version: **0.4.0** (Agave / Solana 3.x)
 
-Dieses Repository befindet sich in einem **Debuggable-First Architektur-Umbau** (Multi-Prozess, deterministisch, intent-only). Der Validator (Agave 3.x) läuft co-located für minimale Latenz.
+**Multi-Process Architektur** mit 6 unabhängigen Services, NATS IPC, JetStream State Recovery und co-located Validator (Agave 3.x) für minimale Latenz.
 
-## Architektur-Umbau Status (Debuggable-First)
+## Architektur
 
-**Source of Truth (bei Widerspruch gewinnt diese Doku):**
+**Source of Truth:**
 - `docs/TARGET_ARCHITECTURE.md`
 - `docs/DEFINITION_OF_DONE.md`
 - `docs/STORAGE_CONVENTIONS.md`
+- `docs/RUNBOOK_PROD.md`
 
-**Non-negotiables (P0 / Live-verboten ohne Erfüllung):**
+**Non-negotiables (P0):**
 - **Single-Signer**: Nur die Execution Engine signiert/sendet.
 - **Intent-only**: Strategien/Worker erzeugen nur `TradeIntent`s.
 - **Simulate-gated**: Simulation-fail ⇒ niemals senden (insb. Arbitrage).
@@ -176,13 +177,12 @@ Trade Logging
 - Felder: Zeit, Side, Mint, DEX, Signature, In/Out Lamports, Tokens, Expected, Shortfall, Fee, Realized PnL, Notes
 - Shortfall Analyse (expected vs actual Fill Tokens) & Fee Schätzung (`get_fee_for_message`)
 
-Backtest & Tools
-- Backtest Engine + Scenario Runner (Size/Slippage Sweep, Impact-Knobs) + Tests
-- CLI: `raydium_pools`, `backtest_driver`
+Tools
+- CLI: `raydium_pools` - Pool information viewer
 
-## 🚀 Quickstart Guide
+## 🚀 Local Development Guide
 
-Hinweis: Dieser Quickstart bezieht sich auf den aktuellen Legacy/Monolith-Stand. Für den Umbau gilt: Keys gehören ausschließlich in die `execution-engine`, Strategien sind keyless und senden nie direkt. Siehe `docs/TARGET_ARCHITECTURE.md` + `docs/DEFINITION_OF_DONE.md`.
+**Wichtig:** Keys gehören ausschließlich in die `execution-engine`. Alle anderen Prozesse sind keyless und erzeugen nur Intents.
 
 ### Prerequisites
 1. **Rust Installation**: Ensure you have Rust installed (latest stable)
@@ -326,18 +326,8 @@ Neues Binary `latency_stress` misst parallel Quote‑ und Swap‑Plan‑Latenzen
 Beispiel (PowerShell):
 ```powershell
 $env:SOLANA_RPC_URL="http://127.0.0.1:8899";
-cargo run --bin latency_stress -- --duration-secs 30 --concurrency 64 --w-single 2 --w-hops2 1 --w-hops3 1 --w-plan2 1
+cargo run --bin latency_stress -- --duration-secs 30 --concurrency 64
 ```
-
-### Backtest: Replay & Impact Modelle
-- Replay Loader: JSONL/JSON Trace Dateien werden eingelesen (`backtest::replay::load_trace`). Unterstützt aktuell Slot & Log Events; Account Events folgen.
-- Impact Model: Pluggable Slippage/Impact Modell für Backtests. CLI Schalter `--impact cpmm|clmm|none` auf `backtest_driver`.
-- Scenario Runner: Parametrisierte Läufe (Sizes, Slippage Bps, Impact-Profile) inkl. ScenarioMeta-Injektion. Siehe auch `docs/BACKTESTING.md` (Quickstart).
-- Beispiel (PowerShell):
-```powershell
-cargo run --bin backtest_driver -- --replay-trace .\traces\sample.jsonl --replay-start 250000000 --replay-end 250000120 --impact cpmm
-```
-Hinweis: Ohne `--replay-trace` generiert der Driver eine minimale Slot-Sequenz. `clmm` ist derzeit ein Platzhalter (CPMM-Fallback).
 
 ## Build & Run (PowerShell)
 ```powershell
@@ -345,7 +335,7 @@ cargo run --release -- --config .\config.example.toml
 ```
 
 ### Fuzzing
-Parser (Replay-Loader, Orca Whirlpool Layout) werden via `cargo-fuzz` getestet:
+Parser (Orca Whirlpool Layout) werden via `cargo-fuzz` getestet:
 ```bash
 cargo install cargo-fuzz
 cd fuzz
@@ -496,35 +486,6 @@ Hinweise:
 ```powershell
 cargo run --release --features python -- --config .\config.example.toml
 ```
-Backtesting (IPC Variante): Für Backtests steht zusätzlich eine einfache IPC‑Strategie zur Verfügung, die bei jedem Event ein Python‑Skript als Prozess startet, das eine `StrategyDecision` als JSON an stdout schreibt. Erwartetes Protokoll: stdin erhält genau ein Zeile JSON des `SimEvent`, stdout liefert genau eine `StrategyDecision` JSON.
-
-Beispiel Python (vereinfachtes Echo):
-```python
-import sys, json
-ev = json.loads(sys.stdin.readline())
-print(json.dumps({"actions": []}))
-```
-Verwendung im Backtest‑Code: `PyProcStrategy::new("python", ["strategies/sample.py"])` (unter Feature `python`).
-
-CLI Komfort (Feature `python_ipc` – pyo3 nicht benötigt, funktioniert ohne Python Headers):
-```powershell
-cargo run --bin backtest_driver --features python_ipc -- --replay-trace .\traces\sample.jsonl --py-script .\strategies\sample.py
-```
-Linux Beispiel:
-```bash
-cargo run --bin backtest_driver --features python_ipc -- --replay-trace ./traces/sample.jsonl --py-script ./strategies/sample.py
-```
-
-#### Strategy Interface (Backtest IPC Schema)
-- Input event (one JSON line): SimEvent
-	- { ts_ms: number, kind: "SlotAdvance" | "CfmPriceUpdate" | "NewPool" | "TradeFill" | "ScenarioMeta" | "Log", ... }
-- Output decision (one JSON line): StrategyDecision
-	- { actions: [ { "Swap": { pool, input_mint, output_mint, amount_in, max_slippage_bps } } ] }
-
-Beispiele:
-- `strategies/sample.py`: Minimale Klasse mit `on_tick()` Rückgabe (Demo)
-- `strategies/sample_worker.py`: Zeilen‑Protokoll Worker, der eingehende Events liest und leere Entscheidungen zurückgibt
-
 
 ### Raydium Pool‑Reader CLI
 ```powershell
@@ -533,11 +494,12 @@ cargo run --bin raydium_pools -- --mint So11111111111111111111111111111111111111
 ```
 
 ## Hinweise / Roadmap Auszug
-- Siehe `docs/TASKS.md` für detaillierte Meilensteine
-- Nächste Schritte: Exakte Fee Aufschlüsselung (Protocol/Referral), zusätzliche Histograms (Absolute Realized PnL, Shortfall %), finalisiertes Grafana Dashboard
+- ✅ Multi-Process Architektur implementiert (6 Services)
+- ✅ JetStream State Recovery implementiert
+- ✅ LivePoolCache + QuoteCalculator implementiert
 - ✅ Jito Bundle Integration implementiert (Feature `jito`)
 - ✅ Geyser gRPC Pool Discovery & Kill Switch implementiert
-- ✅ Zeitbasierte Exits implementiert
+- ✅ WsolManager + AccountJanitor implementiert
 
 ## Test Helpers
 Feature `test_helpers` stellt gezielte Methoden bereit (`test_insert_lot`, `test_simulate_partial_exit_with_fee`, Sharpe Abfragen) für deterministische Unit-/Integrationstests ohne Netzwerk‑Side‑Effects. Standardmäßig nicht im Release aktiv.
@@ -598,7 +560,6 @@ timestamp_utc,side,mint,dex,signature,lamports_in,lamports_out,tokens_in,tokens_
 - SOL/USD Preisquellen: `oracle_preference` steuert Reihenfolge ("pyth" | "switchboard" | "override"). Setze `oracle_pyth_sol_usd` (Pyth Price Account) bzw. `oracle_switchboard_sol_usd` (Aggregator). Fallback: `oracle_sol_usd_override`.
 - SOL/USD Override: `sniper.oracle_sol_usd_override` konvertiert USDC/USDT‑Reserven in SOL für Liquidity‑Schätzungen, wenn Oracles fehlen.
 - Adaptive Slippage: Rolling Mean der beobachteten BUY‑Shortfalls (tatsächlich erhaltene Tokens vs. expected) steuert die effektive Slippage‑Bps. Ziel‑Slippage `adaptive_slippage_target_pct`, Schrittweite `adaptive_slippage_step_bps`, Grenzen `adaptive_slippage_min_bps`/`max_bps`. Zustand wird im Risk‑Snapshot persistiert.
-- Quantile-Based Slippage (optional): Statistisches Lernen aus historischen Fills (P95/P99) statt fester Prozentsätze. Aktivieren mit `quantile_slippage_enabled = true`. Siehe [docs/QUANTILE_SLIPPAGE.md](docs/QUANTILE_SLIPPAGE.md).
 
 - Mint Decimals Auflösung: Primär `getTokenSupply.decimals`; Fallback: Byte 44 des Mint‑Accounts; sonst 0 (Warnung). Quelle wird über `mint_decimals_*` Metriken gezählt. Wallet & Sniper nutzen denselben Helper.
 

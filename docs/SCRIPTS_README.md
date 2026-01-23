@@ -1,169 +1,191 @@
-# IronCrab Start Scripts
+# IronCrab Scripts & Deployment
 
-This directory contains convenience scripts for building, running, and backtesting the IronCrab trading bot.
+Convenience Scripts für Build, Deployment und lokale Entwicklung der Multi-Prozess-Architektur.
 
-## Windows Scripts (PowerShell)
+## Production Deployment (Linux Server)
 
-### build.ps1
-Builds the IronCrab project and all binaries.
+### deploy.sh / deploy_new.sh
+Das Haupt-Deployment-Script für den Production-Server.
+
+```bash
+# Standard-Deployment (Build + Install + Restart)
+./deploy.sh
+
+# Nur bestimmten Service neu deployen
+./deploy.sh --component execution-engine
+
+# Ohne Rebuild (nur Service-Restart)
+./deploy.sh --skip-build
+
+# Legacy Monolith (deprecated)
+./deploy.sh --legacy
+```
+
+`deploy.sh` ist ein Wrapper, der `deploy_new.sh` aufruft. Das Script:
+1. Pullt von `architecture-rebuild` Branch
+2. Baut alle 4 Rust-Binaries (release)
+3. Setzt Python venv für control-plane auf
+4. Installiert alle systemd Services
+5. Startet `ironcrab.target` (alle 6 Services)
+
+### Service Management (Server)
+```bash
+# Alle Services
+sudo systemctl start ironcrab.target
+sudo systemctl stop ironcrab.target
+sudo systemctl restart ironcrab.target
+
+# Einzelne Services
+sudo systemctl restart execution-engine
+sudo systemctl status momentum-bot
+journalctl -u market-data -f
+```
+
+## Local Development (Windows)
+
+### run_local.ps1
+SSH-Tunnel zum Server + optionales lokales UI.
 
 ```powershell
-# Basic debug build
+# Tunnel + UI starten
+.\run_local.ps1 -Action start -Host ironcrab-prod
+
+# Ohne SSH-Config Alias
+.\run_local.ps1 -Action start -Host 109.230.239.43 -User ironcrab -Port 2222
+
+# Nur Tunnel (ohne UI)
+.\run_local.ps1 -Action start -NoUi
+
+# Status prüfen
+.\run_local.ps1 -Action status
+
+# Stoppen
+.\run_local.ps1 -Action stop
+```
+
+Forwarded Ports:
+- `8080` → Control Plane API
+- `9801-9804` → Prometheus Metrics
+- `3000` → Grafana
+- `9090` → Prometheus
+
+### run_ui.ps1 / run_ui.cmd
+Startet das lokale Vite UI (nach Tunnel-Aufbau).
+
+```powershell
+# PowerShell
+.\run_ui.ps1
+
+# Oder CMD (falls PowerShell npm blockt)
+run_ui.cmd
+```
+
+### build.ps1
+Lokaler Build für Entwicklung.
+
+```powershell
+# Debug Build
 .\build.ps1
 
-# Release build
+# Release Build
 .\build.ps1 -Release
 
-# Build with features
-.\build.ps1 -Features -FeatureList "python,notify_watch"
-
-# Show help
+# Hilfe
 .\build.ps1 -Help
 ```
 
-### run.ps1
-Runs the main IronCrab trading bot.
-
-```powershell
-# Run with default config
-.\run.ps1
-
-# Run release build
-.\run.ps1 -Release
-
-# Run with custom config
-.\run.ps1 -Config "my_config.toml"
-
-# Build and run
-.\run.ps1 -Build -Release
-
-# Show help
-.\run.ps1 -Help
-```
-
-### backtest.ps1
-Runs backtesting with various options.
-
-```powershell
-# Basic backtest with trace data
-.\backtest.ps1 -ReplayTrace "data\trace.jsonl.gz" -ReplayStart 250000000 -ReplayEnd 250001000
-
-# Backtest with Python strategy
-.\backtest.ps1 -PyScript "strategies\sample.py" -ReplayTrace "data\trace.jsonl.gz"
-
-# Backtest with impact modeling
-.\backtest.ps1 -Impact "clmm" -ImpactExtraFeeBps 10
-
-# Show help
-.\backtest.ps1 -Help
-```
-
-## Unix/Linux/macOS Scripts (Bash)
-
-First, make the scripts executable:
-```bash
-chmod +x build.sh run.sh backtest.sh
-```
+## Unix/Linux Scripts
 
 ### build.sh
-Builds the IronCrab project and all binaries.
-
 ```bash
-# Basic debug build
+# Debug Build
 ./build.sh
 
-# Release build
+# Release Build
 ./build.sh --release
-
-# Build with features
-./build.sh --features --feature-list "python,notify_watch"
-
-# Show help
-./build.sh --help
 ```
 
-### run.sh
-Runs the main IronCrab trading bot.
+### run.sh / run_new.sh
+Lokales manuelles Starten (für Dev/Test, nicht für Production).
 
 ```bash
-# Run with default config
-./run.sh
-
-# Run release build
-./run.sh --release
-
-# Run with custom config
-./run.sh --config "my_config.toml"
-
-# Build and run
-./run.sh --build --release
-
-# Show help
-./run.sh --help
+# run_new.sh startet die Multi-Prozess-Binaries
+./run_new.sh --config my_config.server.toml
 ```
 
-### backtest.sh
-Runs backtesting with various options.
+**Hinweis**: Auf dem Production-Server immer `deploy.sh` und systemd verwenden, nicht `run_new.sh`.
 
-```bash
-# Basic backtest with trace data
-./backtest.sh --replay-trace "data/trace.jsonl.gz" --replay-start 250000000 --replay-end 250001000
+## Built Binaries (Multi-Process)
 
-# Backtest with Python strategy
-./backtest.sh --py-script "strategies/sample.py" --replay-trace "data/trace.jsonl.gz"
+Nach dem Build sind folgende Binaries verfügbar:
 
-# Backtest with impact modeling
-./backtest.sh --impact "clmm" --impact-extra-fee-bps 10
+| Binary | Zweck |
+|--------|-------|
+| `market-data` | Geyser-Ingest, Pool Discovery, MarketEvents |
+| `momentum-bot` | Strategy: EARLY + ESTABLISHED Policies |
+| `arb-strategy` | Strategy: Multi-Pool Arbitrage |
+| `execution-engine` | Single-Signer, Tx Build/Sim/Send |
 
-# Show help
-./backtest.sh --help
-```
+Plus Python-Services:
+- `control_plane/main.py` — REST API, Config, Kill-Switch
+- `scripts/trades_server.py` — Grafana Infinity Datasource
 
 ## Prerequisites
 
-1. **Rust and Cargo**: Install from https://rustup.rs/
-2. **Configuration file**: Copy `config.example.toml` to your own config file
-3. **For backtesting**: You need recorded trace data (use the `recorder` binary)
-4. **For Python strategies**: Python with required packages
+1. **Rust 1.89+**: Install from https://rustup.rs/
+2. **Python 3.11+**: Für control-plane und trades-server
+3. **NATS Server**: IPC zwischen Prozessen
+4. **Configuration**: `my_config.server.toml` (basierend auf `config.example.toml`)
 
-## Built Binaries
+## Quick Start (Server)
 
-After building, the following binaries will be available:
-
-- `ironcrab` / `ironcrab.exe` - Main trading bot
-- `backtest_driver` / `backtest_driver.exe` - Backtesting engine  
-- `recorder` / `recorder.exe` - Data recorder for backtesting
-- `latency_stress` / `latency_stress.exe` - Performance testing
-- `raydium_pools` / `raydium_pools.exe` - Pool analysis tool
-
-## Quick Start
-
-1. Copy and customize the configuration:
+1. SSH zum Server:
    ```bash
-   cp config.example.toml my_config.toml
-   # Edit my_config.toml with your settings
+   ssh ironcrab-prod
    ```
 
-2. Build the project:
+2. Deploy:
    ```bash
-   # Windows
-   .\build.ps1 -Release
-   
-   # Unix/Linux/macOS
-   ./build.sh --release
+   cd ~/Iron_crab
+   ./deploy.sh
    ```
 
-3. Run the trading bot:
+3. Status prüfen:
    ```bash
-   # Windows
-   .\run.ps1 -Release -Config "my_config.toml"
-   
-   # Unix/Linux/macOS
-   ./run.sh --release --config "my_config.toml"
+   sudo systemctl status ironcrab.target
    ```
 
-## Monitoring
+## Quick Start (Lokale Entwicklung)
 
-When running, metrics are available at: http://localhost:9898/metrics
+1. Tunnel aufbauen:
+   ```powershell
+   .\run_local.ps1 -Action start -Host ironcrab-prod
+   ```
 
-You can import the Grafana dashboard from `docs/grafana_dashboard_example.json` for monitoring.
+2. UI öffnen: http://localhost:5173
+
+3. Control Plane API: http://localhost:8080
+
+## Metrics Endpoints
+
+| Service | Port | URL |
+|---------|------|-----|
+| market-data | 9801 | http://localhost:9801/metrics |
+| momentum-bot | 9802 | http://localhost:9802/metrics |
+| arb-strategy | 9803 | http://localhost:9803/metrics |
+| execution-engine | 9804 | http://localhost:9804/metrics |
+| Control Plane | 8080 | http://localhost:8080 |
+| Trades API | 9899 | http://localhost:9899/trades |
+
+## Grafana Dashboards
+
+Import aus `docs/`:
+- `grafana_multiprocess_dashboard.json` — Haupt-Dashboard
+- `grafana_arbitrage_dashboard.json` — Arb-spezifisch
+- `grafana_sniper_dashboard.json` — Momentum-spezifisch
+
+## Siehe auch
+
+- [RUNBOOK_PROD.md](RUNBOOK_PROD.md) — Vollständige Production-Anleitung
+- [TARGET_ARCHITECTURE.md](TARGET_ARCHITECTURE.md) — Architektur-Dokumentation
+- [LOCAL_SETUP.md](LOCAL_SETUP.md) — Lokale Entwicklungsumgebung

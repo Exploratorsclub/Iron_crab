@@ -138,14 +138,6 @@ name = "arb-strategy"
 path = "src/bin/arb_strategy.rs"
 
 [[bin]]
-name = "backtest-driver"
-path = "src/bin/backtest_driver.rs"
-
-[[bin]]
-name = "recorder"
-path = "src/bin/recorder.rs"
-
-[[bin]]
 name = "raydium-pools"
 path = "src/bin/raydium_pools.rs"
 

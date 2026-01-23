@@ -101,55 +101,120 @@ Einzige Instanz mit Keys. Aufgaben:
 - Tx Plan → Simulate → Send → Confirm
 - Fee/Compute/Tip Policy zentral
 
-**MEV-Layer (in-proc Worker, keine separaten „MEV Bots“):**
+**Implementierte Module:**
+- `LivePoolCache`: Geyser-basierter Pool-State-Cache für frische Quotes (<50ms)
+- `QuoteCalculator`: Berechnet `min_out` basierend auf LivePoolCache Reserves
+- `WsolManager`: Background-Task für automatisches WSOL Wrap/Unwrap
+- `AccountJanitor`: Räumt verwaiste ATAs auf und recovered Rent
+- `CrossDexHandler`: Einheitliches Interface für alle DEX-Swaps
+
+**MEV-Layer (in-proc Worker, keine separaten „MEV Bots"):**
 - `ExecutionArbWorker` (reaktiv; Tx-/Engine-State-getrieben, **nicht** marktgetriebener Scanner)
 - `BackrunWorker`
 - `Liquidation/Re-Arb Worker`
 - `JIT Liquidity Worker`
 - `Fee/Compute Param Worker`
 
-### 2.4 Control/UI: `control-plane` (FastAPI) + UI (React)
+### 2.4 Support Services
 
+#### 2.4.1 `trades-server` (Python)
+Aufgabe: Grafana Infinity Datasource für Trade-Visualisierung.
+- Liest Decision Records aus JSONL
+- Stellt REST API auf Port 9899 bereit
+- Formatiert Daten für Grafana Dashboard
+
+#### 2.4.2 `control-plane` (FastAPI) + UI (React)
 - Start/Stop, Config, Risk Limits, Alerts
+- REST API auf Port 8080
 - Zeigt Decisions/Status live (nicht Trading Hot Path)
 - UI für Kontrolle/Realtime; Grafana für Forensik/Trends
+
+### 2.5 Metrics Ports
+
+| Service | Port | Endpoint |
+|---------|------|----------|
+| market-data | 9801 | `/metrics` |
+| momentum-bot | 9802 | `/metrics` |
+| arb-strategy | 9803 | `/metrics` |
+| execution-engine | 9804 | `/metrics` |
+| control-plane | 8080 | REST API |
+| trades-server | 9899 | `/trades` |
 
 ---
 
 ## 3) Kommunikations-Topologie (NATS)
 
-Topics (Minimum):
-- `MarketEvents` (market-data → consumers)
-- `TradeIntents` (momentum-bot/MEV-worker → execution-engine)
-- `ExecutionResults` (execution-engine → UI/control/analytics)
-- `ControlRequests` (control-plane ↔ execution-engine)
+### 3.1 Pub/Sub Topics (implementiert in `src/nats/topics.rs`)
+- `ironcrab.v1.market_events` (market-data → consumers)
+- `ironcrab.v1.trade_intents` (momentum-bot/arb-strategy → execution-engine)
+- `ironcrab.v1.execution_results` (execution-engine → UI/control/analytics)
+- `ironcrab.v1.decision_records` (execution-engine → analytics/UI)
+- `ironcrab.v1.control_requests` / `ironcrab.v1.control_responses` (control-plane ↔ binaries)
+- `ironcrab.v1.wallet_balance_updates` (market-data → WsolManager)
+
+Legacy Topics (noch in Verwendung):
+- `ironcrab.control.commands` / `ironcrab.control.kill` / `ironcrab.control.config.reload`
+
+### 3.2 JetStream (Persistent State Recovery)
+
+Implementiert in `src/nats/jetstream.rs` für Pool-Cache State Recovery.
+
+**Architektur:**
+- `market-data`: MASTER cache, publishes zu JetStream (ein Subject pro Pool)
+- `execution-engine`: SLAVE cache, konsumiert mit `deliver_last()` für State Recovery
+- `arb-strategy`: SLAVE cache, konsumiert mit `deliver_last()` für State Recovery
+
+**Stream Konfiguration:**
+| Parameter | Wert | Beschreibung |
+|-----------|------|--------------|
+| Stream Name | `POOL_CACHE` | Persistenter Stream |
+| Subject Pattern | `ironcrab.pool_cache.{pool_address}` | Subject pro Pool |
+| Retention | 7 Tage | Debug/Recovery Window |
+| Max Messages/Subject | 1 | Automatic Compaction (nur neuester State) |
+| Storage | File | Persistent über Restarts |
+| Rollup | Enabled | Für Snapshot Support |
+
+**Vorteile:**
+- State Recovery nach Restart (SLAVE holt letzten State per Pool)
+- Automatic Compaction (nur neuester State wird gehalten)
+- Keine Duplizierung von Pool-Daten zwischen Prozessen
 
 Regel: **Kein Bot darf direkt senden/signieren** – nur Intents.
 
 ---
 
-## 4) Datenfluss (ohne doppelte Datenladung)
+## 4) Datenfluss (aktualisiert)
 
 ```text
 Geyser/RPC
   │
   ▼
 market-data (cache + normalize + discovery)
-  │  MarketEvents
+  │  MarketEvents + WalletBalanceUpdates
   ▼
 NATS
   │
   ├─► momentum-bot (EARLY/ESTABLISHED policies) ─► TradeIntents ─┐
-  │                                                            │
-  └─► execution-engine MEV workers (reactive) ─► internal Intents ├─► Plan/Sim/Send
-                                                                │
-                                                                ▼
-                                                        ExecutionResults
+  │                                                              │
+  ├─► arb-strategy (Multi-Pool Arbitrage) ─────► TradeIntents ───┤
+  │                                                              │
+  └─► execution-engine ◄─────────────────────────────────────────┘
+          │
+          ├── LivePoolCache (Geyser → fresh quotes)
+          ├── QuoteCalculator (min_out berechnen)
+          ├── WsolManager (WSOL wrap/unwrap)
+          ├── CrossDexHandler (Tx Build)
+          │
+          ▼
+      Plan/Sim/Send → ExecutionResults + DecisionRecords
+          │
+          ▼
+      NATS → control-plane / trades-server / UI
 ```
 
 ---
 
-## 4) Pool State Management (Geyser-First Architecture)
+## 5) Pool State Management (Geyser-First Architecture)
 
 ### 4.1 Pool Discovery Flow
 
@@ -247,7 +312,7 @@ execution-engine uses for ATA creation (no cache lookup needed!)
 
 ---
 
-## 5) Storage / Datenbank (wichtig für Debuggability, nicht Hot Path)
+## 6) Storage / Datenbank (wichtig für Debuggability, nicht Hot Path)
 
 
 Ziel: Debuggability durch **Replay + Decision Records**, ohne den Hot Path zu blockieren.
@@ -303,27 +368,36 @@ Wichtig:
 
 ---
 
-## 6) Warum kein „Sniper“ mehr
+## 7) Warum kein „Sniper" mehr
 
 - Ohne unfairen Speed-Vorteil ist „mint sofort kaufen“ strukturell negative EV.
 - Stattdessen: **Discovery** liefert Signale/Features, und **Momentum** entscheidet erst nach bestätigenden Kriterien.
 
 ---
 
-## 7) MVP (First Results Fast, aber debugbar)
+## 8) Implementierungsstatus
 
-1) `market-data`: Geyser ingest + Discovery Worker + MarketEvents
-2) `momentum-bot`: nur EARLY-Regime + TradeIntent
-3) `execution-engine`: Locks + Simulate-gate + Decision Records + (optional send)
+### Implementiert ✅
+- `market-data`: Geyser ingest + GeyserPoolDiscovery + MarketEvents + WalletBalanceUpdates
+- `momentum-bot`: EARLY + ESTABLISHED Regime + TradeIntents
+- `arb-strategy`: Multi-Pool 2-Hop Arbitrage (siehe `docs/MULTI_POOL_ROUTING.md`)
+- `execution-engine`: 
+  - LivePoolCache + QuoteCalculator (frische Quotes)
+  - WsolManager (Background WSOL Management)
+  - AccountJanitor (ATA Cleanup)
+  - CrossDexHandler (alle DEXes)
+  - Capital Locks + Simulate-gate + Decision Records
+- `control-plane`: REST API + Config + Kill-Switch
+- `trades-server`: Grafana Infinity Datasource
+- UI: React Dashboard
 
-Erst danach:
-- ESTABLISHED-Regime
-- MEV Workers erweitern
-- Analytics DB
+### In Arbeit 🚧
+- MEV Workers (Backrun, JIT, etc.)
+- Analytics DB Integration
 
 ---
 
-## 8) Future Features (nicht implementiert)
+## 9) Future Features (nicht implementiert)
 
 ### 8.1 Quantile-Based Slippage Learning
 
