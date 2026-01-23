@@ -2,11 +2,38 @@
 
 **Status**: ❌ Not Started (Planning Only)  
 **Created**: 2025-01-21  
+**Updated**: 2025-01-23 (Review Feedback eingearbeitet)  
 **Priority**: Medium (nach WsolManager/Janitor stable)
 
 > ⚠️ **Hinweis**: Dieses Dokument beschreibt eine **geplante** Erweiterung.  
 > Es existiert noch **kein Code** für Multi-Hop Arbitrage.  
 > Aktuell läuft nur 2-Hop Arbitrage (WSOL → Token → WSOL).
+
+---
+
+## 🔍 Review Feedback (2025-01-23)
+
+Das Design wurde von einem Senior-Reviewer analysiert. **Gesamturteil: Realistisch produktionsfähig** mit folgenden kritischen Anpassungen:
+
+### ✅ Was bestätigt wurde
+- Architektur (Pool-Graph in arb-strategy)
+- Best-First Beam Search + Branch-and-Bound Ansatz
+- CU-Budget Limits
+- Overall Flow
+
+### ⚠️ Kritische Fixes (eingearbeitet)
+
+| Problem | Lösung | Status |
+|---------|--------|--------|
+| `edge_ratio` basiert auf Spot-Preis (ignoriert Slippage) | **Probe-based Quote** mit fixed amount | ✅ Fixed |
+| Beam-Limit zählt "first K" statt "best K" | **Proper Top-K Selection** mit Score-Threshold | ✅ Fixed |
+| `sqrt(liquidity)` überdominiert Scoring | **Gedämpftes Scoring** mit log() oder clamp() | ✅ Fixed |
+| Nur 1 Pool pro Pair (fragil) | **Pool-Fallbacks** (Top-3) im Intent | ✅ Fixed |
+
+### 📝 Weitere Empfehlungen (nice-to-have)
+- `node.path.contains()` O(n) → `visited: HashSet` für Performance
+- Early `best_profit` seeding aus 2-Hop Scan
+- `edge_count` Tracking korrigieren (Metrics)
 
 ## Motivation
 
@@ -271,7 +298,8 @@ Vor der Suche werden statische Daten berechnet (alle ~30s refreshen):
 ```rust
 /// Pre-computed data für effiziente Cycle-Suche
 pub struct PoolRanker {
-    /// Top K Pools pro Token-Paar (nach Liquidity sortiert)
+    /// Top K Pools pro Token-Paar (nach Score sortiert)
+    /// ⚠️ WICHTIG: Top-3 statt nur Top-1 für Fallback-Support
     top_pools: HashMap<(Pubkey, Pubkey), Vec<RankedPool>>,
     
     /// Max Edge Ratio pro Token (für Upper Bound Pruning)
@@ -280,20 +308,42 @@ pub struct PoolRanker {
     
     /// Blacklisted Tokens (bekannte Rugs, < $1k Liquidity insgesamt)
     blacklist: HashSet<Pubkey>,
+    
+    /// Probe amount für Quote-basierte edge_ratio Berechnung
+    /// Fixed amount (z.B. $100-$500 equivalent) statt Spot-Preis
+    probe_amount_lamports: u64,
 }
+
+/// Konfiguration für Liquidity-Scoring
+const LIQUIDITY_BASELINE: f64 = 10_000.0; // $10k als Referenz
+const LIQUIDITY_CLAMP_MIN: f64 = 0.3;     // Minimum multiplier
+const LIQUIDITY_CLAMP_MAX: f64 = 1.5;     // Maximum multiplier
 
 #[derive(Debug, Clone)]
 pub struct RankedPool {
     pub edge: PoolEdge,
-    /// Pre-computed: output/input ratio (nach Fees)
+    /// Pre-computed: output/input ratio basierend auf PROBE QUOTE (nicht Spot!)
+    /// ⚠️ KRITISCH: Muss quote_out(probe_amount) / probe_amount sein
     pub edge_ratio: f64,
-    /// Liquidity-weighted score für Priorisierung
+    /// Gedämpfter Liquidity-Score (log-basiert oder clamped)
     pub liquidity_score: f64,
 }
 
 impl PoolRanker {
+    pub fn new(probe_amount_lamports: u64) -> Self {
+        Self {
+            top_pools: HashMap::new(),
+            max_edge_ratio: HashMap::new(),
+            blacklist: HashSet::new(),
+            probe_amount_lamports,
+        }
+    }
+
     /// Refresh rankings (call every ~30s)
-    pub fn refresh(&mut self, graph: &PoolGraph, price_cache: &PriceCache) {
+    /// 
+    /// ⚠️ WICHTIG: edge_ratio MUSS quote-basiert sein, nicht Spot-Preis!
+    /// Spot-Preis ignoriert: Trade Size, Curve Shape, Directional Imbalance
+    pub fn refresh(&mut self, graph: &PoolGraph, pool_cache: &LivePoolCache) {
         self.top_pools.clear();
         self.max_edge_ratio.clear();
         
@@ -305,20 +355,50 @@ impl PoolRanker {
                     .filter(|p| p.liquidity_usd >= 1000.0) // Min $1k
                     .filter(|p| !self.blacklist.contains(&p.mint_a) 
                              && !self.blacklist.contains(&p.mint_b))
-                    .map(|p| {
-                        let fee_mult = 1.0 - (p.fee_bps as f64 / 10000.0);
-                        let price = price_cache.get_price(mint_a, mint_b).unwrap_or(1.0);
-                        RankedPool {
+                    .filter_map(|p| {
+                        // ═══════════════════════════════════════════════════
+                        // KRITISCH: Quote-basierte edge_ratio (nicht Spot!)
+                        // ═══════════════════════════════════════════════════
+                        let quote_result = pool_cache
+                            .get_pool(&p.pool_address)
+                            .and_then(|pool| pool.quote_exact_in(self.probe_amount_lamports).ok());
+                        
+                        let edge_ratio = match quote_result {
+                            Some(quote) => quote.output_amount as f64 / self.probe_amount_lamports as f64,
+                            None => return None, // Skip pools ohne valides Quote
+                        };
+                        
+                        // ═══════════════════════════════════════════════════
+                        // KORRIGIERT: Gedämpftes Liquidity-Scoring
+                        // sqrt() war zu dominant → log() oder clamp()
+                        // ═══════════════════════════════════════════════════
+                        // Option A: Log-basiert
+                        // let liquidity_score = (1.0 + p.liquidity_usd).ln();
+                        
+                        // Option B: Clamped (bevorzugt - vorhersagbarer)
+                        let liquidity_factor = (p.liquidity_usd / LIQUIDITY_BASELINE)
+                            .clamp(LIQUIDITY_CLAMP_MIN, LIQUIDITY_CLAMP_MAX);
+                        let liquidity_score = liquidity_factor;
+                        
+                        Some(RankedPool {
                             edge: p.clone(),
-                            edge_ratio: price * fee_mult,
-                            liquidity_score: p.liquidity_usd.sqrt(),
-                        }
+                            edge_ratio,
+                            liquidity_score,
+                        })
                     })
                     .collect();
                 
-                // Sort by liquidity (höchste zuerst)
-                ranked.sort_by(|a, b| b.liquidity_score.partial_cmp(&a.liquidity_score).unwrap());
-                ranked.truncate(5); // Top 5 pro Paar
+                // Sort by combined score (profit × liquidity_factor)
+                ranked.sort_by(|a, b| {
+                    let score_a = a.edge_ratio * a.liquidity_score;
+                    let score_b = b.edge_ratio * b.liquidity_score;
+                    score_b.partial_cmp(&score_a).unwrap()
+                });
+                
+                // ═══════════════════════════════════════════════════
+                // KORRIGIERT: Top-3 statt Top-1 für Fallback-Support
+                // ═══════════════════════════════════════════════════
+                ranked.truncate(3); // Top 3 pro Paar (für Execution Fallbacks)
                 
                 if !ranked.is_empty() {
                     self.top_pools.insert((*mint_a, *mint_b), ranked);
@@ -335,7 +415,7 @@ impl PoolRanker {
         }
     }
     
-    /// Get pre-ranked pools for a token pair
+    /// Get pre-ranked pools for a token pair (Top-3 für Fallbacks)
     pub fn get_top_pools(&self, from: &Pubkey, to: &Pubkey) -> Option<&Vec<RankedPool>> {
         self.top_pools.get(&(*from, *to))
     }
@@ -358,8 +438,9 @@ use std::cmp::Ordering;
 pub struct ArbCycle {
     /// Pfad: [WSOL, Token_A, Token_B, ..., WSOL]
     pub path: Vec<Pubkey>,
-    /// Pools für jeden Hop
-    pub pools: Vec<PoolEdge>,
+    /// Pools für jeden Hop - MIT ALTERNATIVEN für Execution Fallbacks!
+    /// pools[hop_idx][0] = Best Pool, pools[hop_idx][1..] = Fallbacks
+    pub pools: Vec<Vec<PoolEdge>>,
     /// Geschätzter Return (vor Slippage)
     pub estimated_return_bps: i32,
     /// Minimale Liquidity im Pfad
@@ -371,7 +452,8 @@ pub struct ArbCycle {
 struct SearchNode {
     token: Pubkey,
     path: Vec<Pubkey>,
-    pools: Vec<PoolEdge>,
+    /// Pools für jeden Hop - jetzt mit Alternativen für Fallback!
+    pools: Vec<Vec<PoolEdge>>, // Vec<Vec<>> statt Vec<> für Top-3 Fallbacks
     /// Aktueller Profit-Multiplikator (1.0 = break-even)
     profit: f64,
     /// Score für Priorisierung (höher = besser)
@@ -380,6 +462,8 @@ struct SearchNode {
     depth: usize,
     /// Minimale Liquidity entlang des Pfades
     min_liquidity: f64,
+    /// Visited tokens für O(1) lookup statt O(n) path.contains()
+    visited: HashSet<Pubkey>,
 }
 
 // Für BinaryHeap (max-heap nach score)
@@ -438,6 +522,9 @@ impl BeamCycleFinder {
         let mut queue = BinaryHeap::new();
         
         // Start node: WSOL mit profit = 1.0
+        let mut start_visited = HashSet::new();
+        start_visited.insert(self.base_mint);
+        
         queue.push(SearchNode {
             token: self.base_mint,
             path: vec![self.base_mint],
@@ -446,10 +533,16 @@ impl BeamCycleFinder {
             score: 1.0,
             depth: 0,
             min_liquidity: f64::MAX,
+            visited: start_visited,
         });
         
-        // Track nodes per depth level für Beam Limit
-        let mut nodes_at_depth: HashMap<usize, usize> = HashMap::new();
+        // ═══════════════════════════════════════════════════════════════════
+        // KORRIGIERT: Proper Beam Limit mit Score-Threshold
+        // Alte Implementierung zählte "first K" statt "best K"!
+        // ═══════════════════════════════════════════════════════════════════
+        // Track minimum score pro depth level für echtes Top-K
+        let mut min_score_at_depth: HashMap<usize, f64> = HashMap::new();
+        let mut count_at_depth: HashMap<usize, usize> = HashMap::new();
         
         while let Some(node) = queue.pop() {
             // ═══════════════════════════════════════════════════════════
@@ -489,28 +582,32 @@ impl BeamCycleFinder {
             }
             
             // ═══════════════════════════════════════════════════════════
-            // 4. BEAM LIMIT: Max K Nodes pro Tiefenlevel
+            // 4. BEAM LIMIT: KORRIGIERT - Top-K nach Score (nicht First-K!)
             // ═══════════════════════════════════════════════════════════
-            let count = nodes_at_depth.entry(node.depth + 1).or_insert(0);
-            if *count >= self.beam_width {
-                continue; // Beam für dieses Level voll
+            let next_depth = node.depth + 1;
+            let count = count_at_depth.entry(next_depth).or_insert(0);
+            let min_score = min_score_at_depth.entry(next_depth).or_insert(0.0);
+            
+            // Wenn Beam voll ist: nur noch bessere Nodes akzeptieren
+            if *count >= self.beam_width && node.score <= *min_score {
+                continue; // Score nicht gut genug für dieses Level
             }
             
             // ═══════════════════════════════════════════════════════════
             // 5. EXPAND: Nachbarn erkunden (sortiert nach Pre-computed Ranking)
             // ═══════════════════════════════════════════════════════════
             for (next_mint, _) in graph.neighbors(&node.token) {
-                // Skip wenn bereits im Pfad (außer WSOL am Ende)
-                if node.path.contains(next_mint) && *next_mint != self.base_mint {
+                // KORRIGIERT: O(1) visited check statt O(n) path.contains()
+                if node.visited.contains(next_mint) && *next_mint != self.base_mint {
                     continue;
                 }
                 
-                // Hole pre-ranked Pools
+                // Hole pre-ranked Pools (jetzt Top-3 für Fallbacks)
                 let Some(ranked_pools) = ranker.get_top_pools(&node.token, next_mint) else {
                     continue;
                 };
                 
-                // Nimm besten Pool (bereits nach Liquidity sortiert)
+                // Nimm besten Pool für Profit-Berechnung
                 let Some(best) = ranked_pools.first() else {
                     continue;
                 };
@@ -518,15 +615,25 @@ impl BeamCycleFinder {
                 let child_profit = node.profit * best.edge_ratio;
                 let child_liquidity = node.min_liquidity.min(best.edge.liquidity_usd);
                 
-                // Adaptive Scoring: profit × sqrt(min_liquidity)
-                // Höhere Liquidity = geringeres Slippage-Risiko
-                let child_score = child_profit * child_liquidity.sqrt();
+                // ═══════════════════════════════════════════════════════
+                // KORRIGIERT: Gedämpftes Scoring (nicht sqrt!)
+                // sqrt() war zu dominant für high-liquidity Pools
+                // ═══════════════════════════════════════════════════════
+                let child_score = child_profit * best.liquidity_score; // Bereits gedämpft
                 
                 let mut child_path = node.path.clone();
                 child_path.push(*next_mint);
                 
+                // KORRIGIERT: Speichere ALLE ranked pools (Top-3) für Fallbacks
                 let mut child_pools = node.pools.clone();
-                child_pools.push(best.edge.clone());
+                let pool_alternatives: Vec<PoolEdge> = ranked_pools
+                    .iter()
+                    .map(|rp| rp.edge.clone())
+                    .collect();
+                child_pools.push(pool_alternatives);
+                
+                let mut child_visited = node.visited.clone();
+                child_visited.insert(*next_mint);
                 
                 queue.push(SearchNode {
                     token: *next_mint,
@@ -534,11 +641,16 @@ impl BeamCycleFinder {
                     pools: child_pools,
                     profit: child_profit,
                     score: child_score,
-                    depth: node.depth + 1,
+                    depth: next_depth,
                     min_liquidity: child_liquidity,
+                    visited: child_visited,
                 });
                 
+                // Update beam tracking
                 *count += 1;
+                if *count <= self.beam_width {
+                    *min_score = min_score.min(child_score);
+                }
             }
         }
         
@@ -666,9 +778,10 @@ pub struct TradeIntent {
 }
 
 /// Single hop in a multi-hop swap
+/// ⚠️ KORRIGIERT: Mit Pool-Alternativen für Execution Fallbacks!
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapHop {
-    /// Pool address
+    /// Primary pool address (best option from search)
     pub pool_address: String,
     /// DEX type
     pub dex: String,
@@ -678,6 +791,19 @@ pub struct SwapHop {
     pub output_mint: String,
     /// Expected output amount (for slippage check)
     pub expected_output: u64,
+    /// Alternative pools for this hop (fallbacks if primary fails)
+    /// Sorted by preference (best first)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool_alternatives: Vec<PoolAlternative>,
+}
+
+/// Alternative pool for fallback routing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolAlternative {
+    pub pool_address: String,
+    pub dex: String,
+    /// Expected output (may differ from primary)
+    pub expected_output: u64,
 }
 ```
 
@@ -685,13 +811,28 @@ pub struct SwapHop {
 
 ```rust
 fn create_multi_hop_intent(cycle: &ArbCycle, input_amount: u64) -> TradeIntent {
-    let hops: Vec<SwapHop> = cycle.pools.iter().enumerate().map(|(i, pool)| {
+    // cycle.pools ist jetzt Vec<Vec<PoolEdge>> - mit Alternativen!
+    let hops: Vec<SwapHop> = cycle.pools.iter().enumerate().map(|(i, pool_options)| {
+        let primary = &pool_options[0]; // Best pool
+        
+        // Fallback-Pools (Index 1+)
+        let alternatives: Vec<PoolAlternative> = pool_options
+            .iter()
+            .skip(1)
+            .map(|alt| PoolAlternative {
+                pool_address: alt.pool_address.to_string(),
+                dex: alt.dex.to_string(),
+                expected_output: 0, // Calculated by execution-engine
+            })
+            .collect();
+        
         SwapHop {
-            pool_address: pool.pool_address.to_string(),
-            dex: pool.dex.to_string(),
+            pool_address: primary.pool_address.to_string(),
+            dex: primary.dex.to_string(),
             input_mint: cycle.path[i].to_string(),
             output_mint: cycle.path[i + 1].to_string(),
             expected_output: 0, // Calculated by execution-engine
+            pool_alternatives: alternatives,
         }
     }).collect();
 
@@ -718,7 +859,9 @@ fn create_multi_hop_intent(cycle: &ArbCycle, input_amount: u64) -> TradeIntent {
 // src/execution/quote_calculator.rs
 
 impl QuoteCalculator {
-    /// Quote a multi-hop path
+    /// Quote a multi-hop path with fallback support
+    /// 
+    /// ⚠️ KORRIGIERT: Bei Quote-Fehler auf pool_alternatives fallbacken
     pub async fn quote_multi_hop(
         &self,
         path: &[SwapHop],
@@ -726,10 +869,28 @@ impl QuoteCalculator {
     ) -> Result<MultiHopQuote> {
         let mut current_amount = input_amount;
         let mut quotes = Vec::with_capacity(path.len());
+        let mut selected_pools = Vec::with_capacity(path.len());
 
         for hop in path {
-            let pool = self.pool_cache.get_pool(&hop.pool_address)?;
-            let quote = pool.quote_exact_in(current_amount)?;
+            // Versuche Primary Pool
+            let quote_result = self.try_quote_hop(hop, current_amount).await;
+            
+            let (quote, pool_used) = match quote_result {
+                Ok(q) => (q, hop.pool_address.clone()),
+                Err(_) => {
+                    // ═══════════════════════════════════════════════════
+                    // KORRIGIERT: Fallback auf Alternative Pools
+                    // ═══════════════════════════════════════════════════
+                    let mut fallback_quote = None;
+                    for alt in &hop.pool_alternatives {
+                        if let Ok(q) = self.try_quote_pool(&alt.pool_address, current_amount).await {
+                            fallback_quote = Some((q, alt.pool_address.clone()));
+                            break;
+                        }
+                    }
+                    fallback_quote.ok_or_else(|| anyhow!("All pools failed for hop"))?
+                }
+            };
 
             current_amount = quote.output_amount;
             quotes.push(HopQuote {
@@ -737,15 +898,27 @@ impl QuoteCalculator {
                 output_amount: quote.output_amount,
                 price_impact_bps: quote.price_impact_bps,
                 fee_amount: quote.fee_amount,
+                pool_used: pool_used.clone(), // Track welcher Pool genutzt wurde
             });
+            selected_pools.push(pool_used);
         }
 
         Ok(MultiHopQuote {
             input_amount,
             output_amount: current_amount,
             hops: quotes,
+            selected_pools, // Für TX Builder
             total_price_impact_bps: quotes.iter().map(|q| q.price_impact_bps).sum(),
         })
+    }
+    
+    async fn try_quote_hop(&self, hop: &SwapHop, amount: u64) -> Result<PoolQuote> {
+        self.try_quote_pool(&hop.pool_address, amount).await
+    }
+    
+    async fn try_quote_pool(&self, pool_address: &str, amount: u64) -> Result<PoolQuote> {
+        let pool = self.pool_cache.get_pool(pool_address)?;
+        pool.quote_exact_in(amount)
     }
 }
 ```
@@ -757,9 +930,12 @@ impl QuoteCalculator {
 
 impl CrossDexHandler {
     /// Build multi-hop swap transaction
+    /// 
+    /// ⚠️ KORRIGIERT: Nutzt selected_pools aus Quote (nach Fallback-Resolution)
     pub fn build_multi_hop_swap(
         &self,
         path: &[SwapHop],
+        quote: &MultiHopQuote, // Enthält selected_pools nach Fallback
         input_amount: u64,
         min_output: u64,
         wallet: &Pubkey,
@@ -776,14 +952,15 @@ impl CrossDexHandler {
             }
         }
 
-        // 2. Build swap instructions for each hop
+        // 2. Build swap instructions for each hop (mit resolved pools)
         let mut current_amount = input_amount;
-        for (i, hop) in path.iter().enumerate() {
+        for (i, (hop, pool_address)) in path.iter().zip(&quote.selected_pools).enumerate() {
             let is_last = i == path.len() - 1;
             let min_out = if is_last { min_output } else { 1 }; // Only enforce on last hop
 
+            // Nutze den Pool der beim Quote ausgewählt wurde (kann Fallback sein!)
             let swap_ix = self.build_swap_ix(
-                &hop.pool_address,
+                pool_address, // Aus Quote, nicht aus hop.pool_address!
                 &hop.dex,
                 &hop.input_mint,
                 &hop.output_mint,
@@ -794,7 +971,7 @@ impl CrossDexHandler {
             instructions.extend(swap_ix);
 
             // Update current_amount for next hop (from quote)
-            current_amount = hop.expected_output;
+            current_amount = quote.hops[i].output_amount;
         }
 
         Ok(instructions)
@@ -846,25 +1023,30 @@ Example (0.5% per hop):
 
 ### Phase 1: Pool-Graph (arb-strategy)
 - [ ] `PoolGraph` struct implementieren
-- [ ] `PoolEdge` struct implementieren
+- [ ] `PoolEdge` struct implementieren (ungerichtet!)
 - [ ] Graph update handler für MarketEvents
 - [ ] Unit tests für Graph operations
 
-### Phase 2: Pre-Compute & Ranking
+### Phase 2: Pre-Compute & Ranking ⚠️ KRITISCH
 - [ ] `PoolRanker` struct implementieren
+- [ ] **KRITISCH**: `edge_ratio` via probe-based Quote (nicht Spot-Preis!)
+- [ ] `probe_amount_lamports` konfigurierbar (~$100-500)
 - [ ] `max_edge_ratio` Berechnung pro Token
-- [ ] Top-K Pool Selection pro Token-Paar
+- [ ] **KORRIGIERT**: Top-3 Pool Selection (für Fallbacks)
+- [ ] **KORRIGIERT**: Gedämpftes Liquidity-Scoring (log oder clamp)
 - [ ] Blacklist-Handling (Rugs, Low-Liquidity)
 - [ ] Periodic Refresh (~30s)
 - [ ] Unit tests für Ranking
 
-### Phase 3: Cycle Detection (Best-First Beam Search)
+### Phase 3: Cycle Detection (Best-First Beam Search) ⚠️ KRITISCH
 - [ ] `BeamCycleFinder` struct implementieren
 - [ ] `SearchNode` mit Score-basierter Priority Queue
+- [ ] **KRITISCH**: `visited: HashSet` für O(1) lookup (nicht path.contains!)
 - [ ] Branch-and-Bound Upper Bound Pruning
-- [ ] Beam Width Limit pro Tiefenlevel
+- [ ] **KORRIGIERT**: Proper Beam Limit (Top-K nach Score, nicht First-K!)
 - [ ] Depth Constraint (max 4 Hops)
-- [ ] Adaptive Scoring (profit × sqrt(liquidity))
+- [ ] **KORRIGIERT**: Scoring mit gedämpfter Liquidity
+- [ ] **KORRIGIERT**: Pool-Alternativen in ArbCycle speichern
 - [ ] Unit tests für Cycle Detection
 - [ ] Benchmark: Vergleich mit naivem DFS
 
@@ -873,20 +1055,24 @@ Example (0.5% per hop):
 - [ ] Cycle Detection Trigger
 - [ ] Best Cycle Selection + Intent Emission
 - [ ] Metrics/Logging für Cycle-Finder Performance
-- [ ] `SwapHop` struct zu IPC Schema
+- [ ] `SwapHop` struct zu IPC Schema (mit `pool_alternatives`!)
+- [ ] `PoolAlternative` struct für Fallbacks
 - [ ] `swap_path` field zu TradeIntent
 - [ ] Backward-compatible (None = legacy)
 - [ ] arb-strategy Intent creation
 
-### Phase 5: execution-engine
-- [ ] `quote_multi_hop()` in QuoteCalculator
-- [ ] `build_multi_hop_swap()` in CrossDexHandler
+### Phase 5: execution-engine ⚠️ KRITISCH
+- [ ] **KORRIGIERT**: `quote_multi_hop()` mit Fallback-Support
+- [ ] Fallback auf `pool_alternatives` bei Quote-Fehler
+- [ ] `MultiHopQuote.selected_pools` tracken
+- [ ] **KORRIGIERT**: `build_multi_hop_swap()` nutzt selected_pools
 - [ ] Handle `swap_path` in Intent processing
 - [ ] Slippage handling für multi-hop
 
 ### Phase 6: Testing
 - [ ] Unit tests für alle neuen Komponenten
 - [ ] Integration test: 3-hop cycle
+- [ ] Integration test: Fallback bei Pool-Fehler
 - [ ] Dry-run auf Server
 - [ ] CU Measurement für verschiedene Hop-Counts
 
