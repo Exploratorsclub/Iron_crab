@@ -1,133 +1,223 @@
 # Local Development Setup Guide (Windows)
 
-To run tests and build the project locally on Windows, you need to ensure your environment is correctly configured.
+This guide covers setting up IronCrab for local development on Windows.
 
-> **⚠️ Windows Native Build Not Supported**  
-> The `yellowstone-grpc-proto` dependency uses `protobuf-src` which fails to compile on Windows 
-> due to path length and toolchain issues. **Use WSL2 for local development** (see section 5).
->
-> Production runs on Debian Linux (same server as the validator).
+> **⚠️ Windows Native Rust Build Not Fully Supported**  
+> The `yellowstone-grpc-proto` dependency uses `protobuf-src` which may fail on Windows.
+> **Use WSL2 for Rust builds** (see section 5). Windows works fine for UI development.
 
-## 1. Install Prerequisites (for WSL2)
+---
 
-### Rust Toolchain
+## Quick Start (Recommended)
+
+For the fastest setup, use the helper scripts:
+
 ```powershell
-# Install rustup if not already installed
+# Start SSH tunnel to server + local UI
+.\run_local.ps1 -Action start -Host ironcrab-prod
+
+# Check status
+.\run_local.ps1 -Action status
+
+# Stop everything
+.\run_local.ps1 -Action stop
+```
+
+This connects to the production server's control-plane and runs the UI locally.
+
+---
+
+## 1. Prerequisites
+
+### Rust Toolchain (for building binaries)
+```powershell
+# Install rustup
 winget install Rustlang.Rustup
 
 # Project uses Rust 1.89.0 (see rust-toolchain.toml)
 rustup show
 ```
 
-### Visual Studio Build Tools
-Ensure you have **Visual Studio Build Tools** installed with the **"Desktop development with C++"** workload.
-- Download: [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-- During installation, select "Desktop development with C++".
-
-### Protobuf Compiler (REQUIRED for Geyser gRPC)
-The `yellowstone-grpc-proto` dependency requires `protoc`:
-
-**Option A: Via Chocolatey (recommended)**
+### Node.js (for UI development)
 ```powershell
-# Install Chocolatey if not installed: https://chocolatey.org/install
-choco install protoc -y
+# Install Node.js 18+
+winget install OpenJS.NodeJS.LTS
 
 # Verify
+node --version
+npm --version
+```
+
+### Protobuf Compiler (required for Geyser gRPC)
+```powershell
+# Via Chocolatey (recommended)
+choco install protoc -y
 protoc --version
 ```
 
-**Option B: Manual Installation**
-1. Download latest release from [protobuf releases](https://github.com/protocolbuffers/protobuf/releases)
-2. Download `protoc-XX.X-win64.zip`
-3. Extract to `C:\protoc`
-4. Add `C:\protoc\bin` to your PATH
+### Visual Studio Build Tools (for Rust on Windows)
+- Download: [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+- Select **"Desktop development with C++"** workload
 
-### Python 3.x (Required for `pyo3` feature)
-Only needed if building with `--features python`:
-1. Download Python 3.10+ from [python.org](https://www.python.org/downloads/windows/)
-2. **Important:** Check **"Add Python to PATH"** during installation
-3. Verify: `python --version`
+---
 
-### Git Bash (Required for some build scripts)
-1. Download Git for Windows from [git-scm.com](https://git-scm.com/download/win)
-2. Add `C:\Program Files\Git\bin` to your PATH
+## 2. UI Development (Windows Native)
 
-## 2. Configure Environment Variables (PowerShell)
+The React/Vite UI runs natively on Windows:
 
-Add required tools to PATH (for current session):
 ```powershell
-$env:PATH += ";C:\Program Files\Git\bin"
-$env:PATH += ";C:\protoc\bin"  # If manual protoc install
+# Navigate to UI directory
+cd ui
+
+# Install dependencies
+npm install
+
+# Start dev server (http://localhost:5173)
+npm run dev
 ```
 
-To make permanent: System Properties → Environment Variables → Edit `Path`
-
-## 3. Building & Testing
-
+Or use the helper script:
 ```powershell
-# Build (debug)
-cargo build
-
-# Build (release)
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run tests with test helpers
-cargo test --features test_helpers
-
-# Clippy (linter)
-cargo clippy --all-targets -- -D warnings
-
-# Format check
-cargo fmt -- --check
+.\run_ui.ps1
+# or if PowerShell blocks npm.ps1:
+.\run_ui.cmd
 ```
 
-## 4. Common Build Errors
+The UI connects to the control-plane API at `http://localhost:8080` by default.
 
-| Error | Solution |
-|-------|----------|
-| `protoc: command not found` | Install protobuf compiler (see above) |
-| `cannot find -lprotobuf` | Install protobuf via Chocolatey or manual |
-| `sh is required to run configure` | Add `C:\Program Files\Git\bin` to PATH |
-| `no Python 3.x interpreter found` | Install Python with PATH option |
-| `linker link.exe not found` | Install VS Build Tools with C++ workload |
-| `LINK : fatal error LNK1181` | Missing C++ libs, reinstall VS Build Tools |
+---
 
-## 5. Recommended: Build via WSL2
+## 3. Connecting to Server (SSH Tunnel)
 
-**Windows native build is not supported** due to `protobuf-src` compilation issues.
+To test the UI against the production control-plane:
 
-### Setup WSL2
 ```powershell
-# Install WSL2 with Ubuntu (in PowerShell as Admin)
+# Full tunnel (Control Plane + Prometheus + Grafana + Metrics)
+.\run_local.ps1 -Action start -Host ironcrab-prod
+
+# Tunnel only (no UI)
+.\run_local.ps1 -Action start -Host ironcrab-prod -NoUi
+
+# UI only (no tunnel, assumes tunnel already running)
+.\run_local.ps1 -Action start -NoTunnel
+```
+
+**Manual SSH tunnel:**
+```powershell
+# Control Plane only
+ssh -L 8080:127.0.0.1:8080 ironcrab-prod
+
+# All ports (Control Plane + Prometheus + Grafana + Metrics)
+ssh -L 8080:127.0.0.1:8080 -L 9090:127.0.0.1:9090 -L 3000:127.0.0.1:3000 -L 9801:127.0.0.1:9801 -L 9802:127.0.0.1:9802 -L 9803:127.0.0.1:9803 -L 9804:127.0.0.1:9804 ironcrab-prod
+```
+
+---
+
+## 4. Building Rust (Windows/WSL2)
+
+### Option A: WSL2 (Recommended)
+
+```powershell
+# Install WSL2 with Ubuntu
 wsl --install -d Ubuntu
 ```
 
-### Build in WSL2
+In WSL2:
 ```bash
-# In WSL2 (Ubuntu)
+# Install dependencies
 sudo apt-get update
 sudo apt-get install -y build-essential protobuf-compiler libprotobuf-dev pkg-config libssl-dev
 
-# Navigate to project (Windows paths accessible via /mnt/c/)
-cd /mnt/c/Users/rober/Iron_crab
+# Navigate to project (Windows paths via /mnt/c/)
+cd /mnt/c/Users/<YourUsername>/Desktop/Trading_bot/Iron_crab
 
 # Build
 cargo build --release
 
 # Run tests
 cargo test --features test_helpers
+
+# Clippy
+cargo clippy --all-targets -- -D warnings
 ```
 
-This matches the CI and production environment exactly.
+### Option B: Windows Native (Limited Support)
 
-## 6. IDE Setup (VS Code with WSL)
+```powershell
+# May work for some targets, but Geyser gRPC often fails
+cargo build --release --bin execution-engine
+cargo test --features test_helpers
+```
 
-For the best development experience, use VS Code with the WSL extension:
+---
+
+## 5. Local NATS (Optional)
+
+For full local multi-process testing without server:
+
+```powershell
+# Install NATS via Chocolatey
+choco install nats-server -y
+
+# Start NATS with JetStream
+nats-server -js -p 4222
+```
+
+Or via Docker:
+```powershell
+docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:latest -js
+```
+
+---
+
+## 6. IDE Setup
+
+### VS Code with WSL (Recommended for Rust)
 
 1. Install [Remote - WSL](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-wsl) extension
-2. Open VS Code, press `Ctrl+Shift+P` → "WSL: Connect to WSL"
-3. Open the project folder from within WSL
-4. Install rust-analyzer extension in WSL context
+2. `Ctrl+Shift+P` → "WSL: Connect to WSL"
+3. Open project folder from within WSL
+4. Install rust-analyzer in WSL context
+
+### VS Code Native (UI Development)
+
+1. Install [ESLint](https://marketplace.visualstudio.com/items?itemName=dbaeumer.vscode-eslint) extension
+2. Install [Prettier](https://marketplace.visualstudio.com/items?itemName=esbenp.prettier-vscode) extension
+3. Open `ui/` folder for best TypeScript support
+
+---
+
+## 7. Common Issues
+
+| Error | Solution |
+|-------|----------|
+| `protoc: command not found` | Install protobuf: `choco install protoc` |
+| `ECONNREFUSED localhost:8080` | Start SSH tunnel or run control-plane locally |
+| `sh is required to run configure` | Add `C:\Program Files\Git\bin` to PATH |
+| WSL2 cargo slow | Use WSL2 filesystem (`~/projects/`) not `/mnt/c/` |
+| `npm ERR! ERESOLVE` | Delete `node_modules` and `package-lock.json`, retry |
+
+---
+
+## 8. Environment Variables
+
+For local testing, create `.env` in project root:
+
+```env
+# NATS (local or tunnel)
+NATS_URL=nats://localhost:4222
+
+# Metrics ports (match server)
+METRICS_PORT_MARKET_DATA=9801
+METRICS_PORT_MOMENTUM_BOT=9802
+METRICS_PORT_ARB_STRATEGY=9803
+METRICS_PORT_EXECUTION_ENGINE=9804
+```
+
+---
+
+## See Also
+
+- [RUNBOOK_PROD.md](RUNBOOK_PROD.md) - Production operations
+- [CONFIG_SCHEMA.md](CONFIG_SCHEMA.md) - Hot-reload configuration
+- [TARGET_ARCHITECTURE.md](TARGET_ARCHITECTURE.md) - System architecture
