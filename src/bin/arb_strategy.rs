@@ -1252,6 +1252,7 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
 ///
 /// * `nats_client` - Connected NATS client
 /// * `known_pools` - HashSet to populate with pool addresses
+/// * `multi_hop` - Multi-hop arbitrage instance to populate with pools
 ///
 /// # Returns
 ///
@@ -1259,6 +1260,7 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
 async fn bootstrap_known_pools_from_jetstream(
     nats_client: &NatsClient,
     known_pools: &RwLock<HashSet<String>>,
+    multi_hop: &MultiHopArbitrage,
 ) -> Result<usize> {
     use async_nats::jetstream;
     use futures::StreamExt;
@@ -1311,13 +1313,27 @@ async fn bootstrap_known_pools_from_jetstream(
                 }
             };
 
-            // Add pool to known_pools
+            // Add pool to known_pools and multi-hop graph
             match pool_update.update_type {
                 ironcrab::ipc::PoolCacheUpdateType::PoolDiscovered
                 | ironcrab::ipc::PoolCacheUpdateType::BalanceUpdated => {
                     let mut pools = known_pools.write();
                     pools.insert(pool_update.pool_address.clone());
                     pools_recovered += 1;
+                    
+                    // Multi-hop: Add pool to graph for N-hop arbitrage detection
+                    let liquidity_usd = pool_update.liquidity_lamports
+                        .map(|l| l as f64 / 1e9 * 150.0)
+                        .unwrap_or(10_000.0);
+                    multi_hop.upsert_pool(
+                        &pool_update.pool_address,
+                        &pool_update.dex,
+                        &pool_update.base_mint,
+                        &pool_update.quote_mint,
+                        liquidity_usd,
+                        30, // Default 0.3% fee
+                    );
+                    
                     debug!(
                         pool = %pool_update.pool_address,
                         dex = %pool_update.dex,
@@ -1442,12 +1458,16 @@ async fn main() -> Result<()> {
     });
 
     // Bootstrap known_pools from JetStream (state recovery after restart)
+    // Also populates multi-hop graph with recovered pools
     if let Some(ref nats_client) = ctx.nats {
-        match bootstrap_known_pools_from_jetstream(nats_client, &ctx.known_pools).await {
+        match bootstrap_known_pools_from_jetstream(nats_client, &ctx.known_pools, &ctx.multi_hop).await {
             Ok(pools_recovered) => {
+                let mh_stats = ctx.multi_hop.stats();
                 info!(
                     pools_recovered,
-                    "SLAVE CACHE: known_pools recovered from JetStream"
+                    multi_hop_pools = mh_stats.graph_pools,
+                    multi_hop_vertices = mh_stats.graph_vertices,
+                    "SLAVE CACHE: known_pools and multi-hop graph recovered from JetStream"
                 );
                 POOLS_TRACKED_GAUGE.store(pools_recovered as u64, Ordering::Relaxed);
             }
