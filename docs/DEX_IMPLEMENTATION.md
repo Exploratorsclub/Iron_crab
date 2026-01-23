@@ -1,6 +1,6 @@
-# Meteora DLMM + Raydium CPMM Implementation
+# DEX Implementation Reference
 
-## Status: ✅ Fully Implemented
+## Status: ✅ 7 DEXes Fully Implemented
 
 **Last Updated**: Januar 2026
 
@@ -8,10 +8,7 @@
 
 ## Summary
 
-Erweiterung der IronCrab DEX-Coverage um drei zusätzliche DEXes:
-- **Meteora DLMM** - Dynamic Liquidity Market Maker (Concentrated Liquidity)
-- **Meteora CPMM** - Constant Product AMM (DAMM V2)
-- **Raydium CPMM** - Raydium's newer Constant Product AMM
+IronCrab unterstützt 7 DEXes für Pool Discovery, Quoting und Swap Execution:
 
 ## Implementierte Module
 
