@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use ironcrab::arbitrage::{MultiHopArbitrage, MultiHopConfig};
@@ -38,9 +38,9 @@ use ironcrab::metrics::{
     INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
     NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
-use ironcrab::nats::{pool_subject, slave_consumer_config, STREAM_NAME};
+use ironcrab::nats::{slave_consumer_config, STREAM_NAME};
 use ironcrab::nats::{NatsClient, NatsConfig};
-use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_POOL_CACHE_UPDATES, TOPIC_TRADE_INTENTS};
+use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// Build version for decision records
@@ -1489,19 +1489,33 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Subscribe to PoolCacheUpdates (SLAVE sync from market-data MASTER)
-    let pool_cache_subscription = if let Some(ref nats) = ctx.nats {
-        match nats.subscribe(TOPIC_POOL_CACHE_UPDATES).await {
-            Ok(sub) => {
-                info!(
-                    topic = TOPIC_POOL_CACHE_UPDATES,
-                    "Subscribed to PoolCacheUpdates (SLAVE cache sync from market-data MASTER)"
-                );
-                Some(sub)
+    // Subscribe to PoolCacheUpdates from JetStream (SLAVE sync from market-data MASTER)
+    // market-data publishes to JetStream, so we need JetStream consumer (not Core NATS)
+    let pool_cache_consumer = if let Some(ref nats) = ctx.nats {
+        use async_nats::jetstream;
+
+        let js = jetstream::new(nats.client().clone());
+
+        match js.get_stream(STREAM_NAME).await {
+            Ok(stream) => {
+                // Create ephemeral consumer for live updates with LastPerSubject delivery
+                match stream.create_consumer(slave_consumer_config()).await {
+                    Ok(consumer) => {
+                        info!(
+                            stream = STREAM_NAME,
+                            "Subscribed to JetStream PoolCacheUpdates (SLAVE cache sync from market-data MASTER)"
+                        );
+                        Some(consumer)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to create JetStream consumer for PoolCacheUpdates - multi-hop will not receive pool cache");
+                        None
+                    }
+                }
             }
             Err(e) => {
-                error!(error = %e, "Failed to subscribe to PoolCacheUpdates");
-                return Err(e);
+                warn!(error = %e, stream = STREAM_NAME, "JetStream stream not found (market-data may not be running) - multi-hop will not receive pool cache");
+                None
             }
         }
     } else {
@@ -1516,7 +1530,7 @@ async fn main() -> Result<()> {
 
     let mut market_sub = market_subscription;
     let mut cfg_sub = config_subscription;
-    let mut pool_cache_sub = pool_cache_subscription;
+    let mut pool_cache_consumer_opt = pool_cache_consumer;
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(60));
 
     loop {
@@ -1600,57 +1614,72 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // PoolCacheUpdates (SLAVE sync from market-data MASTER)
-            msg = async {
-                if let Some(ref mut sub) = pool_cache_sub {
-                    sub.next().await
-                } else {
-                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
-                }
-            } => {
-                if let Some(nats_msg) = msg {
-                    NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    match serde_json::from_slice::<PoolCacheUpdate>(&nats_msg.payload) {
-                        Ok(update) => {
-                            use ironcrab::ipc::PoolCacheUpdateType;
-                            match update.update_type {
-                                PoolCacheUpdateType::PoolDiscovered => {
-                                    ctx.known_pools.write().insert(update.pool_address.clone());
-                                    debug!(pool = %update.pool_address, dex = %update.dex, "SLAVE CACHE: Pool added to known_pools");
+            // PoolCacheUpdates from JetStream (SLAVE sync from market-data MASTER)
+            _ = async {
+                use futures::StreamExt;
+                if let Some(ref consumer) = pool_cache_consumer_opt {
+                    // Try to pull up to 100 messages in batch (non-blocking)
+                    match consumer.fetch().max_messages(100).messages().await {
+                        Ok(mut messages) => {
+                            while let Some(msg_result) = messages.next().await {
+                                match msg_result {
+                                    Ok(msg) => {
+                                        NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                        match serde_json::from_slice::<PoolCacheUpdate>(&msg.payload) {
+                                            Ok(update) => {
+                                                use ironcrab::ipc::PoolCacheUpdateType;
+                                                match update.update_type {
+                                                    PoolCacheUpdateType::PoolDiscovered => {
+                                                        ctx.known_pools.write().insert(update.pool_address.clone());
+                                                        debug!(pool = %update.pool_address, dex = %update.dex, "SLAVE CACHE: Pool added to known_pools (JetStream)");
 
-                                    // Multi-hop: Add pool to graph for N-hop arbitrage detection
-                                    // Liquidity in USD approximated as lamports / 1e9 * SOL_PRICE (assume $150)
-                                    let liquidity_usd = update.liquidity_lamports
-                                        .map(|l| l as f64 / 1e9 * 150.0)
-                                        .unwrap_or(10_000.0); // Default 10k USD if unknown
-                                    ctx.multi_hop.upsert_pool(
-                                        &update.pool_address,
-                                        &update.dex,
-                                        &update.base_mint,
-                                        &update.quote_mint,
-                                        liquidity_usd,
-                                        30, // Default 0.3% fee; TODO: get from metadata
-                                    );
-                                }
-                                PoolCacheUpdateType::PoolRemoved => {
-                                    ctx.known_pools.write().remove(&update.pool_address);
-                                    debug!(pool = %update.pool_address, "SLAVE CACHE: Pool removed from known_pools");
-
-                                    // Multi-hop: Remove pool from graph
-                                    ctx.multi_hop.remove_pool(&update.pool_address);
-                                }
-                                PoolCacheUpdateType::BalanceUpdated => {
-                                    // Balance updates don't affect pool existence, just state
-                                    debug!(pool = %update.pool_address, "SLAVE CACHE: Balance update received");
+                                                        // Multi-hop: Add pool to graph for N-hop arbitrage detection
+                                                        let liquidity_usd = update.liquidity_lamports
+                                                            .map(|l| l as f64 / 1e9 * 150.0)
+                                                            .unwrap_or(10_000.0);
+                                                        ctx.multi_hop.upsert_pool(
+                                                            &update.pool_address,
+                                                            &update.dex,
+                                                            &update.base_mint,
+                                                            &update.quote_mint,
+                                                            liquidity_usd,
+                                                            30,
+                                                        );
+                                                    }
+                                                    PoolCacheUpdateType::PoolRemoved => {
+                                                        ctx.known_pools.write().remove(&update.pool_address);
+                                                        debug!(pool = %update.pool_address, "SLAVE CACHE: Pool removed (JetStream)");
+                                                        ctx.multi_hop.remove_pool(&update.pool_address);
+                                                    }
+                                                    PoolCacheUpdateType::BalanceUpdated => {
+                                                        debug!(pool = %update.pool_address, "SLAVE CACHE: Balance update (JetStream)");
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(error = %e, "Failed to deserialize PoolCacheUpdate from JetStream");
+                                            }
+                                        }
+                                        // Acknowledge the message
+                                        if let Err(e) = msg.ack().await {
+                                            warn!(error = %e, "Failed to ack JetStream message");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "Error receiving JetStream message");
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!(error = %e, "Failed to deserialize PoolCacheUpdate");
+                            // Fetch timeout or no messages is normal
+                            trace!(error = %e, "JetStream fetch returned (timeout or no messages)");
                         }
                     }
                 }
-            }
+                // Small delay to prevent busy-loop
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } => {}
 
             // Heartbeat
             _ = heartbeat_interval.tick() => {

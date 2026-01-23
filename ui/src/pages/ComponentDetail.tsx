@@ -185,13 +185,27 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     momentum_exit_min_trades: 'EXIT: Min trades needed to evaluate exit',
   },
   'arb-strategy': {
-    min_spread_bps: 'Min spread between DEX prices (bps, 100=1%)',
-    min_profit_lamports: 'Min net profit after estimated tx cost (lamports, 1e9=1 SOL)',
-    max_position_lamports: 'Max notional per arb intent (lamports, 1e9=1 SOL)',
-    est_tx_cost_lamports: 'Estimated tx cost used for net profit gating (lamports)',
-    max_slippage_bps: 'Max slippage included in intent (bps)',
-    intent_cooldown_ms: 'Cooldown per mint/pair before emitting another intent (ms)',
-    intent_ttl_ms: 'Intent time-to-live (ms)',
+    // 2-Hop Arbitrage
+    two_hop_enabled: '2-HOP: Enable 2-hop arbitrage (A→B on DEX1, B→A on DEX2)',
+    min_spread_bps: '2-HOP: Min spread between DEX prices (bps, 100=1%)',
+    min_profit_lamports: '2-HOP: Min net profit after tx cost (lamports)',
+    max_position_lamports: '2-HOP: Max notional per intent (lamports)',
+    est_tx_cost_lamports: '2-HOP: Estimated tx cost for profit calc (lamports)',
+    max_slippage_bps: '2-HOP: Max slippage included in intent (bps)',
+    intent_cooldown_ms: '2-HOP: Cooldown per pair before next intent (ms)',
+    intent_ttl_ms: '2-HOP: Intent time-to-live (ms)',
+    // Multi-Hop Arbitrage
+    multi_hop_enabled: 'MULTI-HOP: Enable multi-hop cycle detection (3+ hops)',
+    multi_hop_shadow_mode: 'MULTI-HOP: Shadow mode (log opportunities, no intents)',
+    multi_hop_max_hops: 'MULTI-HOP: Maximum hops in a cycle (3-5)',
+    multi_hop_beam_width: 'MULTI-HOP: Beam width for search algorithm',
+    multi_hop_min_profit_bps: 'MULTI-HOP: Min profit to emit intent (bps, 30=0.3%)',
+    multi_hop_max_cycles: 'MULTI-HOP: Max cycles to return per search',
+    multi_hop_pool_alternatives: 'MULTI-HOP: Pool alternatives to keep per hop',
+    multi_hop_min_liquidity_usd: 'MULTI-HOP: Min pool liquidity (USD)',
+    multi_hop_input_lamports: 'MULTI-HOP: Input amount for arb (lamports)',
+    multi_hop_min_price_change_bps: 'MULTI-HOP: Min price change to trigger search (bps)',
+    multi_hop_token_cooldown_ms: 'MULTI-HOP: Cooldown per token before re-search (ms)',
   },
   'execution-engine': {
     max_position_size_lamports: 'RISK: Max single position size (lamports, 1e9=1 SOL)',
@@ -316,7 +330,8 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
     ],
   },
   'arb-strategy': {
-    'Arbitrage (Active Knobs)': [
+    '2-Hop Arbitrage': [
+      'two_hop_enabled',
       'min_spread_bps',
       'min_profit_lamports',
       'est_tx_cost_lamports',
@@ -324,6 +339,19 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
       'max_slippage_bps',
       'intent_cooldown_ms',
       'intent_ttl_ms',
+    ],
+    'Multi-Hop Arbitrage (3+ Hops)': [
+      'multi_hop_enabled',
+      'multi_hop_shadow_mode',
+      'multi_hop_max_hops',
+      'multi_hop_beam_width',
+      'multi_hop_min_profit_bps',
+      'multi_hop_max_cycles',
+      'multi_hop_pool_alternatives',
+      'multi_hop_min_liquidity_usd',
+      'multi_hop_input_lamports',
+      'multi_hop_min_price_change_bps',
+      'multi_hop_token_cooldown_ms',
     ],
   },
   'execution-engine': {
@@ -441,6 +469,8 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     momentum_exit_min_trades: 5,
   },
   'arb-strategy': {
+    // 2-Hop Arbitrage
+    two_hop_enabled: true,
     min_spread_bps: 50,
     min_profit_lamports: 10_000_000,
     max_position_lamports: 1_000_000_000,
@@ -448,6 +478,18 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     max_slippage_bps: 100,
     intent_cooldown_ms: 5_000,
     intent_ttl_ms: 3_000,
+    // Multi-Hop Arbitrage
+    multi_hop_enabled: true,
+    multi_hop_shadow_mode: true,
+    multi_hop_max_hops: 4,
+    multi_hop_beam_width: 50,
+    multi_hop_min_profit_bps: 30,
+    multi_hop_max_cycles: 3,
+    multi_hop_pool_alternatives: 3,
+    multi_hop_min_liquidity_usd: 1000,
+    multi_hop_input_lamports: 100_000_000,
+    multi_hop_min_price_change_bps: 10,
+    multi_hop_token_cooldown_ms: 100,
   },
   'market-data': {
     // DEX Discovery Toggles
@@ -553,13 +595,14 @@ export function ComponentDetail() {
     try {
       const data = await fetchJson<{ config: ComponentConfig }>(`${CONTROL_PLANE}/config/${component}`)
       
-      // Merge with defaults if config is empty
-      const loadedConfig = data.config && Object.keys(data.config).length > 0
-        ? data.config
-        : DEFAULT_CONFIGS[component] || {}
+      // Always merge server config with defaults to show all available fields
+      // Server values take precedence, defaults fill in missing fields
+      const defaults = DEFAULT_CONFIGS[component] || {}
+      const serverConfig = data.config || {}
+      const mergedConfig = { ...defaults, ...serverConfig }
       
-      setConfig(loadedConfig)
-      setConfigDraft(loadedConfig)
+      setConfig(mergedConfig)
+      setConfigDraft(mergedConfig)
       setLamportsDisplayDraft({})
     } catch (err) {
       setConfigError(err instanceof Error ? err.message : String(err))
