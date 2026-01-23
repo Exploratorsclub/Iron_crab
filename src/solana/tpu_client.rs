@@ -101,7 +101,7 @@ impl TpuSubmitter {
         ws_url: &str,
         config: TpuSubmitterConfig,
     ) -> Result<Self> {
-        use solana_connection_cache::connection_cache::ConnectionCache;
+        use solana_connection_cache::connection_cache::{ConnectionCache, NewConnectionConfig};
         use solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool};
         use solana_tpu_client::tpu_client::{TpuClient, TpuClientConfig};
 
@@ -185,7 +185,7 @@ impl TpuSubmitter {
 
     /// Reconnect the TPU client.
     pub async fn reconnect(&self) -> Result<(), TpuError> {
-        use solana_connection_cache::connection_cache::ConnectionCache;
+        use solana_connection_cache::connection_cache::{ConnectionCache, NewConnectionConfig};
         use solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool};
         use solana_tpu_client::tpu_client::{TpuClient, TpuClientConfig};
 
