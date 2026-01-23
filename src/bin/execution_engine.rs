@@ -86,6 +86,7 @@ use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
 use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use ironcrab::solana::dex::raydium::Raydium;
+use ironcrab::solana::dex::router::Router;
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::dex_parser::SOL_MINT;
 use ironcrab::solana::jito::{JitoClient, JitoRegion};
@@ -2840,6 +2841,15 @@ async fn main() -> Result<()> {
     let burn_config = JsonlWriterConfig::new("burn_ops").with_log_dir(log_base.join("burns"));
     let burn_writer = JsonlWriter::new(burn_config)?;
 
+    // WSOL Manager and Account Janitor writers
+    let wsol_config_jsonl =
+        JsonlWriterConfig::new("wsol_actions").with_log_dir(log_base.join("wsol"));
+    let wsol_writer = Arc::new(JsonlWriter::new(wsol_config_jsonl)?);
+
+    let janitor_config_jsonl =
+        JsonlWriterConfig::new("janitor_actions").with_log_dir(log_base.join("janitor"));
+    let janitor_writer = Arc::new(JsonlWriter::new(janitor_config_jsonl)?);
+
     info!(log_dir = %log_base.display(), "JSONL writers initialized");
 
     // Load wallet keys and fetch real balance
@@ -3137,12 +3147,13 @@ async fn main() -> Result<()> {
         if wsol_config.enabled {
             // Create separate NATS connection for WsolManager
             let nats_url = args.nats_url.clone();
-            let wsol_manager = WsolManager::new(
+            let wsol_manager = WsolManager::with_jsonl_writer(
                 wsol_config.clone(),
                 Arc::new(treasury.clone()),
                 Arc::clone(&ctx.rpc),
                 env!("CARGO_PKG_VERSION"),
                 &run_id,
+                Arc::clone(&wsol_writer),
             );
             let shutdown_rx_wsol = shutdown_rx.clone();
 
@@ -3213,12 +3224,34 @@ async fn main() -> Result<()> {
             });
 
         if janitor_config.enabled {
-            let janitor = AccountJanitor::new(
-                janitor_config.clone(),
-                Arc::new(treasury.clone()),
-                Arc::clone(&ctx.rpc),
-                run_id.clone(),
-            );
+            // Build Router from CrossDexHandler's DEX connectors (if available)
+            // This enables swap_dust feature to swap dust tokens to SOL
+            let janitor_router = ctx.cross_dex_handler.as_ref().map(|handler| {
+                let dexes = handler.get_all_dexes();
+                Arc::new(Router::new(dexes))
+            });
+
+            let janitor = if let Some(router) = janitor_router {
+                info!("AccountJanitor: Router available with {} DEXes for swap_dust", 
+                      ctx.cross_dex_handler.as_ref().map(|h| h.get_all_dexes().len()).unwrap_or(0));
+                AccountJanitor::with_router_and_jsonl(
+                    janitor_config.clone(),
+                    Arc::new(treasury.clone()),
+                    Arc::clone(&ctx.rpc),
+                    router,
+                    Arc::clone(&janitor_writer),
+                    run_id.clone(),
+                )
+            } else {
+                warn!("AccountJanitor: No Router available, swap_dust disabled");
+                AccountJanitor::with_jsonl_writer(
+                    janitor_config.clone(),
+                    Arc::new(treasury.clone()),
+                    Arc::clone(&ctx.rpc),
+                    Arc::clone(&janitor_writer),
+                    run_id.clone(),
+                )
+            };
             let shutdown_rx_janitor = shutdown_rx.clone();
 
             tokio::spawn(async move {

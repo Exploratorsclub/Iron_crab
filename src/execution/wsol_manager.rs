@@ -46,6 +46,7 @@ use crate::metrics::{
 };
 use crate::nats::NatsClient;
 use crate::solana::rpc::SolanaRpc;
+use crate::storage::JsonlWriter;
 use crate::wallet::Treasury;
 
 /// WSOL mint address (native SOL wrapped)
@@ -208,6 +209,9 @@ pub struct WsolManager {
     build_version: String,
     /// Run ID for records
     run_id: String,
+
+    /// JSONL writer for decision records
+    jsonl_writer: Option<Arc<JsonlWriter>>,
 }
 
 impl WsolManager {
@@ -231,6 +235,32 @@ impl WsolManager {
             running: AtomicBool::new(true),
             build_version: build_version.to_string(),
             run_id: run_id.to_string(),
+            jsonl_writer: None,
+        }
+    }
+
+    /// Create with JSONL writer for decision records
+    pub fn with_jsonl_writer(
+        config: WsolManagerConfig,
+        treasury: Arc<Treasury>,
+        rpc: Arc<SolanaRpc>,
+        build_version: &str,
+        run_id: &str,
+        jsonl_writer: Arc<JsonlWriter>,
+    ) -> Self {
+        let wallet_pubkey = treasury.pubkey();
+        Self {
+            config,
+            treasury,
+            rpc,
+            wallet_pubkey,
+            wsol_balance: AtomicU64::new(0),
+            sol_balance: AtomicU64::new(0),
+            last_action_ts: AtomicU64::new(0),
+            running: AtomicBool::new(true),
+            build_version: build_version.to_string(),
+            run_id: run_id.to_string(),
+            jsonl_writer: Some(jsonl_writer),
         }
     }
 
@@ -547,24 +577,27 @@ impl WsolManager {
         let sol_before = self.sol_balance();
         let wsol_before = self.wsol_balance();
 
-        // TODO: Write action to JSONL log for forensics
-        let _action = WsolManagerAction {
-            header: RecordHeader::new("wsol_manager", &self.build_version, &self.run_id),
-            action: "wrap".to_string(),
-            amount_lamports,
-            sol_before_lamports: sol_before,
-            wsol_before_lamports: wsol_before,
-            reason: format!(
-                "WSOL {} < min {}",
-                wsol_before as f64 / LAMPORTS_PER_SOL as f64,
-                self.config.min_wsol_sol
-            ),
-            signature: None,
-            dry_run: self.config.dry_run,
-            error: None,
-        };
+        let reason = format!(
+            "WSOL {} < min {}",
+            wsol_before as f64 / LAMPORTS_PER_SOL as f64,
+            self.config.min_wsol_sol
+        );
 
         if self.config.dry_run {
+            // Log dry-run action
+            let action = WsolManagerAction {
+                header: RecordHeader::new("wsol_manager", &self.build_version, &self.run_id),
+                action: "wrap".to_string(),
+                amount_lamports,
+                sol_before_lamports: sol_before,
+                wsol_before_lamports: wsol_before,
+                reason: reason.clone(),
+                signature: None,
+                dry_run: true,
+                error: None,
+            };
+            self.write_action(&action);
+
             info!(
                 amount = amount_lamports as f64 / LAMPORTS_PER_SOL as f64,
                 "[DRY-RUN] Would wrap SOL → WSOL"
@@ -575,6 +608,20 @@ impl WsolManager {
         // Build and send wrap TX
         match self.build_and_send_wrap_tx(amount_lamports).await {
             Ok(sig) => {
+                // Log successful action
+                let action = WsolManagerAction {
+                    header: RecordHeader::new("wsol_manager", &self.build_version, &self.run_id),
+                    action: "wrap".to_string(),
+                    amount_lamports,
+                    sol_before_lamports: sol_before,
+                    wsol_before_lamports: wsol_before,
+                    reason,
+                    signature: Some(sig.to_string()),
+                    dry_run: false,
+                    error: None,
+                };
+                self.write_action(&action);
+
                 info!(
                     signature = %sig,
                     amount = amount_lamports as f64 / LAMPORTS_PER_SOL as f64,
@@ -595,6 +642,20 @@ impl WsolManager {
                 Ok(())
             }
             Err(e) => {
+                // Log failed action
+                let action = WsolManagerAction {
+                    header: RecordHeader::new("wsol_manager", &self.build_version, &self.run_id),
+                    action: "wrap".to_string(),
+                    amount_lamports,
+                    sol_before_lamports: sol_before,
+                    wsol_before_lamports: wsol_before,
+                    reason,
+                    signature: None,
+                    dry_run: false,
+                    error: Some(e.to_string()),
+                };
+                self.write_action(&action);
+
                 error!(error = %e, "Failed to wrap SOL");
                 Err(e)
             }
@@ -603,10 +664,30 @@ impl WsolManager {
 
     /// Execute unwrap: WSOL → SOL (close account to get SOL back)
     async fn execute_unwrap(&self, _amount_lamports: u64) -> Result<()> {
-        let _sol_before = self.sol_balance();
+        let sol_before = self.sol_balance();
         let wsol_before = self.wsol_balance();
 
+        let reason = format!(
+            "WSOL {} > max {}",
+            wsol_before as f64 / LAMPORTS_PER_SOL as f64,
+            self.config.max_wsol_sol
+        );
+
         if self.config.dry_run {
+            // Log dry-run action
+            let action = WsolManagerAction {
+                header: RecordHeader::new("wsol_manager", &self.build_version, &self.run_id),
+                action: "unwrap".to_string(),
+                amount_lamports: wsol_before, // We unwrap everything
+                sol_before_lamports: sol_before,
+                wsol_before_lamports: wsol_before,
+                reason: reason.clone(),
+                signature: None,
+                dry_run: true,
+                error: None,
+            };
+            self.write_action(&action);
+
             info!(
                 amount = _amount_lamports as f64 / LAMPORTS_PER_SOL as f64,
                 "[DRY-RUN] Would unwrap WSOL → SOL"
@@ -618,6 +699,20 @@ impl WsolManager {
         // This is simpler and avoids partial unwrap complexity
         match self.build_and_send_unwrap_tx().await {
             Ok(sig) => {
+                // Log successful action
+                let action = WsolManagerAction {
+                    header: RecordHeader::new("wsol_manager", &self.build_version, &self.run_id),
+                    action: "unwrap".to_string(),
+                    amount_lamports: wsol_before,
+                    sol_before_lamports: sol_before,
+                    wsol_before_lamports: wsol_before,
+                    reason: reason.clone(),
+                    signature: Some(sig.to_string()),
+                    dry_run: false,
+                    error: None,
+                };
+                self.write_action(&action);
+
                 info!(
                     signature = %sig,
                     wsol_amount = wsol_before as f64 / LAMPORTS_PER_SOL as f64,
@@ -634,8 +729,31 @@ impl WsolManager {
                 Ok(())
             }
             Err(e) => {
+                // Log failed action
+                let action = WsolManagerAction {
+                    header: RecordHeader::new("wsol_manager", &self.build_version, &self.run_id),
+                    action: "unwrap".to_string(),
+                    amount_lamports: wsol_before,
+                    sol_before_lamports: sol_before,
+                    wsol_before_lamports: wsol_before,
+                    reason,
+                    signature: None,
+                    dry_run: false,
+                    error: Some(e.to_string()),
+                };
+                self.write_action(&action);
+
                 error!(error = %e, "Failed to unwrap WSOL");
                 Err(e)
+            }
+        }
+    }
+
+    /// Write action to JSONL log
+    fn write_action(&self, action: &WsolManagerAction) {
+        if let Some(ref writer) = self.jsonl_writer {
+            if let Err(e) = writer.write(action) {
+                warn!(error = %e, "Failed to write WSOL action to JSONL");
             }
         }
     }

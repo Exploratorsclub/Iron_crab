@@ -1287,6 +1287,11 @@ impl CrossDexHandler {
     pub fn get_dex(&self, name: &str) -> Option<&Arc<dyn Dex>> {
         self.dexes.get(name)
     }
+
+    /// Get all DEX connectors as a Vec (for Router construction)
+    pub fn get_all_dexes(&self) -> Vec<Arc<dyn Dex>> {
+        self.dexes.values().cloned().collect()
+    }
 }
 
 #[cfg(test)]

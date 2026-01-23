@@ -20,6 +20,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::ipc::RecordHeader;
+use crate::storage::JsonlWriter;
 use crate::metrics::{
     JANITOR_ACCOUNTS_SCANNED_TOTAL, JANITOR_CLOSE_ATA_TOTAL, JANITOR_MERGE_DUST_TOTAL,
     JANITOR_SOL_RECOVERED_LAMPORTS, JANITOR_SWEEP_RUNS_TOTAL, JANITOR_SWAP_DUST_FAILED,
@@ -205,6 +206,7 @@ pub struct AccountJanitor {
     router: Option<Arc<Router>>,
     wallet_pubkey: Pubkey,
     run_id: String,
+    jsonl_writer: Option<Arc<JsonlWriter>>,
 }
 
 impl AccountJanitor {
@@ -223,6 +225,27 @@ impl AccountJanitor {
             router: None,
             wallet_pubkey,
             run_id,
+            jsonl_writer: None,
+        }
+    }
+
+    /// Create AccountJanitor with JsonlWriter for logging (no Router = no swap_dust)
+    pub fn with_jsonl_writer(
+        config: AccountJanitorConfig,
+        treasury: Arc<Treasury>,
+        rpc: Arc<SolanaRpc>,
+        jsonl_writer: Arc<JsonlWriter>,
+        run_id: String,
+    ) -> Self {
+        let wallet_pubkey = treasury.pubkey();
+        Self {
+            config,
+            treasury,
+            rpc,
+            router: None,
+            wallet_pubkey,
+            run_id,
+            jsonl_writer: Some(jsonl_writer),
         }
     }
 
@@ -242,6 +265,37 @@ impl AccountJanitor {
             router: Some(router),
             wallet_pubkey,
             run_id,
+            jsonl_writer: None,
+        }
+    }
+
+    /// Create AccountJanitor with Router and JsonlWriter for full logging
+    pub fn with_router_and_jsonl(
+        config: AccountJanitorConfig,
+        treasury: Arc<Treasury>,
+        rpc: Arc<SolanaRpc>,
+        router: Arc<Router>,
+        jsonl_writer: Arc<JsonlWriter>,
+        run_id: String,
+    ) -> Self {
+        let wallet_pubkey = treasury.pubkey();
+        Self {
+            config,
+            treasury,
+            rpc,
+            router: Some(router),
+            wallet_pubkey,
+            run_id,
+            jsonl_writer: Some(jsonl_writer),
+        }
+    }
+
+    /// Write action to JSONL log
+    fn write_action(&self, action: &JanitorAction) {
+        if let Some(ref writer) = self.jsonl_writer {
+            if let Err(e) = writer.write(action) {
+                warn!(error = %e, "Failed to write janitor action to JSONL");
+            }
         }
     }
 
@@ -376,6 +430,7 @@ impl AccountJanitor {
                 action = ?action,
                 "DRY RUN: Would close ATAs"
             );
+            self.write_action(&action);
         } else {
             match &result {
                 Ok(sig) => {
@@ -390,9 +445,11 @@ impl AccountJanitor {
                         sol_recovered = sol_recovered as f64 / 1e9,
                         "Successfully closed empty ATAs"
                     );
+                    self.write_action(&action);
                 }
                 Err(e) => {
                     warn!(error = %e, "Failed to close ATAs");
+                    self.write_action(&action);
                 }
             }
         }
@@ -559,6 +616,7 @@ impl AccountJanitor {
                     total_balance = total_balance,
                     "[DRY-RUN] Would merge ATAs"
                 );
+                self.write_action(&action);
             } else {
                 match &result {
                     Ok(sig) => {
@@ -572,6 +630,7 @@ impl AccountJanitor {
                             ata_count = atas.len(),
                             "Successfully merged duplicate ATAs"
                         );
+                        self.write_action(&action);
                     }
                     Err(e) => {
                         warn!(
@@ -580,6 +639,7 @@ impl AccountJanitor {
                             action = ?action,
                             "Failed to merge ATAs"
                         );
+                        self.write_action(&action);
                     }
                 }
             }
@@ -778,6 +838,7 @@ impl AccountJanitor {
                     estimated_value_sol = dust.estimated_value_sol,
                     "[DRY-RUN] Would swap dust token to SOL"
                 );
+                self.write_action(&action);
             } else {
                 match &result {
                     Ok(sol_recovered) => {
@@ -789,6 +850,7 @@ impl AccountJanitor {
                             sol_recovered_lamports = sol_recovered,
                             "Successfully swapped dust token to SOL"
                         );
+                        self.write_action(&action);
                     }
                     Err(e) => {
                         JANITOR_SWAP_DUST_FAILED.fetch_add(1, Ordering::Relaxed);
@@ -799,6 +861,7 @@ impl AccountJanitor {
                             action = ?action,
                             "Failed to swap dust token"
                         );
+                        self.write_action(&action);
                     }
                 }
             }

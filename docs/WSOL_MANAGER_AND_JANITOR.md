@@ -210,8 +210,8 @@ close_ata_max_per_run = 20          # Max ATAs pro Run
   - [x] `janitor_accounts_scanned_total` - Total accounts scanned
 - [x] Metrics in `src/metrics.rs` definiert und exportiert
 - [x] Integration in `wsol_manager.rs` und `account_janitor.rs`
-- [ ] Logging: Jede Aktion mit Details loggen (already present via tracing)
-- [ ] DecisionRecords für Wrap/Unwrap/Janitor Aktionen (FUTURE)
+- [x] Logging: Jede Aktion mit Details loggen (tracing)
+- [x] DecisionRecords für Wrap/Unwrap/Janitor Aktionen via JSONL ✅
 
 ---
 
@@ -236,11 +236,22 @@ src/ipc/
 
 src/solana/
 ├── cross_dex_handler.rs    # build_swap_plan() - optimized (no WSOL wrap) ✅
+│                           # + get_all_dexes() - für Router (Janitor swap_dust)
 └── ...
 
 src/bin/
 ├── execution_engine.rs     # + WsolManager spawn ✅
+│                           # + AccountJanitor spawn mit Router ✅
 └── market_data.rs          # + TrackedWallet, Geyser wallet tracking, WalletBalanceUpdate ✅
+
+trade_logs/
+├── decisions/              # Decision records (execution pipeline)
+├── executions/             # Execution results
+├── burns/                  # Burn operations
+├── wsol/                   # WSOL Manager actions (wrap/unwrap) ✅ NEW
+│   └── wsol_actions-YYYYMMDD.jsonl
+└── janitor/                # Account Janitor actions ✅ NEW
+    └── janitor_actions-YYYYMMDD.jsonl
 ```
 
 ---
