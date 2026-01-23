@@ -291,6 +291,15 @@ pub struct AccountJanitorCfg {
     /// Maximum ATAs to close per run. Default: 10
     #[serde(default = "default_janitor_max_per_run")]
     pub close_ata_max_per_run: usize,
+    /// Enable merge dust feature (consolidate duplicate ATAs). Default: false
+    #[serde(default)]
+    pub merge_dust_enabled: bool,
+    /// Interval for merging duplicate ATAs in seconds. Default: 300 (5 min)
+    #[serde(default = "default_janitor_merge_interval")]
+    pub merge_dust_interval_secs: u64,
+    /// Maximum token merges per run. Default: 5
+    #[serde(default = "default_janitor_merge_max_per_run")]
+    pub merge_dust_max_per_run: usize,
     /// Dry-run mode: log actions but don't send TX. Default: false
     #[serde(default)]
     pub dry_run: bool,
@@ -305,6 +314,12 @@ fn default_janitor_min_age() -> u64 {
 fn default_janitor_max_per_run() -> usize {
     10
 }
+fn default_janitor_merge_interval() -> u64 {
+    300
+}
+fn default_janitor_merge_max_per_run() -> usize {
+    5
+}
 
 impl Default for AccountJanitorCfg {
     fn default() -> Self {
@@ -313,6 +328,9 @@ impl Default for AccountJanitorCfg {
             close_ata_interval_secs: default_janitor_close_interval(),
             close_ata_min_age_secs: default_janitor_min_age(),
             close_ata_max_per_run: default_janitor_max_per_run(),
+            merge_dust_enabled: false,
+            merge_dust_interval_secs: default_janitor_merge_interval(),
+            merge_dust_max_per_run: default_janitor_merge_max_per_run(),
             dry_run: false,
         }
     }

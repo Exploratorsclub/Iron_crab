@@ -208,6 +208,8 @@ pub static JANITOR_CLOSE_ATA_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::ne
 pub static JANITOR_SOL_RECOVERED_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static JANITOR_SWEEP_RUNS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static JANITOR_ACCOUNTS_SCANNED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static JANITOR_MERGE_DUST_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static JANITOR_TOKENS_MERGED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 // Global counters (simple, lock-free). For production consider Prometheus exporter.
 pub static QUOTE_REQUESTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -864,6 +866,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "janitor_accounts_scanned_total",
         JANITOR_ACCOUNTS_SCANNED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "janitor_merge_dust_total",
+        JANITOR_MERGE_DUST_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "janitor_tokens_merged_total",
+        JANITOR_TOKENS_MERGED_TOTAL.load(Ordering::Relaxed)
     );
 
     // =============================================================================

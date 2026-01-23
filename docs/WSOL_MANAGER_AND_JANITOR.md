@@ -1,6 +1,6 @@
 # WSOL Manager & Account Janitor Implementation
 
-**Status**: Phase 3 Complete (Prometheus Metrics)  
+**Status**: Phase 2.2 Complete (Merge Dust)  
 **Created**: 2026-01-20  
 **Last Updated**: 2026-01-21
 
@@ -163,10 +163,12 @@ close_ata_max_per_run = 20          # Max ATAs pro Run
   - [x] `run()` async main loop (timer-based)
   - [x] Graceful shutdown via watch::channel
 
-#### 2.2 Merge Dust (gleiche Token) - FUTURE
-- [ ] `find_duplicate_atas()` - ATAs für gleichen Mint finden
-- [ ] `build_merge_ix()` - Transfer von ATA_2 → ATA_1
-- [ ] `execute_merge()` - TX bauen und senden
+#### 2.2 Merge Dust (gleiche Token) ✅ COMPLETE
+- [x] `find_duplicate_atas()` - ATAs für gleichen Mint finden
+- [x] `merge_atas_for_mint()` - Transfer von ATA_2 → canonical ATA
+- [x] `run_merge_duplicate_atas()` - TX bauen und senden
+- [x] Config: `merge_dust_enabled`, `merge_dust_interval_secs`, `merge_dust_max_per_run`
+- [x] Prometheus metrics: `JANITOR_MERGE_DUST_TOTAL`, `JANITOR_TOKENS_MERGED_TOTAL`
 
 #### 2.3 Swap Dust → SOL - FUTURE (via interne DEX, nicht Jupiter)
 - [ ] `find_dust_tokens()` - Tokens mit kleinem Wert finden

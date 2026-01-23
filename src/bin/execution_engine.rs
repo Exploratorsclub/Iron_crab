@@ -3197,6 +3197,9 @@ async fn main() -> Result<()> {
                 close_ata_interval_secs: cfg.close_ata_interval_secs,
                 close_ata_min_age_secs: cfg.close_ata_min_age_secs,
                 close_ata_max_per_run: cfg.close_ata_max_per_run,
+                merge_dust_enabled: cfg.merge_dust_enabled,
+                merge_dust_interval_secs: cfg.merge_dust_interval_secs,
+                merge_dust_max_per_run: cfg.merge_dust_max_per_run,
                 dry_run: cfg.dry_run || args.dry_run,
             })
             .unwrap_or_else(|| AccountJanitorConfig {

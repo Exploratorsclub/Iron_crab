@@ -21,8 +21,8 @@ use tracing::{debug, info, warn};
 
 use crate::ipc::RecordHeader;
 use crate::metrics::{
-    JANITOR_ACCOUNTS_SCANNED_TOTAL, JANITOR_CLOSE_ATA_TOTAL, JANITOR_SOL_RECOVERED_LAMPORTS,
-    JANITOR_SWEEP_RUNS_TOTAL,
+    JANITOR_ACCOUNTS_SCANNED_TOTAL, JANITOR_CLOSE_ATA_TOTAL, JANITOR_MERGE_DUST_TOTAL,
+    JANITOR_SOL_RECOVERED_LAMPORTS, JANITOR_SWEEP_RUNS_TOTAL, JANITOR_TOKENS_MERGED_TOTAL,
 };
 use crate::solana::rpc::SolanaRpc;
 use crate::wallet::Treasury;
@@ -51,6 +51,18 @@ pub struct AccountJanitorConfig {
     #[serde(default = "default_close_ata_max_per_run")]
     pub close_ata_max_per_run: usize,
 
+    /// Enable merge dust feature (consolidate duplicate ATAs)
+    #[serde(default)]
+    pub merge_dust_enabled: bool,
+
+    /// Interval for merging duplicate ATAs (seconds)
+    #[serde(default = "default_merge_dust_interval")]
+    pub merge_dust_interval_secs: u64,
+
+    /// Maximum merges per run
+    #[serde(default = "default_merge_dust_max_per_run")]
+    pub merge_dust_max_per_run: usize,
+
     /// Dry run mode - log actions but don't execute
     #[serde(default)]
     pub dry_run: bool,
@@ -75,6 +87,14 @@ fn default_close_ata_max_per_run() -> usize {
     10
 }
 
+fn default_merge_dust_interval() -> u64 {
+    300 // 5 minutes
+}
+
+fn default_merge_dust_max_per_run() -> usize {
+    5
+}
+
 impl Default for AccountJanitorConfig {
     fn default() -> Self {
         Self {
@@ -82,6 +102,9 @@ impl Default for AccountJanitorConfig {
             close_ata_interval_secs: default_close_ata_interval(),
             close_ata_min_age_secs: default_close_ata_min_age(),
             close_ata_max_per_run: default_close_ata_max_per_run(),
+            merge_dust_enabled: false,
+            merge_dust_interval_secs: default_merge_dust_interval(),
+            merge_dust_max_per_run: default_merge_dust_max_per_run(),
             dry_run: false,
         }
     }
@@ -170,15 +193,20 @@ impl AccountJanitor {
             close_interval_secs = self.config.close_ata_interval_secs,
             min_age_secs = self.config.close_ata_min_age_secs,
             max_per_run = self.config.close_ata_max_per_run,
+            merge_dust_enabled = self.config.merge_dust_enabled,
+            merge_dust_interval_secs = self.config.merge_dust_interval_secs,
             dry_run = self.config.dry_run,
             "AccountJanitor starting"
         );
 
         let mut close_interval =
             tokio::time::interval(Duration::from_secs(self.config.close_ata_interval_secs));
+        let mut merge_interval =
+            tokio::time::interval(Duration::from_secs(self.config.merge_dust_interval_secs));
 
         // Skip first tick (immediate)
         close_interval.tick().await;
+        merge_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -192,6 +220,14 @@ impl AccountJanitor {
                 _ = close_interval.tick() => {
                     if let Err(e) = self.run_close_empty_atas().await {
                         warn!(error = %e, "Failed to close empty ATAs");
+                    }
+                }
+
+                _ = merge_interval.tick() => {
+                    if self.config.merge_dust_enabled {
+                        if let Err(e) = self.run_merge_duplicate_atas().await {
+                            warn!(error = %e, "Failed to merge duplicate ATAs");
+                        }
                     }
                 }
             }
@@ -375,6 +411,216 @@ impl AccountJanitor {
             )?;
 
             instructions.push(prog_ix_to_sdk(close_ix));
+        }
+
+        // Build and send transaction
+        let recent_blockhash = self.rpc.get_latest_blockhash_retry().await?;
+        let signer = self.treasury.signer_ref();
+
+        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&self.wallet_pubkey),
+            &[signer],
+            recent_blockhash,
+        );
+
+        let signature = self.rpc.send_and_confirm_transaction(&tx).await?;
+
+        Ok(signature)
+    }
+
+    // =========================================================================
+    // Merge Dust (duplicate ATAs)
+    // =========================================================================
+
+    /// Find and merge duplicate ATAs for the same token
+    async fn run_merge_duplicate_atas(&self) -> Result<()> {
+        info!("AccountJanitor: Starting duplicate ATA scan for merge");
+
+        let duplicates = self.find_duplicate_atas().await?;
+
+        if duplicates.is_empty() {
+            debug!("No duplicate ATAs found");
+            return Ok(());
+        }
+
+        info!(
+            token_count = duplicates.len(),
+            "Found tokens with duplicate ATAs"
+        );
+
+        // Take max_per_run tokens
+        let to_merge: Vec<_> = duplicates
+            .into_iter()
+            .take(self.config.merge_dust_max_per_run)
+            .collect();
+
+        for (mint, atas) in &to_merge {
+            let result = self.merge_atas_for_mint(mint, atas).await;
+
+            // Log action
+            let total_balance: u64 = atas.iter().map(|a| a.balance).sum();
+            let action = JanitorAction {
+                header: RecordHeader::new("account-janitor", env!("CARGO_PKG_VERSION"), &self.run_id),
+                action: "merge_dust".to_string(),
+                accounts_count: atas.len(),
+                sol_recovered_lamports: 0, // Merge doesn't recover SOL (yet)
+                signature: result.as_ref().ok().map(|s| s.to_string()),
+                dry_run: self.config.dry_run,
+                error: result.as_ref().err().map(|e| e.to_string()),
+                details: vec![
+                    format!("mint: {}", mint),
+                    format!("atas: {}", atas.len()),
+                    format!("total_balance: {}", total_balance),
+                ],
+            };
+
+            if self.config.dry_run {
+                info!(
+                    mint = %mint,
+                    ata_count = atas.len(),
+                    total_balance = total_balance,
+                    "[DRY-RUN] Would merge ATAs"
+                );
+            } else {
+                match &result {
+                    Ok(sig) => {
+                        // Update metrics
+                        JANITOR_MERGE_DUST_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        JANITOR_TOKENS_MERGED_TOTAL.fetch_add(total_balance, Ordering::Relaxed);
+
+                        info!(
+                            signature = %sig,
+                            mint = %mint,
+                            ata_count = atas.len(),
+                            "Successfully merged duplicate ATAs"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            mint = %mint,
+                            action = ?action,
+                            "Failed to merge ATAs"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Find all tokens that have multiple ATAs (duplicates)
+    async fn find_duplicate_atas(&self) -> Result<Vec<(Pubkey, Vec<AtaInfo>)>> {
+        use std::collections::HashMap;
+
+        // Get all token accounts for wallet
+        let token_accounts = self
+            .rpc
+            .get_token_accounts_by_owner(&self.wallet_pubkey)
+            .await?;
+
+        // Group by mint
+        let mut by_mint: HashMap<Pubkey, Vec<AtaInfo>> = HashMap::new();
+
+        for (address, account) in token_accounts {
+            if let Ok(token_account) = spl_token::state::Account::unpack(&account.data) {
+                let mint = Pubkey::new_from_array(token_account.mint.to_bytes());
+                let ata = AtaInfo {
+                    address,
+                    mint,
+                    balance: token_account.amount,
+                    decimals: 0, // Will be fetched if needed
+                    estimated_age_secs: None,
+                };
+                by_mint.entry(mint).or_default().push(ata);
+            }
+        }
+
+        // Filter to only mints with multiple ATAs and at least one with balance > 0
+        let duplicates: Vec<_> = by_mint
+            .into_iter()
+            .filter(|(_, atas)| {
+                atas.len() > 1 && atas.iter().any(|a| a.balance > 0)
+            })
+            .collect();
+
+        Ok(duplicates)
+    }
+
+    /// Merge all ATAs for a single mint into the primary ATA
+    async fn merge_atas_for_mint(&self, mint: &Pubkey, atas: &[AtaInfo]) -> Result<Signature> {
+        if self.config.dry_run {
+            return Ok(Signature::default());
+        }
+
+        if atas.len() < 2 {
+            return Err(anyhow!("Need at least 2 ATAs to merge"));
+        }
+
+        // Find the canonical ATA (the associated token address)
+        let canonical_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &spl_token::solana_program::pubkey::Pubkey::new_from_array(self.wallet_pubkey.to_bytes()),
+            &spl_token::solana_program::pubkey::Pubkey::new_from_array(mint.to_bytes()),
+            &spl_token::id(),
+        );
+        let canonical_ata_sdk = Pubkey::new_from_array(canonical_ata.to_bytes());
+
+        // Check if canonical ATA exists in our list
+        let canonical_exists = atas.iter().any(|a| a.address == canonical_ata_sdk);
+        
+        // If canonical doesn't exist, we need to create it first
+        // For now, just use the first ATA with balance as destination
+        let dest_ata = if canonical_exists {
+            canonical_ata_sdk
+        } else {
+            // Use first ATA with balance, or first ATA
+            atas.iter()
+                .find(|a| a.balance > 0)
+                .or(atas.first())
+                .map(|a| a.address)
+                .ok_or_else(|| anyhow!("No destination ATA found"))?
+        };
+
+        let wallet_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+            self.wallet_pubkey.to_bytes(),
+        );
+        let dest_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+            dest_ata.to_bytes(),
+        );
+
+        let mut instructions = Vec::new();
+
+        // Transfer from each non-destination ATA to destination
+        for ata in atas {
+            if ata.address == dest_ata {
+                continue; // Skip destination
+            }
+
+            if ata.balance == 0 {
+                continue; // Nothing to transfer
+            }
+
+            let source_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+                ata.address.to_bytes(),
+            );
+
+            // Transfer instruction
+            let transfer_ix = spl_token::instruction::transfer(
+                &spl_token::id(),
+                &source_spl,
+                &dest_spl,
+                &wallet_spl,
+                &[],
+                ata.balance,
+            )?;
+
+            instructions.push(prog_ix_to_sdk(transfer_ix));
+        }
+
+        if instructions.is_empty() {
+            return Err(anyhow!("No transfers needed"));
         }
 
         // Build and send transaction
