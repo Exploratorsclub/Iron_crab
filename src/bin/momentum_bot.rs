@@ -602,7 +602,10 @@ impl TrackerState {
     /// Returns true if waiting for any execution result
     #[allow(dead_code)] // Useful helper for future usage
     fn is_pending_execution(&self) -> bool {
-        matches!(self, Self::ProbeBuyPending { .. } | Self::ScaleInPending { .. })
+        matches!(
+            self,
+            Self::ProbeBuyPending { .. } | Self::ScaleInPending { .. }
+        )
     }
 }
 
@@ -1695,6 +1698,102 @@ impl MomentumContext {
             best.1.clone(),
             best.2.clone(),
             expected_sol,
+            alternatives_checked,
+        ))
+    }
+
+    /// Find best pool for buying tokens (highest token output for given SOL)
+    /// Only used for ScaleIn entries (Probe entries prioritize speed over price)
+    /// Returns (pool_address, dex, accounts, expected_tokens_out, alternatives_checked)
+    fn find_best_buy_pool(
+        &self,
+        mint: &str,
+        sol_amount: u64,
+        original_pool: &str,
+    ) -> Result<(String, String, Vec<String>, f64, usize)> {
+        let pools = self.mint_pools.read();
+        let candidates = pools
+            .get(mint)
+            .ok_or_else(|| anyhow::anyhow!("No pools known for mint {}", mint))?;
+
+        let now = std::time::Instant::now();
+        let max_age = std::time::Duration::from_secs(300); // Only use pools with trades in last 5min
+
+        // Filter: must have dex_pool_accounts AND recent trade data
+        let valid: Vec<_> = candidates
+            .iter()
+            .filter(|p| {
+                p.dex_pool_accounts.is_some()
+                    && p.last_trade_ratio.is_some()
+                    && now.duration_since(p.last_updated) < max_age
+            })
+            .collect();
+
+        if valid.is_empty() {
+            anyhow::bail!("No pools with recent trade data and accounts available");
+        }
+
+        // Quote each pool using cached last_trade_ratio
+        // For BUY: expected_tokens = sol_amount / ratio (ratio is SOL per token)
+        let mut quotes: Vec<_> = valid
+            .iter()
+            .filter_map(|p| {
+                p.last_trade_ratio.and_then(|ratio| {
+                    if ratio > 0.0 {
+                        let expected_tokens = (sol_amount as f64) / ratio;
+                        Some((
+                            p.pool_address.clone(),
+                            p.dex.clone(),
+                            p.dex_pool_accounts.clone().unwrap(),
+                            expected_tokens,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        if quotes.is_empty() {
+            anyhow::bail!("No pools with valid quotes");
+        }
+
+        let alternatives_checked = quotes.len();
+
+        // Sort by expected token output (descending - more tokens is better)
+        quotes.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+        let best = &quotes[0];
+        let best_pool = &best.0;
+        let expected_tokens = best.3;
+
+        // Log if we're switching pools
+        if best_pool != original_pool && alternatives_checked > 1 {
+            let original_quote = quotes
+                .iter()
+                .find(|q| q.0 == original_pool)
+                .map(|q| q.3)
+                .unwrap_or(0.0);
+
+            if original_quote > 0.0 {
+                let improvement_pct = ((expected_tokens / original_quote) - 1.0) * 100.0;
+                info!(
+                    mint = %mint,
+                    original_pool = %original_pool,
+                    best_pool = %best_pool,
+                    best_dex = %best.1,
+                    improvement_pct = %format!("{:.2}%", improvement_pct),
+                    alternatives = alternatives_checked,
+                    "🎯 Switching to better pool for scale-in buy"
+                );
+            }
+        }
+
+        Ok((
+            best.0.clone(),
+            best.1.clone(),
+            best.2.clone(),
+            expected_tokens,
             alternatives_checked,
         ))
     }
@@ -3143,8 +3242,7 @@ async fn recover_positions_from_jsonl(
                 let reader = BufReader::new(file);
                 for line in reader.lines().map_while(Result::ok) {
                     if let Ok(intent) = serde_json::from_str::<serde_json::Value>(&line) {
-                        if let Some(intent_id) = intent.get("intent_id").and_then(|v| v.as_str())
-                        {
+                        if let Some(intent_id) = intent.get("intent_id").and_then(|v| v.as_str()) {
                             intent_lookup.insert(intent_id.to_string(), intent);
                         }
                     }
@@ -3907,6 +4005,32 @@ async fn generate_and_publish_buy_intent(
 
     let intent_id = ctx.next_intent_id();
 
+    // Multi-Pool Routing: For ScaleIn entries, find the best pool (price > speed)
+    // For Probe entries, use original pool (speed is critical)
+    let (effective_pool, effective_dex, routed_accounts, alternatives_checked) = match signal.kind {
+        EntryKind::ScaleIn => {
+            // Try to find better pool for scale-in
+            match ctx.find_best_buy_pool(&signal.mint, signal.sol_amount, &signal.pool) {
+                Ok((pool, dex, accounts, _expected_tokens, alts)) => {
+                    (pool, dex, Some(accounts), alts)
+                }
+                Err(e) => {
+                    // Fallback to original pool if routing fails
+                    debug!(
+                        mint = %signal.mint,
+                        error = %e,
+                        "Multi-pool routing failed for scale-in, using original pool"
+                    );
+                    (signal.pool.clone(), signal.dex.clone(), None, 1)
+                }
+            }
+        }
+        EntryKind::Probe => {
+            // Probe: Speed is critical, skip multi-pool lookup
+            (signal.pool.clone(), signal.dex.clone(), None, 1)
+        }
+    };
+
     let (creator_opt, last_trade_ratio_opt) = {
         let trackers = ctx.token_trackers.read();
         let tracker = trackers.get(&signal.mint);
@@ -3967,9 +4091,13 @@ async fn generate_and_publish_buy_intent(
         }
     };
 
-    let dex_pool_accounts_opt = ctx.try_get_dex_pool_accounts_for_mint(&signal.mint);
-    let dex_requires_accounts = MomentumContext::dex_requires_pool_accounts(&signal.dex);
-    let dex_accounts: Vec<String> = if dex_requires_accounts {
+    // Use routed_accounts from multi-pool routing if available, otherwise fetch
+    let dex_requires_accounts = MomentumContext::dex_requires_pool_accounts(&effective_dex);
+    let dex_accounts: Vec<String> = if let Some(accounts) = routed_accounts {
+        // Multi-pool routing already provided validated accounts
+        accounts
+    } else if dex_requires_accounts {
+        let dex_pool_accounts_opt = ctx.try_get_dex_pool_accounts_for_mint(&signal.mint);
         let Some(accounts) = dex_pool_accounts_opt else {
             // Roll back stage markers so we can try again when DexPoolAccounts arrives.
             {
@@ -3989,19 +4117,19 @@ async fn generate_and_publish_buy_intent(
             }
             warn!(
                 mint = %signal.mint,
-                pool = %signal.pool,
-                dex = %signal.dex,
+                pool = %effective_pool,
+                dex = %effective_dex,
                 "Skipping BUY intent: missing DexPoolAccounts for deterministic build"
             );
             anyhow::bail!("cannot generate intent: missing DexPoolAccounts")
         };
 
         // Validate accounts[0] matches the pool address
-        if accounts.first().map(|s| s.as_str()) != Some(signal.pool.as_str()) {
+        if accounts.first().map(|s| s.as_str()) != Some(effective_pool.as_str()) {
             warn!(
                 mint = %signal.mint,
-                pool = %signal.pool,
-                dex = %signal.dex,
+                pool = %effective_pool,
+                dex = %effective_dex,
                 first = ?accounts.first(),
                 "Skipping BUY intent: invalid DexPoolAccounts (accounts[0] != pool)"
             );
@@ -4011,7 +4139,7 @@ async fn generate_and_publish_buy_intent(
         // Validate minimum account count based on DEX
         // - pump_amm: exactly 14 accounts
         // - meteora_dlmm: at least 3 (pool, mints) + optional tagged values
-        let dex_lower = signal.dex.to_ascii_lowercase();
+        let dex_lower = effective_dex.to_ascii_lowercase();
         let is_pump_amm = dex_lower == "pump_amm"
             || dex_lower == "pumpfunamm"
             || dex_lower == "pumpswap"
@@ -4020,8 +4148,8 @@ async fn generate_and_publish_buy_intent(
         if is_pump_amm && accounts.len() != 14 {
             warn!(
                 mint = %signal.mint,
-                pool = %signal.pool,
-                dex = %signal.dex,
+                pool = %effective_pool,
+                dex = %effective_dex,
                 accounts_len = accounts.len(),
                 "Skipping BUY intent: pump_amm requires exactly 14 accounts"
             );
@@ -4031,8 +4159,8 @@ async fn generate_and_publish_buy_intent(
         if accounts.len() < 3 {
             warn!(
                 mint = %signal.mint,
-                pool = %signal.pool,
-                dex = %signal.dex,
+                pool = %effective_pool,
+                dex = %effective_dex,
                 accounts_len = accounts.len(),
                 "Skipping BUY intent: DexPoolAccounts needs at least 3 entries"
             );
@@ -4105,7 +4233,7 @@ async fn generate_and_publish_buy_intent(
         TradeResources {
             input_mint: sol_mint.to_string(),
             output_mint: signal.mint.to_string(),
-            pools: vec![signal.pool.to_string()],
+            pools: vec![effective_pool.clone()],
             accounts: dex_accounts,
             token_program: None, // Momentum-bot doesn't need Token-2022 support yet
         },
@@ -4127,7 +4255,7 @@ async fn generate_and_publish_buy_intent(
         .insert("min_out_raw".to_string(), min_out_raw.to_string());
     intent
         .metadata
-        .insert("dex".to_string(), signal.dex.to_string());
+        .insert("dex".to_string(), effective_dex.clone());
     intent
         .metadata
         .insert("reason_code".to_string(), reason_code.to_string());
@@ -4141,17 +4269,29 @@ async fn generate_and_publish_buy_intent(
             EntryKind::ScaleIn => "scale_in".to_string(),
         },
     );
+    // Track multi-pool routing info
+    if alternatives_checked > 1 {
+        intent.metadata.insert(
+            "alternatives_checked".to_string(),
+            alternatives_checked.to_string(),
+        );
+        if effective_pool != signal.pool {
+            intent
+                .metadata
+                .insert("original_pool".to_string(), signal.pool.clone());
+        }
+    }
 
     // Pump.fun and PumpSwap tx building require the creator/dev wallet.
-    if signal.dex == "pumpfun"
-        || signal.dex.eq_ignore_ascii_case("pump_amm")
-        || signal.dex.eq_ignore_ascii_case("pumpswap")
-        || signal.dex.eq_ignore_ascii_case("PumpFunAmm")
+    if effective_dex == "pumpfun"
+        || effective_dex.eq_ignore_ascii_case("pump_amm")
+        || effective_dex.eq_ignore_ascii_case("pumpswap")
+        || effective_dex.eq_ignore_ascii_case("PumpFunAmm")
     {
         let creator = creator_opt.ok_or_else(|| {
             anyhow::anyhow!(
                 "cannot generate {} intent: missing dev_wallet/creator",
-                signal.dex
+                effective_dex
             )
         })?;
         intent.metadata.insert("creator".to_string(), creator);
@@ -4161,20 +4301,21 @@ async fn generate_and_publish_buy_intent(
     ctx.register_buy_intent(
         &intent_id,
         &signal.mint,
-        &signal.pool,
-        &signal.dex,
+        &effective_pool,
+        &effective_dex,
         signal.sol_amount,
         Some(signal.kind),
     );
 
     info!(
         intent_id = %intent.intent_id,
-        pool = %signal.pool,
+        pool = %effective_pool,
         mint = %signal.mint,
-        dex = %signal.dex,
+        dex = %effective_dex,
         kind = ?signal.kind,
         sol_amount = signal.sol_amount,
         reason = %signal.reason,
+        alternatives_checked = alternatives_checked,
         "🚀 Generated BUY TradeIntent"
     );
 

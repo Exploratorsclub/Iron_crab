@@ -1,19 +1,25 @@
 # Multi-Pool Routing
 
-**Status**: ✅ SELL Optimization Complete | ⏳ BUY Optimization Planned  
+**Status**: ✅ Complete (SELL + BUY Optimization)  
 **Implemented**: Januar 2025  
 
 ---
 
 ## Summary
 
-Multi-Pool Routing findet den **besten Pool für EXIT-Trades** wenn ein Token auf mehreren DEXes gelistet ist. Typische Preisverbesserung: 2-10%.
+Multi-Pool Routing findet den **besten Pool** wenn ein Token auf mehreren DEXes gelistet ist:
+- **SELL**: Alle Exit-Trades nutzen Multi-Pool Routing (höchste SOL-Ausgabe)
+- **BUY (ScaleIn)**: Scale-In Entries nutzen Multi-Pool Routing (mehr Tokens)
+- **BUY (Probe)**: Probe Entries verwenden den Original-Pool (Geschwindigkeit kritisch)
+
+Typische Preisverbesserung: 2-10%.
 
 **Code Locations:**
 - `PoolInfo` struct: `src/bin/momentum_bot.rs`
 - `mint_pools` HashMap: `MomentumContext`
-- `find_best_sell_pool()`: Best-Pool-Finder
-- Integration: `generate_and_publish_exit_intent()`
+- `find_best_sell_pool()`: Best-Pool-Finder für SELL
+- `find_best_buy_pool()`: Best-Pool-Finder für BUY (ScaleIn only)
+- Integration: `generate_and_publish_exit_intent()`, `generate_and_publish_buy_intent()`
 
 ---
 
@@ -93,11 +99,41 @@ async fn generate_and_publish_exit_intent(...) {
 }
 ```
 
-### BUY Optimization (⏳ Nicht implementiert)
+### BUY Optimization (✅ Implementiert - ScaleIn only)
 
-BUY Optimization für ESTABLISHED entries ist geplant aber noch nicht implementiert:
-- EARLY: Immer Original-Pool (Geschwindigkeit > Preis)
-- ESTABLISHED: Könnte besten Pool suchen (nicht zeitkritisch)
+```rust
+fn find_best_buy_pool(
+    &self,
+    mint: &str,
+    sol_amount: u64,
+    original_pool: &str,
+) -> Result<(String, String, Vec<String>, f64, usize)> {
+    // Returns: (pool, dex, accounts, expected_tokens_out, alternatives_checked)
+    
+    // Same logic as find_best_sell_pool but inverted:
+    // - expected_tokens = sol_amount / ratio (ratio is SOL per token)
+    // - Sort by highest token output
+}
+```
+
+**Integration in Buy Intent (ScaleIn only):**
+```rust
+async fn generate_and_publish_buy_intent(...) {
+    let (effective_pool, effective_dex, routed_accounts, alternatives_checked) =
+        match signal.kind {
+            EntryKind::ScaleIn => {
+                // Find best pool for scale-in (price > speed)
+                ctx.find_best_buy_pool(&signal.mint, signal.sol_amount, &signal.pool)?
+            }
+            EntryKind::Probe => {
+                // Probe: Speed is critical, skip multi-pool lookup
+                (signal.pool.clone(), signal.dex.clone(), None, 1)
+            }
+        };
+    
+    // Build intent with effective_pool
+}
+```
 
 ---
 
@@ -113,10 +149,9 @@ BUY Optimization für ESTABLISHED entries ist geplant aber noch nicht implementi
 
 ## Future Work
 
-1. **BUY Optimization**: `find_best_buy_pool()` für ESTABLISHED entries
-2. **Simulation-based selection**: Statt cached ratio echte Simulation
-3. **Multi-hop routing**: Token → USDC → SOL
-4. **Liquidity weighting**: Prefer deeper pools
+1. **Simulation-based selection**: Statt cached ratio echte Simulation
+2. **Multi-hop routing**: Token → USDC → SOL
+3. **Liquidity weighting**: Prefer deeper pools
 
 ---
 
