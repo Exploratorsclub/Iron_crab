@@ -63,7 +63,7 @@ pub struct MultiHopConfig {
 impl Default for MultiHopConfig {
     fn default() -> Self {
         Self {
-            enabled: false,       // Disabled by default for safe rollout
+            enabled: true,        // Enabled for shadow mode testing
             max_hops: 4,
             beam_width: 50,
             min_profit_bps: 30,
@@ -71,7 +71,7 @@ impl Default for MultiHopConfig {
             pool_alternatives: 3,
             min_liquidity_usd: 1000.0,
             input_amount_lamports: 100_000_000, // 0.1 SOL
-            shadow_mode: true,    // Shadow mode by default
+            shadow_mode: true,    // Shadow mode by default - logs but doesn't trade
             min_price_change_bps: 10,
             token_cooldown_ms: 100,
         }
