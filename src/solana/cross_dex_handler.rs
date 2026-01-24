@@ -608,18 +608,24 @@ impl CrossDexHandler {
             let sol_amount = trade_amount as f64 / 1_000_000_000.0;
             let tokens = sol_amount / buy_price;
             // Convert to token smallest unit (6 decimals for pump.fun tokens)
-            // Apply 3% safety margin to account for fees, slippage, and price impact
-            // The actual buy output may be slightly less than expected due to:
+            //
+            // CRITICAL FIX: Apply 20% safety margin (was 3%) to account for:
             // - DEX swap fees (~0.25-1%)
-            // - Price impact from trade size
+            // - Price impact from trade size (can be 5-15% on Meteora DLMM)
             // - Price movement between quote and execution
+            // - Concentrated liquidity slippage on DLMM pools
+            //
+            // The sell leg uses this as amount_in, so if buy delivers fewer tokens
+            // than expected, the sell will fail with "insufficient funds".
+            // A larger margin ensures sell succeeds even with adverse slippage.
+            // The actual profit is validated by simulation, not by this estimate.
             let raw_tokens = (tokens * 1_000_000.0) as u64;
-            let with_safety = (raw_tokens as f64 * 0.97) as u64;
+            let with_safety = (raw_tokens as f64 * 0.80) as u64; // 20% safety margin
             info!(
                 raw_tokens,
                 with_safety,
-                safety_margin_pct = 3,
-                "Applied safety margin to expected_tokens_out"
+                safety_margin_pct = 20,
+                "Applied safety margin to expected_tokens_out (DLMM-safe)"
             );
             with_safety
         } else {
@@ -1202,16 +1208,21 @@ impl CrossDexHandler {
         }
 
         // ====================================================================
-        // SELL AMOUNT: Use expected token output from buy leg (buy_quote.amount_out)
+        // SELL AMOUNT: Use CONSERVATIVE token output from buy leg
         // ====================================================================
         // For atomic arb bundles:
-        // - Buy leg: SOL → Token (receives buy_quote.amount_out tokens)
+        // - Buy leg: SOL → Token (receives some tokens, varies by slippage)
         // - Sell leg: Token → SOL (sells those tokens)
         //
-        // The sell_amount_in should be the EXPECTED buy output, not the minimum.
-        // If buy gets more tokens than expected, we still only sell the expected amount.
-        // If buy gets fewer tokens, the sell will fail (no tokens to sell).
-        // This is intentional: the simulation will catch this case.
+        // CRITICAL: buy_quote.amount_out already has 20% safety margin applied
+        // (see validate_cross_dex_spread_from_intent). This ensures we sell
+        // FEWER tokens than buy produces, so sell never fails with "insufficient funds".
+        //
+        // If buy delivers more tokens than we sell → leftover tokens (OK, small loss)
+        // If buy delivers fewer tokens → sell fails (simulation catches this early)
+        //
+        // The 20% margin is conservative for DLMM pools with concentrated liquidity.
+        // Real profit is validated by simulation, not by this estimate.
         let sell_amount_in = buy_quote.amount_out;
 
         info!(
