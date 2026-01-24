@@ -204,6 +204,8 @@ pub struct WsolManager {
     last_action_ts: AtomicU64,
     /// Running flag for graceful shutdown
     running: AtomicBool,
+    /// Wrap in progress flag (prevents double-wrap race condition)
+    wrap_in_progress: AtomicBool,
 
     /// Build version for records
     build_version: String,
@@ -233,6 +235,7 @@ impl WsolManager {
             sol_balance: AtomicU64::new(0),
             last_action_ts: AtomicU64::new(0),
             running: AtomicBool::new(true),
+            wrap_in_progress: AtomicBool::new(false),
             build_version: build_version.to_string(),
             run_id: run_id.to_string(),
             jsonl_writer: None,
@@ -258,6 +261,7 @@ impl WsolManager {
             sol_balance: AtomicU64::new(0),
             last_action_ts: AtomicU64::new(0),
             running: AtomicBool::new(true),
+            wrap_in_progress: AtomicBool::new(false),
             build_version: build_version.to_string(),
             run_id: run_id.to_string(),
             jsonl_writer: Some(jsonl_writer),
@@ -510,26 +514,46 @@ impl WsolManager {
             return Ok(());
         }
 
+        // Check if wrap already in progress (prevents double-wrap race condition)
+        if self.wrap_in_progress.load(Ordering::Relaxed) {
+            debug!("Wrap already in progress, skipping");
+            return Ok(());
+        }
+
         // Check if wrap needed
         if wsol < min {
             let wrap_amount = target.saturating_sub(wsol);
             let available_sol = sol.saturating_sub(min_native);
 
             if available_sol >= wrap_amount {
+                // Set wrap_in_progress BEFORE async operation to prevent race condition
+                self.wrap_in_progress.store(true, Ordering::Relaxed);
+                
                 info!(
                     wsol_current = wsol as f64 / LAMPORTS_PER_SOL as f64,
                     wsol_min = min as f64 / LAMPORTS_PER_SOL as f64,
                     wrap_amount = wrap_amount as f64 / LAMPORTS_PER_SOL as f64,
                     "WSOL below minimum, wrapping"
                 );
-                self.execute_wrap(wrap_amount).await?;
+                let result = self.execute_wrap(wrap_amount).await;
+                
+                // Clear wrap_in_progress after operation completes
+                self.wrap_in_progress.store(false, Ordering::Relaxed);
+                result?;
             } else if available_sol > 0 {
+                // Set wrap_in_progress BEFORE async operation
+                self.wrap_in_progress.store(true, Ordering::Relaxed);
+                
                 // Wrap what we can
                 info!(
                     available = available_sol as f64 / LAMPORTS_PER_SOL as f64,
                     "Wrapping available SOL (less than ideal)"
                 );
-                self.execute_wrap(available_sol).await?;
+                let result = self.execute_wrap(available_sol).await;
+                
+                // Clear wrap_in_progress after operation completes
+                self.wrap_in_progress.store(false, Ordering::Relaxed);
+                result?;
             } else {
                 warn!(
                     sol = sol as f64 / LAMPORTS_PER_SOL as f64,
@@ -538,16 +562,21 @@ impl WsolManager {
                 );
             }
         }
-        // Check if unwrap needed
+        // Check if WSOL above max (LOG ONLY - no action)
+        // IMPORTANT: We do NOT unwrap excess WSOL because:
+        // 1. WSOL cannot be partially unwrapped - CloseAccount closes the ENTIRE ATA
+        // 2. Closing the ATA breaks all pending/future arb transactions
+        // 3. Excess WSOL is not a problem - it's just pre-funded for more trades
+        // 4. If you need to recover SOL, do it manually via UI/CLI
         else if wsol > max {
-            let unwrap_amount = wsol.saturating_sub(target);
-            info!(
+            let excess = wsol.saturating_sub(max);
+            debug!(
                 wsol_current = wsol as f64 / LAMPORTS_PER_SOL as f64,
                 wsol_max = max as f64 / LAMPORTS_PER_SOL as f64,
-                unwrap_amount = unwrap_amount as f64 / LAMPORTS_PER_SOL as f64,
-                "WSOL above maximum, unwrapping excess"
+                excess = excess as f64 / LAMPORTS_PER_SOL as f64,
+                "WSOL above maximum (info only - no auto-unwrap to preserve ATA)"
             );
-            self.execute_unwrap(unwrap_amount).await?;
+            // NO ACTION - just log. Manual intervention required if user wants to unwrap.
         }
 
         Ok(())
