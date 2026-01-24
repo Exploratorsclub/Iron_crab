@@ -478,27 +478,31 @@ impl Treasury {
         // Check if ATA exists and verify it's owned by classic SPL Token
         let _ata_exists = match rpc.rpc.get_account(&ata).await {
             Ok(acc) => {
-                if acc.owner != spl_token_sdk {
-                    // WSOL ATA exists but has wrong owner (shouldn't happen, but handle it)
-                    // Close it first, then recreate
+                if acc.owner == spl_token_sdk {
+                    // Valid SPL Token account exists
+                    true
+                } else if acc.owner == system_program_id() {
+                    // Account exists but is System-owned (just SOL, not a token account).
+                    // This can happen if someone sent SOL to the ATA address after it was closed.
+                    // CreateIdempotent will handle this - it will initialize the token account
+                    // properly. We do NOT try to close it with Token Program (that would fail).
+                    tracing::warn!(
+                        ata=%ata,
+                        owner=%acc.owner,
+                        lamports=acc.lamports,
+                        "ATA address contains System-owned account (raw SOL). CreateIdempotent will initialize it."
+                    );
+                    false // Treat as not existing, let CreateIdempotent handle it
+                } else {
+                    // Account exists but has unexpected owner (neither Token nor System program)
+                    // This is unusual - log it but don't try to close (would likely fail)
                     tracing::warn!(
                         ata=%ata,
                         actual_owner=%acc.owner,
                         expected_owner=%spl_token_sdk,
-                        "WSOL ATA has incorrect owner, closing and recreating"
+                        "WSOL ATA has unexpected owner, attempting CreateIdempotent anyway"
                     );
-                    // Add close instruction
-                    let close_ix = prog_ix_to_sdk(spl_ix::close_account(
-                        &spl_token_program_id(),
-                        &sdk_to_spl(&ata),
-                        &sdk_to_spl(&owner),
-                        &sdk_to_spl(&owner),
-                        &[],
-                    )?);
-                    ixs.push(close_ix);
-                    false // Treat as not existing so we recreate
-                } else {
-                    true // Valid ATA exists
+                    false // Let CreateIdempotent try to handle it
                 }
             }
             Err(_) => false, // ATA doesn't exist
