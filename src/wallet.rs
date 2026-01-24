@@ -504,18 +504,19 @@ impl Treasury {
             Err(_) => false, // ATA doesn't exist
         };
 
-        // DISABLED: ATA creation causes "seeds constraint violated" errors due to RPC lag.
-        // The WSOL ATA should already exist after the first trade. If not, the TX will fail
-        // and we'll retry - but at least we won't waste SOL on failed createIdempotent TXs.
-        // if !ata_exists {
-        //     let create_ix = prog_ix_to_sdk(create_associated_token_account_idempotent(
-        //         &sdk_to_spl(&self.pubkey()),
-        //         &sdk_to_spl(&owner),
-        //         &sdk_to_spl(&wsol_mint_sdk),
-        //         &spl_token_program_id(),
-        //     ));
-        //     ixs.push(create_ix);
-        // }
+        // RE-ENABLED: ATA creation is necessary when Janitor closes WSOL ATA.
+        // Using createIdempotent - if ATA exists, this is a no-op.
+        // The "seeds constraint violated" errors were caused by a different issue.
+        if !_ata_exists {
+            let create_ix = prog_ix_to_sdk(create_associated_token_account_idempotent(
+                &sdk_to_spl(&self.pubkey()),
+                &sdk_to_spl(&owner),
+                &sdk_to_spl(&wsol_mint_sdk),
+                &spl_token_program_id(),
+            ));
+            ixs.push(create_ix);
+            tracing::info!(ata=%ata, "Adding WSOL ATA creation instruction");
+        }
 
         // Only add transfer and sync if lamports > 0
         // When lamports=0, we just want to ensure the ATA exists
