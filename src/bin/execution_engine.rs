@@ -607,6 +607,30 @@ struct ExecutionConfig {
     /// Fairness policy to prevent strategy starvation
     #[allow(dead_code)]
     fairness_policy: FairnessPolicy,
+
+    // === WSOL Manager Config (hot-reloadable) ===
+    wsol_enabled: bool,
+    wsol_min_wsol_sol: f64,
+    wsol_target_wsol_sol: f64,
+    wsol_max_wsol_sol: f64,
+    wsol_min_native_sol: f64,
+    wsol_cooldown_secs: u64,
+    wsol_dry_run: bool,
+
+    // === Account Janitor Config (hot-reloadable) ===
+    janitor_enabled: bool,
+    janitor_close_ata_interval_secs: u64,
+    janitor_close_ata_min_age_secs: u64,
+    janitor_close_ata_max_per_run: usize,
+    janitor_merge_dust_enabled: bool,
+    janitor_merge_dust_interval_secs: u64,
+    janitor_merge_dust_max_per_run: usize,
+    janitor_swap_dust_enabled: bool,
+    janitor_swap_dust_interval_secs: u64,
+    janitor_swap_dust_min_value_sol: f64,
+    janitor_swap_dust_max_slippage_bps: u32,
+    janitor_swap_dust_max_per_run: usize,
+    janitor_dry_run: bool,
 }
 
 impl Default for ExecutionConfig {
@@ -632,6 +656,28 @@ impl Default for ExecutionConfig {
             fee_policy: FeePolicy::default(),
             // P1: Fairness Policy
             fairness_policy: FairnessPolicy::default(),
+            // WSOL Manager defaults
+            wsol_enabled: true,
+            wsol_min_wsol_sol: 0.5,
+            wsol_target_wsol_sol: 1.0,
+            wsol_max_wsol_sol: 2.0,
+            wsol_min_native_sol: 0.1,
+            wsol_cooldown_secs: 30,
+            wsol_dry_run: false,
+            // Account Janitor defaults
+            janitor_enabled: false,
+            janitor_close_ata_interval_secs: 3600,
+            janitor_close_ata_min_age_secs: 86400,
+            janitor_close_ata_max_per_run: 10,
+            janitor_merge_dust_enabled: false,
+            janitor_merge_dust_interval_secs: 300,
+            janitor_merge_dust_max_per_run: 5,
+            janitor_swap_dust_enabled: false,
+            janitor_swap_dust_interval_secs: 86400,
+            janitor_swap_dust_min_value_sol: 0.001,
+            janitor_swap_dust_max_slippage_bps: 500,
+            janitor_swap_dust_max_per_run: 5,
+            janitor_dry_run: false,
         }
     }
 }
@@ -2276,6 +2322,240 @@ impl ExecutionContext {
                         rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                     }
                 }
+                // === WSOL Manager Config ===
+                "wsol_enabled" => {
+                    if let Some(v) = value.as_bool() {
+                        config.wsol_enabled = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "wsol_min_wsol_sol" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 && v <= 100.0 {
+                            config.wsol_min_wsol_sol = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 0-100".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "wsol_target_wsol_sol" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 && v <= 100.0 {
+                            config.wsol_target_wsol_sol = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 0-100".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "wsol_max_wsol_sol" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 && v <= 100.0 {
+                            config.wsol_max_wsol_sol = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 0-100".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "wsol_min_native_sol" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 && v <= 10.0 {
+                            config.wsol_min_native_sol = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 0-10".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "wsol_cooldown_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v <= 3600 {
+                            config.wsol_cooldown_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 0-3600".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "wsol_dry_run" => {
+                    if let Some(v) = value.as_bool() {
+                        config.wsol_dry_run = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                // === Account Janitor Config ===
+                "janitor_enabled" => {
+                    if let Some(v) = value.as_bool() {
+                        config.janitor_enabled = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "janitor_close_ata_interval_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v >= 60 {
+                            config.janitor_close_ata_interval_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be >= 60".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "janitor_close_ata_min_age_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        config.janitor_close_ata_min_age_secs = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "janitor_close_ata_max_per_run" => {
+                    if let Some(v) = value.as_u64() {
+                        if v >= 1 && v <= 100 {
+                            config.janitor_close_ata_max_per_run = v as usize;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-100".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "janitor_merge_dust_enabled" => {
+                    if let Some(v) = value.as_bool() {
+                        config.janitor_merge_dust_enabled = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "janitor_merge_dust_interval_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v >= 60 {
+                            config.janitor_merge_dust_interval_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be >= 60".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "janitor_merge_dust_max_per_run" => {
+                    if let Some(v) = value.as_u64() {
+                        if v >= 1 && v <= 100 {
+                            config.janitor_merge_dust_max_per_run = v as usize;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-100".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "janitor_swap_dust_enabled" => {
+                    if let Some(v) = value.as_bool() {
+                        config.janitor_swap_dust_enabled = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "janitor_swap_dust_interval_secs" => {
+                    if let Some(v) = value.as_u64() {
+                        if v >= 60 {
+                            config.janitor_swap_dust_interval_secs = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be >= 60".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "janitor_swap_dust_min_value_sol" => {
+                    if let Some(v) = value.as_f64() {
+                        if v >= 0.0 && v <= 1.0 {
+                            config.janitor_swap_dust_min_value_sol = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 0-1".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "janitor_swap_dust_max_slippage_bps" => {
+                    if let Some(v) = value.as_u64() {
+                        if v >= 1 && v <= 10000 {
+                            config.janitor_swap_dust_max_slippage_bps = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-10000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "janitor_swap_dust_max_per_run" => {
+                    if let Some(v) = value.as_u64() {
+                        if v >= 1 && v <= 100 {
+                            config.janitor_swap_dust_max_per_run = v as usize;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 1-100".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "janitor_dry_run" => {
+                    if let Some(v) = value.as_bool() {
+                        config.janitor_dry_run = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
                 _ => {
                     rejected.push((key.clone(), format!("Unknown config key: {}", key)));
                 }
@@ -2722,6 +3002,11 @@ async fn main() -> Result<()> {
         .and_then(|c| c.execution_engine.as_ref());
     let sniper_cfg = app_config.as_ref().and_then(|c| c.sniper.as_ref());
 
+    // Get WSOL config from [execution_engine.wsol_manager] section
+    let wsol_cfg = exec_eng_cfg.and_then(|e| e.wsol_manager.as_ref());
+    // Get Janitor config from [execution_engine.account_janitor] section
+    let janitor_cfg = exec_eng_cfg.and_then(|e| e.account_janitor.as_ref());
+
     // Setup config - read Jito settings: prefer [execution_engine] section, fallback to [sniper]
     let exec_config = ExecutionConfig {
         send_enabled: !args.simulate_only && !args.dry_run && has_keys,
@@ -2737,6 +3022,28 @@ async fn main() -> Result<()> {
             .and_then(|e| e.jito_region.clone())
             .or_else(|| sniper_cfg.and_then(|s| s.jito_region.clone()))
             .unwrap_or_else(|| "frankfurt".to_string()),
+        // WSOL Manager config (for hot-reload tracking)
+        wsol_enabled: wsol_cfg.map(|c| c.enabled).unwrap_or(true),
+        wsol_min_wsol_sol: wsol_cfg.map(|c| c.min_wsol_sol).unwrap_or(0.5),
+        wsol_target_wsol_sol: wsol_cfg.map(|c| c.target_wsol_sol).unwrap_or(1.0),
+        wsol_max_wsol_sol: wsol_cfg.map(|c| c.max_wsol_sol).unwrap_or(2.0),
+        wsol_min_native_sol: wsol_cfg.map(|c| c.min_native_sol).unwrap_or(0.1),
+        wsol_cooldown_secs: wsol_cfg.map(|c| c.cooldown_secs).unwrap_or(30),
+        wsol_dry_run: wsol_cfg.map(|c| c.dry_run).unwrap_or(false) || args.dry_run,
+        // Account Janitor config (for hot-reload tracking)
+        janitor_enabled: janitor_cfg.map(|c| c.enabled).unwrap_or(false),
+        janitor_close_ata_interval_secs: janitor_cfg.map(|c| c.close_ata_interval_secs).unwrap_or(3600),
+        janitor_close_ata_min_age_secs: janitor_cfg.map(|c| c.close_ata_min_age_secs).unwrap_or(86400),
+        janitor_close_ata_max_per_run: janitor_cfg.map(|c| c.close_ata_max_per_run).unwrap_or(10),
+        janitor_merge_dust_enabled: janitor_cfg.map(|c| c.merge_dust_enabled).unwrap_or(false),
+        janitor_merge_dust_interval_secs: janitor_cfg.map(|c| c.merge_dust_interval_secs).unwrap_or(300),
+        janitor_merge_dust_max_per_run: janitor_cfg.map(|c| c.merge_dust_max_per_run).unwrap_or(5),
+        janitor_swap_dust_enabled: janitor_cfg.map(|c| c.swap_dust_enabled).unwrap_or(false),
+        janitor_swap_dust_interval_secs: janitor_cfg.map(|c| c.swap_dust_interval_secs).unwrap_or(86400),
+        janitor_swap_dust_min_value_sol: janitor_cfg.map(|c| c.swap_dust_min_value_sol).unwrap_or(0.001),
+        janitor_swap_dust_max_slippage_bps: janitor_cfg.map(|c| c.swap_dust_max_slippage_bps).unwrap_or(500),
+        janitor_swap_dust_max_per_run: janitor_cfg.map(|c| c.swap_dust_max_per_run).unwrap_or(5),
+        janitor_dry_run: janitor_cfg.map(|c| c.dry_run).unwrap_or(false) || args.dry_run,
         ..Default::default()
     };
 

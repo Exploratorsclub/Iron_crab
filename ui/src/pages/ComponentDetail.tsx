@@ -512,7 +512,7 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     confirmation_timeout_ms: 30_000,
     send_enabled: false,
     // WSOL Manager defaults
-    wsol_enabled: false,
+    wsol_enabled: true,
     wsol_min_wsol_sol: 0.5,
     wsol_target_wsol_sol: 1.0,
     wsol_max_wsol_sol: 2.0,
