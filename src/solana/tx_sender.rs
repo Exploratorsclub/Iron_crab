@@ -148,6 +148,7 @@ impl TxSender {
                 primary_method: "rpc".into(),
                 fallback_chain: vec![],
                 tpu_enabled: false,
+                parallel_send: false, // No TPU, so no parallel send
                 ..Default::default()
             },
         }
@@ -157,6 +158,7 @@ impl TxSender {
     ///
     /// Tries methods in order: primary_method → fallback_chain
     /// For bundle-required transactions, only Jito is used.
+    /// If parallel_send is enabled and TPU is available, sends via TPU + RPC simultaneously.
     ///
     /// # Arguments
     /// * `tx` - Signed transaction to send
@@ -178,12 +180,90 @@ impl TxSender {
                 });
         }
 
+        // Parallel send: TPU + RPC simultaneously for maximum reliability
+        // Solana deduplicates by signature, so only one TX lands and fees are paid once.
+        if self.config.parallel_send && self.tpu.is_some() {
+            return self.send_parallel(tx).await;
+        }
+
+        // Sequential fallback chain (legacy behavior)
+        self.send_sequential(tx).await
+    }
+
+    /// Send via TPU and RPC in parallel. First success wins.
+    /// Both methods send the same signed TX, so Solana deduplicates by signature.
+    /// This ensures maximum reliability without paying double fees.
+    async fn send_parallel(&self, tx: &Transaction) -> Result<SendResult, SendError> {
+        debug!("Parallel send: TPU + RPC simultaneously");
+
+        let tx_clone = tx.clone();
+        let tpu_future = async {
+            match self.send_via_tpu(tx).await {
+                Ok(sig) => Some((sig, SendMethod::TpuDirect)),
+                Err(e) => {
+                    warn!(error = %e, "Parallel send: TPU failed");
+                    None
+                }
+            }
+        };
+
+        let rpc_future = async {
+            match self.send_via_rpc(&tx_clone).await {
+                Ok(sig) => Some((sig, SendMethod::Rpc)),
+                Err(e) => {
+                    warn!(error = %e, "Parallel send: RPC failed");
+                    None
+                }
+            }
+        };
+
+        // Run both in parallel, collect results
+        let (tpu_result, rpc_result) = tokio::join!(tpu_future, rpc_future);
+
+        // Prefer TPU result if available (it was sent first/faster typically)
+        // But either result is valid since it's the same TX
+        match (tpu_result, rpc_result) {
+            (Some((sig, method)), _) => {
+                info!(
+                    signature = %sig,
+                    method = %method,
+                    parallel = true,
+                    "TX sent via parallel send (TPU succeeded)"
+                );
+                Ok(SendResult {
+                    signature: sig,
+                    method,
+                    bundle_id: None,
+                })
+            }
+            (None, Some((sig, method))) => {
+                info!(
+                    signature = %sig,
+                    method = %method,
+                    parallel = true,
+                    "TX sent via parallel send (RPC succeeded, TPU failed)"
+                );
+                Ok(SendResult {
+                    signature: sig,
+                    method,
+                    bundle_id: None,
+                })
+            }
+            (None, None) => {
+                error!("Parallel send: Both TPU and RPC failed");
+                Err(SendError::AllMethodsFailed)
+            }
+        }
+    }
+
+    /// Sequential send with fallback chain (legacy behavior)
+    async fn send_sequential(&self, tx: &Transaction) -> Result<SendResult, SendError> {
         // Build method chain: primary + fallbacks
         let methods: Vec<&str> = std::iter::once(self.config.primary_method.as_str())
             .chain(self.config.fallback_chain.iter().map(|s| s.as_str()))
             .collect();
 
-        debug!(methods = ?methods, "TX send method chain");
+        debug!(methods = ?methods, "TX send method chain (sequential)");
 
         let mut last_error: Option<SendError> = None;
 

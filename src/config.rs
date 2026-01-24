@@ -170,6 +170,13 @@ pub struct TxSubmissionCfg {
     /// Skip TPU for bundle-required intents (always use Jito). Default: true
     #[serde(default = "default_skip_tpu_for_bundles")]
     pub skip_tpu_for_bundles: bool,
+
+    /// Enable parallel send (TPU + RPC simultaneously). Default: true
+    /// Sends via both TPU and RPC at the same time for maximum reliability.
+    /// Solana deduplicates by signature, so only one TX lands and you pay fees once.
+    /// Recommended for all non-bundle transactions (liquidations, sells, buys).
+    #[serde(default = "default_parallel_send")]
+    pub parallel_send: bool,
 }
 
 fn default_tx_primary_method() -> String {
@@ -196,6 +203,9 @@ fn default_tx_retries_per_method() -> u32 {
 fn default_skip_tpu_for_bundles() -> bool {
     true
 }
+fn default_parallel_send() -> bool {
+    true
+}
 
 impl Default for TxSubmissionCfg {
     fn default() -> Self {
@@ -208,6 +218,7 @@ impl Default for TxSubmissionCfg {
             method_timeout_ms: default_tx_method_timeout_ms(),
             retries_per_method: default_tx_retries_per_method(),
             skip_tpu_for_bundles: default_skip_tpu_for_bundles(),
+            parallel_send: default_parallel_send(),
         }
     }
 }
