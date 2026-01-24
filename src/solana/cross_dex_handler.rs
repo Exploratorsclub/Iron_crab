@@ -599,49 +599,61 @@ impl CrossDexHandler {
             "OPTION B: Trusting arb-strategy spread (simulation will validate)"
         );
 
-        // Calculate expected token output from buy leg
-        // buy_price = SOL per token → tokens_out = sol_in / buy_price
-        // If buy_price is 0 or invalid, use a conservative estimate
-        let expected_tokens_out: u64 = if buy_price > 0.0 {
-            // trade_amount is in lamports (1e9), buy_price is SOL/token
-            // tokens = lamports / 1e9 / buy_price * 1e6 (assuming 6 decimals for pump tokens)
-            let sol_amount = trade_amount as f64 / 1_000_000_000.0;
-            let tokens = sol_amount / buy_price;
-            // Convert to token smallest unit (6 decimals for pump.fun tokens)
-            //
-            // CRITICAL FIX: Apply 20% safety margin (was 3%) to account for:
-            // - DEX swap fees (~0.25-1%)
-            // - Price impact from trade size (can be 5-15% on Meteora DLMM)
-            // - Price movement between quote and execution
-            // - Concentrated liquidity slippage on DLMM pools
-            //
-            // The sell leg uses this as amount_in, so if buy delivers fewer tokens
-            // than expected, the sell will fail with "insufficient funds".
-            // A larger margin ensures sell succeeds even with adverse slippage.
-            // The actual profit is validated by simulation, not by this estimate.
-            let raw_tokens = (tokens * 1_000_000.0) as u64;
-            let with_safety = (raw_tokens as f64 * 0.80) as u64; // 20% safety margin
-            info!(
-                raw_tokens,
-                with_safety,
-                safety_margin_pct = 20,
-                "Applied safety margin to expected_tokens_out (DLMM-safe)"
-            );
-            with_safety
-        } else {
-            // Fallback: can't compute without price, use trade_amount as estimate
-            // This will likely fail simulation but provides a reasonable default
-            warn!(
-                buy_price,
-                trade_amount, "buy_price missing or zero, using trade_amount as token estimate"
-            );
-            trade_amount
-        };
+        // =========================================================================
+        // OPTION D: Use expected_token_output from arb-strategy (calculated from reserves)
+        // =========================================================================
+        // arb-strategy calculates exact token output using:
+        // - Cached pool reserves from Geyser (PoolStateUpdate events)
+        // - Constant product formula with fee deduction
+        //
+        // This eliminates the need for safety margins because:
+        // - The value is computed from the same Geyser data the simulation uses
+        // - No stale price estimation, no guessing
+        //
+        // Fallback (if arb-strategy didn't provide it):
+        // - Price-based estimation with 3% safety margin (for DLMM or missing reserves)
+        let expected_tokens_out: u64 = intent
+            .metadata
+            .get("expected_token_output")
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|token_out| {
+                info!(
+                    token_out,
+                    source = "arb-strategy (Option D)",
+                    "Using expected_token_output from intent metadata (reserve-based)"
+                );
+                token_out
+            })
+            .unwrap_or_else(|| {
+                // Fallback: price-based estimation for DLMM or when reserves unavailable
+                if buy_price > 0.0 {
+                    let sol_amount = trade_amount as f64 / 1_000_000_000.0;
+                    let tokens = sol_amount / buy_price;
+                    let raw_tokens = (tokens * 1_000_000.0) as u64;
+                    // 3% safety margin for price-based estimation
+                    let with_safety = (raw_tokens as f64 * 0.97) as u64;
+                    info!(
+                        raw_tokens,
+                        with_safety,
+                        safety_margin_pct = 3,
+                        source = "price-based (fallback)",
+                        "Using price-based estimation (no expected_token_output in metadata)"
+                    );
+                    with_safety
+                } else {
+                    warn!(
+                        buy_price,
+                        trade_amount,
+                        "buy_price missing or zero, using trade_amount as token estimate"
+                    );
+                    trade_amount
+                }
+            });
 
         // Build quotes for build_swap_plan
         // buy_quote.amount_out is used as sell_amount_in for the sell leg
         let buy_quote = Quote {
-            amount_out: expected_tokens_out, // Expected token output from buy (with safety margin)
+            amount_out: expected_tokens_out, // From Option D (reserves) or fallback (price-based)
             price_impact_bps: 0,
             route: vec![buy_pool.clone()],
             fee_bps: 30,
@@ -1208,28 +1220,25 @@ impl CrossDexHandler {
         }
 
         // ====================================================================
-        // SELL AMOUNT: Use CONSERVATIVE token output from buy leg
+        // SELL AMOUNT: Use expected token output from buy leg (Option D)
         // ====================================================================
         // For atomic arb bundles:
-        // - Buy leg: SOL → Token (receives some tokens, varies by slippage)
+        // - Buy leg: SOL → Token (receives tokens)
         // - Sell leg: Token → SOL (sells those tokens)
         //
-        // CRITICAL: buy_quote.amount_out already has 20% safety margin applied
-        // (see validate_cross_dex_spread_from_intent). This ensures we sell
-        // FEWER tokens than buy produces, so sell never fails with "insufficient funds".
+        // OPTION D: buy_quote.amount_out comes from arb-strategy's reserve-based calculation
+        // - For AMMs (Raydium, CPMM): exact value from constant product formula
+        // - For DLMM: price-based estimation with 3% safety margin (fallback)
         //
-        // If buy delivers more tokens than we sell → leftover tokens (OK, small loss)
-        // If buy delivers fewer tokens → sell fails (simulation catches this early)
-        //
-        // The 20% margin is conservative for DLMM pools with concentrated liquidity.
-        // Real profit is validated by simulation, not by this estimate.
+        // This eliminates the previous 20% safety margin problem that made trades unprofitable.
+        // The simulation validates the actual output - if there's a mismatch, it fails early.
         let sell_amount_in = buy_quote.amount_out;
 
         info!(
             sell_amount_in,
             buy_quote_amount_out = buy_quote.amount_out,
             sell_min_out,
-            "Building sell instruction with expected buy output as amount_in"
+            "Building sell instruction with expected buy output as amount_in (Option D)"
         );
 
         let sell_instructions = sell_connector

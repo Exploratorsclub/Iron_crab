@@ -253,6 +253,17 @@ pub enum MarketEventKind {
         quote_mint: String,
         /// Slot when this update was observed
         update_slot: u64,
+        // =====================================================================
+        // DLMM-specific fields (Option D: Bin Array Traversierung)
+        // =====================================================================
+        /// Meteora DLMM: Active bin index (where current price is)
+        /// For non-DLMM pools this is None.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        active_id: Option<i32>,
+        /// Meteora DLMM: Bin step (price increment per bin in bps)
+        /// For non-DLMM pools this is None.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bin_step: Option<u16>,
     },
     /// Meteora DLMM Bin Array update (via Geyser Account Subscription)
     ///

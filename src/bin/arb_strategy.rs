@@ -474,6 +474,11 @@ impl TokenArbTracker {
             return None;
         }
 
+        let trade_amount_lamports = (max_trade_sol * Decimal::from(1_000_000_000u64))
+            .to_string()
+            .parse::<u64>()
+            .unwrap_or(config.max_position_lamports);
+
         Some(ArbOpportunity {
             base_mint: self.base_mint.clone(),
             buy_dex: buy_pool.dex.clone(),
@@ -483,10 +488,7 @@ impl TokenArbTracker {
             sell_pool: sell_pool.pool_address.clone(),
             sell_price,
             spread_bps: spread_bps as u32,
-            trade_amount_lamports: (max_trade_sol * Decimal::from(1_000_000_000u64))
-                .to_string()
-                .parse::<u64>()
-                .unwrap_or(config.max_position_lamports),
+            trade_amount_lamports,
             estimated_profit_lamports: net_profit,
         })
     }
@@ -504,6 +506,8 @@ struct ArbOpportunity {
     spread_bps: u32,
     trade_amount_lamports: u64,
     estimated_profit_lamports: u64,
+    // NOTE: expected_token_output is calculated in create_arb_intent() using ArbContext
+    // because TokenArbTracker doesn't have access to vault_balances cache.
 }
 
 // ============================================================================
@@ -572,6 +576,9 @@ struct VaultBalanceCache {
     reserve_base: u64,
     reserve_quote: u64,
     update_slot: u64,
+    // DLMM-specific (Option D: Bin Array Traversierung)
+    active_id: Option<i32>,
+    bin_step: Option<u16>,
 }
 
 /// Cached bin array data from BinArrayUpdate events
@@ -846,6 +853,8 @@ impl ArbContext {
         reserve_base: u64,
         reserve_quote: u64,
         update_slot: u64,
+        active_id: Option<i32>,
+        bin_step: Option<u16>,
     ) {
         let mut cache = self.vault_balances.write();
         let is_new = !cache.contains_key(pool_address);
@@ -855,6 +864,8 @@ impl ArbContext {
                 reserve_base,
                 reserve_quote,
                 update_slot,
+                active_id,
+                bin_step,
             },
         );
         if is_new {
@@ -863,6 +874,8 @@ impl ArbContext {
                 reserve_base,
                 reserve_quote,
                 slot = update_slot,
+                active_id = ?active_id,
+                bin_step = ?bin_step,
                 "Vault balances cached (new pool)"
             );
         } else {
@@ -905,6 +918,256 @@ impl ArbContext {
             .read()
             .get(pool_address)
             .map(|c| (c.reserve_base, c.reserve_quote))
+    }
+
+    /// Calculate expected token output from buy using AMM constant product formula.
+    ///
+    /// For a SOL→Token swap on constant-product AMMs (Raydium, Raydium CPMM, Meteora CPMM):
+    ///   token_out = reserve_token * sol_in / (reserve_sol + sol_in) * (1 - fee)
+    ///
+    /// For Meteora DLMM: Uses Bin Array Traversierung (Option D complete)
+    ///   - Traverse bins starting from active_id
+    ///   - Accumulate token output as we consume SOL in each bin
+    ///   - Respects bin boundaries and concentrated liquidity
+    ///
+    /// Returns None if:
+    /// - Reserves not cached (Geyser hasn't delivered PoolStateUpdate)
+    /// - DEX not supported for reserve-based calculation
+    fn calculate_expected_token_output(
+        &self,
+        buy_pool: &str,
+        buy_dex: &str,
+        sol_in_lamports: u64,
+        _token_decimals: u8,
+    ) -> Option<u64> {
+        // Get cached pool state (includes reserves + DLMM-specific data)
+        let cache = self.vault_balances.read();
+        let pool_state = cache.get(buy_pool)?;
+
+        let reserve_base = pool_state.reserve_base;
+        let reserve_quote = pool_state.reserve_quote;
+
+        // For most Solana DEX pools:
+        // - base = Token
+        // - quote = SOL/WSOL
+        // So reserve_base = token reserve, reserve_quote = SOL reserve
+
+        match buy_dex {
+            "raydium" | "raydium_cpmm" | "meteora_cpmm" => {
+                // Fee rates by DEX (in basis points)
+                let fee_bps: u64 = match buy_dex {
+                    "raydium" => 25,        // 0.25%
+                    "raydium_cpmm" => 25,   // 0.25%
+                    "meteora_cpmm" => 25,   // 0.25%
+                    _ => 25,
+                };
+
+                // Constant product AMM formula:
+                // token_out = reserve_token * sol_in / (reserve_sol + sol_in)
+                // Then apply fee: token_out_after_fee = token_out * (10000 - fee_bps) / 10000
+
+                // Use u128 to prevent overflow
+                let reserve_token = reserve_base as u128;
+                let reserve_sol = reserve_quote as u128;
+                let sol_in = sol_in_lamports as u128;
+
+                if reserve_sol == 0 || reserve_token == 0 {
+                    warn!(
+                        pool = %buy_pool,
+                        reserve_sol,
+                        reserve_token,
+                        "Pool has zero reserves - cannot calculate token output"
+                    );
+                    return None;
+                }
+
+                // token_out_raw = reserve_token * sol_in / (reserve_sol + sol_in)
+                let numerator = reserve_token.checked_mul(sol_in)?;
+                let denominator = reserve_sol.checked_add(sol_in)?;
+                let token_out_raw = numerator.checked_div(denominator)?;
+
+                // Apply fee: token_out = token_out_raw * (10000 - fee_bps) / 10000
+                let fee_multiplier = 10000u128 - fee_bps as u128;
+                let token_out_after_fee = token_out_raw
+                    .checked_mul(fee_multiplier)?
+                    .checked_div(10000)?;
+
+                let result = token_out_after_fee as u64;
+
+                info!(
+                    pool = %buy_pool,
+                    dex = %buy_dex,
+                    sol_in_lamports,
+                    reserve_sol = %reserve_sol,
+                    reserve_token = %reserve_token,
+                    token_out_raw = %token_out_raw,
+                    token_out_after_fee = result,
+                    fee_bps,
+                    "Calculated expected token output from reserves (Option D - AMM)"
+                );
+
+                Some(result)
+            }
+
+            "meteora_dlmm" => {
+                // DLMM Bin Array Traversierung
+                self.calculate_dlmm_token_output(buy_pool, sol_in_lamports, pool_state)
+            }
+
+            _ => {
+                debug!(
+                    pool = %buy_pool,
+                    dex = %buy_dex,
+                    "Unknown DEX: using price-based estimation"
+                );
+                None
+            }
+        }
+    }
+
+    /// Calculate expected token output for Meteora DLMM using Bin Array Traversierung.
+    ///
+    /// DLMM pools have concentrated liquidity in discrete price bins.
+    /// To calculate exact output, we need to traverse bins starting from active_id
+    /// and accumulate token output as we consume SOL in each bin.
+    ///
+    /// Algorithm:
+    /// 1. Start at active_id (current price bin)
+    /// 2. For each bin: consume available SOL liquidity, accumulate token output
+    /// 3. If bin depleted, move to next bin (higher price = less tokens per SOL)
+    /// 4. Continue until all sol_in consumed or no more liquidity
+    fn calculate_dlmm_token_output(
+        &self,
+        pool_address: &str,
+        sol_in_lamports: u64,
+        pool_state: &VaultBalanceCache,
+    ) -> Option<u64> {
+        // Get DLMM-specific parameters
+        let active_id = pool_state.active_id?;
+        let bin_step = pool_state.bin_step?;
+
+        // Get cached bin arrays for this pool
+        let bin_arrays = self.get_bin_arrays(pool_address)?;
+
+        if bin_arrays.is_empty() {
+            debug!(
+                pool = %pool_address,
+                "DLMM: no bin arrays cached, falling back to price-based"
+            );
+            return None;
+        }
+
+        // Convert active_id to bin array index
+        let active_array_index = active_id as i64 / 70; // 70 bins per array
+        let active_bin_offset = (active_id as i64 % 70) as usize;
+
+        // Find the active bin array
+        let active_array = bin_arrays.get(&active_array_index)?;
+
+        // Find the active bin within the array
+        let active_bin = active_array.iter().find(|b| b.offset as usize == active_bin_offset);
+
+        // If active bin not found in cache, we can't calculate accurately
+        if active_bin.is_none() {
+            debug!(
+                pool = %pool_address,
+                active_id,
+                active_array_index,
+                active_bin_offset,
+                "DLMM: active bin not in cache, falling back to price-based"
+            );
+            return None;
+        }
+
+        // Traverse bins starting from active_id
+        // For SOL→Token (buy): we give SOL (amount_y) and receive Token (amount_x)
+        // Start at active bin and traverse towards higher bin_ids (token becomes cheaper)
+        let mut remaining_sol = sol_in_lamports as u128;
+        let mut total_tokens_out: u128 = 0;
+        let mut bins_traversed: i32 = 0;
+
+        // Collect all bins sorted by bin_id for traversal
+        let mut all_bins: Vec<(i32, BinData)> = Vec::new();
+        for (array_idx, bins) in &bin_arrays {
+            for bin in bins {
+                let bin_id = (*array_idx * 70 + bin.offset as i64) as i32;
+                all_bins.push((bin_id, bin.clone()));
+            }
+        }
+        all_bins.sort_by_key(|(id, _)| *id);
+
+        // Filter to only bins >= active_id (collect first, then iterate)
+        let relevant_bins: Vec<_> = all_bins.into_iter().filter(|(id, _)| *id >= active_id).collect();
+
+        // Traverse bins starting from active_id
+        for (bin_id, bin) in relevant_bins {
+            if remaining_sol == 0 {
+                break;
+            }
+
+            // amount_y = SOL in bin, amount_x = Token in bin
+            // For buy: we give SOL, receive Token
+            let sol_in_bin = bin.amount_y as u128;
+            let tokens_in_bin = bin.amount_x as u128;
+
+            if tokens_in_bin == 0 {
+                // No tokens in this bin, skip
+                bins_traversed += 1;
+                continue;
+            }
+
+            // Calculate price at this bin
+            // price = tokens_per_sol = tokens_in_bin / sol_in_bin (if sol_in_bin > 0)
+            // For bins with no SOL, use bin_step to estimate price from previous bin
+            let tokens_received = if sol_in_bin > 0 {
+                // Use actual ratio in this bin
+                let sol_to_use = remaining_sol.min(sol_in_bin);
+                let tokens = sol_to_use.checked_mul(tokens_in_bin)?.checked_div(sol_in_bin)?;
+                remaining_sol = remaining_sol.saturating_sub(sol_to_use);
+                tokens
+            } else {
+                // Bin has tokens but no SOL - skip (no counter-liquidity)
+                bins_traversed += 1;
+                continue;
+            };
+
+            total_tokens_out = total_tokens_out.checked_add(tokens_received)?;
+            bins_traversed += 1;
+
+            // Log progress for debugging
+            if bins_traversed <= 3 {
+                debug!(
+                    bin_id,
+                    sol_in_bin,
+                    tokens_in_bin,
+                    tokens_received,
+                    remaining_sol = %remaining_sol,
+                    "DLMM bin traversal step"
+                );
+            }
+        }
+
+        // Apply DLMM fee (typically variable, use bin_step as approximation)
+        // Base fee ≈ 0.1% + bin_step * 0.01%
+        let fee_bps = 10u128 + (bin_step as u128).min(100);
+        let fee_multiplier = 10000u128 - fee_bps;
+        let tokens_after_fee = total_tokens_out.checked_mul(fee_multiplier)?.checked_div(10000)?;
+
+        let result = tokens_after_fee as u64;
+
+        info!(
+            pool = %pool_address,
+            sol_in_lamports,
+            active_id,
+            bin_step,
+            bins_traversed,
+            total_tokens_out = %total_tokens_out,
+            tokens_after_fee = result,
+            fee_bps,
+            "Calculated expected token output from bin arrays (Option D - DLMM)"
+        );
+
+        Some(result)
     }
 
     /// Get cached bin arrays for a Meteora DLMM pool (returns None if not cached)
@@ -1146,6 +1409,39 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     // This avoids IncorrectProgramId errors when creating ATAs for Token-2022 tokens
     let token_program = ctx.get_token_program_for_mint(&opp.base_mint);
 
+    // =========================================================================
+    // OPTION D: Calculate expected_token_output from pool reserves (Geyser)
+    // =========================================================================
+    // This eliminates the need for safety margins in execution-engine.
+    // The sell leg uses this as amount_in - exact value from reserves, not estimated.
+    //
+    // For AMMs (Raydium, CPMM): constant product formula with fee deduction
+    // For DLMM: falls back to price-based (concentrated liquidity is complex)
+    //
+    // Token decimals: pump.fun tokens are always 6 decimals
+    let expected_token_output = ctx.calculate_expected_token_output(
+        &opp.buy_pool,
+        &opp.buy_dex,
+        opp.trade_amount_lamports,
+        6, // pump.fun tokens
+    );
+
+    if let Some(token_out) = expected_token_output {
+        debug!(
+            buy_pool = %opp.buy_pool,
+            buy_dex = %opp.buy_dex,
+            sol_in = opp.trade_amount_lamports,
+            token_out,
+            "Option D: calculated expected_token_output from reserves"
+        );
+    } else {
+        debug!(
+            buy_pool = %opp.buy_pool,
+            buy_dex = %opp.buy_dex,
+            "Option D: falling back to price-based estimation (no reserves or DLMM)"
+        );
+    }
+
     let resources = TradeResources {
         input_mint: "So11111111111111111111111111111111111111112".to_string(),
         output_mint: opp.base_mint.clone(),
@@ -1224,6 +1520,18 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
         "estimated_profit_lamports".to_string(),
         opp.estimated_profit_lamports.to_string(),
     );
+
+    // =========================================================================
+    // OPTION D: Pass expected_token_output to execution-engine
+    // =========================================================================
+    // If calculated from reserves, this is the exact value the sell leg should use.
+    // If None (DLMM or missing reserves), execution-engine falls back to price-based.
+    if let Some(token_out) = expected_token_output {
+        intent.metadata.insert(
+            "expected_token_output".to_string(),
+            token_out.to_string(),
+        );
+    }
 
     // Decision record: why this opportunity was chosen
     intent.metadata.insert("decision_reason".to_string(), format!(
@@ -1896,6 +2204,8 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             reserve_base,
             reserve_quote,
             update_slot,
+            active_id,
+            bin_step,
             ..
         } => {
             ctx.handle_pool_state_update(
@@ -1904,6 +2214,8 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
                 *reserve_base,
                 *reserve_quote,
                 *update_slot,
+                *active_id,
+                *bin_step,
             );
             None
         }

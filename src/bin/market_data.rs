@@ -246,6 +246,13 @@ struct VaultInfo {
     is_base_vault: bool,
     /// Last known balance (for delta detection)
     last_balance: std::sync::atomic::AtomicU64,
+    // =========================================================================
+    // DLMM-specific fields (Option D: Bin Array Traversierung)
+    // =========================================================================
+    /// Meteora DLMM: Active bin index (where current price is)
+    active_id: Option<i32>,
+    /// Meteora DLMM: Bin step (price increment per bin in bps)
+    bin_step: Option<u16>,
 }
 
 impl Clone for VaultInfo {
@@ -259,6 +266,8 @@ impl Clone for VaultInfo {
             last_balance: std::sync::atomic::AtomicU64::new(
                 self.last_balance.load(std::sync::atomic::Ordering::Relaxed),
             ),
+            active_id: self.active_id,
+            bin_step: self.bin_step,
         }
     }
 }
@@ -1118,6 +1127,9 @@ async fn run_geyser_loop(
                                             base_mint: vault_info.base_mint.to_string(),
                                             quote_mint: vault_info.quote_mint.to_string(),
                                             update_slot: account_update.slot,
+                                            // DLMM-specific fields (Option D)
+                                            active_id: vault_info.active_id,
+                                            bin_step: vault_info.bin_step,
                                         },
                                     );
 
@@ -1765,6 +1777,9 @@ async fn run_geyser_loop(
                     // Track vault accounts for PoolStateUpdate events (Geyser-based reserve balances)
                     // This enables real-time reserve tracking without RPC calls.
                     let dex_str = pool_event.dex_type.to_string();
+                    // DLMM-specific: pass active_id/bin_step for Option D (Bin Array Traversierung)
+                    let dlmm_active_id = pool_event.active_id;
+                    let dlmm_bin_step = pool_event.bin_step;
                     let mut vaults_changed = false;
                     {
                         let mut vaults = ctx.tracked_vaults.write();
@@ -1778,6 +1793,8 @@ async fn run_geyser_loop(
                                     quote_mint: pool_event.quote_mint,
                                     is_base_vault: true,
                                     last_balance: std::sync::atomic::AtomicU64::new(0),
+                                    active_id: dlmm_active_id,
+                                    bin_step: dlmm_bin_step,
                                 }
                             });
                         }
@@ -1791,6 +1808,8 @@ async fn run_geyser_loop(
                                     quote_mint: pool_event.quote_mint,
                                     is_base_vault: false,
                                     last_balance: std::sync::atomic::AtomicU64::new(0),
+                                    active_id: dlmm_active_id,
+                                    bin_step: dlmm_bin_step,
                                 }
                             });
                         }
