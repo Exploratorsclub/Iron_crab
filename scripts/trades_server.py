@@ -82,6 +82,8 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             signature = record.get('signature', '')
             fill_in = record.get('fill_in', {})
             fill_out = record.get('fill_out', {})
+            source = record.get('source', 'unknown')
+            intent_id = record.get('intent_id', '')
             
             # NEW: Get actual wallet SOL delta (includes all fees)
             wallet_sol_delta_lamports = record.get('wallet_sol_delta_lamports')
@@ -89,62 +91,98 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             # NEW: Get token_mint directly from execution record (no decision join needed)
             token_mint = record.get('token_mint', 'unknown')
             
+            # ARBITRAGE DETECTION: Check source or intent_id prefix
+            is_arbitrage = (
+                source == 'arb-strategy' or 
+                intent_id.startswith('arb-') or
+                'arb' in source.lower()
+            )
+            
+            # LIQUIDATION DETECTION: Check intent_id prefix
+            is_liquidation = intent_id.startswith('liquidation-')
+            
             # Determine action from fill amounts
-            # BUY: fill_out contains tokens (>0), fill_in may be unavailable (partial status)
-            # SELL: fill_in contains tokens (>0), fill_out may be unavailable
             fill_in_raw = fill_in.get('raw', 0)
             fill_in_decimals = fill_in.get('decimals', 9)
             fill_out_raw = fill_out.get('raw', 0)
             fill_out_decimals = fill_out.get('decimals', 9)
             
-            # Better heuristic: Check which side has tokens (non-zero raw amount with 6-9 decimals)
-            # SOL/WSOL always has 9 decimals, tokens typically 6-9
-            has_fill_out = fill_out_raw > 0 and fill_out_decimals in [6, 7, 8, 9]
-            has_fill_in = fill_in_raw > 0 and fill_in_decimals in [6, 7, 8, 9]
-            
-            # If fill_out has value and fill_in doesn't (or is WSOL-sized), it's likely a BUY
-            # Default to BUY if uncertain (most common case for momentum-bot)
-            if has_fill_out and fill_out_decimals <= 9:
-                # If fill_out is much larger than typical SOL amounts, it's tokens (BUY)
-                if fill_out_raw > 1_000_000 or not has_fill_in:
+            # Arbitrage has special action type
+            if is_arbitrage:
+                action = "ARBITRAGE"
+                # For arbitrage, amount is the token amount traded
+                # fill_out typically has tokens received from buy leg
+                if fill_out_raw > 0 and fill_out_decimals <= 9:
+                    amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
+                elif fill_in_raw > 0 and fill_in_decimals <= 9:
+                    amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
+                else:
+                    amount_tokens = None  # unknown
+            else:
+                # Regular BUY/SELL detection
+                # BUY: fill_out contains tokens (non-SOL)
+                # SELL: fill_in contains tokens (non-SOL), fill_out is WSOL
+                
+                # Check which side has tokens (6 decimals typically) vs SOL (9 decimals)
+                fill_out_is_tokens = fill_out_raw > 0 and fill_out_decimals == 6
+                fill_in_is_tokens = fill_in_raw > 0 and fill_in_decimals == 6
+                
+                if fill_out_is_tokens and not fill_in_is_tokens:
+                    # Received tokens, paid SOL = BUY
                     action = "BUY"
                     amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
+                elif fill_in_is_tokens:
+                    # Sent tokens, received SOL = SELL
+                    action = "SELL"
+                    amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
+                elif fill_out_raw > fill_in_raw * 100:
+                    # fill_out >> fill_in suggests tokens received (BUY)
+                    action = "BUY"
+                    amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
+                elif fill_in_raw > 0:
+                    # Default to SELL if we sent something
+                    action = "SELL"
+                    amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
                 else:
-                    # Both have values - compare magnitudes
-                    action = "SELL" if fill_in_raw > fill_out_raw else "BUY"
-                    amount_tokens = fill_in_raw / (10 ** fill_in_decimals) if action == "SELL" else fill_out_raw / (10 ** fill_out_decimals)
-            elif has_fill_in:
-                action = "SELL"
-                amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
-            else:
-                # No fills available - default to BUY with 0 amount
-                action = "BUY"
-                amount_tokens = 0.0
+                    action = "BUY"
+                    amount_tokens = fill_out_raw / (10 ** fill_out_decimals) if fill_out_raw > 0 else None
             
+            # Calculate SOL price/cost
             # Prefer wallet_sol_delta_lamports (actual SOL change) over WSOL token amounts
             if wallet_sol_delta_lamports is not None:
-                # wallet_sol_delta_lamports: positive = gained SOL, negative = lost SOL
-                # For price_sol, we want absolute amount
+                # wallet_sol_delta_lamports: negative = lost SOL (paid), positive = gained SOL
                 sol_amount = abs(wallet_sol_delta_lamports) / 1e9
             else:
-                # Fallback to WSOL token amounts (old behavior)
-                if is_sell:
-                    sol_amount = fill_out_raw / 1e9  # WSOL received
+                # Fallback: use WSOL fill amount
+                if action == "SELL":
+                    # SELL: received SOL/WSOL in fill_out
+                    sol_amount = fill_out_raw / 1e9 if fill_out_decimals == 9 else 0
+                elif action == "ARBITRAGE":
+                    # ARBITRAGE: profit is usually negative wallet delta (we paid fees)
+                    # Use fill_in (what we paid) as the "cost"
+                    sol_amount = fill_in_raw / 1e9 if fill_in_decimals == 9 else 0
                 else:
-                    sol_amount = fill_in_raw / 1e9  # SOL paid
+                    # BUY: paid SOL/WSOL in fill_in
+                    sol_amount = fill_in_raw / 1e9 if fill_in_decimals == 9 else 0
             
             price_sol = sol_amount
+            
+            # Truncate token mint for display (keep first 8 + last 4 chars)
+            if token_mint and token_mint != "unknown" and len(token_mint) > 15:
+                display_mint = token_mint[:8] + "..." + token_mint[-4:]
+            else:
+                display_mint = token_mint
             
             return {
                 "timestamp_ms": ts_ms,
                 "time": datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S"),
                 "action": action,
-                "token_mint": token_mint[:20] + "..." if token_mint != "unknown" else token_mint,
-                "tx_hash": signature,
+                "token_mint": display_mint,
+                "tx_hash": signature[:8] + "..." if len(signature) > 12 else signature,
                 "amount": amount_tokens,
-                "price_sol": round(price_sol, 9),
+                "price_sol": round(price_sol, 12) if price_sol else None,
                 "pnl_sol": 0.0,  # Would need position tracking
-                "pnl_percent": 0.0  # Would need position tracking
+                "pnl_percent": None  # null shows as "null" in table
             }
         except Exception as e:
             print(f"Error parsing execution result: {e}")
