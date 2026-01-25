@@ -3006,6 +3006,33 @@ async fn main() -> Result<()> {
     let wsol_cfg = exec_eng_cfg.and_then(|e| e.wsol_manager.as_ref());
     // Get Janitor config from [execution_engine.account_janitor] section
     let janitor_cfg = exec_eng_cfg.and_then(|e| e.account_janitor.as_ref());
+    // Get Fee Policy config from [execution_engine.fee_policy] section
+    let fee_policy_cfg = exec_eng_cfg.and_then(|e| e.fee_policy.as_ref());
+
+    // Build FeePolicy from config (or use defaults)
+    let fee_policy = if let Some(fp) = fee_policy_cfg {
+        FeePolicy {
+            default_compute_units: fp.default_compute_units,
+            max_compute_units: fp.max_compute_units,
+            arb_compute_units: fp.arb_compute_units,
+            default_priority_fee_micro_lamports: fp.default_priority_fee_micro_lamports,
+            max_priority_fee_micro_lamports: fp.max_priority_fee_micro_lamports,
+            tier0_priority_fee_micro_lamports: fp.tier0_priority_fee_micro_lamports,
+            urgency_multiplier_elevated: 2.0,
+            urgency_multiplier_urgent: 5.0,
+            max_tx_cost_lamports: fp.max_tx_cost_lamports,
+            min_profit_after_fees_bps: fp.min_profit_after_fees_bps,
+        }
+    } else {
+        FeePolicy::default()
+    };
+
+    info!(
+        tier0_priority_fee = fee_policy.tier0_priority_fee_micro_lamports,
+        default_priority_fee = fee_policy.default_priority_fee_micro_lamports,
+        max_priority_fee = fee_policy.max_priority_fee_micro_lamports,
+        "Fee policy loaded"
+    );
 
     // Setup config - read Jito settings: prefer [execution_engine] section, fallback to [sniper]
     let exec_config = ExecutionConfig {
@@ -3056,6 +3083,8 @@ async fn main() -> Result<()> {
             .unwrap_or(500),
         janitor_swap_dust_max_per_run: janitor_cfg.map(|c| c.swap_dust_max_per_run).unwrap_or(5),
         janitor_dry_run: janitor_cfg.map(|c| c.dry_run).unwrap_or(false) || args.dry_run,
+        // Fee Policy
+        fee_policy,
         ..Default::default()
     };
 

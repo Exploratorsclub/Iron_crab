@@ -342,6 +342,18 @@ jito_enabled = true                 # Enable Jito bundle submission
 jito_tip_lamports = 100000         # Tip: 0.0001 SOL per bundle (10x higher = much better success rate)
 jito_region = "frankfurt"          # Legacy config - code now uses ALL 5 regions in parallel
 
+# P1: Fee Policy (CRITICAL for TX confirmation!)
+# Priority fees must be high enough to compete with other TXs on the network
+[execution_engine.fee_policy]
+default_compute_units = 200_000
+max_compute_units = 1_400_000
+arb_compute_units = 400_000
+default_priority_fee_micro_lamports = 100_000  # 0.1 lamports per CU (baseline)
+tier0_priority_fee_micro_lamports = 500_000    # 0.5 lamports per CU (KillSwitch, exits)
+max_priority_fee_micro_lamports = 1_000_000    # 1 lamport per CU (absolute max)
+max_tx_cost_lamports = 5_000_000               # 0.005 SOL max TX cost
+min_profit_after_fees_bps = 10                 # 0.1% min profit after all fees
+
 # P2: TPU Direct TX Submission (faster than RPC)
 # TPU sends directly to slot leaders via QUIC (~50-100ms vs ~200-400ms RPC)
 [execution_engine.tx_submission]

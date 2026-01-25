@@ -125,6 +125,64 @@ pub struct ExecutionEngineCfg {
     /// TX Submission Configuration (TPU/Jito/RPC fallback)
     #[serde(default)]
     pub tx_submission: Option<TxSubmissionCfg>,
+    /// Fee Policy Configuration (priority fees, compute limits)
+    #[serde(default)]
+    pub fee_policy: Option<FeePolicyCfg>,
+}
+
+/// Fee Policy Configuration
+/// Controls compute units, priority fees, and cost limits.
+/// TOML section: [execution_engine.fee_policy]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeePolicyCfg {
+    /// Default compute units for transactions. Default: 200000
+    #[serde(default = "default_compute_units")]
+    pub default_compute_units: u32,
+    /// Maximum compute units allowed. Default: 1400000
+    #[serde(default = "default_max_compute_units")]
+    pub max_compute_units: u32,
+    /// Compute units for arbitrage transactions. Default: 400000
+    #[serde(default = "default_arb_compute_units")]
+    pub arb_compute_units: u32,
+    /// Default priority fee (micro-lamports per CU). Default: 1000
+    #[serde(default = "default_priority_fee")]
+    pub default_priority_fee_micro_lamports: u64,
+    /// Maximum priority fee allowed. Default: 100000
+    #[serde(default = "default_max_priority_fee")]
+    pub max_priority_fee_micro_lamports: u64,
+    /// Priority fee for Tier0/urgent intents (liquidation, kills). Default: 100000
+    #[serde(default = "default_tier0_priority_fee")]
+    pub tier0_priority_fee_micro_lamports: u64,
+    /// Maximum total TX cost in lamports. Default: 50000000 (0.05 SOL)
+    #[serde(default = "default_max_tx_cost")]
+    pub max_tx_cost_lamports: u64,
+    /// Minimum profit after fees in basis points. Default: 10
+    #[serde(default = "default_min_profit_after_fees")]
+    pub min_profit_after_fees_bps: i32,
+}
+
+fn default_compute_units() -> u32 { 200_000 }
+fn default_max_compute_units() -> u32 { 1_400_000 }
+fn default_arb_compute_units() -> u32 { 400_000 }
+fn default_priority_fee() -> u64 { 1_000 }
+fn default_max_priority_fee() -> u64 { 1_000_000 }  // 1 lamport/CU max
+fn default_tier0_priority_fee() -> u64 { 500_000 }  // 0.5 lamports/CU for urgent
+fn default_max_tx_cost() -> u64 { 50_000_000 }
+fn default_min_profit_after_fees() -> i32 { 10 }
+
+impl Default for FeePolicyCfg {
+    fn default() -> Self {
+        Self {
+            default_compute_units: default_compute_units(),
+            max_compute_units: default_max_compute_units(),
+            arb_compute_units: default_arb_compute_units(),
+            default_priority_fee_micro_lamports: default_priority_fee(),
+            max_priority_fee_micro_lamports: default_max_priority_fee(),
+            tier0_priority_fee_micro_lamports: default_tier0_priority_fee(),
+            max_tx_cost_lamports: default_max_tx_cost(),
+            min_profit_after_fees_bps: default_min_profit_after_fees(),
+        }
+    }
 }
 
 /// TX Submission Configuration
