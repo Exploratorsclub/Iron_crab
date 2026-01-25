@@ -3862,15 +3862,20 @@ async fn main() -> Result<()> {
                             }
 
                             if active && liquidate_positions {
-                                let slippage = max_slippage_bps.unwrap_or(9900);
-                                let ttl = ttl_ms.unwrap_or(60_000);
-                                ExecutionContext::run_liquidation_job(
-                                    Arc::clone(&ctx),
-                                    slippage,
-                                    ttl,
-                                    reason,
-                                )
-                                .await;
+                                // Check if liquidation is already in progress BEFORE spawning
+                                if ctx.liquidation_in_progress.load(Ordering::SeqCst) {
+                                    warn!("KillSwitch: Liquidation already in progress, ignoring duplicate request");
+                                } else {
+                                    let slippage = max_slippage_bps.unwrap_or(9900);
+                                    let ttl = ttl_ms.unwrap_or(60_000);
+                                    ExecutionContext::run_liquidation_job(
+                                        Arc::clone(&ctx),
+                                        slippage,
+                                        ttl,
+                                        reason,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                         ControlRequestKind::ResetKillSwitch => {
