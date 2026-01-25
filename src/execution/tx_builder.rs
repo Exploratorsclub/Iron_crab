@@ -570,17 +570,21 @@ pub async fn build_tx_plan(
             }
         };
 
-        if intent.resources.accounts.len() != 12 {
+        // Accept both formats:
+        // - 12 accounts: SELL format (no volume accumulators)  
+        // - 14 accounts: BUY format (with global_volume_accumulator + user_volume_accumulator)
+        let accounts_len = intent.resources.accounts.len();
+        if accounts_len != 12 && accounts_len != 14 {
             return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                 reason: RejectReason::UnsupportedIntent,
                 details: format!(
-                    "pump_amm requires resources.accounts (DexPoolAccounts v2, len=12, no volume accumulators), got len={}",
-                    intent.resources.accounts.len()
+                    "pump_amm requires resources.accounts (len=12 for SELL or len=14 for BUY), got len={}",
+                    accounts_len
                 ),
             });
         }
 
-        let mut pool_accounts: Vec<Pubkey> = Vec::with_capacity(12);
+        let mut pool_accounts: Vec<Pubkey> = Vec::with_capacity(accounts_len);
         for (idx, a) in intent.resources.accounts.iter().enumerate() {
             match Pubkey::from_str(a) {
                 Ok(pk) => pool_accounts.push(pk),
