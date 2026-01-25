@@ -3878,8 +3878,10 @@ async fn main() -> Result<()> {
                 if let Some(ref mut consumer) = pool_cache_consumer_opt {
                     use futures::StreamExt;
 
-                    // Fetch up to 100 messages per tick (non-blocking batch)
-                    match consumer.fetch().max_messages(100).messages().await {
+                    // Fetch up to 100 messages per tick with 100ms timeout (NON-BLOCKING!)
+                    // Without expires(), fetch() can block indefinitely waiting for messages,
+                    // which freezes the entire select! loop and prevents processing intents/control requests.
+                    match consumer.fetch().max_messages(100).expires(std::time::Duration::from_millis(100)).messages().await {
                         Ok(mut messages) => {
                             let mut msg_count = 0;
                             while let Some(msg_result) = messages.next().await {
