@@ -595,6 +595,11 @@ impl MultiHopArbitrage {
         }
     }
 
+    /// Get current configuration (clone for hot-reload updates)
+    pub fn get_config(&self) -> MultiHopConfig {
+        self.config.read().clone()
+    }
+
     /// Update configuration at runtime
     pub fn update_config(&self, config: MultiHopConfig) {
         *self.config.write() = config;

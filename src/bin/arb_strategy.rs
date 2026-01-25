@@ -71,6 +71,8 @@ struct ArbConfig {
     /// Since execution-engine calculates fresh min_out from Geyser cache,
     /// we can use shorter TTL without quote staleness issues.
     intent_ttl_ms: u64,
+    /// Enable 2-hop arbitrage (A→B on DEX1, B→A on DEX2). Default: true
+    two_hop_enabled: bool,
 }
 
 impl Default for ArbConfig {
@@ -83,6 +85,7 @@ impl Default for ArbConfig {
             max_slippage_bps: 100,                // 1% max slippage
             intent_cooldown_ms: 5000,             // 5s cooldown per pair
             intent_ttl_ms: 1000,                  // 1s TTL (Option C: fresh quotes in exec-engine)
+            two_hop_enabled: true,                // 2-hop arb enabled by default
         }
     }
 }
@@ -256,6 +259,15 @@ impl TokenArbTracker {
         config: &ArbConfig,
         known_pools: &HashSet<String>,
     ) -> Option<ArbOpportunity> {
+        // Check if 2-hop arbitrage is enabled
+        if !config.two_hop_enabled {
+            debug!(
+                mint = %self.base_mint,
+                "2-hop arb check skipped: two_hop_enabled=false"
+            );
+            return None;
+        }
+
         // Need at least 2 DEXes with prices
         let pools_with_price: Vec<_> = self
             .pools_by_dex
@@ -705,9 +717,192 @@ impl ArbContext {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
+                // =====================================================================
+                // 2-HOP Arbitrage Config (hot-reload)
+                // =====================================================================
+                "two_hop_enabled" => {
+                    if let Some(v) = value.as_bool() {
+                        config.two_hop_enabled = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
                 _ => rejected.push((key.clone(), format!("Unknown config key: {}", key))),
             }
         }
+
+        // =====================================================================
+        // Multi-Hop Config (applied to self.multi_hop, not ArbConfig)
+        // =====================================================================
+        drop(config); // Release ArbConfig lock before updating multi_hop
+
+        let mut multi_hop_applied = Vec::new();
+        let mut multi_hop_rejected = Vec::new();
+        let mut multi_hop_config = self.multi_hop.get_config();
+
+        for (key, value) in &update.config {
+            match key.as_str() {
+                "multi_hop_enabled" => {
+                    if let Some(v) = value.as_bool() {
+                        multi_hop_config.enabled = v;
+                        multi_hop_applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Multi-hop config updated");
+                    } else {
+                        multi_hop_rejected
+                            .push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "multi_hop_shadow_mode" => {
+                    if let Some(v) = value.as_bool() {
+                        multi_hop_config.shadow_mode = v;
+                        multi_hop_applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Multi-hop config updated");
+                    } else {
+                        multi_hop_rejected
+                            .push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "multi_hop_max_hops" => {
+                    if let Some(v) = value.as_u64() {
+                        if (3..=5).contains(&v) {
+                            multi_hop_config.max_hops = v as usize;
+                            multi_hop_applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Multi-hop config updated");
+                        } else {
+                            multi_hop_rejected.push((key.clone(), "Must be 3-5".to_string()));
+                        }
+                    } else {
+                        multi_hop_rejected
+                            .push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "multi_hop_beam_width" => {
+                    if let Some(v) = value.as_u64() {
+                        if (10..=200).contains(&v) {
+                            multi_hop_config.beam_width = v as usize;
+                            multi_hop_applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Multi-hop config updated");
+                        } else {
+                            multi_hop_rejected.push((key.clone(), "Must be 10-200".to_string()));
+                        }
+                    } else {
+                        multi_hop_rejected
+                            .push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "multi_hop_min_profit_bps" => {
+                    if let Some(v) = value.as_i64() {
+                        if (1..=1000).contains(&v) {
+                            multi_hop_config.min_profit_bps = v as i32;
+                            multi_hop_applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Multi-hop config updated");
+                        } else {
+                            multi_hop_rejected.push((key.clone(), "Must be 1-1000".to_string()));
+                        }
+                    } else {
+                        multi_hop_rejected
+                            .push((key.clone(), "Invalid type, expected i64".to_string()));
+                    }
+                }
+                "multi_hop_max_cycles" => {
+                    if let Some(v) = value.as_u64() {
+                        if (1..=20).contains(&v) {
+                            multi_hop_config.max_cycles = v as usize;
+                            multi_hop_applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Multi-hop config updated");
+                        } else {
+                            multi_hop_rejected.push((key.clone(), "Must be 1-20".to_string()));
+                        }
+                    } else {
+                        multi_hop_rejected
+                            .push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "multi_hop_pool_alternatives" => {
+                    if let Some(v) = value.as_u64() {
+                        if (1..=10).contains(&v) {
+                            multi_hop_config.pool_alternatives = v as usize;
+                            multi_hop_applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Multi-hop config updated");
+                        } else {
+                            multi_hop_rejected.push((key.clone(), "Must be 1-10".to_string()));
+                        }
+                    } else {
+                        multi_hop_rejected
+                            .push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "multi_hop_min_liquidity_usd" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=1_000_000.0).contains(&v) {
+                            multi_hop_config.min_liquidity_usd = v;
+                            multi_hop_applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Multi-hop config updated");
+                        } else {
+                            multi_hop_rejected.push((key.clone(), "Must be 0-1000000".to_string()));
+                        }
+                    } else {
+                        multi_hop_rejected
+                            .push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "multi_hop_input_lamports" => {
+                    if let Some(v) = value.as_u64() {
+                        if (1_000_000..=10_000_000_000).contains(&v) {
+                            multi_hop_config.input_amount_lamports = v;
+                            multi_hop_applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Multi-hop config updated");
+                        } else {
+                            multi_hop_rejected
+                                .push((key.clone(), "Must be 1M-10B lamports".to_string()));
+                        }
+                    } else {
+                        multi_hop_rejected
+                            .push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "multi_hop_min_price_change_bps" => {
+                    if let Some(v) = value.as_u64() {
+                        if (1..=1000).contains(&v) {
+                            multi_hop_config.min_price_change_bps = v as u32;
+                            multi_hop_applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Multi-hop config updated");
+                        } else {
+                            multi_hop_rejected.push((key.clone(), "Must be 1-1000".to_string()));
+                        }
+                    } else {
+                        multi_hop_rejected
+                            .push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "multi_hop_token_cooldown_ms" => {
+                    if let Some(v) = value.as_u64() {
+                        if v <= 60_000 {
+                            multi_hop_config.token_cooldown_ms = v;
+                            multi_hop_applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Multi-hop config updated");
+                        } else {
+                            multi_hop_rejected.push((key.clone(), "Must be <= 60000".to_string()));
+                        }
+                    } else {
+                        multi_hop_rejected
+                            .push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                _ => {} // Ignore keys not related to multi-hop (already handled above)
+            }
+        }
+
+        // Apply multi-hop config if any changes were made
+        if !multi_hop_applied.is_empty() {
+            self.multi_hop.update_config(multi_hop_config);
+        }
+
+        // Merge results
+        applied.extend(multi_hop_applied);
+        rejected.extend(multi_hop_rejected);
 
         let status = if rejected.is_empty() {
             ConfigUpdateStatus::Applied
