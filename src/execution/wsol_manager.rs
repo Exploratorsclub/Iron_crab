@@ -214,6 +214,9 @@ pub struct WsolManager {
 
     /// JSONL writer for decision records
     jsonl_writer: Option<Arc<JsonlWriter>>,
+
+    /// Kill switch checker - when returns true, no wrapping should occur
+    kill_switch_checker: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl WsolManager {
@@ -239,6 +242,7 @@ impl WsolManager {
             build_version: build_version.to_string(),
             run_id: run_id.to_string(),
             jsonl_writer: None,
+            kill_switch_checker: None,
         }
     }
 
@@ -265,7 +269,25 @@ impl WsolManager {
             build_version: build_version.to_string(),
             run_id: run_id.to_string(),
             jsonl_writer: Some(jsonl_writer),
+            kill_switch_checker: None,
         }
+    }
+
+    /// Set kill switch checker function
+    pub fn with_kill_switch<F>(mut self, checker: F) -> Self
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        self.kill_switch_checker = Some(Arc::new(checker));
+        self
+    }
+
+    /// Check if kill switch is currently active
+    fn is_kill_switch_active(&self) -> bool {
+        self.kill_switch_checker
+            .as_ref()
+            .map(|checker| checker())
+            .unwrap_or(false)
     }
 
     /// Get current WSOL balance (from cache)
@@ -501,6 +523,12 @@ impl WsolManager {
 
     /// Check current balances and wrap/unwrap if needed
     async fn check_and_act(&self) -> Result<()> {
+        // Skip all actions if kill switch is active - no WSOL needed when liquidating
+        if self.is_kill_switch_active() {
+            debug!("Kill switch active, skipping WSOL management");
+            return Ok(());
+        }
+
         let wsol = self.wsol_balance();
         let sol = self.sol_balance();
 
@@ -692,6 +720,8 @@ impl WsolManager {
     }
 
     /// Execute unwrap: WSOL → SOL (close account to get SOL back)
+    /// Note: Currently not used but kept for future max_wsol overflow handling
+    #[allow(dead_code)]
     async fn execute_unwrap(&self, _amount_lamports: u64) -> Result<()> {
         let sol_before = self.sol_balance();
         let wsol_before = self.wsol_balance();
@@ -807,6 +837,8 @@ impl WsolManager {
     }
 
     /// Build and send unwrap transaction (close WSOL ATA)
+    /// Note: Currently not used but kept for future max_wsol overflow handling
+    #[allow(dead_code)]
     async fn build_and_send_unwrap_tx(&self) -> Result<Signature> {
         let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
         let ata = spl_associated_token_account::get_associated_token_address_with_program_id(

@@ -616,13 +616,12 @@ impl CrossDexHandler {
             .metadata
             .get("expected_token_output")
             .and_then(|s| s.parse::<u64>().ok())
-            .map(|token_out| {
+            .inspect(|&token_out| {
                 info!(
                     token_out,
                     source = "arb-strategy (Option D)",
                     "Using expected_token_output from intent metadata (reserve-based)"
                 );
-                token_out
             })
             .unwrap_or_else(|| {
                 // Fallback: price-based estimation for DLMM or when reserves unavailable

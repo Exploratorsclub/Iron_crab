@@ -2334,7 +2334,7 @@ impl ExecutionContext {
                 }
                 "wsol_min_wsol_sol" => {
                     if let Some(v) = value.as_f64() {
-                        if v >= 0.0 && v <= 100.0 {
+                        if (0.0..=100.0).contains(&v) {
                             config.wsol_min_wsol_sol = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -2347,7 +2347,7 @@ impl ExecutionContext {
                 }
                 "wsol_target_wsol_sol" => {
                     if let Some(v) = value.as_f64() {
-                        if v >= 0.0 && v <= 100.0 {
+                        if (0.0..=100.0).contains(&v) {
                             config.wsol_target_wsol_sol = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -2360,7 +2360,7 @@ impl ExecutionContext {
                 }
                 "wsol_max_wsol_sol" => {
                     if let Some(v) = value.as_f64() {
-                        if v >= 0.0 && v <= 100.0 {
+                        if (0.0..=100.0).contains(&v) {
                             config.wsol_max_wsol_sol = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -2373,7 +2373,7 @@ impl ExecutionContext {
                 }
                 "wsol_min_native_sol" => {
                     if let Some(v) = value.as_f64() {
-                        if v >= 0.0 && v <= 10.0 {
+                        if (0.0..=10.0).contains(&v) {
                             config.wsol_min_native_sol = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -2440,7 +2440,7 @@ impl ExecutionContext {
                 }
                 "janitor_close_ata_max_per_run" => {
                     if let Some(v) = value.as_u64() {
-                        if v >= 1 && v <= 100 {
+                        if (1..=100).contains(&v) {
                             config.janitor_close_ata_max_per_run = v as usize;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -2475,7 +2475,7 @@ impl ExecutionContext {
                 }
                 "janitor_merge_dust_max_per_run" => {
                     if let Some(v) = value.as_u64() {
-                        if v >= 1 && v <= 100 {
+                        if (1..=100).contains(&v) {
                             config.janitor_merge_dust_max_per_run = v as usize;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -2510,7 +2510,7 @@ impl ExecutionContext {
                 }
                 "janitor_swap_dust_min_value_sol" => {
                     if let Some(v) = value.as_f64() {
-                        if v >= 0.0 && v <= 1.0 {
+                        if (0.0..=1.0).contains(&v) {
                             config.janitor_swap_dust_min_value_sol = v;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -2523,7 +2523,7 @@ impl ExecutionContext {
                 }
                 "janitor_swap_dust_max_slippage_bps" => {
                     if let Some(v) = value.as_u64() {
-                        if v >= 1 && v <= 10000 {
+                        if (1..=10000).contains(&v) {
                             config.janitor_swap_dust_max_slippage_bps = v as u32;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -2536,7 +2536,7 @@ impl ExecutionContext {
                 }
                 "janitor_swap_dust_max_per_run" => {
                     if let Some(v) = value.as_u64() {
-                        if v >= 1 && v <= 100 {
+                        if (1..=100).contains(&v) {
                             config.janitor_swap_dust_max_per_run = v as usize;
                             applied.push(key.clone());
                             info!(key = %key, new_value = %v, "Config updated");
@@ -3454,6 +3454,7 @@ async fn main() -> Result<()> {
         if wsol_config.enabled {
             // Create separate NATS connection for WsolManager
             let nats_url = args.nats_url.clone();
+            let ctx_for_kill_switch = Arc::clone(&ctx);
             let wsol_manager = WsolManager::with_jsonl_writer(
                 wsol_config.clone(),
                 Arc::new(treasury.clone()),
@@ -3461,7 +3462,8 @@ async fn main() -> Result<()> {
                 env!("CARGO_PKG_VERSION"),
                 &run_id,
                 Arc::clone(&wsol_writer),
-            );
+            )
+            .with_kill_switch(move || ctx_for_kill_switch.is_kill_switch_active());
             let shutdown_rx_wsol = shutdown_rx.clone();
 
             tokio::spawn(async move {
