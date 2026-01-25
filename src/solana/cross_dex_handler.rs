@@ -629,12 +629,14 @@ impl CrossDexHandler {
                     let sol_amount = trade_amount as f64 / 1_000_000_000.0;
                     let tokens = sol_amount / buy_price;
                     let raw_tokens = (tokens * 1_000_000.0) as u64;
-                    // 3% safety margin for price-based estimation
-                    let with_safety = (raw_tokens as f64 * 0.97) as u64;
+                    // 15% safety margin for price-based estimation
+                    // DLMM bin concentration can cause significant deviation from price-based estimates
+                    // This ensures sell_amount_in <= actual buy output to prevent "insufficient funds"
+                    let with_safety = (raw_tokens as f64 * 0.85) as u64;
                     info!(
                         raw_tokens,
                         with_safety,
-                        safety_margin_pct = 3,
+                        safety_margin_pct = 15,
                         source = "price-based (fallback)",
                         "Using price-based estimation (no expected_token_output in metadata)"
                     );

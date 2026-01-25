@@ -226,6 +226,13 @@ impl PumpFunAmmDex {
     ///
     /// Ordering matches `MarketEventKind::DexPoolAccounts` (PumpSwap v1) and
     /// `PumpFunAmmDex::build_swap_ix_from_pool_accounts`.
+    ///
+    /// Returns 14 accounts:
+    /// [0] pool_market, [1] global_config, [2] base_mint, [3] quote_mint,
+    /// [4] pool_base_vault, [5] pool_quote_vault, [6] protocol_fee_recipient,
+    /// [7] protocol_fee_recipient_ta, [8] event_authority, [9] coin_creator_vault_ata,
+    /// [10] coin_creator_vault_authority, [11] global_volume_accumulator,
+    /// [12] fee_config, [13] fee_program
     pub async fn pool_accounts_v1_for_base_mint(
         &self,
         base_mint: Pubkey,
@@ -235,23 +242,24 @@ impl PumpFunAmmDex {
             None => return Ok(None),
         };
 
-        // NOTE: reduced from 14 to 12 accounts (removed global_volume_accumulator and fee_program)
-        // fee_program is now derived in build_swap_ix_from_pool_accounts()
+        // CRITICAL: global_volume_accumulator is required for BUY (BuyExactQuoteIn).
+        // The PumpSwap program validates it exists and is initialized.
+        // Without it: "AccountNotInitialized" error (Custom(3012)).
         Ok(Some(vec![
-            pool.pool_market,
-            pool.global_config,
-            pool.base_mint,
-            pool.quote_mint,
-            pool.pool_base_vault,
-            pool.pool_quote_vault,
-            pool.protocol_fee_recipient,
-            pool.protocol_fee_recipient_ta,
-            pool.event_authority,
-            pool.coin_creator_vault_ata,
-            pool.coin_creator_vault_authority,
-            // pool.global_volume_accumulator,  // removed
-            pool.fee_config,
-            // pool.fee_program,  // removed (now derived)
+            pool.pool_market,              // [0]
+            pool.global_config,            // [1]
+            pool.base_mint,                // [2]
+            pool.quote_mint,               // [3]
+            pool.pool_base_vault,          // [4]
+            pool.pool_quote_vault,         // [5]
+            pool.protocol_fee_recipient,   // [6]
+            pool.protocol_fee_recipient_ta, // [7]
+            pool.event_authority,          // [8]
+            pool.coin_creator_vault_ata,   // [9]
+            pool.coin_creator_vault_authority, // [10]
+            pool.global_volume_accumulator, // [11] - REQUIRED for BUY!
+            pool.fee_config,               // [12]
+            pool.fee_program,              // [13]
         ]))
     }
 
@@ -2692,10 +2700,10 @@ impl PumpFunAmmDex {
         user: Pubkey,
         pool_accounts: &[Pubkey],
     ) -> Result<Vec<Instruction>> {
-        // Accept both v1 (14 accounts with volume accumulators) and v2 (12 accounts without)
-        if pool_accounts.len() < 12 {
+        // Require 14 accounts (v1 format with global_volume_accumulator)
+        if pool_accounts.len() < 14 {
             return Err(anyhow!(
-                "pump_amm expected at least 12 pool_accounts, got {}",
+                "pump_amm expected at least 14 pool_accounts (v1 format), got {}",
                 pool_accounts.len()
             ));
         }
@@ -2714,6 +2722,7 @@ impl PumpFunAmmDex {
         let event_authority = pool_accounts[8];
         let coin_creator_vault_ata = pool_accounts[9];
         let coin_creator_vault_authority = pool_accounts[10];
+        let global_volume_accumulator = pool_accounts[11]; // REQUIRED for BUY!
 
         // CRITICAL FIX: Use the global fee_config constant instead of trusting pool_accounts.
         // The fee_config is the SAME for all pools - it's a global account owned by the Fee Program.
@@ -2742,8 +2751,8 @@ impl PumpFunAmmDex {
         let user_base_ta = Self::derive_ata(user, base_mint);
         let user_quote_ta = Self::derive_ata(user, quote_mint);
 
-        // User volume accumulator is a PDA; derive deterministically (but not used in v2 account list).
-        let _user_vol = Self::derive_user_volume_accumulator(program_id, pool_market, user);
+        // User volume accumulator is a PDA; needed for BUY transactions.
+        let user_vol = Self::derive_user_volume_accumulator(program_id, pool_market, user);
 
         let disc = if is_buy {
             anchor_disc("buy_exact_quote_in")
@@ -2752,38 +2761,74 @@ impl PumpFunAmmDex {
         };
         let data = Self::build_ix_data(disc, amount_in, min_out);
 
-        // Account ordering is taken from an observed on-chain Pump.fun AMM swap transaction.
-        let metas = vec![
-            AccountMeta::new(pool_market, false),                     // 0
-            AccountMeta::new(user, true),                             // 1
-            AccountMeta::new_readonly(global_config, false),          // 2
-            AccountMeta::new_readonly(base_mint, false),              // 3
-            AccountMeta::new_readonly(quote_mint, false),             // 4
-            AccountMeta::new(user_base_ta, false),                    // 5
-            AccountMeta::new(user_quote_ta, false),                   // 6
-            AccountMeta::new(pool_base_vault, false),                 // 7
-            AccountMeta::new(pool_quote_vault, false),                // 8
-            AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
-            AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
-            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 11
-            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 12
-            AccountMeta::new_readonly(
-                Pubkey::new_from_array(solana_system_program::id().to_bytes()),
-                false,
-            ), // 13
-            AccountMeta::new_readonly(
-                Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
-                false,
-            ), // 14
-            AccountMeta::new_readonly(event_authority, false), // 15
-            AccountMeta::new_readonly(program_id, false),      // 16
-            AccountMeta::new(coin_creator_vault_ata, false),   // 17
-            AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
-            // NOTE: global_volume_accumulator and user_vol are NOT in actual on-chain swap TXs!
-            // Removed to match observed transaction structure (21 accounts total).
-            AccountMeta::new_readonly(fee_config, false), // 19
-            AccountMeta::new_readonly(fee_program, false), // 20
-        ];
+        // Account ordering differs between BUY (23 accounts) and SELL (21 accounts).
+        // BUY requires global_volume_accumulator and user_volume_accumulator.
+        // See dex_parser.rs for reference account ordering from on-chain transactions.
+        let metas = if is_buy {
+            // BUY: 23 accounts
+            vec![
+                AccountMeta::new(pool_market, false),                     // 0
+                AccountMeta::new(user, true),                             // 1
+                AccountMeta::new_readonly(global_config, false),          // 2
+                AccountMeta::new_readonly(base_mint, false),              // 3
+                AccountMeta::new_readonly(quote_mint, false),             // 4
+                AccountMeta::new(user_base_ta, false),                    // 5
+                AccountMeta::new(user_quote_ta, false),                   // 6
+                AccountMeta::new(pool_base_vault, false),                 // 7
+                AccountMeta::new(pool_quote_vault, false),                // 8
+                AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
+                AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
+                AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 11
+                AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 12
+                AccountMeta::new_readonly(
+                    Pubkey::new_from_array(solana_system_program::id().to_bytes()),
+                    false,
+                ), // 13
+                AccountMeta::new_readonly(
+                    Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
+                    false,
+                ), // 14
+                AccountMeta::new_readonly(event_authority, false), // 15
+                AccountMeta::new(global_volume_accumulator, false), // 16 - REQUIRED for BUY!
+                AccountMeta::new(coin_creator_vault_ata, false),   // 17
+                AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
+                AccountMeta::new(user_vol, false),                 // 19 - user volume accumulator
+                AccountMeta::new_readonly(fee_config, false),      // 20
+                AccountMeta::new_readonly(fee_program, false),     // 21
+                AccountMeta::new_readonly(program_id, false),      // 22
+            ]
+        } else {
+            // SELL: 21 accounts (no volume accumulators)
+            vec![
+                AccountMeta::new(pool_market, false),                     // 0
+                AccountMeta::new(user, true),                             // 1
+                AccountMeta::new_readonly(global_config, false),          // 2
+                AccountMeta::new_readonly(base_mint, false),              // 3
+                AccountMeta::new_readonly(quote_mint, false),             // 4
+                AccountMeta::new(user_base_ta, false),                    // 5
+                AccountMeta::new(user_quote_ta, false),                   // 6
+                AccountMeta::new(pool_base_vault, false),                 // 7
+                AccountMeta::new(pool_quote_vault, false),                // 8
+                AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
+                AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
+                AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 11
+                AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 12
+                AccountMeta::new_readonly(
+                    Pubkey::new_from_array(solana_system_program::id().to_bytes()),
+                    false,
+                ), // 13
+                AccountMeta::new_readonly(
+                    Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
+                    false,
+                ), // 14
+                AccountMeta::new_readonly(event_authority, false), // 15
+                AccountMeta::new_readonly(program_id, false),      // 16
+                AccountMeta::new(coin_creator_vault_ata, false),   // 17
+                AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
+                AccountMeta::new_readonly(fee_config, false),      // 19
+                AccountMeta::new_readonly(fee_program, false),     // 20
+            ]
+        };
 
         Ok(vec![Instruction {
             program_id,
