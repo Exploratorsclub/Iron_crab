@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+### Fixed
+- **Critical: Cross-DEX Price Comparison Bug** - arb-strategy was comparing prices between pools with different quote mints (e.g., TOKEN/SOL vs TOKEN/USDC), causing false arbitrage opportunities with extreme spreads (>100,000 bps)
+  - Added `quote_mint` field to `ParsedDexEvent::Trade` and `MarketEventKind::Trade`
+  - `handle_trade()` now filters trades by `quote_mint == SOL` to ensure only comparable prices are used
+  - All 6 DEX parsers (Raydium AMM, Raydium CPMM, Orca, Meteora DLMM, PumpFun, PumpFun AMM) now include quote_mint in Trade events
+  - Backward compatible: old Trade events without quote_mint default to SOL via `#[serde(default)]`
+
+### Technical Details
+- Root cause: DLMM pools often have USDC as quote (TOKEN/USDC) while PumpFun pools have SOL (TOKEN/SOL). The arb-strategy was comparing these prices as if they were in the same unit.
+- Example: Token X price 0.008 USDC vs 0.00000008 SOL created a false 21,000,000 bps "opportunity"
+- Multi-hop arbitrage is unaffected - it correctly handles cross-quote paths (WSOL → Token → USDC → Token2 → WSOL) via graph-based routing
+
 ## [0.4.0] - 2026-01-23
 ### Added
 - **Multi-Hop Arbitrage Module** (`src/arbitrage/`): N-hop cycle detection for cross-DEX arbitrage

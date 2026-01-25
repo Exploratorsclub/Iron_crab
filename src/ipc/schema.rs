@@ -18,6 +18,14 @@ use std::collections::HashMap;
 /// Current schema version for all IPC types
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Native SOL mint address
+pub const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Default quote mint for backward compatibility (SOL)
+fn default_sol_mint() -> String {
+    NATIVE_SOL_MINT.to_string()
+}
+
 // ============================================================================
 // Common Header (embedded in each record type)
 // ============================================================================
@@ -179,9 +187,13 @@ pub enum MarketEventKind {
     Trade {
         pool_address: String,
         mint: String,
+        /// Quote mint (e.g., SOL or USDC) - critical for cross-DEX price comparison.
+        /// Only trades with matching quote_mint should have prices compared.
+        #[serde(default = "default_sol_mint")]
+        quote_mint: String,
         trader: String,
         is_buy: bool,
-        sol_amount: u64, // lamports
+        sol_amount: u64, // lamports (or quote amount in quote_mint units)
         token_amount: u64,
         token_decimals: u8, // e.g., 6 for USDC, 9 for most pump.fun tokens
         signature: Option<String>,

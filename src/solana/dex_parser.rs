@@ -25,6 +25,12 @@ pub const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 pub const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
+use std::sync::LazyLock;
+
+/// Native SOL mint as Pubkey (for quote_mint in Trade events)
+pub static SOL_MINT_PUBKEY: LazyLock<Pubkey> =
+    LazyLock::new(|| Pubkey::from_str(SOL_MINT).expect("valid SOL mint"));
+
 // ============================================================================
 // Parsed Event Types (intermediate before conversion to MarketEventKind)
 // ============================================================================
@@ -48,6 +54,8 @@ pub enum ParsedDexEvent {
     Trade {
         pool_address: Pubkey,
         mint: Pubkey,
+        /// Quote mint (e.g., SOL or USDC) - critical for cross-DEX price comparison
+        quote_mint: Pubkey,
         trader: Pubkey,
         dex: DexType,
         is_buy: bool,
@@ -357,6 +365,7 @@ fn parse_raydium_swap(
     Some(ParsedDexEvent::Trade {
         pool_address,
         mint: base_mint,
+        quote_mint: *SOL_MINT_PUBKEY,
         trader,
         dex: DexType::RaydiumAmmV4,
         is_buy,
@@ -523,6 +532,7 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
     Some(ParsedDexEvent::Trade {
         pool_address,
         mint: base_mint,
+        quote_mint: *SOL_MINT_PUBKEY,
         trader,
         dex: DexType::OrcaWhirlpool,
         is_buy,
@@ -702,6 +712,7 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
     Some(ParsedDexEvent::Trade {
         pool_address: bonding_curve,
         mint,
+        quote_mint: *SOL_MINT_PUBKEY,
         trader,
         dex: DexType::PumpFun,
         is_buy,
@@ -857,6 +868,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     Some(ParsedDexEvent::Trade {
         pool_address: pool_market,
         mint: base_mint,
+        quote_mint: *SOL_MINT_PUBKEY,
         trader,
         dex: DexType::PumpFunAmm,
         is_buy,
@@ -980,6 +992,7 @@ impl ParsedDexEvent {
             ParsedDexEvent::Trade {
                 pool_address,
                 mint,
+                quote_mint,
                 trader,
                 dex,
                 is_buy,
@@ -991,6 +1004,7 @@ impl ParsedDexEvent {
             } => MarketEventKind::Trade {
                 pool_address: pool_address.to_string(),
                 mint: mint.to_string(),
+                quote_mint: quote_mint.to_string(),
                 trader: trader.to_string(),
                 is_buy: *is_buy,
                 sol_amount: *sol_amount,
@@ -1129,9 +1143,15 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
 
     let token_decimals = get_token_decimals(&update.post_token_balances, &base_mint);
 
+    // DLMM can have non-SOL quotes (e.g., USDC), but for now we assume SOL.
+    // The arb-strategy filters by quote_mint anyway, so non-SOL pairs will be excluded.
+    // TODO: Extract actual quote_mint from pool state or token balances.
+    let quote_mint = *SOL_MINT_PUBKEY;
+
     Some(ParsedDexEvent::Trade {
         pool_address,
         mint: base_mint,
+        quote_mint,
         trader,
         dex: DexType::MeteoraDlmm,
         is_buy,
@@ -1244,9 +1264,14 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
 
     let token_decimals = get_token_decimals(&update.post_token_balances, &base_mint);
 
+    // CPMM can have non-SOL quotes, but for now we assume SOL.
+    // The arb-strategy filters by quote_mint anyway.
+    let quote_mint = *SOL_MINT_PUBKEY;
+
     Some(ParsedDexEvent::Trade {
         pool_address,
         mint: base_mint,
+        quote_mint,
         trader,
         dex: DexType::RaydiumCpmm,
         is_buy,

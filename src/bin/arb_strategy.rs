@@ -1182,17 +1182,34 @@ impl ArbContext {
     }
 
     /// Update price from trade event
+    /// 
+    /// Only processes trades with SOL as quote_mint. Trades with non-SOL quotes
+    /// (e.g., USDC) are skipped to avoid comparing prices in different units.
     #[allow(clippy::too_many_arguments)]
     fn handle_trade(
         &self,
         pool_address: &str,
         mint: &str,
+        quote_mint: &str,
         sol_amount: u64,
         token_amount: u64,
         token_decimals: u8,
         _is_buy: bool,
         dex: &str,
     ) -> Option<ArbOpportunity> {
+        // CRITICAL: Only track SOL-quoted pools for price comparison.
+        // Comparing TOKEN/SOL prices with TOKEN/USDC prices is invalid!
+        if quote_mint != NATIVE_SOL_MINT {
+            debug!(
+                pool = %pool_address,
+                mint = %mint,
+                quote_mint = %quote_mint,
+                dex = %dex,
+                "Trade skipped: non-SOL quote (prices not comparable)"
+            );
+            return None;
+        }
+
         // DATA QUALITY: Reject trades with zero amounts (parser failed to extract token balance)
         if token_amount == 0 || sol_amount == 0 {
             self.zero_amount_trades.fetch_add(1, Ordering::Relaxed);
@@ -2097,6 +2114,7 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
         MarketEventKind::Trade {
             pool_address,
             mint,
+            quote_mint,
             sol_amount,
             token_amount,
             token_decimals,
@@ -2154,6 +2172,7 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             if let Some(opp) = ctx.handle_trade(
                 pool_address,
                 mint,
+                quote_mint,
                 *sol_amount,
                 *token_amount,
                 *token_decimals,
