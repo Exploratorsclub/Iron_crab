@@ -246,20 +246,20 @@ impl PumpFunAmmDex {
         // The PumpSwap program validates it exists and is initialized.
         // Without it: "AccountNotInitialized" error (Custom(3012)).
         Ok(Some(vec![
-            pool.pool_market,              // [0]
-            pool.global_config,            // [1]
-            pool.base_mint,                // [2]
-            pool.quote_mint,               // [3]
-            pool.pool_base_vault,          // [4]
-            pool.pool_quote_vault,         // [5]
-            pool.protocol_fee_recipient,   // [6]
-            pool.protocol_fee_recipient_ta, // [7]
-            pool.event_authority,          // [8]
-            pool.coin_creator_vault_ata,   // [9]
+            pool.pool_market,                  // [0]
+            pool.global_config,                // [1]
+            pool.base_mint,                    // [2]
+            pool.quote_mint,                   // [3]
+            pool.pool_base_vault,              // [4]
+            pool.pool_quote_vault,             // [5]
+            pool.protocol_fee_recipient,       // [6]
+            pool.protocol_fee_recipient_ta,    // [7]
+            pool.event_authority,              // [8]
+            pool.coin_creator_vault_ata,       // [9]
             pool.coin_creator_vault_authority, // [10]
-            pool.global_volume_accumulator, // [11] - REQUIRED for BUY!
-            pool.fee_config,               // [12]
-            pool.fee_program,              // [13]
+            pool.global_volume_accumulator,    // [11] - REQUIRED for BUY!
+            pool.fee_config,                   // [12]
+            pool.fee_program,                  // [13]
         ]))
     }
 
@@ -2778,8 +2778,14 @@ impl PumpFunAmmDex {
                 AccountMeta::new(pool_quote_vault, false),                // 8
                 AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
                 AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
-                AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 11
-                AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 12
+                AccountMeta::new_readonly(
+                    Pubkey::new_from_array(spl_token::id().to_bytes()),
+                    false,
+                ), // 11
+                AccountMeta::new_readonly(
+                    Pubkey::new_from_array(spl_token::id().to_bytes()),
+                    false,
+                ), // 12
                 AccountMeta::new_readonly(
                     Pubkey::new_from_array(solana_system_program::id().to_bytes()),
                     false,
@@ -2788,14 +2794,14 @@ impl PumpFunAmmDex {
                     Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
                     false,
                 ), // 14
-                AccountMeta::new_readonly(event_authority, false), // 15
-                AccountMeta::new(global_volume_accumulator, false), // 16 - REQUIRED for BUY!
-                AccountMeta::new(coin_creator_vault_ata, false),   // 17
+                AccountMeta::new_readonly(event_authority, false),        // 15
+                AccountMeta::new(global_volume_accumulator, false),       // 16 - REQUIRED for BUY!
+                AccountMeta::new(coin_creator_vault_ata, false),          // 17
                 AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
-                AccountMeta::new(user_vol, false),                 // 19 - user volume accumulator
-                AccountMeta::new_readonly(fee_config, false),      // 20
-                AccountMeta::new_readonly(fee_program, false),     // 21
-                AccountMeta::new_readonly(program_id, false),      // 22
+                AccountMeta::new(user_vol, false), // 19 - user volume accumulator
+                AccountMeta::new_readonly(fee_config, false), // 20
+                AccountMeta::new_readonly(fee_program, false), // 21
+                AccountMeta::new_readonly(program_id, false), // 22
             ]
         } else {
             // SELL: 21 accounts (no volume accumulators)
@@ -2811,8 +2817,14 @@ impl PumpFunAmmDex {
                 AccountMeta::new(pool_quote_vault, false),                // 8
                 AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
                 AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
-                AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 11
-                AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 12
+                AccountMeta::new_readonly(
+                    Pubkey::new_from_array(spl_token::id().to_bytes()),
+                    false,
+                ), // 11
+                AccountMeta::new_readonly(
+                    Pubkey::new_from_array(spl_token::id().to_bytes()),
+                    false,
+                ), // 12
                 AccountMeta::new_readonly(
                     Pubkey::new_from_array(solana_system_program::id().to_bytes()),
                     false,
@@ -2821,12 +2833,12 @@ impl PumpFunAmmDex {
                     Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
                     false,
                 ), // 14
-                AccountMeta::new_readonly(event_authority, false), // 15
-                AccountMeta::new_readonly(program_id, false),      // 16
-                AccountMeta::new(coin_creator_vault_ata, false),   // 17
+                AccountMeta::new_readonly(event_authority, false),        // 15
+                AccountMeta::new_readonly(program_id, false),             // 16
+                AccountMeta::new(coin_creator_vault_ata, false),          // 17
                 AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
-                AccountMeta::new_readonly(fee_config, false),      // 19
-                AccountMeta::new_readonly(fee_program, false),     // 20
+                AccountMeta::new_readonly(fee_config, false),             // 19
+                AccountMeta::new_readonly(fee_program, false),            // 20
             ]
         };
 

@@ -161,14 +161,30 @@ pub struct FeePolicyCfg {
     pub min_profit_after_fees_bps: i32,
 }
 
-fn default_compute_units() -> u32 { 200_000 }
-fn default_max_compute_units() -> u32 { 1_400_000 }
-fn default_arb_compute_units() -> u32 { 400_000 }
-fn default_priority_fee() -> u64 { 1_000 }
-fn default_max_priority_fee() -> u64 { 1_000_000 }  // 1 lamport/CU max
-fn default_tier0_priority_fee() -> u64 { 500_000 }  // 0.5 lamports/CU for urgent
-fn default_max_tx_cost() -> u64 { 50_000_000 }
-fn default_min_profit_after_fees() -> i32 { 10 }
+fn default_compute_units() -> u32 {
+    200_000
+}
+fn default_max_compute_units() -> u32 {
+    1_400_000
+}
+fn default_arb_compute_units() -> u32 {
+    400_000
+}
+fn default_priority_fee() -> u64 {
+    1_000
+}
+fn default_max_priority_fee() -> u64 {
+    1_000_000
+} // 1 lamport/CU max
+fn default_tier0_priority_fee() -> u64 {
+    500_000
+} // 0.5 lamports/CU for urgent
+fn default_max_tx_cost() -> u64 {
+    50_000_000
+}
+fn default_min_profit_after_fees() -> i32 {
+    10
+}
 
 impl Default for FeePolicyCfg {
     fn default() -> Self {

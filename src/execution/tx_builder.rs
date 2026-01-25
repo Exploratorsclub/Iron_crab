@@ -571,7 +571,7 @@ pub async fn build_tx_plan(
         };
 
         // Accept both formats:
-        // - 12 accounts: SELL format (no volume accumulators)  
+        // - 12 accounts: SELL format (no volume accumulators)
         // - 14 accounts: BUY format (with global_volume_accumulator + user_volume_accumulator)
         let accounts_len = intent.resources.accounts.len();
         if accounts_len != 12 && accounts_len != 14 {
