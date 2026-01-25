@@ -20,14 +20,14 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::ipc::RecordHeader;
-use crate::storage::JsonlWriter;
 use crate::metrics::{
     JANITOR_ACCOUNTS_SCANNED_TOTAL, JANITOR_CLOSE_ATA_TOTAL, JANITOR_MERGE_DUST_TOTAL,
-    JANITOR_SOL_RECOVERED_LAMPORTS, JANITOR_SWEEP_RUNS_TOTAL, JANITOR_SWAP_DUST_FAILED,
-    JANITOR_SWAP_DUST_SOL_RECOVERED, JANITOR_SWAP_DUST_TOTAL, JANITOR_TOKENS_MERGED_TOTAL,
+    JANITOR_SOL_RECOVERED_LAMPORTS, JANITOR_SWAP_DUST_FAILED, JANITOR_SWAP_DUST_SOL_RECOVERED,
+    JANITOR_SWAP_DUST_TOTAL, JANITOR_SWEEP_RUNS_TOTAL, JANITOR_TOKENS_MERGED_TOTAL,
 };
 use crate::solana::dex::router::Router;
 use crate::solana::rpc::SolanaRpc;
+use crate::storage::JsonlWriter;
 use crate::wallet::Treasury;
 
 // ============================================================================
@@ -595,7 +595,11 @@ impl AccountJanitor {
             // Log action
             let total_balance: u64 = atas.iter().map(|a| a.balance).sum();
             let action = JanitorAction {
-                header: RecordHeader::new("account-janitor", env!("CARGO_PKG_VERSION"), &self.run_id),
+                header: RecordHeader::new(
+                    "account-janitor",
+                    env!("CARGO_PKG_VERSION"),
+                    &self.run_id,
+                ),
                 action: "merge_dust".to_string(),
                 accounts_count: atas.len(),
                 sol_recovered_lamports: 0, // Merge doesn't recover SOL (yet)
@@ -678,9 +682,7 @@ impl AccountJanitor {
         // Filter to only mints with multiple ATAs and at least one with balance > 0
         let duplicates: Vec<_> = by_mint
             .into_iter()
-            .filter(|(_, atas)| {
-                atas.len() > 1 && atas.iter().any(|a| a.balance > 0)
-            })
+            .filter(|(_, atas)| atas.len() > 1 && atas.iter().any(|a| a.balance > 0))
             .collect();
 
         Ok(duplicates)
@@ -697,16 +699,19 @@ impl AccountJanitor {
         }
 
         // Find the canonical ATA (the associated token address)
-        let canonical_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
-            &spl_token::solana_program::pubkey::Pubkey::new_from_array(self.wallet_pubkey.to_bytes()),
-            &spl_token::solana_program::pubkey::Pubkey::new_from_array(mint.to_bytes()),
-            &spl_token::id(),
-        );
+        let canonical_ata =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &spl_token::solana_program::pubkey::Pubkey::new_from_array(
+                    self.wallet_pubkey.to_bytes(),
+                ),
+                &spl_token::solana_program::pubkey::Pubkey::new_from_array(mint.to_bytes()),
+                &spl_token::id(),
+            );
         let canonical_ata_sdk = Pubkey::new_from_array(canonical_ata.to_bytes());
 
         // Check if canonical ATA exists in our list
         let canonical_exists = atas.iter().any(|a| a.address == canonical_ata_sdk);
-        
+
         // If canonical doesn't exist, we need to create it first
         // For now, just use the first ATA with balance as destination
         let dest_ata = if canonical_exists {
@@ -723,9 +728,8 @@ impl AccountJanitor {
         let wallet_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
             self.wallet_pubkey.to_bytes(),
         );
-        let dest_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
-            dest_ata.to_bytes(),
-        );
+        let dest_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(dest_ata.to_bytes());
 
         let mut instructions = Vec::new();
 
@@ -739,9 +743,8 @@ impl AccountJanitor {
                 continue; // Nothing to transfer
             }
 
-            let source_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
-                ata.address.to_bytes(),
-            );
+            let source_spl =
+                spl_token::solana_program::pubkey::Pubkey::new_from_array(ata.address.to_bytes());
 
             // Transfer instruction
             let transfer_ix = spl_token::instruction::transfer(
@@ -816,7 +819,11 @@ impl AccountJanitor {
 
             // Log action
             let action = JanitorAction {
-                header: RecordHeader::new("account-janitor", env!("CARGO_PKG_VERSION"), &self.run_id),
+                header: RecordHeader::new(
+                    "account-janitor",
+                    env!("CARGO_PKG_VERSION"),
+                    &self.run_id,
+                ),
                 action: "swap_dust".to_string(),
                 accounts_count: 1,
                 sol_recovered_lamports: result.as_ref().ok().copied().unwrap_or(0),
@@ -843,7 +850,8 @@ impl AccountJanitor {
                 match &result {
                     Ok(sol_recovered) => {
                         JANITOR_SWAP_DUST_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        JANITOR_SWAP_DUST_SOL_RECOVERED.fetch_add(*sol_recovered, Ordering::Relaxed);
+                        JANITOR_SWAP_DUST_SOL_RECOVERED
+                            .fetch_add(*sol_recovered, Ordering::Relaxed);
 
                         info!(
                             mint = %dust.mint,
@@ -943,11 +951,7 @@ impl AccountJanitor {
     }
 
     /// Swap a single dust token to SOL
-    async fn swap_dust_token(
-        &self,
-        router: &Router,
-        dust: &DustTokenInfo,
-    ) -> Result<u64> {
+    async fn swap_dust_token(&self, router: &Router, dust: &DustTokenInfo) -> Result<u64> {
         if self.config.dry_run {
             return Ok(0);
         }

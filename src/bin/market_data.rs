@@ -185,6 +185,11 @@ struct MarketDataContext {
     /// Updated via Geyser events and propagated to execution-engine via NATS.
     live_pool_cache: Arc<LivePoolCache>,
 
+    /// Creator cache for PumpFun tokens: mint -> creator pubkey.
+    /// Populated from PoolCreated events, used to enrich Trade events.
+    /// This enables momentum-bot to build intents without RPC calls.
+    creator_cache: parking_lot::RwLock<std::collections::HashMap<String, String>>,
+
     /// === WsolManager Support: Wallet Balance Tracking ===
     /// Wallet pubkey to track for balance updates (for WsolManager in execution-engine).
     /// Set via IRONCRAB_WALLET_PUBKEY env var.
@@ -714,6 +719,7 @@ async fn main() -> Result<()> {
         tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_bin_arrays_tx,
         live_pool_cache: Arc::new(LivePoolCache::new()),
+        creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_wallet,
         tracked_wallet_tx,
     });
@@ -773,6 +779,7 @@ async fn main() -> Result<()> {
 }
 
 /// Run with real Geyser connection
+#[allow(clippy::too_many_arguments)]
 async fn run_geyser_loop(
     ctx: Arc<MarketDataContext>,
     run_id: &str,
@@ -954,7 +961,7 @@ async fn run_geyser_loop(
                         if balance_changed {
                             let wallet_str = tracked_wallet.wallet.to_string();
                             let update = WalletBalanceUpdate {
-                                header: RecordHeader::new("market-data", BUILD_VERSION, &run_id),
+                                header: RecordHeader::new("market-data", BUILD_VERSION, run_id),
                                 wallet: wallet_str.clone(),
                                 sol_lamports: new_sol,
                                 wsol_lamports: new_wsol,
@@ -1370,6 +1377,7 @@ async fn run_geyser_loop(
                 // Pump.fun: propagate creator/dev wallet so strategy can build deterministic intents.
                 // The PoolCreated MarketEventKind intentionally does not carry creator today, so emit
                 // a separate DevWalletIdentified event when available.
+                // Also cache the creator for later Trade events.
                 if let Some(ParsedDexEvent::PoolCreated {
                     base_mint,
                     dex: DexType::PumpFun,
@@ -1377,6 +1385,18 @@ async fn run_geyser_loop(
                     ..
                 }) = parsed_event.as_ref()
                 {
+                    // Cache creator for later Trade events (P0: avoid RPC in momentum-bot)
+                    {
+                        let mut cache = ctx.creator_cache.write();
+                        cache.insert(base_mint.to_string(), creator.to_string());
+                        debug!(
+                            mint = %base_mint,
+                            creator = %creator,
+                            cache_size = cache.len(),
+                            "Cached PumpFun creator for Trade enrichment"
+                        );
+                    }
+
                     let dev_event = MarketEvent::new(
                         "market-data",
                         BUILD_VERSION,
@@ -1546,7 +1566,24 @@ async fn run_geyser_loop(
                         sig = %tx_update.signature,
                         "Parsed DEX transaction"
                     );
-                    parsed.to_market_event_kind()
+                    let mut kind = parsed.to_market_event_kind();
+
+                    // Enrich Trade events with creator from cache (P0: PumpFun intent building)
+                    if let MarketEventKind::Trade { ref mint, ref dex, ref mut creator, .. } = kind {
+                        if dex == "pumpfun" || dex == "pump_amm" {
+                            let cache = ctx.creator_cache.read();
+                            if let Some(cached_creator) = cache.get(mint) {
+                                *creator = Some(cached_creator.clone());
+                                debug!(
+                                    mint = %mint,
+                                    dex = %dex,
+                                    creator = %cached_creator,
+                                    "Enriched Trade event with cached creator"
+                                );
+                            }
+                        }
+                    }
+                    kind
                 } else {
                     // Fallback to raw event for unknown transactions
                     MarketEventKind::TransactionDetected {

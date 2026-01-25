@@ -67,6 +67,9 @@ pub enum ParsedDexEvent {
         /// Optional static pool account list for deterministic intent building.
         /// Order is DEX-specific.
         pool_accounts: Option<Vec<Pubkey>>,
+        /// Creator/dev wallet for PumpFun bonding curve tokens.
+        /// Extracted from Fee Recipient account in swap instruction.
+        creator: Option<Pubkey>,
     },
     /// Liquidity removed (potential rug)
     LiquidityRemoved {
@@ -375,6 +378,7 @@ fn parse_raydium_swap(
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: None,
+        creator: None,
     })
 }
 
@@ -542,6 +546,7 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: None,
+        creator: None,
     })
 }
 
@@ -709,6 +714,9 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
 
     let token_decimals = get_token_decimals(&update.post_token_balances, &mint);
 
+    // Extract creator from Fee Recipient account[1] for PumpFun Bonding Curve
+    let creator = update.instruction_accounts.get(1).copied();
+
     Some(ParsedDexEvent::Trade {
         pool_address: bonding_curve,
         mint,
@@ -722,6 +730,7 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: None,
+        creator,
     })
 }
 
@@ -878,6 +887,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: Some(pool_accounts),
+        creator: None, // PumpSwap uses coin_creator_vault_authority from pool_accounts[10]
     })
 }
 
@@ -1000,6 +1010,7 @@ impl ParsedDexEvent {
                 token_amount,
                 token_decimals,
                 signature,
+                creator,
                 ..
             } => MarketEventKind::Trade {
                 pool_address: pool_address.to_string(),
@@ -1012,6 +1023,7 @@ impl ParsedDexEvent {
                 token_decimals: *token_decimals,
                 signature: Some(signature.clone()),
                 dex: dex.to_string(),
+                creator: creator.map(|c| c.to_string()),
             },
             ParsedDexEvent::LiquidityRemoved {
                 pool_address,
@@ -1161,6 +1173,7 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: None,
+        creator: None,
     })
 }
 
@@ -1281,6 +1294,7 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
         signature: update.signature.clone(),
         slot: update.slot,
         pool_accounts: None,
+        creator: None,
     })
 }
 

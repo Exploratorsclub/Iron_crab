@@ -556,7 +556,7 @@ impl WsolManager {
             if available_sol >= wrap_amount {
                 // Set wrap_in_progress BEFORE async operation to prevent race condition
                 self.wrap_in_progress.store(true, Ordering::Relaxed);
-                
+
                 info!(
                     wsol_current = wsol as f64 / LAMPORTS_PER_SOL as f64,
                     wsol_min = min as f64 / LAMPORTS_PER_SOL as f64,
@@ -564,21 +564,21 @@ impl WsolManager {
                     "WSOL below minimum, wrapping"
                 );
                 let result = self.execute_wrap(wrap_amount).await;
-                
+
                 // Clear wrap_in_progress after operation completes
                 self.wrap_in_progress.store(false, Ordering::Relaxed);
                 result?;
             } else if available_sol > 0 {
                 // Set wrap_in_progress BEFORE async operation
                 self.wrap_in_progress.store(true, Ordering::Relaxed);
-                
+
                 // Wrap what we can
                 info!(
                     available = available_sol as f64 / LAMPORTS_PER_SOL as f64,
                     "Wrapping available SOL (less than ideal)"
                 );
                 let result = self.execute_wrap(available_sol).await;
-                
+
                 // Clear wrap_in_progress after operation completes
                 self.wrap_in_progress.store(false, Ordering::Relaxed);
                 result?;

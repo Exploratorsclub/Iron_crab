@@ -5288,7 +5288,8 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             token_amount,
             signature,
             dex: event_dex,
-            ..  // Ignore token_decimals, we don't need it for momentum detection
+            creator: trade_creator, // Creator from market-data cache (PumpFun)
+            ..  // Ignore token_decimals, quote_mint - we don't need them for momentum detection
         } => {
             // P1: Trade-based Token Discovery
             // If we missed the PoolCreated event (Geyser filter issues), discover via first trade
@@ -5355,6 +5356,23 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             };
 
             ctx.record_trade(mint, trader, *is_buy, sol_lamports, token_raw, &sig);
+
+            // P1: If Trade event carries creator (from market-data cache), set it on tracker.
+            // This enables intent building without waiting for separate DevWalletIdentified event.
+            if let Some(ref creator) = trade_creator {
+                let config = ctx.config.read().clone();
+                let mut trackers = ctx.token_trackers.write();
+                if let Some(tracker) = trackers.get_mut(mint) {
+                    if tracker.dev_wallet.is_none() {
+                        tracker.set_dev_info(creator, 0.0, &config);
+                        debug!(
+                            mint = %mint,
+                            creator = %creator,
+                            "Set dev_wallet from Trade event (creator_cache)"
+                        );
+                    }
+                }
+            }
 
             // Update open position price estimate (tokens per SOL) based on trade ratio.
             if sol_lamports > 0 && token_raw > 0 {

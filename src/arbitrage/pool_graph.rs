@@ -138,11 +138,7 @@ impl PoolGraph {
 
     /// Count unique neighbors for a token (degree)
     pub fn degree(&self, mint: &Pubkey) -> usize {
-        self.adj
-            .read()
-            .get(mint)
-            .map(|n| n.len())
-            .unwrap_or(0)
+        self.adj.read().get(mint).map(|n| n.len()).unwrap_or(0)
     }
 
     /// Clear all data
@@ -186,7 +182,10 @@ impl PoolGraph {
         let pools = neighbors.entry(to).or_default();
 
         // Check if pool already exists in this direction
-        if let Some(idx) = pools.iter().position(|p| p.pool_address == edge.pool_address) {
+        if let Some(idx) = pools
+            .iter()
+            .position(|p| p.pool_address == edge.pool_address)
+        {
             // Update existing
             pools[idx] = edge;
         } else {
@@ -356,7 +355,12 @@ mod tests {
         graph.upsert_pool(make_edge(0x10, 0x01, 0x02, 1000.0));
         graph.upsert_pool(make_edge(0x11, 0x01, 0x02, 2000.0));
 
-        assert_eq!(graph.pools_between(&test_pubkey(0x01), &test_pubkey(0x02)).len(), 2);
+        assert_eq!(
+            graph
+                .pools_between(&test_pubkey(0x01), &test_pubkey(0x02))
+                .len(),
+            2
+        );
 
         graph.remove_pool(&test_pubkey(0x10));
 

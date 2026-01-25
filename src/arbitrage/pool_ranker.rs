@@ -163,8 +163,10 @@ impl<Q: QuoteProvider> PoolRanker<Q> {
 
         // Dampened liquidity score (clamped, NOT sqrt!)
         // From external review: clamp(liquidity/baseline, 0.3, 1.5)
-        let liquidity_score = (edge.liquidity_usd / self.config.liquidity_baseline_usd)
-            .clamp(self.config.min_liquidity_score, self.config.max_liquidity_score);
+        let liquidity_score = (edge.liquidity_usd / self.config.liquidity_baseline_usd).clamp(
+            self.config.min_liquidity_score,
+            self.config.max_liquidity_score,
+        );
 
         Some(RankedPool {
             edge: edge.clone(),
@@ -321,8 +323,20 @@ mod tests {
         let pool_high_liq = test_pubkey(0x11);
 
         let mut mock = MockQuoteProvider::new();
-        mock.add_quote(pool_low_liq, wsol, test_pubkey(0x02), DEFAULT_PROBE_LAMPORTS, 9_800_000);
-        mock.add_quote(pool_high_liq, wsol, test_pubkey(0x03), DEFAULT_PROBE_LAMPORTS, 9_800_000);
+        mock.add_quote(
+            pool_low_liq,
+            wsol,
+            test_pubkey(0x02),
+            DEFAULT_PROBE_LAMPORTS,
+            9_800_000,
+        );
+        mock.add_quote(
+            pool_high_liq,
+            wsol,
+            test_pubkey(0x03),
+            DEFAULT_PROBE_LAMPORTS,
+            9_800_000,
+        );
 
         let ranker = PoolRanker::new(mock);
         let graph = PoolGraph::new();
@@ -335,10 +349,12 @@ mod tests {
         let ranked = ranker.rank_pools_from(&graph, &wsol);
 
         // Find the pools
-        let low_liq_pool = ranked.iter()
+        let low_liq_pool = ranked
+            .iter()
             .find(|(m, _)| *m == test_pubkey(0x02))
             .map(|(_, p)| &p[0]);
-        let high_liq_pool = ranked.iter()
+        let high_liq_pool = ranked
+            .iter()
             .find(|(m, _)| *m == test_pubkey(0x03))
             .map(|(_, p)| &p[0]);
 
@@ -349,10 +365,14 @@ mod tests {
         let low_score = low_liq_pool.unwrap().liquidity_score;
         let high_score = high_liq_pool.unwrap().liquidity_score;
 
-        assert!((low_score - MIN_LIQUIDITY_SCORE).abs() < 0.01,
-            "Low liq score should be clamped to {MIN_LIQUIDITY_SCORE}, got {low_score}");
-        assert!((high_score - MAX_LIQUIDITY_SCORE).abs() < 0.01,
-            "High liq score should be clamped to {MAX_LIQUIDITY_SCORE}, got {high_score}");
+        assert!(
+            (low_score - MIN_LIQUIDITY_SCORE).abs() < 0.01,
+            "Low liq score should be clamped to {MIN_LIQUIDITY_SCORE}, got {low_score}"
+        );
+        assert!(
+            (high_score - MAX_LIQUIDITY_SCORE).abs() < 0.01,
+            "High liq score should be clamped to {MAX_LIQUIDITY_SCORE}, got {high_score}"
+        );
     }
 
     #[test]
@@ -374,12 +394,18 @@ mod tests {
 
         // Check max edge ratio was cached
         let max_ratio = ranker.max_edge_ratio_for(&wsol);
-        assert!((max_ratio - 1.02).abs() < 0.001, "Expected ~1.02, got {max_ratio}");
+        assert!(
+            (max_ratio - 1.02).abs() < 0.001,
+            "Expected ~1.02, got {max_ratio}"
+        );
 
         // Upper bound with 3 remaining hops
         let upper = ranker.compute_upper_bound(1.0, &wsol, 3);
         let expected = 1.02_f64.powi(3); // ~1.0612
-        assert!((upper - expected).abs() < 0.001, "Expected ~{expected}, got {upper}");
+        assert!(
+            (upper - expected).abs() < 0.001,
+            "Expected ~{expected}, got {upper}"
+        );
     }
 
     #[test]

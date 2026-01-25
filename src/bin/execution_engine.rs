@@ -3032,16 +3032,28 @@ async fn main() -> Result<()> {
         wsol_dry_run: wsol_cfg.map(|c| c.dry_run).unwrap_or(false) || args.dry_run,
         // Account Janitor config (for hot-reload tracking)
         janitor_enabled: janitor_cfg.map(|c| c.enabled).unwrap_or(false),
-        janitor_close_ata_interval_secs: janitor_cfg.map(|c| c.close_ata_interval_secs).unwrap_or(3600),
-        janitor_close_ata_min_age_secs: janitor_cfg.map(|c| c.close_ata_min_age_secs).unwrap_or(86400),
+        janitor_close_ata_interval_secs: janitor_cfg
+            .map(|c| c.close_ata_interval_secs)
+            .unwrap_or(3600),
+        janitor_close_ata_min_age_secs: janitor_cfg
+            .map(|c| c.close_ata_min_age_secs)
+            .unwrap_or(86400),
         janitor_close_ata_max_per_run: janitor_cfg.map(|c| c.close_ata_max_per_run).unwrap_or(10),
         janitor_merge_dust_enabled: janitor_cfg.map(|c| c.merge_dust_enabled).unwrap_or(false),
-        janitor_merge_dust_interval_secs: janitor_cfg.map(|c| c.merge_dust_interval_secs).unwrap_or(300),
+        janitor_merge_dust_interval_secs: janitor_cfg
+            .map(|c| c.merge_dust_interval_secs)
+            .unwrap_or(300),
         janitor_merge_dust_max_per_run: janitor_cfg.map(|c| c.merge_dust_max_per_run).unwrap_or(5),
         janitor_swap_dust_enabled: janitor_cfg.map(|c| c.swap_dust_enabled).unwrap_or(false),
-        janitor_swap_dust_interval_secs: janitor_cfg.map(|c| c.swap_dust_interval_secs).unwrap_or(86400),
-        janitor_swap_dust_min_value_sol: janitor_cfg.map(|c| c.swap_dust_min_value_sol).unwrap_or(0.001),
-        janitor_swap_dust_max_slippage_bps: janitor_cfg.map(|c| c.swap_dust_max_slippage_bps).unwrap_or(500),
+        janitor_swap_dust_interval_secs: janitor_cfg
+            .map(|c| c.swap_dust_interval_secs)
+            .unwrap_or(86400),
+        janitor_swap_dust_min_value_sol: janitor_cfg
+            .map(|c| c.swap_dust_min_value_sol)
+            .unwrap_or(0.001),
+        janitor_swap_dust_max_slippage_bps: janitor_cfg
+            .map(|c| c.swap_dust_max_slippage_bps)
+            .unwrap_or(500),
         janitor_swap_dust_max_per_run: janitor_cfg.map(|c| c.swap_dust_max_per_run).unwrap_or(5),
         janitor_dry_run: janitor_cfg.map(|c| c.dry_run).unwrap_or(false) || args.dry_run,
         ..Default::default()
@@ -3541,8 +3553,13 @@ async fn main() -> Result<()> {
             });
 
             let janitor = if let Some(router) = janitor_router {
-                info!("AccountJanitor: Router available with {} DEXes for swap_dust", 
-                      ctx.cross_dex_handler.as_ref().map(|h| h.get_all_dexes().len()).unwrap_or(0));
+                info!(
+                    "AccountJanitor: Router available with {} DEXes for swap_dust",
+                    ctx.cross_dex_handler
+                        .as_ref()
+                        .map(|h| h.get_all_dexes().len())
+                        .unwrap_or(0)
+                );
                 AccountJanitor::with_router_and_jsonl(
                     janitor_config.clone(),
                     Arc::new(treasury.clone()),

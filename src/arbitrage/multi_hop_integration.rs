@@ -63,7 +63,7 @@ pub struct MultiHopConfig {
 impl Default for MultiHopConfig {
     fn default() -> Self {
         Self {
-            enabled: true,        // Enabled for shadow mode testing
+            enabled: true, // Enabled for shadow mode testing
             max_hops: 4,
             beam_width: 50,
             min_profit_bps: 30,
@@ -71,7 +71,7 @@ impl Default for MultiHopConfig {
             pool_alternatives: 3,
             min_liquidity_usd: 1000.0,
             input_amount_lamports: 100_000_000, // 0.1 SOL
-            shadow_mode: true,    // Shadow mode by default - logs but doesn't trade
+            shadow_mode: true,                  // Shadow mode by default - logs but doesn't trade
             min_price_change_bps: 10,
             token_cooldown_ms: 100,
         }
@@ -121,17 +121,25 @@ impl CachedQuoteProvider {
         };
 
         let mut cache = self.cache.write();
-        cache.insert((pool, input_mint, output_mint), (normalized_output, Instant::now()));
+        cache.insert(
+            (pool, input_mint, output_mint),
+            (normalized_output, Instant::now()),
+        );
     }
 
     /// Get cached edge ratio for a pool direction
     /// Returns: Option<(normalized_output, age_ms)>
     #[allow(dead_code)]
-    pub fn get_cached_ratio(&self, pool: &Pubkey, input: &Pubkey, output: &Pubkey) -> Option<(u64, u64)> {
+    pub fn get_cached_ratio(
+        &self,
+        pool: &Pubkey,
+        input: &Pubkey,
+        output: &Pubkey,
+    ) -> Option<(u64, u64)> {
         let cache = self.cache.read();
-        cache.get(&(*pool, *input, *output)).map(|(out, ts)| {
-            (*out, ts.elapsed().as_millis() as u64)
-        })
+        cache
+            .get(&(*pool, *input, *output))
+            .map(|(out, ts)| (*out, ts.elapsed().as_millis() as u64))
     }
 
     /// Clear stale entries
@@ -153,7 +161,7 @@ impl QuoteProvider for CachedQuoteProvider {
         amount_in: u64,
     ) -> Option<u64> {
         let cache = self.cache.read();
-        
+
         if let Some((cached_output, ts)) = cache.get(&(*pool_address, *input_mint, *output_mint)) {
             if ts.elapsed() < self.cache_ttl {
                 let probe = 10_000_000u64;
@@ -219,7 +227,7 @@ impl MultiHopArbitrage {
         fee_bps: u16,
     ) {
         let config = self.config.read();
-        
+
         if liquidity_usd < config.min_liquidity_usd {
             return;
         }
@@ -243,7 +251,7 @@ impl MultiHopArbitrage {
 
         let edge = PoolEdge::new(pool, dex_type, mint_a_pk, mint_b_pk, liquidity_usd, fee_bps);
         self.graph.upsert_pool(edge);
-        
+
         // Track pool -> mints mapping
         self.pool_mints.write().insert(pool, (mint_a_pk, mint_b_pk));
     }
@@ -273,7 +281,7 @@ impl MultiHopArbitrage {
         run_id: &str,
     ) -> Vec<TradeIntent> {
         let config = self.config.read().clone();
-        
+
         if !config.enabled {
             return vec![];
         }
@@ -293,7 +301,8 @@ impl MultiHopArbitrage {
         };
 
         // Update quote cache
-        self.quote_provider.update_quote(pool, input, output, input_amount, output_amount);
+        self.quote_provider
+            .update_quote(pool, input, output, input_amount, output_amount);
 
         // Check if this is a significant price change
         let normalized_price = if input_amount > 0 {
@@ -309,11 +318,8 @@ impl MultiHopArbitrage {
         };
 
         // Check cooldown and price change for both tokens
-        let tokens_to_search = self.filter_tokens_for_search(
-            &[mint_a, mint_b],
-            normalized_price,
-            &config,
-        );
+        let tokens_to_search =
+            self.filter_tokens_for_search(&[mint_a, mint_b], normalized_price, &config);
 
         if tokens_to_search.is_empty() {
             return vec![];
@@ -345,7 +351,8 @@ impl MultiHopArbitrage {
 
             // Check cooldown
             if now.duration_since(entry.last_search) < cooldown {
-                self.searches_skipped_cooldown.fetch_add(1, Ordering::Relaxed);
+                self.searches_skipped_cooldown
+                    .fetch_add(1, Ordering::Relaxed);
                 trace!(token = %token, "Skipping search: cooldown");
                 continue;
             }
@@ -353,13 +360,15 @@ impl MultiHopArbitrage {
             // Check price change threshold
             if let Some(last_ratio) = entry.last_price_ratio {
                 let change_bps = if last_ratio > 0 {
-                    ((new_price_ratio as i64 - last_ratio as i64).abs() * 10_000 / last_ratio as i64) as u32
+                    ((new_price_ratio as i64 - last_ratio as i64).abs() * 10_000
+                        / last_ratio as i64) as u32
                 } else {
                     u32::MAX
                 };
 
                 if change_bps < config.min_price_change_bps {
-                    self.searches_skipped_small_change.fetch_add(1, Ordering::Relaxed);
+                    self.searches_skipped_small_change
+                        .fetch_add(1, Ordering::Relaxed);
                     trace!(token = %token, change_bps, "Skipping search: small price change");
                     continue;
                 }
@@ -391,8 +400,10 @@ impl MultiHopArbitrage {
 
         // Only search if one of the affected tokens connects to WSOL
         // or if WSOL itself is affected
-        let wsol_connected = tokens.contains(&wsol) || 
-            tokens.iter().any(|t| !self.graph.pools_between(t, &wsol).is_empty());
+        let wsol_connected = tokens.contains(&wsol)
+            || tokens
+                .iter()
+                .any(|t| !self.graph.pools_between(t, &wsol).is_empty());
 
         if !wsol_connected {
             trace!("Skipping search: affected tokens not connected to WSOL");
@@ -419,7 +430,8 @@ impl MultiHopArbitrage {
 
         // Find cycles (searches from WSOL through the graph)
         let cycles = finder.find_cycles(&self.graph);
-        self.cycles_found.fetch_add(cycles.len() as u64, Ordering::Relaxed);
+        self.cycles_found
+            .fetch_add(cycles.len() as u64, Ordering::Relaxed);
 
         // Filter profitable
         let profitable: Vec<_> = cycles
@@ -427,7 +439,8 @@ impl MultiHopArbitrage {
             .filter(|c| c.estimated_return_bps >= config.min_profit_bps)
             .collect();
 
-        self.cycles_profitable.fetch_add(profitable.len() as u64, Ordering::Relaxed);
+        self.cycles_profitable
+            .fetch_add(profitable.len() as u64, Ordering::Relaxed);
 
         if profitable.is_empty() {
             return vec![];
@@ -435,7 +448,10 @@ impl MultiHopArbitrage {
 
         debug!(
             found = profitable.len(),
-            best_bps = profitable.first().map(|c| c.estimated_return_bps).unwrap_or(0),
+            best_bps = profitable
+                .first()
+                .map(|c| c.estimated_return_bps)
+                .unwrap_or(0),
             affected_tokens = tokens.len(),
             "Multi-hop cycles found"
         );
@@ -461,7 +477,8 @@ impl MultiHopArbitrage {
             .filter_map(|cycle| self.cycle_to_intent(cycle, config, component, build, run_id))
             .collect();
 
-        self.intents_generated.fetch_add(intents.len() as u64, Ordering::Relaxed);
+        self.intents_generated
+            .fetch_add(intents.len() as u64, Ordering::Relaxed);
         intents
     }
 
@@ -481,7 +498,7 @@ impl MultiHopArbitrage {
 
         // Build swap path
         let mut swap_path = Vec::with_capacity(cycle.hop_count());
-        
+
         for (i, pool_options) in cycle.pools.iter().enumerate() {
             if pool_options.is_empty() {
                 warn!(hop = i, "Cycle has empty pool options for hop");
@@ -544,7 +561,10 @@ impl MultiHopArbitrage {
                 let mut m = std::collections::HashMap::new();
                 m.insert("multi_hop".to_string(), "true".to_string());
                 m.insert("hop_count".to_string(), cycle.hop_count().to_string());
-                m.insert("min_liquidity_usd".to_string(), format!("{:.0}", cycle.min_liquidity_usd));
+                m.insert(
+                    "min_liquidity_usd".to_string(),
+                    format!("{:.0}", cycle.min_liquidity_usd),
+                );
                 m
             },
             execution: None,
@@ -566,7 +586,9 @@ impl MultiHopArbitrage {
             graph_pools: self.graph.stats().total_pools,
             searches_triggered: self.searches_triggered.load(Ordering::Relaxed),
             searches_skipped_cooldown: self.searches_skipped_cooldown.load(Ordering::Relaxed),
-            searches_skipped_small_change: self.searches_skipped_small_change.load(Ordering::Relaxed),
+            searches_skipped_small_change: self
+                .searches_skipped_small_change
+                .load(Ordering::Relaxed),
             cycles_found: self.cycles_found.load(Ordering::Relaxed),
             cycles_profitable: self.cycles_profitable.load(Ordering::Relaxed),
             intents_generated: self.intents_generated.load(Ordering::Relaxed),
@@ -650,7 +672,7 @@ mod tests {
     #[test]
     fn test_cached_quote_provider() {
         let provider = CachedQuoteProvider::new(Duration::from_secs(30));
-        
+
         let pool = Pubkey::new_unique();
         let input = Pubkey::new_unique();
         let output = Pubkey::new_unique();
@@ -659,7 +681,7 @@ mod tests {
 
         let result = provider.get_quote(&pool, DexType::RaydiumAmmV4, &input, &output, 10_000_000);
         assert!(result.is_some());
-        
+
         let out = result.unwrap();
         assert!(out > 9_700_000 && out < 9_900_000, "Got {out}");
     }

@@ -199,6 +199,10 @@ pub enum MarketEventKind {
         signature: Option<String>,
         /// DEX name (raydium, orca, meteora_dlmm, pumpfun, pump_amm)
         dex: String,
+        /// Creator/dev wallet for PumpFun tokens (needed for intent building).
+        /// Populated from creator_cache when available.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        creator: Option<String>,
     },
     /// Swap observed on-chain (legacy format)
     SwapObserved {
@@ -1123,7 +1127,10 @@ impl TradeIntent {
 
     /// Check if this is a multi-hop intent
     pub fn is_multi_hop(&self) -> bool {
-        self.swap_path.as_ref().map(|p| p.len() > 1).unwrap_or(false)
+        self.swap_path
+            .as_ref()
+            .map(|p| p.len() > 1)
+            .unwrap_or(false)
     }
 
     /// Get hop count (1 for legacy, N for multi-hop)
@@ -1151,7 +1158,10 @@ impl TradeIntent {
             if path[i].output_mint != path[i + 1].input_mint {
                 return Err(format!(
                     "hop {} output ({}) != hop {} input ({})",
-                    i, path[i].output_mint, i + 1, path[i + 1].input_mint
+                    i,
+                    path[i].output_mint,
+                    i + 1,
+                    path[i + 1].input_mint
                 ));
             }
         }

@@ -197,8 +197,8 @@ impl TpuSubmitter {
         };
 
         // Create QUIC connection manager (Solana 3.0 API)
-        let quic_config = QuicConfig::new()
-            .map_err(|e| TpuError::ReconnectFailed(format!("{:?}", e)))?;
+        let quic_config =
+            QuicConfig::new().map_err(|e| TpuError::ReconnectFailed(format!("{:?}", e)))?;
         let connection_manager = QuicConnectionManager::new_with_connection_config(quic_config);
         let connection_cache = ConnectionCache::<QuicPool, QuicConnectionManager, QuicConfig>::new(
             "ironcrab-tpu",

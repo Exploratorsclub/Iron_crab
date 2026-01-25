@@ -172,10 +172,7 @@ impl<Q: QuoteProvider> BeamCycleFinder<Q> {
         }
 
         // Sort results by estimated return (descending)
-        results.sort_by(|a, b| {
-            b.estimated_return_bps
-                .cmp(&a.estimated_return_bps)
-        });
+        results.sort_by(|a, b| b.estimated_return_bps.cmp(&a.estimated_return_bps));
 
         results
     }
@@ -394,16 +391,51 @@ mod tests {
         let pool2 = test_pubkey(0x11);
         let pool3 = test_pubkey(0x12);
 
-        graph.upsert_pool(PoolEdge::new(pool1, DexType::RaydiumAmmV4, wsol, usdc, 1_000_000.0, 30));
-        graph.upsert_pool(PoolEdge::new(pool2, DexType::Orca, wsol, usdc, 800_000.0, 25));
-        graph.upsert_pool(PoolEdge::new(pool3, DexType::MeteoraDlmm, wsol, usdc, 600_000.0, 20));
+        graph.upsert_pool(PoolEdge::new(
+            pool1,
+            DexType::RaydiumAmmV4,
+            wsol,
+            usdc,
+            1_000_000.0,
+            30,
+        ));
+        graph.upsert_pool(PoolEdge::new(
+            pool2,
+            DexType::Orca,
+            wsol,
+            usdc,
+            800_000.0,
+            25,
+        ));
+        graph.upsert_pool(PoolEdge::new(
+            pool3,
+            DexType::MeteoraDlmm,
+            wsol,
+            usdc,
+            600_000.0,
+            20,
+        ));
 
         // Single pool for other legs
         let pool_usdc_a = test_pubkey(0x20);
         let pool_a_wsol = test_pubkey(0x21);
 
-        graph.upsert_pool(PoolEdge::new(pool_usdc_a, DexType::RaydiumAmmV4, usdc, token_a, 500_000.0, 30));
-        graph.upsert_pool(PoolEdge::new(pool_a_wsol, DexType::RaydiumAmmV4, token_a, wsol, 400_000.0, 30));
+        graph.upsert_pool(PoolEdge::new(
+            pool_usdc_a,
+            DexType::RaydiumAmmV4,
+            usdc,
+            token_a,
+            500_000.0,
+            30,
+        ));
+        graph.upsert_pool(PoolEdge::new(
+            pool_a_wsol,
+            DexType::RaydiumAmmV4,
+            token_a,
+            wsol,
+            400_000.0,
+            30,
+        ));
 
         let probe = 10_000_000u64;
         for pool in [pool1, pool2, pool3] {

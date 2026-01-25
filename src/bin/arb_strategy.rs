@@ -846,6 +846,7 @@ impl ArbContext {
 
     /// Handle PoolStateUpdate event - cache vault balances from Geyser
     /// This eliminates RPC calls to fetch vault balances during quoting.
+    #[allow(clippy::too_many_arguments)]
     fn handle_pool_state_update(
         &self,
         pool_address: &str,
@@ -956,9 +957,9 @@ impl ArbContext {
             "raydium" | "raydium_cpmm" | "meteora_cpmm" => {
                 // Fee rates by DEX (in basis points)
                 let fee_bps: u64 = match buy_dex {
-                    "raydium" => 25,        // 0.25%
-                    "raydium_cpmm" => 25,   // 0.25%
-                    "meteora_cpmm" => 25,   // 0.25%
+                    "raydium" => 25,      // 0.25%
+                    "raydium_cpmm" => 25, // 0.25%
+                    "meteora_cpmm" => 25, // 0.25%
                     _ => 25,
                 };
 
@@ -1065,7 +1066,9 @@ impl ArbContext {
         let active_array = bin_arrays.get(&active_array_index)?;
 
         // Find the active bin within the array
-        let active_bin = active_array.iter().find(|b| b.offset as usize == active_bin_offset);
+        let active_bin = active_array
+            .iter()
+            .find(|b| b.offset as usize == active_bin_offset);
 
         // If active bin not found in cache, we can't calculate accurately
         if active_bin.is_none() {
@@ -1097,7 +1100,10 @@ impl ArbContext {
         all_bins.sort_by_key(|(id, _)| *id);
 
         // Filter to only bins >= active_id (collect first, then iterate)
-        let relevant_bins: Vec<_> = all_bins.into_iter().filter(|(id, _)| *id >= active_id).collect();
+        let relevant_bins: Vec<_> = all_bins
+            .into_iter()
+            .filter(|(id, _)| *id >= active_id)
+            .collect();
 
         // Traverse bins starting from active_id
         for (bin_id, bin) in relevant_bins {
@@ -1122,7 +1128,9 @@ impl ArbContext {
             let tokens_received = if sol_in_bin > 0 {
                 // Use actual ratio in this bin
                 let sol_to_use = remaining_sol.min(sol_in_bin);
-                let tokens = sol_to_use.checked_mul(tokens_in_bin)?.checked_div(sol_in_bin)?;
+                let tokens = sol_to_use
+                    .checked_mul(tokens_in_bin)?
+                    .checked_div(sol_in_bin)?;
                 remaining_sol = remaining_sol.saturating_sub(sol_to_use);
                 tokens
             } else {
@@ -1151,7 +1159,9 @@ impl ArbContext {
         // Base fee ≈ 0.1% + bin_step * 0.01%
         let fee_bps = 10u128 + (bin_step as u128).min(100);
         let fee_multiplier = 10000u128 - fee_bps;
-        let tokens_after_fee = total_tokens_out.checked_mul(fee_multiplier)?.checked_div(10000)?;
+        let tokens_after_fee = total_tokens_out
+            .checked_mul(fee_multiplier)?
+            .checked_div(10000)?;
 
         let result = tokens_after_fee as u64;
 
@@ -1182,7 +1192,7 @@ impl ArbContext {
     }
 
     /// Update price from trade event
-    /// 
+    ///
     /// Only processes trades with SOL as quote_mint. Trades with non-SOL quotes
     /// (e.g., USDC) are skipped to avoid comparing prices in different units.
     #[allow(clippy::too_many_arguments)]
@@ -1544,10 +1554,9 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     // If calculated from reserves, this is the exact value the sell leg should use.
     // If None (DLMM or missing reserves), execution-engine falls back to price-based.
     if let Some(token_out) = expected_token_output {
-        intent.metadata.insert(
-            "expected_token_output".to_string(),
-            token_out.to_string(),
-        );
+        intent
+            .metadata
+            .insert("expected_token_output".to_string(), token_out.to_string());
     }
 
     // Decision record: why this opportunity was chosen
@@ -1645,9 +1654,10 @@ async fn bootstrap_known_pools_from_jetstream(
                     let mut pools = known_pools.write();
                     pools.insert(pool_update.pool_address.clone());
                     pools_recovered += 1;
-                    
+
                     // Multi-hop: Add pool to graph for N-hop arbitrage detection
-                    let liquidity_usd = pool_update.liquidity_lamports
+                    let liquidity_usd = pool_update
+                        .liquidity_lamports
                         .map(|l| l as f64 / 1e9 * 150.0)
                         .unwrap_or(10_000.0);
                     multi_hop.upsert_pool(
@@ -1658,7 +1668,7 @@ async fn bootstrap_known_pools_from_jetstream(
                         liquidity_usd,
                         30, // Default 0.3% fee
                     );
-                    
+
                     debug!(
                         pool = %pool_update.pool_address,
                         dex = %pool_update.dex,
@@ -1785,7 +1795,9 @@ async fn main() -> Result<()> {
     // Bootstrap known_pools from JetStream (state recovery after restart)
     // Also populates multi-hop graph with recovered pools
     if let Some(ref nats_client) = ctx.nats {
-        match bootstrap_known_pools_from_jetstream(nats_client, &ctx.known_pools, &ctx.multi_hop).await {
+        match bootstrap_known_pools_from_jetstream(nats_client, &ctx.known_pools, &ctx.multi_hop)
+            .await
+        {
             Ok(pools_recovered) => {
                 let mh_stats = ctx.multi_hop.stats();
                 info!(
@@ -1875,7 +1887,7 @@ async fn main() -> Result<()> {
 
     let mut market_sub = market_subscription;
     let mut cfg_sub = config_subscription;
-    let mut pool_cache_consumer_opt = pool_cache_consumer;
+    let pool_cache_consumer_opt = pool_cache_consumer;
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(60));
 
     loop {

@@ -169,10 +169,7 @@ impl ArbCycle {
 
     /// Get primary pools (best option for each hop)
     pub fn primary_pools(&self) -> Vec<&PoolEdge> {
-        self.pools
-            .iter()
-            .filter_map(|alts| alts.first())
-            .collect()
+        self.pools.iter().filter_map(|alts| alts.first()).collect()
     }
 
     /// Check if cycle is valid (starts and ends at same token)
@@ -346,7 +343,14 @@ mod tests {
         assert!(start.has_visited(&wsol));
         assert!(!start.has_visited(&token_a));
 
-        let edge = PoolEdge::new(test_pubkey(0x42), DexType::RaydiumAmmV4, wsol, token_a, 5000.0, 30);
+        let edge = PoolEdge::new(
+            test_pubkey(0x42),
+            DexType::RaydiumAmmV4,
+            wsol,
+            token_a,
+            5000.0,
+            30,
+        );
 
         let expanded = start.expand(token_a, vec![edge], 1.02, 1.0, 5000.0);
 
@@ -372,10 +376,19 @@ mod tests {
 
     #[test]
     fn test_dex_type_parsing() {
-        assert_eq!("raydium".parse::<DexType>().ok(), Some(DexType::RaydiumAmmV4));
-        assert_eq!("RAYDIUM_CPMM".parse::<DexType>().ok(), Some(DexType::RaydiumCpmm));
+        assert_eq!(
+            "raydium".parse::<DexType>().ok(),
+            Some(DexType::RaydiumAmmV4)
+        );
+        assert_eq!(
+            "RAYDIUM_CPMM".parse::<DexType>().ok(),
+            Some(DexType::RaydiumCpmm)
+        );
         assert_eq!("orca".parse::<DexType>().ok(), Some(DexType::Orca));
-        assert_eq!("meteora_dlmm".parse::<DexType>().ok(), Some(DexType::MeteoraDlmm));
+        assert_eq!(
+            "meteora_dlmm".parse::<DexType>().ok(),
+            Some(DexType::MeteoraDlmm)
+        );
         assert!("unknown_dex".parse::<DexType>().is_err());
     }
 }

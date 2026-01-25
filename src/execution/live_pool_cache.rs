@@ -1191,7 +1191,7 @@ mod tests {
         assert!(cache.vault_to_pool.contains_key(&vault_a));
         assert!(cache.vault_to_pool.contains_key(&vault_b));
 
-        let (found_pool, pos) = cache.vault_to_pool.get(&vault_a).unwrap().clone();
+        let (found_pool, pos) = *cache.vault_to_pool.get(&vault_a).unwrap();
         assert_eq!(found_pool, pool);
         assert!(matches!(pos, VaultPosition::A));
     }
