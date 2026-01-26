@@ -1,5 +1,5 @@
 use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
-use crate::ipc::{RejectReason, TradeIntent, TradeSide};
+use crate::ipc::{RejectReason, SwapHop, TradeIntent, TradeSide};
 use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::orca_whirlpool_layout;
@@ -238,6 +238,20 @@ pub async fn build_tx_plan(
     rpc: Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
 ) -> TxPlanOutcome {
+    // === Multi-hop detection (takes priority over single-hop) ===
+    // Multi-hop intents have swap_path with multiple hops for atomic arbitrage
+    if let Some(ref swap_path) = intent.swap_path {
+        if !swap_path.is_empty() {
+            tracing::info!(
+                intent_id = %intent.intent_id,
+                hops = swap_path.len(),
+                "Building multi-hop tx plan"
+            );
+            return build_multi_hop_tx_plan(intent, wallet_pubkey, rpc, cache, swap_path).await;
+        }
+    }
+
+    // === Single-hop path (original logic) ===
     let dex_hint = match dex_hint_from_intent(intent) {
         Ok(h) => h,
         Err(e) => return TxPlanOutcome::Unsupported(e),
@@ -823,6 +837,463 @@ pub async fn build_tx_plan(
     TxPlanOutcome::Planned(TxPlan {
         instructions: final_ixs,
     })
+}
+
+// ============================================================================
+// Multi-hop TX Plan Builder (for atomic arbitrage)
+// ============================================================================
+
+/// Build transaction plan for multi-hop arbitrage (atomic bundle).
+///
+/// Multi-hop intents contain a `swap_path` with multiple SwapHop entries,
+/// each specifying: pool_address, dex, input_mint, output_mint.
+///
+/// For a 2-hop arb cycle WSOL → Token → WSOL:
+/// - Hop 0: Buy token (WSOL → Token) on DEX A
+/// - Hop 1: Sell token (Token → WSOL) on DEX B
+///
+/// All swaps are combined into a single atomic transaction (Jito bundle).
+async fn build_multi_hop_tx_plan(
+    intent: &TradeIntent,
+    wallet_pubkey: Pubkey,
+    rpc: Arc<SolanaRpc>,
+    cache: Option<&SharedLivePoolCache>,
+    swap_path: &[SwapHop],
+) -> TxPlanOutcome {
+    // Validate: must start and end with SOL for arbitrage
+    if swap_path.is_empty() {
+        return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+            reason: RejectReason::UnsupportedIntent,
+            details: "multi-hop: swap_path is empty".to_string(),
+        });
+    }
+
+    let first_hop = &swap_path[0];
+    let last_hop = &swap_path[swap_path.len() - 1];
+
+    // Arb cycle: WSOL → ... → WSOL
+    if first_hop.input_mint != SOL_MINT {
+        return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+            reason: RejectReason::UnsupportedIntent,
+            details: format!(
+                "multi-hop: first hop input_mint={} (expected WSOL for arb)",
+                first_hop.input_mint
+            ),
+        });
+    }
+    if last_hop.output_mint != SOL_MINT {
+        return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+            reason: RejectReason::UnsupportedIntent,
+            details: format!(
+                "multi-hop: last hop output_mint={} (expected WSOL for arb)",
+                last_hop.output_mint
+            ),
+        });
+    }
+
+    let mut all_instructions: Vec<Instruction> = Vec::new();
+
+    // 1. Wrap SOL for first hop (BUY side)
+    let wrap_ixs = build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
+    all_instructions.extend(wrap_ixs);
+
+    // 2. Build swap instructions for each hop
+    let mut current_amount = intent.required_capital.raw;
+
+    for (hop_idx, hop) in swap_path.iter().enumerate() {
+        tracing::debug!(
+            intent_id = %intent.intent_id,
+            hop_idx,
+            dex = %hop.dex,
+            pool = %hop.pool_address,
+            input_mint = %hop.input_mint,
+            output_mint = %hop.output_mint,
+            amount_in = current_amount,
+            "Building hop instruction"
+        );
+
+        let hop_ixs = match build_hop_instructions(
+            wallet_pubkey,
+            hop,
+            current_amount,
+            &rpc,
+            cache,
+        )
+        .await
+        {
+            Ok(ixs) => ixs,
+            Err(e) => {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: e.reason,
+                    details: format!("multi-hop: hop {} failed: {}", hop_idx, e.details),
+                });
+            }
+        };
+
+        all_instructions.extend(hop_ixs);
+
+        // For subsequent hops, use expected_output as input amount.
+        // Note: This is an estimate; simulation will validate the actual flow.
+        // For atomic arb, we use min_out=1 and let simulation validate profitability.
+        if hop.expected_output > 0 {
+            current_amount = hop.expected_output;
+        }
+        // If expected_output is 0, keep current_amount (simulation will handle)
+    }
+
+    tracing::info!(
+        intent_id = %intent.intent_id,
+        total_instructions = all_instructions.len(),
+        hops = swap_path.len(),
+        "Multi-hop tx plan built successfully"
+    );
+
+    TxPlanOutcome::Planned(TxPlan {
+        instructions: all_instructions,
+    })
+}
+
+/// Build swap instructions for a single hop.
+///
+/// Routes to the appropriate DEX based on hop.dex field.
+async fn build_hop_instructions(
+    wallet_pubkey: Pubkey,
+    hop: &SwapHop,
+    amount_in: u64,
+    rpc: &Arc<SolanaRpc>,
+    cache: Option<&SharedLivePoolCache>,
+) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
+    let dex = hop.dex.to_lowercase();
+    let pool_address = match Pubkey::from_str(&hop.pool_address) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(UnsupportedTxPlan {
+                reason: RejectReason::InvalidIntent,
+                details: format!("invalid pool_address {}: {}", hop.pool_address, e),
+            });
+        }
+    };
+
+    // For atomic arb, we use min_out=1 (simulation validates profitability)
+    let min_out: u64 = 1;
+
+    match dex.as_str() {
+        "pumpfun" => {
+            build_hop_pumpfun(wallet_pubkey, hop, amount_in, min_out, rpc, cache).await
+        }
+        "pump_amm" => {
+            build_hop_pump_amm(wallet_pubkey, hop, &pool_address, amount_in, min_out, rpc, cache)
+                .await
+        }
+        "raydium" | "raydium_amm" => {
+            build_hop_raydium(wallet_pubkey, hop, &pool_address, amount_in, min_out, rpc, cache)
+                .await
+        }
+        "orca" | "orca_whirlpool" => {
+            build_hop_orca(wallet_pubkey, hop, &pool_address, amount_in, min_out, rpc, cache).await
+        }
+        "meteora_dlmm" | "meteora" => {
+            build_hop_meteora_dlmm(wallet_pubkey, hop, &pool_address, amount_in, min_out, rpc, cache)
+                .await
+        }
+        other => Err(UnsupportedTxPlan {
+            reason: RejectReason::UnsupportedIntent,
+            details: format!("multi-hop: unsupported DEX '{}' in hop", other),
+        }),
+    }
+}
+
+// --- DEX-specific hop builders ---
+
+async fn build_hop_pumpfun(
+    _wallet_pubkey: Pubkey,
+    hop: &SwapHop,
+    _amount_in: u64,
+    _min_out: u64,
+    _rpc: &Arc<SolanaRpc>,
+    _cache: Option<&SharedLivePoolCache>,
+) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
+    // PumpFun Bonding Curve does NOT support arbitrage!
+    // The bonding curve price changes with each trade, making arb impossible.
+    // Only PumpSwap AMM (post-graduation pools) can be used for arbitrage.
+    //
+    // If you see this error, the arb-strategy should use "pump_amm" DEX type
+    // for graduated tokens, not "pumpfun".
+    Err(UnsupportedTxPlan {
+        reason: RejectReason::UnsupportedIntent,
+        details: format!(
+            "pumpfun bonding curve does not support multi-hop arbitrage (pool={}). Use pump_amm for graduated tokens.",
+            hop.pool_address
+        ),
+    })
+}
+
+async fn build_hop_pump_amm(
+    wallet_pubkey: Pubkey,
+    hop: &SwapHop,
+    pool_address: &Pubkey,
+    amount_in: u64,
+    min_out: u64,
+    _rpc: &Arc<SolanaRpc>,
+    cache: Option<&SharedLivePoolCache>,
+) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
+    // PumpSwap AMM (graduated tokens) - get pool_accounts from cache
+    let pool_accounts = if let Some(cache) = cache {
+        if let Some(state) = cache.get(pool_address) {
+            if let CachedPoolState::PumpAmm(amm_state) = state {
+                if amm_state.pool_accounts.len() >= 14 {
+                    tracing::debug!(
+                        pool = %pool_address,
+                        accounts_len = amm_state.pool_accounts.len(),
+                        "multi-hop pump_amm: using cached pool_accounts"
+                    );
+                    amm_state.pool_accounts.clone()
+                } else {
+                    return Err(UnsupportedTxPlan {
+                        reason: RejectReason::UnsupportedIntent,
+                        details: format!(
+                            "pump_amm: cached pool_accounts too short (got {}, need 14)",
+                            amm_state.pool_accounts.len()
+                        ),
+                    });
+                }
+            } else {
+                return Err(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!("pump_amm: cache hit but wrong DEX type for {}", pool_address),
+                });
+            }
+        } else {
+            return Err(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: format!("pump_amm: pool {} not in cache", pool_address),
+            });
+        }
+    } else {
+        return Err(UnsupportedTxPlan {
+            reason: RejectReason::UnsupportedIntent,
+            details: "pump_amm: no cache available for multi-hop".to_string(),
+        });
+    };
+
+    // Use static method with pool_accounts from cache
+    let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+        &hop.input_mint,
+        &hop.output_mint,
+        amount_in,
+        min_out,
+        wallet_pubkey,
+        &pool_accounts,
+    )
+    .map_err(|e| UnsupportedTxPlan {
+        reason: RejectReason::UnsupportedIntent,
+        details: format!("pump_amm build_swap_ix_from_pool_accounts failed: {}", e),
+    })?;
+
+    Ok(ixs)
+}
+
+async fn build_hop_raydium(
+    wallet_pubkey: Pubkey,
+    hop: &SwapHop,
+    pool_address: &Pubkey,
+    amount_in: u64,
+    min_out: u64,
+    rpc: &Arc<SolanaRpc>,
+    cache: Option<&SharedLivePoolCache>,
+) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
+    let mut raydium = Raydium::new(Arc::clone(rpc));
+
+    // Try to inject pool state from cache
+    let mut used_cache = false;
+    if let Some(cache) = cache {
+        if let Some(CachedPoolState::RaydiumAmm(amm_state)) = cache.get(pool_address) {
+            tracing::debug!(
+                pool = %pool_address,
+                "multi-hop raydium: using cached pool state"
+            );
+            raydium.inject_cached_amm_state(
+                *pool_address,
+                amm_state.base_mint,
+                amm_state.quote_mint,
+                amm_state.coin_vault,
+                amm_state.pc_vault,
+                amm_state.base_decimals,
+                amm_state.quote_decimals,
+                amm_state.market_id,
+                amm_state.serum_bids,
+                amm_state.serum_asks,
+                amm_state.serum_event_queue,
+            );
+            used_cache = true;
+        }
+    }
+
+    // If cache didn't provide state, load from RPC
+    if !used_cache {
+        if let Err(e) = raydium.load_pool_from_geyser(pool_address).await {
+            return Err(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: format!("raydium load_pool failed: {}", e),
+            });
+        }
+    }
+
+    raydium.set_user_authority(wallet_pubkey);
+
+    // Raydium needs Serum accounts if not already populated
+    if let Err(e) = raydium.fetch_and_populate_serum_accounts(pool_address).await {
+        tracing::warn!(
+            pool = %pool_address,
+            error = %e,
+            "raydium: serum account fetch failed (non-fatal, may already be populated)"
+        );
+    }
+
+    let ixs = raydium
+        .build_swap_ix(&hop.input_mint, &hop.output_mint, amount_in, min_out)
+        .map_err(|e| UnsupportedTxPlan {
+            reason: RejectReason::UnsupportedIntent,
+            details: format!("raydium build_swap_ix failed: {}", e),
+        })?;
+
+    Ok(ixs)
+}
+
+async fn build_hop_orca(
+    wallet_pubkey: Pubkey,
+    hop: &SwapHop,
+    pool_address: &Pubkey,
+    amount_in: u64,
+    min_out: u64,
+    rpc: &Arc<SolanaRpc>,
+    cache: Option<&SharedLivePoolCache>,
+) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
+    let orca = Orca::new(Arc::clone(rpc));
+    orca.set_user_authority(wallet_pubkey);
+
+    // Get pool state from cache or RPC
+    let parsed = if let Some(cache) = cache {
+        if let Some(state) = cache.get(pool_address) {
+            match state {
+                CachedPoolState::Orca(orca_state) => {
+                    tracing::debug!(
+                        pool = %pool_address,
+                        "multi-hop orca: using cached pool state"
+                    );
+                    orca_whirlpool_layout::WhirlpoolParsed {
+                        token_mint_a: orca_state.token_mint_a,
+                        token_mint_b: orca_state.token_mint_b,
+                        token_vault_a: orca_state.token_vault_a,
+                        token_vault_b: orca_state.token_vault_b,
+                        tick_current_index: orca_state.tick_current_index,
+                        sqrt_price: orca_state.sqrt_price,
+                        liquidity: orca_state.liquidity,
+                        fee_rate: orca_state.fee_rate,
+                        protocol_fee_rate: orca_state.protocol_fee_rate,
+                        tick_spacing: orca_state.tick_spacing,
+                    }
+                }
+                _ => {
+                    // Cache hit but wrong type - fallback to RPC
+                    fetch_orca_from_rpc(rpc, pool_address).await?
+                }
+            }
+        } else {
+            // Cache miss - fallback to RPC
+            fetch_orca_from_rpc(rpc, pool_address).await?
+        }
+    } else {
+        fetch_orca_from_rpc(rpc, pool_address).await?
+    };
+
+    // Register ATAs for both mints
+    let owner_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
+    let token_program_spl = spl_token::id();
+
+    for mint_str in [&hop.input_mint, &hop.output_mint] {
+        let mint_sdk = Pubkey::from_str(mint_str).map_err(|e| UnsupportedTxPlan {
+            reason: RejectReason::InvalidIntent,
+            details: format!("invalid mint {}: {}", mint_str, e),
+        })?;
+        let mint_spl = SplProgramPubkey::new_from_array(mint_sdk.to_bytes());
+        let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_spl,
+            &mint_spl,
+            &token_program_spl,
+        );
+        let ata_sdk = Pubkey::new_from_array(ata_spl.to_bytes());
+        orca.set_user_token_account(mint_sdk, ata_sdk);
+    }
+
+    orca.insert_whirlpool_parsed(*pool_address, parsed);
+
+    let ixs = orca
+        .build_swap_ix(&hop.input_mint, &hop.output_mint, amount_in, min_out)
+        .map_err(|e| UnsupportedTxPlan {
+            reason: RejectReason::UnsupportedIntent,
+            details: format!("orca build_swap_ix failed: {}", e),
+        })?;
+
+    Ok(ixs)
+}
+
+async fn build_hop_meteora_dlmm(
+    wallet_pubkey: Pubkey,
+    hop: &SwapHop,
+    pool_address: &Pubkey,
+    amount_in: u64,
+    min_out: u64,
+    rpc: &Arc<SolanaRpc>,
+    cache: Option<&SharedLivePoolCache>,
+) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
+    let mut meteora = MeteoraDlmm::new(Arc::clone(rpc));
+    meteora.set_user_authority(wallet_pubkey);
+
+    // Try to inject state from cache
+    let mut used_cache = false;
+    if let Some(cache) = cache {
+        if let Some(CachedPoolState::Meteora(dlmm_state)) = cache.get(pool_address) {
+            // Only use if active_id != 0 (real Geyser data, not default)
+            if dlmm_state.active_id != 0 {
+                if let Ok(true) = meteora.inject_cached_meteora_state(pool_address, &dlmm_state) {
+                    tracing::debug!(
+                        pool = %pool_address,
+                        active_id = dlmm_state.active_id,
+                        "multi-hop meteora: using cached pool state"
+                    );
+                    used_cache = true;
+                }
+            } else {
+                tracing::warn!(
+                    pool = %pool_address,
+                    "multi-hop meteora: active_id=0 (stale cache), skipping injection"
+                );
+            }
+        }
+    }
+
+    // If cache didn't help, load from RPC
+    if !used_cache {
+        // Try to load pool state via single RPC getAccount call
+        if let Err(e) = meteora.load_pool_by_address(pool_address).await {
+            return Err(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: format!("meteora_dlmm load_pool_by_address failed: {}", e),
+            });
+        }
+    }
+
+    // Meteora DLMM needs async bin array derivation
+    let ixs = meteora
+        .build_swap_ix_async(&hop.input_mint, &hop.output_mint, amount_in, min_out)
+        .await
+        .map_err(|e| UnsupportedTxPlan {
+            reason: RejectReason::UnsupportedIntent,
+            details: format!("meteora_dlmm build_swap_ix failed: {}", e),
+        })?;
+
+    Ok(ixs)
 }
 
 #[cfg(test)]
