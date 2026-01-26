@@ -152,6 +152,13 @@ if systemctl list-unit-files trades_server.service >/dev/null 2>&1; then
     sudo rm -f "$SYSTEMD_DIR/trades_server.service"
 fi
 
+# Kill any manually started trades_server processes (nohup, etc.) that block port 9899
+if pgrep -f 'trades_server.py' >/dev/null 2>&1; then
+    log_warn "Killing manually started trades_server.py processes..."
+    pkill -f 'trades_server.py' || true
+    sleep 1
+fi
+
 sudo systemctl daemon-reload
 
 # -----------------------------------------------------------------------------
