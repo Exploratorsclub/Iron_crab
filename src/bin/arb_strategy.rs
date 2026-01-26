@@ -729,6 +729,8 @@ impl ArbContext {
                         rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                     }
                 }
+                // Skip multi_hop_* keys here - they're handled in the second loop below
+                k if k.starts_with("multi_hop_") => {}
                 _ => rejected.push((key.clone(), format!("Unknown config key: {}", key))),
             }
         }
