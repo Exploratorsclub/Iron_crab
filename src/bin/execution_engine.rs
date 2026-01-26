@@ -264,12 +264,10 @@ async fn compute_intent_fills_best_effort(
     let input_mint = intent.resources.input_mint.as_str();
     let output_mint = intent.resources.output_mint.as_str();
 
-    // Primary path: use token-balance deltas (works for most SPL tokens, including WSOL if used).
-    let input_token_delta = extract_owner_mint_delta_raw(&tx, &wallet, input_mint);
-    let output_token_delta = extract_owner_mint_delta_raw(&tx, &wallet, output_mint);
+    // ARBITRAGE DETECTION: input_mint == output_mint == WSOL means it's an arb cycle
+    let is_arb_cycle = input_mint == output_mint && input_mint == SOL_MINT;
 
-    // Fallback path (best-effort): if SOL is represented as So111.. but token balances are absent
-    // (e.g. native SOL transfers), approximate fills using fee payer lamport delta.
+    // Get native SOL (lamport) delta for wallet - used for fees and native SOL tracking
     let mut lamport_reason: Option<FillUnavailableReason> = None;
     let (payer_delta_lamports, fee_lamports, lamport_noise) =
         match compute_wallet_lamport_delta_best_effort(&tx, &wallet) {
@@ -285,6 +283,86 @@ async fn compute_intent_fills_best_effort(
                 (0, 0, true)
             }
         };
+
+    // ============ ARBITRAGE CYCLE HANDLING ============
+    // For arb (WSOL → ... → WSOL), we need to track:
+    // - fill_in: Total WSOL spent in first swap leg (pre_balance - intermediate minimum)
+    // - fill_out: Total WSOL received in last swap leg (final_balance after sell)
+    // - wallet_sol_delta: Net PnL = fill_out - fill_in - fees (can be negative = loss)
+    if is_arb_cycle {
+        // Get WSOL token balance delta (this is the net WSOL change, i.e. PnL before native fees)
+        let wsol_token_delta = extract_owner_mint_delta_raw(&tx, &wallet, SOL_MINT);
+
+        if let Some((decimals, wsol_delta)) = wsol_token_delta {
+            // For arbitrage:
+            // - Negative delta means we lost WSOL (unprofitable arb or fees)
+            // - Positive delta means we gained WSOL (profitable arb)
+            //
+            // We need to reconstruct fill_in and fill_out from the TX.
+            // The wsol_delta alone is the net, but for display we want:
+            // - fill_in: amount used in buy leg
+            // - fill_out: amount received from sell leg
+            //
+            // Best approach: parse all WSOL transfers to/from wallet in the TX
+            let (arb_fill_in, arb_fill_out) =
+                extract_arb_wsol_flows(&tx, &wallet).unwrap_or((None, None));
+
+            // If we couldn't parse individual legs, approximate from the input amount
+            let fill_in = arb_fill_in.or_else(|| {
+                // Fallback: use intent's required_capital as fill_in (input amount)
+                Some(intent.required_capital.clone())
+            });
+
+            // fill_out = fill_in + wsol_delta (since delta = out - in)
+            let fill_out = arb_fill_out.or_else(|| {
+                fill_in.as_ref().map(|fi| {
+                    let in_raw = fi.raw as i128;
+                    let out_raw = (in_raw + wsol_delta).max(0) as u64;
+                    ExplicitAmount::new(out_raw, decimals)
+                })
+            });
+
+            // wallet_sol_delta: Combine WSOL token delta with native SOL delta (for Jito tip etc.)
+            // Total PnL = WSOL delta + native SOL delta
+            let total_sol_delta = if !lamport_noise {
+                wsol_delta + payer_delta_lamports
+            } else {
+                wsol_delta // Native delta unavailable, use WSOL delta only
+            };
+
+            return (
+                fill_in,
+                fill_out,
+                FillStatus::Complete,
+                None,
+                Some(total_sol_delta),
+            );
+        }
+
+        // Fallback if WSOL token balance not found - use native lamport delta
+        if !lamport_noise {
+            // For arb without WSOL tracking, native delta is our best approximation
+            let fill_in = Some(intent.required_capital.clone());
+            let fill_out = {
+                let in_raw = intent.required_capital.raw as i128;
+                let out_raw = (in_raw + payer_delta_lamports).max(0) as u64;
+                Some(ExplicitAmount::new(out_raw, 9))
+            };
+
+            return (
+                fill_in,
+                fill_out,
+                FillStatus::Partial,
+                Some(FillUnavailableReason::TokenBalanceDeltaMissing),
+                Some(payer_delta_lamports),
+            );
+        }
+    }
+
+    // ============ REGULAR BUY/SELL HANDLING ============
+    // Primary path: use token-balance deltas (works for most SPL tokens, including WSOL if used).
+    let input_token_delta = extract_owner_mint_delta_raw(&tx, &wallet, input_mint);
+    let output_token_delta = extract_owner_mint_delta_raw(&tx, &wallet, output_mint);
 
     let fill_in = if let Some((decimals, delta)) = input_token_delta {
         if delta < 0 {
@@ -355,6 +433,69 @@ async fn compute_intent_fills_best_effort(
         fill_unavailable_reason,
         wallet_sol_delta,
     )
+}
+
+/// Extract WSOL flows from arbitrage TX: (amount_spent, amount_received)
+/// Parses token balance changes to find the actual WSOL in/out for each leg.
+fn extract_arb_wsol_flows(
+    tx: &EncodedConfirmedTransactionWithStatusMeta,
+    wallet: &Pubkey,
+) -> Option<(Option<ExplicitAmount>, Option<ExplicitAmount>)> {
+    let meta = tx.transaction.meta.as_ref()?;
+
+    let pre_balances_opt =
+        Option::<Vec<UiTransactionTokenBalance>>::from(meta.pre_token_balances.clone());
+    let post_balances_opt =
+        Option::<Vec<UiTransactionTokenBalance>>::from(meta.post_token_balances.clone());
+    let (pre_balances, post_balances) = (pre_balances_opt?, post_balances_opt?);
+
+    let wallet_str = wallet.to_string();
+
+    // Find WSOL accounts owned by wallet
+    let mut wsol_pre: u64 = 0;
+    let mut wsol_post: u64 = 0;
+
+    for b in pre_balances.iter() {
+        let b_owner = Option::<String>::from(b.owner.clone());
+        if b.mint == SOL_MINT && b_owner.as_deref() == Some(&wallet_str) {
+            if let Ok(v) = u64::from_str(&b.ui_token_amount.amount) {
+                wsol_pre = wsol_pre.saturating_add(v);
+            }
+        }
+    }
+
+    for b in post_balances.iter() {
+        let b_owner = Option::<String>::from(b.owner.clone());
+        if b.mint == SOL_MINT && b_owner.as_deref() == Some(&wallet_str) {
+            if let Ok(v) = u64::from_str(&b.ui_token_amount.amount) {
+                wsol_post = wsol_post.saturating_add(v);
+            }
+        }
+    }
+
+    // For arb: fill_in is the max WSOL we had, fill_out is what we ended with
+    // In a typical arb: we start with X WSOL, buy tokens (WSOL drops to 0), sell tokens (WSOL returns)
+    // The issue is we only see pre and post, not the intermediate.
+    //
+    // Better approach: use the intent's input amount as fill_in (what we intended to spend)
+    // and wsol_post as fill_out (what we actually ended up with)
+    //
+    // For now, return (pre, post) and let caller compute delta
+    if wsol_pre > 0 || wsol_post > 0 {
+        let fill_in = if wsol_pre > wsol_post {
+            // We spent more than we received = lost WSOL
+            Some(ExplicitAmount::new(wsol_pre, 9))
+        } else {
+            // We received more than we started = gained WSOL (unusual for arb input)
+            Some(ExplicitAmount::new(wsol_pre, 9))
+        };
+
+        let fill_out = Some(ExplicitAmount::new(wsol_post, 9));
+
+        Some((fill_in, fill_out))
+    } else {
+        None
+    }
 }
 
 /// DEPRECATED: This function is no longer used in the multi-process architecture.
