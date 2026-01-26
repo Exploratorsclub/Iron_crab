@@ -985,9 +985,16 @@ async fn build_hop_instructions(
             build_hop_pump_amm(wallet_pubkey, hop, &pool_address, amount_in, min_out, rpc, cache)
                 .await
         }
-        "raydium" | "raydium_amm" => {
+        "raydium" | "raydium_amm" | "raydium_amm_v4" => {
             build_hop_raydium(wallet_pubkey, hop, &pool_address, amount_in, min_out, rpc, cache)
                 .await
+        }
+        "raydium_cpmm" => {
+            // TODO: Implement Raydium CPMM support for multi-hop
+            Err(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: format!("raydium_cpmm multi-hop not yet implemented (pool={})", hop.pool_address),
+            })
         }
         "orca" | "orca_whirlpool" => {
             build_hop_orca(wallet_pubkey, hop, &pool_address, amount_in, min_out, rpc, cache).await

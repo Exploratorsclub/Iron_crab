@@ -293,8 +293,16 @@ impl CrossDexHandler {
         (buy_accounts, sell_accounts)
     }
 
-    /// Check if this intent is a cross-DEX arbitrage intent
+    /// Check if this intent is a cross-DEX arbitrage intent (old 2-hop style)
+    ///
+    /// Returns false for multi-hop intents (which have swap_path populated),
+    /// as those should go through tx_builder::build_multi_hop_tx_plan instead.
     pub fn is_cross_dex_arb_intent(intent: &TradeIntent) -> bool {
+        // Multi-hop intents have swap_path - they use the new multi-hop tx plan builder
+        if intent.swap_path.as_ref().is_some_and(|sp| !sp.is_empty()) {
+            return false;
+        }
+        // Old 2-hop arb: pools.len() == 2 and source == arb-strategy
         intent.resources.pools.len() == 2 && intent.source == "arb-strategy"
     }
 
