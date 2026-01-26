@@ -85,16 +85,17 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             source = record.get('source', 'unknown')
             intent_id = record.get('intent_id', '')
             
-            # NEW: Get actual wallet SOL delta (includes all fees)
+            # Get actual wallet SOL delta (includes all fees)
             wallet_sol_delta_lamports = record.get('wallet_sol_delta_lamports')
             
-            # NEW: Get token_mint directly from execution record (no decision join needed)
-            token_mint = record.get('token_mint', 'unknown')
+            # Get token_mint directly from execution record
+            token_mint = record.get('token_mint', '')
             
             # ARBITRAGE DETECTION: Check source or intent_id prefix
             is_arbitrage = (
                 source == 'arb-strategy' or 
                 intent_id.startswith('arb-') or
+                intent_id.startswith('mh-') or  # multi-hop
                 'arb' in source.lower()
             )
             
@@ -107,82 +108,88 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             fill_out_raw = fill_out.get('raw', 0)
             fill_out_decimals = fill_out.get('decimals', 9)
             
-            # Arbitrage has special action type
+            # ============ ARBITRAGE ============
             if is_arbitrage:
                 action = "ARBITRAGE"
-                # For arbitrage, amount is the token amount traded
-                # fill_out typically has tokens received from buy leg
-                if fill_out_raw > 0 and fill_out_decimals <= 9:
-                    amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
-                elif fill_in_raw > 0 and fill_in_decimals <= 9:
-                    amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
-                else:
-                    amount_tokens = None  # unknown
-            else:
-                # Regular BUY/SELL detection
-                # BUY: fill_out contains tokens (non-SOL)
-                # SELL: fill_in contains tokens (non-SOL), fill_out is WSOL
+                # For arbitrage: no single token mint, show "-"
+                display_mint = "-"
+                # Amount: not meaningful for arb, show "-"
+                amount_tokens = None
                 
-                # Check which side has tokens (6 decimals typically) vs SOL (9 decimals)
-                fill_out_is_tokens = fill_out_raw > 0 and fill_out_decimals == 6
-                fill_in_is_tokens = fill_in_raw > 0 and fill_in_decimals == 6
+                # Price = WSOL spent on buy leg (fill_in with 9 decimals = SOL)
+                if fill_in_decimals == 9:
+                    price_sol = fill_in_raw / 1e9
+                else:
+                    price_sol = 0
                 
-                if fill_out_is_tokens and not fill_in_is_tokens:
-                    # Received tokens, paid SOL = BUY
-                    action = "BUY"
-                    amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
-                elif fill_in_is_tokens:
-                    # Sent tokens, received SOL = SELL
-                    action = "SELL"
-                    amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
-                elif fill_out_raw > fill_in_raw * 100:
-                    # fill_out >> fill_in suggests tokens received (BUY)
-                    action = "BUY"
-                    amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
-                elif fill_in_raw > 0:
-                    # Default to SELL if we sent something
-                    action = "SELL"
-                    amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
+                # PnL = actual wallet delta (negative = loss from fees, positive = profit)
+                if wallet_sol_delta_lamports is not None:
+                    pnl_sol = wallet_sol_delta_lamports / 1e9  # Keep sign: negative = loss
                 else:
-                    action = "BUY"
-                    amount_tokens = fill_out_raw / (10 ** fill_out_decimals) if fill_out_raw > 0 else None
+                    pnl_sol = 0.0
+                
+                return {
+                    "timestamp_ms": ts_ms,
+                    "time": datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+                    "action": action,
+                    "mint": display_mint,  # Grafana expects "mint"
+                    "tx_hash": signature,  # Full signature for link
+                    "amount_tokens": None,  # Grafana expects "amount_tokens"
+                    "price_sol": round(price_sol, 9),
+                    "pnl_sol": round(pnl_sol, 9),
+                    "pnl_pct": None  # Not applicable for arb
+                }
             
-            # Calculate SOL price/cost
-            # Prefer wallet_sol_delta_lamports (actual SOL change) over WSOL token amounts
-            if wallet_sol_delta_lamports is not None:
-                # wallet_sol_delta_lamports: negative = lost SOL (paid), positive = gained SOL
-                sol_amount = abs(wallet_sol_delta_lamports) / 1e9
+            # ============ BUY / SELL ============
+            # Check which side has tokens (6 decimals typically) vs SOL (9 decimals)
+            fill_out_is_tokens = fill_out_raw > 0 and fill_out_decimals == 6
+            fill_in_is_tokens = fill_in_raw > 0 and fill_in_decimals == 6
+            
+            if fill_in_is_tokens:
+                # Sent tokens, received SOL = SELL
+                action = "SELL"
+                amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
+                # SOL received
+                if fill_out_decimals == 9:
+                    price_sol = fill_out_raw / 1e9
+                else:
+                    price_sol = 0
+            elif fill_out_is_tokens:
+                # Received tokens, paid SOL = BUY
+                action = "BUY"
+                amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
+                # SOL paid
+                if fill_in_decimals == 9:
+                    price_sol = fill_in_raw / 1e9
+                else:
+                    price_sol = 0
             else:
-                # Fallback: use WSOL fill amount
-                if action == "SELL":
-                    # SELL: received SOL/WSOL in fill_out
-                    sol_amount = fill_out_raw / 1e9 if fill_out_decimals == 9 else 0
-                elif action == "ARBITRAGE":
-                    # ARBITRAGE: profit is usually negative wallet delta (we paid fees)
-                    # Use fill_in (what we paid) as the "cost"
-                    sol_amount = fill_in_raw / 1e9 if fill_in_decimals == 9 else 0
+                # Fallback heuristics
+                if fill_out_raw > fill_in_raw * 100:
+                    action = "BUY"
+                    amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
+                    price_sol = fill_in_raw / 1e9 if fill_in_decimals == 9 else 0
                 else:
-                    # BUY: paid SOL/WSOL in fill_in
-                    sol_amount = fill_in_raw / 1e9 if fill_in_decimals == 9 else 0
-            
-            price_sol = sol_amount
+                    action = "SELL"
+                    amount_tokens = fill_in_raw / (10 ** fill_in_decimals) if fill_in_raw > 0 else 0
+                    price_sol = fill_out_raw / 1e9 if fill_out_decimals == 9 else 0
             
             # Truncate token mint for display (keep first 8 + last 4 chars)
-            if token_mint and token_mint != "unknown" and len(token_mint) > 15:
+            if token_mint and len(token_mint) > 15:
                 display_mint = token_mint[:8] + "..." + token_mint[-4:]
             else:
-                display_mint = token_mint
+                display_mint = token_mint or "-"
             
             return {
                 "timestamp_ms": ts_ms,
                 "time": datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S"),
                 "action": action,
-                "token_mint": display_mint,
-                "tx_hash": signature[:8] + "..." if len(signature) > 12 else signature,
-                "amount": amount_tokens,
-                "price_sol": round(price_sol, 12) if price_sol else None,
-                "pnl_sol": 0.0,  # Would need position tracking
-                "pnl_percent": None  # null shows as "null" in table
+                "mint": display_mint,  # Grafana expects "mint"
+                "tx_hash": signature,  # Full signature for link
+                "amount_tokens": round(amount_tokens, 6) if amount_tokens else None,
+                "price_sol": round(price_sol, 9) if price_sol else None,
+                "pnl_sol": 0.0,  # Would need position tracking for momentum
+                "pnl_pct": None
             }
         except Exception as e:
             print(f"Error parsing execution result: {e}")
