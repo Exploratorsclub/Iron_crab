@@ -39,8 +39,8 @@ use ironcrab::metrics::{
     NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
-    ensure_pool_cache_stream, pool_subject, wallet_balance_topic, NatsClient, NatsConfig,
-    TOPIC_MARKET_EVENTS,
+    config_consumer_config, config_subject, ensure_pool_cache_stream, pool_subject,
+    wallet_balance_topic, NatsClient, NatsConfig, CONFIG_STREAM_NAME, TOPIC_MARKET_EVENTS,
 };
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
@@ -738,10 +738,11 @@ async fn main() -> Result<()> {
     ironcrab::metrics::record_activity();
 
     // P1: Subscribe to Config Updates (Runtime Configuration via UI)
+    // Core NATS subscription (for backward compatibility)
     let config_subscription = if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_CONFIG_RELOAD).await {
             Ok(sub) => {
-                info!(topic = TOPIC_CONFIG_RELOAD, "Subscribed to Config Updates");
+                info!(topic = TOPIC_CONFIG_RELOAD, "Subscribed to Config Updates (Core NATS fallback)");
                 Some(sub)
             }
             Err(e) => {
@@ -752,6 +753,67 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // P1: JetStream Config Bootstrap (persisted, solves race condition)
+    // Fetch and apply the last config from JetStream before starting the main loop.
+    if let Some(ref nats) = ctx.nats {
+        use async_nats::jetstream;
+        use futures::StreamExt;
+
+        let jetstream = jetstream::new(nats.client().clone());
+
+        match jetstream.get_stream(CONFIG_STREAM_NAME).await {
+            Ok(stream) => {
+                match stream.create_consumer(config_consumer_config("market-data")).await {
+                    Ok(consumer) => {
+                        info!(
+                            stream = CONFIG_STREAM_NAME,
+                            subject = %config_subject("market-data"),
+                            "Connected to JetStream Config Updates (persisted)"
+                        );
+
+                        // Bootstrap: Try to get the last config from JetStream
+                        match consumer.fetch().max_messages(1).messages().await {
+                            Ok(mut messages) => {
+                                if let Some(Ok(msg)) = messages.next().await {
+                                    match serde_json::from_slice::<ConfigUpdate>(&msg.payload) {
+                                        Ok(update) => {
+                                            info!(
+                                                component = %update.target_component,
+                                                keys = ?update.config.keys().collect::<Vec<_>>(),
+                                                "Bootstrap: Applying config from JetStream"
+                                            );
+                                            let response = ctx.apply_config_update(&update);
+                                            info!(
+                                                status = ?response.status,
+                                                applied = ?response.applied_keys,
+                                                "Bootstrap config applied"
+                                            );
+                                            if let Err(e) = msg.ack().await {
+                                                warn!(error = %e, "Failed to ack bootstrap config");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "Failed to deserialize bootstrap config");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "No bootstrap config in JetStream (first run or empty)");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to create JetStream config consumer");
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, stream = CONFIG_STREAM_NAME, "JetStream CONFIG_UPDATES stream not found (control-plane may not be running)");
+            }
+        }
+    }
 
     if args.simulate {
         info!("Simulation mode: emitting fake slot events");

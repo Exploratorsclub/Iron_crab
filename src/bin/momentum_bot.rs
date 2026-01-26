@@ -47,7 +47,8 @@ use ironcrab::metrics::{
     NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
-    NatsClient, NatsConfig, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS,
+    config_consumer_config, config_subject, NatsClient, NatsConfig, CONFIG_STREAM_NAME,
+    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS,
 };
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
@@ -3671,14 +3672,81 @@ async fn main() -> Result<()> {
     };
 
     // P1: Subscribe to Config Updates (Runtime Configuration via UI)
+    // Core NATS fallback subscription (for backward compatibility)
     let mut config_subscription = if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_CONFIG_RELOAD).await {
             Ok(sub) => {
-                info!(topic = TOPIC_CONFIG_RELOAD, "Subscribed to Config Updates");
+                info!(topic = TOPIC_CONFIG_RELOAD, "Subscribed to Config Updates (Core NATS fallback)");
                 Some(sub)
             }
             Err(e) => {
                 warn!(error = %e, "Failed to subscribe to Config Updates");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // P1: JetStream Config Consumer (persisted, solves race condition)
+    let mut config_js_consumer = if let Some(ref nats) = ctx.nats {
+        use async_nats::jetstream;
+
+        let jetstream = jetstream::new(nats.client().clone());
+
+        match jetstream.get_stream(CONFIG_STREAM_NAME).await {
+            Ok(stream) => {
+                match stream.create_consumer(config_consumer_config("momentum-bot")).await {
+                    Ok(consumer) => {
+                        info!(
+                            stream = CONFIG_STREAM_NAME,
+                            subject = %config_subject("momentum-bot"),
+                            "Subscribed to JetStream Config Updates (persisted)"
+                        );
+
+                        // Bootstrap: Try to get the last config from JetStream
+                        match consumer.fetch().max_messages(1).messages().await {
+                            Ok(mut messages) => {
+                                use futures::StreamExt;
+                                if let Some(Ok(msg)) = messages.next().await {
+                                    match serde_json::from_slice::<ConfigUpdate>(&msg.payload) {
+                                        Ok(update) => {
+                                            info!(
+                                                component = %update.target_component,
+                                                keys = ?update.config.keys().collect::<Vec<_>>(),
+                                                "Bootstrap: Applying config from JetStream"
+                                            );
+                                            let response = ctx.apply_config_update(&update);
+                                            info!(
+                                                status = ?response.status,
+                                                applied = ?response.applied_keys,
+                                                "Bootstrap config applied"
+                                            );
+                                            if let Err(e) = msg.ack().await {
+                                                warn!(error = %e, "Failed to ack bootstrap config");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "Failed to deserialize bootstrap config");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "No bootstrap config in JetStream (first run or empty)");
+                            }
+                        }
+
+                        Some(consumer)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to create JetStream config consumer");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, stream = CONFIG_STREAM_NAME, "JetStream CONFIG_UPDATES stream not found (control-plane may not be running)");
                 None
             }
         }
@@ -3831,7 +3899,7 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // P1: Handle Config Updates (Runtime Configuration via UI)
+            // P1: Handle Config Updates (Runtime Configuration via UI) - Core NATS fallback
             msg = async {
                 if let Some(ref mut sub) = config_subscription {
                     sub.next().await
@@ -3849,7 +3917,7 @@ async fn main() -> Result<()> {
                                 info!(
                                     component = %update.target_component,
                                     keys = ?update.config.keys().collect::<Vec<_>>(),
-                                    "Received Config Update from control-plane"
+                                    "Received Config Update from control-plane (Core NATS)"
                                 );
                                 let response = ctx.apply_config_update(&update);
                                 info!(
@@ -3864,6 +3932,58 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to deserialize ConfigUpdate");
+                        }
+                    }
+                }
+            }
+
+            // P1: Handle Config Updates via JetStream (preferred, persistent)
+            msg = async {
+                use futures::StreamExt;
+                if let Some(ref mut consumer) = config_js_consumer {
+                    match consumer.fetch().max_messages(1).expires(std::time::Duration::from_millis(100)).messages().await {
+                        Ok(mut messages) => {
+                            if let Some(Ok(msg)) = messages.next().await {
+                                Some(msg)
+                            } else {
+                                None
+                            }
+                        }
+                        Err(_) => None
+                    }
+                } else {
+                    std::future::pending::<Option<async_nats::jetstream::message::Message>>().await
+                }
+            } => {
+                if let Some(msg) = msg {
+                    ironcrab::metrics::record_activity();
+                    NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    match serde_json::from_slice::<ConfigUpdate>(&msg.payload) {
+                        Ok(update) => {
+                            // Only process if targeted at momentum-bot
+                            if update.target_component == "momentum-bot" {
+                                info!(
+                                    component = %update.target_component,
+                                    keys = ?update.config.keys().collect::<Vec<_>>(),
+                                    "Received Config Update from control-plane (JetStream)"
+                                );
+                                let response = ctx.apply_config_update(&update);
+                                info!(
+                                    status = ?response.status,
+                                    applied = ?response.applied_keys,
+                                    rejected = ?response.rejected_keys,
+                                    "Config update processed"
+                                );
+                            } else {
+                                debug!(component = %update.target_component, "Ignoring config update for other component");
+                            }
+                            if let Err(e) = msg.ack().await {
+                                warn!(error = %e, "Failed to ack JetStream config message");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to deserialize ConfigUpdate");
+                            let _ = msg.ack().await;
                         }
                     }
                 }

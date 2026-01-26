@@ -461,18 +461,67 @@ class ControlPlaneState:
         try:
             self.nats_client = await nats.connect(config.NATS_URL)
             logger.info(f"Connected to NATS at {config.NATS_URL}")
+            
+            # Initialize JetStream for config persistence
+            await self._ensure_config_stream()
+            
             # Start decision record subscriber
             self.decision_subscriber_task = asyncio.create_task(self._subscribe_decisions())
-            # Broadcast persisted configs to all components on startup
+            # Broadcast persisted configs to all components on startup (via JetStream)
             await self._broadcast_persisted_configs()
         except Exception as e:
             logger.error(f"Failed to connect to NATS: {e}")
+    
+    async def _ensure_config_stream(self):
+        """Ensure CONFIG_UPDATES JetStream stream exists for config persistence.
+        
+        This stream keeps the last config per component, so components can
+        recover their config even if they start after the control-plane.
+        """
+        if not self.nats_client:
+            return
+        
+        try:
+            js = self.nats_client.jetstream()
+            
+            # Create or get CONFIG_UPDATES stream
+            stream_config = {
+                "name": "CONFIG_UPDATES",
+                "subjects": ["ironcrab.config.*"],
+                "retention": "limits",
+                "max_age": 24 * 60 * 60 * 1_000_000_000,  # 1 day in nanoseconds
+                "max_msgs_per_subject": 1,  # Keep only latest config per component
+                "storage": "file",
+                "discard": "old",
+            }
+            
+            try:
+                await js.add_stream(**stream_config)
+                logger.info("Created JetStream CONFIG_UPDATES stream")
+            except Exception as e:
+                if "already in use" in str(e).lower() or "stream name already" in str(e).lower():
+                    logger.info("JetStream CONFIG_UPDATES stream already exists")
+                else:
+                    # Try to update the stream
+                    try:
+                        await js.update_stream(**stream_config)
+                        logger.info("Updated JetStream CONFIG_UPDATES stream")
+                    except Exception:
+                        logger.warning(f"Could not create/update CONFIG_UPDATES stream: {e}")
+                        
+            self.jetstream = js
+        except Exception as e:
+            logger.warning(f"JetStream not available (continuing with Core NATS): {e}")
+            self.jetstream = None
     
     async def _broadcast_persisted_configs(self):
         """Send persisted configs to all components after NATS connection.
         
         This ensures that UI config changes survive component restarts.
-        Components receive their config via NATS hot-reload mechanism.
+        Components receive their config via JetStream (preferred) or Core NATS fallback.
+        
+        JetStream publishes to subject-per-component (ironcrab.config.{component})
+        with max_msgs_per_subject=1, so the latest config is always available.
         """
         if not self.nats_client or not self.component_configs:
             return
@@ -495,12 +544,20 @@ class ControlPlaneState:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             
+            payload = json.dumps(config_msg).encode('utf-8')
+            
+            # Publish to JetStream (persisted, survives component restarts)
+            js_subject = f"ironcrab.config.{component}"
             try:
-                payload = json.dumps(config_msg).encode('utf-8')
-                await self.nats_client.publish(config.TOPIC_CONFIG_RELOAD, payload)
-                logger.info(f"Broadcast config to {component}: {list(comp_config.keys())}")
+                if hasattr(self, 'jetstream') and self.jetstream:
+                    await self.jetstream.publish(js_subject, payload)
+                    logger.info(f"Published config to JetStream {js_subject}: {list(comp_config.keys())}")
+                else:
+                    # Fallback to Core NATS if JetStream not available
+                    await self.nats_client.publish(config.TOPIC_CONFIG_RELOAD, payload)
+                    logger.info(f"Broadcast config via Core NATS to {component}: {list(comp_config.keys())}")
             except Exception as e:
-                logger.error(f"Failed to broadcast config to {component}: {e}")
+                logger.error(f"Failed to publish config to {component}: {e}")
     
     async def _subscribe_decisions(self):
         """Subscribe to decision records topic for live updates"""
@@ -1123,7 +1180,8 @@ async def update_config(update: ConfigUpdate, user: User = Depends(require_admin
     """
     Update configuration for a component (requires: admin).
     
-    Publishes config update to NATS for hot reload.
+    Publishes config update to JetStream (preferred) or Core NATS fallback.
+    JetStream ensures components receive config even if they start later.
     
     Supported keys for execution-engine:
     - max_position_size_lamports: u64 (must be > 0)
@@ -1159,12 +1217,35 @@ async def update_config(update: ConfigUpdate, user: User = Depends(require_admin
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     
-    published = await state.publish(config.TOPIC_CONFIG_RELOAD, config_msg)
+    payload = json.dumps(config_msg).encode('utf-8')
+    
+    # Publish to JetStream (persisted) with subject-per-component
+    js_subject = f"ironcrab.config.{update.component}"
+    published_js = False
+    published_core = False
+    
+    try:
+        if hasattr(state, 'jetstream') and state.jetstream:
+            await state.jetstream.publish(js_subject, payload)
+            published_js = True
+            logger.info(f"Published config to JetStream {js_subject}")
+    except Exception as e:
+        logger.warning(f"JetStream publish failed, falling back to Core NATS: {e}")
+    
+    # Also publish to Core NATS topic for backward compatibility (existing subscribers)
+    try:
+        published_core = await state.publish(config.TOPIC_CONFIG_RELOAD, config_msg)
+    except Exception as e:
+        logger.warning(f"Core NATS publish failed: {e}")
+    
+    published = published_js or published_core
     
     return {
         "status": "config_update_published" if published else "nats_not_connected",
         "component": update.component,
         "config_keys": list(update.config.keys()),
+        "jetstream": published_js,
+        "core_nats": published_core,
     }
 
 @app.get("/logs/{component}")

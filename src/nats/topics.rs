@@ -44,6 +44,17 @@ pub fn wallet_balance_topic(wallet: &str) -> String {
 /// This allows JetStream to keep only the latest state per pool (max_messages_per_subject=1)
 pub const TOPIC_POOL_CACHE_PATTERN: &str = "ironcrab.pool_cache.*";
 
+/// JetStream subject pattern for config updates (subject-per-component)
+/// Each component gets its own subject: ironcrab.config.{component}
+/// JetStream keeps the last config per component (max_messages_per_subject=1)
+/// This ensures components get the latest config even if they start after the broadcast.
+pub const TOPIC_CONFIG_PATTERN: &str = "ironcrab.config.*";
+
+/// Helper function to build config topic for a specific component
+pub fn config_topic(component: &str) -> String {
+    format!("ironcrab.config.{}", component)
+}
+
 /// Get all topics for subscription
 pub fn all_topics() -> Vec<&'static str> {
     vec![

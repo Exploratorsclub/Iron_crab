@@ -25,6 +25,9 @@ use tracing::{info, warn};
 /// JetStream stream name for pool cache updates
 pub const STREAM_NAME: &str = "POOL_CACHE";
 
+/// JetStream stream name for config updates
+pub const CONFIG_STREAM_NAME: &str = "CONFIG_UPDATES";
+
 /// Subject pattern for pool cache (subject-per-pool for compaction)
 pub const SUBJECT_PATTERN: &str = "ironcrab.pool_cache.*";
 
@@ -92,6 +95,70 @@ pub async fn ensure_pool_cache_stream(client: &async_nats::Client) -> Result<()>
             );
             Err(e).context("JetStream stream creation/update failed")
         }
+    }
+}
+
+/// Create or update the CONFIG_UPDATES stream for config hot-reload
+///
+/// This stream ensures components receive config updates even if they start
+/// after the control-plane broadcasts (solves race condition).
+///
+/// # Configuration
+///
+/// - Stream Name: CONFIG_UPDATES
+/// - Subjects: ironcrab.config.*
+/// - Retention: 1 day (short, configs are re-published on change)
+/// - Max messages per subject: 1 (keeps only latest config per component)
+pub async fn ensure_config_stream(client: &async_nats::Client) -> Result<()> {
+    let jetstream = jetstream::new(client.clone());
+
+    let stream_config = jetstream::stream::Config {
+        name: CONFIG_STREAM_NAME.to_string(),
+        subjects: vec!["ironcrab.config.*".to_string()],
+        retention: jetstream::stream::RetentionPolicy::Limits,
+        max_age: std::time::Duration::from_secs(24 * 60 * 60), // 1 day
+        storage: jetstream::stream::StorageType::File,
+        num_replicas: 1,
+        discard: jetstream::stream::DiscardPolicy::Old,
+        max_messages_per_subject: 1, // Keep only latest config per component
+        ..Default::default()
+    };
+
+    match jetstream.get_or_create_stream(stream_config).await {
+        Ok(mut stream) => {
+            let info = stream.info().await?;
+            info!(
+                stream_name = %CONFIG_STREAM_NAME,
+                subjects = "ironcrab.config.*",
+                max_msgs_per_subject = 1,
+                num_messages = info.state.messages,
+                "JetStream CONFIG_UPDATES stream ready"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                stream_name = %CONFIG_STREAM_NAME,
+                error = %e,
+                "Failed to create CONFIG_UPDATES stream"
+            );
+            Err(e).context("CONFIG_UPDATES stream creation failed")
+        }
+    }
+}
+
+/// Get config subject for a specific component
+pub fn config_subject(component: &str) -> String {
+    format!("ironcrab.config.{}", component)
+}
+
+/// Consumer configuration for config updates (gets last config per component)
+pub fn config_consumer_config(component: &str) -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::Last,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        filter_subject: format!("ironcrab.config.{}", component),
+        ..Default::default()
     }
 }
 
