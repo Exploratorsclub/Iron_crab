@@ -463,8 +463,44 @@ class ControlPlaneState:
             logger.info(f"Connected to NATS at {config.NATS_URL}")
             # Start decision record subscriber
             self.decision_subscriber_task = asyncio.create_task(self._subscribe_decisions())
+            # Broadcast persisted configs to all components on startup
+            await self._broadcast_persisted_configs()
         except Exception as e:
             logger.error(f"Failed to connect to NATS: {e}")
+    
+    async def _broadcast_persisted_configs(self):
+        """Send persisted configs to all components after NATS connection.
+        
+        This ensures that UI config changes survive component restarts.
+        Components receive their config via NATS hot-reload mechanism.
+        """
+        if not self.nats_client or not self.component_configs:
+            return
+        
+        logger.info(f"Broadcasting persisted configs to {len(self.component_configs)} components")
+        
+        for component, comp_config in self.component_configs.items():
+            if not comp_config:
+                continue
+            
+            config_msg = {
+                "schema_version": 1,
+                "ts_unix_ms": _now_unix_ms(),
+                "component": CONTROL_PLANE_COMPONENT,
+                "build": CONTROL_PLANE_BUILD,
+                "run_id": CONTROL_PLANE_RUN_ID,
+                "command": "config_update",
+                "target_component": component,
+                "config": comp_config,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            
+            try:
+                payload = json.dumps(config_msg).encode('utf-8')
+                await self.nats_client.publish(config.TOPIC_CONFIG_RELOAD, payload)
+                logger.info(f"Broadcast config to {component}: {list(comp_config.keys())}")
+            except Exception as e:
+                logger.error(f"Failed to broadcast config to {component}: {e}")
     
     async def _subscribe_decisions(self):
         """Subscribe to decision records topic for live updates"""
