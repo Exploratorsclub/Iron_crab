@@ -1634,6 +1634,14 @@ impl ExecutionContext {
         // - Unwrap WSOL by closing WSOL ATA
         // - Close empty token accounts to avoid leaving rent-funded accounts open
         // Best-effort: failures are logged but do not fail the liquidation job.
+        //
+        // IMPORTANT: Wait for token sale TXs to confirm before cleanup!
+        // send_transaction_rpc is fire-and-forget (no confirmation wait).
+        // Without this delay, cleanup may run before token sales are confirmed,
+        // causing WSOL ATA to be closed based on stale state, then token sales
+        // create new WSOL that remains in the wallet.
+        info!("Waiting for liquidation TXs to confirm before cleanup...");
+        tokio::time::sleep(Duration::from_secs(15)).await;
         #[cfg(unix)]
         maybe_ping_watchdog();
         if let Err(e) = Self::cleanup_wallet_after_liquidation(ctx.as_ref(), owner).await {
