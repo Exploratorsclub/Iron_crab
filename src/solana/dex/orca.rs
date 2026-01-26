@@ -96,6 +96,104 @@ impl Orca {
         *self.user_authority.write().unwrap() = Some(auth);
     }
 
+    /// Inject cached Orca Whirlpool state from LivePoolCache.
+    ///
+    /// This allows build_swap_ix to use fresh Geyser-sourced data
+    /// instead of making RPC calls. The cached state includes the
+    /// current tick_current_index which changes with price.
+    ///
+    /// Returns Ok(true) if state was injected, Ok(false) if pool already exists.
+    pub fn inject_cached_orca_state(
+        &self,
+        pool_address: &Pubkey,
+        state: &crate::execution::live_pool_cache::OrcaWhirlpoolState,
+    ) -> Result<bool> {
+        // Check if already exists
+        if self.pools.contains_key(pool_address) {
+            // Update existing entry with fresh tick data
+            if let Some(mut entry) = self.pools.get_mut(pool_address) {
+                entry.tick_current_index = Some(state.tick_current_index);
+                if let Some(balance_a) = state.vault_a_balance {
+                    entry.reserve_base = balance_a as u128;
+                }
+                if let Some(balance_b) = state.vault_b_balance {
+                    entry.reserve_quote = balance_b as u128;
+                }
+                entry.cached_reserves = Some((entry.reserve_base, entry.reserve_quote));
+                entry.last_reserve_fetch = Some(std::time::SystemTime::now());
+            }
+            return Ok(false);
+        }
+
+        // Create new pool entry from cached state
+        let pool = OrcaPool {
+            base_mint: state.token_mint_a,
+            quote_mint: state.token_mint_b,
+            reserve_base: state.vault_a_balance.unwrap_or(0) as u128,
+            reserve_quote: state.vault_b_balance.unwrap_or(0) as u128,
+            fee_bps: state.fee_rate as u32,
+            fee_tier: None,
+            tick_spacing: Some(state.tick_spacing),
+            vault_a: state.token_vault_a,
+            vault_b: state.token_vault_b,
+            tick_current_index: Some(state.tick_current_index),
+            cached_reserves: Some((
+                state.vault_a_balance.unwrap_or(0) as u128,
+                state.vault_b_balance.unwrap_or(0) as u128,
+            )),
+            last_reserve_fetch: Some(std::time::SystemTime::now()),
+            base_mint_program: state.token_a_program,
+            quote_mint_program: state.token_b_program,
+        };
+
+        self.pools.insert(*pool_address, pool);
+
+        // Update mint index
+        self.mint_index
+            .entry(state.token_mint_a)
+            .or_default()
+            .push(*pool_address);
+        self.mint_index
+            .entry(state.token_mint_b)
+            .or_default()
+            .push(*pool_address);
+
+        tracing::info!(
+            pool = %pool_address,
+            tick_current_index = state.tick_current_index,
+            tick_spacing = state.tick_spacing,
+            "orca: injected cached state from LivePoolCache"
+        );
+
+        Ok(true)
+    }
+
+    /// Get pool accounts in DexPoolAccounts format for a given pool address.
+    ///
+    /// Returns accounts in the format expected by tx_builder:
+    /// - accounts[0] = pool_address (whirlpool)
+    /// - accounts[1] = token_mint_a
+    /// - accounts[2] = token_mint_b
+    /// - accounts[3] = token_vault_a
+    /// - accounts[4] = token_vault_b
+    /// - accounts[5] = "tick_current_index:<value>"
+    /// - accounts[6] = "tick_spacing:<value>"
+    ///
+    /// Returns None if pool is not cached.
+    pub fn get_pool_accounts(&self, pool_address: &Pubkey) -> Option<Vec<String>> {
+        self.pools.get(pool_address).map(|pool| {
+            vec![
+                pool_address.to_string(),
+                pool.base_mint.to_string(),
+                pool.quote_mint.to_string(),
+                pool.vault_a.to_string(),
+                pool.vault_b.to_string(),
+                format!("tick_current_index:{}", pool.tick_current_index.unwrap_or(0)),
+                format!("tick_spacing:{}", pool.tick_spacing.unwrap_or(64)),
+            ]
+        })
+    }
+
     /// Register (or override) a user token account (ATA) for a given mint.
     pub fn set_user_token_account(&self, mint: Pubkey, ata: Pubkey) {
         self.user_token_accounts.insert(mint, ata);

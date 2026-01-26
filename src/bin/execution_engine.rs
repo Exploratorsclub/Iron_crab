@@ -83,6 +83,7 @@ use ironcrab::nats::{
 };
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
+use ironcrab::solana::dex::orca::Orca;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
 use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use ironcrab::solana::dex::raydium::Raydium;
@@ -1072,14 +1073,7 @@ impl ExecutionContext {
         maybe_ping_watchdog();
 
         // Initialize DEX connectors for quote discovery.
-        let raydium = Raydium::new(Arc::clone(&ctx.rpc));
-        let mut meteora = MeteoraDlmm::new(Arc::clone(&ctx.rpc));
-        meteora.set_user_authority(owner);
-        let pump_amm = PumpFunAmmDex::new(
-            Arc::clone(&ctx.rpc),
-            ctx.rpc_url.clone(),
-            ctx.helius_rpc_url.clone(),
-        );
+        // Order priority: PumpFun → PumpSwap → Meteora DLMM → Raydium → Orca
         let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc)) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -1087,21 +1081,51 @@ impl ExecutionContext {
                 None
             }
         };
+        let pump_amm = PumpFunAmmDex::new(
+            Arc::clone(&ctx.rpc),
+            ctx.rpc_url.clone(),
+            ctx.helius_rpc_url.clone(),
+        );
+        let mut meteora = MeteoraDlmm::new(Arc::clone(&ctx.rpc));
+        meteora.set_user_authority(owner);
+        let raydium = Raydium::new(Arc::clone(&ctx.rpc));
+        let orca = Orca::new(Arc::clone(&ctx.rpc));
+        orca.set_user_authority(owner);
 
         if let Err(e) = raydium.refresh_pools().await {
             warn!(error = %e, "Raydium refresh_pools failed; liquidation may miss routes");
         }
-        // Meteora: inject cached pools from Geyser LivePoolCache (NO RPC needed!)
+        if let Err(e) = orca.refresh_pools().await {
+            warn!(error = %e, "Orca refresh_pools failed; liquidation may miss routes");
+        }
+        // Meteora + Orca: inject cached pools from Geyser LivePoolCache (NO RPC needed!)
         // The pools are already cached from market-data via Geyser subscription.
         if let Some(ref cache) = ctx.live_pool_cache {
+            let mut meteora_count = 0;
+            let mut orca_count = 0;
             for (pool_addr, state) in cache.iter() {
-                if let CachedPoolState::Meteora(ref ms) = state {
-                    let _ = meteora.inject_cached_meteora_state(&pool_addr, ms);
+                match state {
+                    CachedPoolState::Meteora(ref ms) => {
+                        // Only inject if we have real Geyser data (active_id != 0)
+                        // Default active_id=0 means no real data, would cause wrong bin array derivation
+                        if ms.active_id != 0
+                            && meteora.inject_cached_meteora_state(&pool_addr, ms).is_ok()
+                        {
+                            meteora_count += 1;
+                        }
+                    }
+                    CachedPoolState::Orca(ref os) => {
+                        if orca.inject_cached_orca_state(&pool_addr, os).is_ok() {
+                            orca_count += 1;
+                        }
+                    }
+                    _ => {}
                 }
             }
             info!(
-                meteora_pools = meteora.list_pools().len(),
-                "Meteora: injected pools from LivePoolCache (GEYSER-FIRST)"
+                meteora_pools = meteora_count,
+                orca_pools = orca_count,
+                "DEX pools injected from LivePoolCache (GEYSER-FIRST)"
             );
         }
         #[cfg(unix)]
@@ -1377,6 +1401,69 @@ impl ExecutionContext {
                 }
             }
 
+            // Fallback to Meteora DLMM (before Raydium for better liquidity on meme tokens).
+            // IMPORTANT: Only use if we have real Geyser data (active_id != 0).
+            // Default active_id=0 means no real data, would cause wrong bin array derivation.
+            if min_out_sol.is_none() {
+                match meteora
+                    .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
+                    .await
+                {
+                    Ok(Some(q)) => {
+                        #[cfg(unix)]
+                        maybe_ping_watchdog();
+
+                        if let Some(pool_id) = q.route.first().cloned() {
+                            // Get DexPoolAccounts for the pool (required by build_tx_plan)
+                            if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
+                                if let Some(pool_accounts) = meteora.get_pool_accounts(&pool_pk) {
+                                    // Validate we have real Geyser data (not defaults)
+                                    // active_id is stored as "active_id:<value>" in accounts[5]
+                                    let active_id = pool_accounts
+                                        .get(5)
+                                        .and_then(|s| s.strip_prefix("active_id:"))
+                                        .and_then(|v| v.parse::<i32>().ok())
+                                        .unwrap_or(0);
+
+                                    if active_id != 0 {
+                                        metadata.insert("dex".to_string(), "meteora_dlmm".to_string());
+                                        resources.pools = vec![pool_id.clone()];
+                                        resources.accounts = pool_accounts;
+                                        min_out_sol = Some(Self::apply_slippage_min_out(
+                                            q.amount_out,
+                                            max_slippage_bps,
+                                        ));
+                                        quote_attempts.push(format!(
+                                            "meteora=ok amount_out={} pool={} active_id={} accounts_len={}",
+                                            q.amount_out,
+                                            pool_id,
+                                            active_id,
+                                            resources.accounts.len()
+                                        ));
+                                    } else {
+                                        quote_attempts.push(format!(
+                                            "meteora=skip active_id=0 (no Geyser data) pool={}",
+                                            pool_id
+                                        ));
+                                    }
+                                } else {
+                                    quote_attempts.push(format!(
+                                        "meteora=skip no_pool_accounts amount_out={} pool={}",
+                                        q.amount_out, pool_id
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        quote_attempts.push("meteora=none".to_string());
+                    }
+                    Err(e) => {
+                        quote_attempts.push(format!("meteora=err {e:#}"));
+                    }
+                }
+            }
+
             // Fallback to Raydium.
             if min_out_sol.is_none() {
                 match raydium
@@ -1407,9 +1494,9 @@ impl ExecutionContext {
                 }
             }
 
-            // Fallback to Meteora DLMM.
+            // Fallback to Orca Whirlpool.
             if min_out_sol.is_none() {
-                match meteora
+                match orca
                     .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
                     .await
                 {
@@ -1418,10 +1505,9 @@ impl ExecutionContext {
                         maybe_ping_watchdog();
 
                         if let Some(pool_id) = q.route.first().cloned() {
-                            // Get DexPoolAccounts for the pool (required by build_tx_plan)
                             if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
-                                if let Some(pool_accounts) = meteora.get_pool_accounts(&pool_pk) {
-                                    metadata.insert("dex".to_string(), "meteora_dlmm".to_string());
+                                if let Some(pool_accounts) = orca.get_pool_accounts(&pool_pk) {
+                                    metadata.insert("dex".to_string(), "orca".to_string());
                                     resources.pools = vec![pool_id.clone()];
                                     resources.accounts = pool_accounts;
                                     min_out_sol = Some(Self::apply_slippage_min_out(
@@ -1429,14 +1515,14 @@ impl ExecutionContext {
                                         max_slippage_bps,
                                     ));
                                     quote_attempts.push(format!(
-                                        "meteora=ok amount_out={} pool={} accounts_len={}",
+                                        "orca=ok amount_out={} pool={} accounts_len={}",
                                         q.amount_out,
                                         pool_id,
                                         resources.accounts.len()
                                     ));
                                 } else {
                                     quote_attempts.push(format!(
-                                        "meteora=skip no_pool_accounts amount_out={} pool={}",
+                                        "orca=skip no_pool_accounts amount_out={} pool={}",
                                         q.amount_out, pool_id
                                     ));
                                 }
@@ -1444,10 +1530,10 @@ impl ExecutionContext {
                         }
                     }
                     Ok(None) => {
-                        quote_attempts.push("meteora=none".to_string());
+                        quote_attempts.push("orca=none".to_string());
                     }
                     Err(e) => {
-                        quote_attempts.push(format!("meteora=err {e:#}"));
+                        quote_attempts.push(format!("orca=err {e:#}"));
                     }
                 }
             }
