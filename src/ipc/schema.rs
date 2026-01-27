@@ -203,6 +203,11 @@ pub enum MarketEventKind {
         /// Populated from creator_cache when available.
         #[serde(skip_serializing_if = "Option::is_none")]
         creator: Option<String>,
+        /// Token program for the base mint (SPL Token or Token-2022).
+        /// Extracted from PumpFun swap instruction accounts.
+        /// Used for deterministic ATA creation without RPC lookup.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_program: Option<String>,
     },
     /// Swap observed on-chain (legacy format)
     SwapObserved {

@@ -231,17 +231,19 @@ impl PumpFunDex {
 
     /// Returns the token program for a pump.fun mint.
     /// 
-    /// If `override_program` is provided, use that (e.g., from intent.resources.token_program).
-    /// Otherwise, defaults to SPL Token. However, newer PumpFun tokens may use Token-2022!
+    /// If `override_program` is provided (from intent.resources.token_program via Geyser),
+    /// use that. Otherwise, defaults to SPL Token (legacy behavior).
     /// 
-    /// The override should come from the Geyser-observed mint account owner.
+    /// The override MUST come from the Geyser-observed mint account owner.
+    /// NO RPC calls in the hot path!
     fn token_program_for_mint(&self, _token_mint: &Pubkey, override_program: Option<&Pubkey>) -> Pubkey {
         if let Some(prog) = override_program {
-            *prog
-        } else {
-            // Default to SPL Token - but this may be wrong for newer Token-2022 mints!
-            Pubkey::new_from_array(spl_token::id().to_bytes())
+            return *prog;
         }
+        
+        // Default to SPL Token if no override provided
+        // This is a fallback - the correct token_program should come from Geyser via the intent
+        Pubkey::new_from_array(spl_token::id().to_bytes())
     }
 
     /// Derive creator vault PDA (NEW in Pump.fun protocol update)
@@ -917,6 +919,7 @@ impl PumpFunDex {
     /// # Arguments
     /// * `token_program_override` - If set, use this token program instead of defaulting to SPL Token.
     ///   This is critical for Token-2022 mints (newer PumpFun tokens).
+    #[allow(clippy::too_many_arguments)]
     pub async fn build_swap_ix_async_with_slippage(
         &self,
         input_mint: &str,

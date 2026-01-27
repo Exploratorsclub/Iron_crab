@@ -5412,6 +5412,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             signature,
             dex: event_dex,
             creator: trade_creator, // Creator from market-data cache (PumpFun)
+            token_program: trade_token_program, // Token program from Geyser (PumpFun swaps)
             ..  // Ignore token_decimals, quote_mint - we don't need them for momentum detection
         } => {
             // P1: Trade-based Token Discovery
@@ -5479,6 +5480,33 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             };
 
             ctx.record_trade(mint, trader, *is_buy, sol_lamports, token_raw, &sig);
+
+            // P1: If Trade event carries token_program (from PumpFun Geyser parsing), cache it.
+            // This enables deterministic ATA creation without waiting for TokenMintInfo event.
+            // Critical fix for Token-2022 tokens where TokenMintInfo arrives AFTER intent generation.
+            if let Some(ref tp) = trade_token_program {
+                let mut infos = ctx.mint_infos.write();
+                if !infos.contains_key(mint) {
+                    // Create minimal MintInfo entry with token_program.
+                    // Other fields will be updated when TokenMintInfo arrives.
+                    infos.insert(
+                        mint.to_string(),
+                        MintInfo {
+                            token_program: tp.clone(),
+                            decimals: 9, // Default, will be updated by TokenMintInfo
+                            supply: 0,   // Unknown, will be updated by TokenMintInfo
+                            mint_authority: None,
+                            freeze_authority: None,
+                            last_updated: Instant::now(),
+                        },
+                    );
+                    info!(
+                        mint = %mint,
+                        token_program = %tp,
+                        "📦 Token program cached from Trade event (before TokenMintInfo)"
+                    );
+                }
+            }
 
             // P1: If Trade event carries creator (from market-data cache), set it on tracker.
             // This enables intent building without waiting for separate DevWalletIdentified event.

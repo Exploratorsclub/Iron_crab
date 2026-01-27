@@ -70,6 +70,11 @@ pub enum ParsedDexEvent {
         /// Creator/dev wallet for PumpFun bonding curve tokens.
         /// Extracted from Fee Recipient account in swap instruction.
         creator: Option<Pubkey>,
+        /// Token program for the base mint (SPL Token or Token-2022).
+        /// Extracted from instruction accounts for PumpFun swaps.
+        /// - SPL Token: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+        /// - Token-2022: TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb
+        token_program: Option<Pubkey>,
     },
     /// Liquidity removed (potential rug)
     LiquidityRemoved {
@@ -379,6 +384,7 @@ fn parse_raydium_swap(
         slot: update.slot,
         pool_accounts: None,
         creator: None,
+        token_program: None, // Raydium uses SPL Token, but we don't trade there for momentum
     })
 }
 
@@ -547,6 +553,7 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
         slot: update.slot,
         pool_accounts: None,
         creator: None,
+        token_program: None, // Orca uses SPL Token, but we don't trade there for momentum
     })
 }
 
@@ -717,6 +724,20 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
     // Extract creator from Fee Recipient account[1] for PumpFun Bonding Curve
     let creator = update.instruction_accounts.get(1).copied();
 
+    // Extract Token Program from instruction accounts[8].
+    // PumpFun now supports both SPL Token AND Token-2022 mints.
+    // This is critical for deterministic ATA creation without RPC lookup.
+    let token_program = update.instruction_accounts.get(8).copied();
+
+    if let Some(ref tp) = token_program {
+        debug!(
+            mint = %mint,
+            token_program = %tp,
+            sig = %update.signature,
+            "PumpFun swap: extracted token_program from instruction"
+        );
+    }
+
     Some(ParsedDexEvent::Trade {
         pool_address: bonding_curve,
         mint,
@@ -731,6 +752,7 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
         slot: update.slot,
         pool_accounts: None,
         creator,
+        token_program,
     })
 }
 
@@ -888,6 +910,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         slot: update.slot,
         pool_accounts: Some(pool_accounts),
         creator: None, // PumpSwap uses coin_creator_vault_authority from pool_accounts[10]
+        token_program: None, // TODO: Extract from PumpSwap instruction if needed
     })
 }
 
@@ -1011,6 +1034,7 @@ impl ParsedDexEvent {
                 token_decimals,
                 signature,
                 creator,
+                token_program,
                 ..
             } => MarketEventKind::Trade {
                 pool_address: pool_address.to_string(),
@@ -1024,6 +1048,7 @@ impl ParsedDexEvent {
                 signature: Some(signature.clone()),
                 dex: dex.to_string(),
                 creator: creator.map(|c| c.to_string()),
+                token_program: token_program.map(|tp| tp.to_string()),
             },
             ParsedDexEvent::LiquidityRemoved {
                 pool_address,
@@ -1174,6 +1199,7 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
         slot: update.slot,
         pool_accounts: None,
         creator: None,
+        token_program: None, // Meteora uses SPL Token, not relevant for momentum trading
     })
 }
 
@@ -1295,6 +1321,7 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
         slot: update.slot,
         pool_accounts: None,
         creator: None,
+        token_program: None, // Raydium CPMM uses SPL Token, not relevant for momentum trading
     })
 }
 

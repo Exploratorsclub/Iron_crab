@@ -31,6 +31,7 @@ async fn test_pumpfun_build_buy_ix_pure_derivation() {
             123_456,   // min_out (raw)
             Some(creator),
             500, // 5% slippage
+            None, // token_program_override - use default SPL Token
         )
         .await
         .expect("build_swap_ix_async_with_slippage");
