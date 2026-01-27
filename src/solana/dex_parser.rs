@@ -727,7 +727,13 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
     // Extract Token Program from instruction accounts[8].
     // PumpFun now supports both SPL Token AND Token-2022 mints.
     // This is critical for deterministic ATA creation without RPC lookup.
-    let token_program = update.instruction_accounts.get(8).copied();
+    // VALIDATE: Only accept known token programs to avoid caching wrong accounts.
+    let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").ok();
+    let token_2022 = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").ok();
+    
+    let token_program = update.instruction_accounts.get(8).copied().filter(|tp| {
+        spl_token.as_ref() == Some(tp) || token_2022.as_ref() == Some(tp)
+    });
 
     if let Some(ref tp) = token_program {
         debug!(
