@@ -3528,10 +3528,16 @@ async fn recover_positions_from_jsonl(
             }
 
             // Determine BUY vs SELL from fill amounts
-            // BUY: token fill_out > 0, likely from momentum-bot
-            // SELL: token fill_in > 100k (includes liquidations from execution-engine)
-            let is_buy = exec.fill_out.is_some() && exec.fill_out.as_ref().unwrap().raw > 0;
-            let is_sell = exec.fill_in.is_some() && exec.fill_in.as_ref().unwrap().raw > 100_000;
+            // Key insight: For liquidations/SELLs, fill_in (tokens sold) is MUCH larger than fill_out (SOL received)
+            // For BUYs, fill_out (tokens received) is large, fill_in may be absent or small
+            let fill_in_raw = exec.fill_in.as_ref().map(|f| f.raw).unwrap_or(0);
+            let fill_out_raw = exec.fill_out.as_ref().map(|f| f.raw).unwrap_or(0);
+            
+            // SELL: large fill_in (tokens being sold) - this takes priority
+            // The tokens sold (fill_in) should be > 100k and larger than fill_out for it to be a SELL
+            let is_sell = fill_in_raw > 100_000 && fill_in_raw > fill_out_raw;
+            // BUY: large fill_out (tokens received), not a SELL
+            let is_buy = fill_out_raw > 0 && !is_sell;
 
             // For BUYs: only track momentum-bot executions
             // For SELLs: track from any source (momentum-bot OR execution-engine liquidations)
