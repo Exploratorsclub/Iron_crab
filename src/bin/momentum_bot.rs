@@ -376,6 +376,107 @@ struct PositionTracker {
     exit_generated: bool,
 }
 
+/// Serializable position state for JetStream KV persistence
+///
+/// This struct can be serialized to JSON and stored in NATS JetStream KV.
+/// Unlike PositionTracker which uses std::time::Instant (not serializable),
+/// this uses Unix timestamps for entry_time.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedPosition {
+    /// Token mint address
+    mint: String,
+    /// Token decimals
+    token_decimals: u8,
+    /// Pool address for selling
+    pool: String,
+    /// DEX name
+    dex: String,
+    /// Entry time as Unix timestamp (milliseconds)
+    entry_time_unix_ms: u64,
+    /// Entry price (token per SOL)
+    entry_price: f64,
+    /// Amount of tokens held (raw)
+    token_amount: u64,
+    /// SOL invested (lamports)
+    sol_invested: u64,
+    /// Highest price seen since entry
+    highest_price: f64,
+    /// Current estimated price
+    current_price: f64,
+    /// Has trailing stop been activated?
+    trailing_active: bool,
+    /// Exit intent already generated?
+    exit_generated: bool,
+    /// Schema version for forward compatibility
+    schema_version: u8,
+}
+
+impl PersistedPosition {
+    const CURRENT_SCHEMA_VERSION: u8 = 1;
+
+    /// Convert from PositionTracker to PersistedPosition
+    fn from_tracker(tracker: &PositionTracker) -> Self {
+        // Calculate entry_time_unix_ms from the elapsed time
+        let elapsed = tracker.entry_time.elapsed();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let entry_time_unix_ms = now_ms.saturating_sub(elapsed.as_millis() as u64);
+
+        Self {
+            mint: tracker.mint.clone(),
+            token_decimals: tracker.token_decimals,
+            pool: tracker.pool.clone(),
+            dex: tracker.dex.clone(),
+            entry_time_unix_ms,
+            entry_price: tracker.entry_price,
+            token_amount: tracker.token_amount,
+            sol_invested: tracker.sol_invested,
+            highest_price: tracker.highest_price,
+            current_price: tracker.current_price,
+            trailing_active: tracker.trailing_active,
+            exit_generated: tracker.exit_generated,
+            schema_version: Self::CURRENT_SCHEMA_VERSION,
+        }
+    }
+
+    /// Convert to PositionTracker, reconstructing entry_time from Unix timestamp
+    fn to_tracker(&self) -> PositionTracker {
+        // Calculate how long ago entry_time was
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let elapsed_ms = now_ms.saturating_sub(self.entry_time_unix_ms);
+
+        // Reconstruct entry_time as Instant::now() minus elapsed
+        // Note: This is approximate but accurate enough for our purposes
+        let entry_time = Instant::now()
+            .checked_sub(Duration::from_millis(elapsed_ms))
+            .unwrap_or_else(Instant::now);
+
+        PositionTracker {
+            mint: self.mint.clone(),
+            token_decimals: self.token_decimals,
+            pool: self.pool.clone(),
+            dex: self.dex.clone(),
+            entry_time,
+            entry_price: self.entry_price,
+            token_amount: self.token_amount,
+            sol_invested: self.sol_invested,
+            highest_price: self.highest_price,
+            current_price: self.current_price,
+            recent_trades: Vec::new(), // Not persisted - will be rebuilt from live data
+            trailing_active: self.trailing_active,
+            exit_generated: self.exit_generated,
+        }
+    }
+}
+
+/// JetStream KV bucket name for position state
+const POSITION_KV_BUCKET: &str = "POSITIONS";
+
 impl PositionTracker {
     fn new(
         mint: &str,
@@ -1504,6 +1605,8 @@ struct MomentumContext {
     pending_intents: parking_lot::RwLock<HashMap<String, PendingIntent>>,
     /// Multi-pool registry: All known pools per mint (mint -> Vec<PoolInfo>)
     mint_pools: parking_lot::RwLock<HashMap<String, Vec<PoolInfo>>>,
+    /// JetStream KV Store for position persistence (initialized lazily)
+    position_kv: tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
     /// Stats
     tokens_tracked: std::sync::atomic::AtomicU64,
     tokens_blacklisted: std::sync::atomic::AtomicU64,
@@ -2159,43 +2262,53 @@ impl MomentumContext {
     // =========================================================================
 
     /// Open a new position after buy intent is executed
-    fn open_position(&self, p: OpenPositionParams<'_>) {
-        let mut positions = self.positions.write();
-        if let Some(pos) = positions.get_mut(p.mint) {
-            pos.token_amount = pos.token_amount.saturating_add(p.token_amount);
-            pos.add_investment(p.sol_invested);
-            // Keep the best-known decimals (prefer non-zero).
-            if pos.token_decimals == 0 && p.token_decimals != 0 {
-                pos.token_decimals = p.token_decimals;
+    /// Also persists the position to JetStream KV for crash recovery
+    fn open_position(self: &Arc<Self>, p: OpenPositionParams<'_>) {
+        let mint_owned = p.mint.to_string();
+        let tracker = {
+            let mut positions = self.positions.write();
+            if let Some(pos) = positions.get_mut(p.mint) {
+                pos.token_amount = pos.token_amount.saturating_add(p.token_amount);
+                pos.add_investment(p.sol_invested);
+                // Keep the best-known decimals (prefer non-zero).
+                if pos.token_decimals == 0 && p.token_decimals != 0 {
+                    pos.token_decimals = p.token_decimals;
+                }
+                info!(
+                    mint = %p.mint,
+                    additional_sol = p.sol_invested,
+                    additional_tokens_raw = p.token_amount,
+                    total_sol = pos.sol_invested,
+                    total_tokens_raw = pos.token_amount,
+                    "📈 Position scaled in"
+                );
+                pos.clone()
+            } else {
+                let new_tracker = PositionTracker::new(
+                    p.mint,
+                    p.pool,
+                    p.dex,
+                    p.entry_price,
+                    p.token_decimals,
+                    p.token_amount,
+                    p.sol_invested,
+                );
+                positions.insert(p.mint.to_string(), new_tracker.clone());
+                info!(
+                    mint = %p.mint,
+                    entry_price = p.entry_price,
+                    sol_invested = p.sol_invested,
+                    "📈 Position opened"
+                );
+                new_tracker
             }
-            info!(
-                mint = %p.mint,
-                additional_sol = p.sol_invested,
-                additional_tokens_raw = p.token_amount,
-                total_sol = pos.sol_invested,
-                total_tokens_raw = pos.token_amount,
-                "📈 Position scaled in"
-            );
-            return;
-        }
-        positions.insert(
-            p.mint.to_string(),
-            PositionTracker::new(
-                p.mint,
-                p.pool,
-                p.dex,
-                p.entry_price,
-                p.token_decimals,
-                p.token_amount,
-                p.sol_invested,
-            ),
-        );
-        info!(
-            mint = %p.mint,
-            entry_price = p.entry_price,
-            sol_invested = p.sol_invested,
-            "📈 Position opened"
-        );
+        };
+
+        // Persist to KV asynchronously (fire-and-forget)
+        let ctx = Arc::clone(self);
+        tokio::spawn(async move {
+            ctx.save_position_to_kv(&mint_owned, &tracker).await;
+        });
     }
 
     /// Update position price from market trade
@@ -2210,9 +2323,15 @@ impl MomentumContext {
     }
 
     /// Close position (after sell executed)
-    fn close_position(&self, mint: &str) {
-        let mut positions = self.positions.write();
-        if let Some(pos) = positions.remove(mint) {
+    /// Also removes the position from JetStream KV
+    fn close_position(self: &Arc<Self>, mint: &str) {
+        let mint_owned = mint.to_string();
+        let removed = {
+            let mut positions = self.positions.write();
+            positions.remove(mint)
+        };
+
+        if let Some(pos) = removed {
             let pnl = pos.pnl_pct();
             let hold_secs = pos.entry_time.elapsed().as_secs();
             info!(
@@ -2221,6 +2340,123 @@ impl MomentumContext {
                 hold_time_secs = hold_secs,
                 "📉 Position closed"
             );
+        }
+
+        // Delete from KV asynchronously (fire-and-forget)
+        let ctx = Arc::clone(self);
+        tokio::spawn(async move {
+            ctx.delete_position_from_kv(&mint_owned).await;
+        });
+    }
+
+    // =========================================================================
+    // JetStream KV Position Persistence
+    // =========================================================================
+
+    /// Get or initialize the JetStream KV store for positions
+    async fn get_position_kv(&self) -> Option<&async_nats::jetstream::kv::Store> {
+        let nats = self.nats.as_ref()?;
+
+        // Try to get cached store first
+        if let Some(store) = self.position_kv.get() {
+            return Some(store);
+        }
+
+        // Initialize the KV bucket
+        match nats.get_or_create_kv_bucket(POSITION_KV_BUCKET).await {
+            Ok(store) => {
+                // Try to set it (ignore if another task beat us)
+                let _ = self.position_kv.set(store);
+                self.position_kv.get()
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to create position KV bucket");
+                None
+            }
+        }
+    }
+
+    /// Save a position to JetStream KV
+    async fn save_position_to_kv(&self, mint: &str, tracker: &PositionTracker) {
+        let Some(nats) = self.nats.as_ref() else {
+            return;
+        };
+        let Some(store) = self.get_position_kv().await else {
+            return;
+        };
+
+        let persisted = PersistedPosition::from_tracker(tracker);
+        match nats.kv_put(store, mint, &persisted).await {
+            Ok(rev) => {
+                debug!(mint = %mint, revision = rev, "Position saved to KV");
+            }
+            Err(e) => {
+                warn!(mint = %mint, error = %e, "Failed to save position to KV");
+            }
+        }
+    }
+
+    /// Delete a position from JetStream KV
+    async fn delete_position_from_kv(&self, mint: &str) {
+        let Some(nats) = self.nats.as_ref() else {
+            return;
+        };
+        let Some(store) = self.get_position_kv().await else {
+            return;
+        };
+
+        match nats.kv_delete(store, mint).await {
+            Ok(()) => {
+                debug!(mint = %mint, "Position deleted from KV");
+            }
+            Err(e) => {
+                // Not a critical error - position might not exist in KV
+                debug!(mint = %mint, error = %e, "Failed to delete position from KV (may not exist)");
+            }
+        }
+    }
+
+    /// Load all positions from JetStream KV on startup
+    /// Note: Currently unused as we load directly in main for cleaner error handling,
+    /// but kept for potential future use (e.g., hot-reload scenarios).
+    #[allow(dead_code)]
+    async fn load_positions_from_kv(&self) -> HashMap<String, PositionTracker> {
+        let Some(nats) = self.nats.as_ref() else {
+            info!("NATS not connected, skipping KV position recovery");
+            return HashMap::new();
+        };
+        let Some(store) = self.get_position_kv().await else {
+            warn!("Failed to get position KV store");
+            return HashMap::new();
+        };
+
+        match nats.kv_get_all::<PersistedPosition>(store).await {
+            Ok(persisted_positions) => {
+                let mut positions = HashMap::new();
+                for (mint, persisted) in persisted_positions {
+                    let tracker = persisted.to_tracker();
+                    let hold_secs = tracker.entry_time.elapsed().as_secs();
+                    info!(
+                        mint = %mint,
+                        pool = %tracker.pool,
+                        dex = %tracker.dex,
+                        entry_price = tracker.entry_price,
+                        sol_invested = tracker.sol_invested,
+                        hold_secs = hold_secs,
+                        "🔄 Position recovered from JetStream KV"
+                    );
+                    positions.insert(mint, tracker);
+                }
+                info!(
+                    recovered = positions.len(),
+                    "Position recovery from JetStream KV complete"
+                );
+                positions
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to load positions from KV");
+                HashMap::new()
+            }
         }
     }
 
@@ -2410,7 +2646,7 @@ impl MomentumContext {
     }
 
     /// Handle execution result from execution-engine
-    fn handle_execution_result(&self, result: &ExecutionResult) {
+    fn handle_execution_result(self: &Arc<Self>, result: &ExecutionResult) {
         // Find the pending intent by id (source is not authoritative).
         let pending_opt = {
             let mut pending = self.pending_intents.write();
@@ -3560,17 +3796,7 @@ async fn main() -> Result<()> {
 
     info!(log_dir = %log_dir.display(), "JSONL writer initialized");
 
-    // === P0: Recover open positions from execution_results JSONL ===
-    // Critical: Prevents "forgotten" tokens after restarts
-    let recovered_positions = match recover_positions_from_jsonl(&log_dir).await {
-        Ok(positions) => positions,
-        Err(e) => {
-            warn!(error = %e, "Failed to recover positions from JSONL, starting with empty state");
-            HashMap::new()
-        }
-    };
-
-    // Setup NATS
+    // Setup NATS first (needed for KV recovery)
     let nats = if args.dry_run {
         info!("Dry-run mode: NATS publishing disabled");
         None
@@ -3584,6 +3810,85 @@ async fn main() -> Result<()> {
             info!(url = %args.nats_url, "Connected to NATS");
             Some(client)
         }
+    };
+
+    // === P0: Recover open positions ===
+    // Priority: JetStream KV (preferred) -> JSONL fallback (legacy)
+    let recovered_positions = {
+        let mut positions = HashMap::new();
+        let mut from_kv = false;
+
+        // Try JetStream KV first
+        if let Some(ref nats_client) = nats {
+            match nats_client.get_or_create_kv_bucket(POSITION_KV_BUCKET).await {
+                Ok(store) => {
+                    match nats_client.kv_get_all::<PersistedPosition>(&store).await {
+                        Ok(persisted_positions) => {
+                            for (mint, persisted) in persisted_positions {
+                                let tracker = persisted.to_tracker();
+                                let hold_secs = tracker.entry_time.elapsed().as_secs();
+                                info!(
+                                    mint = %mint,
+                                    pool = %tracker.pool,
+                                    dex = %tracker.dex,
+                                    entry_price = tracker.entry_price,
+                                    sol_invested = tracker.sol_invested,
+                                    hold_secs = hold_secs,
+                                    "🔄 Position recovered from JetStream KV"
+                                );
+                                positions.insert(mint, tracker);
+                            }
+                            if !positions.is_empty() {
+                                from_kv = true;
+                                info!(
+                                    recovered = positions.len(),
+                                    "✅ Positions recovered from JetStream KV (preferred)"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to load positions from KV");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to get position KV bucket");
+                }
+            }
+        }
+
+        // Fallback to JSONL if no KV positions found
+        if !from_kv {
+            info!("No positions in JetStream KV, trying JSONL fallback...");
+            match recover_positions_from_jsonl(&log_dir).await {
+                Ok(jsonl_positions) => {
+                    if !jsonl_positions.is_empty() {
+                        info!(
+                            recovered = jsonl_positions.len(),
+                            "⚠️ Positions recovered from JSONL (legacy fallback)"
+                        );
+                        // Migrate to KV for future restarts
+                        if let Some(ref nats_client) = nats {
+                            if let Ok(store) = nats_client.get_or_create_kv_bucket(POSITION_KV_BUCKET).await {
+                                for (mint, tracker) in &jsonl_positions {
+                                    let persisted = PersistedPosition::from_tracker(tracker);
+                                    if let Err(e) = nats_client.kv_put(&store, mint, &persisted).await {
+                                        warn!(mint = %mint, error = %e, "Failed to migrate position to KV");
+                                    }
+                                }
+                                info!("Migrated {} positions from JSONL to JetStream KV", jsonl_positions.len());
+                            }
+                        }
+                        positions = jsonl_positions;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to recover positions from JSONL, starting with empty state");
+                }
+            }
+        }
+
+        positions
     };
 
     let ctx = Arc::new(MomentumContext {
@@ -3600,6 +3905,7 @@ async fn main() -> Result<()> {
         positions: parking_lot::RwLock::new(recovered_positions),
         pending_intents: parking_lot::RwLock::new(HashMap::new()),
         mint_pools: parking_lot::RwLock::new(HashMap::new()),
+        position_kv: tokio::sync::OnceCell::new(),
         tokens_tracked: std::sync::atomic::AtomicU64::new(0),
         tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
         intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -4628,6 +4934,7 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            position_kv: tokio::sync::OnceCell::new(),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -4874,6 +5181,7 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            position_kv: tokio::sync::OnceCell::new(),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -4971,6 +5279,7 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            position_kv: tokio::sync::OnceCell::new(),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -5036,6 +5345,7 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            position_kv: tokio::sync::OnceCell::new(),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
