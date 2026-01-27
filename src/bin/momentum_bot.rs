@@ -4160,9 +4160,12 @@ async fn generate_and_publish_buy_intent(
         )
     };
 
-    let token_decimals_opt = {
+    let (token_decimals_opt, token_program_opt) = {
         let mint_infos = ctx.mint_infos.read();
-        mint_infos.get(&signal.mint).map(|m| m.decimals)
+        match mint_infos.get(&signal.mint) {
+            Some(m) => (Some(m.decimals), Some(m.token_program.clone())),
+            None => (None, None),
+        }
     };
 
     // Fallback: pump.fun/pumpfun/pump_amm tokens ALWAYS have 6 decimals
@@ -4355,7 +4358,7 @@ async fn generate_and_publish_buy_intent(
             output_mint: signal.mint.to_string(),
             pools: vec![effective_pool.clone()],
             accounts: dex_accounts,
-            token_program: None, // Momentum-bot doesn't need Token-2022 support yet
+            token_program: token_program_opt.clone(),
         },
         50, // Expected ROI: 0.5%
         max_slippage,

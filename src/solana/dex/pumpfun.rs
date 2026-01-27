@@ -230,11 +230,18 @@ impl PumpFunDex {
     }
 
     /// Returns the token program for a pump.fun mint.
-    /// Pump.fun tokens are ALWAYS SPL Token (never Token-2022).
-    /// This is a synchronous function - no RPC needed.
-    fn token_program_for_mint(&self, _token_mint: &Pubkey) -> Pubkey {
-        // Pump.fun tokens are ALWAYS SPL Token - this is a protocol invariant
-        Pubkey::new_from_array(spl_token::id().to_bytes())
+    /// 
+    /// If `override_program` is provided, use that (e.g., from intent.resources.token_program).
+    /// Otherwise, defaults to SPL Token. However, newer PumpFun tokens may use Token-2022!
+    /// 
+    /// The override should come from the Geyser-observed mint account owner.
+    fn token_program_for_mint(&self, _token_mint: &Pubkey, override_program: Option<&Pubkey>) -> Pubkey {
+        if let Some(prog) = override_program {
+            *prog
+        } else {
+            // Default to SPL Token - but this may be wrong for newer Token-2022 mints!
+            Pubkey::new_from_array(spl_token::id().to_bytes())
+        }
     }
 
     /// Derive creator vault PDA (NEW in Pump.fun protocol update)
@@ -892,7 +899,7 @@ impl PumpFunDex {
         min_out: u64,
         fallback_creator: Option<Pubkey>, // Creator from Geyser event for fresh launches
     ) -> Result<Vec<Instruction>> {
-        // Default slippage for backwards compatibility
+        // Default slippage for backwards compatibility, no token_program override
         self.build_swap_ix_async_with_slippage(
             input_mint,
             output_mint,
@@ -900,11 +907,16 @@ impl PumpFunDex {
             min_out,
             fallback_creator,
             1500,
+            None, // No token_program override - uses default SPL Token
         )
         .await
     }
 
     /// Build swap instruction with explicit slippage for proper max_sol_cost calculation
+    /// 
+    /// # Arguments
+    /// * `token_program_override` - If set, use this token program instead of defaulting to SPL Token.
+    ///   This is critical for Token-2022 mints (newer PumpFun tokens).
     pub async fn build_swap_ix_async_with_slippage(
         &self,
         input_mint: &str,
@@ -913,6 +925,7 @@ impl PumpFunDex {
         min_out: u64,
         fallback_creator: Option<Pubkey>,
         slippage_bps: u32,
+        token_program_override: Option<Pubkey>,
     ) -> Result<Vec<Instruction>> {
         let sol_mint = "So11111111111111111111111111111111111111112";
 
@@ -926,7 +939,7 @@ impl PumpFunDex {
         };
 
         let token_mint = Pubkey::from_str(token_mint_str)?;
-        let token_program_sdk = self.token_program_for_mint(&token_mint);
+        let token_program_sdk = self.token_program_for_mint(&token_mint, token_program_override.as_ref());
         let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
         let (associated_bonding_curve, _bump2) =
             self.derive_associated_bonding_curve(&bonding_curve, &token_mint, &token_program_sdk);

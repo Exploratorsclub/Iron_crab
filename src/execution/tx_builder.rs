@@ -803,6 +803,13 @@ pub async fn build_tx_plan(
     };
     pumpfun.set_user_authority(wallet_pubkey);
 
+    // Parse token_program from intent (for Token-2022 support)
+    let token_program_override = intent
+        .resources
+        .token_program
+        .as_ref()
+        .and_then(|s| Pubkey::from_str(s).ok());
+
     let ixs = match pumpfun
         .build_swap_ix_async_with_slippage(
             &intent.resources.input_mint,
@@ -811,6 +818,7 @@ pub async fn build_tx_plan(
             min_out,
             Some(creator),
             intent.max_slippage_bps,
+            token_program_override,
         )
         .await
     {
