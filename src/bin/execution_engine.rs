@@ -380,6 +380,11 @@ async fn compute_intent_fills_best_effort(
         } else {
             None
         }
+    } else if input_mint == SOL_MINT && lamport_noise {
+        // BUY with account lifecycle noise (new ATA created):
+        // Use intent's required_capital as fill_in (this is the SOL amount we intended to spend).
+        // This is accurate for BUYs since the intent specifies the exact SOL input amount.
+        Some(intent.required_capital.clone())
     } else {
         None
     };
