@@ -3522,41 +3522,35 @@ async fn recover_positions_from_jsonl(
                 Err(_) => continue,
             };
 
-            // Only process momentum-bot executions
-            if exec.source != "momentum-bot" {
+            // Only process confirmed executions
+            if exec.status != ExecutionStatus::Confirmed {
                 continue;
             }
 
-            // Only process confirmed executions
-            if exec.status != ExecutionStatus::Confirmed {
+            // Determine BUY vs SELL from fill amounts
+            // BUY: token fill_out > 0, likely from momentum-bot
+            // SELL: token fill_in > 100k (includes liquidations from execution-engine)
+            let is_buy = exec.fill_out.is_some() && exec.fill_out.as_ref().unwrap().raw > 0;
+            let is_sell = exec.fill_in.is_some() && exec.fill_in.as_ref().unwrap().raw > 100_000;
+
+            // For BUYs: only track momentum-bot executions
+            // For SELLs: track from any source (momentum-bot OR execution-engine liquidations)
+            if is_buy && exec.source != "momentum-bot" {
                 continue;
             }
 
             // Get token_mint (from new schema or fallback to intent lookup)
             let mint = if let Some(ref m) = exec.token_mint {
                 m.clone()
-            } else {
-                // Old schema - try to get mint from intent
+            } else if is_buy {
+                // Old schema - try to get mint from intent (only for BUYs since we filter source)
                 let mint_from_intent = if let Some(intent) = intent_lookup.get(&exec.intent_id) {
-                    // Determine BUY vs SELL from fill amounts first
-                    let has_fill_out =
-                        exec.fill_out.is_some() && exec.fill_out.as_ref().unwrap().raw > 0;
-
-                    if has_fill_out {
-                        // BUY: output_mint is the token
-                        intent
-                            .get("resources")
-                            .and_then(|r| r.get("output_mint"))
-                            .and_then(|m| m.as_str())
-                            .map(|s| s.to_string())
-                    } else {
-                        // SELL: input_mint is the token
-                        intent
-                            .get("resources")
-                            .and_then(|r| r.get("input_mint"))
-                            .and_then(|m| m.as_str())
-                            .map(|s| s.to_string())
-                    }
+                    // BUY: output_mint is the token
+                    intent
+                        .get("resources")
+                        .and_then(|r| r.get("output_mint"))
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
                 } else {
                     None
                 };
@@ -3565,14 +3559,14 @@ async fn recover_positions_from_jsonl(
                     Some(m) => m,
                     None => continue, // Skip if we can't determine mint
                 }
+            } else {
+                // SELL without token_mint - skip (can't determine which position to close)
+                continue;
             };
-
-            // Determine BUY vs SELL from fill amounts
-            let is_buy = exec.fill_out.is_some() && exec.fill_out.as_ref().unwrap().raw > 0;
-            let is_sell = exec.fill_in.is_some() && exec.fill_in.as_ref().unwrap().raw > 100_000;
 
             if is_sell {
                 // SELL confirmed - mark this mint as closed
+                // This includes liquidations from execution-engine!
                 sells.insert(mint.clone());
                 // Remove from open buys
                 buys_by_mint.remove(&mint);
