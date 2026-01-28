@@ -1406,32 +1406,13 @@ async fn run_geyser_loop(
                             let updated: Vec<Pubkey> = tracked.iter().copied().collect();
                             let _ = ctx.tracked_mints_tx.send(updated);
 
-                            // CRITICAL FIX (2026-01-18): DO NOT EMIT TokenMintInfo BEFORE GEYSER DELIVERS MINT ACCOUNT!
-                            //
-                            // Previous bug: market-data emitted TokenMintInfo for pump.fun with hard-coded:
-                            //   token_program: spl_token::ID (SPL Token)
-                            //   decimals: 6
-                            //
-                            // This assumption was FALSE for Token-2022 mints created via Pump.fun!
-                            // Example: DMYNp65mub3i7LRpBdB66CgBAceLcQnv4gsWeCi6pump (Token-2022 mint)
-                            //
-                            // Root cause: Pump.fun now supports BOTH SPL Token AND Token-2022.
-                            // The only source of truth is the mint account.owner (= token program).
-                            //
-                            // SOLUTION: Wait for Geyser to deliver the mint account (82 bytes, owner = token program).
+                            // Geyser delivers mint accounts via AccountsDB snapshot when subscribed.
                             // tracked_mints_tx already sent above → GeyserListener will resubscribe.
-                            // When Geyser delivers the mint account, this code at line 779 will emit TokenMintInfo:
-                            //   if ctx.tracked_mints.read().contains(&account_update.pubkey) { ... }
-                            //
-                            // NO RPC CALL NEEDED - Geyser delivers mint accounts automatically.
-                            // NO EARLY EMIT - avoids sending wrong token_program.
                             debug!(
                                 mint = %mint,
                                 dex = ?dex_opt,
-                                "New mint tracked, waiting for Geyser mint account delivery (Token-2022 safe)"
+                                "New mint tracked, waiting for Geyser mint account delivery"
                             );
-                            // For other DEXes: Same strategy - Geyser will deliver the mint account when subscribed.
-                            // No RPC call needed - tracked_mints is already sent to Geyser subscriber.
                         }
                     }
                 }

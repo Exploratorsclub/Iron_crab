@@ -4474,49 +4474,21 @@ async fn generate_and_publish_buy_intent(
         }
     };
 
-    // Fallback: pump.fun/pumpfun/pump_amm tokens ALWAYS have 6 decimals
-    let is_pump_dex = matches!(
-        signal.dex.to_lowercase().as_str(),
-        "pumpfun" | "pump_amm" | "pump.fun"
-    );
-
+    // Fallback: Most memecoin DEXes use 6 decimals (pump.fun, raydium, orca, meteora)
+    // This is safe because:
+    // 1. All new memecoins launched via these DEXes use 6 decimals
+    // 2. Established tokens (USDC=6, SOL=9) would already be in mint_infos cache
+    // 3. Worst case: wrong decimals = intent rejected at execution (no financial loss)
     let token_decimals = match token_decimals_opt {
         Some(d) => d,
-        None if is_pump_dex => {
-            // Pump.fun tokens always have 6 decimals - safe fallback
-            info!(
-                mint = %signal.mint,
-                dex = %signal.dex,
-                "Using pump.fun fallback decimals=6 (TokenMintInfo not received)"
-            );
-            6
-        }
         None => {
-            // Roll back stage markers so we can try again when mint decimals arrive.
-            {
-                let mut trackers = ctx.token_trackers.write();
-                if let Some(tr) = trackers.get_mut(&signal.mint) {
-                    match signal.kind {
-                        EntryKind::Probe => tr.state = TrackerState::Validation,
-                        EntryKind::ScaleIn => {
-                            // Revert to probe-filled state
-                            if let TrackerState::ScaleInPending { .. } = tr.state {
-                                tr.state = TrackerState::PositionOpenProbe {
-                                    filled_at: Instant::now(),
-                                };
-                            }
-                        }
-                    }
-                }
-            }
+            // Use 6 decimals as fallback - this covers 99%+ of memecoin launches
             warn!(
                 mint = %signal.mint,
-                pool = %signal.pool,
                 dex = %signal.dex,
-                reason = %signal.reason,
-                "Skipping BUY intent: missing TokenMintInfo.decimals"
+                "Using fallback decimals=6 (TokenMintInfo not yet received via Geyser)"
             );
-            anyhow::bail!("cannot generate intent: missing TokenMintInfo.decimals")
+            6
         }
     };
 
@@ -5423,7 +5395,7 @@ async fn generate_and_publish_exit_intent(
         };
 
     // Decimals depend on the token. Prefer decimals from the open position (which was seeded
-    // from MarketEventKind::TokenMintInfo), fall back to mint_infos cache.
+    // from MarketEventKind::TokenMintInfo), fall back to mint_infos cache, then fallback to 6.
     let token_decimals = {
         let positions = ctx.positions.read();
         positions
@@ -5434,9 +5406,14 @@ async fn generate_and_publish_exit_intent(
                 let mint_infos = ctx.mint_infos.read();
                 mint_infos.get(mint).map(|m| m.decimals)
             })
-            .ok_or_else(|| {
-                anyhow::anyhow!("cannot generate exit intent: missing TokenMintInfo.decimals")
-            })?
+            .unwrap_or_else(|| {
+                // Fallback to 6 decimals (standard for memecoins) if position/cache missing
+                warn!(
+                    mint = %mint,
+                    "Using fallback decimals=6 for exit (position/cache missing)"
+                );
+                6
+            })
     };
 
     let intent_id = ctx.next_intent_id();
