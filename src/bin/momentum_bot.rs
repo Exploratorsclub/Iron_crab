@@ -2461,6 +2461,7 @@ impl MomentumContext {
     }
 
     /// Check all positions for exit signals
+    /// Returns exit signals without marking exit_generated - caller must call mark_exit_generated() after successful publish
     fn check_for_exits(&self) -> Vec<(String, String, String, String, String, u64)> {
         // Returns: Vec<(mint, pool, dex, exit_type, reason, token_amount)>
         let config = self.config.read().clone();
@@ -2527,7 +2528,7 @@ impl MomentumContext {
                             <= Duration::from_secs(config.lp_removal_window_secs);
 
                     if lp_at > pos.entry_time && within_window {
-                        pos.exit_generated = true;
+                        // Note: exit_generated is set by caller after successful publish
                         exits.push((
                             mint.clone(),
                             pos.pool.clone(),
@@ -2544,7 +2545,7 @@ impl MomentumContext {
                     if dev_at > pos.entry_time {
                         let sig_s = sig.dev_sold_sig.as_deref().unwrap_or("<unknown>");
                         let sol = sig.dev_sold_sol.unwrap_or(0);
-                        pos.exit_generated = true;
+                        // Note: exit_generated is set by caller after successful publish
                         exits.push((
                             mint.clone(),
                             pos.pool.clone(),
@@ -2563,7 +2564,7 @@ impl MomentumContext {
             }
 
             if let Some((exit_type, reason)) = pos.should_exit(&config) {
-                pos.exit_generated = true;
+                // Note: exit_generated is set by caller after successful publish
                 exits.push((
                     mint.clone(),
                     pos.pool.clone(),
@@ -2576,6 +2577,15 @@ impl MomentumContext {
         }
 
         exits
+    }
+
+    /// Mark a position's exit as generated (call after successful SELL intent publish)
+    fn mark_exit_generated(&self, mint: &str) {
+        let mut positions = self.positions.write();
+        if let Some(pos) = positions.get_mut(mint) {
+            pos.exit_generated = true;
+            debug!(mint = %mint, "Marked position exit_generated=true");
+        }
     }
 
     /// Get position count for heartbeat
@@ -3947,8 +3957,10 @@ async fn main() -> Result<()> {
             )
             .await
             {
-                error!(error = %e, mint = %mint, "Failed to generate/publish immediate exit intent");
+                error!(error = %e, mint = %mint, "Failed to generate/publish immediate exit intent - will retry in main loop");
             } else {
+                // Only mark exit_generated AFTER successful publish
+                ctx.mark_exit_generated(&mint);
                 ctx.exits_generated
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -4375,8 +4387,11 @@ async fn main() -> Result<()> {
                     );
 
                     if let Err(e) = generate_and_publish_exit_intent(&ctx, &mint, &pool, &dex, &exit_type, &reason, token_amount).await {
-                        error!(error = %e, mint = %mint, "Failed to generate/publish sell intent");
+                        error!(error = %e, mint = %mint, "Failed to generate/publish sell intent - will retry on next tick");
+                        // Do NOT mark exit_generated - allow retry on next strategy tick
                     } else {
+                        // Only mark exit_generated AFTER successful publish
+                        ctx.mark_exit_generated(&mint);
                         ctx.exits_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
