@@ -5700,7 +5700,8 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             dex: event_dex,
             creator: trade_creator, // Creator from market-data cache (PumpFun)
             token_program: trade_token_program, // Token program from Geyser (PumpFun swaps)
-            ..  // Ignore token_decimals, quote_mint - we don't need them for momentum detection
+            token_decimals: trade_token_decimals, // Decimals from post_token_balances (Geyser)
+            ..  // Ignore quote_mint - we don't need it for momentum detection
         } => {
             // P1: Trade-based Token Discovery
             // If we missed the PoolCreated event (Geyser filter issues), discover via first trade
@@ -5780,7 +5781,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                         mint.to_string(),
                         MintInfo {
                             token_program: tp.clone(),
-                            decimals: 9, // Default, will be updated by TokenMintInfo
+                            decimals: *trade_token_decimals, // Use decimals from Geyser post_token_balances
                             supply: 0,   // Unknown, will be updated by TokenMintInfo
                             mint_authority: None,
                             freeze_authority: None,
@@ -5790,7 +5791,51 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     info!(
                         mint = %mint,
                         token_program = %tp,
-                        "📦 Token program cached from Trade event (before TokenMintInfo)"
+                        decimals = *trade_token_decimals,
+                        "📦 Token info cached from Trade event (token_program + decimals)"
+                    );
+                } else {
+                    // Entry exists - update decimals if it was set to default (9)
+                    if let Some(info) = infos.get_mut(mint) {
+                        if info.decimals == 9 && *trade_token_decimals != 9 {
+                            info.decimals = *trade_token_decimals;
+                            debug!(
+                                mint = %mint,
+                                decimals = *trade_token_decimals,
+                                "📦 Updated decimals from Trade event"
+                            );
+                        }
+                    }
+                }
+            } else if *trade_token_decimals != 9 {
+                // No token_program in Trade, but we have decimals - cache them anyway
+                let mut infos = ctx.mint_infos.write();
+                if let Some(info) = infos.get_mut(mint) {
+                    if info.decimals == 9 {
+                        info.decimals = *trade_token_decimals;
+                        debug!(
+                            mint = %mint,
+                            decimals = *trade_token_decimals,
+                            "📦 Updated decimals from Trade event (no token_program)"
+                        );
+                    }
+                } else {
+                    // Create entry with decimals only, token_program unknown
+                    infos.insert(
+                        mint.to_string(),
+                        MintInfo {
+                            token_program: String::new(), // Unknown, will be updated by TokenMintInfo
+                            decimals: *trade_token_decimals,
+                            supply: 0,
+                            mint_authority: None,
+                            freeze_authority: None,
+                            last_updated: Instant::now(),
+                        },
+                    );
+                    debug!(
+                        mint = %mint,
+                        decimals = *trade_token_decimals,
+                        "📦 Decimals cached from Trade event (token_program unknown)"
                     );
                 }
             }
