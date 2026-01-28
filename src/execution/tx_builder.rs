@@ -43,8 +43,10 @@ fn prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> In
 /// 2. Transfer native SOL to the WSOL ATA
 /// 3. Sync native balance to token balance
 ///
-/// This is required for BUY trades (SOL → Token) because DEX connectors
-/// expect WSOL in the ATA, not native SOL.
+/// NOTE: This function is currently unused because WsolManager maintains
+/// WSOL buffer outside of trades. Keeping it for potential future use
+/// (e.g., manual wrap scenarios or fallback mode).
+#[allow(dead_code)]
 fn build_wrap_sol_instructions(wallet_pubkey: Pubkey, amount_lamports: u64) -> Vec<Instruction> {
     let wsol_mint = Pubkey::from_str(SOL_MINT).expect("valid SOL_MINT");
     let wsol_mint_spl = SplProgramPubkey::new_from_array(wsol_mint.to_bytes());
@@ -453,18 +455,12 @@ pub async fn build_tx_plan(
             }
         };
 
-        // For BUY trades (SOL → Token), prepend wrap SOL instructions
-        let final_ixs = if intent.side == TradeSide::Buy {
-            let mut all_ixs =
-                build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
-            all_ixs.extend(ixs);
-            all_ixs
-        } else {
-            ixs
-        };
+        // NOTE: No in-TX wrap for BUYs!
+        // WsolManager maintains WSOL buffer outside of trades.
+        // This saves ~2000-3000 CU and avoids lamport noise that breaks fill_in detection.
 
         return TxPlanOutcome::Planned(TxPlan {
-            instructions: final_ixs,
+            instructions: ixs,
         });
     }
 
@@ -555,18 +551,12 @@ pub async fn build_tx_plan(
             }
         };
 
-        // For BUY trades (SOL → Token), prepend wrap SOL instructions
-        let final_ixs = if intent.side == TradeSide::Buy {
-            let mut all_ixs =
-                build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
-            all_ixs.extend(ixs);
-            all_ixs
-        } else {
-            ixs
-        };
+        // NOTE: No in-TX wrap for BUYs!
+        // WsolManager maintains WSOL buffer outside of trades.
+        // This saves ~2000-3000 CU and avoids lamport noise that breaks fill_in detection.
 
         return TxPlanOutcome::Planned(TxPlan {
-            instructions: final_ixs,
+            instructions: ixs,
         });
     }
 
@@ -640,15 +630,11 @@ pub async fn build_tx_plan(
             }
         };
 
-        // For BUY trades (SOL → Token), prepend wrap SOL instructions
-        // For SELL trades, just ensure WSOL ATA exists (for receiving output)
-        if intent.side == TradeSide::Buy {
-            let wrap_ixs = build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
-            for (i, ix) in wrap_ixs.into_iter().enumerate() {
-                ixs.insert(i, ix);
-            }
-        } else {
-            // SELL: just ensure WSOL ATA exists (idempotent create)
+        // NOTE: No in-TX wrap for BUYs!
+        // WsolManager maintains WSOL buffer outside of trades.
+        // This saves ~2000-3000 CU and avoids lamport noise that breaks fill_in detection.
+        // For SELL trades, ensure WSOL ATA exists (for receiving output).
+        if intent.side == TradeSide::Sell {
             let wsol_mint = Pubkey::from_str(SOL_MINT).expect("valid SOL_MINT");
             let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
             let wsol_mint_spl = SplProgramPubkey::new_from_array(wsol_mint.to_bytes());
@@ -722,12 +708,12 @@ pub async fn build_tx_plan(
             }
         };
 
-        // For BUY trades (SOL → Token), prepend wrap SOL + token ATA instructions
+        // NOTE: No in-TX wrap for BUYs!
+        // WsolManager maintains WSOL buffer outside of trades.
+        // This saves ~2000-3000 CU and avoids lamport noise that breaks fill_in detection.
+        // We only create the token ATA for receiving bought tokens.
         let final_ixs = if intent.side == TradeSide::Buy {
-            let mut all_ixs =
-                build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
-
-            // Also create token ATA (for receiving bought tokens)
+            // Create token ATA (for receiving bought tokens)
             let token_mint = Pubkey::from_str(&intent.resources.output_mint).unwrap_or_default();
             let token_mint_spl = SplProgramPubkey::new_from_array(token_mint.to_bytes());
             let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
@@ -740,7 +726,7 @@ pub async fn build_tx_plan(
                     &token_program_spl,
                 ),
             );
-            all_ixs.push(token_ata_ix);
+            let mut all_ixs = vec![token_ata_ix];
             all_ixs.extend(ixs);
             all_ixs
         } else {
@@ -831,19 +817,13 @@ pub async fn build_tx_plan(
         }
     };
 
-    // For BUY trades (SOL → Token), prepend wrap SOL instructions
-    // Pump.fun BC uses native SOL for buys, but WSOL ATA is still needed
-    // for consistency and potential WSOL interactions
-    let final_ixs = if intent.side == TradeSide::Buy {
-        let mut all_ixs = build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
-        all_ixs.extend(ixs);
-        all_ixs
-    } else {
-        ixs
-    };
+    // NOTE: No in-TX wrap for BUYs!
+    // WsolManager maintains WSOL buffer outside of trades.
+    // This saves ~2000-3000 CU and avoids lamport noise that breaks fill_in detection.
+    // Pump.fun BC swap instructions handle the SOL transfer internally.
 
     TxPlanOutcome::Planned(TxPlan {
-        instructions: final_ixs,
+        instructions: ixs,
     })
 }
 
@@ -901,11 +881,12 @@ async fn build_multi_hop_tx_plan(
 
     let mut all_instructions: Vec<Instruction> = Vec::new();
 
-    // 1. Wrap SOL for first hop (BUY side)
-    let wrap_ixs = build_wrap_sol_instructions(wallet_pubkey, intent.required_capital.raw);
-    all_instructions.extend(wrap_ixs);
+    // NOTE: No in-TX wrap for arbitrage!
+    // WsolManager maintains WSOL buffer outside of trades.
+    // This saves ~2000-3000 CU per trade and avoids lamport noise.
+    // If WSOL balance is insufficient, the swap will fail in simulation.
 
-    // 2. Build swap instructions for each hop
+    // Build swap instructions for each hop
     let mut current_amount = intent.required_capital.raw;
 
     for (hop_idx, hop) in swap_path.iter().enumerate() {
