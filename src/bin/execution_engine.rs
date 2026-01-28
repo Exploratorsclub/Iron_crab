@@ -1366,11 +1366,16 @@ impl ExecutionContext {
                 continue;
             }
 
-            let token_program = Self::token_program_for_mint_cached(
-                ctx.live_pool_cache.as_deref(),
-                &mint,
-                None, // No DEX hint in liquidation context
-            );
+            // Use the token account's owner (= token program) directly from RPC response
+            // This is more reliable than cache lookup for Token-2022 tokens
+            let token_program = Pubkey::from_str(&ta.account.owner).unwrap_or_else(|_| {
+                // Fallback to cache-based lookup if owner parsing fails
+                Self::token_program_for_mint_cached(
+                    ctx.live_pool_cache.as_deref(),
+                    &mint,
+                    None, // No DEX hint in liquidation context
+                )
+            });
             #[cfg(unix)]
             maybe_ping_watchdog();
             let ata = Self::ata_for_owner_mint(&owner, &mint, &token_program);
@@ -4674,53 +4679,84 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         let mint_str = intent.resources.input_mint.clone();
         let required_raw = intent.required_capital.raw;
 
-        let balance_check: Result<(u64, Pubkey)> = async {
+        let balance_check: Result<(u64, Pubkey, Pubkey)> = async {
             let mint = Pubkey::from_str(&mint_str)
                 .map_err(|_| anyhow::anyhow!("invalid input_mint: {}", mint_str))?;
 
+            let spl_token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+            let token_2022_program =
+                Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+                    .expect("static pubkey");
+
             // GEYSER-FIRST: Get token program from cache, not RPC
-            let token_program = if let Some(cache) = ctx.live_pool_cache.as_ref() {
-                cache.get_mint_program(&mint).unwrap_or_else(|| {
-                    // Fallback: Check if it's a pump.fun token (always SPL Token)
-                    let dex_hint = intent.metadata.get("dex").map(|s| s.as_str());
-                    let is_pump = dex_hint
-                        .map(|d| d.contains("pump") || d == "pumpfun" || d == "pump_amm")
-                        .unwrap_or(false);
-                    if is_pump {
-                        Pubkey::new_from_array(spl_token::id().to_bytes())
-                    } else {
-                        // Default to SPL Token (most common)
-                        Pubkey::new_from_array(spl_token::id().to_bytes())
-                    }
-                })
+            let cached_program = if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                cache.get_mint_program(&mint)
             } else {
-                // No cache, default to SPL Token
-                Pubkey::new_from_array(spl_token::id().to_bytes())
+                None
             };
 
+            // If we have a cached program, use it directly
+            if let Some(token_program) = cached_program {
+                let ata_spl = get_associated_token_address_with_program_id(
+                    &sdk_to_spl(&wallet),
+                    &sdk_to_spl(&mint),
+                    &sdk_to_spl(&token_program),
+                );
+                let ata = spl_to_sdk(&ata_spl);
+
+                let available_raw = match rpc.rpc.get_token_account_balance(&ata).await {
+                    Ok(ui) => ui
+                        .amount
+                        .parse::<u64>()
+                        .map_err(|e| anyhow::anyhow!("invalid token amount: {}", e))?,
+                    Err(_) => 0,
+                };
+
+                return Ok((available_raw, ata, token_program));
+            }
+
+            // No cache hit: Try SPL Token first (most common), then Token-2022
             let ata_spl = get_associated_token_address_with_program_id(
                 &sdk_to_spl(&wallet),
                 &sdk_to_spl(&mint),
-                &sdk_to_spl(&token_program),
+                &sdk_to_spl(&spl_token_program),
             );
-            let ata = spl_to_sdk(&ata_spl);
+            let ata_spl_sdk = spl_to_sdk(&ata_spl);
 
-            // TODO: Track wallet ATAs via Geyser subscription instead of RPC
-            // For now, this RPC call remains as it's wallet-specific, not pool-related
-            let available_raw = match rpc.rpc.get_token_account_balance(&ata).await {
-                Ok(ui) => ui
-                    .amount
-                    .parse::<u64>()
-                    .map_err(|e| anyhow::anyhow!("invalid token amount: {}", e))?,
+            let spl_balance = match rpc.rpc.get_token_account_balance(&ata_spl_sdk).await {
+                Ok(ui) => ui.amount.parse::<u64>().unwrap_or(0),
                 Err(_) => 0,
             };
 
-            Ok((available_raw, ata))
+            // If SPL Token has balance, use it
+            if spl_balance > 0 {
+                return Ok((spl_balance, ata_spl_sdk, spl_token_program));
+            }
+
+            // Try Token-2022
+            let ata_2022 = get_associated_token_address_with_program_id(
+                &sdk_to_spl(&wallet),
+                &sdk_to_spl(&mint),
+                &sdk_to_spl(&token_2022_program),
+            );
+            let ata_2022_sdk = spl_to_sdk(&ata_2022);
+
+            let t2022_balance = match rpc.rpc.get_token_account_balance(&ata_2022_sdk).await {
+                Ok(ui) => ui.amount.parse::<u64>().unwrap_or(0),
+                Err(_) => 0,
+            };
+
+            if t2022_balance > 0 {
+                return Ok((t2022_balance, ata_2022_sdk, token_2022_program));
+            }
+
+            // Neither has balance, return SPL Token ATA with 0
+            Ok((0, ata_spl_sdk, spl_token_program))
         }
         .await;
 
         match balance_check {
-            Ok((available_raw, ata)) => {
+            Ok((available_raw, ata, _token_program)) => {
                 // Seed lock-manager token availability so we can lock against it.
                 // This prevents overlapping SELLs on the same mint from overbooking.
                 ctx.lock_manager.set_available_token_balance(
