@@ -11,6 +11,8 @@ StartLimitBurst=5
 StartLimitIntervalSec=300
 
 [Service]
+# Bootstrap can take 2-3 minutes with 600k+ pool states in POOL_CACHE stream
+TimeoutStartSec=300
 Type=notify
 NotifyAccess=main
 User=ironcrab
