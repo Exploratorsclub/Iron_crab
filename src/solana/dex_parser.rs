@@ -6,6 +6,7 @@
 //! Source of Truth: docs/TARGET_ARCHITECTURE.md §2.1
 //! Supports: Raydium AMM V4, Orca Whirlpool, PumpFun
 
+use crate::solana::dex::pumpfun::BondingCurveState;
 use crate::solana::geyser_listener::{GeyserAccountUpdate, GeyserTransactionUpdate};
 use rust_decimal::Decimal;
 use solana_sdk::hash::hash;
@@ -85,6 +86,16 @@ pub enum ParsedDexEvent {
         signature: String,
         slot: u64,
     },
+    /// PumpFun Bonding Curve account update (contains creator)
+    /// Emitted from Geyser account updates when bonding curve state changes
+    BondingCurveUpdate {
+        pool_address: Pubkey,
+        creator: Pubkey,
+        virtual_token_reserves: u64,
+        virtual_sol_reserves: u64,
+        complete: bool,
+        slot: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,11 +161,7 @@ pub fn parse_account_update(update: &GeyserAccountUpdate) -> Option<ParsedDexEve
     match owner_str.as_str() {
         RAYDIUM_AMM_V4 => parse_raydium_account(update),
         ORCA_WHIRLPOOL => parse_orca_account(update),
-        PUMPFUN_PROGRAM => {
-            // PumpFun uses TX-based discovery, account updates are bonding curve state
-            // We could parse price updates here, but PoolCreated comes from TX
-            None
-        }
+        PUMPFUN_PROGRAM => parse_pumpfun_account(update),
         _ => None,
     }
 }
@@ -561,6 +568,47 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
 // PumpFun Parsing
 // ============================================================================
 
+/// Parse PumpFun bonding curve account update.
+/// Extracts creator from account data (bytes 49-80).
+/// This enables creator discovery even when we miss the CREATE transaction.
+fn parse_pumpfun_account(update: &GeyserAccountUpdate) -> Option<ParsedDexEvent> {
+    // Bonding curve accounts are 81+ bytes
+    if update.data.len() < 81 {
+        return None;
+    }
+
+    // Parse using existing BondingCurveState parser
+    let state = BondingCurveState::parse(&update.data).ok()?;
+
+    // Only emit for non-completed curves (active trading)
+    // Completed curves have migrated to Raydium
+    if state.complete {
+        trace!(
+            pool = %update.pubkey,
+            "PumpFun bonding curve completed (migrated to Raydium), skipping"
+        );
+        return None;
+    }
+
+    debug!(
+        pool = %update.pubkey,
+        creator = %state.creator,
+        virtual_sol = state.virtual_sol_reserves,
+        virtual_token = state.virtual_token_reserves,
+        slot = update.slot,
+        "PumpFun BondingCurveUpdate parsed from account"
+    );
+
+    Some(ParsedDexEvent::BondingCurveUpdate {
+        pool_address: update.pubkey,
+        creator: state.creator,
+        virtual_token_reserves: state.virtual_token_reserves,
+        virtual_sol_reserves: state.virtual_sol_reserves,
+        complete: state.complete,
+        slot: update.slot,
+    })
+}
+
 fn parse_pumpfun_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
     if update.instruction_data.len() < 8 {
         return None;
@@ -735,10 +783,12 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
     // VALIDATE: Only accept known token programs to avoid caching wrong accounts.
     let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").ok();
     let token_2022 = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").ok();
-    
-    let token_program = update.instruction_accounts.get(8).copied().filter(|tp| {
-        spl_token.as_ref() == Some(tp) || token_2022.as_ref() == Some(tp)
-    });
+
+    let token_program = update
+        .instruction_accounts
+        .get(8)
+        .copied()
+        .filter(|tp| spl_token.as_ref() == Some(tp) || token_2022.as_ref() == Some(tp));
 
     if let Some(ref tp) = token_program {
         debug!(
@@ -1075,6 +1125,20 @@ impl ParsedDexEvent {
                 token_amount: *token_amount,
                 signature: Some(signature.clone()),
             },
+            // BondingCurveUpdate is handled specially in market_data.rs
+            // It doesn't map to a single MarketEventKind - instead we use it to
+            // populate the creator_cache and emit DevWalletIdentified events
+            ParsedDexEvent::BondingCurveUpdate { pool_address, .. } => {
+                // Return a placeholder - this should not be called directly
+                // market_data.rs handles BondingCurveUpdate separately
+                MarketEventKind::PoolCreated {
+                    pool_address: pool_address.to_string(),
+                    base_mint: String::new(),
+                    quote_mint: String::new(),
+                    dex: "pumpfun".to_string(),
+                    initial_liquidity_sol: None,
+                }
+            }
         }
     }
 
@@ -1084,6 +1148,7 @@ impl ParsedDexEvent {
             ParsedDexEvent::PoolCreated { slot, .. } => *slot,
             ParsedDexEvent::Trade { slot, .. } => *slot,
             ParsedDexEvent::LiquidityRemoved { slot, .. } => *slot,
+            ParsedDexEvent::BondingCurveUpdate { slot, .. } => *slot,
         }
     }
 }

@@ -190,6 +190,16 @@ struct MarketDataContext {
     /// This enables momentum-bot to build intents without RPC calls.
     creator_cache: parking_lot::RwLock<std::collections::HashMap<String, String>>,
 
+    /// Pool to mint mapping for PumpFun bonding curves.
+    /// Maps pool_address -> mint. Populated from Trade events and PoolCreated.
+    /// Used to look up mint when we receive BondingCurveUpdate (which only has pool_address).
+    pool_mint_map: parking_lot::RwLock<std::collections::HashMap<String, String>>,
+
+    /// Pool to creator mapping for PumpFun bonding curves.
+    /// Maps pool_address -> creator. Populated from BondingCurveUpdate account events.
+    /// Used as secondary lookup when creator_cache (mint -> creator) misses.
+    pool_creator_cache: parking_lot::RwLock<std::collections::HashMap<String, String>>,
+
     /// === WsolManager Support: Wallet Balance Tracking ===
     /// Wallet pubkey to track for balance updates (for WsolManager in execution-engine).
     /// Set via IRONCRAB_WALLET_PUBKEY env var.
@@ -720,6 +730,8 @@ async fn main() -> Result<()> {
         tracked_bin_arrays_tx,
         live_pool_cache: Arc::new(LivePoolCache::new()),
         creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_wallet,
         tracked_wallet_tx,
     });
@@ -742,7 +754,10 @@ async fn main() -> Result<()> {
     let config_subscription = if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_CONFIG_RELOAD).await {
             Ok(sub) => {
-                info!(topic = TOPIC_CONFIG_RELOAD, "Subscribed to Config Updates (Core NATS fallback)");
+                info!(
+                    topic = TOPIC_CONFIG_RELOAD,
+                    "Subscribed to Config Updates (Core NATS fallback)"
+                );
                 Some(sub)
             }
             Err(e) => {
@@ -764,7 +779,10 @@ async fn main() -> Result<()> {
 
         match jetstream.get_stream(CONFIG_STREAM_NAME).await {
             Ok(stream) => {
-                match stream.create_consumer(config_consumer_config("market-data")).await {
+                match stream
+                    .create_consumer(config_consumer_config("market-data"))
+                    .await
+                {
                     Ok(consumer) => {
                         info!(
                             stream = CONFIG_STREAM_NAME,
@@ -1341,7 +1359,82 @@ async fn run_geyser_loop(
                 }
 
                 // Try to parse as DEX pool event (for MarketEvents - existing logic)
-                let event_kind = if let Some(parsed) = parse_account_update(&account_update) {
+                let parsed = parse_account_update(&account_update);
+
+                // Special handling for PumpFun BondingCurveUpdate: cache creator
+                if let Some(ParsedDexEvent::BondingCurveUpdate {
+                    pool_address,
+                    creator,
+                    slot,
+                    ..
+                }) = &parsed {
+                    let pool_str = pool_address.to_string();
+                    let creator_str = creator.to_string();
+
+                    // Cache pool -> creator mapping
+                    {
+                        let mut pool_creator = ctx.pool_creator_cache.write();
+                        if !pool_creator.contains_key(&pool_str) {
+                            pool_creator.insert(pool_str.clone(), creator_str.clone());
+                            debug!(
+                                pool = %pool_str,
+                                creator = %creator_str,
+                                "Cached creator from BondingCurveUpdate (pool_creator_cache)"
+                            );
+                        }
+                    }
+
+                    // If we know the mint for this pool, also update creator_cache (mint -> creator)
+                    // and emit DevWalletIdentified event
+                    if let Some(mint) = ctx.pool_mint_map.read().get(&pool_str).cloned() {
+                        let mut creator_cache = ctx.creator_cache.write();
+                        if !creator_cache.contains_key(&mint) {
+                            creator_cache.insert(mint.clone(), creator_str.clone());
+                            drop(creator_cache); // Release lock before async operations
+
+                            info!(
+                                mint = %mint,
+                                pool = %pool_str,
+                                creator = %creator_str,
+                                "Creator cached from BondingCurve account update"
+                            );
+
+                            // Emit DevWalletIdentified event
+                            let dev_event = MarketEvent::new(
+                                "market-data",
+                                BUILD_VERSION,
+                                run_id,
+                                ctx.next_event_id(),
+                                "geyser",
+                                Some(*slot),
+                                MarketEventKind::DevWalletIdentified {
+                                    mint: mint.clone(),
+                                    dev_wallet: creator_str.clone(),
+                                    supply_percentage: 0.0, // Not computed from account data
+                                },
+                            );
+
+                            if let Err(e) = ctx.jsonl_writer.write(&dev_event) {
+                                error!(error = %e, "Failed to write DevWalletIdentified to JSONL");
+                            }
+
+                            if let Some(ref nats) = ctx.nats {
+                                if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &dev_event).await {
+                                    warn!(error = %e, "Failed to publish DevWalletIdentified to NATS");
+                                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                    MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+
+                    // Don't emit the BondingCurveUpdate as a MarketEvent - it's internal
+                    continue;
+                }
+
+                let event_kind = if let Some(parsed) = parsed {
                     debug!(
                         slot = account_update.slot,
                         "Parsed DEX account update"
@@ -1398,6 +1491,7 @@ async fn run_geyser_loop(
                         ParsedDexEvent::PoolCreated { base_mint, dex, .. } => Some((*base_mint, Some(*dex))),
                         ParsedDexEvent::Trade { mint, dex, .. } => Some((*mint, Some(*dex))),
                         ParsedDexEvent::LiquidityRemoved { mint, .. } => Some((*mint, None)),
+                        ParsedDexEvent::BondingCurveUpdate { .. } => None, // Handled separately in account update
                     };
                     if let Some((mint, dex_opt)) = mint_and_dex {
                         let mut tracked = ctx.tracked_mints.write();
@@ -1414,6 +1508,33 @@ async fn run_geyser_loop(
                                 "New mint tracked, waiting for Geyser mint account delivery"
                             );
                         }
+                    }
+
+                    // Build pool_mint_map for PumpFun (needed for BondingCurveUpdate -> creator lookup)
+                    match parsed {
+                        ParsedDexEvent::PoolCreated {
+                            pool_address,
+                            base_mint,
+                            dex: DexType::PumpFun,
+                            ..
+                        } => {
+                            ctx.pool_mint_map.write().insert(
+                                pool_address.to_string(),
+                                base_mint.to_string()
+                            );
+                        }
+                        ParsedDexEvent::Trade {
+                            pool_address,
+                            mint,
+                            dex: DexType::PumpFun,
+                            ..
+                        } => {
+                            ctx.pool_mint_map.write().insert(
+                                pool_address.to_string(),
+                                mint.to_string()
+                            );
+                        }
+                        _ => {}
                     }
                 }
 
@@ -1494,6 +1615,8 @@ async fn run_geyser_loop(
                             )
                         }
                         ParsedDexEvent::LiquidityRemoved { .. } => Vec::new(),
+                        // BondingCurveUpdate is handled separately (account updates, not TX)
+                        ParsedDexEvent::BondingCurveUpdate { .. } => Vec::new(),
                     }
                 } else {
                     Vec::new()
@@ -1612,10 +1735,36 @@ async fn run_geyser_loop(
                     let mut kind = parsed.to_market_event_kind();
 
                     // Enrich Trade events with creator from cache (P0: PumpFun intent building)
-                    if let MarketEventKind::Trade { ref mint, ref dex, ref mut creator, .. } = kind {
+                    if let MarketEventKind::Trade { ref pool_address, ref mint, ref dex, ref mut creator, .. } = kind {
                         if dex == "pumpfun" || dex == "pump_amm" {
-                            let cache = ctx.creator_cache.read();
-                            if let Some(cached_creator) = cache.get(mint) {
+                            // Try creator_cache first (mint -> creator)
+                            let mut found_creator = None;
+                            {
+                                let cache = ctx.creator_cache.read();
+                                if let Some(cached_creator) = cache.get(mint) {
+                                    found_creator = Some(cached_creator.clone());
+                                }
+                            }
+
+                            // Fallback to pool_creator_cache (pool -> creator) from BondingCurveUpdate
+                            if found_creator.is_none() {
+                                let pool_cache = ctx.pool_creator_cache.read();
+                                if let Some(pool_creator) = pool_cache.get(pool_address) {
+                                    found_creator = Some(pool_creator.clone());
+
+                                    // Also populate creator_cache for future lookups
+                                    drop(pool_cache);
+                                    ctx.creator_cache.write().insert(mint.clone(), found_creator.clone().unwrap());
+                                    debug!(
+                                        mint = %mint,
+                                        pool = %pool_address,
+                                        creator = %found_creator.as_ref().unwrap(),
+                                        "Populated creator_cache from pool_creator_cache"
+                                    );
+                                }
+                            }
+
+                            if let Some(cached_creator) = found_creator {
                                 *creator = Some(cached_creator.clone());
                                 debug!(
                                     mint = %mint,

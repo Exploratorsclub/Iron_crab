@@ -1573,7 +1573,8 @@ impl ExecutionContext {
                                         .unwrap_or(0);
 
                                     if active_id != 0 {
-                                        metadata.insert("dex".to_string(), "meteora_dlmm".to_string());
+                                        metadata
+                                            .insert("dex".to_string(), "meteora_dlmm".to_string());
                                         resources.pools = vec![pool_id.clone()];
                                         resources.accounts = pool_accounts;
                                         min_out_sol = Some(Self::apply_slippage_min_out(
@@ -3920,7 +3921,10 @@ async fn main() -> Result<()> {
     let config_subscription = if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_CONFIG_RELOAD).await {
             Ok(sub) => {
-                info!(topic = TOPIC_CONFIG_RELOAD, "Subscribed to Config Updates (Core NATS fallback)");
+                info!(
+                    topic = TOPIC_CONFIG_RELOAD,
+                    "Subscribed to Config Updates (Core NATS fallback)"
+                );
                 Some(sub)
             }
             Err(e) => {
@@ -3940,7 +3944,10 @@ async fn main() -> Result<()> {
 
         match jetstream.get_stream(CONFIG_STREAM_NAME).await {
             Ok(stream) => {
-                match stream.create_consumer(config_consumer_config("execution-engine")).await {
+                match stream
+                    .create_consumer(config_consumer_config("execution-engine"))
+                    .await
+                {
                     Ok(consumer) => {
                         info!(
                             stream = CONFIG_STREAM_NAME,
@@ -4060,7 +4067,13 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             use futures::StreamExt;
             loop {
-                match config_consumer.fetch().max_messages(10).expires(std::time::Duration::from_secs(5)).messages().await {
+                match config_consumer
+                    .fetch()
+                    .max_messages(10)
+                    .expires(std::time::Duration::from_secs(5))
+                    .messages()
+                    .await
+                {
                     Ok(mut messages) => {
                         while let Some(msg_result) = messages.next().await {
                             if let Ok(msg) = msg_result {

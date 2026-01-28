@@ -3532,7 +3532,7 @@ async fn recover_positions_from_jsonl(
             // For BUYs, fill_out (tokens received) is large, fill_in may be absent or small
             let fill_in_raw = exec.fill_in.as_ref().map(|f| f.raw).unwrap_or(0);
             let fill_out_raw = exec.fill_out.as_ref().map(|f| f.raw).unwrap_or(0);
-            
+
             // SELL: large fill_in (tokens being sold) - this takes priority
             // The tokens sold (fill_in) should be > 100k and larger than fill_out for it to be a SELL
             let is_sell = fill_in_raw > 100_000 && fill_in_raw > fill_out_raw;
@@ -3820,37 +3820,38 @@ async fn main() -> Result<()> {
 
         // Try JetStream KV first
         if let Some(ref nats_client) = nats {
-            match nats_client.get_or_create_kv_bucket(POSITION_KV_BUCKET).await {
-                Ok(store) => {
-                    match nats_client.kv_get_all::<PersistedPosition>(&store).await {
-                        Ok(persisted_positions) => {
-                            for (mint, persisted) in persisted_positions {
-                                let tracker = persisted.to_tracker();
-                                let hold_secs = tracker.entry_time.elapsed().as_secs();
-                                info!(
-                                    mint = %mint,
-                                    pool = %tracker.pool,
-                                    dex = %tracker.dex,
-                                    entry_price = tracker.entry_price,
-                                    sol_invested = tracker.sol_invested,
-                                    hold_secs = hold_secs,
-                                    "🔄 Position recovered from JetStream KV"
-                                );
-                                positions.insert(mint, tracker);
-                            }
-                            if !positions.is_empty() {
-                                from_kv = true;
-                                info!(
-                                    recovered = positions.len(),
-                                    "✅ Positions recovered from JetStream KV (preferred)"
-                                );
-                            }
+            match nats_client
+                .get_or_create_kv_bucket(POSITION_KV_BUCKET)
+                .await
+            {
+                Ok(store) => match nats_client.kv_get_all::<PersistedPosition>(&store).await {
+                    Ok(persisted_positions) => {
+                        for (mint, persisted) in persisted_positions {
+                            let tracker = persisted.to_tracker();
+                            let hold_secs = tracker.entry_time.elapsed().as_secs();
+                            info!(
+                                mint = %mint,
+                                pool = %tracker.pool,
+                                dex = %tracker.dex,
+                                entry_price = tracker.entry_price,
+                                sol_invested = tracker.sol_invested,
+                                hold_secs = hold_secs,
+                                "🔄 Position recovered from JetStream KV"
+                            );
+                            positions.insert(mint, tracker);
                         }
-                        Err(e) => {
-                            warn!(error = %e, "Failed to load positions from KV");
+                        if !positions.is_empty() {
+                            from_kv = true;
+                            info!(
+                                recovered = positions.len(),
+                                "✅ Positions recovered from JetStream KV (preferred)"
+                            );
                         }
                     }
-                }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to load positions from KV");
+                    }
+                },
                 Err(e) => {
                     warn!(error = %e, "Failed to get position KV bucket");
                 }
@@ -3869,14 +3870,22 @@ async fn main() -> Result<()> {
                         );
                         // Migrate to KV for future restarts
                         if let Some(ref nats_client) = nats {
-                            if let Ok(store) = nats_client.get_or_create_kv_bucket(POSITION_KV_BUCKET).await {
+                            if let Ok(store) = nats_client
+                                .get_or_create_kv_bucket(POSITION_KV_BUCKET)
+                                .await
+                            {
                                 for (mint, tracker) in &jsonl_positions {
                                     let persisted = PersistedPosition::from_tracker(tracker);
-                                    if let Err(e) = nats_client.kv_put(&store, mint, &persisted).await {
+                                    if let Err(e) =
+                                        nats_client.kv_put(&store, mint, &persisted).await
+                                    {
                                         warn!(mint = %mint, error = %e, "Failed to migrate position to KV");
                                     }
                                 }
-                                info!("Migrated {} positions from JSONL to JetStream KV", jsonl_positions.len());
+                                info!(
+                                    "Migrated {} positions from JSONL to JetStream KV",
+                                    jsonl_positions.len()
+                                );
                             }
                         }
                         positions = jsonl_positions;
@@ -3982,7 +3991,10 @@ async fn main() -> Result<()> {
     let mut config_subscription = if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_CONFIG_RELOAD).await {
             Ok(sub) => {
-                info!(topic = TOPIC_CONFIG_RELOAD, "Subscribed to Config Updates (Core NATS fallback)");
+                info!(
+                    topic = TOPIC_CONFIG_RELOAD,
+                    "Subscribed to Config Updates (Core NATS fallback)"
+                );
                 Some(sub)
             }
             Err(e) => {
@@ -4002,7 +4014,10 @@ async fn main() -> Result<()> {
 
         match jetstream.get_stream(CONFIG_STREAM_NAME).await {
             Ok(stream) => {
-                match stream.create_consumer(config_consumer_config("momentum-bot")).await {
+                match stream
+                    .create_consumer(config_consumer_config("momentum-bot"))
+                    .await
+                {
                     Ok(consumer) => {
                         info!(
                             stream = CONFIG_STREAM_NAME,

@@ -459,9 +459,7 @@ pub async fn build_tx_plan(
         // WsolManager maintains WSOL buffer outside of trades.
         // This saves ~2000-3000 CU and avoids lamport noise that breaks fill_in detection.
 
-        return TxPlanOutcome::Planned(TxPlan {
-            instructions: ixs,
-        });
+        return TxPlanOutcome::Planned(TxPlan { instructions: ixs });
     }
 
     if dex_hint == DexHint::Raydium {
@@ -555,9 +553,7 @@ pub async fn build_tx_plan(
         // WsolManager maintains WSOL buffer outside of trades.
         // This saves ~2000-3000 CU and avoids lamport noise that breaks fill_in detection.
 
-        return TxPlanOutcome::Planned(TxPlan {
-            instructions: ixs,
-        });
+        return TxPlanOutcome::Planned(TxPlan { instructions: ixs });
     }
 
     if dex_hint == DexHint::PumpAmm {
@@ -822,9 +818,7 @@ pub async fn build_tx_plan(
     // This saves ~2000-3000 CU and avoids lamport noise that breaks fill_in detection.
     // Pump.fun BC swap instructions handle the SOL transfer internally.
 
-    TxPlanOutcome::Planned(TxPlan {
-        instructions: ixs,
-    })
+    TxPlanOutcome::Planned(TxPlan { instructions: ixs })
 }
 
 // ============================================================================
@@ -901,23 +895,16 @@ async fn build_multi_hop_tx_plan(
             "Building hop instruction"
         );
 
-        let hop_ixs = match build_hop_instructions(
-            wallet_pubkey,
-            hop,
-            current_amount,
-            &rpc,
-            cache,
-        )
-        .await
-        {
-            Ok(ixs) => ixs,
-            Err(e) => {
-                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                    reason: e.reason,
-                    details: format!("multi-hop: hop {} failed: {}", hop_idx, e.details),
-                });
-            }
-        };
+        let hop_ixs =
+            match build_hop_instructions(wallet_pubkey, hop, current_amount, &rpc, cache).await {
+                Ok(ixs) => ixs,
+                Err(e) => {
+                    return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                        reason: e.reason,
+                        details: format!("multi-hop: hop {} failed: {}", hop_idx, e.details),
+                    });
+                }
+            };
 
         all_instructions.extend(hop_ixs);
 
@@ -967,30 +954,64 @@ async fn build_hop_instructions(
     let min_out: u64 = 1;
 
     match dex.as_str() {
-        "pumpfun" => {
-            build_hop_pumpfun(wallet_pubkey, hop, amount_in, min_out, rpc, cache).await
-        }
+        "pumpfun" => build_hop_pumpfun(wallet_pubkey, hop, amount_in, min_out, rpc, cache).await,
         "pump_amm" => {
-            build_hop_pump_amm(wallet_pubkey, hop, &pool_address, amount_in, min_out, rpc, cache)
-                .await
+            build_hop_pump_amm(
+                wallet_pubkey,
+                hop,
+                &pool_address,
+                amount_in,
+                min_out,
+                rpc,
+                cache,
+            )
+            .await
         }
         "raydium" | "raydium_amm" | "raydium_amm_v4" => {
-            build_hop_raydium(wallet_pubkey, hop, &pool_address, amount_in, min_out, rpc, cache)
-                .await
+            build_hop_raydium(
+                wallet_pubkey,
+                hop,
+                &pool_address,
+                amount_in,
+                min_out,
+                rpc,
+                cache,
+            )
+            .await
         }
         "raydium_cpmm" => {
             // TODO: Implement Raydium CPMM support for multi-hop
             Err(UnsupportedTxPlan {
                 reason: RejectReason::UnsupportedIntent,
-                details: format!("raydium_cpmm multi-hop not yet implemented (pool={})", hop.pool_address),
+                details: format!(
+                    "raydium_cpmm multi-hop not yet implemented (pool={})",
+                    hop.pool_address
+                ),
             })
         }
         "orca" | "orca_whirlpool" => {
-            build_hop_orca(wallet_pubkey, hop, &pool_address, amount_in, min_out, rpc, cache).await
+            build_hop_orca(
+                wallet_pubkey,
+                hop,
+                &pool_address,
+                amount_in,
+                min_out,
+                rpc,
+                cache,
+            )
+            .await
         }
         "meteora_dlmm" | "meteora" => {
-            build_hop_meteora_dlmm(wallet_pubkey, hop, &pool_address, amount_in, min_out, rpc, cache)
-                .await
+            build_hop_meteora_dlmm(
+                wallet_pubkey,
+                hop,
+                &pool_address,
+                amount_in,
+                min_out,
+                rpc,
+                cache,
+            )
+            .await
         }
         other => Err(UnsupportedTxPlan {
             reason: RejectReason::UnsupportedIntent,
@@ -1056,7 +1077,10 @@ async fn build_hop_pump_amm(
             } else {
                 return Err(UnsupportedTxPlan {
                     reason: RejectReason::UnsupportedIntent,
-                    details: format!("pump_amm: cache hit but wrong DEX type for {}", pool_address),
+                    details: format!(
+                        "pump_amm: cache hit but wrong DEX type for {}",
+                        pool_address
+                    ),
                 });
             }
         } else {
@@ -1138,7 +1162,10 @@ async fn build_hop_raydium(
     raydium.set_user_authority(wallet_pubkey);
 
     // Raydium needs Serum accounts if not already populated
-    if let Err(e) = raydium.fetch_and_populate_serum_accounts(pool_address).await {
+    if let Err(e) = raydium
+        .fetch_and_populate_serum_accounts(pool_address)
+        .await
+    {
         tracing::warn!(
             pool = %pool_address,
             error = %e,

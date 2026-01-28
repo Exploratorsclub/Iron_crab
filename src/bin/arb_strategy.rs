@@ -38,7 +38,9 @@ use ironcrab::metrics::{
     INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
     NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
-use ironcrab::nats::{slave_consumer_config, config_consumer_config, config_subject, STREAM_NAME, CONFIG_STREAM_NAME};
+use ironcrab::nats::{
+    config_consumer_config, config_subject, slave_consumer_config, CONFIG_STREAM_NAME, STREAM_NAME,
+};
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
@@ -2033,25 +2035,30 @@ async fn main() -> Result<()> {
         use async_nats::jetstream;
 
         let js = jetstream::new(nats.client().clone());
-        
+
         // Try JetStream first (preferred - persisted config)
         let js_consumer = match js.get_stream(CONFIG_STREAM_NAME).await {
             Ok(stream) => {
-                match stream.create_consumer(config_consumer_config("arb-strategy")).await {
+                match stream
+                    .create_consumer(config_consumer_config("arb-strategy"))
+                    .await
+                {
                     Ok(consumer) => {
                         info!(
                             stream = CONFIG_STREAM_NAME,
                             subject = %config_subject("arb-strategy"),
                             "Subscribed to JetStream Config Updates (persisted)"
                         );
-                        
+
                         // Bootstrap: Pull the last config message (if any)
                         match consumer.fetch().max_messages(1).messages().await {
                             Ok(mut messages) => {
                                 use futures::StreamExt;
                                 while let Some(msg_result) = messages.next().await {
                                     if let Ok(msg) = msg_result {
-                                        if let Ok(update) = serde_json::from_slice::<ConfigUpdate>(&msg.payload) {
+                                        if let Ok(update) =
+                                            serde_json::from_slice::<ConfigUpdate>(&msg.payload)
+                                        {
                                             if update.target_component == "arb-strategy" {
                                                 info!(keys = ?update.config.keys(), "Bootstrap: Applying config from JetStream");
                                                 let _ = ctx.apply_config_update(&update);
@@ -2065,7 +2072,7 @@ async fn main() -> Result<()> {
                                 warn!(error = %e, "Failed to bootstrap config from JetStream");
                             }
                         }
-                        
+
                         Some(consumer)
                     }
                     Err(e) => {
@@ -2083,7 +2090,10 @@ async fn main() -> Result<()> {
         // Also subscribe to Core NATS topic as fallback (for backward compatibility)
         let core_sub = match nats.subscribe(TOPIC_CONFIG_RELOAD).await {
             Ok(sub) => {
-                info!(topic = TOPIC_CONFIG_RELOAD, "Subscribed to Config Updates (Core NATS fallback)");
+                info!(
+                    topic = TOPIC_CONFIG_RELOAD,
+                    "Subscribed to Config Updates (Core NATS fallback)"
+                );
                 Some(sub)
             }
             Err(e) => {

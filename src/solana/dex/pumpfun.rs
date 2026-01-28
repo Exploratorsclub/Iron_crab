@@ -230,17 +230,21 @@ impl PumpFunDex {
     }
 
     /// Returns the token program for a pump.fun mint.
-    /// 
+    ///
     /// If `override_program` is provided (from intent.resources.token_program via Geyser),
     /// use that. Otherwise, defaults to SPL Token (legacy behavior).
-    /// 
+    ///
     /// The override MUST come from the Geyser-observed mint account owner.
     /// NO RPC calls in the hot path!
-    fn token_program_for_mint(&self, _token_mint: &Pubkey, override_program: Option<&Pubkey>) -> Pubkey {
+    fn token_program_for_mint(
+        &self,
+        _token_mint: &Pubkey,
+        override_program: Option<&Pubkey>,
+    ) -> Pubkey {
         if let Some(prog) = override_program {
             return *prog;
         }
-        
+
         // Default to SPL Token if no override provided
         // This is a fallback - the correct token_program should come from Geyser via the intent
         Pubkey::new_from_array(spl_token::id().to_bytes())
@@ -915,7 +919,7 @@ impl PumpFunDex {
     }
 
     /// Build swap instruction with explicit slippage for proper max_sol_cost calculation
-    /// 
+    ///
     /// # Arguments
     /// * `token_program_override` - If set, use this token program instead of defaulting to SPL Token.
     ///   This is critical for Token-2022 mints (newer PumpFun tokens).
@@ -942,7 +946,8 @@ impl PumpFunDex {
         };
 
         let token_mint = Pubkey::from_str(token_mint_str)?;
-        let token_program_sdk = self.token_program_for_mint(&token_mint, token_program_override.as_ref());
+        let token_program_sdk =
+            self.token_program_for_mint(&token_mint, token_program_override.as_ref());
         let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
         let (associated_bonding_curve, _bump2) =
             self.derive_associated_bonding_curve(&bonding_curve, &token_mint, &token_program_sdk);

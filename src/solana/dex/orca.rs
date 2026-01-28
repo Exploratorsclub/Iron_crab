@@ -188,7 +188,10 @@ impl Orca {
                 pool.quote_mint.to_string(),
                 pool.vault_a.to_string(),
                 pool.vault_b.to_string(),
-                format!("tick_current_index:{}", pool.tick_current_index.unwrap_or(0)),
+                format!(
+                    "tick_current_index:{}",
+                    pool.tick_current_index.unwrap_or(0)
+                ),
                 format!("tick_spacing:{}", pool.tick_spacing.unwrap_or(64)),
             ]
         })
