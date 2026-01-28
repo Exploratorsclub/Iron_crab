@@ -721,8 +721,13 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
 
     let token_decimals = get_token_decimals(&update.post_token_balances, &mint);
 
-    // Extract creator from Fee Recipient account[1] for PumpFun Bonding Curve
-    let creator = update.instruction_accounts.get(1).copied();
+    // NOTE: Do NOT extract creator from swap instruction accounts!
+    // account[1] is Fee Recipient, not the token creator.
+    // Creator must come from:
+    // 1. PoolCreated event (instruction_accounts[7] in CREATE)
+    // 2. market-data creator_cache (populated from PoolCreated)
+    // 3. On-chain bonding curve state (if cache miss)
+    let creator: Option<Pubkey> = None;
 
     // Extract Token Program from instruction accounts[8].
     // PumpFun now supports both SPL Token AND Token-2022 mints.
