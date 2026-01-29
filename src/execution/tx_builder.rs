@@ -609,6 +609,13 @@ pub async fn build_tx_plan(
             });
         }
 
+        // Parse token_program from intent for Token-2022 support (same as pumpfun path)
+        let token_program_override = intent
+            .resources
+            .token_program
+            .as_ref()
+            .and_then(|s| Pubkey::from_str(s).ok());
+
         let mut ixs = match PumpFunAmmDex::build_swap_ix_from_pool_accounts(
             &intent.resources.input_mint,
             &intent.resources.output_mint,
@@ -616,6 +623,7 @@ pub async fn build_tx_plan(
             min_out,
             wallet_pubkey,
             &pool_accounts,
+            token_program_override,
         ) {
             Ok(ixs) => ixs,
             Err(e) => {
@@ -1097,6 +1105,8 @@ async fn build_hop_pump_amm(
     };
 
     // Use static method with pool_accounts from cache
+    // Note: Multi-hop arb doesn't pass token_program yet; Token-2022 arb tokens are rare.
+    // TODO: If needed, add token_program to SwapHop struct for full Token-2022 arb support.
     let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts(
         &hop.input_mint,
         &hop.output_mint,
@@ -1104,6 +1114,7 @@ async fn build_hop_pump_amm(
         min_out,
         wallet_pubkey,
         &pool_accounts,
+        None, // Token-2022 not yet supported in multi-hop arb
     )
     .map_err(|e| UnsupportedTxPlan {
         reason: RejectReason::UnsupportedIntent,

@@ -2692,6 +2692,10 @@ impl PumpFunAmmDex {
     /// [11] global_volume_accumulator
     /// [12] fee_config
     /// [13] fee_program
+    ///
+    /// `base_token_program` - Optional token program override for the base token.
+    /// Use `Some(TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb)` for Token-2022 tokens.
+    /// Defaults to SPL Token if None.
     pub fn build_swap_ix_from_pool_accounts(
         input_mint: &str,
         output_mint: &str,
@@ -2699,6 +2703,7 @@ impl PumpFunAmmDex {
         min_out: u64,
         user: Pubkey,
         pool_accounts: &[Pubkey],
+        base_token_program: Option<Pubkey>,
     ) -> Result<Vec<Instruction>> {
         // Require 14 accounts (v1 format with global_volume_accumulator)
         if pool_accounts.len() < 14 {
@@ -2747,9 +2752,14 @@ impl PumpFunAmmDex {
             ));
         }
 
-        // User token accounts are deterministic ATAs.
-        let user_base_ta = Self::derive_ata(user, base_mint);
-        let user_quote_ta = Self::derive_ata(user, quote_mint);
+        // Resolve token programs: use override for base token (Token-2022 support),
+        // WSOL always uses SPL Token.
+        let base_tp = base_token_program.unwrap_or_else(|| Pubkey::new_from_array(spl_token::id().to_bytes()));
+        let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes()); // WSOL always SPL Token
+
+        // User token accounts are deterministic ATAs with correct token program.
+        let user_base_ta = Self::derive_ata_with_program(user, base_mint, base_tp);
+        let user_quote_ta = Self::derive_ata_with_program(user, quote_mint, quote_tp);
 
         // User volume accumulator is a PDA; needed for BUY transactions.
         let user_vol = Self::derive_user_volume_accumulator(program_id, pool_market, user);
@@ -2778,14 +2788,8 @@ impl PumpFunAmmDex {
                 AccountMeta::new(pool_quote_vault, false),                // 8
                 AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
                 AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
-                AccountMeta::new_readonly(
-                    Pubkey::new_from_array(spl_token::id().to_bytes()),
-                    false,
-                ), // 11
-                AccountMeta::new_readonly(
-                    Pubkey::new_from_array(spl_token::id().to_bytes()),
-                    false,
-                ), // 12
+                AccountMeta::new_readonly(base_tp, false),                // 11 - base token program (Token-2022 aware)
+                AccountMeta::new_readonly(quote_tp, false),               // 12 - quote token program (always SPL)
                 AccountMeta::new_readonly(
                     Pubkey::new_from_array(solana_system_program::id().to_bytes()),
                     false,
@@ -2817,14 +2821,8 @@ impl PumpFunAmmDex {
                 AccountMeta::new(pool_quote_vault, false),                // 8
                 AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
                 AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
-                AccountMeta::new_readonly(
-                    Pubkey::new_from_array(spl_token::id().to_bytes()),
-                    false,
-                ), // 11
-                AccountMeta::new_readonly(
-                    Pubkey::new_from_array(spl_token::id().to_bytes()),
-                    false,
-                ), // 12
+                AccountMeta::new_readonly(base_tp, false),                // 11 - base token program (Token-2022 aware)
+                AccountMeta::new_readonly(quote_tp, false),               // 12 - quote token program (always SPL)
                 AccountMeta::new_readonly(
                     Pubkey::new_from_array(solana_system_program::id().to_bytes()),
                     false,
