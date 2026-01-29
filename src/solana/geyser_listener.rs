@@ -75,6 +75,10 @@ pub struct GeyserTransactionUpdate {
     /// Native SOL balances (lamports) for all accounts
     pub pre_balances: Vec<u64>,
     pub post_balances: Vec<u64>,
+    /// Transaction fee in lamports (for priority fee tracking)
+    pub fee_lamports: u64,
+    /// Compute units consumed (for priority fee calculation)
+    pub compute_units_consumed: Option<u64>,
 }
 
 pub struct GeyserListener {
@@ -502,8 +506,14 @@ impl GeyserListener {
                                     let mut post_token_balances = Vec::new();
                                     let mut pre_balances = Vec::new();
                                     let mut post_balances = Vec::new();
+                                    let mut fee_lamports = 0u64;
+                                    let mut compute_units_consumed = None;
 
                                     if let Some(meta) = &tx.meta {
+                                        // Extract fee and compute units for priority fee tracking
+                                        fee_lamports = meta.fee;
+                                        compute_units_consumed = meta.compute_units_consumed;
+                                        
                                         // Extract native SOL balances (lamports)
                                         pre_balances = meta.pre_balances.clone();
                                         post_balances = meta.post_balances.clone();
@@ -547,6 +557,8 @@ impl GeyserListener {
                                         post_token_balances,
                                         pre_balances,
                                         post_balances,
+                                        fee_lamports,
+                                        compute_units_consumed,
                                     };
 
                                     // Broadcast to subscribers

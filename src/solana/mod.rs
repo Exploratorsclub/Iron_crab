@@ -16,6 +16,7 @@ pub mod geyser_tx_confirm;
 pub mod geyser_tx_confirm;
 pub mod jito;
 pub mod kill_switch;
+pub mod priority_fee_tracker;
 pub mod rpc;
 pub mod token_utils;
 pub mod tpu_client;

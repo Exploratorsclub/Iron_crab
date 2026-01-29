@@ -454,6 +454,105 @@ impl MarketEvent {
 }
 
 // ============================================================================
+// P2: Dynamic Priority Fee (from Geyser transactions, NO RPC calls)
+// ============================================================================
+
+/// Priority fee sample from a Geyser transaction
+///
+/// Published by market-data to NATS for execution-engine consumption.
+/// Allows dynamic fee estimation without additional RPC calls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PriorityFeeSample {
+    #[serde(flatten)]
+    pub header: RecordHeader,
+    /// Slot when transaction was processed
+    pub slot: u64,
+    /// Total fee in lamports
+    pub fee_lamports: u64,
+    /// Compute units consumed
+    pub compute_units: u64,
+    /// Calculated priority fee in micro-lamports per CU
+    pub priority_fee_micro_lamports: u64,
+}
+
+impl PriorityFeeSample {
+    pub fn new(
+        component: &str,
+        build: &str,
+        run_id: &str,
+        slot: u64,
+        fee_lamports: u64,
+        compute_units: u64,
+        priority_fee_micro_lamports: u64,
+    ) -> Self {
+        Self {
+            header: RecordHeader::new(component, build, run_id),
+            slot,
+            fee_lamports,
+            compute_units,
+            priority_fee_micro_lamports,
+        }
+    }
+}
+
+/// Fee percentiles from recent Geyser samples
+///
+/// Periodically published by market-data with aggregated statistics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PriorityFeePercentiles {
+    #[serde(flatten)]
+    pub header: RecordHeader,
+    /// Number of samples used for calculation
+    pub sample_count: usize,
+    /// Last slot in sample window
+    pub last_slot: u64,
+    /// 25th percentile (micro-lamports per CU)
+    pub p25: u64,
+    /// 50th percentile / median (micro-lamports per CU)
+    pub p50: u64,
+    /// 75th percentile (micro-lamports per CU)
+    pub p75: u64,
+    /// 90th percentile (micro-lamports per CU)
+    pub p90: u64,
+    /// Recommended fee for Tier0 (P90 × 1.5)
+    pub tier0_recommended: u64,
+    /// Recommended fee for Tier1 (P50 × 1.2)
+    pub tier1_recommended: u64,
+    /// Recommended fee for Arb (P75 × 1.3)
+    pub arb_recommended: u64,
+}
+
+impl PriorityFeePercentiles {
+    pub fn new(
+        component: &str,
+        build: &str,
+        run_id: &str,
+        sample_count: usize,
+        last_slot: u64,
+        p25: u64,
+        p50: u64,
+        p75: u64,
+        p90: u64,
+        tier0_recommended: u64,
+        tier1_recommended: u64,
+        arb_recommended: u64,
+    ) -> Self {
+        Self {
+            header: RecordHeader::new(component, build, run_id),
+            sample_count,
+            last_slot,
+            p25,
+            p50,
+            p75,
+            p90,
+            tier0_recommended,
+            tier1_recommended,
+            arb_recommended,
+        }
+    }
+}
+
+// ============================================================================
 // P1: Fee/Compute Policy (owned by execution-engine)
 // ============================================================================
 
@@ -542,6 +641,11 @@ impl FeePolicy {
         let base_fee = match intent.tier {
             IntentTier::Tier0 => self.tier0_priority_fee_micro_lamports,
             IntentTier::Tier1 => self.default_priority_fee_micro_lamports,
+            // Arb uses elevated fee (between Tier1 and Tier0)
+            IntentTier::Arb => {
+                (self.default_priority_fee_micro_lamports + self.tier0_priority_fee_micro_lamports)
+                    / 2
+            }
         };
 
         // Apply urgency multiplier
@@ -647,6 +751,8 @@ pub enum IntentTier {
     Tier0 = 0,
     /// Tier 1: normal priority (e.g., momentum trades)
     Tier1 = 1,
+    /// Arbitrage: time-sensitive but not emergency
+    Arb = 2,
 }
 
 /// Origin type for Typ A vs Typ B classification (DoD D.1)

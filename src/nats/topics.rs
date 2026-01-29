@@ -26,6 +26,10 @@ pub const TOPIC_CONTROL_RESPONSES: &str = "ironcrab.v1.control_responses";
 /// Decision records (for audit/debug)
 pub const TOPIC_DECISION_RECORDS: &str = "ironcrab.v1.decision_records";
 
+/// Priority fee samples from market-data (for dynamic fee estimation)
+/// Published by market-data, consumed by execution-engine
+pub const TOPIC_PRIORITY_FEE_SAMPLES: &str = "ironcrab.v1.priority_fee_samples";
+
 /// Pool cache updates from market-data (Single Source of Truth)
 /// NOTE: For JetStream persistence, use subject-per-pool pattern from jetstream.rs
 pub const TOPIC_POOL_CACHE_UPDATES: &str = "ironcrab.v1.pool_cache_updates";

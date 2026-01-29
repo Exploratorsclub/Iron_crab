@@ -31,8 +31,8 @@ use uuid::Uuid;
 use ironcrab::config::WalletTrackerCfg;
 use ironcrab::execution::wsol_manager::WalletBalanceUpdate;
 use ironcrab::ipc::{
-    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, MarketEvent, MarketEventKind,
-    PoolCacheUpdate, RecordHeader,
+    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, IntentTier, MarketEvent,
+    MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles, RecordHeader,
 };
 use ironcrab::metrics::{
     serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
@@ -41,6 +41,7 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_pool_cache_stream, pool_subject,
     wallet_balance_topic, NatsClient, NatsConfig, CONFIG_STREAM_NAME, TOPIC_MARKET_EVENTS,
+    TOPIC_PRIORITY_FEE_SAMPLES,
 };
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
@@ -49,6 +50,7 @@ use ironcrab::solana::dex_parser::{
     parse_account_update, parse_transaction_update, DexType, ParsedDexEvent,
 };
 use ironcrab::solana::geyser_pool_discovery::{DexType as PoolDexType, GeyserPoolDiscovery};
+use ironcrab::solana::priority_fee_tracker::PriorityFeeTracker;
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::solana::wallet_tracker::WalletTracker;
 use spl_token::solana_program::program_option::COption;
@@ -159,6 +161,9 @@ struct MarketDataContext {
     event_counter: std::sync::atomic::AtomicU64,
     /// P1: Wallet tracker for smart money / early buyer detection
     wallet_tracker: WalletTracker,
+
+    /// P2: Dynamic Priority Fee Tracker (Geyser-based, NO RPC)
+    priority_fee_tracker: Arc<PriorityFeeTracker>,
 
     /// Tracked token mints for mint-authority/freeze-authority metadata.
     tracked_mints: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
@@ -721,6 +726,7 @@ async fn main() -> Result<()> {
         jsonl_writer,
         event_counter: std::sync::atomic::AtomicU64::new(0),
         wallet_tracker,
+        priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
         tracked_mints: parking_lot::RwLock::new(std::collections::HashSet::new()),
         tracked_mints_tx,
         known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
@@ -1480,6 +1486,48 @@ async fn run_geyser_loop(
             Ok(tx_update) = transaction_rx.recv() => {
                 tx_count += 1;
                 ironcrab::metrics::record_activity();
+
+                // P2: Track priority fees from Geyser transactions (NO RPC calls!)
+                if let Some(priority_fee) = ctx.priority_fee_tracker.add_sample(
+                    tx_update.slot,
+                    tx_update.fee_lamports,
+                    tx_update.compute_units_consumed,
+                ) {
+                    // Publish percentiles every 50 samples (rate limited)
+                    let sample_count = ctx.priority_fee_tracker.sample_count();
+                    if sample_count % 50 == 0 && sample_count >= 10 {
+                        let percentiles = ctx.priority_fee_tracker.get_percentiles();
+                        let fee_msg = PriorityFeePercentiles::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            &ctx.run_id,
+                            percentiles.sample_count,
+                            percentiles.last_slot,
+                            percentiles.p25,
+                            percentiles.p50,
+                            percentiles.p75,
+                            percentiles.p90,
+                            ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Tier0),
+                            ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Tier1),
+                            ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Arb),
+                        );
+                        if let Some(ref nats) = ctx.nats {
+                            if let Err(e) = nats.publish(
+                                TOPIC_PRIORITY_FEE_SAMPLES,
+                                &serde_json::to_vec(&fee_msg).unwrap_or_default(),
+                            ).await {
+                                debug!(error = %e, "Failed to publish priority fee percentiles");
+                            }
+                        }
+                        debug!(
+                            samples = sample_count,
+                            p50 = percentiles.p50,
+                            p90 = percentiles.p90,
+                            last_fee = priority_fee,
+                            "priority_fee: published percentiles"
+                        );
+                    }
+                }
 
                 // Try to parse as DEX event (PoolCreated, Trade)
                 let parsed_event = parse_transaction_update(&tx_update);
