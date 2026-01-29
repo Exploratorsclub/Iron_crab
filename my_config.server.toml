@@ -364,4 +364,5 @@ tpu_fanout_slots = 4                # Send to current + next N leaders (increase
 tpu_leader_forward_count = 4        # Forward count per leader
 method_timeout_ms = 2000            # Timeout per method before fallback
 retries_per_method = 2              # Retries before trying next method
+parallel_send = true                # Send via TPU+RPC in parallel (Solana deduplicates by signature)
 skip_tpu_for_bundles = true         # Bundles always use Jito (arb atomicity)
