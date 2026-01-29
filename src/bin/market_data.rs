@@ -1512,9 +1512,10 @@ async fn run_geyser_loop(
                             ctx.priority_fee_tracker.get_fee_for_tier(IntentTier::Arb),
                         );
                         if let Some(ref nats) = ctx.nats {
+                            // NOTE: nats.publish() already serializes - don't double-serialize!
                             if let Err(e) = nats.publish(
                                 TOPIC_PRIORITY_FEE_SAMPLES,
-                                &serde_json::to_vec(&fee_msg).unwrap_or_default(),
+                                &fee_msg,
                             ).await {
                                 debug!(error = %e, "Failed to publish priority fee percentiles");
                             }

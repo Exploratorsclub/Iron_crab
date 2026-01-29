@@ -49,7 +49,7 @@ use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ironcrab::config::Config as AppConfig;
@@ -4207,10 +4207,6 @@ async fn main() -> Result<()> {
         let ctx_clone = Arc::clone(&ctx);
         tokio::spawn(async move {
             while let Some(msg) = fee_sub.next().await {
-                // Debug: log raw payload for troubleshooting (temp: warn level)
-                let payload_preview: String = String::from_utf8_lossy(&msg.payload[..msg.payload.len().min(200)]).to_string();
-                warn!(payload_len = msg.payload.len(), payload_preview = %payload_preview, "DEBUG: Received priority fee message");
-                
                 match serde_json::from_slice::<PriorityFeePercentiles>(&msg.payload) {
                     Ok(percentiles) => {
                         // Update the shared state
