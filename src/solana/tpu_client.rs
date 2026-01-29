@@ -18,18 +18,18 @@
 //! Platform Support:
 //! - Linux: Full TPU Direct via QUIC (solana-quic-client)
 //! - Windows: Stub implementation (falls back to RPC in tx_sender)
+//!
+//! Leader Cache Health:
+//! - The TPU client maintains a leader schedule cache updated via WebSocket
+//! - If the WebSocket connection drops, the cache becomes stale
+//! - This module provides health checks and automatic reconnection
 
 use anyhow::Result;
 use solana_sdk::{signature::Signature, transaction::Transaction};
 use std::sync::Arc;
 
-// info! is used on Linux only
 #[cfg(not(windows))]
-use tracing::info;
-
-// warn! is used on Windows only (stub)
-#[cfg(windows)]
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 /// Error types specific to TPU submission
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +44,8 @@ pub enum TpuError {
     SendFailed(String),
     #[error("Reconnection failed: {0}")]
     ReconnectFailed(String),
+    #[error("Leader cache stale: cache_slot={0}, current_slot={1}")]
+    LeaderCacheStale(u64, u64),
 }
 
 /// Configuration for the TPU submitter
@@ -53,13 +55,19 @@ pub struct TpuSubmitterConfig {
     pub fanout_slots: u64,
     /// Number of times to forward TX to leaders
     pub leader_forward_count: u64,
+    /// Max slots the leader cache can be stale before triggering reconnect
+    pub cache_stale_threshold: u64,
+    /// Consecutive failures before suggesting reconnect
+    pub reconnect_failure_threshold: u32,
 }
 
 impl Default for TpuSubmitterConfig {
     fn default() -> Self {
         Self {
-            fanout_slots: 2,
+            fanout_slots: 4,
             leader_forward_count: 4,
+            cache_stale_threshold: 50,
+            reconnect_failure_threshold: 3,
         }
     }
 }
@@ -84,6 +92,10 @@ pub struct TpuSubmitter {
     config: TpuSubmitterConfig,
     /// Track consecutive failures for backoff
     consecutive_failures: Arc<std::sync::atomic::AtomicU32>,
+    /// Track last known good slot (for staleness detection)
+    last_known_slot: Arc<std::sync::atomic::AtomicU64>,
+    /// Track last reconnect time to avoid rapid reconnects
+    last_reconnect_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[cfg(not(windows))]
@@ -108,6 +120,7 @@ impl TpuSubmitter {
         info!(
             ws_url = %ws_url,
             fanout_slots = config.fanout_slots,
+            cache_stale_threshold = config.cache_stale_threshold,
             "Creating TPU client with QUIC"
         );
 
@@ -134,7 +147,10 @@ impl TpuSubmitter {
         )
         .map_err(|e| anyhow::anyhow!("Failed to create TPU client: {:?}", e))?;
 
-        info!("TPU client initialized successfully");
+        // Get initial slot for staleness tracking
+        let initial_slot = rpc_client.get_slot().unwrap_or(0);
+
+        info!(initial_slot = initial_slot, "TPU client initialized successfully");
 
         Ok(Self {
             tpu_client: Arc::new(tokio::sync::RwLock::new(Some(tpu_client))),
@@ -142,6 +158,8 @@ impl TpuSubmitter {
             ws_url: ws_url.to_string(),
             config,
             consecutive_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            last_known_slot: Arc::new(std::sync::atomic::AtomicU64::new(initial_slot)),
+            last_reconnect_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -183,13 +201,68 @@ impl TpuSubmitter {
         self.consecutive_failures() >= threshold
     }
 
+    /// Check if the leader cache is stale by comparing current slot with last known slot.
+    /// Returns (is_stale, current_slot, cached_slot) if stale.
+    pub fn check_leader_cache_health(&self) -> Result<(), TpuError> {
+        // Get current slot from RPC
+        let current_slot = self.rpc_client.get_slot().unwrap_or(0);
+        let cached_slot = self
+            .last_known_slot
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // Update last known slot
+        self.last_known_slot
+            .store(current_slot, std::sync::atomic::Ordering::Relaxed);
+
+        // Check staleness
+        if cached_slot > 0 && current_slot > cached_slot + self.config.cache_stale_threshold {
+            warn!(
+                current_slot = current_slot,
+                cached_slot = cached_slot,
+                threshold = self.config.cache_stale_threshold,
+                "Leader cache is stale, WebSocket may have disconnected"
+            );
+            return Err(TpuError::LeaderCacheStale(cached_slot, current_slot));
+        }
+
+        debug!(
+            current_slot = current_slot,
+            cached_slot = cached_slot,
+            "Leader cache health OK"
+        );
+        Ok(())
+    }
+
+    /// Check if enough time has passed since last reconnect to avoid rapid reconnects.
+    /// Returns true if reconnect is allowed.
+    pub fn can_reconnect(&self, min_interval_ms: u64) -> bool {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let last_reconnect = self
+            .last_reconnect_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        now_ms.saturating_sub(last_reconnect) >= min_interval_ms
+    }
+
     /// Reconnect the TPU client.
     pub async fn reconnect(&self) -> Result<(), TpuError> {
         use solana_connection_cache::connection_cache::{ConnectionCache, NewConnectionConfig};
         use solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool};
         use solana_tpu_client::tpu_client::{TpuClient, TpuClientConfig};
 
-        info!("Reconnecting TPU client");
+        // Record reconnect time
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_reconnect_ms
+            .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+
+        info!("Reconnecting TPU client (WebSocket + QUIC)");
 
         let tpu_config = TpuClientConfig {
             fanout_slots: self.config.fanout_slots,
@@ -215,13 +288,21 @@ impl TpuSubmitter {
         )
         .map_err(|e| TpuError::ReconnectFailed(format!("{:?}", e)))?;
 
+        // Update slot tracking
+        let current_slot = self.rpc_client.get_slot().unwrap_or(0);
+        self.last_known_slot
+            .store(current_slot, std::sync::atomic::Ordering::Relaxed);
+
         let mut guard = self.tpu_client.write().await;
         *guard = Some(new_client);
 
         self.consecutive_failures
             .store(0, std::sync::atomic::Ordering::Relaxed);
 
-        info!("TPU client reconnected successfully");
+        info!(
+            current_slot = current_slot,
+            "TPU client reconnected successfully"
+        );
         Ok(())
     }
 }
@@ -229,6 +310,9 @@ impl TpuSubmitter {
 // ============================================================================
 // Windows stub implementation
 // ============================================================================
+
+#[cfg(windows)]
+use tracing::warn;
 
 #[cfg(windows)]
 pub struct TpuSubmitter {
@@ -263,6 +347,14 @@ impl TpuSubmitter {
         false
     }
 
+    pub fn check_leader_cache_health(&self) -> Result<(), TpuError> {
+        Err(TpuError::NotSupported)
+    }
+
+    pub fn can_reconnect(&self, _min_interval_ms: u64) -> bool {
+        false
+    }
+
     pub async fn reconnect(&self) -> Result<(), TpuError> {
         Err(TpuError::NotSupported)
     }
@@ -275,8 +367,10 @@ mod tests {
     #[test]
     fn test_tpu_submitter_config_defaults() {
         let config = TpuSubmitterConfig::default();
-        assert_eq!(config.fanout_slots, 2);
+        assert_eq!(config.fanout_slots, 4);
         assert_eq!(config.leader_forward_count, 4);
+        assert_eq!(config.cache_stale_threshold, 50);
+        assert_eq!(config.reconnect_failure_threshold, 3);
     }
 
     #[test]
@@ -289,5 +383,11 @@ mod tests {
 
         let err = TpuError::SendFailed("test error".into());
         assert_eq!(err.to_string(), "Failed to send transaction: test error");
+
+        let err = TpuError::LeaderCacheStale(100, 200);
+        assert_eq!(
+            err.to_string(),
+            "Leader cache stale: cache_slot=100, current_slot=200"
+        );
     }
 }

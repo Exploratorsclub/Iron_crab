@@ -251,6 +251,20 @@ pub struct TxSubmissionCfg {
     /// Recommended for all non-bundle transactions (liquidations, sells, buys).
     #[serde(default = "default_parallel_send")]
     pub parallel_send: bool,
+
+    /// TPU Leader Cache Health Check: Max slots the cache can be stale before reconnect. Default: 50
+    /// If the leader cache is more than N slots behind current slot, trigger reconnect.
+    #[serde(default = "default_tpu_cache_stale_threshold")]
+    pub tpu_cache_stale_threshold: u64,
+
+    /// TPU Leader Cache Health Check interval in seconds. Default: 10
+    /// How often to check if the leader cache is stale.
+    #[serde(default = "default_tpu_health_check_interval_secs")]
+    pub tpu_health_check_interval_secs: u64,
+
+    /// Reconnect threshold: consecutive send failures before reconnect. Default: 3
+    #[serde(default = "default_tpu_reconnect_failure_threshold")]
+    pub tpu_reconnect_failure_threshold: u32,
 }
 
 fn default_tx_primary_method() -> String {
@@ -263,7 +277,7 @@ fn default_tpu_enabled() -> bool {
     true
 }
 fn default_tpu_fanout_slots() -> u64 {
-    2
+    4 // Increased from 2 for better landing rate
 }
 fn default_tpu_leader_forward_count() -> u64 {
     4
@@ -280,6 +294,15 @@ fn default_skip_tpu_for_bundles() -> bool {
 fn default_parallel_send() -> bool {
     true
 }
+fn default_tpu_cache_stale_threshold() -> u64 {
+    50 // ~20 seconds worth of slots
+}
+fn default_tpu_health_check_interval_secs() -> u64 {
+    10
+}
+fn default_tpu_reconnect_failure_threshold() -> u32 {
+    3
+}
 
 impl Default for TxSubmissionCfg {
     fn default() -> Self {
@@ -293,6 +316,9 @@ impl Default for TxSubmissionCfg {
             retries_per_method: default_tx_retries_per_method(),
             skip_tpu_for_bundles: default_skip_tpu_for_bundles(),
             parallel_send: default_parallel_send(),
+            tpu_cache_stale_threshold: default_tpu_cache_stale_threshold(),
+            tpu_health_check_interval_secs: default_tpu_health_check_interval_secs(),
+            tpu_reconnect_failure_threshold: default_tpu_reconnect_failure_threshold(),
         }
     }
 }

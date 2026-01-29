@@ -112,12 +112,18 @@ impl TxSender {
                 TpuSubmitterConfig {
                     fanout_slots: config.tpu_fanout_slots,
                     leader_forward_count: config.tpu_leader_forward_count,
+                    cache_stale_threshold: config.tpu_cache_stale_threshold,
+                    reconnect_failure_threshold: config.tpu_reconnect_failure_threshold,
                 },
             )
             .await
             {
                 Ok(submitter) => {
-                    info!("TPU Direct client initialized successfully");
+                    info!(
+                        fanout_slots = config.tpu_fanout_slots,
+                        cache_stale_threshold = config.tpu_cache_stale_threshold,
+                        "TPU Direct client initialized successfully"
+                    );
                     Some(submitter)
                 }
                 Err(e) => {
@@ -129,6 +135,19 @@ impl TxSender {
             info!("TPU Direct disabled in config");
             None
         };
+
+        let fallback_desc = if config.parallel_send && tpu.is_some() {
+            "TPU+RPC parallel"
+        } else {
+            &config.primary_method
+        };
+
+        info!(
+            primary = %fallback_desc,
+            fallback = ?config.fallback_chain,
+            tpu_enabled = config.tpu_enabled,
+            "TxSender initialized with fallback chain (TPU → RPC)"
+        );
 
         Ok(Self {
             tpu,
@@ -323,11 +342,28 @@ impl TxSender {
             .as_ref()
             .ok_or(SendError::MethodNotConfigured("tpu"))?;
 
-        // Check if we should reconnect
-        if tpu.should_reconnect(5) {
-            warn!("TPU client has many failures, attempting reconnect");
-            if let Err(e) = tpu.reconnect().await {
-                warn!(error = %e, "TPU reconnect failed");
+        // Health check: check leader cache staleness and reconnect if needed
+        if let Err(e) = tpu.check_leader_cache_health() {
+            warn!(error = %e, "Leader cache stale, attempting reconnect");
+            // Only reconnect if enough time has passed (30s minimum between reconnects)
+            if tpu.can_reconnect(30_000) {
+                if let Err(reconnect_err) = tpu.reconnect().await {
+                    warn!(error = %reconnect_err, "TPU reconnect failed, continuing with stale cache");
+                }
+            }
+        }
+
+        // Check if we should reconnect due to consecutive failures
+        if tpu.should_reconnect(self.config.tpu_reconnect_failure_threshold) {
+            warn!(
+                consecutive_failures = tpu.consecutive_failures(),
+                threshold = self.config.tpu_reconnect_failure_threshold,
+                "TPU client has many failures, attempting reconnect"
+            );
+            if tpu.can_reconnect(30_000) {
+                if let Err(e) = tpu.reconnect().await {
+                    warn!(error = %e, "TPU reconnect failed");
+                }
             }
         }
 
@@ -478,6 +514,49 @@ impl TxSender {
         } else {
             Err(TpuError::NotInitialized)
         }
+    }
+
+    /// Check TPU leader cache health. Returns Ok if healthy, Err if stale.
+    pub fn check_tpu_health(&self) -> Result<(), TpuError> {
+        if let Some(tpu) = &self.tpu {
+            tpu.check_leader_cache_health()
+        } else {
+            Err(TpuError::NotInitialized)
+        }
+    }
+
+    /// Spawn a background task that periodically checks TPU health and reconnects if needed.
+    /// Returns a JoinHandle that can be used to await or abort the task.
+    pub fn spawn_health_check_task(
+        self: &Arc<Self>,
+        interval_secs: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        let sender = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+
+                if let Some(tpu) = &sender.tpu {
+                    // Check leader cache health
+                    if let Err(e) = tpu.check_leader_cache_health() {
+                        warn!(error = %e, "TPU health check: leader cache stale");
+                        if tpu.can_reconnect(30_000) {
+                            info!("TPU health check: triggering reconnect");
+                            if let Err(reconnect_err) = tpu.reconnect().await {
+                                error!(error = %reconnect_err, "TPU health check: reconnect failed");
+                            } else {
+                                info!("TPU health check: reconnected successfully");
+                            }
+                        }
+                    } else {
+                        debug!("TPU health check: OK");
+                    }
+                }
+            }
+        })
     }
 }
 
