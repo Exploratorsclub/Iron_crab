@@ -63,8 +63,8 @@ use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, ExecutionResult, ExecutionStatus, ExplicitAmount, FairnessPolicy, FeePolicy,
     FillStatus, FillUnavailableReason, IntentOrigin, IntentTier, PoolCacheUpdate,
-    PoolCacheUpdateType, RecordHeader, RejectReason, SimulationResult, TradeExecutionConstraints,
-    TradeIntent, TradeResources, TradeSide, TradingRegime,
+    PoolCacheUpdateType, PriorityFeePercentiles, RecordHeader, RejectReason, SimulationResult,
+    TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind};
 use ironcrab::metrics::{
@@ -80,7 +80,7 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     config_consumer_config, config_subject, slave_consumer_config, NatsClient, NatsConfig,
     CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_DECISION_RECORDS,
-    TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS,
+    TOPIC_EXECUTION_RESULTS, TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS,
 };
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
@@ -1025,6 +1025,10 @@ struct ExecutionContext {
     /// Unified transaction sender with automatic fallback (TPU → Jito → RPC)
     tx_sender: Option<Arc<TxSender>>,
 
+    // === P2: Dynamic Priority Fees (from Geyser via market-data NATS) ===
+    /// Latest priority fee percentiles from market-data (None = use static config)
+    dynamic_fee_percentiles: parking_lot::RwLock<Option<PriorityFeePercentiles>>,
+
     // === Option C: Live Pool Cache (P0: fresh quotes, no RPC in hot path) ===
     /// Cache of pool states from Geyser for fresh quote calculation
     live_pool_cache: Option<Arc<ironcrab::execution::live_pool_cache::LivePoolCache>>,
@@ -1068,6 +1072,40 @@ impl ExecutionContext {
 
     fn is_kill_switch_active(&self) -> bool {
         self.kill_switch_active.load(Ordering::Relaxed)
+    }
+
+    /// Get priority fee for an intent using dynamic percentiles if available, else static config.
+    ///
+    /// P2: Dynamic Priority Fee Usage
+    /// - If market-data is publishing percentiles via NATS, use tier-specific recommended fee
+    /// - Otherwise fall back to static config from FeePolicy
+    fn get_priority_fee_for_intent(&self, intent: &TradeIntent, fee_policy: &FeePolicy) -> u64 {
+        if let Some(ref percentiles) = *self.dynamic_fee_percentiles.read() {
+            let dynamic_fee = match intent.tier {
+                IntentTier::Tier0 => percentiles.tier0_recommended,
+                IntentTier::Tier1 => percentiles.tier1_recommended,
+                IntentTier::Arb => percentiles.arb_recommended,
+            };
+            tracing::debug!(
+                intent_id = %intent.intent_id,
+                tier = ?intent.tier,
+                dynamic_fee_micro_lamports = dynamic_fee,
+                p50 = percentiles.p50,
+                p90 = percentiles.p90,
+                sample_count = percentiles.sample_count,
+                "Using DYNAMIC priority fee from Geyser percentiles"
+            );
+            dynamic_fee
+        } else {
+            let static_fee = fee_policy.priority_fee_for_intent(intent);
+            tracing::debug!(
+                intent_id = %intent.intent_id,
+                tier = ?intent.tier,
+                static_fee_micro_lamports = static_fee,
+                "Using STATIC priority fee (no dynamic percentiles available)"
+            );
+            static_fee
+        }
     }
 
     #[inline]
@@ -3629,6 +3667,8 @@ async fn main() -> Result<()> {
         address_lookup_table,
         // P2: TxSender with fallback chain (initialized below after ctx creation)
         tx_sender: None,
+        // P2: Dynamic priority fees from Geyser (via market-data NATS)
+        dynamic_fee_percentiles: parking_lot::RwLock::new(None),
         // Option C: LivePoolCache - for zero-RPC quote calculation
         live_pool_cache: live_pool_cache.clone(),
         // Metrics
@@ -3941,6 +3981,26 @@ async fn main() -> Result<()> {
         None
     };
 
+    // P2: Subscribe to Dynamic Priority Fee Percentiles (from market-data via Geyser)
+    // These are used instead of static config values for better fee estimation
+    let priority_fee_subscription = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_PRIORITY_FEE_SAMPLES).await {
+            Ok(sub) => {
+                info!(
+                    topic = TOPIC_PRIORITY_FEE_SAMPLES,
+                    "Subscribed to Dynamic Priority Fee Percentiles"
+                );
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to Priority Fee Percentiles; using static config");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // P1: JetStream Config Consumer (persisted, solves race condition)
     let config_js_consumer = if let Some(ref nats) = ctx.nats {
         use async_nats::jetstream;
@@ -4139,6 +4199,35 @@ async fn main() -> Result<()> {
                 warn!(error = %e, "Failed to subscribe to ControlRequests");
             }
         }
+    }
+
+    // P2: Spawn dedicated task for Priority Fee Percentiles subscription
+    // Updates dynamic_fee_percentiles in ctx for use in TX building
+    if let Some(mut fee_sub) = priority_fee_subscription {
+        let ctx_clone = Arc::clone(&ctx);
+        tokio::spawn(async move {
+            while let Some(msg) = fee_sub.next().await {
+                match serde_json::from_slice::<PriorityFeePercentiles>(&msg.payload) {
+                    Ok(percentiles) => {
+                        // Update the shared state
+                        *ctx_clone.dynamic_fee_percentiles.write() = Some(percentiles.clone());
+                        debug!(
+                            p50 = percentiles.p50,
+                            p90 = percentiles.p90,
+                            tier0 = percentiles.tier0_recommended,
+                            tier1 = percentiles.tier1_recommended,
+                            arb = percentiles.arb_recommended,
+                            samples = percentiles.sample_count,
+                            "Updated dynamic priority fee percentiles from market-data"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to deserialize PriorityFeePercentiles");
+                    }
+                }
+            }
+            warn!("Priority fee subscription ended");
+        });
     }
 
     // Subscribe to PoolCacheUpdates from JetStream (Single Source of Truth)
@@ -4826,8 +4915,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         details: Some(format!("compute_units={}", compute_units)),
     });
 
-    // Check: Priority fee within limit
-    let priority_fee = fee_policy.priority_fee_for_intent(&intent);
+    // Check: Priority fee within limit (P2: use dynamic fees if available)
+    let priority_fee = ctx.get_priority_fee_for_intent(&intent, fee_policy);
     if priority_fee > fee_policy.max_priority_fee_micro_lamports {
         let reason = RejectReason::FeePriorityExceedsLimit;
         checks.push(CheckResult {
@@ -5168,8 +5257,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             };
 
             // Include compute budget ixs so simulation matches send (and CU limit is sufficient).
+            // P2: Use dynamic priority fees if available from Geyser
             let compute_units = fee_policy.compute_units_for_intent(&intent);
-            let micro_lamports_per_cu = fee_policy.priority_fee_for_intent(&intent);
+            let micro_lamports_per_cu = ctx.get_priority_fee_for_intent(&intent, fee_policy);
 
             let mut ixs = Vec::new();
             ixs.push(
