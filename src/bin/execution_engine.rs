@@ -4211,7 +4211,7 @@ async fn main() -> Result<()> {
                     Ok(percentiles) => {
                         // Update the shared state
                         *ctx_clone.dynamic_fee_percentiles.write() = Some(percentiles.clone());
-                        info!(
+                        debug!(
                             p50 = percentiles.p50,
                             p90 = percentiles.p90,
                             tier0 = percentiles.tier0_recommended,
