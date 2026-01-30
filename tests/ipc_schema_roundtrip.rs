@@ -405,7 +405,7 @@ fn test_execution_result_required_fields() {
     assert!(json.contains("intent_id"));
     assert!(json.contains("signature"));
     assert!(json.contains("status"));
-    assert!(json.contains("Confirmed"));
+    assert!(json.contains("\"confirmed\""));
 
     // P1: Source attribution (DoD §F.P1)
     assert!(json.contains("source"));

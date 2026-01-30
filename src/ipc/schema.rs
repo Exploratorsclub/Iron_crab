@@ -1914,7 +1914,7 @@ mod tests {
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("execution_id"));
-        assert!(json.contains("Sent"));
+        assert!(json.contains("\"sent\""));
 
         let parsed: ExecutionResult = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.status, ExecutionStatus::Sent);

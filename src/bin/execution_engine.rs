@@ -57,6 +57,7 @@ use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::live_pool_cache::{
     create_shared_cache, CachedPoolState, SharedLivePoolCache,
 };
+use ironcrab::execution::quote_calculator;
 use ironcrab::execution::tx_builder;
 use ironcrab::execution::wsol_manager::{WsolManager, WsolManagerConfig};
 use ironcrab::ipc::{
@@ -964,6 +965,29 @@ impl StateSnapshot {
     }
 }
 
+#[derive(Debug, Clone)]
+struct RouteCandidate {
+    dex: String,
+    amount_out: u64,
+    pool_id: String,
+    accounts: Vec<String>,
+    creator: Option<String>,
+}
+
+fn select_best_route(candidates: Vec<RouteCandidate>) -> Option<RouteCandidate> {
+    let mut best: Option<RouteCandidate> = None;
+    for candidate in candidates {
+        let replace = best
+            .as_ref()
+            .map(|b| candidate.amount_out > b.amount_out)
+            .unwrap_or(true);
+        if replace {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
 /// Runtime context for execution-engine
 struct ExecutionContext {
     run_id: String,
@@ -1268,7 +1292,7 @@ impl ExecutionContext {
         maybe_ping_watchdog();
 
         // Initialize DEX connectors for quote discovery.
-        // Order priority: PumpFun → PumpSwap → Meteora DLMM → Raydium → Orca
+        // Order priority: Pump.fun bonding curve (known pool) → multi-pool best quote
         let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc)) {
             Ok(p) => Some(p),
             Err(e) => {
@@ -1504,6 +1528,10 @@ impl ExecutionContext {
                             maybe_ping_watchdog();
 
                             if metadata.contains_key("creator") && resources.pools.len() == 1 {
+                                metadata.insert(
+                                    "sell_routing".to_string(),
+                                    "primary".to_string(),
+                                );
                                 metadata.insert("dex".to_string(), "pumpfun".to_string());
                                 min_out_sol = Some(Self::apply_slippage_min_out(
                                     q.amount_out,
@@ -1537,10 +1565,24 @@ impl ExecutionContext {
                 }
             }
 
-            // Fallback to Pump.fun AMM (PumpSwap).
-            // Timeout: pump_amm discovery can scan up to 100 pages of tx history, which can hang
-            // on tokens with no pump_amm pool. Use a 10s timeout for liquidation safety.
+            // Fallback to multi-pool routing (PumpSwap + Meteora + Raydium + Orca).
+            // Pump.fun bonding curve is handled above as the known pool.
             if min_out_sol.is_none() {
+                let mut candidates: Vec<RouteCandidate> = Vec::new();
+                let mut record_candidate = |dex: &str,
+                                            amount_out: u64,
+                                            pool_id: String,
+                                            accounts: Vec<String>| {
+                    candidates.push(RouteCandidate {
+                        dex: dex.to_string(),
+                        amount_out,
+                        pool_id,
+                        accounts,
+                        creator: None,
+                    });
+                };
+
+                // PumpSwap (Pump.fun AMM) with timeout guard.
                 let pump_amm_quote = tokio::time::timeout(
                     Duration::from_secs(10),
                     pump_amm.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in),
@@ -1554,28 +1596,23 @@ impl ExecutionContext {
                         Ok(Some(q)) => {
                             #[cfg(unix)]
                             maybe_ping_watchdog();
-
                             if let Some(pool_id) = q.route.first().cloned() {
                                 match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
                                     Ok(Some(accounts)) => {
-                                        metadata.insert("dex".to_string(), "pump_amm".to_string());
-                                        resources.pools = vec![pool_id.clone()];
-                                        resources.accounts =
+                                        let acct_strings: Vec<String> =
                                             accounts.into_iter().map(|p| p.to_string()).collect();
-                                        min_out_sol = Some(Self::apply_slippage_min_out(
-                                            q.amount_out,
-                                            max_slippage_bps,
-                                        ));
                                         quote_attempts.push(format!(
                                             "pump_amm=ok amount_out={} pool={} accounts_len={}",
                                             q.amount_out,
-                                            resources
-                                                .pools
-                                                .first()
-                                                .map(|s| s.as_str())
-                                                .unwrap_or("<none>"),
-                                            resources.accounts.len()
+                                            pool_id,
+                                            acct_strings.len()
                                         ));
+                                        record_candidate(
+                                            "pump_amm",
+                                            q.amount_out,
+                                            pool_id,
+                                            acct_strings,
+                                        );
                                     }
                                     Ok(None) => {
                                         warn!(mint = %mint, "pump_amm quote returned route, but pool accounts not found; skipping pump_amm");
@@ -1599,12 +1636,8 @@ impl ExecutionContext {
                         }
                     },
                 }
-            }
 
-            // Fallback to Meteora DLMM (before Raydium for better liquidity on meme tokens).
-            // IMPORTANT: Only use if we have real Geyser data (active_id != 0).
-            // Default active_id=0 means no real data, would cause wrong bin array derivation.
-            if min_out_sol.is_none() {
+                // Meteora DLMM (requires valid Geyser active_id and pool accounts).
                 match meteora
                     .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
                     .await
@@ -1614,11 +1647,8 @@ impl ExecutionContext {
                         maybe_ping_watchdog();
 
                         if let Some(pool_id) = q.route.first().cloned() {
-                            // Get DexPoolAccounts for the pool (required by build_tx_plan)
                             if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
                                 if let Some(pool_accounts) = meteora.get_pool_accounts(&pool_pk) {
-                                    // Validate we have real Geyser data (not defaults)
-                                    // active_id is stored as "active_id:<value>" in accounts[5]
                                     let active_id = pool_accounts
                                         .get(5)
                                         .and_then(|s| s.strip_prefix("active_id:"))
@@ -1626,21 +1656,19 @@ impl ExecutionContext {
                                         .unwrap_or(0);
 
                                     if active_id != 0 {
-                                        metadata
-                                            .insert("dex".to_string(), "meteora_dlmm".to_string());
-                                        resources.pools = vec![pool_id.clone()];
-                                        resources.accounts = pool_accounts;
-                                        min_out_sol = Some(Self::apply_slippage_min_out(
-                                            q.amount_out,
-                                            max_slippage_bps,
-                                        ));
                                         quote_attempts.push(format!(
                                             "meteora=ok amount_out={} pool={} active_id={} accounts_len={}",
                                             q.amount_out,
                                             pool_id,
                                             active_id,
-                                            resources.accounts.len()
+                                            pool_accounts.len()
                                         ));
+                                        record_candidate(
+                                            "meteora_dlmm",
+                                            q.amount_out,
+                                            pool_id,
+                                            pool_accounts,
+                                        );
                                     } else {
                                         quote_attempts.push(format!(
                                             "meteora=skip active_id=0 (no Geyser data) pool={}",
@@ -1663,10 +1691,8 @@ impl ExecutionContext {
                         quote_attempts.push(format!("meteora=err {e:#}"));
                     }
                 }
-            }
 
-            // Fallback to Raydium.
-            if min_out_sol.is_none() {
+                // Raydium (no additional pool accounts needed here).
                 match raydium
                     .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
                     .await
@@ -1676,14 +1702,16 @@ impl ExecutionContext {
                         maybe_ping_watchdog();
 
                         if let Some(pool_id) = q.route.first().cloned() {
-                            metadata.insert("dex".to_string(), "raydium".to_string());
-                            resources.pools = vec![pool_id.clone()];
-                            min_out_sol =
-                                Some(Self::apply_slippage_min_out(q.amount_out, max_slippage_bps));
                             quote_attempts.push(format!(
                                 "raydium=ok amount_out={} pool={}",
                                 q.amount_out, pool_id
                             ));
+                            record_candidate(
+                                "raydium",
+                                q.amount_out,
+                                pool_id,
+                                resources.accounts.clone(),
+                            );
                         }
                     }
                     Ok(None) => {
@@ -1693,10 +1721,8 @@ impl ExecutionContext {
                         quote_attempts.push(format!("raydium=err {e:#}"));
                     }
                 }
-            }
 
-            // Fallback to Orca Whirlpool.
-            if min_out_sol.is_none() {
+                // Orca Whirlpool (requires pool accounts).
                 match orca
                     .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
                     .await
@@ -1708,19 +1734,18 @@ impl ExecutionContext {
                         if let Some(pool_id) = q.route.first().cloned() {
                             if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
                                 if let Some(pool_accounts) = orca.get_pool_accounts(&pool_pk) {
-                                    metadata.insert("dex".to_string(), "orca".to_string());
-                                    resources.pools = vec![pool_id.clone()];
-                                    resources.accounts = pool_accounts;
-                                    min_out_sol = Some(Self::apply_slippage_min_out(
-                                        q.amount_out,
-                                        max_slippage_bps,
-                                    ));
                                     quote_attempts.push(format!(
                                         "orca=ok amount_out={} pool={} accounts_len={}",
                                         q.amount_out,
                                         pool_id,
-                                        resources.accounts.len()
+                                        pool_accounts.len()
                                     ));
+                                    record_candidate(
+                                        "orca",
+                                        q.amount_out,
+                                        pool_id,
+                                        pool_accounts,
+                                    );
                                 } else {
                                     quote_attempts.push(format!(
                                         "orca=skip no_pool_accounts amount_out={} pool={}",
@@ -1735,6 +1760,203 @@ impl ExecutionContext {
                     }
                     Err(e) => {
                         quote_attempts.push(format!("orca=err {e:#}"));
+                    }
+                }
+
+                if let Some(best_route) = select_best_route(candidates) {
+                    metadata.insert(
+                        "sell_routing".to_string(),
+                        "multi_pool".to_string(),
+                    );
+                    metadata.insert("dex".to_string(), best_route.dex.clone());
+                    if let Some(creator) = best_route.creator.clone() {
+                        metadata.insert("creator".to_string(), creator);
+                    }
+                    resources.pools = vec![best_route.pool_id.clone()];
+                    resources.accounts = best_route.accounts;
+                    min_out_sol = Some(Self::apply_slippage_min_out(
+                        best_route.amount_out,
+                        max_slippage_bps,
+                    ));
+                    quote_attempts.push(format!(
+                        "multi_pool=best dex={} amount_out={} pool={}",
+                        best_route.dex, best_route.amount_out, best_route.pool_id
+                    ));
+                }
+            }
+
+            // Final fallback: LivePoolCache-derived quote + accounts (GEYSER-first).
+            if min_out_sol.is_none() {
+                if let Some(ref cache) = ctx.live_pool_cache {
+                    let sol_mint_pk = sol_mint;
+                    let mut candidates: Vec<RouteCandidate> = Vec::new();
+
+                    for (pool_addr, state) in cache.iter() {
+                        let has_pair = match &state {
+                            CachedPoolState::PumpFun(s) => {
+                                s.token_mint == mint && s.creator != Pubkey::default()
+                            }
+                            CachedPoolState::PumpAmm(s) => {
+                                (s.base_mint == mint && s.quote_mint == sol_mint_pk)
+                                    || (s.quote_mint == mint && s.base_mint == sol_mint_pk)
+                            }
+                            CachedPoolState::RaydiumAmm(s) => {
+                                (s.base_mint == mint && s.quote_mint == sol_mint_pk)
+                                    || (s.quote_mint == mint && s.base_mint == sol_mint_pk)
+                            }
+                            CachedPoolState::RaydiumCpmm(s) => {
+                                (s.token_0_mint == mint && s.token_1_mint == sol_mint_pk)
+                                    || (s.token_1_mint == mint && s.token_0_mint == sol_mint_pk)
+                            }
+                            CachedPoolState::Meteora(s) => {
+                                (s.token_x_mint == mint && s.token_y_mint == sol_mint_pk)
+                                    || (s.token_y_mint == mint && s.token_x_mint == sol_mint_pk)
+                            }
+                            CachedPoolState::MeteoraCpmm(s) => {
+                                (s.token_0_mint == mint && s.token_1_mint == sol_mint_pk)
+                                    || (s.token_1_mint == mint && s.token_0_mint == sol_mint_pk)
+                            }
+                            CachedPoolState::Orca(s) => {
+                                (s.token_mint_a == mint && s.token_mint_b == sol_mint_pk)
+                                    || (s.token_mint_b == mint && s.token_mint_a == sol_mint_pk)
+                            }
+                        };
+
+                        if !has_pair {
+                            continue;
+                        }
+
+                        let mut intent_for_quote = TradeIntent::new_sell(
+                            "execution-engine",
+                            BUILD_VERSION,
+                            &ctx.run_id,
+                            format!("liquidation-cache-{}", Uuid::new_v4()),
+                            "execution-engine",
+                            IntentTier::Tier0,
+                            IntentOrigin::ExecutionMevB,
+                            mint.to_string(),
+                            decimals,
+                            sol_mint.to_string(),
+                            amount_in,
+                            0,
+                            max_slippage_bps,
+                            TradingRegime::NotApplicable,
+                        );
+                        intent_for_quote.resources.pools = vec![pool_addr.to_string()];
+
+                        let min_out = match quote_calculator::calculate_fresh_min_out(
+                            cache,
+                            &intent_for_quote,
+                        ) {
+                            Ok(Some(v)) => v,
+                            Ok(None) => {
+                                quote_attempts.push(format!(
+                                    "cache=skip no_quote pool={}",
+                                    pool_addr
+                                ));
+                                continue;
+                            }
+                            Err(e) => {
+                                quote_attempts.push(format!(
+                                    "cache=err pool={} err={}",
+                                    pool_addr, e
+                                ));
+                                continue;
+                            }
+                        };
+
+                        let dex = state.dex_name().to_string();
+                        let pool_id = pool_addr.to_string();
+
+                        let accounts = match &state {
+                            CachedPoolState::PumpAmm(s) => {
+                                if s.pool_accounts.is_empty() {
+                                    quote_attempts.push(format!(
+                                        "cache=skip pump_amm no_pool_accounts pool={}",
+                                        pool_id
+                                    ));
+                                    continue;
+                                }
+                                if s.pool_accounts[0].to_string() != pool_id {
+                                    quote_attempts.push(format!(
+                                        "cache=skip pump_amm pool_mismatch pool={}",
+                                        pool_id
+                                    ));
+                                    continue;
+                                }
+                                s.pool_accounts.iter().map(|p| p.to_string()).collect()
+                            }
+                            CachedPoolState::Meteora(_) => {
+                                let pool_pk = match Pubkey::from_str(&pool_id) {
+                                    Ok(pk) => pk,
+                                    Err(_) => continue,
+                                };
+                                let Some(pool_accounts) = meteora.get_pool_accounts(&pool_pk) else {
+                                    quote_attempts.push(format!(
+                                        "cache=skip meteora no_pool_accounts pool={}",
+                                        pool_id
+                                    ));
+                                    continue;
+                                };
+                                let active_id = pool_accounts
+                                    .get(5)
+                                    .and_then(|s| s.strip_prefix("active_id:"))
+                                    .and_then(|v| v.parse::<i32>().ok())
+                                    .unwrap_or(0);
+                                if active_id == 0 {
+                                    quote_attempts.push(format!(
+                                        "cache=skip meteora active_id=0 pool={}",
+                                        pool_id
+                                    ));
+                                    continue;
+                                }
+                                pool_accounts
+                            }
+                            CachedPoolState::Orca(_) => {
+                                let pool_pk = match Pubkey::from_str(&pool_id) {
+                                    Ok(pk) => pk,
+                                    Err(_) => continue,
+                                };
+                                let Some(pool_accounts) = orca.get_pool_accounts(&pool_pk) else {
+                                    quote_attempts.push(format!(
+                                        "cache=skip orca no_pool_accounts pool={}",
+                                        pool_id
+                                    ));
+                                    continue;
+                                };
+                                pool_accounts
+                            }
+                            _ => resources.accounts.clone(),
+                        };
+
+                        candidates.push(RouteCandidate {
+                            dex,
+                            amount_out: min_out,
+                            pool_id,
+                            accounts,
+                            creator: match &state {
+                                CachedPoolState::PumpFun(s) => Some(s.creator.to_string()),
+                                _ => None,
+                            },
+                        });
+                    }
+
+                    if let Some(best_route) = select_best_route(candidates) {
+                        metadata.insert(
+                            "sell_routing".to_string(),
+                            "multi_pool".to_string(),
+                        );
+                        metadata.insert("dex".to_string(), best_route.dex.clone());
+                        if let Some(creator) = best_route.creator.clone() {
+                            metadata.insert("creator".to_string(), creator);
+                        }
+                        resources.pools = vec![best_route.pool_id.clone()];
+                        resources.accounts = best_route.accounts;
+                        min_out_sol = Some(best_route.amount_out);
+                        quote_attempts.push(format!(
+                            "cache=best dex={} min_out={} pool={}",
+                            best_route.dex, best_route.amount_out, best_route.pool_id
+                        ));
                     }
                 }
             }
@@ -4579,6 +4801,15 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         source = %intent.source,
         "Processing intent"
     );
+    if intent.side == TradeSide::Sell {
+        if let Some(sell_routing) = intent.metadata.get("sell_routing") {
+            info!(
+                intent_id = %intent.intent_id,
+                sell_routing = %sell_routing,
+                "Sell routing path"
+            );
+        }
+    }
 
     // Update received counter
     NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -5906,6 +6137,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         }
     }
 
+    let input_snapshots = build_input_snapshots(&intent);
+
     // Emit decision record
     let decision = if config.send_enabled && sent_anything {
         DecisionRecord {
@@ -5927,7 +6160,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             send: send_result.clone(),
             outcome: final_outcome,
             config_snapshot_id: None,
-            input_snapshots: std::collections::HashMap::new(),
+            input_snapshots: input_snapshots.clone(),
         }
     } else if config.send_enabled && send_failed {
         DecisionRecord {
@@ -5949,7 +6182,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             send: None,
             outcome: DecisionOutcome::Rejected,
             config_snapshot_id: None,
-            input_snapshots: std::collections::HashMap::new(),
+            input_snapshots: input_snapshots.clone(),
         }
     } else if config.send_enabled {
         // Simulation succeeded but execution is not implemented.
@@ -5973,7 +6206,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             send: None,
             outcome: DecisionOutcome::Rejected,
             config_snapshot_id: None,
-            input_snapshots: std::collections::HashMap::new(),
+            input_snapshots: input_snapshots.clone(),
         }
     } else {
         // Don't mark this as a simulation failure: simulation succeeded, but sending is disabled.
@@ -6009,7 +6242,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             send: None,
             outcome: DecisionOutcome::Rejected,
             config_snapshot_id: None,
-            input_snapshots: std::collections::HashMap::new(),
+            input_snapshots,
         }
     };
 
@@ -6200,6 +6433,9 @@ async fn emit_rejected_decision(
         checks,
         reason.to_string(),
     );
+    if let Some(sell_routing) = intent.metadata.get("sell_routing") {
+        decision = decision.with_input_snapshot("sell_routing".to_string(), sell_routing.clone());
+    }
     if reason == RejectReason::KillSwitchActive {
         decision.kill_switch = ctx.get_kill_switch_context();
     }
@@ -6235,7 +6471,7 @@ async fn emit_sim_failed_decision(
     INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
     REJECT_SIMULATION_FAIL.fetch_add(1, Ordering::Relaxed);
 
-    let decision = DecisionRecord::new_sim_failed(
+    let mut decision = DecisionRecord::new_sim_failed(
         "execution-engine",
         BUILD_VERSION,
         &ctx.run_id,
@@ -6248,6 +6484,9 @@ async fn emit_sim_failed_decision(
         plan_hash,
         sim_result,
     );
+    if let Some(sell_routing) = intent.metadata.get("sell_routing") {
+        decision = decision.with_input_snapshot("sell_routing".to_string(), sell_routing.clone());
+    }
 
     ctx.decision_writer.write(&decision)?;
 
@@ -6571,6 +6810,14 @@ fn parse_commitment_level_opt(value: Option<&str>) -> Option<CommitmentLevel> {
     }
 }
 
+fn build_input_snapshots(intent: &TradeIntent) -> std::collections::HashMap<String, String> {
+    let mut snapshots = std::collections::HashMap::new();
+    if let Some(sell_routing) = intent.metadata.get("sell_routing") {
+        snapshots.insert("sell_routing".to_string(), sell_routing.clone());
+    }
+    snapshots
+}
+
 enum ConfirmOutcome {
     Confirmed { details: String },
     FailedConfirmed { details: String },
@@ -6654,5 +6901,42 @@ async fn confirm_signature_status(
         attempt = attempt.saturating_add(1);
         let sleep_ms = (50u64 * attempt.min(20) as u64).min(1_000);
         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+    }
+}
+
+#[cfg(test)]
+mod execution_engine_tests {
+    use super::{select_best_route, RouteCandidate};
+
+    #[test]
+    fn select_best_route_prefers_highest_and_keeps_first_on_tie() {
+        let candidates = vec![
+            RouteCandidate {
+                dex: "raydium".to_string(),
+                amount_out: 100,
+                pool_id: "pool-1".to_string(),
+                accounts: vec!["a1".to_string()],
+                creator: None,
+            },
+            RouteCandidate {
+                dex: "orca".to_string(),
+                amount_out: 200,
+                pool_id: "pool-2".to_string(),
+                accounts: vec!["a2".to_string()],
+                creator: None,
+            },
+            RouteCandidate {
+                dex: "pump_amm".to_string(),
+                amount_out: 200,
+                pool_id: "pool-3".to_string(),
+                accounts: vec!["a3".to_string()],
+                creator: None,
+            },
+        ];
+
+        let best = select_best_route(candidates).expect("expected a best route");
+        assert_eq!(best.dex, "orca");
+        assert_eq!(best.pool_id, "pool-2");
+        assert_eq!(best.amount_out, 200);
     }
 }

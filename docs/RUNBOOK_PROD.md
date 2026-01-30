@@ -163,6 +163,11 @@ Weniger aussagekraeftig:
 
 Merksatz: **"WSOL ist Kapital, SOL ist Reserve."**
 
+Hinweis (Wallet-Snapshot JetStream):
+Die Wallet-Snapshot-Recovery ist aktuell nicht nach Wallet gefiltert. Das ist
+ok, solange nur ein Wallet genutzt wird. Bei Multi-Wallet-Betrieb muss ein
+Wallet-Filter im Consumer ergaenzt werden.
+
 ## JSONL Logs (Decision Records)
 
 Alle Prozesse schreiben append-only JSONL nach `trade_logs/`:

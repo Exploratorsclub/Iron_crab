@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn test_multi_hop_config_default() {
         let config = MultiHopConfig::default();
-        assert!(!config.enabled);
+        assert!(config.enabled);
         assert!(config.shadow_mode);
         assert_eq!(config.max_hops, 4);
         assert_eq!(config.min_price_change_bps, 10);

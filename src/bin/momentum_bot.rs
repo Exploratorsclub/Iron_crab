@@ -5480,9 +5480,16 @@ async fn generate_and_publish_exit_intent(
     let sol_mint = "So11111111111111111111111111111111111111112";
 
     // === MULTI-POOL ROUTING: Find best pool for exit ===
-    let (pool, dex, pool_accounts, expected_sol, alternatives_checked) =
+    let (pool, dex, pool_accounts, expected_sol, alternatives_checked, sell_routing) =
         match ctx.find_best_sell_pool(mint, token_amount, original_pool) {
-            Ok(result) => result,
+            Ok((pool, dex, accounts, expected, alts)) => (
+                pool,
+                dex,
+                accounts,
+                expected,
+                alts,
+                "multi_pool".to_string(),
+            ),
             Err(e) => {
                 // Fallback to original pool if multi-pool routing fails
                 warn!(
@@ -5499,12 +5506,19 @@ async fn generate_and_publish_exit_intent(
                         anyhow::anyhow!("cannot generate exit intent: missing DexPoolAccounts")
                     })?;
 
+                let routing = if original_dex.eq_ignore_ascii_case("pump_amm") {
+                    "pumpswap_fallback"
+                } else {
+                    "primary"
+                };
+
                 (
                     original_pool.to_string(),
                     original_dex.to_string(),
                     accounts,
                     0.0,     // Unknown expected
                     0_usize, // No alternatives checked
+                    routing.to_string(),
                 )
             }
         };
@@ -5658,6 +5672,9 @@ async fn generate_and_publish_exit_intent(
     intent
         .metadata
         .insert("reason_code".to_string(), reason_code.to_string());
+    intent
+        .metadata
+        .insert("sell_routing".to_string(), sell_routing);
 
     // Multi-pool routing metadata
     intent.metadata.insert(
