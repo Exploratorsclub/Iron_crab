@@ -159,6 +159,15 @@ pub struct FeePolicyCfg {
     /// Minimum profit after fees in basis points. Default: 10
     #[serde(default = "default_min_profit_after_fees")]
     pub min_profit_after_fees_bps: i32,
+    /// Optional: override Tier0 priority fee for liquidation sells
+    #[serde(default)]
+    pub liquidation_priority_fee_micro_lamports: Option<u64>,
+    /// Optional: override max priority fee for liquidation sells
+    #[serde(default)]
+    pub liquidation_max_priority_fee_micro_lamports: Option<u64>,
+    /// Optional: override max total TX cost for liquidation sells (lamports)
+    #[serde(default)]
+    pub liquidation_max_tx_cost_lamports: Option<u64>,
 }
 
 fn default_compute_units() -> u32 {
@@ -197,6 +206,9 @@ impl Default for FeePolicyCfg {
             tier0_priority_fee_micro_lamports: default_tier0_priority_fee(),
             max_tx_cost_lamports: default_max_tx_cost(),
             min_profit_after_fees_bps: default_min_profit_after_fees(),
+            liquidation_priority_fee_micro_lamports: None,
+            liquidation_max_priority_fee_micro_lamports: None,
+            liquidation_max_tx_cost_lamports: None,
         }
     }
 }

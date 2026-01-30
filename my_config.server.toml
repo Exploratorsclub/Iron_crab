@@ -353,6 +353,9 @@ tier0_priority_fee_micro_lamports = 500_000    # 0.5 lamports per CU (KillSwitch
 max_priority_fee_micro_lamports = 5_000_000    # 1 lamport per CU (absolute max)
 max_tx_cost_lamports = 5_000_000               # 0.005 SOL max TX cost
 min_profit_after_fees_bps = 10                 # 0.1% min profit after all fees
+liquidation_priority_fee_micro_lamports = 2_000_000   # 2.0 lamports/CU for liquidation
+liquidation_max_priority_fee_micro_lamports = 10_000_000 # 10 lamports/CU hard cap
+liquidation_max_tx_cost_lamports = 20_000_000          # 0.02 SOL max TX cost
 
 # P2: TPU Direct TX Submission (faster than RPC)
 # TPU sends directly to slot leaders via QUIC (~50-100ms vs ~200-400ms RPC)

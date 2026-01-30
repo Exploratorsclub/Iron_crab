@@ -751,6 +751,10 @@ struct ExecutionConfig {
     // === P1: Fee/Compute Policies ===
     /// Centralized fee policy (engine owns compute budget and priority fees)
     fee_policy: FeePolicy,
+    /// Optional liquidation-specific fee overrides (kill switch / liquidation sells)
+    liquidation_priority_fee_micro_lamports: Option<u64>,
+    liquidation_max_priority_fee_micro_lamports: Option<u64>,
+    liquidation_max_tx_cost_lamports: Option<u64>,
 
     // === P1: Fairness/Starvation Policy ===
     /// Fairness policy to prevent strategy starvation
@@ -803,6 +807,9 @@ impl Default for ExecutionConfig {
             jito_timeout_secs: 30,
             // P1: Fee/Compute Policy
             fee_policy: FeePolicy::default(),
+            liquidation_priority_fee_micro_lamports: None,
+            liquidation_max_priority_fee_micro_lamports: None,
+            liquidation_max_tx_cost_lamports: None,
             // P1: Fairness Policy
             fairness_policy: FairnessPolicy::default(),
             // WSOL Manager defaults
@@ -3602,6 +3609,12 @@ async fn main() -> Result<()> {
         janitor_dry_run: janitor_cfg.map(|c| c.dry_run).unwrap_or(false) || args.dry_run,
         // Fee Policy
         fee_policy,
+        liquidation_priority_fee_micro_lamports: fee_policy_cfg
+            .and_then(|fp| fp.liquidation_priority_fee_micro_lamports),
+        liquidation_max_priority_fee_micro_lamports: fee_policy_cfg
+            .and_then(|fp| fp.liquidation_max_priority_fee_micro_lamports),
+        liquidation_max_tx_cost_lamports: fee_policy_cfg
+            .and_then(|fp| fp.liquidation_max_tx_cost_lamports),
         ..Default::default()
     };
 
@@ -5144,11 +5157,32 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     }
 
     // === P1: Fee/Compute Policy Checks ===
-    let fee_policy = &config.fee_policy;
+    let mut effective_fee_policy = config.fee_policy.clone();
+    let fee_policy_label = if is_liquidation_sell {
+        if let Some(v) = config.liquidation_priority_fee_micro_lamports {
+            effective_fee_policy.tier0_priority_fee_micro_lamports = v;
+        }
+        if let Some(v) = config.liquidation_max_priority_fee_micro_lamports {
+            effective_fee_policy.max_priority_fee_micro_lamports = v;
+        }
+        if let Some(v) = config.liquidation_max_tx_cost_lamports {
+            effective_fee_policy.max_tx_cost_lamports = v;
+        }
+        "liquidation"
+    } else {
+        "standard"
+    };
+    if is_liquidation_sell {
+        info!(
+            intent_id = %intent.intent_id,
+            fee_policy = %fee_policy_label,
+            "Using liquidation fee policy"
+        );
+    }
 
     // Check: Compute units within limit
-    let compute_units = fee_policy.compute_units_for_intent(&intent);
-    if compute_units > fee_policy.max_compute_units {
+    let compute_units = effective_fee_policy.compute_units_for_intent(&intent);
+    if compute_units > effective_fee_policy.max_compute_units {
         let reason = RejectReason::FeeComputeExceedsLimit;
         checks.push(CheckResult {
             check_name: "fee_compute_limit".to_string(),
@@ -5156,7 +5190,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             reason_code: Some(reason.to_string()),
             details: Some(format!(
                 "compute_units={} > max={}",
-                compute_units, fee_policy.max_compute_units
+                compute_units, effective_fee_policy.max_compute_units
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -5169,8 +5203,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     });
 
     // Check: Priority fee within limit (P2: use dynamic fees if available)
-    let priority_fee = ctx.get_priority_fee_for_intent(&intent, fee_policy);
-    if priority_fee > fee_policy.max_priority_fee_micro_lamports {
+    let priority_fee = ctx.get_priority_fee_for_intent(&intent, &effective_fee_policy);
+    if priority_fee > effective_fee_policy.max_priority_fee_micro_lamports {
         let reason = RejectReason::FeePriorityExceedsLimit;
         checks.push(CheckResult {
             check_name: "fee_priority_limit".to_string(),
@@ -5178,7 +5212,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             reason_code: Some(reason.to_string()),
             details: Some(format!(
                 "priority_fee={} > max={}",
-                priority_fee, fee_policy.max_priority_fee_micro_lamports
+                priority_fee, effective_fee_policy.max_priority_fee_micro_lamports
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -5191,8 +5225,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     });
 
     // Check: Total transaction cost within limit
-    let (base_fee, priority_fee_lamports, total_cost) = fee_policy.estimate_tx_cost(&intent);
-    if total_cost > fee_policy.max_tx_cost_lamports {
+    let (base_fee, priority_fee_lamports, total_cost) =
+        effective_fee_policy.estimate_tx_cost(&intent);
+    if total_cost > effective_fee_policy.max_tx_cost_lamports {
         let reason = RejectReason::FeeExceedsMaxCost;
         checks.push(CheckResult {
             check_name: "fee_max_cost".to_string(),
@@ -5200,7 +5235,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             reason_code: Some(reason.to_string()),
             details: Some(format!(
                 "total_cost={} (base={}, priority={}) > max={}",
-                total_cost, base_fee, priority_fee_lamports, fee_policy.max_tx_cost_lamports
+                total_cost, base_fee, priority_fee_lamports, effective_fee_policy.max_tx_cost_lamports
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -5221,7 +5256,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // For SELL exits (incl. liquidations), skip - exits aren't expected to be profitable-after-fees.
     let is_arb_intent = intent.source == "arb-strategy";
     if intent.side == TradeSide::Buy && is_arb_intent {
-        let (is_profitable, profit_after_fees_bps) = fee_policy.is_profitable_after_fees(&intent);
+        let (is_profitable, profit_after_fees_bps) =
+            effective_fee_policy.is_profitable_after_fees(&intent);
         if !is_profitable {
             let reason = RejectReason::FeeUnprofitable;
             checks.push(CheckResult {
@@ -5230,7 +5266,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 reason_code: Some(reason.to_string()),
                 details: Some(format!(
                     "profit_after_fees={}bps < min={}bps",
-                    profit_after_fees_bps, fee_policy.min_profit_after_fees_bps
+                    profit_after_fees_bps, effective_fee_policy.min_profit_after_fees_bps
                 )),
             });
             return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -5239,10 +5275,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             check_name: "fee_profitability".to_string(),
             passed: true,
             reason_code: None,
-            details: Some(format!(
-                "profit_after_fees={}bps >= min={}bps",
-                profit_after_fees_bps, fee_policy.min_profit_after_fees_bps
-            )),
+        details: Some(format!(
+            "profit_after_fees={}bps >= min={}bps",
+            profit_after_fees_bps, effective_fee_policy.min_profit_after_fees_bps
+        )),
         });
     } else {
         // Skip for momentum-bot (speculative), SELL exits, and other non-arb sources
@@ -5444,7 +5480,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
             // Use the same fee policy estimates that will be used for the actual send path.
             let (_base_fee, _priority_fee_lamports, total_cost_lamports) =
-                fee_policy.estimate_tx_cost(&intent);
+                effective_fee_policy.estimate_tx_cost(&intent);
 
             // Cross-DEX arb must be revalidated with live quotes before plan is built.
             let validation = match handler
@@ -5511,8 +5547,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
             // Include compute budget ixs so simulation matches send (and CU limit is sufficient).
             // P2: Use dynamic priority fees if available from Geyser
-            let compute_units = fee_policy.compute_units_for_intent(&intent);
-            let micro_lamports_per_cu = ctx.get_priority_fee_for_intent(&intent, fee_policy);
+            let compute_units = effective_fee_policy.compute_units_for_intent(&intent);
+            let micro_lamports_per_cu =
+                ctx.get_priority_fee_for_intent(&intent, &effective_fee_policy);
 
             let mut ixs = Vec::new();
             ixs.push(
@@ -6137,7 +6174,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         }
     }
 
-    let input_snapshots = build_input_snapshots(&intent);
+    let mut input_snapshots = build_input_snapshots(&intent);
+    input_snapshots.insert("fee_policy".to_string(), fee_policy_label.to_string());
 
     // Emit decision record
     let decision = if config.send_enabled && sent_anything {
@@ -6436,6 +6474,23 @@ async fn emit_rejected_decision(
     if let Some(sell_routing) = intent.metadata.get("sell_routing") {
         decision = decision.with_input_snapshot("sell_routing".to_string(), sell_routing.clone());
     }
+    let is_liquidation_sell = intent.side == TradeSide::Sell
+        && (intent
+            .metadata
+            .get("purpose")
+            .map(|v| v == "liquidation")
+            .unwrap_or(false)
+            || intent
+                .metadata
+                .get("kill_switch")
+                .map(|v| v == "true")
+                .unwrap_or(false));
+    let fee_policy_label = if is_liquidation_sell {
+        "liquidation"
+    } else {
+        "standard"
+    };
+    decision = decision.with_input_snapshot("fee_policy".to_string(), fee_policy_label.to_string());
     if reason == RejectReason::KillSwitchActive {
         decision.kill_switch = ctx.get_kill_switch_context();
     }
@@ -6487,6 +6542,23 @@ async fn emit_sim_failed_decision(
     if let Some(sell_routing) = intent.metadata.get("sell_routing") {
         decision = decision.with_input_snapshot("sell_routing".to_string(), sell_routing.clone());
     }
+    let is_liquidation_sell = intent.side == TradeSide::Sell
+        && (intent
+            .metadata
+            .get("purpose")
+            .map(|v| v == "liquidation")
+            .unwrap_or(false)
+            || intent
+                .metadata
+                .get("kill_switch")
+                .map(|v| v == "true")
+                .unwrap_or(false));
+    let fee_policy_label = if is_liquidation_sell {
+        "liquidation"
+    } else {
+        "standard"
+    };
+    decision = decision.with_input_snapshot("fee_policy".to_string(), fee_policy_label.to_string());
 
     ctx.decision_writer.write(&decision)?;
 
