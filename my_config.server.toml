@@ -350,7 +350,7 @@ max_compute_units = 1_400_000
 arb_compute_units = 400_000
 default_priority_fee_micro_lamports = 100_000  # 0.1 lamports per CU (baseline)
 tier0_priority_fee_micro_lamports = 500_000    # 0.5 lamports per CU (KillSwitch, exits)
-max_priority_fee_micro_lamports = 1_000_000    # 1 lamport per CU (absolute max)
+max_priority_fee_micro_lamports = 5_000_000    # 1 lamport per CU (absolute max)
 max_tx_cost_lamports = 5_000_000               # 0.005 SOL max TX cost
 min_profit_after_fees_bps = 10                 # 0.1% min profit after all fees
 
