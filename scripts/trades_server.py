@@ -18,11 +18,14 @@ import argparse
 
 TRADE_LOG_DIR = os.environ.get("IRONCRAB_LOG_DIR", "trade_logs")
 EXECUTIONS_DIR = Path(TRADE_LOG_DIR) / "executions"
+DECISIONS_DIR = Path(TRADE_LOG_DIR) / "decisions"
 
 class TradesHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/trades" or self.path == "/trades/":
             self.serve_trades()
+        elif self.path == "/decisions" or self.path == "/decisions/":
+            self.serve_decisions()
         elif self.path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -40,6 +43,15 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(trades).encode())
+
+    def serve_decisions(self):
+        decisions = self.read_recent_decisions(200)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(decisions).encode())
     
     def read_recent_trades(self, limit: int) -> list:
         """Read last N trades from execution_results JSONL files (mint now included in execution records)"""
@@ -73,6 +85,55 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         # Sort by timestamp descending, take last N
         trades.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
         return trades[:limit]
+
+    def read_recent_decisions(self, limit: int) -> list:
+        """Read last N decision records with a simple status field."""
+        decisions = []
+        execution_by_intent = {}
+
+        # Preload execution results for signature/token_mint when available.
+        for days_ago in [0, 1, 2]:
+            date = (datetime.now() - timedelta(days=days_ago)).strftime("%Y%m%d")
+            jsonl_path = EXECUTIONS_DIR / f"execution_results-{date}.jsonl"
+            if not jsonl_path.exists():
+                continue
+            try:
+                with open(jsonl_path, 'r') as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            record = json.loads(line)
+                            intent_id = record.get('intent_id')
+                            if intent_id:
+                                execution_by_intent[intent_id] = record
+                        except json.JSONDecodeError:
+                            continue
+            except Exception as e:
+                print(f"Error reading {jsonl_path}: {e}")
+
+        for days_ago in [0, 1, 2]:
+            date = (datetime.now() - timedelta(days=days_ago)).strftime("%Y%m%d")
+            jsonl_path = DECISIONS_DIR / f"decision_records-{date}.jsonl"
+            if not jsonl_path.exists():
+                continue
+            try:
+                with open(jsonl_path, 'r') as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            record = json.loads(line)
+                            decision = self.parse_decision_record(record, execution_by_intent)
+                            if decision:
+                                decisions.append(decision)
+                        except json.JSONDecodeError:
+                            continue
+            except Exception as e:
+                print(f"Error reading {jsonl_path}: {e}")
+
+        decisions.sort(key=lambda d: d.get('timestamp_ms', 0), reverse=True)
+        return decisions[:limit]
     
     def parse_execution_result(self, record: dict) -> dict:
         """Parse execution_results JSONL record into Grafana-compatible trade format"""
@@ -193,6 +254,49 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             }
         except Exception as e:
             print(f"Error parsing execution result: {e}")
+            return None
+
+    def parse_decision_record(self, record: dict, execution_by_intent: dict) -> dict:
+        """Parse decision record into a simple status view for Grafana."""
+        try:
+            ts_ms = record.get('ts_unix_ms', 0)
+            intent_id = record.get('intent_id', '')
+            decision_id = record.get('decision_id', '')
+            source = record.get('source', 'unknown')
+            outcome = record.get('outcome', 'Rejected')
+            reject_reason = record.get('primary_reject_reason')
+
+            status_map = {
+                "Confirmed": "confirmed",
+                "Sent": "sent",
+                "FailedConfirmed": "failed_confirmed",
+                "SimFailed": "rejected",
+                "Expired": "rejected",
+                "Rejected": "rejected",
+            }
+            status = status_map.get(outcome, "rejected")
+
+            exec_record = execution_by_intent.get(intent_id, {})
+            signature = exec_record.get('signature')
+            token_mint = exec_record.get('token_mint')
+
+            if not signature:
+                signature = (record.get('send') or {}).get('signature')
+
+            return {
+                "timestamp_ms": ts_ms,
+                "time": datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+                "decision_id": decision_id,
+                "intent_id": intent_id,
+                "source": source,
+                "status": status,
+                "outcome": outcome,
+                "tx_hash": signature,
+                "token_mint": token_mint,
+                "reject_reason": reject_reason,
+            }
+        except Exception as e:
+            print(f"Error parsing decision record: {e}")
             return None
     
     def log_message(self, format, *args):
