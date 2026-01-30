@@ -98,14 +98,24 @@ fi
 # 3.5. Configure Wallet Pubkey for Position Reconciliation
 # -----------------------------------------------------------------------------
 log_info "Configuring wallet pubkey for position reconciliation..."
-if [ -f "$HOME/.config/solana/id.json" ]; then
+# Prefer explicit keypair path if provided; otherwise try common locations.
+KEYPAIR_PATH=""
+if [ -n "${SOLANA_KEYPAIR_PATH:-}" ]; then
+    KEYPAIR_PATH="$SOLANA_KEYPAIR_PATH"
+elif [ -f "$HOME/.config/solana/id.json" ]; then
+    KEYPAIR_PATH="$HOME/.config/solana/id.json"
+elif [ -f "/home/sol/.config/solana/id.json" ]; then
+    KEYPAIR_PATH="/home/sol/.config/solana/id.json"
+fi
+
+if [ -n "$KEYPAIR_PATH" ] && [ -f "$KEYPAIR_PATH" ]; then
     # Ensure solders is installed for keypair handling
     .venv/bin/pip install -q solders >/dev/null 2>&1 || true
     
-    WALLET_PUBKEY=$(.venv/bin/python3 <<'EOF' 2>/dev/null || echo ""
+    WALLET_PUBKEY=$(.venv/bin/python3 <<EOF 2>/dev/null || echo ""
 import json
 from solders.keypair import Keypair
-with open('$HOME/.config/solana/id.json') as f:
+with open('$KEYPAIR_PATH') as f:
     kp = Keypair.from_bytes(bytes(json.load(f)))
 print(str(kp.pubkey()))
 EOF
@@ -123,7 +133,7 @@ EOF
         log_warn "Could not extract wallet pubkey (position reconciliation disabled)"
     fi
 else
-    log_warn "No wallet keypair found at ~/.config/solana/id.json (position reconciliation disabled)"
+    log_warn "No wallet keypair found (position reconciliation disabled)"
 fi
 
 # -----------------------------------------------------------------------------

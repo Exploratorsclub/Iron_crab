@@ -146,6 +146,23 @@ journalctl -u execution-engine -n 100 --no-pager
 | Control Plane API | `http://localhost:8080` | REST API |
 | Trades API | `http://localhost:9899/trades` | Grafana Infinity |
 
+## Dashboard-Interpretation (WSOL-first)
+
+Aktuelle Architektur handelt primär in WSOL (kein Auto-Unwrap). Daher gelten
+folgende Interpretations-Regeln:
+
+- **WSOL-Balance (ATA)** = Trading-Liquiditaet (entscheidend fuer Buy/Scale-In)
+- **WSOL-Wrap-Events** = Nachschub/Buffer fuer Trading
+- **Open Positions** = Strategie-Sicht (korrekt nur mit aktivem Reconciliation)
+- **ExecutionResults (Confirmed/Sent/Rejected)** = reale Handelsausfuehrung
+- **Available SOL** = Lock/Budget-Metrik (kein On-Chain-Stand)
+
+Weniger aussagekraeftig:
+
+- **Wallet SOL Balance** als Trading-Kapital (WSOL ist primär)
+
+Merksatz: **"WSOL ist Kapital, SOL ist Reserve."**
+
 ## JSONL Logs (Decision Records)
 
 Alle Prozesse schreiben append-only JSONL nach `trade_logs/`:
