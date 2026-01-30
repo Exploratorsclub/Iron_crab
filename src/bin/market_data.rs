@@ -39,9 +39,9 @@ use ironcrab::metrics::{
     NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
-    config_consumer_config, config_subject, ensure_pool_cache_stream, pool_subject,
-    wallet_balance_topic, NatsClient, NatsConfig, CONFIG_STREAM_NAME, TOPIC_MARKET_EVENTS,
-    TOPIC_PRIORITY_FEE_SAMPLES,
+    config_consumer_config, config_subject, ensure_pool_cache_stream,
+    ensure_wallet_snapshot_stream, pool_subject, wallet_balance_topic, wallet_snapshot_subject,
+    NatsClient, NatsConfig, CONFIG_STREAM_NAME, TOPIC_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES,
 };
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
@@ -492,6 +492,8 @@ async fn publish_wallet_snapshot(
     let mut total_accounts = 0usize;
     let mut non_zero_accounts = 0usize;
 
+    let wallet_str = wallet.to_string();
+
     // Scan both SPL Token and Token-2022 programs
     for (program_id, program_name) in [
         (token_program, "SPL Token"),
@@ -576,6 +578,12 @@ async fn publish_wallet_snapshot(
             if let Some(ref nats) = ctx.nats {
                 if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
                     warn!(error = %e, mint = %mint, "Failed to publish WalletBalanceSnapshot");
+                }
+
+                // Persist snapshot to JetStream (race-free recovery)
+                let subject = wallet_snapshot_subject(&wallet_str, mint_str);
+                if let Err(e) = nats.jetstream_publish(&subject, &event).await {
+                    warn!(error = %e, mint = %mint, "Failed to publish WalletBalanceSnapshot to JetStream");
                 }
             }
 
@@ -677,6 +685,15 @@ async fn main() -> Result<()> {
                 error!("Check that nats-server is running with -js flag");
             } else {
                 info!("JetStream POOL_CACHE stream ready for persistent state recovery");
+            }
+
+            // Initialize JetStream stream for WalletBalanceSnapshot (position reconciliation)
+            if let Err(e) = ensure_wallet_snapshot_stream(client.client()).await {
+                error!(error = %e, "Failed to create/update JetStream WALLET_SNAPSHOT stream");
+                error!("WalletBalanceSnapshot persistence disabled!");
+                error!("Check that nats-server is running with -js flag");
+            } else {
+                info!("JetStream WALLET_SNAPSHOT stream ready for position reconciliation");
             }
 
             Some(client)

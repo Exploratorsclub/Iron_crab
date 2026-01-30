@@ -43,6 +43,18 @@ pub fn wallet_balance_topic(wallet: &str) -> String {
     format!("{}.{}", TOPIC_WALLET_BALANCE_PREFIX, wallet)
 }
 
+/// Wallet balance snapshot (JetStream persisted for strategy reconciliation)
+/// Subject per wallet+mint: ironcrab.wallet_snapshot.{wallet}.{mint}
+pub const TOPIC_WALLET_SNAPSHOT_PREFIX: &str = "ironcrab.wallet_snapshot";
+
+/// Subject pattern for wallet snapshots (for JetStream consumers)
+pub const TOPIC_WALLET_SNAPSHOT_PATTERN: &str = "ironcrab.wallet_snapshot.*.*";
+
+/// Helper function to build wallet snapshot subject
+pub fn wallet_snapshot_subject(wallet: &str, mint: &str) -> String {
+    format!("{}.{}.{}", TOPIC_WALLET_SNAPSHOT_PREFIX, wallet, mint)
+}
+
 /// JetStream subject pattern for pool cache (subject-per-pool for automatic compaction)
 /// Each pool gets its own subject: ironcrab.pool_cache.{pool_address}
 /// This allows JetStream to keep only the latest state per pool (max_messages_per_subject=1)

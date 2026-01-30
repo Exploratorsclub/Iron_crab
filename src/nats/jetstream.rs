@@ -22,11 +22,16 @@ use anyhow::{Context, Result};
 use async_nats::jetstream;
 use tracing::{info, warn};
 
+use super::TOPIC_WALLET_SNAPSHOT_PATTERN;
+
 /// JetStream stream name for pool cache updates
 pub const STREAM_NAME: &str = "POOL_CACHE";
 
 /// JetStream stream name for config updates
 pub const CONFIG_STREAM_NAME: &str = "CONFIG_UPDATES";
+
+/// JetStream stream name for wallet balance snapshots
+pub const WALLET_SNAPSHOT_STREAM_NAME: &str = "WALLET_SNAPSHOT";
 
 /// Subject pattern for pool cache (subject-per-pool for compaction)
 pub const SUBJECT_PATTERN: &str = "ironcrab.pool_cache.*";
@@ -94,6 +99,50 @@ pub async fn ensure_pool_cache_stream(client: &async_nats::Client) -> Result<()>
                 "Failed to create/update JetStream stream - check JetStream enabled with -js flag"
             );
             Err(e).context("JetStream stream creation/update failed")
+        }
+    }
+}
+
+/// Create or update the WALLET_SNAPSHOT stream for wallet reconciliation
+///
+/// Keeps the latest snapshot per wallet+mint (subject-per-wallet+mint).
+pub async fn ensure_wallet_snapshot_stream(client: &async_nats::Client) -> Result<()> {
+    let jetstream = jetstream::new(client.clone());
+
+    let stream_config = jetstream::stream::Config {
+        name: WALLET_SNAPSHOT_STREAM_NAME.to_string(),
+        subjects: vec![TOPIC_WALLET_SNAPSHOT_PATTERN.to_string()],
+        retention: jetstream::stream::RetentionPolicy::Limits,
+        max_age: std::time::Duration::from_secs(7 * 24 * 60 * 60), // 7 days
+        storage: jetstream::stream::StorageType::File,
+        num_replicas: 1,
+        discard: jetstream::stream::DiscardPolicy::Old,
+        max_messages_per_subject: 1, // Keep only latest per wallet+mint
+        allow_rollup: true,
+        ..Default::default()
+    };
+
+    match jetstream.get_or_create_stream(stream_config).await {
+        Ok(mut stream) => {
+            let info = stream.info().await?;
+            info!(
+                stream_name = %WALLET_SNAPSHOT_STREAM_NAME,
+                subjects = %TOPIC_WALLET_SNAPSHOT_PATTERN,
+                retention_days = 7,
+                max_msgs_per_subject = 1,
+                num_messages = info.state.messages,
+                storage = ?info.config.storage,
+                "JetStream WALLET_SNAPSHOT stream ready"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                stream_name = %WALLET_SNAPSHOT_STREAM_NAME,
+                error = %e,
+                "Failed to create/update WALLET_SNAPSHOT stream"
+            );
+            Err(e).context("WALLET_SNAPSHOT stream creation/update failed")
         }
     }
 }
@@ -200,6 +249,17 @@ pub fn slave_consumer_config() -> jetstream::consumer::pull::Config {
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
         max_ack_pending: 1000,
         filter_subject: "ironcrab.pool_cache.>".to_string(), // Required for LastPerSubject
+        ..Default::default()
+    }
+}
+
+/// Consumer config for wallet snapshot recovery (LastPerSubject)
+pub fn wallet_snapshot_consumer_config() -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::LastPerSubject,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        max_ack_pending: 1000,
+        filter_subject: "ironcrab.wallet_snapshot.>".to_string(),
         ..Default::default()
     }
 }

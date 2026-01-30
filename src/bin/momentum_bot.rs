@@ -47,8 +47,9 @@ use ironcrab::metrics::{
     NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
-    config_consumer_config, config_subject, NatsClient, NatsConfig, CONFIG_STREAM_NAME,
-    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS,
+    config_consumer_config, config_subject, wallet_snapshot_consumer_config, NatsClient,
+    NatsConfig, CONFIG_STREAM_NAME, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
+    TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
@@ -3700,6 +3701,83 @@ async fn recover_positions_from_jsonl(
     Ok(positions)
 }
 
+/// Bootstrap WalletBalanceSnapshot events from JetStream (race-free recovery)
+async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &MomentumContext) -> Result<usize> {
+    use async_nats::jetstream;
+    use futures::StreamExt;
+
+    let Some(ref nats_client) = ctx.nats else {
+        return Ok(0);
+    };
+
+    let jetstream = jetstream::new(nats_client.client().clone());
+    let stream = match jetstream.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                error = %e,
+                stream = WALLET_SNAPSHOT_STREAM_NAME,
+                "Wallet snapshot stream not found (market-data may not be running)"
+            );
+            return Ok(0);
+        }
+    };
+
+    let consumer = stream.create_consumer(wallet_snapshot_consumer_config()).await?;
+    let mut recovered = 0usize;
+    let batch_size = 1000;
+
+    loop {
+        let mut messages = consumer.fetch().max_messages(batch_size).messages().await?;
+        let mut batch_count = 0;
+
+        while let Some(msg) = messages.next().await {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "Error fetching wallet snapshot from JetStream");
+                    continue;
+                }
+            };
+
+            batch_count += 1;
+
+            let event: MarketEvent = match serde_json::from_slice(&msg.payload) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(error = %e, "Failed to deserialize WalletBalanceSnapshot from JetStream");
+                    if let Err(ack_err) = msg.ack().await {
+                        warn!(error = %ack_err, "Failed to ack wallet snapshot message");
+                    }
+                    continue;
+                }
+            };
+
+            if let MarketEventKind::WalletBalanceSnapshot { .. } = &event.kind {
+                if let Err(e) = process_market_event(ctx, &event).await {
+                    warn!(error = %e, "Failed to apply WalletBalanceSnapshot");
+                } else {
+                    recovered += 1;
+                }
+            }
+
+            if let Err(ack_err) = msg.ack().await {
+                warn!(error = %ack_err, "Failed to ack wallet snapshot message");
+            }
+        }
+
+        if batch_count < batch_size {
+            break;
+        }
+    }
+
+    if recovered > 0 {
+        info!(recovered, "✅ Wallet snapshots recovered from JetStream");
+    }
+
+    Ok(recovered)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -3930,6 +4008,13 @@ async fn main() -> Result<()> {
         intents_generated: std::sync::atomic::AtomicU64::new(0),
         exits_generated: std::sync::atomic::AtomicU64::new(0),
     });
+
+    // === P0: Wallet snapshot recovery from JetStream ===
+    if let Ok(recovered) = bootstrap_wallet_snapshot_from_jetstream(&ctx).await {
+        if recovered == 0 {
+            debug!("No wallet snapshots recovered from JetStream");
+        }
+    }
 
     // === CRITICAL: Check for immediate exits after position recovery ===
     // Recovered positions might already violate max_hold_time or stop-loss
