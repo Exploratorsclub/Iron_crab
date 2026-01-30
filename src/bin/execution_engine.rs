@@ -62,7 +62,7 @@ use ironcrab::execution::wsol_manager::{WsolManager, WsolManagerConfig};
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, ExecutionResult, ExecutionStatus, ExplicitAmount, FairnessPolicy, FeePolicy,
-    FillStatus, FillUnavailableReason, IntentOrigin, IntentTier, PoolCacheUpdate,
+    FillStatus, FillUnavailableReason, IntentOrigin, IntentTier, KillSwitchContext, PoolCacheUpdate,
     PoolCacheUpdateType, PriorityFeePercentiles, RecordHeader, RejectReason, SimulationResult,
     TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
 };
@@ -997,6 +997,8 @@ struct ExecutionContext {
     kill_switch_active: AtomicBool,
     /// Prevent concurrent liquidation jobs.
     liquidation_in_progress: AtomicBool,
+    /// Last kill switch context from control-plane.
+    kill_switch_context: parking_lot::RwLock<Option<KillSwitchContext>>,
 
     /// Prevent concurrent manual burn jobs.
     burn_in_progress: AtomicBool,
@@ -1072,6 +1074,14 @@ impl ExecutionContext {
 
     fn is_kill_switch_active(&self) -> bool {
         self.kill_switch_active.load(Ordering::Relaxed)
+    }
+
+    fn set_kill_switch_context(&self, context: Option<KillSwitchContext>) {
+        *self.kill_switch_context.write() = context;
+    }
+
+    fn get_kill_switch_context(&self) -> Option<KillSwitchContext> {
+        self.kill_switch_context.read().clone()
     }
 
     /// Get priority fee for an intent using dynamic percentiles if available, else static config.
@@ -3655,6 +3665,7 @@ async fn main() -> Result<()> {
         open_positions: std::sync::atomic::AtomicUsize::new(initial_positions),
         kill_switch_active: AtomicBool::new(initial_kill_switch_active),
         liquidation_in_progress: AtomicBool::new(false),
+        kill_switch_context: parking_lot::RwLock::new(None),
         burn_in_progress: AtomicBool::new(false),
         // P1: Jito bundle support
         jito_client,
@@ -4306,6 +4317,16 @@ async fn main() -> Result<()> {
                         ControlRequestKind::KillSwitch { active, reason, liquidate_positions, max_slippage_bps, ttl_ms } => {
                             ctx.kill_switch_active.store(active, Ordering::Relaxed);
                             info!(active, liquidate_positions, reason = ?reason, "Kill switch updated");
+                            if active {
+                                ctx.set_kill_switch_context(Some(KillSwitchContext {
+                                    reason: reason.clone(),
+                                    source: Some(req.header.component.clone()),
+                                    liquidate_positions: Some(liquidate_positions),
+                                    request_id: Some(request_id.clone()),
+                                }));
+                            } else {
+                                ctx.set_kill_switch_context(None);
+                            }
 
                             // Persist immediately so restarts don't silently drop the kill switch.
                             if let Err(e) = ctx.save_state() {
@@ -4332,6 +4353,7 @@ async fn main() -> Result<()> {
                         ControlRequestKind::ResetKillSwitch => {
                             ctx.kill_switch_active.store(false, Ordering::Relaxed);
                             info!("Kill switch reset");
+                            ctx.set_kill_switch_context(None);
 
                             // Persist immediately so restarts don't re-enable a previously active kill switch.
                             if let Err(e) = ctx.save_state() {
@@ -5899,6 +5921,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             regime: intent.regime,
             checks,
             primary_reject_reason: None,
+            kill_switch: None,
             plan_hash,
             simulate: Some(sim_result),
             send: send_result.clone(),
@@ -5920,6 +5943,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             regime: intent.regime,
             checks,
             primary_reject_reason: Some(RejectReason::SendFailed.to_string()),
+            kill_switch: None,
             plan_hash,
             simulate: Some(sim_result),
             send: None,
@@ -5943,6 +5967,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             regime: intent.regime,
             checks,
             primary_reject_reason: Some("send_not_implemented".to_string()),
+            kill_switch: None,
             plan_hash,
             simulate: Some(sim_result),
             send: None,
@@ -5978,6 +6003,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             regime: intent.regime,
             checks,
             primary_reject_reason: Some("send_disabled".to_string()),
+            kill_switch: None,
             plan_hash,
             simulate: Some(sim_result),
             send: None,
@@ -6162,7 +6188,7 @@ async fn emit_rejected_decision(
     // Keep Prometheus counters aligned with decision records.
     INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 
-    let decision = DecisionRecord::new_rejected(
+    let mut decision = DecisionRecord::new_rejected(
         "execution-engine",
         BUILD_VERSION,
         &ctx.run_id,
@@ -6174,6 +6200,9 @@ async fn emit_rejected_decision(
         checks,
         reason.to_string(),
     );
+    if reason == RejectReason::KillSwitchActive {
+        decision.kill_switch = ctx.get_kill_switch_context();
+    }
 
     ctx.decision_writer.write(&decision)?;
 

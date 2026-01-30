@@ -1303,6 +1303,23 @@ pub struct CheckResult {
     pub details: Option<String>,
 }
 
+/// Kill switch context attached to a decision (optional).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KillSwitchContext {
+    /// Reason provided by control-plane (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Origin of the kill switch activation (e.g., "control-plane", "auto").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Whether liquidation was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liquidate_positions: Option<bool>,
+    /// Control request ID for correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
 /// Simulation result summary
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SimulationResult {
@@ -1364,6 +1381,10 @@ pub struct DecisionRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_reject_reason: Option<String>,
 
+    /// Optional kill switch context for audit/debugging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kill_switch: Option<KillSwitchContext>,
+
     /// Hash of the transaction plan (for correlation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_hash: Option<String>,
@@ -1411,6 +1432,7 @@ impl DecisionRecord {
             regime,
             checks,
             primary_reject_reason: Some(primary_reject_reason),
+            kill_switch: None,
             plan_hash: None,
             simulate: None,
             send: None,
@@ -1443,6 +1465,7 @@ impl DecisionRecord {
             regime,
             checks,
             primary_reject_reason: sim_result.error_code.clone(),
+            kill_switch: None,
             plan_hash: Some(plan_hash),
             simulate: Some(sim_result),
             send: None,
