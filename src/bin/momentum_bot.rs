@@ -346,6 +346,18 @@ struct TradeEvent {
     signature: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PositionEntrySource {
+    Live,
+    WalletSnapshot,
+}
+
+impl Default for PositionEntrySource {
+    fn default() -> Self {
+        Self::Live
+    }
+}
+
 /// Tracks an open position for exit strategy
 #[derive(Debug, Clone)]
 struct PositionTracker {
@@ -375,6 +387,20 @@ struct PositionTracker {
     trailing_active: bool,
     /// Exit intent already generated?
     exit_generated: bool,
+    /// When we last generated an exit intent (for retry reconciliation)
+    exit_generated_at: Option<Instant>,
+    /// Origin of this position (live execution vs. wallet snapshot reconciliation)
+    entry_source: PositionEntrySource,
+}
+
+#[derive(Clone, Debug)]
+struct TimedExitReconcileCandidate {
+    mint: String,
+    pool: String,
+    dex: String,
+    token_amount: u64,
+    hold_secs: u64,
+    last_exit_age_secs: Option<u64>,
 }
 
 /// Serializable position state for JetStream KV persistence
@@ -408,12 +434,18 @@ struct PersistedPosition {
     trailing_active: bool,
     /// Exit intent already generated?
     exit_generated: bool,
+    /// When exit intent was last generated (unix ms)
+    #[serde(default)]
+    exit_generated_at_unix_ms: Option<u64>,
+    /// Origin of this position
+    #[serde(default)]
+    entry_source: PositionEntrySource,
     /// Schema version for forward compatibility
     schema_version: u8,
 }
 
 impl PersistedPosition {
-    const CURRENT_SCHEMA_VERSION: u8 = 1;
+    const CURRENT_SCHEMA_VERSION: u8 = 2;
 
     /// Convert from PositionTracker to PersistedPosition
     fn from_tracker(tracker: &PositionTracker) -> Self {
@@ -424,6 +456,10 @@ impl PersistedPosition {
             .unwrap_or_default()
             .as_millis() as u64;
         let entry_time_unix_ms = now_ms.saturating_sub(elapsed.as_millis() as u64);
+        let exit_generated_at_unix_ms = tracker.exit_generated_at.map(|ts| {
+            let exit_elapsed = ts.elapsed();
+            now_ms.saturating_sub(exit_elapsed.as_millis() as u64)
+        });
 
         Self {
             mint: tracker.mint.clone(),
@@ -438,6 +474,8 @@ impl PersistedPosition {
             current_price: tracker.current_price,
             trailing_active: tracker.trailing_active,
             exit_generated: tracker.exit_generated,
+            exit_generated_at_unix_ms,
+            entry_source: tracker.entry_source,
             schema_version: Self::CURRENT_SCHEMA_VERSION,
         }
     }
@@ -450,12 +488,18 @@ impl PersistedPosition {
             .unwrap_or_default()
             .as_millis() as u64;
         let elapsed_ms = now_ms.saturating_sub(self.entry_time_unix_ms);
+        let exit_elapsed_ms = self
+            .exit_generated_at_unix_ms
+            .map(|ms| now_ms.saturating_sub(ms));
 
         // Reconstruct entry_time as Instant::now() minus elapsed
         // Note: This is approximate but accurate enough for our purposes
         let entry_time = Instant::now()
             .checked_sub(Duration::from_millis(elapsed_ms))
             .unwrap_or_else(Instant::now);
+        let exit_generated_at = exit_elapsed_ms.and_then(|ms| {
+            Instant::now().checked_sub(Duration::from_millis(ms))
+        });
 
         PositionTracker {
             mint: self.mint.clone(),
@@ -471,6 +515,8 @@ impl PersistedPosition {
             recent_trades: Vec::new(), // Not persisted - will be rebuilt from live data
             trailing_active: self.trailing_active,
             exit_generated: self.exit_generated,
+            exit_generated_at,
+            entry_source: self.entry_source,
         }
     }
 }
@@ -502,6 +548,8 @@ impl PositionTracker {
             recent_trades: Vec::new(),
             trailing_active: false,
             exit_generated: false,
+            exit_generated_at: None,
+            entry_source: PositionEntrySource::Live,
         }
     }
 
@@ -1717,6 +1765,50 @@ impl MomentumContext {
         }
     }
 
+    fn select_reconcile_pool(&self, mint: &str) -> Option<(String, String, Option<f64>)> {
+        let pools = self.mint_pools.read();
+        let pool_list = pools.get(mint)?;
+        let best = pool_list.iter().max_by_key(|p| p.last_trade_slot)?;
+        Some((
+            best.pool_address.clone(),
+            best.dex.clone(),
+            best.last_trade_ratio,
+        ))
+    }
+
+    fn build_reconciled_position(
+        &self,
+        mint: &str,
+        balance_raw: u64,
+        decimals: u8,
+    ) -> Option<PositionTracker> {
+        let (pool, dex, ratio_opt) = self.select_reconcile_pool(mint)?;
+        let entry_price = ratio_opt
+            .filter(|r| *r > 0.0)
+            .map(|r| 1.0 / r)
+            .unwrap_or(1.0);
+
+        let mut tracker = PositionTracker::new(
+            mint,
+            &pool,
+            &dex,
+            entry_price,
+            decimals,
+            balance_raw,
+            0,
+        );
+        tracker.entry_source = PositionEntrySource::WalletSnapshot;
+
+        let config = self.config.read();
+        if config.max_hold_time_secs > 0 {
+            tracker.entry_time = Instant::now()
+                .checked_sub(Duration::from_secs(config.max_hold_time_secs))
+                .unwrap_or_else(Instant::now);
+        }
+
+        Some(tracker)
+    }
+
     /// Find best pool for selling tokens (highest SOL output)
     /// Returns (pool_address, dex, accounts, expected_sol_out, alternatives_checked)
     fn find_best_sell_pool(
@@ -2580,11 +2672,125 @@ impl MomentumContext {
         exits
     }
 
+    fn collect_timed_exit_reconcile_candidates(
+        &self,
+        now: Instant,
+    ) -> Vec<TimedExitReconcileCandidate> {
+        let config = self.config.read().clone();
+        if config.max_hold_time_secs == 0 {
+            return Vec::new();
+        }
+
+        let pending_sells: std::collections::HashSet<String> = self
+            .pending_intents
+            .read()
+            .values()
+            .filter(|p| p.side == TradeSide::Sell)
+            .map(|p| p.mint.clone())
+            .collect();
+
+        let retry_after = Duration::from_secs(60);
+        let positions = self.positions.read();
+        let mut candidates = Vec::new();
+
+        for (mint, pos) in positions.iter() {
+            let hold_secs = pos.entry_time.elapsed().as_secs();
+            if hold_secs < config.max_hold_time_secs {
+                continue;
+            }
+
+            if !pos.exit_generated {
+                continue;
+            }
+
+            if pending_sells.contains(mint) {
+                continue;
+            }
+
+            let last_exit_age = pos.exit_generated_at.and_then(|ts| {
+                now.checked_duration_since(ts).map(|d| d.as_secs())
+            });
+
+            if let Some(age) = last_exit_age {
+                if age < retry_after.as_secs() {
+                    continue;
+                }
+            }
+
+            let (pool, dex) = if !pos.pool.is_empty() && !pos.dex.is_empty() {
+                (pos.pool.clone(), pos.dex.clone())
+            } else {
+                continue;
+            };
+
+            candidates.push(TimedExitReconcileCandidate {
+                mint: mint.clone(),
+                pool,
+                dex,
+                token_amount: pos.token_amount,
+                hold_secs,
+                last_exit_age_secs: last_exit_age,
+            });
+        }
+
+        candidates
+    }
+
+    async fn reconcile_timed_exits(self: &Arc<Self>) {
+        let now = Instant::now();
+        let candidates = self.collect_timed_exit_reconcile_candidates(now);
+        if candidates.is_empty() {
+            return;
+        }
+
+        for candidate in candidates {
+            let reason = match candidate.last_exit_age_secs {
+                Some(age) => format!(
+                    "Timed exit reconcile: hold={}s, last_exit_age={}s",
+                    candidate.hold_secs, age
+                ),
+                None => format!("Timed exit reconcile: hold={}s", candidate.hold_secs),
+            };
+
+            info!(
+                mint = %candidate.mint,
+                pool = %candidate.pool,
+                dex = %candidate.dex,
+                hold_secs = candidate.hold_secs,
+                last_exit_age_secs = candidate.last_exit_age_secs,
+                "♻️  Retrying timed exit"
+            );
+
+            if let Err(e) = generate_and_publish_exit_intent(
+                self,
+                &candidate.mint,
+                &candidate.pool,
+                &candidate.dex,
+                "TIME_EXIT",
+                &reason,
+                candidate.token_amount,
+            )
+            .await
+            {
+                error!(
+                    error = %e,
+                    mint = %candidate.mint,
+                    "Failed to publish timed-exit reconcile intent"
+                );
+            } else {
+                self.mark_exit_generated(&candidate.mint);
+                self.exits_generated
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Mark a position's exit as generated (call after successful SELL intent publish)
     fn mark_exit_generated(&self, mint: &str) {
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(mint) {
             pos.exit_generated = true;
+            pos.exit_generated_at = Some(Instant::now());
             debug!(mint = %mint, "Marked position exit_generated=true");
         }
     }
@@ -4214,6 +4420,7 @@ async fn main() -> Result<()> {
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut strategy_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut reconcile_interval = tokio::time::interval(std::time::Duration::from_secs(15));
     let mut events_received: u64 = 0;
     let mut last_slot: u64 = 0;
 
@@ -4480,6 +4687,12 @@ async fn main() -> Result<()> {
                         ctx.exits_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
+            }
+
+            // Timed-exit reconciliation (retry exits that were generated but never confirmed)
+            _ = reconcile_interval.tick() => {
+                ironcrab::metrics::record_activity();
+                ctx.reconcile_timed_exits().await;
             }
 
             // Periodic heartbeat
@@ -5462,6 +5675,130 @@ mod tests {
         assert_eq!(exits[0].3, "LP_REMOVAL");
         assert_eq!(exits[0].4, "LP removed post-entry");
     }
+
+    #[test]
+    fn timed_exit_reconcile_candidates_require_stale_exit_and_no_pending_sell() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_hold_time_secs = 60;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = MomentumContext {
+            run_id: "run-test".to_string(),
+            config: parking_lot::RwLock::new(cfg),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            position_kv: tokio::sync::OnceCell::new(),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        let now = Instant::now();
+        {
+            let mut positions = ctx.positions.write();
+            let mut pos = PositionTracker::new("mint", "pool", "dex", 1.0, 6, 100, 1_000);
+            pos.entry_time = now - Duration::from_secs(120);
+            pos.exit_generated = true;
+            pos.exit_generated_at = Some(now - Duration::from_secs(120));
+            positions.insert("mint".to_string(), pos);
+        }
+
+        let candidates = ctx.collect_timed_exit_reconcile_candidates(now);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].mint, "mint");
+
+        // Add a pending SELL for the same mint; should suppress reconcile.
+        {
+            let mut pending = ctx.pending_intents.write();
+            pending.insert(
+                "intent".to_string(),
+                PendingIntent {
+                    mint: "mint".to_string(),
+                    pool: "pool".to_string(),
+                    dex: "dex".to_string(),
+                    side: TradeSide::Sell,
+                    entry_kind: None,
+                    sol_amount: 0,
+                    token_amount: 100,
+                    created_at: now,
+                },
+            );
+        }
+
+        let candidates_after = ctx.collect_timed_exit_reconcile_candidates(now);
+        assert!(candidates_after.is_empty());
+    }
+
+    #[test]
+    fn integration_style_wallet_snapshot_reconcile_creates_retry_candidate() {
+        let mut cfg = MomentumConfig::default();
+        cfg.max_hold_time_secs = 60;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = MomentumContext {
+            run_id: "run-test".to_string(),
+            config: parking_lot::RwLock::new(cfg.clone()),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            position_kv: tokio::sync::OnceCell::new(),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        // Seed pool registry so reconciliation can pick a pool.
+        ctx.register_pool("mint", "pool", "raydium", 1);
+        ctx.update_pool_trade_data("mint", "pool", 1_000_000_000, 1_000_000, 1);
+        ctx.update_pool_accounts(
+            "mint",
+            "pool",
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+
+        let mut reconciled = ctx
+            .build_reconciled_position("mint", 1_000_000, 6)
+            .expect("reconciled position");
+        assert_eq!(reconciled.entry_source, PositionEntrySource::WalletSnapshot);
+        assert!(reconciled.entry_time.elapsed().as_secs() >= cfg.max_hold_time_secs);
+
+        let now = Instant::now();
+        reconciled.exit_generated = true;
+        reconciled.exit_generated_at = Some(now - Duration::from_secs(120));
+        {
+            let mut positions = ctx.positions.write();
+            positions.insert("mint".to_string(), reconciled);
+        }
+
+        let candidates = ctx.collect_timed_exit_reconcile_candidates(now);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].mint, "mint");
+    }
 }
 
 /// Generate and publish a SELL intent for position exit
@@ -6104,6 +6441,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
         MarketEventKind::WalletBalanceSnapshot {
             mint,
             balance_raw,
+            decimals,
             ..
         } => {
             // P0: Position Reconciliation after restart
@@ -6126,20 +6464,36 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 }
             } else {
                 // Position exists in wallet - verify we're tracking it
-                let positions = ctx.positions.read();
-                if positions.contains_key(mint) {
+                let has_position = { ctx.positions.read().contains_key(mint) };
+                if has_position {
                     debug!(
                         mint = %mint,
                         balance_raw = *balance_raw,
                         "✅ WalletBalanceSnapshot: position verified in wallet"
                     );
+                } else if let Some(reconciled) =
+                    ctx.build_reconciled_position(mint, *balance_raw, *decimals)
+                {
+                    let hold_secs = reconciled.entry_time.elapsed().as_secs();
+                    {
+                        let mut positions = ctx.positions.write();
+                        positions.insert(mint.to_string(), reconciled.clone());
+                    }
+                    info!(
+                        mint = %mint,
+                        pool = %reconciled.pool,
+                        dex = %reconciled.dex,
+                        balance_raw = *balance_raw,
+                        hold_secs = hold_secs,
+                        "🧭 Wallet snapshot reconciled into position (timed exit will apply)"
+                    );
+                    ctx.save_position_to_kv(mint, &reconciled).await;
                 } else {
-                    // Wallet has tokens but we're not tracking a position
-                    // This is OK - could be from pre-restart manual buy or airdrop
-                    debug!(
+                    // Wallet has tokens but we're not tracking a position and no pool is known.
+                    warn!(
                         mint = %mint,
                         balance_raw = *balance_raw,
-                        "WalletBalanceSnapshot: tokens in wallet but no position tracked (manual buy or airdrop)"
+                        "WalletBalanceSnapshot: tokens present but no known pool to reconcile"
                     );
                 }
             }
