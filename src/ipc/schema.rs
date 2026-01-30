@@ -1491,10 +1491,15 @@ impl DecisionRecord {
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {
+    #[serde(alias = "Sent", alias = "SENT")]
     Sent,
+    #[serde(alias = "Confirmed", alias = "CONFIRMED")]
     Confirmed,
+    #[serde(alias = "Failed", alias = "FAILED")]
     Failed,
+    #[serde(alias = "Timeout", alias = "TIMEOUT")]
     Timeout,
 }
 

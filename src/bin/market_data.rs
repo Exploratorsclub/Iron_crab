@@ -227,6 +227,8 @@ struct TrackedWallet {
     last_sol_balance: std::sync::atomic::AtomicU64,
     /// Last known WSOL balance (lamports)
     last_wsol_balance: std::sync::atomic::AtomicU64,
+    /// Whether we've seen a WSOL ATA balance update yet
+    wsol_seen: std::sync::atomic::AtomicBool,
 }
 
 /// WSOL Mint address constant
@@ -251,6 +253,7 @@ impl TrackedWallet {
             wsol_ata: ata,
             last_sol_balance: std::sync::atomic::AtomicU64::new(0),
             last_wsol_balance: std::sync::atomic::AtomicU64::new(0),
+            wsol_seen: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -1032,11 +1035,14 @@ async fn run_geyser_loop(
                             let lamports = account_update.lamports;
                             let prev = tracked_wallet.last_sol_balance.swap(lamports, Ordering::Relaxed);
                             let wsol = tracked_wallet.last_wsol_balance.load(Ordering::Relaxed);
-                            (lamports, Some(wsol), lamports != prev)
+                            let has_wsol = tracked_wallet.wsol_seen.load(Ordering::Relaxed);
+                            let wsol_value = if has_wsol { Some(wsol) } else { None };
+                            (lamports, wsol_value, lamports != prev)
                         } else {
                             // WSOL ATA - parse token account balance
                             if let Some(balance) = try_parse_token_account_balance(&account_update.data) {
                                 let prev = tracked_wallet.last_wsol_balance.swap(balance, Ordering::Relaxed);
+                                tracked_wallet.wsol_seen.store(true, Ordering::Relaxed);
                                 let sol = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
                                 (sol, Some(balance), balance != prev)
                             } else {

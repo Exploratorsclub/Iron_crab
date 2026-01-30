@@ -200,6 +200,8 @@ pub struct WsolManager {
     wsol_balance: AtomicU64,
     /// Last known native SOL balance
     sol_balance: AtomicU64,
+    /// Whether WSOL balance has been initialized from RPC or Geyser
+    wsol_initialized: AtomicBool,
     /// Last action timestamp (for cooldown)
     last_action_ts: AtomicU64,
     /// Running flag for graceful shutdown
@@ -236,6 +238,7 @@ impl WsolManager {
             wallet_pubkey,
             wsol_balance: AtomicU64::new(0),
             sol_balance: AtomicU64::new(0),
+            wsol_initialized: AtomicBool::new(false),
             last_action_ts: AtomicU64::new(0),
             running: AtomicBool::new(true),
             wrap_in_progress: AtomicBool::new(false),
@@ -263,6 +266,7 @@ impl WsolManager {
             wallet_pubkey,
             wsol_balance: AtomicU64::new(0),
             sol_balance: AtomicU64::new(0),
+            wsol_initialized: AtomicBool::new(false),
             last_action_ts: AtomicU64::new(0),
             running: AtomicBool::new(true),
             wrap_in_progress: AtomicBool::new(false),
@@ -464,8 +468,18 @@ impl WsolManager {
             .store(update.sol_lamports, Ordering::Relaxed);
         if let Some(wsol) = update.wsol_lamports {
             self.wsol_balance.store(wsol, Ordering::Relaxed);
+            self.wsol_initialized.store(true, Ordering::Relaxed);
             // Update Prometheus gauge
             WSOL_BALANCE_LAMPORTS.store(wsol, Ordering::Relaxed);
+        } else if !self.wsol_initialized.load(Ordering::Relaxed) {
+            // If WSOL was never initialized, do a one-time RPC snapshot.
+            info!(
+                wallet = %self.wallet_pubkey,
+                "WSOL not initialized from Geyser; running one-time RPC snapshot"
+            );
+            if let Err(e) = self.fetch_and_update_balances().await {
+                debug!(error = %e, "WSOL snapshot RPC failed");
+            }
         }
 
         debug!(
@@ -491,6 +505,7 @@ impl WsolManager {
         let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
         let wsol_balance = self.get_wsol_balance(&wsol_mint).await.unwrap_or(0);
         self.wsol_balance.store(wsol_balance, Ordering::Relaxed);
+        self.wsol_initialized.store(true, Ordering::Relaxed);
 
         debug!(
             sol = sol_balance as f64 / LAMPORTS_PER_SOL as f64,
