@@ -3911,6 +3911,7 @@ async fn recover_positions_from_jsonl(
 async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &MomentumContext) -> Result<usize> {
     use async_nats::jetstream;
     use futures::StreamExt;
+    use std::collections::HashSet;
 
     let Some(ref nats_client) = ctx.nats else {
         return Ok(0);
@@ -3931,6 +3932,7 @@ async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &MomentumContext) -> Resu
 
     let consumer = stream.create_consumer(wallet_snapshot_consumer_config()).await?;
     let mut recovered = 0usize;
+    let mut snapshot_mints: HashSet<String> = HashSet::new();
     let batch_size = 1000;
 
     loop {
@@ -3959,7 +3961,8 @@ async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &MomentumContext) -> Resu
                 }
             };
 
-            if let MarketEventKind::WalletBalanceSnapshot { .. } = &event.kind {
+            if let MarketEventKind::WalletBalanceSnapshot { mint, .. } = &event.kind {
+                snapshot_mints.insert(mint.clone());
                 if let Err(e) = process_market_event(ctx, &event).await {
                     warn!(error = %e, "Failed to apply WalletBalanceSnapshot");
                 } else {
@@ -3979,6 +3982,23 @@ async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &MomentumContext) -> Resu
 
     if recovered > 0 {
         info!(recovered, "✅ Wallet snapshots recovered from JetStream");
+
+        let mut positions = ctx.positions.write();
+        let mut removed = 0usize;
+        positions.retain(|mint, _| {
+            let keep = snapshot_mints.contains(mint);
+            if !keep {
+                removed += 1;
+            }
+            keep
+        });
+        if removed > 0 {
+            info!(
+                removed,
+                remaining = positions.len(),
+                "🧹 Closed positions not present in wallet snapshot"
+            );
+        }
     }
 
     Ok(recovered)
