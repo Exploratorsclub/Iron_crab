@@ -4820,6 +4820,46 @@ async fn generate_and_publish_buy_intent(
         }
     };
 
+    let token_program_override = {
+        let token_program_opt = token_program_opt
+            .as_deref()
+            .map(|tp| tp.trim())
+            .filter(|tp| !tp.is_empty())
+            .map(|tp| tp.to_string());
+
+        let dex_lower = effective_dex.to_ascii_lowercase();
+        let is_pump = dex_lower.contains("pump");
+        let spl = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+        let spl22 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+        match token_program_opt.as_deref() {
+            Some(tp) if tp == spl => Some(tp.to_string()),
+            Some(tp) if tp == spl22 => {
+                if is_pump {
+                    warn!(
+                        mint = %signal.mint,
+                        dex = %effective_dex,
+                        token_program = %tp,
+                        "Ignoring Token-2022 override for pump tokens; waiting for TokenMintInfo"
+                    );
+                    None
+                } else {
+                    Some(tp.to_string())
+                }
+            }
+            Some(tp) => {
+                warn!(
+                    mint = %signal.mint,
+                    dex = %effective_dex,
+                    token_program = %tp,
+                    "Ignoring unknown token_program override"
+                );
+                None
+            }
+            None => None,
+        }
+    };
+
     // Use routed_accounts from multi-pool routing if available, otherwise fetch
     let dex_requires_accounts = MomentumContext::dex_requires_pool_accounts(&effective_dex);
     let dex_accounts: Vec<String> = if let Some(accounts) = routed_accounts {
@@ -4964,7 +5004,7 @@ async fn generate_and_publish_buy_intent(
             output_mint: signal.mint.to_string(),
             pools: vec![effective_pool.clone()],
             accounts: dex_accounts,
-            token_program: token_program_opt.clone(),
+            token_program: token_program_override.clone(),
         },
         50, // Expected ROI: 0.5%
         max_slippage,

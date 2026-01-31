@@ -149,6 +149,10 @@ struct Args {
     /// Simulate mode: emit fake slot events instead of real Geyser connection
     #[arg(long)]
     simulate: bool,
+
+    /// Publish wallet snapshot once and exit (debug)
+    #[arg(long, env = "IRONCRAB_WALLET_SNAPSHOT_ONLY")]
+    wallet_snapshot_only: bool,
 }
 
 /// Runtime context for market-data
@@ -494,6 +498,9 @@ async fn publish_wallet_snapshot(
 
     let wallet_str = wallet.to_string();
 
+    use solana_account_decoder::UiAccountEncoding;
+    use solana_client::rpc_config::RpcAccountInfoConfig;
+
     // Scan both SPL Token and Token-2022 programs
     for (program_id, program_name) in [
         (token_program, "SPL Token"),
@@ -501,7 +508,14 @@ async fn publish_wallet_snapshot(
     ] {
         let accounts = match rpc
             .rpc
-            .get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(program_id))
+            .get_token_accounts_by_owner_with_config(
+                wallet,
+                TokenAccountsFilter::ProgramId(program_id),
+                RpcAccountInfoConfig {
+                    encoding: Some(UiAccountEncoding::JsonParsed),
+                    ..Default::default()
+                },
+            )
             .await
         {
             Ok(accounts) => accounts,
@@ -607,6 +621,19 @@ async fn publish_wallet_snapshot(
         "✅ Wallet snapshot published for position reconciliation"
     );
 
+    if total_accounts == 0 {
+        warn!(
+            wallet = %wallet_str,
+            "Wallet snapshot: no token accounts found (RPC returned 0 accounts)"
+        );
+    } else if non_zero_accounts == 0 {
+        warn!(
+            wallet = %wallet_str,
+            total_accounts = total_accounts,
+            "Wallet snapshot: all token accounts have zero balance"
+        );
+    }
+
     Ok(())
 }
 
@@ -624,11 +651,14 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let run_id = Uuid::new_v4().to_string();
 
+    let wallet_env = std::env::var("IRONCRAB_WALLET_PUBKEY").ok();
     info!(
         run_id = %run_id,
         config = %args.config.display(),
         geyser_url = %args.geyser_url,
         metrics_port = args.metrics_port,
+        wallet_pubkey = ?wallet_env,
+        wallet_snapshot_only = args.wallet_snapshot_only,
         "Starting market-data service"
     );
 
@@ -873,6 +903,7 @@ async fn main() -> Result<()> {
             tracked_vaults_rx,
             tracked_bin_arrays_rx,
             tracked_wallet_rx,
+            args.wallet_snapshot_only,
         )
         .await?;
     }
@@ -895,6 +926,7 @@ async fn run_geyser_loop(
     tracked_vaults_rx: watch::Receiver<Vec<Pubkey>>,
     tracked_bin_arrays_rx: watch::Receiver<Vec<Pubkey>>,
     tracked_wallet_rx: watch::Receiver<Vec<Pubkey>>,
+    wallet_snapshot_only: bool,
 ) -> Result<()> {
     // Initialize RPC client for fallback/metadata (prefer local RPC, fallback to Helius)
     let rpc_url =
@@ -917,6 +949,11 @@ async fn run_geyser_loop(
         }
     } else {
         info!("IRONCRAB_WALLET_PUBKEY not set, skipping wallet snapshot");
+    }
+
+    if wallet_snapshot_only {
+        info!("Wallet snapshot only mode enabled, exiting after snapshot");
+        return Ok(());
     }
 
     // Mint metadata fetch pipeline:
