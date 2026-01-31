@@ -1,0 +1,19 @@
+---
+description: Core AI rules for IronCrab
+alwaysApply: true
+---
+
+# IronCrab Core Rules
+- Follow `docs/TARGET_ARCHITECTURE.md` and `docs/DEFINITION_OF_DONE.md` as source of truth; also respect `docs/STORAGE_CONVENTIONS.md` and `docs/ROLE_SEPARATION.md`.
+- Propose a plan before coding.
+- Do not change architecture without explicit approval.
+- Prefer small, isolated changes.
+- Enforce Single-Signer: only `execution-engine` loads keys and signs/sends.
+- Intent-only: other processes are keyless and only emit `TradeIntent` or `MarketEvents`.
+- Simulation-gated: if simulation fails, never send (esp. arbitrage).
+- Decision Records required for every decision (inputs, checks, outcome).
+- Amounts must be explicit (units/decimals); no implicit conventions.
+- Prefer Geyser over RPC/WS; use RPC/WS only as fallback.
+- No new ad-hoc NATS topics; align with versioned topics or document clearly.
+- Avoid expanding legacy monolith; align new work to target multi-process architecture and MVP vertical slice.
+- SSH/Server commands only when the user explicitly requests or approves.

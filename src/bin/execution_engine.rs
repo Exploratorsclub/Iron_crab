@@ -63,9 +63,10 @@ use ironcrab::execution::wsol_manager::{WsolManager, WsolManagerConfig};
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, ExecutionResult, ExecutionStatus, ExplicitAmount, FairnessPolicy, FeePolicy,
-    FillStatus, FillUnavailableReason, IntentOrigin, IntentTier, KillSwitchContext, PoolCacheUpdate,
-    PoolCacheUpdateType, PriorityFeePercentiles, RecordHeader, RejectReason, SimulationResult,
-    TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
+    FillStatus, FillUnavailableReason, IntentOrigin, IntentTier, KillSwitchContext, MarketEvent,
+    MarketEventKind, PoolCacheUpdate, PoolCacheUpdateType, PriorityFeePercentiles, RecordHeader,
+    RejectReason, SimulationResult, TradeExecutionConstraints, TradeIntent, TradeResources,
+    TradeSide, TradingRegime,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind};
 use ironcrab::metrics::{
@@ -79,9 +80,10 @@ use ironcrab::metrics::{
     TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL,
 };
 use ironcrab::nats::{
-    config_consumer_config, config_subject, slave_consumer_config, NatsClient, NatsConfig,
-    CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_DECISION_RECORDS,
-    TOPIC_EXECUTION_RESULTS, TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS,
+    config_consumer_config, config_subject, slave_consumer_config, wallet_snapshot_consumer_config,
+    NatsClient, NatsConfig, CONFIG_STREAM_NAME, STREAM_NAME, WALLET_SNAPSHOT_STREAM_NAME,
+    TOPIC_CONTROL_REQUESTS, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS,
+    TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS,
 };
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
@@ -3432,6 +3434,100 @@ async fn bootstrap_pool_cache_from_jetstream(
     Ok(pools_recovered)
 }
 
+/// Bootstrap open positions count from wallet snapshots (JetStream)
+///
+/// Uses last-per-subject WalletBalanceSnapshot events to count non-zero mints.
+/// Returns None if no snapshots were found (do not override persisted state).
+async fn bootstrap_open_positions_from_wallet_snapshot(
+    nats_client: &NatsClient,
+    wallet: &Pubkey,
+) -> Result<Option<usize>> {
+    use async_nats::jetstream;
+    use futures::StreamExt;
+
+    let jetstream = jetstream::new(nats_client.client().clone());
+    let stream = match jetstream.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                error = %e,
+                stream = WALLET_SNAPSHOT_STREAM_NAME,
+                "Wallet snapshot stream not found (market-data may not be running)"
+            );
+            return Ok(None);
+        }
+    };
+
+    let wallet_str = wallet.to_string();
+    let mut consumer_config = wallet_snapshot_consumer_config();
+    consumer_config.filter_subject = format!("ironcrab.wallet_snapshot.{}.*", wallet_str);
+
+    let consumer = stream.create_consumer(consumer_config).await?;
+    let mut mints: HashSet<String> = HashSet::new();
+    let mut observed = 0usize;
+    let batch_size = 1000;
+
+    loop {
+        let mut messages = consumer.fetch().max_messages(batch_size).messages().await?;
+        let mut batch_count = 0;
+
+        while let Some(msg) = messages.next().await {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "Error fetching wallet snapshot from JetStream");
+                    continue;
+                }
+            };
+
+            batch_count += 1;
+
+            let event: MarketEvent = match serde_json::from_slice(&msg.payload) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(error = %e, "Failed to deserialize WalletBalanceSnapshot from JetStream");
+                    if let Err(ack_err) = msg.ack().await {
+                        warn!(error = %ack_err, "Failed to ack wallet snapshot message");
+                    }
+                    continue;
+                }
+            };
+
+            if let MarketEventKind::WalletBalanceSnapshot { mint, balance_raw, .. } = &event.kind {
+                observed += 1;
+                if *balance_raw > 0 {
+                    mints.insert(mint.clone());
+                }
+            }
+
+            if let Err(ack_err) = msg.ack().await {
+                warn!(error = %ack_err, "Failed to ack wallet snapshot message");
+            }
+        }
+
+        if batch_count < batch_size {
+            break;
+        }
+    }
+
+    if observed == 0 {
+        info!(
+            wallet = %wallet_str,
+            "Wallet snapshot bootstrap: no snapshots found (keeping persisted open_positions)"
+        );
+        return Ok(None);
+    }
+
+    info!(
+        wallet = %wallet_str,
+        snapshots = observed,
+        open_positions = mints.len(),
+        "Wallet snapshot bootstrap: open_positions reconciled from wallet"
+    );
+
+    Ok(Some(mints.len()))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -3798,7 +3894,7 @@ async fn main() -> Result<()> {
     let (
         initial_day,
         initial_daily_loss,
-        initial_positions,
+        mut initial_positions,
         initial_decision_counter,
         initial_execution_counter,
     ) = if let Some(ref snap) = snapshot {
@@ -3846,6 +3942,26 @@ async fn main() -> Result<()> {
             0,
         )
     };
+
+    // Reconcile open positions from wallet snapshot (JetStream) if available.
+    if let (Some(ref nats_client), Some(wallet)) = (&nats, wallet_pubkey) {
+        match bootstrap_open_positions_from_wallet_snapshot(nats_client, &wallet).await {
+            Ok(Some(reconciled)) => {
+                if reconciled != initial_positions {
+                    info!(
+                        previous = initial_positions,
+                        reconciled,
+                        "Open positions reconciled from wallet snapshot"
+                    );
+                }
+                initial_positions = reconciled;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "Wallet snapshot bootstrap failed (keeping persisted open_positions)");
+            }
+        }
+    }
 
     // Kill-switch persistence: survives restarts and is independent of day.
     let initial_kill_switch_active = snapshot
