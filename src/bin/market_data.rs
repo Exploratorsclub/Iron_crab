@@ -485,6 +485,9 @@ async fn publish_wallet_snapshot(
     wallet: &Pubkey,
 ) -> Result<()> {
     use solana_client::rpc_request::TokenAccountsFilter;
+    use base64::Engine;
+    use solana_account_decoder::UiAccountData;
+    use std::collections::HashMap;
 
     let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
         .expect("valid token program");
@@ -495,11 +498,9 @@ async fn publish_wallet_snapshot(
 
     let mut total_accounts = 0usize;
     let mut non_zero_accounts = 0usize;
+    let mut mint_decimals_cache: HashMap<Pubkey, u8> = HashMap::new();
 
     let wallet_str = wallet.to_string();
-
-    use solana_account_decoder::UiAccountEncoding;
-    use solana_client::rpc_config::RpcAccountInfoConfig;
 
     // Scan both SPL Token and Token-2022 programs
     for (program_id, program_name) in [
@@ -508,14 +509,7 @@ async fn publish_wallet_snapshot(
     ] {
         let accounts = match rpc
             .rpc
-            .get_token_accounts_by_owner_with_config(
-                wallet,
-                TokenAccountsFilter::ProgramId(program_id),
-                RpcAccountInfoConfig {
-                    encoding: Some(UiAccountEncoding::JsonParsed),
-                    ..Default::default()
-                },
-            )
+            .get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(program_id))
             .await
         {
             Ok(accounts) => accounts,
@@ -528,42 +522,94 @@ async fn publish_wallet_snapshot(
         total_accounts += accounts.len();
 
         for account in accounts {
-            // Parse JSON to extract mint and balance
-            let parsed = match account.account.data {
-                solana_account_decoder::UiAccountData::Json(parsed) => parsed,
+            let (mint, balance_raw, decimals) = match &account.account.data {
+                UiAccountData::Json(parsed) => {
+                    let serde_json::Value::Object(root) = &parsed.parsed else {
+                        continue;
+                    };
+
+                    let Some(info) = root.get("info").and_then(|v| v.as_object()) else {
+                        continue;
+                    };
+
+                    let Some(mint_str) = info.get("mint").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let Ok(mint) = Pubkey::from_str(mint_str) else {
+                        continue;
+                    };
+
+                    let Some(token_amount) = info.get("tokenAmount").and_then(|v| v.as_object())
+                    else {
+                        continue;
+                    };
+                    let Some(amount_str) = token_amount.get("amount").and_then(|v| v.as_str())
+                    else {
+                        continue;
+                    };
+                    let Ok(balance_raw) = amount_str.parse::<u64>() else {
+                        continue;
+                    };
+                    let decimals = token_amount
+                        .get("decimals")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(6) as u8;
+
+                    (mint, balance_raw, decimals)
+                }
+                UiAccountData::Binary(data, _) | UiAccountData::LegacyBinary(data) => {
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .ok();
+                    let Some(raw) = decoded else {
+                        continue;
+                    };
+
+                    let (mint, balance_raw) = if program_id == token_program {
+                        spl_token::state::Account::unpack(&raw)
+                            .ok()
+                            .map(|acc| (acc.mint, acc.amount))?
+                    } else if program_id == token_2022_program {
+                        spl_token_2022::state::Account::unpack(&raw)
+                            .ok()
+                            .map(|acc| (acc.mint, acc.amount))?
+                    } else {
+                        continue;
+                    };
+
+                    let decimals = if let Some(d) = mint_decimals_cache.get(&mint) {
+                        *d
+                    } else {
+                        let mint_account = rpc.rpc.get_account(&mint).await.ok();
+                        let Some(mint_account) = mint_account else {
+                            6
+                        } else if mint_account.owner == token_program {
+                            spl_token::state::Mint::unpack(&mint_account.data)
+                                .ok()
+                                .map(|m| m.decimals)
+                                .unwrap_or(6)
+                        } else if mint_account.owner == token_2022_program {
+                            spl_token_2022::state::Mint::unpack(&mint_account.data)
+                                .ok()
+                                .map(|m| m.decimals)
+                                .unwrap_or(6)
+                        } else {
+                            warn!(
+                                mint = %mint,
+                                owner = %mint_account.owner,
+                                "Unknown mint owner when resolving decimals"
+                            );
+                            6
+                        };
+
+                        mint_decimals_cache.insert(mint, decimals);
+                        decimals
+                    };
+
+                    (mint, balance_raw, decimals)
+                }
                 _ => continue,
             };
-
-            let serde_json::Value::Object(root) = parsed.parsed else {
-                continue;
-            };
-
-            let Some(info) = root.get("info").and_then(|v| v.as_object()) else {
-                continue;
-            };
-
-            // Extract mint
-            let Some(mint_str) = info.get("mint").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Ok(mint) = Pubkey::from_str(mint_str) else {
-                continue;
-            };
-
-            // Extract balance
-            let Some(token_amount) = info.get("tokenAmount").and_then(|v| v.as_object()) else {
-                continue;
-            };
-            let Some(amount_str) = token_amount.get("amount").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Ok(balance_raw) = amount_str.parse::<u64>() else {
-                continue;
-            };
-            let decimals = token_amount
-                .get("decimals")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(6) as u8;
 
             // Skip zero balances and SOL/WSOL
             if balance_raw == 0 || mint == sol_mint {
