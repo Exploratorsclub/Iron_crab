@@ -566,39 +566,45 @@ async fn publish_wallet_snapshot(
                     };
 
                     let (mint, balance_raw) = if program_id == token_program {
-                        spl_token::state::Account::unpack(&raw)
-                            .ok()
-                            .map(|acc| (acc.mint, acc.amount))?
+                        let Ok(acc) = spl_token::state::Account::unpack(&raw) else {
+                            continue;
+                        };
+                        (acc.mint, acc.amount)
                     } else if program_id == token_2022_program {
-                        spl_token_2022::state::Account::unpack(&raw)
-                            .ok()
-                            .map(|acc| (acc.mint, acc.amount))?
+                        let Ok(acc) = spl_token_2022::state::Account::unpack(&raw) else {
+                            continue;
+                        };
+                        (acc.mint, acc.amount)
                     } else {
                         continue;
                     };
+
+                    let mint = Pubkey::new_from_array(mint.to_bytes());
 
                     let decimals = if let Some(d) = mint_decimals_cache.get(&mint) {
                         *d
                     } else {
                         let mint_account = rpc.rpc.get_account(&mint).await.ok();
-                        let Some(mint_account) = mint_account else {
-                            6
-                        } else if mint_account.owner == token_program {
-                            spl_token::state::Mint::unpack(&mint_account.data)
-                                .ok()
-                                .map(|m| m.decimals)
-                                .unwrap_or(6)
-                        } else if mint_account.owner == token_2022_program {
-                            spl_token_2022::state::Mint::unpack(&mint_account.data)
-                                .ok()
-                                .map(|m| m.decimals)
-                                .unwrap_or(6)
+                        let decimals = if let Some(mint_account) = mint_account {
+                            if mint_account.owner == token_program {
+                                spl_token::state::Mint::unpack(&mint_account.data)
+                                    .ok()
+                                    .map(|m| m.decimals)
+                                    .unwrap_or(6)
+                            } else if mint_account.owner == token_2022_program {
+                                spl_token_2022::state::Mint::unpack(&mint_account.data)
+                                    .ok()
+                                    .map(|m| m.decimals)
+                                    .unwrap_or(6)
+                            } else {
+                                warn!(
+                                    mint = %mint,
+                                    owner = %mint_account.owner,
+                                    "Unknown mint owner when resolving decimals"
+                                );
+                                6
+                            }
                         } else {
-                            warn!(
-                                mint = %mint,
-                                owner = %mint_account.owner,
-                                "Unknown mint owner when resolving decimals"
-                            );
                             6
                         };
 
@@ -618,7 +624,8 @@ async fn publish_wallet_snapshot(
 
             non_zero_accounts += 1;
 
-            let event_id = format!("wallet_snapshot_{}", mint);
+            let mint_str = mint.to_string();
+            let event_id = format!("wallet_snapshot_{}", mint_str);
             let event = MarketEvent::new(
                 "market-data",
                 BUILD_VERSION,
@@ -641,7 +648,7 @@ async fn publish_wallet_snapshot(
                 }
 
                 // Persist snapshot to JetStream (race-free recovery)
-                let subject = wallet_snapshot_subject(&wallet_str, mint_str);
+                let subject = wallet_snapshot_subject(&wallet_str, &mint_str);
                 if let Err(e) = nats.jetstream_publish(&subject, &event).await {
                     warn!(error = %e, mint = %mint, "Failed to publish WalletBalanceSnapshot to JetStream");
                 }
