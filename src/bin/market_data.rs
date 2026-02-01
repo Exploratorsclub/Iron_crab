@@ -679,6 +679,44 @@ async fn publish_wallet_snapshot(
             wallet = %wallet_str,
             "Wallet snapshot: no token accounts found (RPC returned 0 accounts)"
         );
+        let empty_mint = sol_mint.to_string();
+        let event_id = "wallet_snapshot_empty".to_string();
+        let event = MarketEvent::new(
+            "market-data",
+            BUILD_VERSION,
+            &ctx.run_id,
+            event_id,
+            "wallet_scan",
+            None, // No slot for RPC-based snapshot
+            MarketEventKind::WalletBalanceSnapshot {
+                mint: empty_mint.clone(),
+                balance_raw: 0,
+                decimals: 9,
+                token_program: token_program.to_string(),
+            },
+        );
+
+        if let Some(ref nats) = ctx.nats {
+            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
+                warn!(
+                    error = %e,
+                    mint = %empty_mint,
+                    "Failed to publish empty WalletBalanceSnapshot"
+                );
+            }
+            let subject = wallet_snapshot_subject(&wallet_str, &empty_mint);
+            if let Err(e) = nats.jetstream_publish(&subject, &event).await {
+                warn!(
+                    error = %e,
+                    mint = %empty_mint,
+                    "Failed to publish empty WalletBalanceSnapshot to JetStream"
+                );
+            }
+        }
+
+        if let Err(e) = ctx.jsonl_writer.write(&event) {
+            warn!(error = %e, "Failed to write empty WalletBalanceSnapshot to JSONL");
+        }
     } else if non_zero_accounts == 0 {
         warn!(
             wallet = %wallet_str,
