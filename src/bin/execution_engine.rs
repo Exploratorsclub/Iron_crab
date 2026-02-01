@@ -3495,6 +3495,9 @@ async fn bootstrap_open_positions_from_wallet_snapshot(
 
             if let MarketEventKind::WalletBalanceSnapshot { mint, balance_raw, .. } = &event.kind {
                 observed += 1;
+                if mint == SOL_MINT {
+                    continue;
+                }
                 if *balance_raw > 0 {
                     mints.insert(mint.clone());
                 }
