@@ -338,7 +338,7 @@
           { "selector": "mint", "text": "Token (Mint)", "type": "string" },
           { "selector": "tx_hash", "text": "TX Hash", "type": "string" },
           { "selector": "amount_tokens", "text": "Amount", "type": "number" },
-          { "selector": "price_sol", "text": "Price (SOL)", "type": "number" },
+          { "selector": "value_sol", "text": "Value (SOL)", "type": "number" },
           { "selector": "pnl_sol", "text": "PnL (SOL)", "type": "number" },
           { "selector": "pnl_pct", "text": "PnL %", "type": "number" }
         ]
@@ -401,7 +401,7 @@
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "Price (SOL)" },
+            "matcher": { "id": "byName", "options": "Value (SOL)" },
             "properties": [{ "id": "decimals", "value": 12 }]
           },
           {

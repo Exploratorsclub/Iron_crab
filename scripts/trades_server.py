@@ -83,6 +83,47 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 print(f"Error reading {jsonl_path}: {e}")
         
+        # Compute running PnL using wallet deltas (fees included)
+        trades.sort(key=lambda t: t.get('timestamp_ms', 0))
+        positions = {}
+        for trade in trades:
+            action = trade.get('action')
+            mint_full = trade.get('mint_full')
+            amount_tokens = trade.get('amount_tokens')
+            value_sol = trade.get('value_sol')
+            wallet_delta = trade.get('wallet_sol_delta')
+
+            if not mint_full or mint_full == "-" or not amount_tokens:
+                continue
+
+            if action == "BUY":
+                cost_sol = abs(wallet_delta) if wallet_delta is not None else value_sol
+                if cost_sol is None:
+                    continue
+                pos = positions.get(mint_full, {"tokens": 0.0, "cost_sol": 0.0})
+                pos["tokens"] += amount_tokens
+                pos["cost_sol"] += cost_sol
+                positions[mint_full] = pos
+                trade["pnl_sol"] = 0.0
+                trade["pnl_pct"] = None
+            elif action == "SELL":
+                proceeds_sol = wallet_delta if wallet_delta is not None else value_sol
+                if proceeds_sol is None:
+                    continue
+                pos = positions.get(mint_full)
+                if pos and pos["tokens"] > 0:
+                    avg_cost = pos["cost_sol"] / pos["tokens"]
+                    sold_cost = avg_cost * amount_tokens
+                    pnl_sol = proceeds_sol - sold_cost
+                    pos["tokens"] = max(0.0, pos["tokens"] - amount_tokens)
+                    pos["cost_sol"] = max(0.0, pos["cost_sol"] - sold_cost)
+                    positions[mint_full] = pos
+                    trade["pnl_sol"] = round(pnl_sol, 9)
+                    trade["pnl_pct"] = round((pnl_sol / sold_cost) * 100, 2) if sold_cost > 0 else None
+                else:
+                    trade["pnl_sol"] = None
+                    trade["pnl_pct"] = None
+
         # Sort by timestamp descending, take last N
         trades.sort(key=lambda t: t.get('timestamp_ms', 0), reverse=True)
         return trades[:limit]
@@ -149,6 +190,11 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             
             # Get actual wallet SOL delta (includes all fees)
             wallet_sol_delta_lamports = record.get('wallet_sol_delta_lamports')
+            wallet_sol_delta_sol = (
+                wallet_sol_delta_lamports / 1e9
+                if wallet_sol_delta_lamports is not None
+                else None
+            )
             
             # Get token_mint directly from execution record
             token_mint = record.get('token_mint', '')
@@ -178,11 +224,13 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 # Amount: not meaningful for arb, show "-"
                 amount_tokens = None
                 
-                # Price = WSOL spent on buy leg (fill_in with 9 decimals = SOL)
-                if fill_in_decimals == 9:
-                    price_sol = fill_in_raw / 1e9
+                # Value = SOL spent/received (wallet delta preferred)
+                if wallet_sol_delta_sol is not None:
+                    value_sol = abs(wallet_sol_delta_sol)
+                elif fill_in_decimals == 9:
+                    value_sol = fill_in_raw / 1e9
                 else:
-                    price_sol = 0
+                    value_sol = 0
                 
                 # PnL = actual wallet delta (negative = loss from fees, positive = profit)
                 if wallet_sol_delta_lamports is not None:
@@ -197,9 +245,11 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                     "mint": display_mint,  # Grafana expects "mint"
                     "tx_hash": signature,  # Full signature for link
                     "amount_tokens": None,  # Grafana expects "amount_tokens"
-                    "price_sol": round(price_sol, 9),
+                    "value_sol": round(value_sol, 9),
                     "pnl_sol": round(pnl_sol, 9),
-                    "pnl_pct": None  # Not applicable for arb
+                    "pnl_pct": None,  # Not applicable for arb
+                    "wallet_sol_delta": wallet_sol_delta_sol,
+                    "mint_full": token_mint,
                 }
             
             # ============ BUY / SELL ============
@@ -212,29 +262,33 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 action = "SELL"
                 amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
                 # SOL received
-                if fill_out_decimals == 9:
-                    price_sol = fill_out_raw / 1e9
+                if wallet_sol_delta_sol is not None:
+                    value_sol = abs(wallet_sol_delta_sol)
+                elif fill_out_decimals == 9:
+                    value_sol = fill_out_raw / 1e9
                 else:
-                    price_sol = 0
+                    value_sol = 0
             elif fill_out_is_tokens:
                 # Received tokens, paid SOL = BUY
                 action = "BUY"
                 amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
                 # SOL paid
-                if fill_in_decimals == 9:
-                    price_sol = fill_in_raw / 1e9
+                if wallet_sol_delta_sol is not None:
+                    value_sol = abs(wallet_sol_delta_sol)
+                elif fill_in_decimals == 9:
+                    value_sol = fill_in_raw / 1e9
                 else:
-                    price_sol = 0
+                    value_sol = 0
             else:
                 # Fallback heuristics
                 if fill_out_raw > fill_in_raw * 100:
                     action = "BUY"
                     amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
-                    price_sol = fill_in_raw / 1e9 if fill_in_decimals == 9 else 0
+                    value_sol = fill_in_raw / 1e9 if fill_in_decimals == 9 else 0
                 else:
                     action = "SELL"
                     amount_tokens = fill_in_raw / (10 ** fill_in_decimals) if fill_in_raw > 0 else 0
-                    price_sol = fill_out_raw / 1e9 if fill_out_decimals == 9 else 0
+                    value_sol = fill_out_raw / 1e9 if fill_out_decimals == 9 else 0
             
             # Truncate token mint for display (keep first 8 + last 4 chars)
             if token_mint and len(token_mint) > 15:
@@ -249,9 +303,11 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 "mint": display_mint,  # Grafana expects "mint"
                 "tx_hash": signature,  # Full signature for link
                 "amount_tokens": round(amount_tokens, 6) if amount_tokens else None,
-                "price_sol": round(price_sol, 9) if price_sol else None,
-                "pnl_sol": 0.0,  # Would need position tracking for momentum
-                "pnl_pct": None
+                "value_sol": round(value_sol, 9) if value_sol else None,
+                "pnl_sol": None,  # Filled in during running PnL calculation
+                "pnl_pct": None,
+                "wallet_sol_delta": wallet_sol_delta_sol,
+                "mint_full": token_mint,
             }
         except Exception as e:
             print(f"Error parsing execution result: {e}")
