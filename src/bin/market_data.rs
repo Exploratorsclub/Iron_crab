@@ -615,7 +615,6 @@ async fn publish_wallet_snapshot(
 
                     (mint, balance_raw, decimals)
                 }
-                _ => continue,
             };
 
             // Skip zero balances and SOL/WSOL

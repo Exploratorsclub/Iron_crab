@@ -4863,15 +4863,16 @@ async fn generate_and_publish_buy_intent(
                 if is_pump {
                     let mint_info_is_final = mint_supply_opt.unwrap_or(0) > 0 || has_authority;
                     if mint_info_is_final {
-                        return Some(tp.to_string());
+                        Some(tp.to_string())
+                    } else {
+                        warn!(
+                            mint = %signal.mint,
+                            dex = %effective_dex,
+                            token_program = %tp,
+                            "Ignoring Token-2022 override for pump tokens; waiting for TokenMintInfo"
+                        );
+                        None
                     }
-                    warn!(
-                        mint = %signal.mint,
-                        dex = %effective_dex,
-                        token_program = %tp,
-                        "Ignoring Token-2022 override for pump tokens; waiting for TokenMintInfo"
-                    );
-                    None
                 } else {
                     Some(tp.to_string())
                 }
