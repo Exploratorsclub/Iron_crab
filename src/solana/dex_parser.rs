@@ -32,6 +32,19 @@ use std::sync::LazyLock;
 pub static SOL_MINT_PUBKEY: LazyLock<Pubkey> =
     LazyLock::new(|| Pubkey::from_str(SOL_MINT).expect("valid SOL mint"));
 
+/// Orca pool info used to deterministically parse swaps from pool state.
+#[derive(Debug, Clone, Copy)]
+pub struct OrcaPoolInfo {
+    pub token_mint_a: Pubkey,
+    pub token_mint_b: Pubkey,
+    pub token_vault_a: Pubkey,
+    pub token_vault_b: Pubkey,
+    pub tick_current_index: Option<i32>,
+    pub tick_spacing: Option<u16>,
+    pub token_a_program: Option<Pubkey>,
+    pub token_b_program: Option<Pubkey>,
+}
+
 // ============================================================================
 // Parsed Event Types (intermediate before conversion to MarketEventKind)
 // ============================================================================
@@ -169,6 +182,15 @@ pub fn parse_account_update(update: &GeyserAccountUpdate) -> Option<ParsedDexEve
 /// Parse a transaction update into a DEX event (pool creation, swap)
 /// Used for all DEXes for swap detection, and PumpFun for pool creation
 pub fn parse_transaction_update(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
+    parse_transaction_update_with_pool_lookup(update, None)
+}
+
+/// Parse a transaction update into a DEX event (pool creation, swap) with optional pool lookup.
+/// The pool lookup is used to resolve Orca pool mints deterministically.
+pub fn parse_transaction_update_with_pool_lookup(
+    update: &GeyserTransactionUpdate,
+    pool_lookup: Option<&dyn Fn(&Pubkey) -> Option<OrcaPoolInfo>>,
+) -> Option<ParsedDexEvent> {
     // Identify DEX by checking account keys
     let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).ok()?;
     let raydium_cpmm = Pubkey::from_str(RAYDIUM_CPMM).ok()?;
@@ -193,7 +215,7 @@ pub fn parse_transaction_update(update: &GeyserTransactionUpdate) -> Option<Pars
         return parse_raydium_transaction(update);
     }
     if update.account_keys.contains(&orca) {
-        return parse_orca_transaction(update);
+        return parse_orca_transaction(update, pool_lookup);
     }
 
     None
@@ -428,7 +450,10 @@ fn parse_orca_account(update: &GeyserAccountUpdate) -> Option<ParsedDexEvent> {
     })
 }
 
-fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
+fn parse_orca_transaction(
+    update: &GeyserTransactionUpdate,
+    pool_lookup: Option<&dyn Fn(&Pubkey) -> Option<OrcaPoolInfo>>,
+) -> Option<ParsedDexEvent> {
     // Orca Whirlpool swap detection
     // Discriminator for swap: sighash("global:swap") = first 8 bytes
     if update.instruction_data.len() < 8 {
@@ -461,77 +486,116 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
         .unwrap_or(update.instruction_accounts[3]);
 
     // Parse amounts
-    // Layout: discriminator(8) + amount(8) + other_amount_threshold(8) + sqrt_price_limit(16) + ...
-    if update.instruction_data.len() < 25 {
+    // Layout: discriminator(8) + amount(8) + other_amount_threshold(8) + sqrt_price_limit(16) +
+    //         amount_specified_is_input(1) + a_to_b(1)
+    if update.instruction_data.len() < 42 {
         return None;
     }
 
     let amount = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
-    let a_to_b = update.instruction_data[24] == 1; // direction flag
+    let amount_specified_is_input = update.instruction_data[40] == 1;
+    let a_to_b = update.instruction_data[41] == 1; // direction flag
+    let pool_info = pool_lookup.and_then(|f| f(&pool_address));
+    let sol_mint = *SOL_MINT_PUBKEY;
 
-    let is_buy = !a_to_b; // a_to_b=true means selling token A
+    let (base_mint, quote_mint, is_buy, token_program, pool_accounts) =
+        if let Some(info) = pool_info {
+            let (base_mint, quote_mint, is_buy) =
+                if info.token_mint_a == sol_mint && info.token_mint_b != sol_mint {
+                    (info.token_mint_b, sol_mint, a_to_b)
+                } else if info.token_mint_b == sol_mint && info.token_mint_a != sol_mint {
+                    (info.token_mint_a, sol_mint, !a_to_b)
+                } else {
+                    (info.token_mint_a, info.token_mint_b, !a_to_b)
+                };
 
-    // Extract mints from token balances (similar to Raydium)
-    // Account indices vary, use mint matching instead
-    let base_mint = if is_buy {
-        // BUY: Find token account with increasing balance
-        update
-            .post_token_balances
-            .iter()
-            .find(|post| {
-                let post_amt: u64 = post.ui_token_amount.amount.parse().unwrap_or(0);
-                let pre_amt: u64 = update
-                    .pre_token_balances
-                    .iter()
-                    .find(|pre| pre.mint == post.mint && pre.account_index == post.account_index)
-                    .and_then(|pre| pre.ui_token_amount.amount.parse().ok())
-                    .unwrap_or(0);
-                post_amt > pre_amt && post.mint != "So11111111111111111111111111111111111111112"
-            })
-            .and_then(|b| Pubkey::from_str(&b.mint).ok())
-            .unwrap_or_default()
-    } else {
-        // SELL: Find token account with decreasing balance
-        update
-            .pre_token_balances
-            .iter()
-            .find(|pre| {
-                let pre_amt: u64 = pre.ui_token_amount.amount.parse().unwrap_or(0);
-                let post_amt: u64 = update
+            let token_program = if base_mint == info.token_mint_a {
+                info.token_a_program
+            } else if base_mint == info.token_mint_b {
+                info.token_b_program
+            } else {
+                None
+            };
+
+            let mut accounts = vec![
+                pool_address,
+                info.token_mint_a,
+                info.token_mint_b,
+                info.token_vault_a,
+                info.token_vault_b,
+            ];
+            accounts.retain(|pk| pk != &Pubkey::default());
+
+            (base_mint, quote_mint, is_buy, token_program, Some(accounts))
+        } else {
+            // Extract mints from token balances (fallback heuristic)
+            let base_mint = if !a_to_b {
+                // BUY: Find token account with increasing balance
+                update
                     .post_token_balances
                     .iter()
-                    .find(|post| post.mint == pre.mint && post.account_index == pre.account_index)
-                    .and_then(|post| post.ui_token_amount.amount.parse().ok())
-                    .unwrap_or(0);
-                pre_amt > post_amt && pre.mint != "So11111111111111111111111111111111111111112"
-            })
-            .and_then(|b| Pubkey::from_str(&b.mint).ok())
-            .unwrap_or_default()
-    };
-
-    // Note: quote_mint not needed anymore - SELL path uses native balance
-    let _quote_mint =
-        Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default(); // SOL
+                    .find(|post| {
+                        let post_amt: u64 = post.ui_token_amount.amount.parse().unwrap_or(0);
+                        let pre_amt: u64 = update
+                            .pre_token_balances
+                            .iter()
+                            .find(|pre| {
+                                pre.mint == post.mint && pre.account_index == post.account_index
+                            })
+                            .and_then(|pre| pre.ui_token_amount.amount.parse().ok())
+                            .unwrap_or(0);
+                        post_amt > pre_amt && post.mint != SOL_MINT
+                    })
+                    .and_then(|b| Pubkey::from_str(&b.mint).ok())
+                    .unwrap_or_default()
+            } else {
+                // SELL: Find token account with decreasing balance
+                update
+                    .pre_token_balances
+                    .iter()
+                    .find(|pre| {
+                        let pre_amt: u64 = pre.ui_token_amount.amount.parse().unwrap_or(0);
+                        let post_amt: u64 = update
+                            .post_token_balances
+                            .iter()
+                            .find(|post| {
+                                post.mint == pre.mint && post.account_index == pre.account_index
+                            })
+                            .and_then(|post| post.ui_token_amount.amount.parse().ok())
+                            .unwrap_or(0);
+                        pre_amt > post_amt && pre.mint != SOL_MINT
+                    })
+                    .and_then(|b| Pubkey::from_str(&b.mint).ok())
+                    .unwrap_or_default()
+            };
+            (base_mint, sol_mint, !a_to_b, None, None)
+        };
 
     // Calculate actual amounts from token balance changes
-    let (sol_amount, token_amount) = if is_buy {
-        let tokens_received = calculate_token_balance_change(
-            &update.pre_token_balances,
-            &update.post_token_balances,
-            &base_mint,
-        )
-        .unwrap_or(0);
-        (amount, tokens_received)
-    } else {
-        // SELL: SOL received is in native balances, not token_balances!
-        let sol_received = calculate_native_balance_change(
+    let tokens_changed = calculate_token_balance_change(
+        &update.pre_token_balances,
+        &update.post_token_balances,
+        &base_mint,
+    )
+    .unwrap_or(0);
+    let sol_changed = if quote_mint == sol_mint {
+        calculate_native_balance_change(
             &update.account_keys,
             &update.pre_balances,
             &update.post_balances,
             &trader,
         )
-        .unwrap_or(0);
-        (sol_received, amount)
+        .unwrap_or(0)
+    } else {
+        0
+    };
+    let token_amount = if tokens_changed > 0 { tokens_changed } else { amount };
+    let sol_amount = if sol_changed > 0 {
+        sol_changed
+    } else if quote_mint == sol_mint && amount_specified_is_input {
+        amount
+    } else {
+        0
     };
 
     debug!(
@@ -549,7 +613,7 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
     Some(ParsedDexEvent::Trade {
         pool_address,
         mint: base_mint,
-        quote_mint: *SOL_MINT_PUBKEY,
+        quote_mint,
         trader,
         dex: DexType::OrcaWhirlpool,
         is_buy,
@@ -558,9 +622,9 @@ fn parse_orca_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexE
         token_decimals,
         signature: update.signature.clone(),
         slot: update.slot,
-        pool_accounts: None,
+        pool_accounts,
         creator: None,
-        token_program: None, // Orca uses SPL Token, but we don't trade there for momentum
+        token_program,
     })
 }
 

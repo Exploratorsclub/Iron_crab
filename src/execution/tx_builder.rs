@@ -440,12 +440,15 @@ pub async fn build_tx_plan(
 
         orca.insert_whirlpool_parsed(pool_id, parsed);
 
-        let ixs = match orca.build_swap_ix(
-            &intent.resources.input_mint,
-            &intent.resources.output_mint,
-            intent.required_capital.raw,
-            min_out,
-        ) {
+        let ixs = match orca
+            .build_swap_ix_async(
+                &intent.resources.input_mint,
+                &intent.resources.output_mint,
+                intent.required_capital.raw,
+                min_out,
+            )
+            .await
+        {
             Ok(ixs) => ixs,
             Err(e) => {
                 return TxPlanOutcome::Unsupported(UnsupportedTxPlan {

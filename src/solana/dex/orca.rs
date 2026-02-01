@@ -1358,6 +1358,37 @@ impl Dex for Orca {
             "orca: derived tick array PDAs (async with fresh tick)"
         );
 
+        // Validate tick arrays exist to avoid InvalidTickArraySequence (6023)
+        match self
+            .rpc
+            .rpc
+            .get_multiple_accounts(&[tick_array_0, tick_array_1, tick_array_2])
+            .await
+        {
+            Ok(accounts) => {
+                let missing: Vec<usize> = accounts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, acct)| if acct.is_none() { Some(idx) } else { None })
+                    .collect();
+                if !missing.is_empty() {
+                    tracing::warn!(
+                        pool = %pool_id,
+                        missing = ?missing,
+                        "orca: missing tick array accounts (swap may fail)"
+                    );
+                    return Err(anyhow!("orca tick array accounts missing"));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pool = %pool_id,
+                    error = %e,
+                    "orca: failed to validate tick arrays (continuing)"
+                );
+            }
+        }
+
         let oracle = derive_oracle_pda(&pool_id);
 
         // Build instruction data

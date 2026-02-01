@@ -47,7 +47,8 @@ use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use ironcrab::solana::dex_parser::{
-    parse_account_update, parse_transaction_update, DexType, ParsedDexEvent,
+    parse_account_update, parse_transaction_update_with_pool_lookup, DexType, OrcaPoolInfo,
+    ParsedDexEvent,
 };
 use ironcrab::solana::geyser_pool_discovery::{DexType as PoolDexType, GeyserPoolDiscovery};
 use ironcrab::solana::priority_fee_tracker::PriorityFeeTracker;
@@ -1682,7 +1683,25 @@ async fn run_geyser_loop(
                 }
 
                 // Try to parse as DEX event (PoolCreated, Trade)
-                let parsed_event = parse_transaction_update(&tx_update);
+                let pool_lookup = |pool: &Pubkey| -> Option<OrcaPoolInfo> {
+                    match ctx.live_pool_cache.get(pool) {
+                        Some(CachedPoolState::Orca(state)) => {
+                            Some(OrcaPoolInfo {
+                                token_mint_a: state.token_mint_a,
+                                token_mint_b: state.token_mint_b,
+                                token_vault_a: state.token_vault_a,
+                                token_vault_b: state.token_vault_b,
+                                tick_current_index: Some(state.tick_current_index),
+                                tick_spacing: Some(state.tick_spacing),
+                                token_a_program: state.token_a_program,
+                                token_b_program: state.token_b_program,
+                            })
+                        }
+                        _ => None,
+                    }
+                };
+                let parsed_event =
+                    parse_transaction_update_with_pool_lookup(&tx_update, Some(&pool_lookup));
 
                 // Track mint pubkeys for mint-authority/freeze metadata.
                 // GEYSER-FIRST: No RPC calls! For pump.fun we know decimals=6. For others, Geyser delivers.
