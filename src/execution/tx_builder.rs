@@ -577,37 +577,82 @@ pub async fn build_tx_plan(
         // - 12 accounts: SELL format (no volume accumulators)
         // - 14 accounts: BUY format (with global_volume_accumulator + user_volume_accumulator)
         let accounts_len = intent.resources.accounts.len();
-        if accounts_len != 12 && accounts_len != 14 {
+        let pool_accounts: Vec<Pubkey> = if accounts_len == 0 {
+            if let Some(cache) = cache {
+                if let Some(CachedPoolState::PumpAmm(amm_state)) = cache.get(&pool_id) {
+                    if amm_state.pool_accounts.len() >= 12 {
+                        tracing::warn!(
+                            pool = %pool_id,
+                            accounts_len = amm_state.pool_accounts.len(),
+                            "pump_amm: using cached pool_accounts (intent missing accounts)"
+                        );
+                        amm_state.pool_accounts.clone()
+                    } else {
+                        return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                            reason: RejectReason::UnsupportedIntent,
+                            details: format!(
+                                "pump_amm cached pool_accounts too short: len={}",
+                                amm_state.pool_accounts.len()
+                            ),
+                        });
+                    }
+                } else {
+                    return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                        reason: RejectReason::UnsupportedIntent,
+                        details: format!("pump_amm: pool {} not in cache", pool_id),
+                    });
+                }
+            } else {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: "pump_amm requires resources.accounts or cache".to_string(),
+                });
+            }
+        } else {
+            if accounts_len != 12 && accounts_len != 14 {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!(
+                        "pump_amm requires resources.accounts (len=12 for SELL or len=14 for BUY), got len={}",
+                        accounts_len
+                    ),
+                });
+            }
+
+            let mut parsed = Vec::with_capacity(accounts_len);
+            for (idx, a) in intent.resources.accounts.iter().enumerate() {
+                match Pubkey::from_str(a) {
+                    Ok(pk) => parsed.push(pk),
+                    Err(e) => {
+                        return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                            reason: RejectReason::InvalidIntent,
+                            details: format!(
+                                "invalid resources.accounts[{idx}] pubkey for pump_amm: {e}"
+                            ),
+                        })
+                    }
+                }
+            }
+
+            if parsed[0] != pool_id {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::InvalidIntent,
+                    details: format!(
+                        "pump_amm pool mismatch: resources.pools[0]={pool_id} but resources.accounts[0]={}",
+                        parsed[0]
+                    ),
+                });
+            }
+
+            parsed
+        };
+
+        if pool_accounts.len() != 12 && pool_accounts.len() != 14 {
             return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                 reason: RejectReason::UnsupportedIntent,
                 details: format!(
-                    "pump_amm requires resources.accounts (len=12 for SELL or len=14 for BUY), got len={}",
-                    accounts_len
-                ),
-            });
-        }
-
-        let mut pool_accounts: Vec<Pubkey> = Vec::with_capacity(accounts_len);
-        for (idx, a) in intent.resources.accounts.iter().enumerate() {
-            match Pubkey::from_str(a) {
-                Ok(pk) => pool_accounts.push(pk),
-                Err(e) => {
-                    return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                        reason: RejectReason::InvalidIntent,
-                        details: format!(
-                            "invalid resources.accounts[{idx}] pubkey for pump_amm: {e}"
-                        ),
-                    })
-                }
-            }
-        }
-
-        if pool_accounts[0] != pool_id {
-            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                reason: RejectReason::InvalidIntent,
-                details: format!(
-                    "pump_amm pool mismatch: resources.pools[0]={pool_id} but resources.accounts[0]={}",
-                    pool_accounts[0]
+                    "pump_amm requires 12 or 14 accounts, got len={}",
+                    pool_accounts.len()
                 ),
             });
         }
@@ -673,27 +718,45 @@ pub async fn build_tx_plan(
             }
         };
 
-        // Meteora DLMM requires DexPoolAccounts with pool data
-        // Format: [lb_pair, token_x_mint, token_y_mint, reserve_x?, reserve_y?, active_id:N?, bin_step:N?]
-        if intent.resources.accounts.len() < 3 {
-            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                reason: RejectReason::UnsupportedIntent,
-                details: format!(
-                    "meteora_dlmm requires resources.accounts (DexPoolAccounts), got len={}",
-                    intent.resources.accounts.len()
-                ),
-            });
-        }
-
         let mut meteora = MeteoraDlmm::new(Arc::clone(&rpc));
         meteora.set_user_authority(wallet_pubkey);
 
-        // Parse accounts and set pool from intent data
-        if let Err(e) = meteora.set_pool_from_accounts(pool_id_str, &intent.resources.accounts) {
-            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                reason: RejectReason::UnsupportedIntent,
-                details: format!("meteora_dlmm set_pool_from_accounts failed: {e}"),
-            });
+        // Meteora DLMM: If DexPoolAccounts missing, fallback to cache/RPC.
+        // Format: [lb_pair, token_x_mint, token_y_mint, reserve_x?, reserve_y?, active_id:N?, bin_step:N?]
+        if intent.resources.accounts.len() >= 3 {
+            if let Err(e) = meteora.set_pool_from_accounts(pool_id_str, &intent.resources.accounts)
+            {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!("meteora_dlmm set_pool_from_accounts failed: {e}"),
+                });
+            }
+        } else {
+            let mut used_cache = false;
+            if let Some(cache) = cache {
+                if let Some(CachedPoolState::Meteora(dlmm_state)) = cache.get(&_pool_id) {
+                    if dlmm_state.active_id != 0 {
+                        if let Ok(true) = meteora.inject_cached_meteora_state(&_pool_id, &dlmm_state)
+                        {
+                            tracing::warn!(
+                                pool = %_pool_id,
+                                active_id = dlmm_state.active_id,
+                                "meteora_dlmm: using cached pool state (intent missing accounts)"
+                            );
+                            used_cache = true;
+                        }
+                    }
+                }
+            }
+
+            if !used_cache {
+                if let Err(e) = meteora.load_pool_by_address(&_pool_id).await {
+                    return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                        reason: RejectReason::UnsupportedIntent,
+                        details: format!("meteora_dlmm load_pool_by_address failed: {e}"),
+                    });
+                }
+            }
         }
 
         // Use async version - Meteora DLMM requires bin array derivation

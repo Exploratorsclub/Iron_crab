@@ -179,6 +179,9 @@ struct MarketDataContext {
     /// Key: pool_address
     known_pump_amm_pools: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
 
+    /// Pools for which we've already emitted DexPoolAccounts from trade parsing.
+    known_trade_dex_pools: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+
     /// Vault account tracking for PoolStateUpdate events (Geyser-based reserve balances).
     /// Maps vault_address → VaultInfo (pool context).
     tracked_vaults: parking_lot::RwLock<std::collections::HashMap<Pubkey, VaultInfo>>,
@@ -871,6 +874,7 @@ async fn main() -> Result<()> {
         tracked_mints: parking_lot::RwLock::new(std::collections::HashSet::new()),
         tracked_mints_tx,
         known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
+        known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
         tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_vaults_tx,
         tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -1940,6 +1944,58 @@ async fn run_geyser_loop(
                         } else {
                             NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                             MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+
+                // For non-pump_amm DEXes: emit DexPoolAccounts on first trade if pool_accounts present.
+                if let Some(ParsedDexEvent::Trade {
+                    pool_address,
+                    mint,
+                    quote_mint,
+                    dex,
+                    pool_accounts: Some(pool_accounts),
+                    ..
+                }) = parsed_event.as_ref()
+                {
+                    if !matches!(dex, DexType::PumpFunAmm) {
+                        let is_first_trade = ctx.known_trade_dex_pools.write().insert(*pool_address);
+                        if is_first_trade {
+                            let accounts_event = MarketEvent::new(
+                                "market-data",
+                                BUILD_VERSION,
+                                run_id,
+                                ctx.next_event_id(),
+                                "geyser_first_trade",
+                                Some(tx_update.slot),
+                                MarketEventKind::DexPoolAccounts {
+                                    dex: dex.to_string(),
+                                    pool_address: pool_address.to_string(),
+                                    base_mint: mint.to_string(),
+                                    quote_mint: quote_mint.to_string(),
+                                    accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
+                                },
+                            );
+
+                            if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
+                                error!(error = %e, "Failed to write DexPoolAccounts event to JSONL");
+                            }
+
+                            if let Some(ref nats) = ctx.nats {
+                                if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &accounts_event).await
+                                {
+                                    warn!(error = %e, "Failed to publish DexPoolAccounts event to NATS");
+                                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                    MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                    debug!(
+                                        dex = %dex,
+                                        pool = %pool_address,
+                                        "Emitted DexPoolAccounts from first trade"
+                                    );
+                                }
+                            }
                         }
                     }
                 }

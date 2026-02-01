@@ -5907,11 +5907,18 @@ async fn generate_and_publish_exit_intent(
                 );
 
                 // Get accounts for original pool
-                let accounts = ctx
-                    .try_get_dex_pool_accounts_for_mint(mint)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("cannot generate exit intent: missing DexPoolAccounts")
-                    })?;
+                let accounts = match ctx.try_get_dex_pool_accounts_for_mint(mint) {
+                    Some(accounts) => accounts,
+                    None => {
+                        warn!(
+                            mint = %mint,
+                            pool = %original_pool,
+                            dex = %original_dex,
+                            "Missing DexPoolAccounts for exit intent; falling back to empty accounts"
+                        );
+                        Vec::new()
+                    }
+                };
 
                 let routing = if original_dex.eq_ignore_ascii_case("pump_amm") {
                     "pumpswap_fallback"
