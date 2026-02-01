@@ -4814,11 +4814,16 @@ async fn generate_and_publish_buy_intent(
         )
     };
 
-    let (token_decimals_opt, token_program_opt) = {
+    let (token_decimals_opt, token_program_opt, mint_supply_opt, has_authority) = {
         let mint_infos = ctx.mint_infos.read();
         match mint_infos.get(&signal.mint) {
-            Some(m) => (Some(m.decimals), Some(m.token_program.clone())),
-            None => (None, None),
+            Some(m) => (
+                Some(m.decimals),
+                Some(m.token_program.clone()),
+                Some(m.supply),
+                m.mint_authority.is_some() || m.freeze_authority.is_some(),
+            ),
+            None => (None, None, None, false),
         }
     };
 
@@ -4856,6 +4861,10 @@ async fn generate_and_publish_buy_intent(
             Some(tp) if tp == spl => Some(tp.to_string()),
             Some(tp) if tp == spl22 => {
                 if is_pump {
+                    let mint_info_is_final = mint_supply_opt.unwrap_or(0) > 0 || has_authority;
+                    if mint_info_is_final {
+                        return Some(tp.to_string());
+                    }
                     warn!(
                         mint = %signal.mint,
                         dex = %effective_dex,
