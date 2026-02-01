@@ -72,8 +72,9 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                             continue
                         try:
                             record = json.loads(line)
-                            # Only include confirmed/successful executions
-                            if record.get('status') == 'Confirmed':
+                            # Only include confirmed/successful executions (snake_case or legacy)
+                            status = str(record.get('status') or '').lower()
+                            if status in ('confirmed', 'failed_confirmed'):
                                 trade = self.parse_execution_result(record)
                                 if trade:
                                     trades.append(trade)
