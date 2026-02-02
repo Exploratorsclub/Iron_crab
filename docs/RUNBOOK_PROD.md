@@ -155,7 +155,7 @@ folgende Interpretations-Regeln:
 - **WSOL-Wrap-Events** = Nachschub/Buffer fuer Trading
 - **Open Positions** = Strategie-Sicht (korrekt nur mit aktivem Reconciliation)
 - **ExecutionResults (Confirmed/Sent/Rejected)** = reale Handelsausfuehrung
-- **Available SOL** = Lock/Budget-Metrik (kein On-Chain-Stand)
+- **Available WSOL** = Lock/Budget-Metrik (WSOL ATA Balance, nicht native SOL)
 
 Weniger aussagekraeftig:
 

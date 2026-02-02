@@ -253,7 +253,7 @@
     },
     {
       "type": "stat",
-      "title": "Available SOL",
+      "title": "Available WSOL",
       "targets": [{ "expr": "available_sol_lamports{job=\"ironcrab-execution-engine\"} / 1e9", "refId": "A" }],
       "gridPos": {"h":4,"w":4,"x":16,"y":29},
       "fieldConfig": { "defaults": { "unit": "short", "decimals": 2 } }
