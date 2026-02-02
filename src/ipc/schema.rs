@@ -319,8 +319,9 @@ pub enum MarketEventKind {
     /// - Emergency liquidations via UI
     /// - External transfers
     ///
-    /// Published once at market-data startup for all non-zero token accounts.
-    /// NO periodic refresh (wallet changes come via ExecutionResults).
+    /// Published at market-data startup AND periodically (every 5 minutes)
+    /// for position reconciliation. Periodic refresh catches ghost positions
+    /// from closed ATAs that Geyser doesn't report.
     WalletBalanceSnapshot {
         /// Token mint address
         mint: String,
@@ -330,6 +331,18 @@ pub enum MarketEventKind {
         decimals: u8,
         /// Token program (SPL Token or Token-2022)
         token_program: String,
+    },
+
+    /// Sent after a complete wallet scan to indicate all mints present in wallet.
+    /// momentum-bot uses this to close ghost positions for mints NOT in the list.
+    /// This is necessary because Geyser does NOT report deleted/closed accounts.
+    WalletSnapshotComplete {
+        /// All token mints currently in the wallet (excluding WSOL)
+        mints_in_wallet: Vec<String>,
+        /// Wallet address
+        wallet: String,
+        /// Is this a periodic reconciliation (vs startup)?
+        is_periodic: bool,
     },
 
     // =========================================================================

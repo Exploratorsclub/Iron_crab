@@ -480,17 +480,20 @@ fn try_parse_token_account_balance(data: &[u8]) -> Option<u64> {
 
 /// Publish wallet token balance snapshot for position reconciliation.
 ///
-/// Called once at market-data startup to provide momentum-bot with current wallet state.
+/// Called at market-data startup AND periodically to provide momentum-bot with current wallet state.
 /// This allows momentum-bot to reconcile positions after restarts, detecting:
 /// - Manual sales via Phantom/Jupiter (no ExecutionResult)
 /// - Emergency liquidations via UI
 /// - External transfers
+/// - Closed ATAs (Geyser doesn't report deleted accounts)
 ///
-/// NO periodic refresh - wallet changes come via ExecutionResults in normal operation.
+/// The periodic refresh (every 5 minutes) ensures ghost positions are detected
+/// even when ATAs are closed, which Geyser cannot track.
 async fn publish_wallet_snapshot(
     ctx: &MarketDataContext,
     rpc: &SolanaRpc,
     wallet: &Pubkey,
+    is_periodic: bool,
 ) -> Result<()> {
     use solana_client::rpc_request::TokenAccountsFilter;
     use base64::Engine;
@@ -507,6 +510,8 @@ async fn publish_wallet_snapshot(
     let mut total_accounts = 0usize;
     let mut non_zero_accounts = 0usize;
     let mut mint_decimals_cache: HashMap<Pubkey, u8> = HashMap::new();
+    // Track mints with non-zero balance for WalletSnapshotComplete event
+    let mut mints_with_balance: Vec<String> = Vec::new();
     let mut wallet_token_accounts: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
 
     let wallet_str = wallet.to_string();
@@ -647,8 +652,9 @@ async fn publish_wallet_snapshot(
             }
 
             non_zero_accounts += 1;
-
+            
             let mint_str = mint.to_string();
+            mints_with_balance.push(mint_str.clone());
             let event_id = format!("wallet_snapshot_{}", mint_str);
             let event = MarketEvent::new(
                 "market-data",
@@ -760,6 +766,38 @@ async fn publish_wallet_snapshot(
             "Wallet snapshot: all token accounts have zero balance"
         );
     }
+
+    // Send WalletSnapshotComplete event so momentum-bot can close ghost positions
+    // for mints NOT in the wallet (closed ATAs that Geyser doesn't report)
+    let complete_event = MarketEvent::new(
+        "market-data",
+        BUILD_VERSION,
+        &ctx.run_id,
+        format!("wallet_snapshot_complete_{}", if is_periodic { "periodic" } else { "startup" }),
+        "wallet_scan_complete",
+        None,
+        MarketEventKind::WalletSnapshotComplete {
+            mints_in_wallet: mints_with_balance.clone(),
+            wallet: wallet_str.clone(),
+            is_periodic,
+        },
+    );
+
+    if let Some(ref nats) = ctx.nats {
+        if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &complete_event).await {
+            warn!(error = %e, "Failed to publish WalletSnapshotComplete");
+        }
+    }
+
+    if let Err(e) = ctx.jsonl_writer.write(&complete_event) {
+        warn!(error = %e, "Failed to write WalletSnapshotComplete to JSONL");
+    }
+
+    info!(
+        mints_count = mints_with_balance.len(),
+        is_periodic = is_periodic,
+        "📋 WalletSnapshotComplete published"
+    );
 
     Ok(())
 }
@@ -1065,21 +1103,32 @@ async fn run_geyser_loop(
     info!(rpc_url = %rpc_url, "Initialized RPC client for metadata/fallback");
 
     // === P0: Wallet Balance Snapshot (Position Reconciliation) ===
-    // Publish current wallet state once at startup to reconcile positions after restarts.
-    // Handles: manual sales, emergency liquidations, external transfers.
-    // NO periodic refresh - wallet changes come via ExecutionResults.
-    if let Ok(wallet_pubkey_str) = std::env::var("IRONCRAB_WALLET_PUBKEY") {
-        if let Ok(wallet_pubkey) = Pubkey::from_str(&wallet_pubkey_str) {
-            info!(wallet = %wallet_pubkey, "📸 Publishing wallet balance snapshot for position reconciliation");
-            if let Err(e) = publish_wallet_snapshot(&ctx, &rpc, &wallet_pubkey).await {
-                warn!(error = %e, "Failed to publish wallet snapshot (continuing anyway)");
+    // Publish current wallet state at startup AND periodically to reconcile positions.
+    // Handles: manual sales, emergency liquidations, external transfers, closed ATAs.
+    //
+    // IMPORTANT: Geyser does NOT send updates for closed/deleted token accounts.
+    // This periodic refresh ensures we detect when tokens are sold externally
+    // (e.g., via Phantom/Jupiter) or when ATAs are closed.
+    let wallet_for_reconciliation: Option<Pubkey> =
+        if let Ok(wallet_pubkey_str) = std::env::var("IRONCRAB_WALLET_PUBKEY") {
+            if let Ok(wallet_pubkey) = Pubkey::from_str(&wallet_pubkey_str) {
+                info!(wallet = %wallet_pubkey, "📸 Publishing wallet balance snapshot for position reconciliation");
+                if let Err(e) = publish_wallet_snapshot(&ctx, &rpc, &wallet_pubkey, false).await {
+                    warn!(error = %e, "Failed to publish wallet snapshot (continuing anyway)");
+                }
+                Some(wallet_pubkey)
+            } else {
+                warn!("IRONCRAB_WALLET_PUBKEY is set but not a valid pubkey");
+                None
             }
         } else {
-            warn!("IRONCRAB_WALLET_PUBKEY is set but not a valid pubkey");
-        }
-    } else {
-        info!("IRONCRAB_WALLET_PUBKEY not set, skipping wallet snapshot");
-    }
+            info!("IRONCRAB_WALLET_PUBKEY not set, skipping wallet snapshot");
+            None
+        };
+    
+    // Periodic wallet reconciliation interval (5 minutes)
+    // This catches ghost positions from closed ATAs that Geyser doesn't report
+    const WALLET_RECONCILIATION_INTERVAL_SECS: u64 = 300; // 5 minutes
 
     if wallet_snapshot_only {
         info!("Wallet snapshot only mode enabled, exiting after snapshot");
@@ -1170,6 +1219,13 @@ async fn run_geyser_loop(
     let mut tx_count = 0u64;
     let mut last_heartbeat = std::time::Instant::now();
     let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    
+    // Periodic wallet reconciliation timer - catches ghost positions from closed ATAs
+    let mut wallet_reconciliation_interval = tokio::time::interval(
+        std::time::Duration::from_secs(WALLET_RECONCILIATION_INTERVAL_SECS)
+    );
+    // Skip first tick (we already did startup snapshot)
+    wallet_reconciliation_interval.tick().await;
 
     loop {
         tokio::select! {
@@ -1199,6 +1255,17 @@ async fn run_geyser_loop(
                 // P1 Crash Isolation: Ping systemd watchdog frequently enough.
                 #[cfg(unix)]
                 let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+            }
+            
+            // Periodic wallet reconciliation - catches ghost positions from closed ATAs
+            // Geyser does NOT report deleted accounts, so we must poll periodically
+            _ = wallet_reconciliation_interval.tick() => {
+                if let Some(wallet_pubkey) = wallet_for_reconciliation {
+                    info!(wallet = %wallet_pubkey, "🔄 Periodic wallet reconciliation - scanning for ghost positions");
+                    if let Err(e) = publish_wallet_snapshot(&ctx, &rpc, &wallet_pubkey, true).await {
+                        warn!(error = %e, "Failed to publish periodic wallet snapshot");
+                    }
+                }
             }
 
             // Account updates (pool state changes)

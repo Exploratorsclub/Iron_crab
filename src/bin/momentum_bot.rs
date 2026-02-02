@@ -6523,7 +6523,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             ..
         } => {
             // P0: Position Reconciliation after restart
-            // Published by market-data at startup to sync wallet state with position tracking.
+            // Published by market-data at startup AND periodically to sync wallet state.
             // Handles: manual sales, emergency liquidations, external transfers.
 
             if *balance_raw == 0 {
@@ -6574,6 +6574,59 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                         "WalletBalanceSnapshot: tokens present but no known pool to reconcile"
                     );
                 }
+            }
+        }
+
+        MarketEventKind::WalletSnapshotComplete {
+            mints_in_wallet,
+            is_periodic,
+            ..
+        } => {
+            // P0: Ghost Position Cleanup
+            // Close positions for mints NOT in the wallet (closed ATAs that Geyser doesn't report).
+            // This is the definitive reconciliation after market-data completes a wallet scan.
+            
+            let mints_set: std::collections::HashSet<&str> = 
+                mints_in_wallet.iter().map(|s| s.as_str()).collect();
+            
+            let mut positions = ctx.positions.write();
+            let position_mints: Vec<String> = positions.keys().cloned().collect();
+            let mut closed_count = 0usize;
+            
+            for mint in position_mints {
+                if !mints_set.contains(mint.as_str()) {
+                    if let Some(removed) = positions.remove(&mint) {
+                        closed_count += 1;
+                        warn!(
+                            mint = %mint,
+                            pool = %removed.pool,
+                            dex = %removed.dex,
+                            hold_secs = removed.entry_time.elapsed().as_secs(),
+                            is_periodic = is_periodic,
+                            "👻 Ghost position closed: mint NOT in WalletSnapshotComplete (ATA was closed)"
+                        );
+                        // Also remove from JetStream KV
+                        drop(positions); // Release write lock before async
+                        ctx.delete_position_from_kv(&mint).await;
+                        positions = ctx.positions.write(); // Re-acquire
+                    }
+                }
+            }
+            
+            if closed_count > 0 {
+                info!(
+                    closed_count = closed_count,
+                    mints_in_wallet = mints_in_wallet.len(),
+                    is_periodic = is_periodic,
+                    "✅ WalletSnapshotComplete: reconciliation finished"
+                );
+            } else {
+                debug!(
+                    mints_in_wallet = mints_in_wallet.len(),
+                    positions_tracked = positions.len(),
+                    is_periodic = is_periodic,
+                    "WalletSnapshotComplete: no ghost positions found"
+                );
             }
         }
 
