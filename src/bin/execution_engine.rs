@@ -49,7 +49,7 @@ use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use ironcrab::config::Config as AppConfig;
@@ -123,13 +123,24 @@ fn extract_owner_mint_delta_raw(
         Option::<Vec<UiTransactionTokenBalance>>::from(meta.pre_token_balances.clone());
     let post_balances_opt =
         Option::<Vec<UiTransactionTokenBalance>>::from(meta.post_token_balances.clone());
-    let (pre_balances, post_balances) = (pre_balances_opt?, post_balances_opt?);
+    let (pre_balances, post_balances) = match (pre_balances_opt, post_balances_opt) {
+        (Some(pre), Some(post)) => (pre, post),
+        _ => {
+            trace!(
+                target_mint = %mint,
+                "Token balances missing from TX meta"
+            );
+            return None;
+        }
+    };
 
     let owner_str = owner.to_string();
 
     let mut pre_sum: u128 = 0;
     let mut post_sum: u128 = 0;
     let mut decimals_opt: Option<u8> = None;
+    let mut matched_pre = 0usize;
+    let mut matched_post = 0usize;
 
     for b in pre_balances.iter() {
         let b_owner = Option::<String>::from(b.owner.clone());
@@ -137,6 +148,7 @@ fn extract_owner_mint_delta_raw(
             decimals_opt = Some(b.ui_token_amount.decimals);
             if let Ok(v) = u128::from_str(&b.ui_token_amount.amount) {
                 pre_sum = pre_sum.saturating_add(v);
+                matched_pre += 1;
             }
         }
     }
@@ -147,12 +159,42 @@ fn extract_owner_mint_delta_raw(
             decimals_opt = Some(b.ui_token_amount.decimals);
             if let Ok(v) = u128::from_str(&b.ui_token_amount.amount) {
                 post_sum = post_sum.saturating_add(v);
+                matched_post += 1;
             }
         }
     }
 
+    // Debug logging when no balance found for the target mint
+    if decimals_opt.is_none() {
+        // Log available mints for debugging owner mismatch issues
+        let available_mints: Vec<&str> = post_balances
+            .iter()
+            .map(|b| b.mint.as_str())
+            .collect();
+        trace!(
+            target_mint = %mint,
+            target_owner = %owner_str,
+            available_mints = ?available_mints,
+            pre_balance_count = pre_balances.len(),
+            post_balance_count = post_balances.len(),
+            "No token balance found for mint/owner combination"
+        );
+        return None;
+    }
+
     let decimals = decimals_opt?;
     let delta = post_sum as i128 - pre_sum as i128;
+
+    trace!(
+        target_mint = %mint,
+        pre_sum = pre_sum,
+        post_sum = post_sum,
+        delta = delta,
+        matched_pre = matched_pre,
+        matched_post = matched_post,
+        "Token balance delta computed"
+    );
+
     Some((decimals, delta))
 }
 
@@ -427,6 +469,21 @@ async fn compute_intent_fills_best_effort(
     } else {
         Some(FillUnavailableReason::TokenBalanceDeltaMissing)
     };
+
+    // Debug logging for incomplete fills (helps diagnose dashboard issues)
+    if fill_status != FillStatus::Complete {
+        debug!(
+            input_mint = %input_mint,
+            output_mint = %output_mint,
+            fill_in_present = fill_in.is_some(),
+            fill_out_present = fill_out.is_some(),
+            fill_status = ?fill_status,
+            fill_reason = ?fill_unavailable_reason,
+            lamport_noise = lamport_noise,
+            payer_delta_lamports = payer_delta_lamports,
+            "Fill accounting incomplete - dashboard values may be inaccurate"
+        );
+    }
 
     // Return wallet SOL delta (5th tuple element) unless gated by noise
     let wallet_sol_delta = if !lamport_noise {

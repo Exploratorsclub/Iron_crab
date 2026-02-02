@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Recent trade record for dashboard display
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecentTrade {
     pub timestamp_ms: u64,
     pub mint: String,
@@ -26,8 +26,12 @@ const MAX_RECENT_TRADES: usize = 20;
 pub static RECENT_TRADES: Lazy<RwLock<VecDeque<RecentTrade>>> =
     Lazy::new(|| RwLock::new(VecDeque::with_capacity(MAX_RECENT_TRADES)));
 
-/// Record a new trade (BUY or SELL)
+/// Record a new trade (BUY or SELL) - persists to both in-memory buffer and JSONL file
 pub fn record_recent_trade(trade: RecentTrade) {
+    // Persist to JSONL file for recovery after restarts
+    append_trade_to_jsonl(&trade);
+
+    // Add to in-memory ring buffer
     let mut trades = RECENT_TRADES.write();
     if trades.len() >= MAX_RECENT_TRADES {
         trades.pop_front();
@@ -35,16 +39,77 @@ pub fn record_recent_trade(trade: RecentTrade) {
     trades.push_back(trade);
 }
 
-/// Get recent trades as JSON - reads from CSV file for persistence across restarts
+/// Append a trade to today's JSONL file for persistence
+fn append_trade_to_jsonl(trade: &RecentTrade) {
+    use chrono::Utc;
+    use std::io::Write;
+
+    let dir_name =
+        std::env::var("IRONCRAB_TRADE_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string());
+    let date = Utc::now().format("%Y%m%d");
+    let file_path = std::path::Path::new(&dir_name).join(format!("recent_trades-{}.jsonl", date));
+
+    // Ensure directory exists
+    if let Some(parent) = file_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // Append to file (create if not exists)
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file_path)
+    {
+        if let Ok(json) = serde_json::to_string(trade) {
+            let _ = writeln!(file, "{}", json);
+        }
+    }
+}
+
+/// Get recent trades as JSON - reads from JSONL/CSV file for persistence across restarts
 pub fn get_recent_trades_json() -> String {
-    // Try to read from today's CSV file for persistence
-    let trades = read_trades_from_csv(20);
+    // Priority 1: Try to read from today's JSONL file (new format)
+    let trades = read_trades_from_jsonl(20);
     if !trades.is_empty() {
         return serde_json::to_string(&trades).unwrap_or_else(|_| "[]".to_string());
     }
-    // Fallback to in-memory buffer
+
+    // Priority 2: Try to read from today's CSV file (legacy format)
+    let csv_trades = read_trades_from_csv(20);
+    if !csv_trades.is_empty() {
+        return serde_json::to_string(&csv_trades).unwrap_or_else(|_| "[]".to_string());
+    }
+
+    // Fallback: in-memory buffer (empty after restart until first trade)
     let mem_trades = RECENT_TRADES.read();
     serde_json::to_string(&*mem_trades).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Read last N trades from today's JSONL file
+fn read_trades_from_jsonl(limit: usize) -> Vec<RecentTrade> {
+    use chrono::Utc;
+    use std::io::BufRead;
+
+    let dir_name =
+        std::env::var("IRONCRAB_TRADE_LOG_DIR").unwrap_or_else(|_| "trade_logs".to_string());
+    let date = Utc::now().format("%Y%m%d");
+    let file_path = std::path::Path::new(&dir_name).join(format!("recent_trades-{}.jsonl", date));
+
+    let file = match std::fs::File::open(&file_path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    let reader = std::io::BufReader::new(file);
+    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+
+    // Take last N lines, reverse to show newest first
+    let start = lines.len().saturating_sub(limit);
+    lines[start..]
+        .iter()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<RecentTrade>(line).ok())
+        .collect()
 }
 
 /// Read last N trades from today's CSV file
