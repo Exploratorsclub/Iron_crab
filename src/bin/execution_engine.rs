@@ -3840,37 +3840,74 @@ async fn main() -> Result<()> {
 
     info!(log_dir = %log_base.display(), "JSONL writers initialized");
 
-    // Load wallet keys and fetch real balance
+    // Load wallet keys and fetch real balance (SOL + WSOL)
     // NOTE: In `--dry-run`, we still allow key loading and balance reads.
     // `--dry-run` means: do not submit transactions, not: keyless.
-    let (wallet_pubkey, initial_balance) = if let Some(ref t) = treasury {
+    let (wallet_pubkey, initial_sol, initial_wsol) = if let Some(ref t) = treasury {
         let pubkey = t.pubkey();
 
         // RS-1.1 acceptance: getBalance through SolanaRpc
-        match rpc.rpc.get_balance(&pubkey).await {
+        let sol_balance = match rpc.rpc.get_balance(&pubkey).await {
             Ok(balance) => {
-                info!(wallet = %pubkey, balance_sol = balance as f64 / 1e9, "Real wallet balance fetched");
-                (Some(pubkey), balance)
+                info!(wallet = %pubkey, balance_sol = balance as f64 / 1e9, "Native SOL balance fetched");
+                balance
             }
             Err(e) => {
-                warn!(error = %e, "Failed to fetch wallet balance, using default");
-                (Some(pubkey), args.initial_sol_lamports)
+                warn!(error = %e, "Failed to fetch wallet SOL balance, using default");
+                args.initial_sol_lamports
             }
-        }
+        };
+
+        // Fetch WSOL ATA balance for dashboard display
+        // Compute WSOL ATA address using PDA derivation (same as spl_associated_token_account)
+        let wsol_mint = Pubkey::from_str(SOL_MINT).expect("valid SOL_MINT");
+        let token_program = spl_token::ID;
+        let ata_program = Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+            .expect("valid ATA program");
+        let (wsol_ata, _bump) = Pubkey::find_program_address(
+            &[pubkey.as_ref(), token_program.as_ref(), wsol_mint.as_ref()],
+            &ata_program,
+        );
+        let wsol_balance = match rpc.rpc.get_token_account_balance(&wsol_ata).await {
+            Ok(balance) => {
+                let lamports = balance.amount.parse::<u64>().unwrap_or(0);
+                info!(
+                    wallet = %pubkey,
+                    wsol_ata = %wsol_ata,
+                    wsol_lamports = lamports,
+                    wsol_sol = lamports as f64 / 1e9,
+                    "WSOL ATA balance fetched"
+                );
+                Some(lamports)
+            }
+            Err(e) => {
+                // WSOL ATA might not exist yet (before first wrap)
+                debug!(error = %e, wsol_ata = %wsol_ata, "WSOL ATA not found or empty");
+                None
+            }
+        };
+
+        (Some(pubkey), sol_balance, wsol_balance)
     } else {
-        (None, args.initial_sol_lamports)
+        (None, args.initial_sol_lamports, None)
     };
 
-    // Setup lock manager with real balance
-    let lock_manager = LockManager::new(initial_balance);
+    // Setup lock manager with real balance (SOL + WSOL)
+    let lock_manager = LockManager::new(initial_sol);
+    // Initialize WSOL balance if we found it
+    if let Some(wsol) = initial_wsol {
+        lock_manager.update_wallet_balances(initial_sol, Some(wsol));
+    }
     info!(
-        initial_sol = initial_balance,
-        balance_sol = initial_balance as f64 / 1e9,
-        "Lock manager initialized with wallet balance"
+        initial_sol = initial_sol,
+        initial_wsol = ?initial_wsol,
+        sol_balance = initial_sol as f64 / 1e9,
+        wsol_balance = initial_wsol.map(|w| w as f64 / 1e9),
+        "Lock manager initialized with wallet balances"
     );
 
-    // Update metrics with real balance
-    AVAILABLE_SOL_LAMPORTS.store(initial_balance, Ordering::Relaxed);
+    // Update metrics with real balance (WSOL if available, else SOL)
+    AVAILABLE_SOL_LAMPORTS.store(initial_wsol.unwrap_or(initial_sol), Ordering::Relaxed);
 
     // P1: Load state snapshot if available (DoD K)
     let snapshot = StateSnapshot::load(log_base.as_path());

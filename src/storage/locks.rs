@@ -300,8 +300,11 @@ pub struct LockManager {
     /// Available native SOL capital (not locked) - used for gas fees
     available_sol: RwLock<u64>,
     /// Available WSOL capital (not locked) - used for trades (BUY side)
-    /// This is what the dashboard should display as "Available SOL"
+    /// This is what the dashboard should display as "Available WSOL"
     available_wsol: RwLock<u64>,
+    /// Whether WSOL balance has been seen at least once (from WalletBalanceUpdate)
+    /// Used to distinguish "WSOL=0" from "WSOL not yet initialized"
+    wsol_initialized: std::sync::atomic::AtomicBool,
     available_tokens: RwLock<HashMap<String, u64>>,
 
     /// Active capital locks
@@ -325,6 +328,7 @@ impl LockManager {
         Self {
             available_sol: RwLock::new(initial_sol),
             available_wsol: RwLock::new(0), // Will be updated by WalletBalanceUpdate events
+            wsol_initialized: std::sync::atomic::AtomicBool::new(false),
             available_tokens: RwLock::new(HashMap::new()),
             capital_locks: RwLock::new(HashMap::new()),
             resource_locks: RwLock::new(HashMap::new()),
@@ -377,16 +381,20 @@ impl LockManager {
     /// - `sol_lamports`: Native SOL balance (for gas fees)
     /// - `wsol_lamports`: WSOL ATA balance (for trades)
     ///
-    /// The dashboard "Available SOL" metric should show WSOL, as that's what
+    /// The dashboard "Available WSOL" metric should show WSOL, as that's what
     /// is actually used for BUY trades (no in-TX wrapping).
     pub fn update_wallet_balances(&self, sol_lamports: u64, wsol_lamports: Option<u64>) {
         *self.available_sol.write() = sol_lamports;
         if let Some(wsol) = wsol_lamports {
             *self.available_wsol.write() = wsol;
+            // Mark WSOL as initialized once we've seen it
+            self.wsol_initialized
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         tracing::debug!(
             sol = sol_lamports,
             wsol = ?wsol_lamports,
+            wsol_initialized = self.wsol_initialized.load(std::sync::atomic::Ordering::Relaxed),
             "LockManager wallet balances updated"
         );
     }
@@ -396,16 +404,19 @@ impl LockManager {
         *self.available_wsol.read()
     }
 
-    /// Get total available capital for trading (WSOL for trades, SOL as backup)
+    /// Get total available capital for trading (WSOL for trades, SOL as fallback before init)
     ///
-    /// Returns WSOL if available, otherwise falls back to SOL.
+    /// Returns WSOL if initialized (even if 0), otherwise falls back to SOL.
     /// This is what should be displayed in the dashboard and used for capital lock checks.
     pub fn available_trading_capital(&self) -> u64 {
-        let wsol = *self.available_wsol.read();
-        if wsol > 0 {
-            wsol
+        // Only use WSOL if we've received at least one WSOL balance update
+        if self
+            .wsol_initialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            *self.available_wsol.read()
         } else {
-            // Fallback to SOL if WSOL not yet initialized
+            // Fallback to SOL only before first WSOL update (e.g., at startup)
             *self.available_sol.read()
         }
     }
