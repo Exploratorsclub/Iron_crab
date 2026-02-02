@@ -1047,19 +1047,28 @@ impl PumpFunDex {
             )?
         };
 
-        // Pump.fun program expects the user's ATA ("associated_user") to be initialized.
-        // Without this, simulation fails with AnchorError AccountNotInitialized (3012).
-        // We prepend an idempotent ATA creation instruction; it's safe if ATA already exists.
-        let create_ata_ix_prog =
-            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                &user_spl, // payer
-                &user_spl, // owner
-                &token_mint_spl,
-                &token_program_spl,
-            );
-        let create_ata_ix = prog_ix_to_sdk(create_ata_ix_prog);
-
-        Ok(vec![create_ata_ix, ix])
+        // For BUY: Create ATA for receiving tokens (may not exist yet)
+        // For SELL: Token ATA already exists (we own the tokens), no create needed
+        //
+        // The ATA create instruction uses GetAccountDataSize which requires the correct
+        // token program. For Token-2022, using spl_token::id() causes IncorrectProgramId.
+        // By skipping ATA create for SELL, we avoid this issue entirely.
+        if buy_token {
+            // BUY: Prepend idempotent ATA creation - user may not have token ATA yet
+            let create_ata_ix_prog =
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &user_spl, // payer
+                    &user_spl, // owner
+                    &token_mint_spl,
+                    &token_program_spl,
+                );
+            let create_ata_ix = prog_ix_to_sdk(create_ata_ix_prog);
+            Ok(vec![create_ata_ix, ix])
+        } else {
+            // SELL: Token ATA must exist (we're selling tokens we own)
+            // SOL is received directly via system transfer, no WSOL ATA needed for BC
+            Ok(vec![ix])
+        }
     }
 }
 

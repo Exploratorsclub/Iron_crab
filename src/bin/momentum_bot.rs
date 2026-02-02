@@ -6051,6 +6051,24 @@ async fn generate_and_publish_exit_intent(
         _ => "EXIT_UNKNOWN",
     };
 
+    // Get token_program from mint_infos for Token-2022 support on SELL
+    // This is critical for pump.fun tokens which use Token-2022
+    let token_program_for_sell = {
+        let mint_infos = ctx.mint_infos.read();
+        mint_infos
+            .get(mint)
+            .map(|info| info.token_program.clone())
+            .filter(|tp| !tp.is_empty())
+    };
+
+    if token_program_for_sell.is_some() {
+        debug!(
+            mint = %mint,
+            token_program = ?token_program_for_sell,
+            "SELL intent: using cached token_program for Token-2022 support"
+        );
+    }
+
     let mut intent = TradeIntent::new(
         "momentum-bot",
         BUILD_VERSION,
@@ -6065,7 +6083,7 @@ async fn generate_and_publish_exit_intent(
             output_mint: sol_mint.to_string(), // Receiving SOL
             pools: vec![pool.to_string()],
             accounts: pool_accounts, // Already validated from find_best_sell_pool
-            token_program: None,     // Momentum-bot doesn't need Token-2022 support yet
+            token_program: token_program_for_sell, // Token-2022 support for SELL
         },
         0, // No expected ROI for exits
         max_slippage,
