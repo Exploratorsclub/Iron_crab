@@ -222,6 +222,10 @@ struct MarketDataContext {
     /// because dropping it would close the Receiver used by the merge task.
     #[allow(dead_code)]
     tracked_wallet_tx: watch::Sender<Vec<Pubkey>>,
+    /// Token ATA accounts for the tracked wallet (Geyser subscription list).
+    tracked_wallet_token_accounts: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+    /// Cached mint decimals for tracked wallet tokens.
+    tracked_wallet_mint_decimals: parking_lot::RwLock<std::collections::HashMap<Pubkey, u8>>,
 }
 
 /// Tracked wallet info for WsolManager balance updates
@@ -503,6 +507,7 @@ async fn publish_wallet_snapshot(
     let mut total_accounts = 0usize;
     let mut non_zero_accounts = 0usize;
     let mut mint_decimals_cache: HashMap<Pubkey, u8> = HashMap::new();
+    let mut wallet_token_accounts: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
 
     let wallet_str = wallet.to_string();
 
@@ -526,6 +531,15 @@ async fn publish_wallet_snapshot(
         total_accounts += accounts.len();
 
         for account in accounts {
+            // NOTE: We add to wallet_token_accounts AFTER successful parsing to ensure
+            // decimals are cached. Adding before parsing caused accounts with parsing
+            // errors or zero balances to be subscribed via Geyser without cached decimals,
+            // leading to incorrect default of 6 decimals later.
+            let account_pubkey = match Pubkey::from_str(&account.pubkey) {
+                Ok(pk) => pk,
+                Err(_) => continue,
+            };
+
             let (mint, balance_raw, decimals) = match &account.account.data {
                 UiAccountData::Json(parsed) => {
                     let serde_json::Value::Object(root) = &parsed.parsed else {
@@ -620,7 +634,14 @@ async fn publish_wallet_snapshot(
                 }
             };
 
-            // Skip zero balances and SOL/WSOL
+            // Always cache decimals and track the account, even for zero balances.
+            // This ensures Geyser updates have correct decimals when balance changes.
+            ctx.tracked_wallet_mint_decimals
+                .write()
+                .insert(mint, decimals);
+            wallet_token_accounts.insert(account_pubkey);
+
+            // Skip zero balances and SOL/WSOL for event publishing
             if balance_raw == 0 || mint == sol_mint {
                 continue;
             }
@@ -676,6 +697,18 @@ async fn publish_wallet_snapshot(
         non_zero_accounts = non_zero_accounts,
         "✅ Wallet snapshot published for position reconciliation"
     );
+
+    // Update tracked wallet token accounts for Geyser subscription
+    if let Some(ref tracked_wallet) = ctx.tracked_wallet {
+        let mut accounts: Vec<Pubkey> = Vec::with_capacity(wallet_token_accounts.len() + 2);
+        accounts.push(tracked_wallet.wallet);
+        accounts.push(tracked_wallet.wsol_ata);
+        accounts.extend(wallet_token_accounts.iter().copied());
+        accounts.sort();
+        accounts.dedup();
+        let _ = ctx.tracked_wallet_tx.send(accounts);
+        *ctx.tracked_wallet_token_accounts.write() = wallet_token_accounts;
+    }
 
     if total_accounts == 0 {
         warn!(
@@ -885,6 +918,8 @@ async fn main() -> Result<()> {
         pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_wallet,
         tracked_wallet_tx,
+        tracked_wallet_token_accounts: parking_lot::RwLock::new(std::collections::HashSet::new()),
+        tracked_wallet_mint_decimals: parking_lot::RwLock::new(std::collections::HashMap::new()),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -1176,6 +1211,10 @@ async fn run_geyser_loop(
                 if let Some(ref tracked_wallet) = ctx.tracked_wallet {
                     let is_wallet_account = account_update.pubkey == tracked_wallet.wallet;
                     let is_wsol_ata = account_update.pubkey == tracked_wallet.wsol_ata;
+                    let is_token_ata = ctx
+                        .tracked_wallet_token_accounts
+                        .read()
+                        .contains(&account_update.pubkey);
 
                     if is_wallet_account || is_wsol_ata {
                         // Parse balance based on account type
@@ -1227,6 +1266,82 @@ async fn run_geyser_loop(
                                     NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
+                        }
+                    } else if is_token_ata
+                        && (account_update.owner.to_bytes() == spl_token::ID.to_bytes()
+                            || account_update.owner.to_bytes()
+                                == spl_token_2022::ID.to_bytes())
+                    {
+                        let (mint, balance_raw) = if account_update.owner.to_bytes()
+                            == spl_token::ID.to_bytes()
+                        {
+                            match spl_token::state::Account::unpack(&account_update.data) {
+                                Ok(acc) => (Pubkey::new_from_array(acc.mint.to_bytes()), acc.amount),
+                                Err(_) => continue,
+                            }
+                        } else {
+                            match spl_token_2022::state::Account::unpack(&account_update.data) {
+                                Ok(acc) => (Pubkey::new_from_array(acc.mint.to_bytes()), acc.amount),
+                                Err(_) => continue,
+                            }
+                        };
+
+                        let decimals = ctx
+                            .tracked_wallet_mint_decimals
+                            .read()
+                            .get(&mint)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                // This should only happen for accounts created after initial scan.
+                                // Log a warning so we can track if this becomes a problem.
+                                warn!(
+                                    mint = %mint,
+                                    account = %account_update.pubkey,
+                                    "Decimals not cached for token account, using default 6"
+                                );
+                                6
+                            });
+
+                        let mint_str = mint.to_string();
+                        let event = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            ctx.next_event_id(),
+                            "geyser_wallet_update",
+                            Some(account_update.slot),
+                            MarketEventKind::WalletBalanceSnapshot {
+                                mint: mint_str.clone(),
+                                balance_raw,
+                                decimals,
+                                token_program: account_update.owner.to_string(),
+                            },
+                        );
+
+                        if let Some(ref nats) = ctx.nats {
+                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
+                                warn!(error = %e, mint = %mint_str, "Failed to publish WalletBalanceSnapshot");
+                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let subject = wallet_snapshot_subject(
+                                &tracked_wallet.wallet.to_string(),
+                                &mint_str,
+                            );
+                            if let Err(e) = nats.jetstream_publish(&subject, &event).await {
+                                warn!(
+                                    error = %e,
+                                    mint = %mint_str,
+                                    "Failed to publish WalletBalanceSnapshot to JetStream"
+                                );
+                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+
+                        if let Err(e) = ctx.jsonl_writer.write(&event) {
+                            warn!(error = %e, "Failed to write WalletBalanceSnapshot to JSONL");
                         }
                     }
                 }
