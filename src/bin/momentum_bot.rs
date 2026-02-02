@@ -40,7 +40,7 @@ use ironcrab::ipc::{
     TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    serve_metrics, FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY,
+    serve_metrics, EXITS_GENERATED_TOTAL, FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY,
     FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_INFLOW, FILTER_REJECTED_LIQUIDITY,
     FILTER_REJECTED_TOTAL, FILTER_REJECTED_VELOCITY, INTENTS_GENERATED_TOTAL,
     MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
@@ -4732,6 +4732,7 @@ async fn main() -> Result<()> {
                 POOLS_TRACKED_GAUGE.store(pools as u64, Ordering::Relaxed);
                 TOKENS_TRACKED_GAUGE.store(tokens_tracked, Ordering::Relaxed);
                 INTENTS_GENERATED_TOTAL.store(intents_generated, Ordering::Relaxed);
+                EXITS_GENERATED_TOTAL.store(exits_generated, Ordering::Relaxed);
 
                 info!(
                     events_received = events_received,

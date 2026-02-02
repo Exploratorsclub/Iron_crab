@@ -143,24 +143,40 @@
     },
     {
       "type": "stat",
-      "title": "Intents Generated",
-      "description": "TradeIntents published to NATS",
+      "title": "Total Intents",
+      "description": "All TradeIntents published (BUY + SELL)",
+      "targets": [{ "expr": "intents_generated_total{job=\"ironcrab-momentum-bot\"} + exits_generated_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
+      "gridPos": {"h":4,"w":2,"x":8,"y":15},
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } } }
+    },
+    {
+      "type": "stat",
+      "title": "BUY Intents",
+      "description": "Entry/BUY intents generated",
       "targets": [{ "expr": "intents_generated_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":8,"y":15},
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "yellow", "value": null }, { "color": "green", "value": 1 }] } } }
+      "gridPos": {"h":4,"w":2,"x":10,"y":15},
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } }
+    },
+    {
+      "type": "stat",
+      "title": "SELL Intents",
+      "description": "Exit/SELL intents generated",
+      "targets": [{ "expr": "exits_generated_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
+      "gridPos": {"h":4,"w":2,"x":12,"y":15},
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "orange" } } }
     },
     {
       "type": "stat",
       "title": "4-Filter Passed",
       "targets": [{ "expr": "filter_passed_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":3,"x":12,"y":15},
+      "gridPos": {"h":4,"w":2,"x":14,"y":15},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } }
     },
     {
       "type": "stat",
       "title": "4-Filter Rejected",
       "targets": [{ "expr": "filter_rejected_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":3,"x":15,"y":15},
+      "gridPos": {"h":4,"w":2,"x":16,"y":15},
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "red" } } }
     },
     {
@@ -174,8 +190,11 @@
     {
       "type": "timeseries",
       "title": "Intent Generation Rate",
-      "description": "Rate of TradeIntents generated per minute",
-      "targets": [{ "expr": "rate(intents_generated_total{job=\"ironcrab-momentum-bot\"}[5m]) * 60", "refId": "A", "legendFormat": "intents/min" }],
+      "description": "Rate of TradeIntents generated per minute (BUY + SELL)",
+      "targets": [
+        { "expr": "rate(intents_generated_total{job=\"ironcrab-momentum-bot\"}[5m]) * 60", "refId": "A", "legendFormat": "BUY/min" },
+        { "expr": "rate(exits_generated_total{job=\"ironcrab-momentum-bot\"}[5m]) * 60", "refId": "B", "legendFormat": "SELL/min" }
+      ],
       "gridPos": {"h":4,"w":18,"x":0,"y":19},
       "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "palette-classic" } } }
     },
