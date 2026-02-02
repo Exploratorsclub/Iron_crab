@@ -787,7 +787,17 @@ pub async fn build_tx_plan(
             let token_mint = Pubkey::from_str(&intent.resources.output_mint).unwrap_or_default();
             let token_mint_spl = SplProgramPubkey::new_from_array(token_mint.to_bytes());
             let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
-            let token_program_spl = spl_token::id();
+
+            // Use token_program from intent if provided, otherwise default to SPL Token.
+            // Token-2022 tokens MUST have token_program set in TradeResources.
+            let token_program_spl = intent
+                .resources
+                .token_program
+                .as_ref()
+                .and_then(|tp| Pubkey::from_str(tp).ok())
+                .map(|pk| SplProgramPubkey::new_from_array(pk.to_bytes()))
+                .unwrap_or_else(spl_token::id);
+
             let token_ata_ix = prog_ix_to_sdk(
                 spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                     &payer_spl,
