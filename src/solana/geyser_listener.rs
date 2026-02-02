@@ -48,6 +48,8 @@ pub struct TokenBalance {
     pub account_index: u8,
     pub mint: String,
     pub ui_token_amount: TokenAmount,
+    /// Token program ID (SPL Token or Token-2022) - authoritative source for token type
+    pub program_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -527,6 +529,12 @@ impl GeyserListener {
                                                         decimals: ui_amount.decimals as u8,
                                                         amount: ui_amount.amount.clone(),
                                                     },
+                                                    // Extract program_id (SPL Token or Token-2022)
+                                                    program_id: if balance.program_id.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(balance.program_id.clone())
+                                                    },
                                                 });
                                             }
                                         }
@@ -540,6 +548,12 @@ impl GeyserListener {
                                                         ui_amount: Some(ui_amount.ui_amount),
                                                         decimals: ui_amount.decimals as u8,
                                                         amount: ui_amount.amount.clone(),
+                                                    },
+                                                    // Extract program_id (SPL Token or Token-2022)
+                                                    program_id: if balance.program_id.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(balance.program_id.clone())
                                                     },
                                                 });
                                             }

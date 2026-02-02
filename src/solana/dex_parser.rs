@@ -568,7 +568,20 @@ fn parse_orca_transaction(
                     .and_then(|b| Pubkey::from_str(&b.mint).ok())
                     .unwrap_or_default()
             };
-            (base_mint, sol_mint, !a_to_b, None, None)
+            // Fallback: Extract token_program from post_token_balances
+            let spl_token_str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+            let token_2022_str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+            let fallback_token_program = update
+                .post_token_balances
+                .iter()
+                .find(|b| Pubkey::from_str(&b.mint).ok() == Some(base_mint))
+                .and_then(|b| b.program_id.as_ref())
+                .and_then(|p| Pubkey::from_str(p).ok())
+                .filter(|tp| {
+                    let tp_str = tp.to_string();
+                    tp_str == spl_token_str || tp_str == token_2022_str
+                });
+            (base_mint, sol_mint, !a_to_b, fallback_token_program, None)
         };
 
     // Calculate actual amounts from token balance changes
@@ -841,25 +854,36 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
     // 3. On-chain bonding curve state (if cache miss)
     let creator: Option<Pubkey> = None;
 
-    // Extract Token Program from instruction accounts[8].
+    // Extract Token Program from post_token_balances (authoritative source).
+    // This is more reliable than instruction_accounts position which can vary
+    // depending on CPI calls, routing changes, or program updates.
     // PumpFun now supports both SPL Token AND Token-2022 mints.
-    // This is critical for deterministic ATA creation without RPC lookup.
-    // VALIDATE: Only accept known token programs to avoid caching wrong accounts.
-    let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").ok();
-    let token_2022 = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").ok();
+    let spl_token_str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    let token_2022_str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
     let token_program = update
-        .instruction_accounts
-        .get(8)
-        .copied()
-        .filter(|tp| spl_token.as_ref() == Some(tp) || token_2022.as_ref() == Some(tp));
+        .post_token_balances
+        .iter()
+        .find(|b| Pubkey::from_str(&b.mint).ok() == Some(mint))
+        .and_then(|b| b.program_id.as_ref())
+        .and_then(|p| Pubkey::from_str(p).ok())
+        .filter(|tp| {
+            let tp_str = tp.to_string();
+            tp_str == spl_token_str || tp_str == token_2022_str
+        });
 
     if let Some(ref tp) = token_program {
         debug!(
             mint = %mint,
             token_program = %tp,
             sig = %update.signature,
-            "PumpFun swap: extracted token_program from instruction"
+            "PumpFun swap: extracted token_program from post_token_balances"
+        );
+    } else {
+        debug!(
+            mint = %mint,
+            sig = %update.signature,
+            "PumpFun swap: no token_program in post_token_balances (fallback to None)"
         );
     }
 
@@ -1021,6 +1045,21 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
 
     let token_decimals = get_token_decimals(&update.post_token_balances, &base_mint);
 
+    // Extract Token Program from post_token_balances (authoritative source)
+    let spl_token_str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    let token_2022_str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+    let token_program = update
+        .post_token_balances
+        .iter()
+        .find(|b| Pubkey::from_str(&b.mint).ok() == Some(base_mint))
+        .and_then(|b| b.program_id.as_ref())
+        .and_then(|p| Pubkey::from_str(p).ok())
+        .filter(|tp| {
+            let tp_str = tp.to_string();
+            tp_str == spl_token_str || tp_str == token_2022_str
+        });
+
     Some(ParsedDexEvent::Trade {
         pool_address: pool_market,
         mint: base_mint,
@@ -1035,7 +1074,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
         slot: update.slot,
         pool_accounts: Some(pool_accounts),
         creator: None, // PumpSwap uses coin_creator_vault_authority from pool_accounts[10]
-        token_program: None, // TODO: Extract from PumpSwap instruction if needed
+        token_program,
     })
 }
 
