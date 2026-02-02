@@ -1678,7 +1678,7 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
         &ctx.run_id,
         ctx.next_intent_id(),
         "arb-strategy",
-        IntentTier::Tier1,
+        IntentTier::Arb, // Arbitrage: P75 × 1.3 fee (between Tier0 and Tier1)
         IntentOrigin::StrategyA, // Typ A - market-driven
         ExplicitAmount::new(opp.trade_amount_lamports, 9),
         resources,

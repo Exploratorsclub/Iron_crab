@@ -1117,30 +1117,41 @@ impl ExecutionContext {
         self.kill_switch_context.read().clone()
     }
 
-    /// Get priority fee for an intent using dynamic percentiles if available, else static config.
+    /// Get priority fee for an intent using dynamic percentiles with static config as floor.
     ///
     /// P2: Dynamic Priority Fee Usage
     /// - If market-data is publishing percentiles via NATS, use tier-specific recommended fee
-    /// - Otherwise fall back to static config from FeePolicy
+    /// - Always use static config (fee_policy) as minimum floor to ensure configured fees
+    ///   (especially liquidation_priority_fee) are respected even when network fees are low
+    /// - This prevents time-critical operations (liquidation, exits) from using fees that
+    ///   are too low to land on-chain during normal network conditions
     fn get_priority_fee_for_intent(&self, intent: &TradeIntent, fee_policy: &FeePolicy) -> u64 {
+        // Static fee from config serves as the floor (minimum guaranteed fee)
+        let static_fee = fee_policy.priority_fee_for_intent(intent);
+
         if let Some(ref percentiles) = *self.dynamic_fee_percentiles.read() {
             let dynamic_fee = match intent.tier {
                 IntentTier::Tier0 => percentiles.tier0_recommended,
                 IntentTier::Tier1 => percentiles.tier1_recommended,
                 IntentTier::Arb => percentiles.arb_recommended,
             };
+
+            // Use maximum of dynamic and static fee to ensure config is respected as floor
+            let effective_fee = dynamic_fee.max(static_fee);
+
             tracing::debug!(
                 intent_id = %intent.intent_id,
                 tier = ?intent.tier,
                 dynamic_fee_micro_lamports = dynamic_fee,
+                static_fee_micro_lamports = static_fee,
+                effective_fee_micro_lamports = effective_fee,
                 p50 = percentiles.p50,
                 p90 = percentiles.p90,
                 sample_count = percentiles.sample_count,
-                "Using DYNAMIC priority fee from Geyser percentiles"
+                "Priority fee: max(dynamic, static) - static config as floor"
             );
-            dynamic_fee
+            effective_fee
         } else {
-            let static_fee = fee_policy.priority_fee_for_intent(intent);
             tracing::debug!(
                 intent_id = %intent.intent_id,
                 tier = ?intent.tier,

@@ -535,7 +535,7 @@ impl MultiHopArbitrage {
             header: RecordHeader::new(component, build, run_id),
             intent_id,
             source: "arb-strategy".to_string(),
-            tier: IntentTier::Tier0,
+            tier: IntentTier::Arb, // Arbitrage: P75 × 1.3 fee (between Tier0 and Tier1)
             origin_type: IntentOrigin::StrategyA,
             deadline_slot: None,
             ttl_ms: Some(1000),
