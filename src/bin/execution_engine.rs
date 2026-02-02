@@ -6721,7 +6721,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 (None, None, FillStatus::Unavailable, None, None)
             };
 
-        let (mint, action, amount_tokens, price_sol) = match intent.side {
+        let (mint, action, amount_tokens, value_sol) = match intent.side {
             TradeSide::Buy => {
                 let sol_ui_fallback = intent.required_capital.as_f64();
                 let sol_ui = fill_in
@@ -6758,7 +6758,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             action,
             tx_hash,
             amount_tokens,
-            price_sol,
+            value_sol,
             pnl_sol: None,
             pnl_pct: None,
             latency_ms: None,

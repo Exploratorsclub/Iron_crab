@@ -15,7 +15,8 @@ pub struct RecentTrade {
     pub action: String, // "BUY" or "SELL"
     pub tx_hash: String,
     pub amount_tokens: f64,
-    pub price_sol: f64,
+    #[serde(alias = "price_sol")]
+    pub value_sol: f64,
     pub pnl_sol: Option<f64>,    // Only for SELL
     pub pnl_pct: Option<f64>,    // Only for SELL
     pub latency_ms: Option<u64>, // Discovery to TX landed
@@ -169,7 +170,7 @@ fn parse_csv_line(line: &str) -> Option<RecentTrade> {
 
     // For BUY/FILL: lamports_in is spent, tokens_out received (use expected as fallback)
     // For SELL: tokens_in sold, lamports_out received
-    let (amount_tokens, price_sol) = if action == "BUY" || action == "FILL" {
+    let (amount_tokens, value_sol) = if action == "BUY" || action == "FILL" {
         let tokens = if tokens_out > 0.0 {
             tokens_out
         } else {
@@ -198,7 +199,7 @@ fn parse_csv_line(line: &str) -> Option<RecentTrade> {
         action,
         tx_hash,
         amount_tokens,
-        price_sol,
+        value_sol,
         pnl_sol,
         pnl_pct: None, // Not stored in CSV
         latency_ms: None,
