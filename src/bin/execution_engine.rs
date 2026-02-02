@@ -4208,6 +4208,79 @@ async fn main() -> Result<()> {
         debug!("WsolManager not started (no Treasury)");
     }
 
+    // === WalletBalanceUpdate Listener: Keep LockManager in sync with wallet balances ===
+    // This ensures the dashboard shows correct "Available SOL" (actually WSOL) after wraps
+    if let Some(ref treasury) = ctx.treasury {
+        use ironcrab::nats::wallet_balance_topic;
+
+        let wallet_pubkey = treasury.pubkey();
+        let topic = wallet_balance_topic(&wallet_pubkey.to_string());
+        let ctx_for_balance = Arc::clone(&ctx);
+        let nats_url = args.nats_url.clone();
+        let shutdown_rx_balance = shutdown_rx.clone();
+
+        tokio::spawn(async move {
+            use ironcrab::execution::wsol_manager::WalletBalanceUpdate;
+            // Create dedicated NATS client for balance updates
+            let nats_config = NatsConfig::new(&nats_url, "balance-updater");
+            let mut nats_client = NatsClient::new(nats_config);
+
+            if let Err(e) = nats_client.connect().await {
+                warn!(error = %e, "Balance updater failed to connect to NATS");
+                return;
+            }
+
+            let mut subscription = match nats_client.subscribe(&topic).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!(error = %e, topic = %topic, "Failed to subscribe to wallet balance updates");
+                    return;
+                }
+            };
+
+            info!(topic = %topic, "LockManager balance updater subscribed to wallet balance events");
+
+            let mut shutdown = shutdown_rx_balance;
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            info!("Balance updater shutting down");
+                            break;
+                        }
+                    }
+                    msg = subscription.next() => {
+                        if let Some(msg) = msg {
+                            match serde_json::from_slice::<WalletBalanceUpdate>(&msg.payload) {
+                                Ok(update) => {
+                                    // Update LockManager with new balances
+                                    ctx_for_balance.lock_manager.update_wallet_balances(
+                                        update.sol_lamports,
+                                        update.wsol_lamports,
+                                    );
+                                    debug!(
+                                        sol = update.sol_lamports,
+                                        wsol = ?update.wsol_lamports,
+                                        slot = update.slot,
+                                        "LockManager updated from WalletBalanceUpdate"
+                                    );
+                                }
+                                Err(e) => {
+                                    debug!(error = %e, "Failed to parse WalletBalanceUpdate");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        info!(
+            wallet = %treasury.pubkey(),
+            "LockManager balance updater background task started"
+        );
+    }
+
     // === AccountJanitor: Background cleanup of empty ATAs and dust ===
     if let Some(ref treasury) = ctx.treasury {
         use ironcrab::execution::account_janitor::{AccountJanitor, AccountJanitorConfig};
@@ -4823,7 +4896,9 @@ async fn main() -> Result<()> {
                     let received = ctx.intents_received.load(std::sync::atomic::Ordering::Relaxed);
                     let rejected = ctx.intents_rejected.load(std::sync::atomic::Ordering::Relaxed);
                     let sim_fail = ctx.sim_failures.load(std::sync::atomic::Ordering::Relaxed);
-                    let available_sol = ctx.lock_manager.available_sol();
+                    // Use available_trading_capital() which returns WSOL (used for trades)
+                    // Falls back to native SOL if WSOL not yet initialized
+                    let available_capital = ctx.lock_manager.available_trading_capital();
 
                     // Update Prometheus metrics
                     INTENTS_RECEIVED_TOTAL.store(received, Ordering::Relaxed);
@@ -4832,7 +4907,7 @@ async fn main() -> Result<()> {
                     OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
                     ACTIVE_CAPITAL_LOCKS.store(cap_locks as u64, Ordering::Relaxed);
                     ACTIVE_RESOURCE_LOCKS.store(res_locks as u64, Ordering::Relaxed);
-                    AVAILABLE_SOL_LAMPORTS.store(available_sol, Ordering::Relaxed);
+                    AVAILABLE_SOL_LAMPORTS.store(available_capital, Ordering::Relaxed);
 
                     info!(
                         tick = simulated_tick,
@@ -4841,7 +4916,8 @@ async fn main() -> Result<()> {
                         sim_failures = sim_fail,
                         active_capital_locks = cap_locks,
                         active_resource_locks = res_locks,
-                        available_sol = available_sol,
+                        available_wsol = available_capital,
+                        native_sol = ctx.lock_manager.available_sol(),
                         "Execution-engine heartbeat"
                     );
                 }

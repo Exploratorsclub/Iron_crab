@@ -297,8 +297,11 @@ pub struct FairnessStats {
 
 /// Global lock manager for the execution engine
 pub struct LockManager {
-    /// Available capital (not locked)
+    /// Available native SOL capital (not locked) - used for gas fees
     available_sol: RwLock<u64>,
+    /// Available WSOL capital (not locked) - used for trades (BUY side)
+    /// This is what the dashboard should display as "Available SOL"
+    available_wsol: RwLock<u64>,
     available_tokens: RwLock<HashMap<String, u64>>,
 
     /// Active capital locks
@@ -321,6 +324,7 @@ impl LockManager {
     pub fn new(initial_sol: u64) -> Self {
         Self {
             available_sol: RwLock::new(initial_sol),
+            available_wsol: RwLock::new(0), // Will be updated by WalletBalanceUpdate events
             available_tokens: RwLock::new(HashMap::new()),
             capital_locks: RwLock::new(HashMap::new()),
             resource_locks: RwLock::new(HashMap::new()),
@@ -365,6 +369,45 @@ impl LockManager {
             .write()
             .entry(mint)
             .or_insert(amount_raw);
+    }
+
+    /// Update wallet balances from WalletBalanceUpdate event (SOL + WSOL).
+    ///
+    /// This is called when market-data publishes balance updates via NATS.
+    /// - `sol_lamports`: Native SOL balance (for gas fees)
+    /// - `wsol_lamports`: WSOL ATA balance (for trades)
+    ///
+    /// The dashboard "Available SOL" metric should show WSOL, as that's what
+    /// is actually used for BUY trades (no in-TX wrapping).
+    pub fn update_wallet_balances(&self, sol_lamports: u64, wsol_lamports: Option<u64>) {
+        *self.available_sol.write() = sol_lamports;
+        if let Some(wsol) = wsol_lamports {
+            *self.available_wsol.write() = wsol;
+        }
+        tracing::debug!(
+            sol = sol_lamports,
+            wsol = ?wsol_lamports,
+            "LockManager wallet balances updated"
+        );
+    }
+
+    /// Get current available WSOL (for trades/dashboard)
+    pub fn available_wsol(&self) -> u64 {
+        *self.available_wsol.read()
+    }
+
+    /// Get total available capital for trading (WSOL for trades, SOL as backup)
+    ///
+    /// Returns WSOL if available, otherwise falls back to SOL.
+    /// This is what should be displayed in the dashboard and used for capital lock checks.
+    pub fn available_trading_capital(&self) -> u64 {
+        let wsol = *self.available_wsol.read();
+        if wsol > 0 {
+            wsol
+        } else {
+            // Fallback to SOL if WSOL not yet initialized
+            *self.available_sol.read()
+        }
     }
 
     /// Check if an intent has already been processed (idempotency)

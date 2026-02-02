@@ -557,11 +557,25 @@ impl WsolManager {
             return Ok(());
         }
 
-        // Check if wrap already in progress (prevents double-wrap race condition)
-        if self.wrap_in_progress.load(Ordering::Relaxed) {
-            debug!("Wrap already in progress, skipping");
+        // Atomically try to acquire wrap lock (prevents double-wrap race condition)
+        // compare_exchange ensures only one caller succeeds even with concurrent calls
+        if self
+            .wrap_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            debug!("Wrap already in progress (atomic check), skipping");
             return Ok(());
         }
+
+        // RAII guard to ensure wrap_in_progress is always cleared
+        struct WrapGuard<'a>(&'a AtomicBool);
+        impl Drop for WrapGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = WrapGuard(&self.wrap_in_progress);
 
         // Check if wrap needed
         if wsol < min {
@@ -569,34 +583,20 @@ impl WsolManager {
             let available_sol = sol.saturating_sub(min_native);
 
             if available_sol >= wrap_amount {
-                // Set wrap_in_progress BEFORE async operation to prevent race condition
-                self.wrap_in_progress.store(true, Ordering::Relaxed);
-
                 info!(
                     wsol_current = wsol as f64 / LAMPORTS_PER_SOL as f64,
                     wsol_min = min as f64 / LAMPORTS_PER_SOL as f64,
                     wrap_amount = wrap_amount as f64 / LAMPORTS_PER_SOL as f64,
                     "WSOL below minimum, wrapping"
                 );
-                let result = self.execute_wrap(wrap_amount).await;
-
-                // Clear wrap_in_progress after operation completes
-                self.wrap_in_progress.store(false, Ordering::Relaxed);
-                result?;
+                self.execute_wrap(wrap_amount).await?;
             } else if available_sol > 0 {
-                // Set wrap_in_progress BEFORE async operation
-                self.wrap_in_progress.store(true, Ordering::Relaxed);
-
                 // Wrap what we can
                 info!(
                     available = available_sol as f64 / LAMPORTS_PER_SOL as f64,
                     "Wrapping available SOL (less than ideal)"
                 );
-                let result = self.execute_wrap(available_sol).await;
-
-                // Clear wrap_in_progress after operation completes
-                self.wrap_in_progress.store(false, Ordering::Relaxed);
-                result?;
+                self.execute_wrap(available_sol).await?;
             } else {
                 warn!(
                     sol = sol as f64 / LAMPORTS_PER_SOL as f64,
