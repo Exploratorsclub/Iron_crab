@@ -5097,6 +5097,14 @@ async fn generate_and_publish_buy_intent(
         intent.metadata.insert("creator".to_string(), creator);
     }
 
+    // Include current open positions count for execution-engine risk check.
+    // execution-engine uses this instead of tracking positions itself (Single Source of Truth).
+    let current_open_positions = ctx.positions.read().len();
+    intent.metadata.insert(
+        "current_open_positions".to_string(),
+        current_open_positions.to_string(),
+    );
+
     // Register pending intent BEFORE publishing
     ctx.register_buy_intent(
         &intent_id,
@@ -6143,6 +6151,14 @@ async fn generate_and_publish_exit_intent(
         })?;
         intent.metadata.insert("creator".to_string(), creator);
     }
+
+    // Include current open positions count for execution-engine risk check.
+    // execution-engine uses this instead of tracking positions itself (Single Source of Truth).
+    let current_open_positions = ctx.positions.read().len();
+    intent.metadata.insert(
+        "current_open_positions".to_string(),
+        current_open_positions.to_string(),
+    );
 
     // Register pending intent BEFORE publishing
     ctx.register_sell_intent(&intent_id, mint, &pool, &dex, token_amount);

@@ -4362,23 +4362,34 @@ async fn main() -> Result<()> {
                         .map(|h| h.get_all_dexes().len())
                         .unwrap_or(0)
                 );
-                AccountJanitor::with_router_and_jsonl(
+                let mut janitor = AccountJanitor::with_router_and_jsonl(
                     janitor_config.clone(),
                     Arc::new(treasury.clone()),
                     Arc::clone(&ctx.rpc),
                     router,
                     Arc::clone(&janitor_writer),
                     run_id.clone(),
-                )
+                );
+                // Configure NATS for position blacklist (prevents selling momentum positions as dust)
+                if let Some(ref nats) = ctx.nats {
+                    janitor = janitor.with_nats_client(nats.client().clone());
+                    info!("AccountJanitor: NATS configured for momentum position blacklist");
+                }
+                janitor
             } else {
                 warn!("AccountJanitor: No Router available, swap_dust disabled");
-                AccountJanitor::with_jsonl_writer(
+                let mut janitor = AccountJanitor::with_jsonl_writer(
                     janitor_config.clone(),
                     Arc::new(treasury.clone()),
                     Arc::clone(&ctx.rpc),
                     Arc::clone(&janitor_writer),
                     run_id.clone(),
-                )
+                );
+                // Configure NATS even without Router (for future features)
+                if let Some(ref nats) = ctx.nats {
+                    janitor = janitor.with_nats_client(nats.client().clone());
+                }
+                janitor
             };
             let shutdown_rx_janitor = shutdown_rx.clone();
 
@@ -5195,8 +5206,15 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     }
 
     // Check 3c: Max open positions (applies to BUY only; SELL exits should remain possible)
+    // Position count comes from strategy (momentum-bot) via intent metadata.
+    // execution-engine does NOT track positions itself - momentum-bot is Single Source of Truth.
     if intent.side == TradeSide::Buy {
-        let current_positions = ctx.get_open_positions();
+        let current_positions = intent
+            .metadata
+            .get("current_open_positions")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+
         if current_positions >= config.max_open_positions {
             let reason = RejectReason::RiskMaxOpenPositions;
             checks.push(CheckResult {
@@ -5204,7 +5222,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 passed: false,
                 reason_code: Some(reason.to_string()),
                 details: Some(format!(
-                    "current={} >= max={}",
+                    "current={} >= max={} (from intent metadata)",
                     current_positions, config.max_open_positions
                 )),
             });
@@ -5214,7 +5232,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             check_name: "max_open_positions".to_string(),
             passed: true,
             reason_code: None,
-            details: Some("current < max (buy_only)".to_string()),
+            details: Some(format!(
+                "current={} < max={} (from intent metadata)",
+                current_positions, config.max_open_positions
+            )),
         });
     } else {
         checks.push(CheckResult {
@@ -6609,11 +6630,22 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // Dashboard alignment: count executions only when we have a confirmed on-chain outcome.
     if matches!(decision.outcome, DecisionOutcome::Confirmed) {
         INTENTS_EXECUTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        match intent.side {
-            TradeSide::Buy => ctx.increment_open_positions(),
-            TradeSide::Sell => ctx.decrement_open_positions(),
-        }
-        OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
+
+        // NOTE: execution-engine does NOT track positions itself.
+        // momentum-bot is the Single Source of Truth for positions.
+        // Update dashboard gauge from intent metadata (best-effort approximation).
+        // For BUY: positions will be current+1 after this trade.
+        // For SELL: positions will be current-1 after this trade.
+        let current_positions = intent
+            .metadata
+            .get("current_open_positions")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let estimated_after = match intent.side {
+            TradeSide::Buy => current_positions.saturating_add(1),
+            TradeSide::Sell => current_positions.saturating_sub(1),
+        };
+        OPEN_POSITIONS_GAUGE.store(estimated_after, Ordering::Relaxed);
 
         // Best-effort recent trade record for Grafana (/trades via Infinity datasource).
         // NOTE: If fill accounting is available, use it; otherwise fall back to placeholders.

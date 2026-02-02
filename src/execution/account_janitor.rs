@@ -29,6 +29,7 @@ use crate::solana::dex::router::Router;
 use crate::solana::rpc::SolanaRpc;
 use crate::storage::JsonlWriter;
 use crate::wallet::Treasury;
+use std::collections::HashSet;
 
 // ============================================================================
 // Configuration
@@ -207,6 +208,9 @@ pub struct AccountJanitor {
     wallet_pubkey: Pubkey,
     run_id: String,
     jsonl_writer: Option<Arc<JsonlWriter>>,
+    /// Optional NATS client for querying momentum-bot's POSITIONS KV store.
+    /// Used to blacklist active positions from dust swap (prevent accidental sell).
+    nats_client: Option<async_nats::Client>,
 }
 
 impl AccountJanitor {
@@ -226,6 +230,7 @@ impl AccountJanitor {
             wallet_pubkey,
             run_id,
             jsonl_writer: None,
+            nats_client: None,
         }
     }
 
@@ -246,6 +251,7 @@ impl AccountJanitor {
             wallet_pubkey,
             run_id,
             jsonl_writer: Some(jsonl_writer),
+            nats_client: None,
         }
     }
 
@@ -266,6 +272,7 @@ impl AccountJanitor {
             wallet_pubkey,
             run_id,
             jsonl_writer: None,
+            nats_client: None,
         }
     }
 
@@ -287,7 +294,67 @@ impl AccountJanitor {
             wallet_pubkey,
             run_id,
             jsonl_writer: Some(jsonl_writer),
+            nats_client: None,
         }
+    }
+
+    /// Set NATS client for querying momentum-bot's POSITIONS KV store.
+    /// This enables blacklisting active positions from dust swap.
+    pub fn with_nats_client(mut self, client: async_nats::Client) -> Self {
+        self.nats_client = Some(client);
+        self
+    }
+
+    /// Query momentum-bot's POSITIONS KV store to get list of active position mints.
+    /// These mints should NOT be swapped as dust - they are intentional holdings.
+    ///
+    /// Returns empty set if NATS is not configured or query fails.
+    async fn get_active_positions_from_kv(&self) -> HashSet<String> {
+        let client = match &self.nats_client {
+            Some(c) => c,
+            None => {
+                debug!("NATS not configured, skipping position blacklist");
+                return HashSet::new();
+            }
+        };
+
+        use async_nats::jetstream;
+
+        let jetstream = jetstream::new(client.clone());
+        let kv = match jetstream.get_key_value("POSITIONS").await {
+            Ok(kv) => kv,
+            Err(e) => {
+                debug!(error = %e, "Failed to get POSITIONS KV store (momentum-bot may not be running)");
+                return HashSet::new();
+            }
+        };
+
+        // Get all keys from the KV store - each key is a mint address
+        let mut mints = HashSet::new();
+        let keys = match kv.keys().await {
+            Ok(k) => k,
+            Err(e) => {
+                debug!(error = %e, "Failed to list POSITIONS keys");
+                return HashSet::new();
+            }
+        };
+
+        use futures::StreamExt;
+        let mut keys_stream = keys;
+        while let Some(key_result) = keys_stream.next().await {
+            if let Ok(key) = key_result {
+                mints.insert(key);
+            }
+        }
+
+        if !mints.is_empty() {
+            info!(
+                count = mints.len(),
+                "Loaded active positions from momentum-bot KV store (blacklisted from dust swap)"
+            );
+        }
+
+        mints
     }
 
     /// Write action to JSONL log
@@ -885,6 +952,10 @@ impl AccountJanitor {
             None => return Ok(vec![]),
         };
 
+        // Get blacklist of active momentum positions (these should NOT be swapped)
+        // momentum-bot is the Single Source of Truth for positions.
+        let active_positions = self.get_active_positions_from_kv().await;
+
         // Get all token accounts for wallet
         let token_accounts = self
             .rpc
@@ -906,6 +977,15 @@ impl AccountJanitor {
 
                 // Skip WSOL (we don't want to swap WSOL to SOL via DEX)
                 if mint_str == wsol_mint {
+                    continue;
+                }
+
+                // Skip tokens that momentum-bot is actively holding (prevent accidental sell)
+                if active_positions.contains(&mint_str) {
+                    debug!(
+                        mint = %mint_str,
+                        "Skipping dust swap - active momentum-bot position (blacklisted)"
+                    );
                     continue;
                 }
 
