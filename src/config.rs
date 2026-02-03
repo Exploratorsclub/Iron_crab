@@ -898,6 +898,7 @@ impl Default for MomentumCfg {
             momentum_exit_buy_ratio: default_momentum_exit_ratio(),
             momentum_exit_window_secs: default_momentum_exit_window(),
             momentum_exit_min_trades: default_momentum_exit_min_trades(),
+            exit_max_slippage_bps: default_exit_max_slippage_bps(),
             top1_buyer_share_cap: default_top1_buyer_share_cap(),
             top3_buyer_share_cap: default_top3_buyer_share_cap(),
             repeat_buyer_min_ratio: default_repeat_buyer_min_ratio(),
