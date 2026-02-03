@@ -1630,6 +1630,11 @@ pub struct ExecutionResult {
     /// Duration from intent received to confirmation (ms)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
+
+    /// Metadata from the originating TradeIntent (exit_type, reason_detail, etc.)
+    /// Preserved for downstream analytics (Grafana, trades_server) to track exit reasons.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub metadata: std::collections::HashMap<String, String>,
 }
 
 impl ExecutionResult {
@@ -1666,7 +1671,14 @@ impl ExecutionResult {
             pnl: None,
             error_message: None,
             latency_ms: None,
+            metadata: std::collections::HashMap::new(),
         }
+    }
+
+    /// Attach metadata from the TradeIntent (exit_type, reason_detail, etc.)
+    pub fn with_metadata(mut self, metadata: std::collections::HashMap<String, String>) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     pub fn with_fills(

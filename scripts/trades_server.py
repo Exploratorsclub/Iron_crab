@@ -250,6 +250,8 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                     "pnl_pct": None,  # Not applicable for arb
                     "wallet_sol_delta": wallet_sol_delta_sol,
                     "mint_full": token_mint,
+                    "exit_type": None,
+                    "exit_reason": None,
                 }
             
             # ============ BUY / SELL ============
@@ -296,6 +298,11 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             else:
                 display_mint = token_mint or "-"
             
+            # Extract exit reason from metadata (for SELL trades)
+            metadata = record.get('metadata', {})
+            exit_type = metadata.get('exit_type')
+            reason_detail = metadata.get('reason_detail')
+            
             return {
                 "timestamp_ms": ts_ms,
                 "time": datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S"),
@@ -308,6 +315,8 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 "pnl_pct": None,
                 "wallet_sol_delta": wallet_sol_delta_sol,
                 "mint_full": token_mint,
+                "exit_type": exit_type,
+                "exit_reason": reason_detail,
             }
         except Exception as e:
             print(f"Error parsing execution result: {e}")

@@ -5234,12 +5234,14 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     }
 
     // Check 3b: Max slippage
-    if is_liquidation_sell {
+    // Skip for ALL sells - strategies like momentum-bot may need high slippage to exit positions
+    // (e.g., exit_max_slippage_bps=9500 for emergency exits at any price)
+    if intent.side == TradeSide::Sell {
         checks.push(CheckResult {
             check_name: "max_slippage".to_string(),
             passed: true,
             reason_code: None,
-            details: Some("skipped_for_liquidation_sell".to_string()),
+            details: Some("skipped_for_sell".to_string()),
         });
     } else {
         if intent.max_slippage_bps > config.max_slippage_bps {
@@ -6652,7 +6654,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 token_mint,
                 signature,
                 bundle_id,
-            );
+            )
+            .with_metadata(intent.metadata.clone());
 
             // Best-effort fill accounting: attach fills only when we have a signature and wallet.
             // This is used downstream for correct position accounting/exit sizing.
@@ -6807,6 +6810,13 @@ async fn emit_rejected_decision(
     if let Some(sell_routing) = intent.metadata.get("sell_routing") {
         decision = decision.with_input_snapshot("sell_routing".to_string(), sell_routing.clone());
     }
+    // Capture momentum exit metadata for decision record analysis
+    if let Some(exit_type) = intent.metadata.get("exit_type") {
+        decision = decision.with_input_snapshot("exit_type".to_string(), exit_type.clone());
+    }
+    if let Some(reason_detail) = intent.metadata.get("reason_detail") {
+        decision = decision.with_input_snapshot("reason_detail".to_string(), reason_detail.clone());
+    }
     let is_liquidation_sell = intent.side == TradeSide::Sell
         && (intent
             .metadata
@@ -6874,6 +6884,13 @@ async fn emit_sim_failed_decision(
     );
     if let Some(sell_routing) = intent.metadata.get("sell_routing") {
         decision = decision.with_input_snapshot("sell_routing".to_string(), sell_routing.clone());
+    }
+    // Capture momentum exit metadata for decision record analysis
+    if let Some(exit_type) = intent.metadata.get("exit_type") {
+        decision = decision.with_input_snapshot("exit_type".to_string(), exit_type.clone());
+    }
+    if let Some(reason_detail) = intent.metadata.get("reason_detail") {
+        decision = decision.with_input_snapshot("reason_detail".to_string(), reason_detail.clone());
     }
     let is_liquidation_sell = intent.side == TradeSide::Sell
         && (intent
@@ -7219,6 +7236,13 @@ fn build_input_snapshots(intent: &TradeIntent) -> std::collections::HashMap<Stri
     let mut snapshots = std::collections::HashMap::new();
     if let Some(sell_routing) = intent.metadata.get("sell_routing") {
         snapshots.insert("sell_routing".to_string(), sell_routing.clone());
+    }
+    // Capture momentum exit metadata for decision record analysis
+    if let Some(exit_type) = intent.metadata.get("exit_type") {
+        snapshots.insert("exit_type".to_string(), exit_type.clone());
+    }
+    if let Some(reason_detail) = intent.metadata.get("reason_detail") {
+        snapshots.insert("reason_detail".to_string(), reason_detail.clone());
     }
     snapshots
 }
