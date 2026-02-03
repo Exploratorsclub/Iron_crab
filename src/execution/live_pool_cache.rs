@@ -177,6 +177,8 @@ pub struct PumpAmmState {
     pub quote_reserve: Option<u64>,
     /// Full list of accounts needed for swap instruction
     pub pool_accounts: Vec<Pubkey>,
+    /// Creator of the token (parsed from pool account at offset 11-43)
+    pub creator: Option<Pubkey>,
 }
 
 /// Meteora CPMM (DAMM V2) cached state
@@ -875,6 +877,7 @@ fn parse_pumpamm_pool(data: &[u8]) -> Option<CachedPoolState> {
     // Offset 8: pool_bump (u8)
     // Offset 9: index (u16)
     // Offset 11: creator (Pubkey, 32 bytes)
+    let creator = Pubkey::new_from_array(data[11..43].try_into().ok()?);
     // Offset 43: base_mint (Pubkey, 32 bytes)
     let base_mint = Pubkey::new_from_array(data[43..75].try_into().ok()?);
     // Offset 75: quote_mint (Pubkey, 32 bytes)
@@ -893,6 +896,7 @@ fn parse_pumpamm_pool(data: &[u8]) -> Option<CachedPoolState> {
         base_reserve: None,
         quote_reserve: None,
         pool_accounts: vec![], // Will be populated from DexPoolAccounts event
+        creator: Some(creator),
     }))
 }
 
@@ -1097,6 +1101,7 @@ mod tests {
                 base_reserve: Some(1_000_000_000_000),
                 quote_reserve: Some(50_000_000_000),
                 pool_accounts: vec![],
+                creator: None,
             }),
             100,
         );

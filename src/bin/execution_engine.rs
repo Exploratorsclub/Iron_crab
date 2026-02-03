@@ -3381,6 +3381,7 @@ fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, CachedP
             base_reserve: Some(update.base_reserve),
             quote_reserve: Some(update.quote_reserve),
             pool_accounts: Vec::new(),
+            creator: None,
         }),
         "pumpfun" => CachedPoolState::PumpFun(PumpFunState {
             token_mint: base_mint,

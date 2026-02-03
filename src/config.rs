@@ -649,6 +649,10 @@ pub struct MomentumCfg {
     /// Min trades in momentum window to evaluate exit. Default: 5
     #[serde(default = "default_momentum_exit_min_trades")]
     pub momentum_exit_min_trades: u32,
+    /// Max slippage BPS for EXIT trades. Default: 9500 (95%)
+    /// High value ensures sells succeed even at loss - prevents stuck positions.
+    #[serde(default = "default_exit_max_slippage_bps")]
+    pub exit_max_slippage_bps: u32,
 
     // === Buyer Quality (anti-bot / concentration) ===
     /// Cap for top-1 buyer share (0.0..=1.0) within the buyer window.
@@ -808,6 +812,9 @@ fn default_momentum_exit_window() -> u64 {
 }
 fn default_momentum_exit_min_trades() -> u32 {
     5
+}
+fn default_exit_max_slippage_bps() -> u32 {
+    9500 // 95% - sell at any price rather than hold
 }
 
 fn default_top1_buyer_share_cap() -> f64 {

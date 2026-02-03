@@ -711,6 +711,7 @@ mod tests {
             base_reserve: Some(1_000_000_000_000_000), // 1M tokens
             quote_reserve: Some(50_000_000_000),       // 50 SOL
             pool_accounts: vec![],
+            creator: None,
         };
 
         // Buy tokens with 1 SOL
@@ -736,6 +737,7 @@ mod tests {
             base_reserve: Some(1_000_000_000_000_000), // 1M tokens
             quote_reserve: Some(50_000_000_000),       // 50 SOL
             pool_accounts: vec![],
+            creator: None,
         };
 
         // Sell 20K tokens

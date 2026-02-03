@@ -1666,6 +1666,39 @@ async fn run_geyser_loop(
                             (s.token_x_mint, s.token_y_mint, s.reserve_x_balance.unwrap_or(0), s.reserve_y_balance.unwrap_or(0))
                         }
                         CachedPoolState::PumpAmm(s) => {
+                            // Cache creator for migrated PumpFun tokens (from AMM pool account)
+                            if let Some(creator) = s.creator {
+                                let mint_str = s.base_mint.to_string();
+                                let pool_str = account_update.pubkey.to_string();
+                                let creator_str = creator.to_string();
+
+                                // Cache in pool_creator_cache (pool -> creator)
+                                {
+                                    let mut pool_creator = ctx.pool_creator_cache.write();
+                                    if !pool_creator.contains_key(&pool_str) {
+                                        pool_creator.insert(pool_str.clone(), creator_str.clone());
+                                        debug!(
+                                            pool = %pool_str,
+                                            creator = %creator_str,
+                                            "Cached creator from PumpAmm pool account (pool_creator_cache)"
+                                        );
+                                    }
+                                }
+
+                                // Also cache in creator_cache (mint -> creator)
+                                {
+                                    let mut creator_cache = ctx.creator_cache.write();
+                                    if !creator_cache.contains_key(&mint_str) {
+                                        creator_cache.insert(mint_str.clone(), creator_str.clone());
+                                        info!(
+                                            mint = %mint_str,
+                                            pool = %pool_str,
+                                            creator = %creator_str,
+                                            "Cached creator from PumpAmm pool account (migrated token)"
+                                        );
+                                    }
+                                }
+                            }
                             (s.base_mint, s.quote_mint, s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
                         }
                         CachedPoolState::PumpFun(s) => {

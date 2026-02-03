@@ -202,6 +202,9 @@ struct MomentumConfig {
     momentum_exit_window_secs: u64,
     /// Min trades in momentum window to evaluate exit. Default: 5
     momentum_exit_min_trades: u32,
+    /// Max slippage BPS for EXIT trades. Default: 9500 (95%)
+    /// High value ensures sells succeed even at loss - prevents stuck positions.
+    exit_max_slippage_bps: u32,
 }
 
 impl Default for MomentumConfig {
@@ -274,6 +277,7 @@ impl Default for MomentumConfig {
             momentum_exit_buy_ratio: 0.4,  // Exit if buy ratio < 40%
             momentum_exit_window_secs: 30, // Check last 30s of trades
             momentum_exit_min_trades: 5,   // Need 5+ trades to evaluate
+            exit_max_slippage_bps: 9500,   // 95% - sell at any price rather than hold
         }
     }
 }
@@ -327,6 +331,7 @@ impl MomentumConfig {
             momentum_exit_buy_ratio: cfg.momentum_exit_buy_ratio,
             momentum_exit_window_secs: cfg.momentum_exit_window_secs,
             momentum_exit_min_trades: cfg.momentum_exit_min_trades,
+            exit_max_slippage_bps: cfg.exit_max_slippage_bps,
         }
     }
 }
@@ -5890,7 +5895,7 @@ async fn generate_and_publish_exit_intent(
     reason: &str,
     token_amount: u64,
 ) -> Result<()> {
-    let max_slippage = { ctx.config.read().early_max_slippage_bps }; // Use higher slippage for exits
+    let max_slippage = { ctx.config.read().exit_max_slippage_bps }; // Use 95% for exits - sell at any price
 
     // SOL as output (selling tokens for SOL)
     let sol_mint = "So11111111111111111111111111111111111111112";
