@@ -187,6 +187,9 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             fill_out = record.get('fill_out', {})
             source = record.get('source', 'unknown')
             intent_id = record.get('intent_id', '')
+            metadata = record.get('metadata', {}) or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
             
             # Get actual wallet SOL delta (includes all fees)
             wallet_sol_delta_lamports = record.get('wallet_sol_delta_lamports')
@@ -207,8 +210,12 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 'arb' in source.lower()
             )
             
-            # LIQUIDATION DETECTION: Check intent_id prefix
-            is_liquidation = intent_id.startswith('liquidation-')
+            # LIQUIDATION DETECTION: intent_id prefix or intent metadata hints
+            is_liquidation = (
+                intent_id.startswith('liquidation-')
+                or metadata.get('purpose') == 'liquidation'
+                or str(metadata.get('kill_switch', '')).lower() in ('1', 'true', 'yes', 'y')
+            )
             
             # Determine action from fill amounts
             fill_in_raw = fill_in.get('raw', 0)
@@ -250,47 +257,52 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                     "pnl_pct": None,  # Not applicable for arb
                     "wallet_sol_delta": wallet_sol_delta_sol,
                     "mint_full": token_mint,
+                    "reason": "ARBITRAGE",
                     "exit_type": None,
                     "exit_reason": None,
                 }
             
             # ============ BUY / SELL ============
-            # Check which side has tokens (6 decimals typically) vs SOL (9 decimals)
-            fill_out_is_tokens = fill_out_raw > 0 and fill_out_decimals == 6
-            fill_in_is_tokens = fill_in_raw > 0 and fill_in_decimals == 6
-            
-            if fill_in_is_tokens:
-                # Sent tokens, received SOL = SELL
-                action = "SELL"
-                amount_tokens = fill_in_raw / (10 ** fill_in_decimals)
-                # SOL received
-                if wallet_sol_delta_sol is not None:
-                    value_sol = abs(wallet_sol_delta_sol)
-                elif fill_out_decimals == 9:
-                    value_sol = fill_out_raw / 1e9
-                else:
-                    value_sol = 0
-            elif fill_out_is_tokens:
-                # Received tokens, paid SOL = BUY
-                action = "BUY"
-                amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
-                # SOL paid
-                if wallet_sol_delta_sol is not None:
-                    value_sol = abs(wallet_sol_delta_sol)
-                elif fill_in_decimals == 9:
-                    value_sol = fill_in_raw / 1e9
-                else:
-                    value_sol = 0
+            # Prefer wallet_sol_delta to classify action (most robust across token decimals):
+            # - BUY spends SOL => wallet delta negative
+            # - SELL receives SOL => wallet delta positive
+            if wallet_sol_delta_lamports is not None and wallet_sol_delta_lamports != 0:
+                action = "SELL" if wallet_sol_delta_lamports > 0 else "BUY"
+                value_sol = abs(wallet_sol_delta_sol) if wallet_sol_delta_sol is not None else 0
+
+                token_raw, token_decimals = (
+                    (fill_out_raw, fill_out_decimals) if action == "BUY" else (fill_in_raw, fill_in_decimals)
+                )
+                amount_tokens = (
+                    token_raw / (10 ** token_decimals)
+                    if token_raw and token_decimals is not None
+                    else 0
+                )
             else:
-                # Fallback heuristics
-                if fill_out_raw > fill_in_raw * 100:
-                    action = "BUY"
-                    amount_tokens = fill_out_raw / (10 ** fill_out_decimals)
-                    value_sol = fill_in_raw / 1e9 if fill_in_decimals == 9 else 0
-                else:
+                # Fallback without wallet delta: treat SOL as 9 decimals.
+                fill_in_is_sol = fill_in_raw > 0 and fill_in_decimals == 9
+                fill_out_is_sol = fill_out_raw > 0 and fill_out_decimals == 9
+
+                if fill_out_is_sol and not fill_in_is_sol:
+                    # Sent tokens, received SOL = SELL
                     action = "SELL"
                     amount_tokens = fill_in_raw / (10 ** fill_in_decimals) if fill_in_raw > 0 else 0
                     value_sol = fill_out_raw / 1e9 if fill_out_decimals == 9 else 0
+                elif fill_in_is_sol and not fill_out_is_sol:
+                    # Paid SOL, received tokens = BUY
+                    action = "BUY"
+                    amount_tokens = fill_out_raw / (10 ** fill_out_decimals) if fill_out_raw > 0 else 0
+                    value_sol = fill_in_raw / 1e9 if fill_in_decimals == 9 else 0
+                else:
+                    # Last-resort heuristics
+                    if fill_out_raw > fill_in_raw * 100:
+                        action = "BUY"
+                        amount_tokens = fill_out_raw / (10 ** fill_out_decimals) if fill_out_raw > 0 else 0
+                        value_sol = fill_in_raw / 1e9 if fill_in_decimals == 9 else 0
+                    else:
+                        action = "SELL"
+                        amount_tokens = fill_in_raw / (10 ** fill_in_decimals) if fill_in_raw > 0 else 0
+                        value_sol = fill_out_raw / 1e9 if fill_out_decimals == 9 else 0
             
             # Truncate token mint for display (keep first 8 + last 4 chars)
             if token_mint and len(token_mint) > 15:
@@ -298,10 +310,27 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             else:
                 display_mint = token_mint or "-"
             
-            # Extract exit reason from metadata (for SELL trades)
-            metadata = record.get('metadata', {})
+            # Unified reason field for dashboard:
+            # - BUY: entry reason (reason_detail when available)
+            # - SELL: exit category (exit_type), with liquidation fallback
             exit_type = metadata.get('exit_type')
             reason_detail = metadata.get('reason_detail')
+            reason_code = metadata.get('reason_code')
+
+            reason = None
+            if action == "BUY":
+                reason = reason_detail or reason_code
+            elif action == "SELL":
+                reason = exit_type
+                if not reason:
+                    if is_liquidation:
+                        reason = "LIQUIDATION"
+                    elif str(metadata.get('kill_switch', '')).lower() in ('1', 'true', 'yes', 'y'):
+                        reason = "KILL_SWITCH"
+                    elif reason_code and str(reason_code).startswith("EXIT_"):
+                        reason = str(reason_code).removeprefix("EXIT_")
+                    else:
+                        reason = reason_detail or reason_code
             
             return {
                 "timestamp_ms": ts_ms,
@@ -315,6 +344,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 "pnl_pct": None,
                 "wallet_sol_delta": wallet_sol_delta_sol,
                 "mint_full": token_mint,
+                "reason": reason,
                 "exit_type": exit_type,
                 "exit_reason": reason_detail,
             }
