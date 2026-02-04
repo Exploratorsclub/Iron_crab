@@ -359,7 +359,9 @@
           { "selector": "amount_tokens", "text": "Amount", "type": "number" },
           { "selector": "value_sol", "text": "Value (SOL)", "type": "number" },
           { "selector": "pnl_sol", "text": "PnL (SOL)", "type": "number" },
-          { "selector": "pnl_pct", "text": "PnL %", "type": "number" }
+          { "selector": "pnl_pct", "text": "PnL %", "type": "number" },
+          { "selector": "exit_type", "text": "Exit Type", "type": "string" },
+          { "selector": "exit_reason", "text": "Exit Reason", "type": "string" }
         ]
       }],
       "fieldConfig": {
@@ -462,6 +464,33 @@
                 "id": "custom.cellOptions",
                 "value": { "type": "color-text" }
               }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Exit Type" },
+            "properties": [
+              { "id": "custom.width", "value": 100 },
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-text" }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  { "type": "value", "options": { "DEV_SELL": { "color": "red", "text": "🔴 DEV_SELL" } } },
+                  { "type": "value", "options": { "STOP_LOSS": { "color": "orange", "text": "🟠 STOP_LOSS" } } },
+                  { "type": "value", "options": { "TAKE_PROFIT": { "color": "green", "text": "🟢 TAKE_PROFIT" } } },
+                  { "type": "value", "options": { "LP_REMOVAL": { "color": "purple", "text": "🟣 LP_REMOVAL" } } },
+                  { "type": "value", "options": { "TIMED_EXIT": { "color": "blue", "text": "🔵 TIMED_EXIT" } } },
+                  { "type": "value", "options": { "TRAILING_STOP": { "color": "yellow", "text": "🟡 TRAILING" } } }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Exit Reason" },
+            "properties": [
+              { "id": "custom.width", "value": 200 }
             ]
           }
         ]
