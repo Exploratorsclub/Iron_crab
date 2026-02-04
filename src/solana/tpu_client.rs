@@ -150,7 +150,10 @@ impl TpuSubmitter {
         // Get initial slot for staleness tracking
         let initial_slot = rpc_client.get_slot().unwrap_or(0);
 
-        info!(initial_slot = initial_slot, "TPU client initialized successfully");
+        info!(
+            initial_slot = initial_slot,
+            "TPU client initialized successfully"
+        );
 
         Ok(Self {
             tpu_client: Arc::new(tokio::sync::RwLock::new(Some(tpu_client))),

@@ -495,9 +495,9 @@ async fn publish_wallet_snapshot(
     wallet: &Pubkey,
     is_periodic: bool,
 ) -> Result<()> {
-    use solana_client::rpc_request::TokenAccountsFilter;
     use base64::Engine;
     use solana_account_decoder::UiAccountData;
+    use solana_client::rpc_request::TokenAccountsFilter;
     use std::collections::HashMap;
 
     let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
@@ -512,7 +512,8 @@ async fn publish_wallet_snapshot(
     let mut mint_decimals_cache: HashMap<Pubkey, u8> = HashMap::new();
     // Track mints with non-zero balance for WalletSnapshotComplete event
     let mut mints_with_balance: Vec<String> = Vec::new();
-    let mut wallet_token_accounts: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
+    let mut wallet_token_accounts: std::collections::HashSet<Pubkey> =
+        std::collections::HashSet::new();
 
     let wallet_str = wallet.to_string();
 
@@ -581,9 +582,7 @@ async fn publish_wallet_snapshot(
                     (mint, balance_raw, decimals)
                 }
                 UiAccountData::Binary(data, _) | UiAccountData::LegacyBinary(data) => {
-                    let decoded = base64::engine::general_purpose::STANDARD
-                        .decode(data)
-                        .ok();
+                    let decoded = base64::engine::general_purpose::STANDARD.decode(data).ok();
                     let Some(raw) = decoded else {
                         continue;
                     };
@@ -652,7 +651,7 @@ async fn publish_wallet_snapshot(
             }
 
             non_zero_accounts += 1;
-            
+
             let mint_str = mint.to_string();
             mints_with_balance.push(mint_str.clone());
             let event_id = format!("wallet_snapshot_{}", mint_str);
@@ -773,7 +772,10 @@ async fn publish_wallet_snapshot(
         "market-data",
         BUILD_VERSION,
         &ctx.run_id,
-        format!("wallet_snapshot_complete_{}", if is_periodic { "periodic" } else { "startup" }),
+        format!(
+            "wallet_snapshot_complete_{}",
+            if is_periodic { "periodic" } else { "startup" }
+        ),
         "wallet_scan_complete",
         None,
         MarketEventKind::WalletSnapshotComplete {
@@ -1109,23 +1111,24 @@ async fn run_geyser_loop(
     // IMPORTANT: Geyser does NOT send updates for closed/deleted token accounts.
     // This periodic refresh ensures we detect when tokens are sold externally
     // (e.g., via Phantom/Jupiter) or when ATAs are closed.
-    let wallet_for_reconciliation: Option<Pubkey> =
-        if let Ok(wallet_pubkey_str) = std::env::var("IRONCRAB_WALLET_PUBKEY") {
-            if let Ok(wallet_pubkey) = Pubkey::from_str(&wallet_pubkey_str) {
-                info!(wallet = %wallet_pubkey, "📸 Publishing wallet balance snapshot for position reconciliation");
-                if let Err(e) = publish_wallet_snapshot(&ctx, &rpc, &wallet_pubkey, false).await {
-                    warn!(error = %e, "Failed to publish wallet snapshot (continuing anyway)");
-                }
-                Some(wallet_pubkey)
-            } else {
-                warn!("IRONCRAB_WALLET_PUBKEY is set but not a valid pubkey");
-                None
+    let wallet_for_reconciliation: Option<Pubkey> = if let Ok(wallet_pubkey_str) =
+        std::env::var("IRONCRAB_WALLET_PUBKEY")
+    {
+        if let Ok(wallet_pubkey) = Pubkey::from_str(&wallet_pubkey_str) {
+            info!(wallet = %wallet_pubkey, "📸 Publishing wallet balance snapshot for position reconciliation");
+            if let Err(e) = publish_wallet_snapshot(&ctx, &rpc, &wallet_pubkey, false).await {
+                warn!(error = %e, "Failed to publish wallet snapshot (continuing anyway)");
             }
+            Some(wallet_pubkey)
         } else {
-            info!("IRONCRAB_WALLET_PUBKEY not set, skipping wallet snapshot");
+            warn!("IRONCRAB_WALLET_PUBKEY is set but not a valid pubkey");
             None
-        };
-    
+        }
+    } else {
+        info!("IRONCRAB_WALLET_PUBKEY not set, skipping wallet snapshot");
+        None
+    };
+
     // Periodic wallet reconciliation interval (5 minutes)
     // This catches ghost positions from closed ATAs that Geyser doesn't report
     const WALLET_RECONCILIATION_INTERVAL_SECS: u64 = 300; // 5 minutes
@@ -1219,11 +1222,11 @@ async fn run_geyser_loop(
     let mut tx_count = 0u64;
     let mut last_heartbeat = std::time::Instant::now();
     let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
-    
+
     // Periodic wallet reconciliation timer - catches ghost positions from closed ATAs
-    let mut wallet_reconciliation_interval = tokio::time::interval(
-        std::time::Duration::from_secs(WALLET_RECONCILIATION_INTERVAL_SECS)
-    );
+    let mut wallet_reconciliation_interval = tokio::time::interval(std::time::Duration::from_secs(
+        WALLET_RECONCILIATION_INTERVAL_SECS,
+    ));
     // Skip first tick (we already did startup snapshot)
     wallet_reconciliation_interval.tick().await;
 
@@ -1256,7 +1259,7 @@ async fn run_geyser_loop(
                 #[cfg(unix)]
                 let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
             }
-            
+
             // Periodic wallet reconciliation - catches ghost positions from closed ATAs
             // Geyser does NOT report deleted accounts, so we must poll periodically
             _ = wallet_reconciliation_interval.tick() => {

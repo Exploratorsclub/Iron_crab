@@ -81,9 +81,9 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, slave_consumer_config, wallet_snapshot_consumer_config,
-    NatsClient, NatsConfig, CONFIG_STREAM_NAME, STREAM_NAME, WALLET_SNAPSHOT_STREAM_NAME,
-    TOPIC_CONTROL_REQUESTS, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS,
-    TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS,
+    NatsClient, NatsConfig, CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS,
+    TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_PRIORITY_FEE_SAMPLES,
+    TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
@@ -167,10 +167,7 @@ fn extract_owner_mint_delta_raw(
     // Debug logging when no balance found for the target mint
     if decimals_opt.is_none() {
         // Log available mints for debugging owner mismatch issues
-        let available_mints: Vec<&str> = post_balances
-            .iter()
-            .map(|b| b.mint.as_str())
-            .collect();
+        let available_mints: Vec<&str> = post_balances.iter().map(|b| b.mint.as_str()).collect();
         trace!(
             target_mint = %mint,
             target_owner = %owner_str,
@@ -1605,10 +1602,7 @@ impl ExecutionContext {
                             maybe_ping_watchdog();
 
                             if metadata.contains_key("creator") && resources.pools.len() == 1 {
-                                metadata.insert(
-                                    "sell_routing".to_string(),
-                                    "primary".to_string(),
-                                );
+                                metadata.insert("sell_routing".to_string(), "primary".to_string());
                                 metadata.insert("dex".to_string(), "pumpfun".to_string());
                                 min_out_sol = Some(Self::apply_slippage_min_out(
                                     q.amount_out,
@@ -1646,18 +1640,16 @@ impl ExecutionContext {
             // Pump.fun bonding curve is handled above as the known pool.
             if min_out_sol.is_none() {
                 let mut candidates: Vec<RouteCandidate> = Vec::new();
-                let mut record_candidate = |dex: &str,
-                                            amount_out: u64,
-                                            pool_id: String,
-                                            accounts: Vec<String>| {
-                    candidates.push(RouteCandidate {
-                        dex: dex.to_string(),
-                        amount_out,
-                        pool_id,
-                        accounts,
-                        creator: None,
-                    });
-                };
+                let mut record_candidate =
+                    |dex: &str, amount_out: u64, pool_id: String, accounts: Vec<String>| {
+                        candidates.push(RouteCandidate {
+                            dex: dex.to_string(),
+                            amount_out,
+                            pool_id,
+                            accounts,
+                            creator: None,
+                        });
+                    };
 
                 // PumpSwap (Pump.fun AMM) with timeout guard.
                 let pump_amm_quote = tokio::time::timeout(
@@ -1817,12 +1809,7 @@ impl ExecutionContext {
                                         pool_id,
                                         pool_accounts.len()
                                     ));
-                                    record_candidate(
-                                        "orca",
-                                        q.amount_out,
-                                        pool_id,
-                                        pool_accounts,
-                                    );
+                                    record_candidate("orca", q.amount_out, pool_id, pool_accounts);
                                 } else {
                                     quote_attempts.push(format!(
                                         "orca=skip no_pool_accounts amount_out={} pool={}",
@@ -1841,10 +1828,7 @@ impl ExecutionContext {
                 }
 
                 if let Some(best_route) = select_best_route(candidates) {
-                    metadata.insert(
-                        "sell_routing".to_string(),
-                        "multi_pool".to_string(),
-                    );
+                    metadata.insert("sell_routing".to_string(), "multi_pool".to_string());
                     metadata.insert("dex".to_string(), best_route.dex.clone());
                     if let Some(creator) = best_route.creator.clone() {
                         metadata.insert("creator".to_string(), creator);
@@ -1927,17 +1911,13 @@ impl ExecutionContext {
                         ) {
                             Ok(Some(v)) => v,
                             Ok(None) => {
-                                quote_attempts.push(format!(
-                                    "cache=skip no_quote pool={}",
-                                    pool_addr
-                                ));
+                                quote_attempts
+                                    .push(format!("cache=skip no_quote pool={}", pool_addr));
                                 continue;
                             }
                             Err(e) => {
-                                quote_attempts.push(format!(
-                                    "cache=err pool={} err={}",
-                                    pool_addr, e
-                                ));
+                                quote_attempts
+                                    .push(format!("cache=err pool={} err={}", pool_addr, e));
                                 continue;
                             }
                         };
@@ -1968,7 +1948,8 @@ impl ExecutionContext {
                                     Ok(pk) => pk,
                                     Err(_) => continue,
                                 };
-                                let Some(pool_accounts) = meteora.get_pool_accounts(&pool_pk) else {
+                                let Some(pool_accounts) = meteora.get_pool_accounts(&pool_pk)
+                                else {
                                     quote_attempts.push(format!(
                                         "cache=skip meteora no_pool_accounts pool={}",
                                         pool_id
@@ -2019,10 +2000,7 @@ impl ExecutionContext {
                     }
 
                     if let Some(best_route) = select_best_route(candidates) {
-                        metadata.insert(
-                            "sell_routing".to_string(),
-                            "multi_pool".to_string(),
-                        );
+                        metadata.insert("sell_routing".to_string(), "multi_pool".to_string());
                         metadata.insert("dex".to_string(), best_route.dex.clone());
                         if let Some(creator) = best_route.creator.clone() {
                             metadata.insert("creator".to_string(), creator);
@@ -3562,7 +3540,10 @@ async fn bootstrap_open_positions_from_wallet_snapshot(
                 }
             };
 
-            if let MarketEventKind::WalletBalanceSnapshot { mint, balance_raw, .. } = &event.kind {
+            if let MarketEventKind::WalletBalanceSnapshot {
+                mint, balance_raw, ..
+            } = &event.kind
+            {
                 observed += 1;
                 if mint == SOL_MINT {
                     continue;
@@ -4059,8 +4040,7 @@ async fn main() -> Result<()> {
                 if reconciled != initial_positions {
                     info!(
                         previous = initial_positions,
-                        reconciled,
-                        "Open positions reconciled from wallet snapshot"
+                        reconciled, "Open positions reconciled from wallet snapshot"
                     );
                 }
                 initial_positions = reconciled;
@@ -5559,7 +5539,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             reason_code: Some(reason.to_string()),
             details: Some(format!(
                 "total_cost={} (base={}, priority={}) > max={}",
-                total_cost, base_fee, priority_fee_lamports, effective_fee_policy.max_tx_cost_lamports
+                total_cost,
+                base_fee,
+                priority_fee_lamports,
+                effective_fee_policy.max_tx_cost_lamports
             )),
         });
         return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -5599,10 +5582,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             check_name: "fee_profitability".to_string(),
             passed: true,
             reason_code: None,
-        details: Some(format!(
-            "profit_after_fees={}bps >= min={}bps",
-            profit_after_fees_bps, effective_fee_policy.min_profit_after_fees_bps
-        )),
+            details: Some(format!(
+                "profit_after_fees={}bps >= min={}bps",
+                profit_after_fees_bps, effective_fee_policy.min_profit_after_fees_bps
+            )),
         });
     } else {
         // Skip for momentum-bot (speculative), SELL exits, and other non-arb sources

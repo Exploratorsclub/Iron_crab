@@ -13,9 +13,9 @@
 //! Priority fee per CU = (total_fee - base_fee) / compute_units_consumed
 //! Base fee ≈ 5000 lamports (signature verification)
 
+use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use parking_lot::RwLock;
 use tracing::{debug, info};
 
 use crate::ipc::IntentTier;
@@ -67,8 +67,8 @@ impl Default for PriorityFeeConfig {
     fn default() -> Self {
         Self {
             window_size: 50,
-            min_priority_fee_micro_lamports: 10_000,      // 0.01 lamports/CU
-            max_priority_fee_micro_lamports: 2_000_000,   // 2 lamports/CU
+            min_priority_fee_micro_lamports: 10_000, // 0.01 lamports/CU
+            max_priority_fee_micro_lamports: 2_000_000, // 2 lamports/CU
             tier0_multiplier: 1.5,
             tier1_multiplier: 1.2,
             arb_multiplier: 1.3,
@@ -93,7 +93,9 @@ impl PriorityFeeTracker {
     /// Create a new tracker with custom config
     pub fn with_config(config: PriorityFeeConfig) -> Self {
         Self {
-            samples: Arc::new(RwLock::new(VecDeque::with_capacity(config.window_size + 10))),
+            samples: Arc::new(RwLock::new(VecDeque::with_capacity(
+                config.window_size + 10,
+            ))),
             cached_percentiles: Arc::new(RwLock::new(FeePercentiles::default())),
             config,
         }
@@ -102,10 +104,15 @@ impl PriorityFeeTracker {
     /// Add a fee sample from a Geyser transaction update
     ///
     /// Returns the calculated priority fee in micro-lamports per CU, or None if invalid
-    pub fn add_sample(&self, slot: u64, fee_lamports: u64, compute_units: Option<u64>) -> Option<u64> {
+    pub fn add_sample(
+        &self,
+        slot: u64,
+        fee_lamports: u64,
+        compute_units: Option<u64>,
+    ) -> Option<u64> {
         // Need compute units to calculate priority fee per CU
         let compute_units = compute_units?;
-        
+
         // Skip transactions with zero or very low compute (likely failed or trivial)
         if compute_units < 1000 {
             return None;
@@ -115,7 +122,7 @@ impl PriorityFeeTracker {
         // priority_fee = (total_fee - base_fee) / compute_units * 1_000_000 (to get micro-lamports)
         let base_fee = self.config.base_fee_lamports;
         let priority_portion = fee_lamports.saturating_sub(base_fee);
-        
+
         // Convert to micro-lamports per CU: (priority_portion * 1_000_000) / compute_units
         let priority_fee_micro = priority_portion
             .saturating_mul(1_000_000)
@@ -157,13 +164,16 @@ impl PriorityFeeTracker {
     /// Recalculate percentiles from current samples
     fn recalculate_percentiles(&self) {
         let samples = self.samples.read();
-        
+
         if samples.is_empty() {
             return;
         }
 
         // Collect and sort priority fees
-        let mut fees: Vec<u64> = samples.iter().map(|s| s.priority_fee_micro_lamports).collect();
+        let mut fees: Vec<u64> = samples
+            .iter()
+            .map(|s| s.priority_fee_micro_lamports)
+            .collect();
         fees.sort_unstable();
 
         let len = fees.len();
@@ -273,7 +283,7 @@ mod tests {
     #[test]
     fn test_add_sample_calculates_priority_fee() {
         let tracker = PriorityFeeTracker::new();
-        
+
         // 10000 lamports fee, 100000 CU, base fee 5000
         // priority = (10000 - 5000) / 100000 * 1_000_000 = 50_000 micro-lamports/CU
         let result = tracker.add_sample(100, 10_000, Some(100_000));
@@ -283,7 +293,7 @@ mod tests {
     #[test]
     fn test_percentiles_calculation() {
         let tracker = PriorityFeeTracker::new();
-        
+
         // Add samples with varying fees
         for i in 1..=20 {
             let fee = 5000 + (i * 1000); // 6000, 7000, ..., 25000
@@ -302,9 +312,9 @@ mod tests {
         let mut config = PriorityFeeConfig::default();
         config.min_priority_fee_micro_lamports = 50_000;
         config.max_priority_fee_micro_lamports = 500_000;
-        
+
         let tracker = PriorityFeeTracker::with_config(config);
-        
+
         // Add very low fee samples
         for i in 1..=20 {
             tracker.add_sample(i as u64, 5100, Some(100_000)); // ~1000 micro-lamports
@@ -318,13 +328,13 @@ mod tests {
     #[test]
     fn test_skip_invalid_samples() {
         let tracker = PriorityFeeTracker::new();
-        
+
         // Zero compute units
         assert!(tracker.add_sample(1, 10_000, Some(0)).is_none());
-        
+
         // No compute units
         assert!(tracker.add_sample(1, 10_000, None).is_none());
-        
+
         // Very low compute units
         assert!(tracker.add_sample(1, 10_000, Some(500)).is_none());
     }

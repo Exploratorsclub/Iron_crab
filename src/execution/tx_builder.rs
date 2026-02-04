@@ -736,7 +736,8 @@ pub async fn build_tx_plan(
             if let Some(cache) = cache {
                 if let Some(CachedPoolState::Meteora(dlmm_state)) = cache.get(&_pool_id) {
                     if dlmm_state.active_id != 0 {
-                        if let Ok(true) = meteora.inject_cached_meteora_state(&_pool_id, &dlmm_state)
+                        if let Ok(true) =
+                            meteora.inject_cached_meteora_state(&_pool_id, &dlmm_state)
                         {
                             tracing::warn!(
                                 pool = %_pool_id,

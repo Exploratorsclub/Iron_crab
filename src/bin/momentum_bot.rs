@@ -502,9 +502,8 @@ impl PersistedPosition {
         let entry_time = Instant::now()
             .checked_sub(Duration::from_millis(elapsed_ms))
             .unwrap_or_else(Instant::now);
-        let exit_generated_at = exit_elapsed_ms.and_then(|ms| {
-            Instant::now().checked_sub(Duration::from_millis(ms))
-        });
+        let exit_generated_at =
+            exit_elapsed_ms.and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)));
 
         PositionTracker {
             mint: self.mint.clone(),
@@ -1793,15 +1792,8 @@ impl MomentumContext {
             .map(|r| 1.0 / r)
             .unwrap_or(1.0);
 
-        let mut tracker = PositionTracker::new(
-            mint,
-            &pool,
-            &dex,
-            entry_price,
-            decimals,
-            balance_raw,
-            0,
-        );
+        let mut tracker =
+            PositionTracker::new(mint, &pool, &dex, entry_price, decimals, balance_raw, 0);
         tracker.entry_source = PositionEntrySource::WalletSnapshot;
 
         let config = self.config.read();
@@ -2712,9 +2704,9 @@ impl MomentumContext {
                 continue;
             }
 
-            let last_exit_age = pos.exit_generated_at.and_then(|ts| {
-                now.checked_duration_since(ts).map(|d| d.as_secs())
-            });
+            let last_exit_age = pos
+                .exit_generated_at
+                .and_then(|ts| now.checked_duration_since(ts).map(|d| d.as_secs()));
 
             if let Some(age) = last_exit_age {
                 if age < retry_after.as_secs() {
@@ -3935,7 +3927,9 @@ async fn bootstrap_wallet_snapshot_from_jetstream(ctx: &MomentumContext) -> Resu
         }
     };
 
-    let consumer = stream.create_consumer(wallet_snapshot_consumer_config()).await?;
+    let consumer = stream
+        .create_consumer(wallet_snapshot_consumer_config())
+        .await?;
     let mut recovered = 0usize;
     let mut snapshot_mints: HashSet<String> = HashSet::new();
     let batch_size = 1000;
@@ -5901,55 +5895,56 @@ async fn generate_and_publish_exit_intent(
     let sol_mint = "So11111111111111111111111111111111111111112";
 
     // === MULTI-POOL ROUTING: Find best pool for exit ===
-    let (pool, dex, pool_accounts, expected_sol, alternatives_checked, sell_routing) =
-        match ctx.find_best_sell_pool(mint, token_amount, original_pool) {
-            Ok((pool, dex, accounts, expected, alts)) => (
-                pool,
-                dex,
+    let (pool, dex, pool_accounts, expected_sol, alternatives_checked, sell_routing) = match ctx
+        .find_best_sell_pool(mint, token_amount, original_pool)
+    {
+        Ok((pool, dex, accounts, expected, alts)) => (
+            pool,
+            dex,
+            accounts,
+            expected,
+            alts,
+            "multi_pool".to_string(),
+        ),
+        Err(e) => {
+            // Fallback to original pool if multi-pool routing fails
+            warn!(
+                mint = %mint,
+                original_pool = %original_pool,
+                error = %e,
+                "⚠️  Multi-pool routing failed, using original pool"
+            );
+
+            // Get accounts for original pool
+            let accounts = match ctx.try_get_dex_pool_accounts_for_mint(mint) {
+                Some(accounts) => accounts,
+                None => {
+                    warn!(
+                        mint = %mint,
+                        pool = %original_pool,
+                        dex = %original_dex,
+                        "Missing DexPoolAccounts for exit intent; falling back to empty accounts"
+                    );
+                    Vec::new()
+                }
+            };
+
+            let routing = if original_dex.eq_ignore_ascii_case("pump_amm") {
+                "pumpswap_fallback"
+            } else {
+                "primary"
+            };
+
+            (
+                original_pool.to_string(),
+                original_dex.to_string(),
                 accounts,
-                expected,
-                alts,
-                "multi_pool".to_string(),
-            ),
-            Err(e) => {
-                // Fallback to original pool if multi-pool routing fails
-                warn!(
-                    mint = %mint,
-                    original_pool = %original_pool,
-                    error = %e,
-                    "⚠️  Multi-pool routing failed, using original pool"
-                );
-
-                // Get accounts for original pool
-                let accounts = match ctx.try_get_dex_pool_accounts_for_mint(mint) {
-                    Some(accounts) => accounts,
-                    None => {
-                        warn!(
-                            mint = %mint,
-                            pool = %original_pool,
-                            dex = %original_dex,
-                            "Missing DexPoolAccounts for exit intent; falling back to empty accounts"
-                        );
-                        Vec::new()
-                    }
-                };
-
-                let routing = if original_dex.eq_ignore_ascii_case("pump_amm") {
-                    "pumpswap_fallback"
-                } else {
-                    "primary"
-                };
-
-                (
-                    original_pool.to_string(),
-                    original_dex.to_string(),
-                    accounts,
-                    0.0,     // Unknown expected
-                    0_usize, // No alternatives checked
-                    routing.to_string(),
-                )
-            }
-        };
+                0.0,     // Unknown expected
+                0_usize, // No alternatives checked
+                routing.to_string(),
+            )
+        }
+    };
 
     // Decimals depend on the token. Prefer decimals from the open position (which was seeded
     // from MarketEventKind::TokenMintInfo), fall back to mint_infos cache, then fallback to 6.
@@ -6624,14 +6619,14 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             // P0: Ghost Position Cleanup
             // Close positions for mints NOT in the wallet (closed ATAs that Geyser doesn't report).
             // This is the definitive reconciliation after market-data completes a wallet scan.
-            
-            let mints_set: std::collections::HashSet<&str> = 
+
+            let mints_set: std::collections::HashSet<&str> =
                 mints_in_wallet.iter().map(|s| s.as_str()).collect();
-            
+
             let mut positions = ctx.positions.write();
             let position_mints: Vec<String> = positions.keys().cloned().collect();
             let mut closed_count = 0usize;
-            
+
             for mint in position_mints {
                 if !mints_set.contains(mint.as_str()) {
                     if let Some(removed) = positions.remove(&mint) {
@@ -6651,7 +6646,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     }
                 }
             }
-            
+
             if closed_count > 0 {
                 info!(
                     closed_count = closed_count,

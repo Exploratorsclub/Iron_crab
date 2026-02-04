@@ -2754,7 +2754,8 @@ impl PumpFunAmmDex {
 
         // Resolve token programs: use override for base token (Token-2022 support),
         // WSOL always uses SPL Token.
-        let base_tp = base_token_program.unwrap_or_else(|| Pubkey::new_from_array(spl_token::id().to_bytes()));
+        let base_tp = base_token_program
+            .unwrap_or_else(|| Pubkey::new_from_array(spl_token::id().to_bytes()));
         let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes()); // WSOL always SPL Token
 
         // User token accounts are deterministic ATAs with correct token program.
@@ -2788,8 +2789,8 @@ impl PumpFunAmmDex {
                 AccountMeta::new(pool_quote_vault, false),                // 8
                 AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
                 AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
-                AccountMeta::new_readonly(base_tp, false),                // 11 - base token program (Token-2022 aware)
-                AccountMeta::new_readonly(quote_tp, false),               // 12 - quote token program (always SPL)
+                AccountMeta::new_readonly(base_tp, false), // 11 - base token program (Token-2022 aware)
+                AccountMeta::new_readonly(quote_tp, false), // 12 - quote token program (always SPL)
                 AccountMeta::new_readonly(
                     Pubkey::new_from_array(solana_system_program::id().to_bytes()),
                     false,
@@ -2798,11 +2799,11 @@ impl PumpFunAmmDex {
                     Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
                     false,
                 ), // 14
-                AccountMeta::new_readonly(event_authority, false),        // 15
-                AccountMeta::new(global_volume_accumulator, false),       // 16 - REQUIRED for BUY!
-                AccountMeta::new(coin_creator_vault_ata, false),          // 17
+                AccountMeta::new_readonly(event_authority, false), // 15
+                AccountMeta::new(global_volume_accumulator, false), // 16 - REQUIRED for BUY!
+                AccountMeta::new(coin_creator_vault_ata, false), // 17
                 AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
-                AccountMeta::new(user_vol, false), // 19 - user volume accumulator
+                AccountMeta::new(user_vol, false),         // 19 - user volume accumulator
                 AccountMeta::new_readonly(fee_config, false), // 20
                 AccountMeta::new_readonly(fee_program, false), // 21
                 AccountMeta::new_readonly(program_id, false), // 22
@@ -2821,8 +2822,8 @@ impl PumpFunAmmDex {
                 AccountMeta::new(pool_quote_vault, false),                // 8
                 AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
                 AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
-                AccountMeta::new_readonly(base_tp, false),                // 11 - base token program (Token-2022 aware)
-                AccountMeta::new_readonly(quote_tp, false),               // 12 - quote token program (always SPL)
+                AccountMeta::new_readonly(base_tp, false), // 11 - base token program (Token-2022 aware)
+                AccountMeta::new_readonly(quote_tp, false), // 12 - quote token program (always SPL)
                 AccountMeta::new_readonly(
                     Pubkey::new_from_array(solana_system_program::id().to_bytes()),
                     false,
@@ -2831,12 +2832,12 @@ impl PumpFunAmmDex {
                     Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
                     false,
                 ), // 14
-                AccountMeta::new_readonly(event_authority, false),        // 15
-                AccountMeta::new_readonly(program_id, false),             // 16
-                AccountMeta::new(coin_creator_vault_ata, false),          // 17
+                AccountMeta::new_readonly(event_authority, false), // 15
+                AccountMeta::new_readonly(program_id, false), // 16
+                AccountMeta::new(coin_creator_vault_ata, false), // 17
                 AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
-                AccountMeta::new_readonly(fee_config, false),             // 19
-                AccountMeta::new_readonly(fee_program, false),            // 20
+                AccountMeta::new_readonly(fee_config, false), // 19
+                AccountMeta::new_readonly(fee_program, false), // 20
             ]
         };
 

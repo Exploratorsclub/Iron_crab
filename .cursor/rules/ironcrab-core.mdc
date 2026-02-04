@@ -17,3 +17,4 @@ alwaysApply: true
 - No new ad-hoc NATS topics; align with versioned topics or document clearly.
 - Avoid expanding legacy monolith; align new work to target multi-process architecture and MVP vertical slice.
 - SSH/Server commands only when the user explicitly requests or approves.
+- never add rpc calls to hot path without explizit approval and report all calls in hotpath as architecture violation

@@ -515,7 +515,7 @@ impl GeyserListener {
                                         // Extract fee and compute units for priority fee tracking
                                         fee_lamports = meta.fee;
                                         compute_units_consumed = meta.compute_units_consumed;
-                                        
+
                                         // Extract native SOL balances (lamports)
                                         pre_balances = meta.pre_balances.clone();
                                         post_balances = meta.post_balances.clone();

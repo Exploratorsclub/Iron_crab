@@ -602,7 +602,11 @@ fn parse_orca_transaction(
     } else {
         0
     };
-    let token_amount = if tokens_changed > 0 { tokens_changed } else { amount };
+    let token_amount = if tokens_changed > 0 {
+        tokens_changed
+    } else {
+        amount
+    };
     let sol_amount = if sol_changed > 0 {
         sol_changed
     } else if quote_mint == sol_mint && amount_specified_is_input {

@@ -369,10 +369,26 @@ impl LockManager {
     /// opportunistically (e.g., from a SELL preflight check) without having a
     /// complete wallet token snapshot.
     pub fn set_available_token_balance(&self, mint: String, amount_raw: u64) {
+        // IMPORTANT:
+        // `available_tokens` tracks *unlocked* token balances.
+        // A SELL preflight may temporarily observe 0 (ATA not created yet / RPC lag),
+        // and we must be able to refresh this value later, otherwise SELL intents can
+        // pass the `sell_token_balance` check but still fail at the capital-lock stage.
+        //
+        // Also, do not overwrite reservations: subtract any active capital locks for
+        // this mint so that available_tokens remains "free-to-lock".
+        let locked_for_mint: u64 = self
+            .capital_locks
+            .read()
+            .values()
+            .map(|l| l.tokens.get(&mint).copied().unwrap_or(0))
+            .sum();
+
+        let effective_available = amount_raw.saturating_sub(locked_for_mint);
+
         self.available_tokens
             .write()
-            .entry(mint)
-            .or_insert(amount_raw);
+            .insert(mint, effective_available);
     }
 
     /// Update wallet balances from WalletBalanceUpdate event (SOL + WSOL).
