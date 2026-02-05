@@ -221,6 +221,7 @@ pub fn config_consumer_config(component: &str) -> jetstream::consumer::pull::Con
 ///
 /// ```no_run
 /// use async_nats::jetstream;
+/// use futures::StreamExt;
 /// # async fn example(client: async_nats::Client) -> anyhow::Result<()> {
 /// let jetstream = jetstream::new(client);
 /// let stream = jetstream.get_stream("POOL_CACHE").await?;
@@ -238,7 +239,7 @@ pub fn config_consumer_config(component: &str) -> jetstream::consumer::pull::Con
 /// while let Some(msg) = messages.next().await {
 ///     let msg = msg?;
 ///     // Process pool state...
-///     msg.ack().await?;
+///     let _ = msg.ack().await;
 /// }
 /// # Ok(())
 /// # }

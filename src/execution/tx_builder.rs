@@ -903,6 +903,34 @@ pub async fn build_tx_plan(
     // This saves ~2000-3000 CU and avoids lamport noise that breaks fill_in detection.
     // Pump.fun BC swap instructions handle the SOL transfer internally.
 
+    // SELL: Ensure the input token ATA exists (idempotent) for pure-derivation planning.
+    // This matches BUY behavior (output token ATA creation) and keeps the tx-builder RPC-free.
+    if intent.side == TradeSide::Sell {
+        let token_mint = Pubkey::from_str(&intent.resources.input_mint).unwrap_or_default();
+        let token_mint_spl = SplProgramPubkey::new_from_array(token_mint.to_bytes());
+        let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
+
+        // Use token_program from intent if provided, otherwise default to SPL Token.
+        let token_program_spl = token_program_override
+            .map(|pk| SplProgramPubkey::new_from_array(pk.to_bytes()))
+            .unwrap_or_else(spl_token::id);
+
+        let token_ata_ix = prog_ix_to_sdk(
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &payer_spl,
+                &payer_spl,
+                &token_mint_spl,
+                &token_program_spl,
+            ),
+        );
+
+        let mut all_ixs = vec![token_ata_ix];
+        all_ixs.extend(ixs);
+        return TxPlanOutcome::Planned(TxPlan {
+            instructions: all_ixs,
+        });
+    }
+
     TxPlanOutcome::Planned(TxPlan { instructions: ixs })
 }
 

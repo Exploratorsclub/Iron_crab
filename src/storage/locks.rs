@@ -420,6 +420,15 @@ impl LockManager {
         *self.available_wsol.read()
     }
 
+    /// Get current available (unlocked) token balance for a mint (raw units).
+    pub fn available_token_balance(&self, mint: &str) -> u64 {
+        self.available_tokens
+            .read()
+            .get(mint)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Get total available capital for trading (WSOL for trades, SOL as fallback before init)
     ///
     /// Returns WSOL if initialized (even if 0), otherwise falls back to SOL.

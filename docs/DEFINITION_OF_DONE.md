@@ -707,6 +707,15 @@ Der TPU Client nutzt deinen Validator nur als **Datenquelle** (Leader Schedule, 
 
 ---
 
+## TODO (Phase 2): Wallet Tracking ohne RPC-Scanning (Option C)
+
+Ziel: market-data erkennt auch **manuelle Wallet-Aktionen** (Phantom/Jupiter/Transfers), ohne dass execution-engine Events der einzige Trigger sind.
+
+- [ ] **Option C: TX-Inferenz für ATA Lifecycle**: market-data parst relevante Instruktionen (Associated Token Program create/close, idempotent create) und ruft denselben internen „track this ATA/mint“ Pfad auf wie Option B (ExecutionResult-getrieben).  
+  Abnahme: **keine periodischen Wallet-RPC-Scans**, aber trotzdem Erkennung von neu erstellten/geschlossenen ATAs und schneller Geyser-Resubscribe.
+
+---
+
 ## Abnahme-„Stop Rule“ (gegen €100 Debugging)
 
 Wenn eine neue Funktionalität nicht mindestens erfüllt:

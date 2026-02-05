@@ -42,7 +42,6 @@ use solana_sdk::transaction::Transaction;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding, UiTransactionTokenBalance,
 };
-use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -59,7 +58,7 @@ use ironcrab::execution::live_pool_cache::{
 };
 use ironcrab::execution::quote_calculator;
 use ironcrab::execution::tx_builder;
-use ironcrab::execution::wsol_manager::{WsolManager, WsolManagerConfig};
+use ironcrab::execution::wsol_manager::{WsolManager, WsolManagerConfig, WSOL_MINT};
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, ExecutionResult, ExecutionStatus, ExplicitAmount, FairnessPolicy, FeePolicy,
@@ -3218,48 +3217,11 @@ impl ExecutionContext {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Increment open positions
-    fn increment_open_positions(&self) {
-        self.open_positions
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Decrement open positions
-    fn decrement_open_positions(&self) {
-        // Saturating decrement to avoid underflow.
-        let mut current = self
-            .open_positions
-            .load(std::sync::atomic::Ordering::Relaxed);
-
-        loop {
-            if current == 0 {
-                return;
-            }
-            match self.open_positions.compare_exchange_weak(
-                current,
-                current - 1,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
     /// Get current open positions count
     fn get_open_positions(&self) -> usize {
         self.open_positions
             .load(std::sync::atomic::Ordering::Relaxed)
     }
-}
-
-fn sdk_to_spl(pk: &Pubkey) -> spl_token::solana_program::pubkey::Pubkey {
-    spl_token::solana_program::pubkey::Pubkey::new_from_array(pk.to_bytes())
-}
-
-fn spl_to_sdk(pk: &spl_token::solana_program::pubkey::Pubkey) -> Pubkey {
-    Pubkey::new_from_array(pk.to_bytes())
 }
 
 #[allow(dead_code)]
@@ -3581,6 +3543,91 @@ async fn bootstrap_open_positions_from_wallet_snapshot(
     Ok(Some(mints.len()))
 }
 
+/// Bootstrap token balances from wallet snapshots (JetStream).
+///
+/// Uses last-per-subject WalletBalanceSnapshot events to seed LockManager.available_tokens
+/// without any RPC calls. Live updates continue via JetStream consumer in the main loop.
+async fn bootstrap_token_balances_from_wallet_snapshot(
+    nats_client: &NatsClient,
+    wallet: &Pubkey,
+    lock_manager: &LockManager,
+) -> Result<usize> {
+    use async_nats::jetstream;
+    use futures::StreamExt;
+
+    let jetstream = jetstream::new(nats_client.client().clone());
+    let stream = match jetstream.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                error = %e,
+                stream = WALLET_SNAPSHOT_STREAM_NAME,
+                "Wallet snapshot stream not found (market-data may not be running)"
+            );
+            return Ok(0);
+        }
+    };
+
+    let wallet_str = wallet.to_string();
+    let mut consumer_config = wallet_snapshot_consumer_config();
+    consumer_config.filter_subject = format!("ironcrab.wallet_snapshot.{}.*", wallet_str);
+
+    let consumer = stream.create_consumer(consumer_config).await?;
+    let batch_size = 1000;
+    let mut observed = 0usize;
+
+    loop {
+        let mut messages = consumer.fetch().max_messages(batch_size).messages().await?;
+        let mut batch_count = 0;
+
+        while let Some(msg) = messages.next().await {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(error = %e, "Error fetching wallet snapshot from JetStream");
+                    continue;
+                }
+            };
+            batch_count += 1;
+
+            let event: MarketEvent = match serde_json::from_slice(&msg.payload) {
+                Ok(e) => e,
+                Err(e) => {
+                    debug!(error = %e, "Failed to deserialize WalletBalanceSnapshot from JetStream");
+                    let _ = msg.ack().await;
+                    continue;
+                }
+            };
+
+            if let MarketEventKind::WalletBalanceSnapshot {
+                mint, balance_raw, ..
+            } = &event.kind
+            {
+                observed += 1;
+                if mint != SOL_MINT && mint != WSOL_MINT {
+                    lock_manager.set_available_token_balance(mint.clone(), *balance_raw);
+                }
+            }
+
+            let _ = msg.ack().await;
+        }
+
+        if batch_count < batch_size {
+            break;
+        }
+    }
+
+    if observed > 0 {
+        info!(
+            wallet = %wallet_str,
+            snapshots = observed,
+            "Wallet snapshot bootstrap: token balances seeded into LockManager"
+        );
+    }
+
+    Ok(observed)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -3879,54 +3926,22 @@ async fn main() -> Result<()> {
 
     info!(log_dir = %log_base.display(), "JSONL writers initialized");
 
-    // Load wallet keys and fetch real balance (SOL + WSOL)
-    // NOTE: In `--dry-run`, we still allow key loading and balance reads.
-    // `--dry-run` means: do not submit transactions, not: keyless.
+    // Load wallet keys (Single-Signer).
+    //
+    // Important constraint (see plan / architecture rules):
+    // - No RPC reads for SOL/WSOL/token balances in runtime (simulation excluded).
+    // - We therefore do NOT fetch balances here.
+    // - Balances are learned via market-data events:
+    //   - `WalletBalanceUpdate` (SOL + WSOL)
+    //   - JetStream `WALLET_SNAPSHOT` (token balances)
     let (wallet_pubkey, initial_sol, initial_wsol) = if let Some(ref t) = treasury {
         let pubkey = t.pubkey();
-
-        // RS-1.1 acceptance: getBalance through SolanaRpc
-        let sol_balance = match rpc.rpc.get_balance(&pubkey).await {
-            Ok(balance) => {
-                info!(wallet = %pubkey, balance_sol = balance as f64 / 1e9, "Native SOL balance fetched");
-                balance
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to fetch wallet SOL balance, using default");
-                args.initial_sol_lamports
-            }
-        };
-
-        // Fetch WSOL ATA balance for dashboard display
-        // Compute WSOL ATA address using PDA derivation (same as spl_associated_token_account)
-        let wsol_mint = Pubkey::from_str(SOL_MINT).expect("valid SOL_MINT");
-        let token_program = spl_token::ID;
-        let ata_program = Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-            .expect("valid ATA program");
-        let (wsol_ata, _bump) = Pubkey::find_program_address(
-            &[pubkey.as_ref(), token_program.as_ref(), wsol_mint.as_ref()],
-            &ata_program,
+        info!(
+            wallet = %pubkey,
+            initial_sol_lamports = args.initial_sol_lamports,
+            "Wallet keys loaded; skipping startup balance RPC (event-driven balances)"
         );
-        let wsol_balance = match rpc.rpc.get_token_account_balance(&wsol_ata).await {
-            Ok(balance) => {
-                let lamports = balance.amount.parse::<u64>().unwrap_or(0);
-                info!(
-                    wallet = %pubkey,
-                    wsol_ata = %wsol_ata,
-                    wsol_lamports = lamports,
-                    wsol_sol = lamports as f64 / 1e9,
-                    "WSOL ATA balance fetched"
-                );
-                Some(lamports)
-            }
-            Err(e) => {
-                // WSOL ATA might not exist yet (before first wrap)
-                debug!(error = %e, wsol_ata = %wsol_ata, "WSOL ATA not found or empty");
-                None
-            }
-        };
-
-        (Some(pubkey), sol_balance, wsol_balance)
+        (Some(pubkey), args.initial_sol_lamports, None)
     } else {
         (None, args.initial_sol_lamports, None)
     };
@@ -4049,6 +4064,15 @@ async fn main() -> Result<()> {
             Err(e) => {
                 warn!(error = %e, "Wallet snapshot bootstrap failed (keeping persisted open_positions)");
             }
+        }
+    }
+
+    // Seed token balances from wallet snapshot stream (JetStream) so SELL preflight is RPC-free.
+    if let (Some(ref nats_client), Some(wallet)) = (&nats, wallet_pubkey) {
+        if let Err(e) =
+            bootstrap_token_balances_from_wallet_snapshot(nats_client, &wallet, &lock_manager).await
+        {
+            warn!(error = %e, "Wallet snapshot bootstrap: failed to seed token balances");
         }
     }
 
@@ -4799,6 +4823,52 @@ async fn main() -> Result<()> {
 
     let mut pool_cache_consumer_opt = pool_cache_consumer;
 
+    // Subscribe to WalletBalanceSnapshot from JetStream (subject-per-wallet+mint).
+    //
+    // This keeps LockManager token balances synced WITHOUT any RPC calls.
+    let wallet_snapshot_consumer = if let (Some(ref nats), Some(wallet)) = (&ctx.nats, ctx.wallet_pubkey)
+    {
+        use async_nats::jetstream;
+
+        let jetstream = jetstream::new(nats.client().clone());
+        match jetstream.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
+            Ok(stream) => {
+                let wallet_str = wallet.to_string();
+                let mut cfg = wallet_snapshot_consumer_config();
+                cfg.filter_subject = format!("ironcrab.wallet_snapshot.{}.*", wallet_str);
+                match stream.create_consumer(cfg).await {
+                    Ok(consumer) => {
+                        info!(
+                            stream = WALLET_SNAPSHOT_STREAM_NAME,
+                            wallet = %wallet_str,
+                            "Subscribed to JetStream WalletBalanceSnapshot (token balance sync)"
+                        );
+                        Some(consumer)
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Failed to create JetStream consumer for WalletBalanceSnapshot"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    stream = WALLET_SNAPSHOT_STREAM_NAME,
+                    "JetStream wallet snapshot stream not found (market-data may not be running)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut wallet_snapshot_consumer_opt = wallet_snapshot_consumer;
+
     loop {
         tokio::select! {
             // Receive TradeIntents from channel (buffered from dedicated subscription task)
@@ -4957,6 +5027,53 @@ async fn main() -> Result<()> {
                         Err(e) => {
                             // Expected when no new messages - don't log as warning
                             debug!(error = %e, "No new messages in JetStream");
+                        }
+                    }
+                }
+
+                // Process WalletBalanceSnapshot updates from JetStream (token balances).
+                // Same non-blocking pattern as PoolCacheUpdates to avoid freezing the select! loop.
+                if let Some(ref mut consumer) = wallet_snapshot_consumer_opt {
+                    use futures::StreamExt;
+                    match consumer
+                        .fetch()
+                        .max_messages(500)
+                        .expires(std::time::Duration::from_millis(100))
+                        .messages()
+                        .await
+                    {
+                        Ok(mut messages) => {
+                            while let Some(msg_result) = messages.next().await {
+                                match msg_result {
+                                    Ok(msg) => {
+                                        match serde_json::from_slice::<MarketEvent>(&msg.payload) {
+                                            Ok(event) => {
+                                                if let MarketEventKind::WalletBalanceSnapshot { mint, balance_raw, .. } = &event.kind {
+                                                    if mint != SOL_MINT && mint != WSOL_MINT {
+                                                        ctx.lock_manager.set_available_token_balance(
+                                                            mint.clone(),
+                                                            *balance_raw,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                debug!(error = %e, "Failed to deserialize wallet snapshot MarketEvent");
+                                            }
+                                        }
+                                        if let Err(e) = msg.ack().await {
+                                            debug!(error = %e, "Failed to ack wallet snapshot message");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!(error = %e, "JetStream wallet snapshot fetch returned error");
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Expected when no new messages - keep debug-level
+                            debug!(error = %e, "No new wallet snapshot messages in JetStream");
                         }
                     }
                 }
@@ -5319,145 +5436,45 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
     // Check 3e: SELL token balance preflight (avoid emitting SELL intents we cannot fulfill)
     if intent.side == TradeSide::Sell {
-        let wallet = match ctx.wallet_pubkey {
-            Some(pk) => pk,
-            None => {
-                let reason = RejectReason::InternalError;
-                checks.push(CheckResult {
-                    check_name: "sell_token_balance".to_string(),
-                    passed: false,
-                    reason_code: Some(reason.to_string()),
-                    details: Some("wallet_pubkey_unavailable (no keys loaded)".to_string()),
-                });
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-            }
-        };
-
-        let rpc = Arc::clone(&ctx.rpc);
-
         let mint_str = intent.resources.input_mint.clone();
         let required_raw = intent.required_capital.raw;
 
-        let balance_check: Result<(u64, Pubkey, Pubkey)> = async {
-            let mint = Pubkey::from_str(&mint_str)
-                .map_err(|_| anyhow::anyhow!("invalid input_mint: {}", mint_str))?;
-
-            let spl_token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
-            let token_2022_program =
-                Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
-                    .expect("static pubkey");
-
-            // GEYSER-FIRST: Get token program from cache, not RPC
-            let cached_program = if let Some(cache) = ctx.live_pool_cache.as_ref() {
-                cache.get_mint_program(&mint)
-            } else {
-                None
-            };
-
-            // If we have a cached program, use it directly
-            if let Some(token_program) = cached_program {
-                let ata_spl = get_associated_token_address_with_program_id(
-                    &sdk_to_spl(&wallet),
-                    &sdk_to_spl(&mint),
-                    &sdk_to_spl(&token_program),
-                );
-                let ata = spl_to_sdk(&ata_spl);
-
-                let available_raw = match rpc.rpc.get_token_account_balance(&ata).await {
-                    Ok(ui) => ui
-                        .amount
-                        .parse::<u64>()
-                        .map_err(|e| anyhow::anyhow!("invalid token amount: {}", e))?,
-                    Err(_) => 0,
-                };
-
-                return Ok((available_raw, ata, token_program));
-            }
-
-            // No cache hit: Try SPL Token first (most common), then Token-2022
-            let ata_spl = get_associated_token_address_with_program_id(
-                &sdk_to_spl(&wallet),
-                &sdk_to_spl(&mint),
-                &sdk_to_spl(&spl_token_program),
-            );
-            let ata_spl_sdk = spl_to_sdk(&ata_spl);
-
-            let spl_balance = match rpc.rpc.get_token_account_balance(&ata_spl_sdk).await {
-                Ok(ui) => ui.amount.parse::<u64>().unwrap_or(0),
-                Err(_) => 0,
-            };
-
-            // If SPL Token has balance, use it
-            if spl_balance > 0 {
-                return Ok((spl_balance, ata_spl_sdk, spl_token_program));
-            }
-
-            // Try Token-2022
-            let ata_2022 = get_associated_token_address_with_program_id(
-                &sdk_to_spl(&wallet),
-                &sdk_to_spl(&mint),
-                &sdk_to_spl(&token_2022_program),
-            );
-            let ata_2022_sdk = spl_to_sdk(&ata_2022);
-
-            let t2022_balance = match rpc.rpc.get_token_account_balance(&ata_2022_sdk).await {
-                Ok(ui) => ui.amount.parse::<u64>().unwrap_or(0),
-                Err(_) => 0,
-            };
-
-            if t2022_balance > 0 {
-                return Ok((t2022_balance, ata_2022_sdk, token_2022_program));
-            }
-
-            // Neither has balance, return SPL Token ATA with 0
-            Ok((0, ata_spl_sdk, spl_token_program))
+        // This MUST be RPC-free. Balances are learned from market-data via JetStream wallet snapshots.
+        if ctx.wallet_pubkey.is_none() {
+            let reason = RejectReason::InternalError;
+            checks.push(CheckResult {
+                check_name: "sell_token_balance".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some("wallet_pubkey_unavailable (no keys loaded)".to_string()),
+            });
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
         }
-        .await;
 
-        match balance_check {
-            Ok((available_raw, ata, _token_program)) => {
-                // Seed lock-manager token availability so we can lock against it.
-                // This prevents overlapping SELLs on the same mint from overbooking.
-                ctx.lock_manager.set_available_token_balance(
-                    intent.resources.input_mint.clone(),
-                    available_raw,
-                );
-
-                if available_raw < required_raw {
-                    let reason = RejectReason::SimInsufficientBalance;
-                    checks.push(CheckResult {
-                        check_name: "sell_token_balance".to_string(),
-                        passed: false,
-                        reason_code: Some(reason.to_string()),
-                        details: Some(format!(
-                            "available={} < required={} (mint={}, ata={})",
-                            available_raw, required_raw, intent.resources.input_mint, ata
-                        )),
-                    });
-                    return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-                }
-
-                checks.push(CheckResult {
-                    check_name: "sell_token_balance".to_string(),
-                    passed: true,
-                    reason_code: None,
-                    details: Some(format!(
-                        "available={} >= required={} (ata={})",
-                        available_raw, required_raw, ata
-                    )),
-                });
-            }
-            Err(e) => {
-                let reason = RejectReason::InternalError;
-                checks.push(CheckResult {
-                    check_name: "sell_token_balance".to_string(),
-                    passed: false,
-                    reason_code: Some(reason.to_string()),
-                    details: Some(format!("rpc_error: {}", e)),
-                });
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-            }
+        let available_raw = ctx.lock_manager.available_token_balance(&mint_str);
+        if available_raw < required_raw {
+            let reason = RejectReason::SimInsufficientBalance;
+            checks.push(CheckResult {
+                check_name: "sell_token_balance".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some(format!(
+                    "available={} < required={} (mint={})",
+                    available_raw, required_raw, mint_str
+                )),
+            });
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
         }
+
+        checks.push(CheckResult {
+            check_name: "sell_token_balance".to_string(),
+            passed: true,
+            reason_code: None,
+            details: Some(format!(
+                "available={} >= required={} (mint={})",
+                available_raw, required_raw, mint_str
+            )),
+        });
     }
 
     // === P1: Fee/Compute Policy Checks ===
