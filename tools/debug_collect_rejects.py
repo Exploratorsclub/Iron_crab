@@ -51,6 +51,12 @@ def main() -> None:
     run_id = args.run_id
     mint = args.mint
 
+    # H0: Ensure we know what is deployed.
+    out0 = ssh(host, "cd ~/Iron_crab && git rev-parse HEAD && git log -1 --oneline || true")
+    log("H0", "tools/debug_collect_rejects.py:main", "Server git HEAD", {"text": out0}, run_id)
+    out0b = ssh(host, "systemctl is-active market-data execution-engine momentum-bot 2>/dev/null || true")
+    log("H0", "tools/debug_collect_rejects.py:main", "Systemd active status", {"text": out0b}, run_id)
+
     # H1: Wallet bootstrap overwrites non-ATA balances with 0 -> LOCK_CAPITAL_CONFLICT storms.
     # Collect decision reason distribution.
     out = ssh(
