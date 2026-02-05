@@ -549,7 +549,10 @@ async fn publish_wallet_snapshot(
     // 1) Discover known mints from JetStream (LastPerSubject) for this wallet.
     //    This avoids any RPC owner-scan and gives us stable coverage over restarts.
     let mut known_mints: Vec<Pubkey> = Vec::new();
-    let mut cached_mint_meta: HashMap<Pubkey, (u8, Pubkey)> = HashMap::new(); // mint -> (decimals, token_program)
+    // mint -> (decimals, token_program, last_balance_raw)
+    // IMPORTANT: if bootstrap cannot resolve a token account deterministically (non-ATA),
+    // we must NOT overwrite a previously correct balance with 0.
+    let mut cached_mint_meta: HashMap<Pubkey, (u8, Pubkey, u64)> = HashMap::new();
 
     if let Some(ref nats) = ctx.nats {
         let js = jetstream::new(nats.client().clone());
@@ -583,6 +586,7 @@ async fn publish_wallet_snapshot(
 
                             if let MarketEventKind::WalletBalanceSnapshot {
                                 mint,
+                                balance_raw,
                                 decimals,
                                 token_program,
                                 ..
@@ -597,7 +601,10 @@ async fn publish_wallet_snapshot(
                                 {
                                     if !cached_mint_meta.contains_key(&mint_pk) {
                                         known_mints.push(mint_pk);
-                                        cached_mint_meta.insert(mint_pk, (*decimals, token_prog_pk));
+                                        cached_mint_meta.insert(
+                                            mint_pk,
+                                            (*decimals, token_prog_pk, *balance_raw),
+                                        );
                                     }
                                 }
                             }
@@ -690,10 +697,8 @@ async fn publish_wallet_snapshot(
         )
         .0;
 
-        let mut token_program_used = cached_mint_meta
-            .get(&mint)
-            .map(|(_, p)| *p)
-            .unwrap_or(token_program);
+        let cached = cached_mint_meta.get(&mint).copied();
+        let mut token_program_used = cached.map(|(_, p, _)| p).unwrap_or(token_program);
 
         let mut balance_raw: u64 = 0;
         if let Some(acc) = fetched.get(&ata_spl) {
@@ -717,17 +722,31 @@ async fn publish_wallet_snapshot(
             }
         }
 
+        // If we could not resolve any token account in this single RPC call,
+        // fall back to the last persisted snapshot balance instead of overwriting with 0.
+        if balance_raw == 0 {
+            if let Some((_d, _tp, last_balance)) = cached {
+                if last_balance > 0 {
+                    debug!(
+                        mint = %mint,
+                        last_balance_raw = last_balance,
+                        "Wallet snapshot bootstrap: token account not resolved (non-ATA?); keeping last known balance"
+                    );
+                    balance_raw = last_balance;
+                }
+            }
+        }
+
         // Resolve decimals: mint account (authoritative) → cached snapshot → ctx cache → default.
         let decimals = if let Some(mint_acc) = fetched.get(&mint) {
             try_parse_mint_account(&mint_acc.owner, &mint_acc.data)
                 .map(|(d, _, _, _)| d)
-                .or_else(|| cached_mint_meta.get(&mint).map(|(d, _)| *d))
+                .or_else(|| cached.map(|(d, _, _)| d))
                 .or_else(|| ctx.tracked_wallet_mint_decimals.read().get(&mint).copied())
                 .unwrap_or(6)
         } else {
-            cached_mint_meta
-                .get(&mint)
-                .map(|(d, _)| *d)
+            cached
+                .map(|(d, _, _)| d)
                 .or_else(|| ctx.tracked_wallet_mint_decimals.read().get(&mint).copied())
                 .unwrap_or(6)
         };
