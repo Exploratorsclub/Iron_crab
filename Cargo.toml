@@ -156,3 +156,4 @@ path = "src/bin/pump_amm_tx_probe.rs"
 [[bin]]
 name = "setup-alt"
 path = "src/bin/setup_alt.rs"
+

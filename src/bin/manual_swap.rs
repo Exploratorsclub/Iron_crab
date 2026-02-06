@@ -18,17 +18,9 @@
 //!
 //! No external APIs - uses repo's existing DEX integrations
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
-use solana_client::rpc_client::RpcClient;
-use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    pubkey::Pubkey,
-    signature::{Keypair, Signer},
-    transaction::Transaction,
-};
 use std::path::PathBuf;
-use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[command(name = "manual-swap")]
@@ -73,7 +65,6 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
     let args = Args::parse();
 
     println!("🔧 Manual Swap Tool");
@@ -83,37 +74,9 @@ async fn main() -> Result<()> {
     println!("   Min out: {} lamports", args.min_out);
     println!();
 
-    // Load keypair
-    let keypair_bytes = std::fs::read(&args.keypair)
-        .with_context(|| format!("Failed to read keypair from {:?}", args.keypair))?;
-    
-    let keypair: Keypair = if keypair_bytes.len() == 64 {
-        // Raw bytes format
-        Keypair::from_bytes(&keypair_bytes)?
-    } else {
-        // JSON format
-        let secret: Vec<u8> = serde_json::from_slice(&keypair_bytes)?;
-        Keypair::from_bytes(&secret)?
-    };
-
-    println!("✅ Loaded wallet: {}", keypair.pubkey());
-
-    // Parse addresses
-    let input_mint = Pubkey::from_str(&args.input_mint)?;
-    let output_mint = Pubkey::from_str(&args.output_mint)?;
-    let pool = Pubkey::from_str(&args.pool)?;
-
-    // Connect to RPC
-    let rpc_client = RpcClient::new_with_commitment(
-        args.rpc_url.clone(),
-        CommitmentConfig::confirmed(),
-    );
-
-    println!("🔗 Connected to RPC: {}", args.rpc_url);
-
-    // Get recent blockhash
-    let recent_blockhash = rpc_client.get_latest_blockhash()?;
-    println!("📦 Recent blockhash: {}", recent_blockhash);
+    println!("   Keypair: {:?}", args.keypair);
+    println!("   RPC URL: {}", args.rpc_url);
+    println!();
 
     // TODO: Build swap instructions based on DEX type
     // For now, just show what would be done

@@ -12,7 +12,11 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Manual burn tool (KEYLESS): publishes BurnTokenAccounts ControlRequests to execution-engine")]
+#[command(
+    author,
+    version,
+    about = "Manual burn tool (KEYLESS): publishes BurnTokenAccounts ControlRequests to execution-engine"
+)]
 struct Args {
     #[arg(short, long, default_value = "my_config.server.toml")]
     config: PathBuf,
@@ -83,7 +87,10 @@ async fn token_program_for_mint(rpc: &SolanaRpc, mint: &Pubkey) -> anyhow::Resul
     } else if owner == spl22 {
         Ok(spl22)
     } else {
-        anyhow::bail!("Mint owner is neither spl-token nor spl-token-2022: {}", owner);
+        anyhow::bail!(
+            "Mint owner is neither spl-token nor spl-token-2022: {}",
+            owner
+        );
     }
 }
 
@@ -139,9 +146,9 @@ async fn main() -> anyhow::Result<()> {
 
     // RPC (only needed for --mint derivation)
     if let Some(url) = args.rpc_url.clone() {
-        cfg.rpc_url = url;
+        cfg.solana.rpc_url = url;
     }
-    let rpc = Arc::new(SolanaRpc::new(&cfg.rpc_url));
+    let rpc = Arc::new(SolanaRpc::new(&cfg.solana.rpc_url));
 
     let owner = Pubkey::from_str(&args.owner_pubkey)
         .map_err(|e| anyhow::anyhow!("invalid owner_pubkey: {e}"))?;
@@ -149,8 +156,8 @@ async fn main() -> anyhow::Result<()> {
     let mut token_accounts: Vec<Pubkey> = Vec::new();
 
     for ta in &args.token_account {
-        let p = Pubkey::from_str(ta)
-            .map_err(|e| anyhow::anyhow!("invalid token-account {ta}: {e}"))?;
+        let p =
+            Pubkey::from_str(ta).map_err(|e| anyhow::anyhow!("invalid token-account {ta}: {e}"))?;
         token_accounts.push(p);
     }
 

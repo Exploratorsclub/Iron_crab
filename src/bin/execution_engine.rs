@@ -1423,112 +1423,56 @@ impl ExecutionContext {
         #[cfg(unix)]
         maybe_ping_watchdog();
 
-        let token_program_id =
-            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
-        let token_2022_program_id =
-            Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
 
-        let mut token_accounts = match ctx
-            .rpc
-            .rpc
-            .get_token_accounts_by_owner(&owner, TokenAccountsFilter::ProgramId(token_program_id))
+        // RPC-FREE liquidation inventory:
+        // Use wallet snapshots from market-data (JetStream, last-per-mint) instead of RPC owner scans.
+        let Some(ref nats) = ctx.nats else {
+            warn!(
+                "Liquidation requested but NATS is not configured; cannot fetch wallet snapshots"
+            );
+            return;
+        };
+        let snapshot_entries = match fetch_wallet_snapshot_entries_from_jetstream(nats, &owner)
             .await
         {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "Failed to list token accounts (spl-token)");
-                Vec::new()
+                warn!(error = %e, "Liquidation: failed to fetch wallet snapshots from JetStream");
+                return;
             }
         };
-        #[cfg(unix)]
-        maybe_ping_watchdog();
 
-        if let Ok(mut accounts_2022) = ctx
-            .rpc
-            .rpc
-            .get_token_accounts_by_owner(
-                &owner,
-                TokenAccountsFilter::ProgramId(token_2022_program_id),
-            )
-            .await
-        {
-            token_accounts.append(&mut accounts_2022);
-        }
-        #[cfg(unix)]
-        maybe_ping_watchdog();
-
-        let mut seen_accounts = HashSet::new();
         let mut liquidation_intents: Vec<TradeIntent> = Vec::new();
 
-        for ta in token_accounts {
+        for (mint_str, balance_raw, decimals, token_program_str) in snapshot_entries {
             #[cfg(unix)]
             maybe_ping_watchdog();
 
-            if !seen_accounts.insert(ta.pubkey.clone()) {
+            // Skip non-positions
+            if balance_raw == 0 || mint_str == SOL_MINT || mint_str == WSOL_MINT {
                 continue;
             }
 
-            let ta_pubkey = match Pubkey::from_str(&ta.pubkey) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            // Extract mint+amount from JsonParsed only (safe/fast for liquidation).
-            let parsed = match ta.account.data {
-                UiAccountData::Json(parsed) => parsed,
-                _ => continue,
-            };
-            let serde_json::Value::Object(root) = parsed.parsed else {
-                continue;
-            };
-            let info = match root.get("info") {
-                Some(v) => v,
-                None => continue,
-            };
-            let mint_str = match info.get("mint").and_then(|v| v.as_str()) {
-                Some(s) => s,
-                None => continue,
-            };
-            let amount_str = info
-                .get("tokenAmount")
-                .and_then(|v| v.get("amount"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("0");
-
-            let mint = match Pubkey::from_str(mint_str) {
+            let mint = match Pubkey::from_str(&mint_str) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
             if mint == sol_mint {
                 continue;
             }
-            let amount_in: u64 = match amount_str.parse() {
-                Ok(a) => a,
-                Err(_) => continue,
+            let token_program = match Pubkey::from_str(&token_program_str) {
+                Ok(p) => p,
+                Err(_) => {
+                    // Defensive: should not happen (market-data publishes token_program)
+                    Self::token_program_for_mint_cached(ctx.live_pool_cache.as_deref(), &mint, None)
+                }
             };
-            if amount_in == 0 {
-                continue;
-            }
-
-            // Use the token account's owner (= token program) directly from RPC response
-            // This is more reliable than cache lookup for Token-2022 tokens
-            let token_program = Pubkey::from_str(&ta.account.owner).unwrap_or_else(|_| {
-                // Fallback to cache-based lookup if owner parsing fails
-                Self::token_program_for_mint_cached(
-                    ctx.live_pool_cache.as_deref(),
-                    &mint,
-                    None, // No DEX hint in liquidation context
-                )
-            });
             #[cfg(unix)]
             maybe_ping_watchdog();
             let ata = Self::ata_for_owner_mint(&owner, &mint, &token_program);
-            if ta_pubkey != ata {
-                continue;
-            }
-
-            let decimals = get_token_decimals_or_default(ctx.rpc.as_ref(), &mint).await;
+            let ta_pubkey = ata;
+            let amount_in: u64 = balance_raw;
             #[cfg(unix)]
             maybe_ping_watchdog();
 
@@ -1575,24 +1519,10 @@ impl ExecutionContext {
                                 let mut _creator_found = false;
                                 if let Ok(bc) = Pubkey::from_str(bc_str) {
                                     if let Some(cache) = ctx.live_pool_cache.as_ref() {
-                                        if let Some(CachedPoolState::PumpFun(pf)) = cache.get(&bc) {
-                                            // PumpFunState doesn't have creator yet - skip for now
-                                            // The creator is only needed for metadata, not TX execution
-                                            let _ = pf; // suppress unused warning
-                                        }
-                                    }
-                                    // TODO: Remove this RPC fallback once PumpFunState includes creator
-                                    // This is liquidation path (not hot-path), so acceptable for now
-                                    if !_creator_found {
-                                        if let Ok(acct) = ctx.rpc.rpc.get_account(&bc).await {
-                                            if let Ok(state) = BondingCurveState::parse(&acct.data)
-                                            {
-                                                metadata.insert(
-                                                    "creator".to_string(),
-                                                    state.creator.to_string(),
-                                                );
-                                                _creator_found = true;
-                                            }
+                                        if let Some(creator) = cache.get_pumpfun_creator(&bc) {
+                                            metadata
+                                                .insert("creator".to_string(), creator.to_string());
+                                            _creator_found = true;
                                         }
                                     }
                                 }
@@ -3628,6 +3558,86 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
     Ok(observed)
 }
 
+/// Fetch wallet token snapshots (JetStream last-per-subject) for a wallet.
+///
+/// This is RPC-free and intended for non-steady-state flows that need a
+/// one-shot view of wallet holdings with decimals + token_program, e.g.
+/// liquidation / operator tools.
+async fn fetch_wallet_snapshot_entries_from_jetstream(
+    nats_client: &NatsClient,
+    wallet: &Pubkey,
+) -> Result<Vec<(String, u64, u8, String)>> {
+    use async_nats::jetstream;
+    use futures::StreamExt;
+
+    let jetstream = jetstream::new(nats_client.client().clone());
+    let stream = match jetstream.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                error = %e,
+                stream = WALLET_SNAPSHOT_STREAM_NAME,
+                "Wallet snapshot stream not found (market-data may not be running)"
+            );
+            return Ok(Vec::new());
+        }
+    };
+
+    let wallet_str = wallet.to_string();
+    let mut consumer_config = wallet_snapshot_consumer_config();
+    consumer_config.filter_subject = format!("ironcrab.wallet_snapshot.{}.*", wallet_str);
+
+    let consumer = stream.create_consumer(consumer_config).await?;
+    let batch_size = 1000;
+    let mut out: Vec<(String, u64, u8, String)> = Vec::new(); // (mint, balance_raw, decimals, token_program)
+
+    loop {
+        let mut messages = consumer.fetch().max_messages(batch_size).messages().await?;
+        let mut batch_count = 0;
+
+        while let Some(msg) = messages.next().await {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(error = %e, "Error fetching wallet snapshot from JetStream");
+                    continue;
+                }
+            };
+            batch_count += 1;
+
+            let event: MarketEvent = match serde_json::from_slice(&msg.payload) {
+                Ok(e) => e,
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        "Failed to deserialize WalletBalanceSnapshot from JetStream"
+                    );
+                    let _ = msg.ack().await;
+                    continue;
+                }
+            };
+
+            if let MarketEventKind::WalletBalanceSnapshot {
+                mint,
+                balance_raw,
+                decimals,
+                token_program,
+            } = &event.kind
+            {
+                out.push((mint.clone(), *balance_raw, *decimals, token_program.clone()));
+            }
+
+            let _ = msg.ack().await;
+        }
+
+        if batch_count < batch_size {
+            break;
+        }
+    }
+
+    Ok(out)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -4826,7 +4836,8 @@ async fn main() -> Result<()> {
     // Subscribe to WalletBalanceSnapshot from JetStream (subject-per-wallet+mint).
     //
     // This keeps LockManager token balances synced WITHOUT any RPC calls.
-    let wallet_snapshot_consumer = if let (Some(ref nats), Some(wallet)) = (&ctx.nats, ctx.wallet_pubkey)
+    let wallet_snapshot_consumer = if let (Some(ref nats), Some(wallet)) =
+        (&ctx.nats, ctx.wallet_pubkey)
     {
         use async_nats::jetstream;
 
@@ -6076,6 +6087,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     let mut bundle_id: Option<String> = None;
     let mut send_signature: Option<String> = None;
     let mut send_method_used: Option<String> = None;
+    let mut sent_tx: Option<Transaction> = None;
     let mut sent_anything = false;
     let mut send_failed = false;
 
@@ -6317,6 +6329,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     sent_anything = true;
                     send_signature = Some(result.signature.clone());
                     send_method_used = Some(result.method.clone());
+                    sent_tx = Some(result.tx);
                     checks.push(CheckResult {
                         check_name: "send".to_string(),
                         passed: true,
@@ -6455,7 +6468,14 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             }
         } else if let Some(ref sr) = send_result {
             if let Some(ref sig_str) = sr.signature {
-                match confirm_signature_status(ctx, sig_str, config.confirmation_timeout_ms).await {
+                match confirm_signature_status(
+                    ctx,
+                    sig_str,
+                    config.confirmation_timeout_ms,
+                    sent_tx.as_ref(),
+                )
+                .await
+                {
                     Ok(ConfirmOutcome::Confirmed { details }) => {
                         checks.push(CheckResult {
                             check_name: "confirm".to_string(),
@@ -7134,7 +7154,8 @@ async fn send_transaction_rpc(
 /// Send transaction result with method tracking
 struct SendTxResult {
     signature: String,
-    method: String, // "tpu", "jito", "rpc"
+    method: String,  // "tpu", "jito", "rpc"
+    tx: Transaction, // signed legacy transaction (for rebroadcast during confirm)
 }
 
 /// Send transaction with TxSender fallback chain (TPU → Jito → RPC).
@@ -7187,6 +7208,7 @@ async fn send_transaction_with_fallback(
                 return Ok(SendTxResult {
                     signature: result.signature.to_string(),
                     method: method_str,
+                    tx,
                 });
             }
             Err(e) => {
@@ -7205,18 +7227,25 @@ async fn send_transaction_with_fallback(
         min_context_slot: None,
     };
 
-    ctx.rpc
+    // IMPORTANT:
+    // Reuse the *exact* signed transaction we are sending as `sent_tx` for any rebroadcasts
+    // during confirmation polling. Creating a new Transaction here could change the signature
+    // (e.g. if blockhash changes or signing is not perfectly deterministic).
+    let versioned = solana_sdk::transaction::VersionedTransaction::from(tx.clone());
+
+    match ctx
         .rpc
-        .send_transaction_with_config(
-            &solana_sdk::transaction::VersionedTransaction::from(tx),
-            config,
-        )
+        .rpc
+        .send_transaction_with_config(&versioned, config)
         .await
-        .map(|sig| SendTxResult {
+    {
+        Ok(sig) => Ok(SendTxResult {
             signature: sig.to_string(),
             method: "rpc".into(),
-        })
-        .map_err(|e| format!("rpc_error:{e}"))
+            tx,
+        }),
+        Err(e) => Err(format!("rpc_error:{e}")),
+    }
 }
 
 fn parse_commitment_level_opt(value: Option<&str>) -> Option<CommitmentLevel> {
@@ -7263,6 +7292,7 @@ async fn confirm_signature_status(
     ctx: &ExecutionContext,
     signature_base58: &str,
     timeout_ms: u64,
+    rebroadcast_tx: Option<&Transaction>,
 ) -> std::result::Result<ConfirmOutcome, String> {
     let signature =
         Signature::from_str(signature_base58).map_err(|e| format!("invalid_signature:{e}"))?;
@@ -7270,13 +7300,14 @@ async fn confirm_signature_status(
     let start = std::time::Instant::now();
     let deadline = Duration::from_millis(timeout_ms.max(1));
     let mut attempt: u32 = 0;
+    let mut rebroadcasts: u32 = 0;
 
     loop {
         if start.elapsed() >= deadline {
             TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
             return Ok(ConfirmOutcome::TimeoutSent {
                 details: format!(
-                    "timeout_ms={timeout_ms} elapsed_ms={} signature={signature_base58}",
+                    "timeout_ms={timeout_ms} elapsed_ms={} signature={signature_base58} rebroadcasts={rebroadcasts}",
                     start.elapsed().as_millis()
                 ),
             });
@@ -7323,6 +7354,43 @@ async fn confirm_signature_status(
                         start.elapsed().as_millis()
                     ),
                 });
+            }
+        }
+
+        // If the status is still missing/only processed, rebroadcast occasionally.
+        // This helps when initial send was accepted but not propagated.
+        if let Some(tx) = rebroadcast_tx {
+            // Roughly every ~500ms-1s depending on backoff. Hard cap to avoid spamming.
+            if rebroadcasts < 5 && attempt > 0 && attempt % 10 == 0 {
+                let cfg = RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    preflight_commitment: None,
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    max_retries: Some(3),
+                    min_context_slot: None,
+                };
+
+                let vtx = solana_sdk::transaction::VersionedTransaction::from(tx.clone());
+                match ctx.rpc.rpc.send_transaction_with_config(&vtx, cfg).await {
+                    Ok(sig) => {
+                        rebroadcasts = rebroadcasts.saturating_add(1);
+                        info!(
+                            signature = %sig,
+                            original_signature = %signature_base58,
+                            rebroadcasts = rebroadcasts,
+                            "Rebroadcasted TX during confirm polling"
+                        );
+                    }
+                    Err(e) => {
+                        rebroadcasts = rebroadcasts.saturating_add(1);
+                        warn!(
+                            error = %e,
+                            original_signature = %signature_base58,
+                            rebroadcasts = rebroadcasts,
+                            "Rebroadcast attempt failed during confirm polling"
+                        );
+                    }
+                }
             }
         }
 

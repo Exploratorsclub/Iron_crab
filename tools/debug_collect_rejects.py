@@ -66,14 +66,12 @@ import os,glob,json,collections
 base=os.path.expanduser('~/Iron_crab/trade_logs/decisions')
 files=sorted(glob.glob(os.path.join(base,'decision_records-*.jsonl')))
 latest=files[-1]
-from collections import deque
-q=deque(maxlen=6000)
-with open(latest,'rb') as f:
-    for line in f: q.append(line)
+import subprocess
+lines=subprocess.check_output(['tail','-n','6000',latest]).splitlines()
 counts=collections.Counter()
 reject=collections.Counter()
 simerr=collections.Counter()
-for raw in list(q)[-2000:]:
+for raw in lines[-2000:]:
     try: obj=json.loads(raw)
     except Exception: continue
     outc=obj.get('outcome')
@@ -104,21 +102,22 @@ PY""",
 import os,glob,json
 base=os.path.expanduser('~/Iron_crab/trade_logs/decisions')
 latest=sorted(glob.glob(os.path.join(base,'decision_records-*.jsonl')))[-1]
+import subprocess
+lines=subprocess.check_output(['tail','-n','8000',latest]).splitlines()
 rows=[]
-with open(latest,'rb') as f:
-    for line in f:
-        try: o=json.loads(line)
-        except Exception: continue
-        if o.get('primary_reject_reason')!='LOCK_CAPITAL_CONFLICT': continue
-        for c in (o.get('checks') or []):
-            if c.get('check_name')=='capital_lock':
-                rows.append({
-                    "ts": o.get("ts_unix_ms"),
-                    "decision_id": o.get("decision_id"),
-                    "intent_id": o.get("intent_id"),
-                    "details": c.get("details"),
-                })
-                break
+for line in lines:
+    try: o=json.loads(line)
+    except Exception: continue
+    if o.get('primary_reject_reason')!='LOCK_CAPITAL_CONFLICT': continue
+    for c in (o.get('checks') or []):
+        if c.get('check_name')=='capital_lock':
+            rows.append({
+                "ts": o.get("ts_unix_ms"),
+                "decision_id": o.get("decision_id"),
+                "intent_id": o.get("intent_id"),
+                "details": c.get("details"),
+            })
+            break
 print(json.dumps({"count": len(rows), "last": rows[-5:]}, ensure_ascii=False))
 PY""",
     )
@@ -136,19 +135,19 @@ import os,glob,json
 mint='{mint}'
 path=sorted(glob.glob(os.path.expanduser('~/Iron_crab/trade_logs/market_events/market_events-*.jsonl')))[-1]
 rows=[]
-with open(path,'rb') as f:
-    for line in f:
-        if mint.encode() not in line: continue
-        if b'WalletBalanceSnapshot' not in line: continue
-        try: o=json.loads(line)
-        except Exception: continue
-        rows.append({{
-            "ts": o.get("ts_unix_ms"),
-            "source": o.get("source"),
-            "balance_raw": o.get("balance_raw"),
-            "decimals": o.get("decimals"),
-            "token_program": o.get("token_program"),
-        }})
+import subprocess
+for line in subprocess.check_output(['tail','-n','20000',path]).splitlines():
+    if mint.encode() not in line: continue
+    if b'WalletBalanceSnapshot' not in line: continue
+    try: o=json.loads(line)
+    except Exception: continue
+    rows.append({{
+        "ts": o.get("ts_unix_ms"),
+        "source": o.get("source"),
+        "balance_raw": o.get("balance_raw"),
+        "decimals": o.get("decimals"),
+        "token_program": o.get("token_program"),
+    }})
 rows.sort(key=lambda r: r.get("ts") or 0)
 nz=[r for r in rows if (r.get("balance_raw") or 0)>0]
 payload={{
@@ -174,20 +173,21 @@ PY""",
 import os,glob,json
 base=os.path.expanduser('~/Iron_crab/trade_logs/decisions')
 latest=sorted(glob.glob(os.path.join(base,'decision_records-*.jsonl')))[-1]
+import subprocess
+lines=subprocess.check_output(['tail','-n','8000',latest]).splitlines()
 rows=[]
-with open(latest,'rb') as f:
-    for line in f:
-        try: o=json.loads(line)
-        except Exception: continue
-        if o.get('outcome')!='SimFailed': continue
-        rr=o.get('primary_reject_reason') or ''
-        if 'IncorrectProgramId' not in rr: continue
-        rows.append({
-            "ts": o.get("ts_unix_ms"),
-            "decision_id": o.get("decision_id"),
-            "intent_id": o.get("intent_id"),
-            "reason": rr,
-        })
+for line in lines:
+    try: o=json.loads(line)
+    except Exception: continue
+    if o.get('outcome')!='SimFailed': continue
+    rr=o.get('primary_reject_reason') or ''
+    if 'IncorrectProgramId' not in rr: continue
+    rows.append({
+        "ts": o.get("ts_unix_ms"),
+        "decision_id": o.get("decision_id"),
+        "intent_id": o.get("intent_id"),
+        "reason": rr,
+    })
 print(json.dumps({"count": len(rows), "last": rows[-5:]}, ensure_ascii=False))
 PY""",
     )

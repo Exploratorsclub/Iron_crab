@@ -239,6 +239,14 @@ impl TxSender {
         // Run both in parallel, collect results
         let (tpu_result, rpc_result) = tokio::join!(tpu_future, rpc_future);
 
+        // Observability: record whether both legs succeeded.
+        // Note: underlying legs already log errors at WARN level.
+        info!(
+            tpu_ok = tpu_result.is_some(),
+            rpc_ok = rpc_result.is_some(),
+            "Parallel send results collected"
+        );
+
         // Prefer TPU result if available (it was sent first/faster typically)
         // But either result is valid since it's the same TX
         match (tpu_result, rpc_result) {

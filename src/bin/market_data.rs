@@ -31,8 +31,8 @@ use uuid::Uuid;
 use ironcrab::config::WalletTrackerCfg;
 use ironcrab::execution::wsol_manager::WalletBalanceUpdate;
 use ironcrab::ipc::{
-    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, IntentTier, MarketEvent,
-    ExecutionResult, MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles, RecordHeader,
+    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult, IntentTier,
+    MarketEvent, MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles, RecordHeader,
 };
 use ironcrab::metrics::{
     serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
@@ -40,9 +40,9 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_pool_cache_stream,
-    ensure_wallet_snapshot_stream, pool_subject, wallet_balance_topic, wallet_snapshot_subject,
-    wallet_snapshot_consumer_config, NatsClient, NatsConfig, CONFIG_STREAM_NAME,
-    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES,
+    ensure_wallet_snapshot_stream, pool_subject, wallet_balance_topic,
+    wallet_snapshot_consumer_config, wallet_snapshot_subject, NatsClient, NatsConfig,
+    CONFIG_STREAM_NAME, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES,
     WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
@@ -528,11 +528,8 @@ async fn publish_wallet_snapshot(
     is_periodic: bool,
 ) -> Result<()> {
     use async_nats::jetstream;
-    use base64::Engine;
-    use solana_account_decoder::UiAccountData;
-    use solana_client::rpc_request::TokenAccountsFilter;
     use futures::StreamExt;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // Constraint: At most one RPC roundtrip on restart.
     // In practice this also bounds the tracked accounts we add for wallet tracking.
@@ -542,9 +539,7 @@ async fn publish_wallet_snapshot(
         .expect("valid token program");
     let token_2022_program = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
         .expect("valid token-2022 program");
-    let sol_mint =
-        Pubkey::from_str("So11111111111111111111111111111111111111112").expect("valid sol mint");
-    let _ata_program =
+    let ata_program =
         Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID).expect("valid associated token program");
 
     let wallet_str = wallet.to_string();
@@ -562,7 +557,8 @@ async fn publish_wallet_snapshot(
         match js.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
             Ok(stream) => {
                 let mut consumer_config = wallet_snapshot_consumer_config();
-                consumer_config.filter_subject = format!("ironcrab.wallet_snapshot.{}.*", wallet_str);
+                consumer_config.filter_subject =
+                    format!("ironcrab.wallet_snapshot.{}.*", wallet_str);
                 match stream.create_consumer(consumer_config).await {
                     Ok(consumer) => {
                         // Pull up to N wallet snapshot subjects (bounded).
@@ -628,153 +624,160 @@ async fn publish_wallet_snapshot(
         }
     }
 
+    // If JetStream has no prior snapshots (first-ever startup), allow an operator-provided
+    // mint list to break the circular dependency ("no known mints" -> no bootstrap).
+    if known_mints.is_empty() {
+        if let Ok(v) = std::env::var("IRONCRAB_BOOTSTRAP_MINTS") {
+            for s in v.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+                match Pubkey::from_str(s) {
+                    Ok(m) => known_mints.push(m),
+                    Err(e) => {
+                        warn!(mint = %s, error = %e, "Invalid IRONCRAB_BOOTSTRAP_MINTS entry")
+                    }
+                }
+            }
+            known_mints.sort();
+            known_mints.dedup();
+        }
+    }
+
     if known_mints.is_empty() {
         info!(
             wallet = %wallet_str,
-            "Wallet snapshot bootstrap: no known mints in JetStream (skipping RPC bootstrap)"
+            "Wallet snapshot bootstrap: no known mints (JetStream empty; no IRONCRAB_BOOTSTRAP_MINTS); publishing empty snapshot complete"
         );
+        // Still publish WalletSnapshotComplete and keep Geyser subscriptions warm for wallet + WSOL.
+        // Token holdings will be learned event-driven (ExecutionResults + Geyser).
     }
 
-    // 2) Bootstrap wallet token balances via RPC owner-scan (startup only).
+    // 2) Single RPC roundtrip: fetch mint accounts + derived SPL/2022 ATAs via getMultipleAccounts.
     //
-    // Rationale: wallets can contain non-ATA token accounts. Pure ATA derivation can miss
-    // real balances and incorrectly publish 0 (which then breaks SELL preflight/locking).
-    //
-    // This remains bounded to startup and replaces periodic scans.
-    let accounts_spl = match rpc
-        .rpc
-        .get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(token_program))
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "Wallet snapshot bootstrap: failed to scan SPL token accounts");
-            Vec::new()
-        }
-    };
-    let accounts_2022 = match rpc
-        .rpc
-        .get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(token_2022_program))
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "Wallet snapshot bootstrap: failed to scan Token-2022 accounts");
-            Vec::new()
-        }
-    };
-
-    if accounts_spl.is_empty() && accounts_2022.is_empty() {
-        warn!(
-            wallet = %wallet_str,
-            "Wallet snapshot bootstrap: no token accounts returned (skipping publish to avoid overwriting)"
+    // IMPORTANT: This does not do an owner-scan. We only reconcile mints we already know from JetStream.
+    // This keeps RPC to a single request and avoids architectural drift back into scanning.
+    fn derive_ata(owner: &Pubkey, mint: &Pubkey, token_prog: &Pubkey, ata_prog: &Pubkey) -> Pubkey {
+        let (ata, _bump) = Pubkey::find_program_address(
+            &[owner.as_ref(), token_prog.as_ref(), mint.as_ref()],
+            ata_prog,
         );
-        return Ok(());
+        ata
     }
 
-    // Aggregate balances per mint and collect token accounts to subscribe via Geyser.
-    let mut per_mint: HashMap<Pubkey, (u64, u8, Pubkey)> = HashMap::new(); // mint -> (sum_balance_raw, decimals, token_program)
+    let mut accounts_by_key: HashMap<Pubkey, solana_sdk::account::Account> = HashMap::new();
+    if !known_mints.is_empty() {
+        let mut keys: Vec<Pubkey> = Vec::with_capacity(known_mints.len() * 3);
+        for mint in &known_mints {
+            keys.push(*mint);
+            keys.push(derive_ata(wallet, mint, &token_program, &ata_program));
+            keys.push(derive_ata(wallet, mint, &token_2022_program, &ata_program));
+        }
+        keys.sort();
+        keys.dedup();
 
-    let mut wallet_token_accounts: std::collections::HashSet<Pubkey> =
-        std::collections::HashSet::new();
-
-    for (program_id, accounts) in [
-        (token_program, accounts_spl),
-        (token_2022_program, accounts_2022),
-    ] {
-        for account in accounts {
-            let account_pubkey = match Pubkey::from_str(&account.pubkey) {
-                Ok(pk) => pk,
-                Err(_) => continue,
-            };
-
-            let (mint, balance_raw, decimals_opt) = match &account.account.data {
-                UiAccountData::Json(parsed) => {
-                    let serde_json::Value::Object(root) = &parsed.parsed else {
-                        continue;
-                    };
-                    let Some(info) = root.get("info").and_then(|v| v.as_object()) else {
-                        continue;
-                    };
-                    let Some(mint_str) = info.get("mint").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let Ok(mint) = Pubkey::from_str(mint_str) else {
-                        continue;
-                    };
-                    let Some(token_amount) = info.get("tokenAmount").and_then(|v| v.as_object())
-                    else {
-                        continue;
-                    };
-                    let Some(amount_str) = token_amount.get("amount").and_then(|v| v.as_str())
-                    else {
-                        continue;
-                    };
-                    let Ok(balance_raw) = amount_str.parse::<u64>() else {
-                        continue;
-                    };
-                    let decimals = token_amount.get("decimals").and_then(|v| v.as_u64()).map(|d| d as u8);
-                    (mint, balance_raw, decimals)
-                }
-                UiAccountData::Binary(data, _) | UiAccountData::LegacyBinary(data) => {
-                    // Fallback: parse token account (mint + amount) from raw layout.
-                    let decoded = base64::engine::general_purpose::STANDARD.decode(data).ok();
-                    let Some(raw) = decoded else {
-                        continue;
-                    };
-                    let (mint, balance_raw) = if program_id == token_program {
-                        let Ok(acc) = spl_token::state::Account::unpack(&raw) else {
-                            continue;
-                        };
-                        (Pubkey::new_from_array(acc.mint.to_bytes()), acc.amount)
-                    } else {
-                        let Ok(acc) = spl_token_2022::state::Account::unpack(&raw) else {
-                            continue;
-                        };
-                        (Pubkey::new_from_array(acc.mint.to_bytes()), acc.amount)
-                    };
-                    (mint, balance_raw, None)
-                }
-            };
-
-            // Skip SOL/WSOL mint.
-            if mint == sol_mint {
-                continue;
+        let fetched = match rpc.rpc.get_multiple_accounts(&keys).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, wallet = %wallet_str, "Wallet snapshot bootstrap: getMultipleAccounts failed");
+                return Ok(());
             }
+        };
 
-            // Cache decimals if present.
-            let decimals = decimals_opt
-                .or_else(|| cached_mint_meta.get(&mint).map(|(d, _, _)| *d))
-                .or_else(|| ctx.tracked_wallet_mint_decimals.read().get(&mint).copied())
-                .unwrap_or(6);
-            ctx.tracked_wallet_mint_decimals.write().insert(mint, decimals);
+        for (idx, maybe_acc) in fetched.into_iter().enumerate() {
+            if let Some(acc) = maybe_acc {
+                if let Some(pk) = keys.get(idx) {
+                    accounts_by_key.insert(*pk, acc);
+                }
+            }
+        }
+    }
 
-            // Track token account for Geyser subscription (covers non-ATA accounts).
-            wallet_token_accounts.insert(account_pubkey);
+    // Publish per-mint snapshots (truth from RPC bootstrap).
+    let mut mints_in_wallet: Vec<String> = Vec::new();
+    let mut wallet_token_accounts: HashSet<Pubkey> = HashSet::new();
 
-            // Aggregate mint balances.
-            per_mint
-                .entry(mint)
-                .and_modify(|e| {
-                    e.0 = e.0.saturating_add(balance_raw);
-                    // Keep existing decimals/program_id.
-                })
-                .or_insert((balance_raw, decimals, program_id));
+    for mint in &known_mints {
+        let last_meta = cached_mint_meta.get(mint).copied();
 
-            // Track mint for TokenMintInfo via Geyser (no RPC here).
+        // Resolve decimals: prefer mint account from RPC; fall back to last persisted snapshot.
+        let decimals = accounts_by_key
+            .get(mint)
+            .and_then(|acc| try_parse_mint_account(&acc.owner, &acc.data).map(|(d, _, _, _)| d))
+            .or_else(|| last_meta.map(|(d, _, _)| d))
+            .or_else(|| ctx.tracked_wallet_mint_decimals.read().get(mint).copied())
+            .unwrap_or_else(|| {
+                warn!(
+                    mint = %mint,
+                    "Bootstrap: decimals unknown for mint; defaulting to 6"
+                );
+                6
+            });
+        ctx.tracked_wallet_mint_decimals
+            .write()
+            .insert(*mint, decimals);
+
+        // Resolve balance via ATA accounts only (no scanning).
+        let ata_spl = derive_ata(wallet, mint, &token_program, &ata_program);
+        let ata_2022 = derive_ata(wallet, mint, &token_2022_program, &ata_program);
+
+        let mut observed: Option<(u64, Pubkey, Pubkey)> = None; // (amount_raw, ata, token_program)
+
+        if let Some(acc) = accounts_by_key.get(&ata_spl) {
+            if acc.owner.to_bytes() == spl_token::ID.to_bytes() {
+                if let Ok(ta) = spl_token::state::Account::unpack(&acc.data) {
+                    let mint_pk = Pubkey::new_from_array(ta.mint.to_bytes());
+                    let owner_pk = Pubkey::new_from_array(ta.owner.to_bytes());
+                    if mint_pk == *mint && owner_pk == *wallet {
+                        observed = Some((ta.amount, ata_spl, token_program));
+                    }
+                }
+            }
+        }
+        if observed.is_none() {
+            if let Some(acc) = accounts_by_key.get(&ata_2022) {
+                if acc.owner.to_bytes() == spl_token_2022::ID.to_bytes() {
+                    if let Ok(ta) = spl_token_2022::state::Account::unpack(&acc.data) {
+                        let mint_pk = Pubkey::new_from_array(ta.mint.to_bytes());
+                        let owner_pk = Pubkey::new_from_array(ta.owner.to_bytes());
+                        if mint_pk == *mint && owner_pk == *wallet {
+                            observed = Some((ta.amount, ata_2022, token_2022_program));
+                        }
+                    }
+                }
+            }
+        }
+
+        let (balance_raw, token_program_used, maybe_ata) = match observed {
+            Some((amt, ata, prog)) => (amt, prog, Some(ata)),
+            None => {
+                // If the last persisted snapshot claimed a non-zero balance and we cannot
+                // resolve an ATA deterministically, do NOT overwrite it with 0.
+                if let Some((_d, _prog, last_balance_raw)) = last_meta {
+                    if last_balance_raw > 0 {
+                        mints_in_wallet.push(mint.to_string());
+                        continue;
+                    }
+                }
+                (
+                    0u64,
+                    last_meta.map(|(_, p, _)| p).unwrap_or(token_program),
+                    None,
+                )
+            }
+        };
+
+        if let Some(ata) = maybe_ata {
+            wallet_token_accounts.insert(ata);
+        }
+        if balance_raw > 0 {
+            mints_in_wallet.push(mint.to_string());
+        }
+
+        // Ensure mint is tracked so Geyser can publish TokenMintInfo later (no RPC here).
+        {
             let mut tracked = ctx.tracked_mints.write();
-            if tracked.insert(mint) {
+            if tracked.insert(*mint) {
                 let updated: Vec<Pubkey> = tracked.iter().copied().collect();
                 let _ = ctx.tracked_mints_tx.send(updated);
             }
-        }
-    }
-
-    // 3) Publish per-mint snapshots (truth from RPC scan).
-    let mut mints_with_balance: Vec<String> = Vec::new();
-    for (mint, (balance_raw, decimals, token_program_used)) in per_mint.iter() {
-        if *balance_raw > 0 {
-            mints_with_balance.push(mint.to_string());
         }
 
         let mint_str = mint.to_string();
@@ -787,8 +790,8 @@ async fn publish_wallet_snapshot(
             None, // No slot for RPC bootstrap
             MarketEventKind::WalletBalanceSnapshot {
                 mint: mint_str.clone(),
-                balance_raw: *balance_raw,
-                decimals: *decimals,
+                balance_raw,
+                decimals,
                 token_program: token_program_used.to_string(),
             },
         );
@@ -807,10 +810,9 @@ async fn publish_wallet_snapshot(
         if let Err(e) = ctx.jsonl_writer.write(&event) {
             warn!(error = %e, "Failed to write WalletBalanceSnapshot (bootstrap) to JSONL");
         }
-
     }
 
-    // 4) Update tracked wallet accounts for Geyser subscription (wallet + WSOL + token ATAs).
+    // 3) Update tracked wallet accounts for Geyser subscription (wallet + WSOL + token ATAs).
     if let Some(ref tracked_wallet) = ctx.tracked_wallet {
         let mut accounts: Vec<Pubkey> = Vec::new();
         accounts.push(tracked_wallet.wallet);
@@ -827,16 +829,19 @@ async fn publish_wallet_snapshot(
         *ctx.tracked_wallet_token_accounts.write() = wallet_token_accounts;
     }
 
-    // 5) WalletSnapshotComplete helps momentum-bot close ghost positions.
+    // 4) WalletSnapshotComplete helps momentum-bot close ghost positions.
     let complete_event = MarketEvent::new(
         "market-data",
         BUILD_VERSION,
         &ctx.run_id,
-        format!("wallet_snapshot_complete_bootstrap_{}", if is_periodic { "periodic" } else { "startup" }),
+        format!(
+            "wallet_snapshot_complete_bootstrap_{}",
+            if is_periodic { "periodic" } else { "startup" }
+        ),
         "wallet_bootstrap_complete",
         None,
         MarketEventKind::WalletSnapshotComplete {
-            mints_in_wallet: mints_with_balance.clone(),
+            mints_in_wallet: mints_in_wallet.clone(),
             wallet: wallet_str.clone(),
             is_periodic,
         },
@@ -854,9 +859,9 @@ async fn publish_wallet_snapshot(
     info!(
         wallet = %wallet_str,
         known_mints = known_mints.len(),
-        non_zero_mints = mints_with_balance.len(),
+        mints_in_wallet = mints_in_wallet.len(),
         is_periodic,
-        "✅ Wallet snapshot bootstrap published (RPC: getTokenAccountsByOwner for SPL + Token-2022, startup only)"
+        "✅ Wallet snapshot bootstrap published (RPC: getMultipleAccounts, no owner-scan)"
     );
 
     Ok(())
@@ -1280,24 +1285,27 @@ async fn run_geyser_loop(
     //
     // This is the trigger that makes wallet tracking "just work" after a BUY:
     // execution-engine already knows token_account/token_program/mint_decimals deterministically.
-    let mut execution_results_subscription: Option<ironcrab::nats::NatsSubscription> =
-        if let Some(ref nats) = ctx.nats {
-            match nats.subscribe(TOPIC_EXECUTION_RESULTS).await {
-                Ok(sub) => {
-                    info!(
-                        topic = TOPIC_EXECUTION_RESULTS,
-                        "Subscribed to ExecutionResults for wallet ATA tracking"
-                    );
-                    Some(sub)
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to subscribe to ExecutionResults (wallet ATA auto-tracking disabled)");
-                    None
-                }
+    let mut execution_results_subscription: Option<ironcrab::nats::NatsSubscription> = if let Some(
+        ref nats,
+    ) =
+        ctx.nats
+    {
+        match nats.subscribe(TOPIC_EXECUTION_RESULTS).await {
+            Ok(sub) => {
+                info!(
+                    topic = TOPIC_EXECUTION_RESULTS,
+                    "Subscribed to ExecutionResults for wallet ATA tracking"
+                );
+                Some(sub)
             }
-        } else {
-            None
-        };
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to ExecutionResults (wallet ATA auto-tracking disabled)");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
@@ -1390,6 +1398,13 @@ async fn run_geyser_loop(
                         Ok(p) => p,
                         Err(_) => continue,
                     };
+                    // Only support SPL Token + Token-2022 for wallet ATA tracking.
+                    // If metadata is malformed, avoid subscribing junk accounts.
+                    if token_program.to_bytes() != spl_token::ID.to_bytes()
+                        && token_program.to_bytes() != spl_token_2022::ID.to_bytes()
+                    {
+                        continue;
+                    }
 
                     let mint_decimals: Option<u8> = exec
                         .metadata
@@ -1598,6 +1613,12 @@ async fn run_geyser_loop(
                     if let Some((decimals, supply, mint_authority, freeze_authority)) =
                         try_parse_mint_account(&account_update.owner, &account_update.data)
                     {
+                        // Decimals-Policy: TokenMintInfo from Geyser is authoritative.
+                        // Keep wallet decimals cache warm so WalletBalanceSnapshot never needs the 6-decimal fallback.
+                        ctx.tracked_wallet_mint_decimals
+                            .write()
+                            .insert(account_update.pubkey, decimals);
+
                         let is_token_2022 = account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes();
 
                         let mint_event = MarketEvent::new(
@@ -2033,6 +2054,12 @@ async fn run_geyser_loop(
             Ok(tx_update) = transaction_rx.recv() => {
                 tx_count += 1;
                 ironcrab::metrics::record_activity();
+
+                // Phase 2 (Roadmap, Option C):
+                // Detect Associated Token Program create/close instructions for the tracked wallet
+                // and feed them into the same wallet-ATA tracking path (no RPC, no scanning).
+                // This is needed to catch manual wallet actions (Phantom/Jupiter) that do not
+                // produce ExecutionResults.
 
                 // P2: Track priority fees from Geyser transactions (NO RPC calls!)
                 if let Some(priority_fee) = ctx.priority_fee_tracker.add_sample(
