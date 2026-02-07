@@ -1912,7 +1912,7 @@ async fn run_geyser_loop(
 
                     // Publish PoolCacheUpdate to JetStream (Single Source of Truth for pool state)
                     if let Some(ref nats) = ctx.nats {
-                        let pool_update = PoolCacheUpdate::new_pool_discovered(
+                        let mut pool_update = PoolCacheUpdate::new_pool_discovered(
                             "market-data",
                             BUILD_VERSION,
                             run_id,
@@ -1925,6 +1925,33 @@ async fn run_geyser_loop(
                             Some(0), // liquidity_lamports not available from account data
                             account_update.slot,
                         );
+
+                        // Propagate DEX-specific metadata to SLAVE caches via PoolCacheUpdate.metadata.
+                        // This ensures execution-engine receives creator, pool accounts, etc. from Geyser
+                        // without needing RPC fallbacks.
+                        match &cached_state {
+                            CachedPoolState::PumpFun(s) => {
+                                if s.creator != Pubkey::default() {
+                                    let mut meta = std::collections::HashMap::new();
+                                    meta.insert("creator".to_string(), s.creator.to_string());
+                                    meta.insert("associated_bonding_curve".to_string(), s.associated_bonding_curve.to_string());
+                                    meta.insert("complete".to_string(), s.complete.to_string());
+                                    pool_update.metadata = Some(meta);
+                                }
+                            }
+                            CachedPoolState::PumpAmm(s) => {
+                                if let Some(creator) = s.creator {
+                                    let mut meta = std::collections::HashMap::new();
+                                    meta.insert("creator".to_string(), creator.to_string());
+                                    if !s.pool_accounts.is_empty() {
+                                        let accounts_str: Vec<String> = s.pool_accounts.iter().map(|p| p.to_string()).collect();
+                                        meta.insert("pool_accounts".to_string(), accounts_str.join(","));
+                                    }
+                                    pool_update.metadata = Some(meta);
+                                }
+                            }
+                            _ => {} // Other DEXes: no extra metadata needed yet
+                        }
                         let subject = pool_subject(&account_update.pubkey.to_string());
                         if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
                             warn!(error = %e, "Failed to publish PoolCacheUpdate to JetStream");

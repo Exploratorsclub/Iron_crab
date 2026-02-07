@@ -10,17 +10,20 @@
 
 | PR | Titel | Status | Dateien | Aufwand |
 |----|-------|--------|---------|---------|
-| PR 1 | Globaler Mint-Decimals-Cache (GEYSER-FIRST) | 🔧 IN PROGRESS | 6 | ~3h |
+| PR 1 | Globaler Mint-Decimals-Cache (GEYSER-FIRST) | ✅ DEPLOYED | 6 | ~3h |
+| Fix 1 | Creator über NATS propagieren (Killswitch Bug) | 🔧 IN PROGRESS | 2 | ~1h |
+| Fix 2 | Simulation-Error Logging (Diagnose) | 🔧 IN PROGRESS | 1 | ~30min |
 | PR 2 | PumpFun Bonding-Curve Quotes aus Cache | ⬜ TODO | 2 | ~4h |
 | PR 3 | Vault-Balance-Reads aus Cache (Orca/Raydium/Meteora/CPMM) | ⬜ TODO | 5 | ~5h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
+| PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
 
 ---
 
 ## PR 1: Globaler Mint-Decimals-Cache (GEYSER-FIRST)
 
 **Branch**: `fix/decimals-cache-geyser`
-**Status**: 🔧 IN PROGRESS
+**Status**: ✅ DEPLOYED (2026-02-07)
 **Risiko**: Niedrig
 **Eliminiert**: 1-2 RPC-Calls pro `get_token_decimals_or_default()` Aufruf
 
@@ -58,6 +61,50 @@ Decimals fließen über **drei** Kanäle in den SLAVE Cache:
 - [ ] Wenn Cache vorhanden: 0 RPC-Calls für bekannte Mints
 - [ ] Wenn Cache leer/kalt: RPC-Fallback funktioniert wie bisher + Write-Back
 - [ ] Metrik zeigt Cache-Hit-Rate
+
+---
+
+## Fix 1: Creator über NATS propagieren (Killswitch Bug Root Cause)
+
+**Branch**: `architecture-rebuild`
+**Status**: 🔧 IN PROGRESS
+**Risiko**: Niedrig
+**Problem**: `market-data` cached PumpFun/PumpSwap Creator korrekt im MASTER LivePoolCache, propagiert ihn aber NICHT über `PoolCacheUpdate.metadata` an den SLAVE Cache in `execution-engine`. → Killswitch kann PumpFun-Token nicht verkaufen weil `metadata.contains_key("creator")` fehlschlägt.
+
+### Aufgaben
+
+- [x] `src/bin/market_data.rs`: Bei `PoolCacheUpdate::PoolDiscovered` für PumpFun + PumpAmm den Creator, associated_bonding_curve und complete in `metadata` HashMap einfügen
+- [x] `src/bin/execution_engine.rs`: `build_minimal_pool_state()` – Creator, associated_bonding_curve, complete und pool_accounts aus `update.metadata` extrahieren
+- [ ] `cargo check` + `cargo clippy` erfolgreich
+- [ ] Deploy + Killswitch-Test
+
+### Akzeptanzkriterien
+
+- [ ] SLAVE LivePoolCache enthält Creator für PumpFun-Pools
+- [ ] Killswitch Liquidation erkennt PumpFun-Bonding-Curve mit Creator → Quote akzeptiert
+- [ ] Kein neuer RPC-Call eingeführt
+
+---
+
+## Fix 2: Besseres Simulation-Error Logging
+
+**Branch**: `architecture-rebuild`
+**Status**: 🔧 IN PROGRESS
+**Risiko**: Keins (nur Logging)
+**Problem**: Bei Simulation-Failures wird nur "Intent simulation failed" geloggt, ohne `error_code`, `logs_preview`, DEX oder Mint. Fehlerdiagnose ist praktisch unmöglich.
+
+### Aufgaben
+
+- [x] `src/bin/execution_engine.rs` `emit_sim_failed_decision()`: error_code, logs_preview (truncated), DEX, side, mint in WARN-Log aufnehmen
+- [x] `src/bin/execution_engine.rs` Liquidation: Detailliertes Logging bei Intent-Erstellung (quote_attempts, routing, creator_present)
+- [x] `src/bin/execution_engine.rs` Liquidation: Detailliertes Logging wenn kein Route gefunden (LIQUIDATION SKIP mit allen quote_attempts)
+- [ ] `cargo check` + `cargo clippy` erfolgreich
+
+### Akzeptanzkriterien
+
+- [ ] Simulation-Failures enthalten: error_code, program logs (truncated), DEX, mint
+- [ ] Liquidation-Skips enthalten: alle quote_attempts (welche DEX wurde probiert, warum fehlgeschlagen)
+- [ ] Keine Performance-Auswirkung (Logging nur bei Fehler)
 
 ---
 
@@ -202,6 +249,39 @@ Jedes DEX-Modul bekommt:
 - [ ] Bestehende Tests bestehen
 - [ ] PR-Description mit Referenz auf Audit-Dokument
 - [ ] Decision Record im Commit (Inputs, Checks, Outcome)
+
+---
+
+## PR 5: Blockhash via Geyser (kein RPC für Blockhash)
+
+**Branch**: TBD
+**Status**: ⬜ TODO
+**Risiko**: Mittel (betrifft TX-Build + Simulation)
+**Eliminiert**: 1-2 RPC `getLatestBlockhash` Calls pro TX (Simulation + Send)
+
+### Hintergrund
+
+Aktuell ruft `simulate_transaction()` und `send_transaction_rpc()` jeweils `ctx.rpc.rpc.get_latest_blockhash().await` auf. Das sind 100-300ms pro Call im Hot-Path. Yellowstone-gRPC bietet zwei Alternativen:
+1. **`GetLatestBlockhash` gRPC Methode** – Direkt aus dem Validator, kein RPC-Roundtrip
+2. **`blocks_meta` Subscription** – Streaming-basiert, Blockhash wird bei jedem neuen Block automatisch aktualisiert
+
+### Aufgaben
+
+- [ ] `src/bin/market_data.rs`: `blocks_meta` Geyser-Subscription hinzufügen
+- [ ] `src/ipc/schema.rs`: `LatestBlockhash` NATS-Nachricht definieren (blockhash, last_valid_block_height, slot)
+- [ ] `src/bin/market_data.rs`: Bei neuem Block → `LatestBlockhash` über NATS publizieren
+- [ ] `src/bin/execution_engine.rs`: NATS-Subscription für `LatestBlockhash` → `AtomicBlockhash` updaten
+- [ ] `src/bin/execution_engine.rs`: `simulate_transaction()` + `send_transaction_rpc()` → lokalen Blockhash verwenden statt RPC
+- [ ] Fallback: Wenn lokaler Blockhash älter als X Slots → RPC-Fallback mit WARN-Log
+- [ ] Metrik: `BLOCKHASH_SOURCE_GEYSER` vs `BLOCKHASH_SOURCE_RPC_FALLBACK`
+
+### Akzeptanzkriterien
+
+- [ ] Blockhash kommt aus Geyser-Stream (0 RPC Calls im Normalfall)
+- [ ] Fallback auf RPC wenn Geyser-Stream ausfällt oder Blockhash zu alt
+- [ ] TX-Simulation und -Send funktionieren identisch
+- [ ] Kein Blockhash-Expiry in Produktion (Freshness-Check)
+- [ ] Latenz-Verbesserung messbar (Prometheus Histogram)
 
 ---
 

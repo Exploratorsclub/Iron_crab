@@ -1946,7 +1946,13 @@ impl ExecutionContext {
             }
 
             let Some(min_out) = min_out_sol else {
-                warn!(mint = %mint, amount_in, token_account = %ta_pubkey, "No supported route for liquidation; skipping");
+                warn!(
+                    mint = %mint,
+                    amount_in,
+                    token_account = %ta_pubkey,
+                    quote_attempts = %quote_attempts.join(" | "),
+                    "LIQUIDATION SKIP: No supported route found for token"
+                );
 
                 // Emit a rejected DecisionRecord so the reason is forensically visible even
                 // when we cannot generate a sell intent (no quote / no supported route).
@@ -2014,6 +2020,19 @@ impl ExecutionContext {
                 max_slippage_bps,
                 TradingRegime::NotApplicable,
             );
+            // Log BEFORE move so we can reference metadata/resources
+            info!(
+                mint = %mint,
+                dex = metadata.get("dex").map(|s| s.as_str()).unwrap_or("?"),
+                routing = metadata.get("sell_routing").map(|s| s.as_str()).unwrap_or("?"),
+                creator_present = metadata.contains_key("creator"),
+                amount_in,
+                min_out,
+                pools = ?resources.pools,
+                quote_attempts = %quote_attempts.join(" | "),
+                "LIQUIDATION: Intent prepared for token"
+            );
+
             intent.ttl_ms = Some(ttl_ms);
             intent.resources = resources;
             intent.execution = Some(TradeExecutionConstraints {
@@ -3243,27 +3262,65 @@ fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, CachedP
             reserve_x_balance: Some(update.base_reserve),
             reserve_y_balance: Some(update.quote_reserve),
         }),
-        "pump_amm" => CachedPoolState::PumpAmm(PumpAmmState {
-            base_mint,
-            quote_mint,
-            pool_base_token_account: Pubkey::default(),
-            pool_quote_token_account: Pubkey::default(),
-            base_reserve: Some(update.base_reserve),
-            quote_reserve: Some(update.quote_reserve),
-            pool_accounts: Vec::new(),
-            creator: None,
-        }),
-        "pumpfun" => CachedPoolState::PumpFun(PumpFunState {
-            token_mint: base_mint,
-            bonding_curve: pool_addr,
-            associated_bonding_curve: Pubkey::default(),
-            virtual_sol_reserves: update.quote_reserve,
-            virtual_token_reserves: update.base_reserve,
-            real_sol_reserves: 0,
-            real_token_reserves: 0,
-            complete: false,
-            creator: Pubkey::default(),
-        }),
+        "pump_amm" => {
+            // Extract creator from metadata (propagated by market-data from Geyser)
+            let creator = update.metadata.as_ref()
+                .and_then(|m| m.get("creator"))
+                .and_then(|s| Pubkey::from_str(s).ok());
+
+            let pool_accounts: Vec<Pubkey> = update.metadata.as_ref()
+                .and_then(|m| m.get("pool_accounts"))
+                .map(|s| s.split(',').filter_map(|a| Pubkey::from_str(a).ok()).collect())
+                .unwrap_or_default();
+
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint,
+                pool_base_token_account: Pubkey::default(),
+                pool_quote_token_account: Pubkey::default(),
+                base_reserve: Some(update.base_reserve),
+                quote_reserve: Some(update.quote_reserve),
+                pool_accounts,
+                creator,
+            })
+        }
+        "pumpfun" => {
+            // Extract creator + associated_bonding_curve + complete from metadata
+            let creator = update.metadata.as_ref()
+                .and_then(|m| m.get("creator"))
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .unwrap_or_default();
+
+            let associated_bonding_curve = update.metadata.as_ref()
+                .and_then(|m| m.get("associated_bonding_curve"))
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .unwrap_or_default();
+
+            let complete = update.metadata.as_ref()
+                .and_then(|m| m.get("complete"))
+                .map(|s| s == "true")
+                .unwrap_or(false);
+
+            if creator != Pubkey::default() {
+                debug!(
+                    pool = %pool_addr,
+                    creator = %creator,
+                    "SLAVE CACHE: Creator extracted from PoolCacheUpdate metadata"
+                );
+            }
+
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: base_mint,
+                bonding_curve: pool_addr,
+                associated_bonding_curve,
+                virtual_sol_reserves: update.quote_reserve,
+                virtual_token_reserves: update.base_reserve,
+                real_sol_reserves: 0,
+                real_token_reserves: 0,
+                complete,
+                creator,
+            })
+        }
         _ => {
             debug!(dex = %update.dex, "Unsupported DEX type for minimal state");
             return None;
@@ -6961,6 +7018,10 @@ async fn emit_sim_failed_decision(
     INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
     REJECT_SIMULATION_FAIL.fetch_add(1, Ordering::Relaxed);
 
+    // Extract diagnostic info before sim_result is moved into DecisionRecord
+    let sim_error_str = sim_result.error_code.clone().unwrap_or_else(|| "unknown".to_string());
+    let sim_logs_str = sim_result.logs_preview.clone().unwrap_or_else(|| "no logs".to_string());
+
     let mut decision = DecisionRecord::new_sim_failed(
         "execution-engine",
         BUILD_VERSION,
@@ -7008,10 +7069,18 @@ async fn emit_sim_failed_decision(
         nats.publish(TOPIC_DECISION_RECORDS, &decision).await?;
     }
 
+    // Enhanced simulation failure logging (Fix 2: diagnostic info for debugging)
+    // sim_error_str and sim_logs_str were cloned before sim_result was moved into DecisionRecord
+    let logs_truncated = if sim_logs_str.len() > 500 { &sim_logs_str[..500] } else { &sim_logs_str };
+
     warn!(
         intent_id = %intent.intent_id,
         decision_id = %decision_id,
-        "Intent simulation failed"
+        dex = intent.metadata.get("dex").map(|s| s.as_str()).unwrap_or("?"),
+        side = ?intent.side,
+        mint = intent.metadata.get("token_mint").or_else(|| intent.metadata.get("mint")).map(|s| s.as_str()).unwrap_or("?"),
+        error = %sim_error_str,
+        "Intent simulation failed | logs: {logs_truncated}"
     );
 
     Ok(())
