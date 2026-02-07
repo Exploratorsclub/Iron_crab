@@ -1423,6 +1423,8 @@ async fn run_geyser_loop(
                     // 2) Cache decimals if provided (fast path; Geyser mint info is authoritative later)
                     if let Some(d) = mint_decimals {
                         ctx.tracked_wallet_mint_decimals.write().insert(mint, d);
+                        // PR1: Also populate MASTER LivePoolCache (consistent with Geyser path)
+                        ctx.live_pool_cache.set_mint_decimals(mint, d);
                     }
 
                     // 3) Track mint so Geyser will deliver the mint account → TokenMintInfo
@@ -1618,6 +1620,10 @@ async fn run_geyser_loop(
                         ctx.tracked_wallet_mint_decimals
                             .write()
                             .insert(account_update.pubkey, decimals);
+
+                        // PR1: Also populate MASTER LivePoolCache mint_decimals (Single Source of Truth).
+                        // This keeps LivePoolCache consistent with tracked_wallet_mint_decimals.
+                        ctx.live_pool_cache.set_mint_decimals(account_update.pubkey, decimals);
 
                         let is_token_2022 = account_update.owner.to_bytes() == spl_token_2022::ID.to_bytes();
 

@@ -81,8 +81,8 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     config_consumer_config, config_subject, slave_consumer_config, wallet_snapshot_consumer_config,
     NatsClient, NatsConfig, CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS,
-    TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_PRIORITY_FEE_SAMPLES,
-    TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
+    TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
+    TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
@@ -2397,7 +2397,7 @@ impl ExecutionContext {
             }
 
             // Re-validate: if a supported sell route exists, refuse to burn.
-            let decimals = get_token_decimals_or_default(ctx.rpc.as_ref(), &mint).await;
+            let decimals = get_token_decimals_or_default(ctx.rpc.as_ref(), &mint, ctx.live_pool_cache.as_deref()).await;
             let unit_u64 = 10u128
                 .checked_pow(decimals as u32)
                 .and_then(|v| u64::try_from(v).ok())
@@ -4799,6 +4799,74 @@ async fn main() -> Result<()> {
         });
     }
 
+    // PR1: Spawn dedicated task for TokenMintInfo events from MarketEvents subscription.
+    // This populates the SLAVE LivePoolCache with mint decimals + token_program from Geyser,
+    // so execution-engine never needs RPC calls to resolve decimals for tracked mints.
+    // Pattern: Same as PriorityFeePercentiles – spawn task that writes directly into shared state.
+    if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_MARKET_EVENTS).await {
+            Ok(mut market_sub) => {
+                info!(
+                    topic = TOPIC_MARKET_EVENTS,
+                    "Subscribed to MarketEvents for TokenMintInfo → SLAVE LivePoolCache decimals"
+                );
+                let cache_for_mint_info: Option<Arc<ironcrab::execution::live_pool_cache::LivePoolCache>> =
+                    ctx.live_pool_cache.as_ref().map(Arc::clone);
+                tokio::spawn(async move {
+                    let mut mint_info_count: u64 = 0;
+                    while let Some(msg) = market_sub.next().await {
+                        // Fast-path: only process if we have a cache
+                        let cache = match cache_for_mint_info.as_ref() {
+                            Some(c) => c,
+                            None => continue,
+                        };
+
+                        // Deserialize and filter for TokenMintInfo events only
+                        let event: MarketEvent = match msg.deserialize() {
+                            Ok(e) => e,
+                            Err(_) => continue, // Not a MarketEvent, skip silently
+                        };
+
+                        if let MarketEventKind::TokenMintInfo {
+                            mint,
+                            token_program,
+                            decimals,
+                            ..
+                        } = &event.kind
+                        {
+                            if let Ok(mint_pk) = Pubkey::from_str(mint) {
+                                cache.set_mint_decimals(mint_pk, *decimals);
+
+                                // Also cache token_program (needed for ATA creation)
+                                if let Ok(program_pk) = Pubkey::from_str(token_program) {
+                                    cache.update_mint_program(&mint_pk, program_pk);
+                                }
+
+                                mint_info_count += 1;
+                                if mint_info_count % 100 == 1 {
+                                    debug!(
+                                        total = mint_info_count,
+                                        mint = %mint,
+                                        decimals,
+                                        "SLAVE CACHE: TokenMintInfo → decimals + token_program cached"
+                                    );
+                                }
+                            }
+                        }
+                        // All other MarketEvent types are silently ignored (they're for momentum-bot/arb-strategy)
+                    }
+                    warn!("MarketEvents subscription ended (TokenMintInfo cache disabled)");
+                });
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to subscribe to MarketEvents (TokenMintInfo decimals will rely on RPC fallback)"
+                );
+            }
+        }
+    }
+
     // Subscribe to PoolCacheUpdates from JetStream (Single Source of Truth)
     let pool_cache_consumer = if let Some(ref nats) = ctx.nats {
         use async_nats::jetstream;
@@ -5059,12 +5127,16 @@ async fn main() -> Result<()> {
                                     Ok(msg) => {
                                         match serde_json::from_slice::<MarketEvent>(&msg.payload) {
                                             Ok(event) => {
-                                                if let MarketEventKind::WalletBalanceSnapshot { mint, balance_raw, .. } = &event.kind {
+                                                if let MarketEventKind::WalletBalanceSnapshot { mint, balance_raw, decimals, .. } = &event.kind {
                                                     if mint != SOL_MINT && mint != WSOL_MINT {
                                                         ctx.lock_manager.set_available_token_balance(
                                                             mint.clone(),
                                                             *balance_raw,
                                                         );
+                                                        // Cache decimals from Geyser-resolved wallet snapshots (PR1: decimals cache)
+                                                        if let (Some(cache), Ok(mint_pk)) = (ctx.live_pool_cache.as_ref(), Pubkey::from_str(mint)) {
+                                                            cache.set_mint_decimals(mint_pk, *decimals);
+                                                        }
                                                     }
                                                 }
                                             }

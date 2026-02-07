@@ -282,6 +282,11 @@ pub struct LivePoolCache {
     /// This is the source of truth for token_program lookups - NO RPC needed!
     mint_programs: DashMap<Pubkey, Pubkey>,
 
+    /// Mint decimals cache (decimals are immutable once a mint is created).
+    /// Populated from Geyser TokenMintInfo events and PoolCacheUpdate metadata.
+    /// This is the GEYSER-FIRST source of truth – avoids RPC calls in token_utils.
+    mint_decimals: DashMap<Pubkey, u8>,
+
     /// Stats
     updates_total: AtomicU64,
     cache_hits: AtomicU64,
@@ -318,6 +323,7 @@ impl LivePoolCache {
             pools: DashMap::new(),
             vault_to_pool: DashMap::new(),
             mint_programs: DashMap::new(),
+            mint_decimals: DashMap::new(),
             updates_total: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
@@ -586,6 +592,19 @@ impl LivePoolCache {
     /// This is the GEYSER-FIRST source of truth - NO RPC calls needed!
     pub fn get_mint_program(&self, mint: &Pubkey) -> Option<Pubkey> {
         self.mint_programs.get(mint).map(|r| *r)
+    }
+
+    /// Get cached mint decimals (immutable once set – decimals never change for a mint)
+    /// Returns None if the mint has not been seen yet via Geyser TokenMintInfo.
+    /// This is the GEYSER-FIRST source of truth – NO RPC calls needed!
+    pub fn get_mint_decimals(&self, mint: &Pubkey) -> Option<u8> {
+        self.mint_decimals.get(mint).map(|r| *r)
+    }
+
+    /// Set mint decimals (called from Geyser TokenMintInfo or PoolCacheUpdate processing).
+    /// Decimals are immutable on-chain, so we never need to overwrite.
+    pub fn set_mint_decimals(&self, mint: Pubkey, decimals: u8) {
+        self.mint_decimals.entry(mint).or_insert(decimals);
     }
 
     /// Get the creator from a PumpFun bonding curve cached state

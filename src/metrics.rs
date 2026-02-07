@@ -307,6 +307,7 @@ pub static RAYDIUM_POOLS_SKIPPED_INVALID: Lazy<AtomicU64> = Lazy::new(|| AtomicU
 pub static RAYDIUM_POOLS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ORCA_POOLS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Mint decimals resolution counters
+pub static MINT_DECIMALS_SOURCE_CACHE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MINT_DECIMALS_SOURCE_SUPPLY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MINT_DECIMALS_SOURCE_ACCOUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MINT_DECIMALS_FALLBACK_DEFAULT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -1030,6 +1031,10 @@ async fn metrics_response() -> Response<Body> {
         RAYDIUM_POOLS_TOTAL.load(Ordering::Relaxed)
     );
     line!("orca_pools_total", ORCA_POOLS_TOTAL.load(Ordering::Relaxed));
+    line!(
+        "mint_decimals_source_cache_total",
+        MINT_DECIMALS_SOURCE_CACHE.load(Ordering::Relaxed)
+    );
     line!(
         "mint_decimals_source_supply_total",
         MINT_DECIMALS_SOURCE_SUPPLY.load(Ordering::Relaxed)

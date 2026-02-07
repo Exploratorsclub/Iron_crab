@@ -332,7 +332,7 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        let decimals = get_token_decimals_or_default(rpc.as_ref(), &mint).await;
+        let decimals = get_token_decimals_or_default(rpc.as_ref(), &mint, None).await;
 
         info!(mint = %mint, amount_raw = amount, decimals, ata = %ata, "Queuing liquidation");
         tasks.push(SellTask {

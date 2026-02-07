@@ -623,7 +623,8 @@ impl Treasury {
     }
 
     async fn try_mint_decimals(&self, rpc: &SolanaRpc, mint: &SdkPubkey) -> Result<u8> {
-        // Delegate to centralized helper with metrics and consistent behavior
-        crate::solana::token_utils::try_token_decimals(rpc, mint).await
+        // Delegate to centralized helper with metrics and consistent behavior.
+        // No LivePoolCache available in wallet context – pass None (RPC fallback).
+        crate::solana::token_utils::try_token_decimals(rpc, mint, None).await
     }
 }
