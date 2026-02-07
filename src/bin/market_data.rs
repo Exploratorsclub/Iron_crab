@@ -598,13 +598,10 @@ async fn publish_wallet_snapshot(
                                 if let (Ok(mint_pk), Ok(token_prog_pk)) =
                                     (Pubkey::from_str(mint), Pubkey::from_str(token_program))
                                 {
-                                    if !cached_mint_meta.contains_key(&mint_pk) {
+                                    cached_mint_meta.entry(mint_pk).or_insert_with(|| {
                                         known_mints.push(mint_pk);
-                                        cached_mint_meta.insert(
-                                            mint_pk,
-                                            (*decimals, token_prog_pk, *balance_raw),
-                                        );
-                                    }
+                                        (*decimals, token_prog_pk, *balance_raw)
+                                    });
                                 }
                             }
                             let _ = msg.ack().await;

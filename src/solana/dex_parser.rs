@@ -32,6 +32,9 @@ use std::sync::LazyLock;
 pub static SOL_MINT_PUBKEY: LazyLock<Pubkey> =
     LazyLock::new(|| Pubkey::from_str(SOL_MINT).expect("valid SOL mint"));
 
+/// Type alias for pool lookup closure (reduces clippy::type_complexity warnings).
+pub type PoolLookupFn<'a> = Option<&'a dyn Fn(&Pubkey) -> Option<OrcaPoolInfo>>;
+
 /// Orca pool info used to deterministically parse swaps from pool state.
 #[derive(Debug, Clone, Copy)]
 pub struct OrcaPoolInfo {
@@ -189,7 +192,7 @@ pub fn parse_transaction_update(update: &GeyserTransactionUpdate) -> Option<Pars
 /// The pool lookup is used to resolve Orca pool mints deterministically.
 pub fn parse_transaction_update_with_pool_lookup(
     update: &GeyserTransactionUpdate,
-    pool_lookup: Option<&dyn Fn(&Pubkey) -> Option<OrcaPoolInfo>>,
+    pool_lookup: PoolLookupFn<'_>,
 ) -> Option<ParsedDexEvent> {
     // Identify DEX by checking account keys
     let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).ok()?;
@@ -452,7 +455,7 @@ fn parse_orca_account(update: &GeyserAccountUpdate) -> Option<ParsedDexEvent> {
 
 fn parse_orca_transaction(
     update: &GeyserTransactionUpdate,
-    pool_lookup: Option<&dyn Fn(&Pubkey) -> Option<OrcaPoolInfo>>,
+    pool_lookup: PoolLookupFn<'_>,
 ) -> Option<ParsedDexEvent> {
     // Orca Whirlpool swap detection
     // Discriminator for swap: sighash("global:swap") = first 8 bytes

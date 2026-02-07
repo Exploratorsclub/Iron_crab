@@ -6623,30 +6623,38 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             let mints_set: std::collections::HashSet<&str> =
                 mints_in_wallet.iter().map(|s| s.as_str()).collect();
 
-            let mut positions = ctx.positions.write();
-            let position_mints: Vec<String> = positions.keys().cloned().collect();
-            let mut closed_count = 0usize;
+            // Phase 1: Identify and remove ghost positions under the write lock (sync only).
+            // Collect removed mints so we can delete from KV after releasing the lock.
+            let mut ghost_mints: Vec<String> = Vec::new();
+            let positions_tracked;
+            {
+                let mut positions = ctx.positions.write();
+                positions_tracked = positions.len();
+                let position_mints: Vec<String> = positions.keys().cloned().collect();
 
-            for mint in position_mints {
-                if !mints_set.contains(mint.as_str()) {
-                    if let Some(removed) = positions.remove(&mint) {
-                        closed_count += 1;
-                        warn!(
-                            mint = %mint,
-                            pool = %removed.pool,
-                            dex = %removed.dex,
-                            hold_secs = removed.entry_time.elapsed().as_secs(),
-                            is_periodic = is_periodic,
-                            "👻 Ghost position closed: mint NOT in WalletSnapshotComplete (ATA was closed)"
-                        );
-                        // Also remove from JetStream KV
-                        drop(positions); // Release write lock before async
-                        ctx.delete_position_from_kv(&mint).await;
-                        positions = ctx.positions.write(); // Re-acquire
+                for mint in position_mints {
+                    if !mints_set.contains(mint.as_str()) {
+                        if let Some(removed) = positions.remove(&mint) {
+                            warn!(
+                                mint = %mint,
+                                pool = %removed.pool,
+                                dex = %removed.dex,
+                                hold_secs = removed.entry_time.elapsed().as_secs(),
+                                is_periodic = is_periodic,
+                                "👻 Ghost position closed: mint NOT in WalletSnapshotComplete (ATA was closed)"
+                            );
+                            ghost_mints.push(mint);
+                        }
                     }
                 }
+            } // write lock released here – safe to await
+
+            // Phase 2: Delete from JetStream KV (async, no lock held)
+            for mint in &ghost_mints {
+                ctx.delete_position_from_kv(mint).await;
             }
 
+            let closed_count = ghost_mints.len();
             if closed_count > 0 {
                 info!(
                     closed_count = closed_count,
@@ -6657,7 +6665,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             } else {
                 debug!(
                     mints_in_wallet = mints_in_wallet.len(),
-                    positions_tracked = positions.len(),
+                    positions_tracked = positions_tracked,
                     is_periodic = is_periodic,
                     "WalletSnapshotComplete: no ghost positions found"
                 );
