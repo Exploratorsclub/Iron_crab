@@ -2868,7 +2868,41 @@ impl MomentumContext {
         };
 
         let Some(pending) = pending_opt else {
-            debug!(intent_id = %result.intent_id, "No pending intent found for execution result");
+            // === Liquidation / external sell handling ===
+            // Liquidation sells are created by execution-engine (not momentum-bot),
+            // so they won't be in pending_intents. When a confirmed sell from
+            // execution-engine arrives, close the matching position by token_mint.
+            // This prevents ghost positions that block max_open_positions.
+            if result.status == ExecutionStatus::Confirmed
+                && result.intent_id.starts_with("liquidation-")
+            {
+                if let Some(ref mint) = result.token_mint {
+                    let has_position = self.positions.read().contains_key(mint);
+                    if has_position {
+                        info!(
+                            intent_id = %result.intent_id,
+                            mint = %mint,
+                            source = %result.source,
+                            signature = ?result.signature,
+                            "LIQUIDATION SELL CONFIRMED (external) - Closing position"
+                        );
+                        self.close_position(mint);
+                    } else {
+                        debug!(
+                            intent_id = %result.intent_id,
+                            mint = %mint,
+                            "Liquidation sell confirmed but no matching position found"
+                        );
+                    }
+                } else {
+                    warn!(
+                        intent_id = %result.intent_id,
+                        "Liquidation sell confirmed but token_mint missing in ExecutionResult"
+                    );
+                }
+            } else {
+                debug!(intent_id = %result.intent_id, "No pending intent found for execution result");
+            }
             return;
         };
 

@@ -12,7 +12,8 @@
 |----|-------|--------|---------|---------|
 | PR 1 | Globaler Mint-Decimals-Cache (GEYSER-FIRST) | ✅ DEPLOYED | 6 | ~3h |
 | Fix 1 | Creator über NATS propagieren (Killswitch Bug) | 🔧 IN PROGRESS | 2 | ~1h |
-| Fix 2 | Simulation-Error Logging (Diagnose) | 🔧 IN PROGRESS | 1 | ~30min |
+| Fix 2 | Simulation-Error Logging (Diagnose) | ✅ DONE | 1 | ~30min |
+| Fix 3 | Position-Tracking: Liquidation-Sells schließen Positionen | 🔧 IN PROGRESS | 2 | ~1h |
 | PR 2 | PumpFun Bonding-Curve Quotes aus Cache | ⬜ TODO | 2 | ~4h |
 | PR 3 | Vault-Balance-Reads aus Cache (Orca/Raydium/Meteora/CPMM) | ⬜ TODO | 5 | ~5h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
@@ -105,6 +106,36 @@ Decimals fließen über **drei** Kanäle in den SLAVE Cache:
 - [ ] Simulation-Failures enthalten: error_code, program logs (truncated), DEX, mint
 - [ ] Liquidation-Skips enthalten: alle quote_attempts (welche DEX wurde probiert, warum fehlgeschlagen)
 - [ ] Keine Performance-Auswirkung (Logging nur bei Fehler)
+
+---
+
+## Fix 3: Position-Tracking: Liquidation-Sells schließen Positionen
+
+**Branch**: `architecture-rebuild`
+**Status**: 🔧 IN PROGRESS
+**Risiko**: Niedrig (nur Logging + Position-Cleanup bei confirmed sells)
+**Problem**: Liquidation-Sells werden von execution-engine erstellt, nicht von momentum-bot. momentum-bot kennt diese Intents nicht (`pending_intents` leer) → `close_position()` wird nie aufgerufen → Ghost Positions → `max_open_positions` blockiert neue Trades.
+
+### Root Cause
+
+- `momentum-bot.handle_execution_result()` sucht Intent in `pending_intents` Map
+- Liquidation-Intent-IDs (`liquidation-...`) sind NIE in dieser Map
+- → `return` ohne Position zu schließen
+- execution-engine's `open_positions` Counter wird ebenfalls nie dekrementiert bei Sells
+
+### Aufgaben
+
+- [x] `src/bin/momentum_bot.rs`: Bei unbekannter Intent-ID + Confirmed + `liquidation-*` Prefix → Position über `token_mint` schließen
+- [x] `src/bin/execution_engine.rs`: `open_positions` Counter bei confirmed BUY/SELL inkrementieren/dekrementieren (statt nur Dashboard-Gauge)
+- [x] `cargo check` + `cargo clippy` erfolgreich (0 errors, 0 warnings)
+- [ ] Deploy + Test
+
+### Akzeptanzkriterien
+
+- [ ] Liquidation-Sells schließen Positionen in momentum-bot
+- [ ] execution-engine `open_positions` Counter bleibt konsistent mit Wallet
+- [ ] `max_open_positions` Limit wird nicht dauerhaft blockiert
+- [ ] Normales Position-Tracking (momentum-bot eigene Intents) funktioniert unverändert
 
 ---
 

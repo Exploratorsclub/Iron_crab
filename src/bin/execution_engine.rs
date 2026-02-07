@@ -6841,21 +6841,27 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     if matches!(decision.outcome, DecisionOutcome::Confirmed) {
         INTENTS_EXECUTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 
-        // NOTE: execution-engine does NOT track positions itself.
-        // momentum-bot is the Single Source of Truth for positions.
-        // Update dashboard gauge from intent metadata (best-effort approximation).
-        // For BUY: positions will be current+1 after this trade.
-        // For SELL: positions will be current-1 after this trade.
-        let current_positions = intent
-            .metadata
-            .get("current_open_positions")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        let estimated_after = match intent.side {
-            TradeSide::Buy => current_positions.saturating_add(1),
-            TradeSide::Sell => current_positions.saturating_sub(1),
-        };
-        OPEN_POSITIONS_GAUGE.store(estimated_after, Ordering::Relaxed);
+        // Update execution-engine's own open_positions counter.
+        // This counter is reconciled from wallet snapshots at bootstrap and updated
+        // here on confirmed trades. momentum-bot remains the authoritative source
+        // for position tracking, but execution-engine needs an accurate counter
+        // for max_open_positions risk checks and dashboard metrics.
+        match intent.side {
+            TradeSide::Buy => {
+                let prev = ctx.open_positions.fetch_add(1, Ordering::Relaxed);
+                OPEN_POSITIONS_GAUGE.store((prev + 1) as u64, Ordering::Relaxed);
+            }
+            TradeSide::Sell => {
+                // Prevent underflow: only decrement if > 0
+                let prev = ctx.open_positions.load(Ordering::Relaxed);
+                if prev > 0 {
+                    ctx.open_positions.fetch_sub(1, Ordering::Relaxed);
+                    OPEN_POSITIONS_GAUGE.store((prev - 1) as u64, Ordering::Relaxed);
+                } else {
+                    OPEN_POSITIONS_GAUGE.store(0, Ordering::Relaxed);
+                }
+            }
+        }
 
         // Best-effort recent trade record for Grafana (/trades via Infinity datasource).
         // NOTE: If fill accounting is available, use it; otherwise fall back to placeholders.
