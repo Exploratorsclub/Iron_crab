@@ -512,15 +512,16 @@ fn try_parse_token_account_balance(data: &[u8]) -> Option<u64> {
 
 /// Publish wallet token balance snapshot for position reconciliation.
 ///
-/// Called at market-data startup AND periodically to provide momentum-bot with current wallet state.
+/// Called at market-data startup to provide momentum-bot with current wallet state.
 /// This allows momentum-bot to reconcile positions after restarts, detecting:
 /// - Manual sales via Phantom/Jupiter (no ExecutionResult)
 /// - Emergency liquidations via UI
 /// - External transfers
 /// - Closed ATAs (Geyser doesn't report deleted accounts)
 ///
-/// The periodic refresh (every 5 minutes) ensures ghost positions are detected
-/// even when ATAs are closed, which Geyser cannot track.
+/// After startup, live balance updates are handled by Geyser (tracked ATA subscriptions).
+/// This startup call is the ONE legitimate RPC roundtrip to catch the Geyser gap
+/// (closed/deleted ATAs are not reported by Geyser).
 async fn publish_wallet_snapshot(
     ctx: &MarketDataContext,
     rpc: &SolanaRpc,
@@ -745,13 +746,18 @@ async fn publish_wallet_snapshot(
         let (balance_raw, token_program_used, maybe_ata) = match observed {
             Some((amt, ata, prog)) => (amt, prog, Some(ata)),
             None => {
-                // If the last persisted snapshot claimed a non-zero balance and we cannot
-                // resolve an ATA deterministically, do NOT overwrite it with 0.
-                if let Some((_d, _prog, last_balance_raw)) = last_meta {
-                    if last_balance_raw > 0 {
-                        mints_in_wallet.push(mint.to_string());
-                        continue;
-                    }
+                // ATA not found on-chain → balance is definitively 0.
+                // The bot exclusively uses ATAs (derived via Associated Token Program).
+                // If the ATA doesn't exist, the token was sold and the ATA was closed.
+                // Previous logic incorrectly preserved stale non-zero balances here,
+                // creating permanent ghost positions that could never be cleaned up.
+                let prev_balance = last_meta.map(|(_, _, b)| b).unwrap_or(0);
+                if prev_balance > 0 {
+                    info!(
+                        mint = %mint,
+                        previous_balance = prev_balance,
+                        "Wallet snapshot: ATA not found on-chain, clearing stale balance → 0 (token was sold/transferred)"
+                    );
                 }
                 (
                     0u64,
