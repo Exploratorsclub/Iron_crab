@@ -17,6 +17,7 @@
 | Fix 4 | Ghost-Balance-Fix: Wallet-Snapshot-Bootstrap schreibt balance=0 | ✅ DEPLOYED | 1 | ~30min |
 | PR 2 | PumpFun Bonding-Curve Quotes aus Cache | ✅ DEPLOYED | 2 | ~4h |
 | Fix 5 | ExecutionResult Metadata + LockManager Seed + WSOL Logging | 🔧 IN PROGRESS | 3 | ~2h |
+| Fix 6 | Startup Owner-Scan: getTokenAccountsByOwner Discovery | 🔧 IN PROGRESS | 1 | ~1h |
 | PR 3 | Vault-Balance-Reads aus Cache (Orca/Raydium/Meteora/CPMM) | ⬜ TODO | 5 | ~5h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
 | PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
@@ -257,6 +258,49 @@ Die Geyser-basierte Wallet-Balance-Implementierung wurde geprüft und ist korrek
 - [ ] SELL-Intents für gekaufte Token werden NICHT mehr mit `SIM_INSUFFICIENT_BALANCE` abgelehnt
 - [ ] Dashboard zeigt WSOL (nicht SOL) nach Geyser-Pipeline-Initialisierung
 - [ ] WalletBalanceUpdate-Flow ist in Logs nachvollziehbar (market-data → NATS → execution-engine)
+
+---
+
+## Fix 6: Startup Owner-Scan: getTokenAccountsByOwner Discovery
+
+**Branch**: `architecture-rebuild`
+**Status**: 🔧 IN PROGRESS
+**Risiko**: Niedrig (nur Startup, kein Hot-Path)
+**Problem**: Der Startup-Wallet-Snapshot nutzte nur `getMultipleAccounts` auf bekannte Mints aus JetStream. Token die nie in JetStream gelandet sind (z.B. wegen Bug in ATA-Tracking, externe Käufe über Phantom/Jupiter) waren für den Bot unsichtbar → Liquidation fand 0 Token, Positionen wurden nicht erkannt.
+
+### Root Cause
+
+- `publish_wallet_snapshot()` liest nur Mints aus JetStream → `getMultipleAccounts` für bekannte ATAs
+- Token die vor Fix 5 gekauft wurden hatten fehlende ExecutionResult-Metadata → `market-data` trackte die ATAs nie → nie in JetStream
+- Catch-22: Startup findet nur was bereits bekannt ist, erkennt keine unbekannten Token
+
+### Fix
+
+- Beim Startup (NICHT bei periodischen Refreshes) werden vor dem `getMultipleAccounts`-Call zwei `getTokenAccountsByOwner` RPC-Calls gemacht (SPL Token + Token-2022)
+- Entdeckte Mints werden in die `known_mints` Liste gemergt
+- Danach läuft der bestehende `getMultipleAccounts`-Flow mit der erweiterten Liste
+- Dies stellt sicher dass der Bot beim Start den wahren On-Chain-Wallet-Status kennt
+
+### RPC-Budget
+
+- Startup: +2 RPC-Calls (`getTokenAccountsByOwner` x2) — einmalig, legitim
+- Laufzeit: 0 RPC-Calls (Geyser + ExecutionResult-basiertes ATA-Tracking)
+
+### Aufgaben
+
+- [x] `src/bin/market_data.rs`: `getTokenAccountsByOwner` für SPL Token + Token-2022 im Startup-Pfad
+- [x] `src/bin/market_data.rs`: Merge entdeckter Mints in `known_mints` + `cached_mint_meta`
+- [x] `src/bin/market_data.rs`: Doc-Kommentar und Log-Messages aktualisiert
+- [x] `cargo check` + `cargo clippy` erfolgreich (0 errors, 0 neue warnings)
+- [ ] Deploy + Test
+
+### Akzeptanzkriterien
+
+- [ ] Startup entdeckt Token die nicht in JetStream sind (z.B. extern gekaufte Token)
+- [ ] Entdeckte Token werden korrekt in JetStream gespeichert (für zukünftige Restarts)
+- [ ] Liquidation findet alle Token in der Wallet (nicht nur bekannte)
+- [ ] Geschlossene Positionen werden korrekt auf balance=0 gesetzt
+- [ ] Kein Owner-Scan im Laufzeit-Betrieb (nur Startup)
 
 ---
 

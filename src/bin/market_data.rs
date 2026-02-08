@@ -518,10 +518,14 @@ fn try_parse_token_account_balance(data: &[u8]) -> Option<u64> {
 /// - Emergency liquidations via UI
 /// - External transfers
 /// - Closed ATAs (Geyser doesn't report deleted accounts)
+/// - Tokens bought externally or with broken ATA tracking (owner-scan discovery)
+///
+/// **Startup RPC calls** (legitimate, NOT in hot-path):
+/// 1. `getTokenAccountsByOwner` x2 (SPL Token + Token-2022) — discover unknown tokens
+/// 2. `getMultipleAccounts` x1 — verify balances + decimals for all known mints
 ///
 /// After startup, live balance updates are handled by Geyser (tracked ATA subscriptions).
-/// This startup call is the ONE legitimate RPC roundtrip to catch the Geyser gap
-/// (closed/deleted ATAs are not reported by Geyser).
+/// No RPC calls are made in the runtime hot-path.
 async fn publish_wallet_snapshot(
     ctx: &MarketDataContext,
     rpc: &SolanaRpc,
@@ -648,10 +652,114 @@ async fn publish_wallet_snapshot(
         // Token holdings will be learned event-driven (ExecutionResults + Geyser).
     }
 
+    // 1.5) Owner-Scan Discovery: getTokenAccountsByOwner (startup only)
+    //
+    // JetStream only knows mints that were previously tracked. If the bot was offline and
+    // tokens were bought externally (Phantom, Jupiter) or a previous run had broken ATA
+    // tracking, those mints won't be in JetStream.
+    //
+    // This owner-scan discovers ALL token accounts in the wallet, merges them with known
+    // mints, and ensures the startup snapshot reflects the true on-chain wallet state.
+    // This is a legitimate startup-only RPC call (2 calls: SPL Token + Token-2022).
+    // It runs at every startup but NOT for periodic refreshes.
+    if !is_periodic {
+        use solana_client::rpc_request::TokenAccountsFilter;
+
+        let mut discovered_from_owner_scan: Vec<(Pubkey, u64, Pubkey)> = Vec::new(); // (mint, balance, token_program)
+
+        // SPL Token accounts
+        match rpc.rpc.get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(token_program)).await {
+            Ok(accounts) => {
+                for keyed in &accounts {
+                    if let solana_account_decoder::UiAccountData::Json(parsed) = &keyed.account.data {
+                        if let Some(info) = parsed.parsed.get("info") {
+                            let mint_str = info.get("mint").and_then(|v| v.as_str()).unwrap_or("");
+                            let balance_str = info.get("tokenAmount")
+                                .and_then(|v| v.get("amount"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0");
+                            let decimals_val = info.get("tokenAmount")
+                                .and_then(|v| v.get("decimals"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(6) as u8;
+                            if let Ok(mint_pk) = Pubkey::from_str(mint_str) {
+                                let balance: u64 = balance_str.parse().unwrap_or(0);
+                                if balance > 0 && mint_str != WSOL_MINT {
+                                    discovered_from_owner_scan.push((mint_pk, balance, token_program));
+                                    // Also cache decimals for later
+                                    cached_mint_meta.entry(mint_pk).or_insert((decimals_val, token_program, 0));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Wallet snapshot bootstrap: getTokenAccountsByOwner (SPL Token) failed");
+            }
+        }
+
+        // Token-2022 accounts
+        match rpc.rpc.get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(token_2022_program)).await {
+            Ok(accounts) => {
+                for keyed in &accounts {
+                    if let solana_account_decoder::UiAccountData::Json(parsed) = &keyed.account.data {
+                        if let Some(info) = parsed.parsed.get("info") {
+                            let mint_str = info.get("mint").and_then(|v| v.as_str()).unwrap_or("");
+                            let balance_str = info.get("tokenAmount")
+                                .and_then(|v| v.get("amount"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0");
+                            let decimals_val = info.get("tokenAmount")
+                                .and_then(|v| v.get("decimals"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(6) as u8;
+                            if let Ok(mint_pk) = Pubkey::from_str(mint_str) {
+                                let balance: u64 = balance_str.parse().unwrap_or(0);
+                                if balance > 0 && mint_str != WSOL_MINT {
+                                    discovered_from_owner_scan.push((mint_pk, balance, token_2022_program));
+                                    cached_mint_meta.entry(mint_pk).or_insert((decimals_val, token_2022_program, 0));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Wallet snapshot bootstrap: getTokenAccountsByOwner (Token-2022) failed");
+            }
+        }
+
+        // Merge discovered mints into known_mints (dedup)
+        let known_set: HashSet<Pubkey> = known_mints.iter().copied().collect();
+        let mut newly_discovered = 0usize;
+        for (mint_pk, _balance, _token_prog) in &discovered_from_owner_scan {
+            if !known_set.contains(mint_pk) && known_mints.len() < MAX_BOOTSTRAP_MINTS {
+                known_mints.push(*mint_pk);
+                newly_discovered += 1;
+            }
+        }
+
+        if newly_discovered > 0 {
+            info!(
+                wallet = %wallet_str,
+                newly_discovered,
+                total_known = known_mints.len(),
+                "Wallet snapshot bootstrap: owner-scan discovered unknown tokens"
+            );
+        } else if !discovered_from_owner_scan.is_empty() {
+            debug!(
+                wallet = %wallet_str,
+                owner_scan_tokens = discovered_from_owner_scan.len(),
+                "Wallet snapshot bootstrap: owner-scan found tokens (all already known)"
+            );
+        }
+    }
+
     // 2) Single RPC roundtrip: fetch mint accounts + derived SPL/2022 ATAs via getMultipleAccounts.
     //
-    // IMPORTANT: This does not do an owner-scan. We only reconcile mints we already know from JetStream.
-    // This keeps RPC to a single request and avoids architectural drift back into scanning.
+    // Reconciles all known mints (from JetStream + owner-scan discovery) via a single
+    // getMultipleAccounts call. This gives us authoritative balance + decimals for every mint.
     fn derive_ata(owner: &Pubkey, mint: &Pubkey, token_prog: &Pubkey, ata_prog: &Pubkey) -> Pubkey {
         let (ata, _bump) = Pubkey::find_program_address(
             &[owner.as_ref(), token_prog.as_ref(), mint.as_ref()],
@@ -864,7 +972,7 @@ async fn publish_wallet_snapshot(
         known_mints = known_mints.len(),
         mints_in_wallet = mints_in_wallet.len(),
         is_periodic,
-        "✅ Wallet snapshot bootstrap published (RPC: getMultipleAccounts, no owner-scan)"
+        "✅ Wallet snapshot bootstrap published (RPC: getMultipleAccounts + startup owner-scan)"
     );
 
     Ok(())
