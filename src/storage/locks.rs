@@ -407,7 +407,7 @@ impl LockManager {
             self.wsol_initialized
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        tracing::debug!(
+        tracing::info!(
             sol = sol_lamports,
             wsol = ?wsol_lamports,
             wsol_initialized = self.wsol_initialized.load(std::sync::atomic::Ordering::Relaxed),

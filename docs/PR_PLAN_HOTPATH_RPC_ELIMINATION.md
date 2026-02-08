@@ -15,7 +15,8 @@
 | Fix 2 | Simulation-Error Logging (Diagnose) | ✅ DEPLOYED | 1 | ~30min |
 | Fix 3 | Position-Tracking: Liquidation-Sells schließen Positionen | ✅ DEPLOYED | 2 | ~1h |
 | Fix 4 | Ghost-Balance-Fix: Wallet-Snapshot-Bootstrap schreibt balance=0 | ✅ DEPLOYED | 1 | ~30min |
-| PR 2 | PumpFun Bonding-Curve Quotes aus Cache | 🔧 IN PROGRESS | 2 | ~4h |
+| PR 2 | PumpFun Bonding-Curve Quotes aus Cache | ✅ DEPLOYED | 2 | ~4h |
+| Fix 5 | ExecutionResult Metadata + LockManager Seed + WSOL Logging | 🔧 IN PROGRESS | 3 | ~2h |
 | PR 3 | Vault-Balance-Reads aus Cache (Orca/Raydium/Meteora/CPMM) | ⬜ TODO | 5 | ~5h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
 | PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
@@ -179,7 +180,7 @@ Die Geyser-basierte Wallet-Balance-Implementierung wurde geprüft und ist korrek
 ## PR 2: PumpFun Bonding-Curve Quotes aus LivePoolCache
 
 **Branch**: `architecture-rebuild`
-**Status**: 🔧 IN PROGRESS
+**Status**: ✅ DEPLOYED (2026-02-08)
 **Risiko**: Mittel (Pump.fun = häufigster DEX)
 **Eliminiert**: 200-2000ms pro Quote + 500-2000ms im TX-Build
 
@@ -211,6 +212,51 @@ Die Geyser-basierte Wallet-Balance-Implementierung wurde geprüft und ist korrek
 - [ ] WARN-Log bei jedem RPC-Fallback
 - [ ] Liquidation funktioniert weiterhin korrekt
 - [ ] Kein Verhaltensunterschied für sell_all.rs (Emergency-Tool ohne Cache)
+
+---
+
+## Fix 5: ExecutionResult Metadata + LockManager Seed + WSOL Logging
+
+**Branch**: `architecture-rebuild`
+**Status**: 🔧 IN PROGRESS
+**Risiko**: Mittel (betrifft Trade-Lifecycle: BUY → SELL Fähigkeit)
+**Problem**: Nach einem bestätigten BUY scheitern SELL-Intents an `SIM_INSUFFICIENT_BALANCE`. Dashboard zeigt SOL statt WSOL.
+
+### Root Cause (3 zusammenhängende Bugs)
+
+1. **ExecutionResult fehlende Metadata**: Reguläre BUY-Intents von `momentum-bot` enthalten `token_account` und `token_program` NICHT in der Intent-Metadata. `execution-engine` kopiert blindlings `intent.metadata` in den ExecutionResult. `market-data` prüft diese Felder und macht `continue` (silent skip) wenn sie fehlen → ATA wird nie bei Geyser registriert → keine Balance-Updates für das neue Token.
+
+2. **Kein sofortiges LockManager-Update nach BUY**: Nach einem Confirmed BUY wird nur der `open_positions`-Counter inkrementiert. `LockManager.available_tokens` wird NIE mit dem gekauften Betrag befüllt. Das System verlässt sich komplett auf den Geyser-Pipeline Roundtrip (market-data → Geyser ATA subscribe → Geyser account update → WalletBalanceSnapshot → NATS → execution-engine), der aber wegen Bug 1 nie ankommt.
+
+3. **WSOL nie initialisiert**: `WalletBalanceUpdate` Logs sind auf `debug!`-Level → unsichtbar in Produktion. `wsol_initialized` wird nie `true` → `available_trading_capital()` fällt auf SOL zurück → Dashboard zeigt SOL statt WSOL.
+
+### Fix
+
+1. **ExecutionResult Metadata anreichern**: Bei BUY die ATA deterministisch ableiten (PDA aus wallet + output_mint + token_program, kein RPC) und zusammen mit `token_program` und `mint_decimals` in die ExecutionResult-Metadata einfügen. Die Daten sind bereits im Intent verfügbar (`TradeResources.token_program`, `resources.output_mint`).
+
+2. **LockManager sofort seeden**: Nach Confirmed BUY den `fill_out.raw` Betrag direkt in `LockManager.set_available_token_balance()` schreiben. Das überbrückt die Geyser-Pipeline-Latenz. Nach Confirmed SELL die Balance auf 0 setzen.
+
+3. **Logging hochstufen**: Alle `WalletBalanceUpdate`-Logs von `debug!` auf `info!` hochstufen (market-data Publisher, execution-engine Consumer, LockManager Update).
+
+### Aufgaben
+
+- [x] `src/bin/execution_engine.rs`: Nach Confirmed BUY ATA + token_program + mint_decimals in ExecutionResult-Metadata einfügen (PDA-Ableitung, kein RPC)
+- [x] `src/bin/execution_engine.rs`: Nach Confirmed BUY `confirmed_buy_fill_out_raw` capturen und `LockManager.set_available_token_balance()` aufrufen
+- [x] `src/bin/execution_engine.rs`: Nach Confirmed SELL `LockManager.set_available_token_balance(mint, 0)` aufrufen
+- [x] `src/bin/execution_engine.rs`: WalletBalanceUpdate Consumer-Log von `debug!` auf `info!` hochgestuft
+- [x] `src/bin/market_data.rs`: `WalletBalanceUpdate: publishing to NATS` von `debug!` auf `info!` hochgestuft
+- [x] `src/bin/market_data.rs`: `ExecutionResult: tracked wallet ATA/mint` von `debug!` auf `info!` hochgestuft
+- [x] `src/storage/locks.rs`: `LockManager wallet balances updated` von `debug!` auf `info!` hochgestuft
+- [x] `cargo check` + `cargo clippy` erfolgreich (0 errors, 0 neue warnings)
+- [ ] Deploy + Test
+
+### Akzeptanzkriterien
+
+- [ ] Nach BUY: market-data loggt `ExecutionResult: tracked wallet ATA/mint` (INFO-Level sichtbar)
+- [ ] Nach BUY: execution-engine loggt `LockManager: seeded token balance from confirmed BUY fill`
+- [ ] SELL-Intents für gekaufte Token werden NICHT mehr mit `SIM_INSUFFICIENT_BALANCE` abgelehnt
+- [ ] Dashboard zeigt WSOL (nicht SOL) nach Geyser-Pipeline-Initialisierung
+- [ ] WalletBalanceUpdate-Flow ist in Logs nachvollziehbar (market-data → NATS → execution-engine)
 
 ---
 

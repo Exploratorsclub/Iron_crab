@@ -1452,7 +1452,7 @@ async fn run_geyser_loop(
                         let _ = ctx.tracked_wallet_tx.send(accounts);
                     }
 
-                    debug!(
+                    info!(
                         execution_id = %exec.execution_id,
                         mint = %mint,
                         ata = %ata,
@@ -1512,7 +1512,7 @@ async fn run_geyser_loop(
                                 slot: account_update.slot,
                             };
 
-                            debug!(
+                            info!(
                                 wallet = %wallet_str,
                                 sol_lamports = new_sol,
                                 wsol_lamports = ?new_wsol,

@@ -4426,7 +4426,7 @@ async fn main() -> Result<()> {
                                         update.sol_lamports,
                                         update.wsol_lamports,
                                     );
-                                    debug!(
+                                    info!(
                                         sol = update.sol_lamports,
                                         wsol = ?update.wsol_lamports,
                                         slot = update.slot,
@@ -4434,7 +4434,7 @@ async fn main() -> Result<()> {
                                     );
                                 }
                                 Err(e) => {
-                                    debug!(error = %e, "Failed to parse WalletBalanceUpdate");
+                                    warn!(error = %e, "Failed to parse WalletBalanceUpdate");
                                 }
                             }
                         }
@@ -6767,6 +6767,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
     // Emit an ExecutionResult so strategy-plane components (e.g. momentum-bot) can
     // manage positions and exits (stop-loss / take-profit) based on confirmed outcomes.
+    // Capture fill_out for immediate LockManager update after confirmed BUY.
+    // Populated inside the should_emit block when fills are available.
+    let mut confirmed_buy_fill_out_raw: Option<u64> = None;
+
     if config.send_enabled {
         let status = match decision.outcome {
             DecisionOutcome::Confirmed => ExecutionStatus::Confirmed,
@@ -6808,6 +6812,61 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             )
             .with_metadata(intent.metadata.clone());
 
+            // Ensure market-data can track the new ATA via Geyser after a BUY.
+            // The intent already carries token_program (from TradeResources) and the
+            // output_mint + wallet_pubkey are known — so we derive the ATA deterministically
+            // (PDA, no RPC call). Without these metadata fields market-data silently skips
+            // ExecutionResult processing and never subscribes the new ATA to Geyser.
+            if intent.side == TradeSide::Buy {
+                if let Some(wallet) = ctx.wallet_pubkey {
+                    let output_mint_str = &intent.resources.output_mint;
+                    if let Ok(output_mint_pk) = Pubkey::from_str(output_mint_str) {
+                        // token_program: use intent-provided value, fall back to SPL Token
+                        use spl_token::solana_program::pubkey::Pubkey as SplPubkey;
+
+                        let token_program_spl = intent
+                            .resources
+                            .token_program
+                            .as_ref()
+                            .and_then(|tp| Pubkey::from_str(tp).ok())
+                            .map(|pk| SplPubkey::new_from_array(pk.to_bytes()))
+                            .unwrap_or_else(spl_token::id);
+
+                        // Derive ATA deterministically (PDA — no RPC)
+                        let wallet_spl = SplPubkey::new_from_array(wallet.to_bytes());
+                        let mint_spl = SplPubkey::new_from_array(output_mint_pk.to_bytes());
+                        let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+                            &wallet_spl, &mint_spl, &token_program_spl,
+                        );
+                        let ata_pk = Pubkey::new_from_array(ata_spl.to_bytes());
+                        let token_program_pk = Pubkey::new_from_array(token_program_spl.to_bytes());
+
+                        exec.metadata
+                            .entry("token_account".to_string())
+                            .or_insert_with(|| ata_pk.to_string());
+                        exec.metadata
+                            .entry("token_program".to_string())
+                            .or_insert_with(|| token_program_pk.to_string());
+
+                        // Also propagate mint_decimals if available in LivePoolCache
+                        if !exec.metadata.contains_key("mint_decimals") {
+                            if let Some(ref cache) = ctx.live_pool_cache {
+                                if let Some(d) = cache.get_mint_decimals(&output_mint_pk) {
+                                    exec.metadata.insert("mint_decimals".to_string(), d.to_string());
+                                }
+                            }
+                        }
+
+                        info!(
+                            intent_id = %intent.intent_id,
+                            token_account = %ata_pk,
+                            token_program = %token_program_pk,
+                            "ExecutionResult: enriched metadata for market-data ATA tracking"
+                        );
+                    }
+                }
+            }
+
             // Best-effort fill accounting: attach fills only when we have a signature and wallet.
             // This is used downstream for correct position accounting/exit sizing.
             if matches!(status, ExecutionStatus::Confirmed) {
@@ -6817,6 +6876,14 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     if let Ok(sig) = Signature::from_str(sig_str) {
                         let (fill_in, fill_out, fill_status, fill_reason, wallet_sol_delta) =
                             compute_intent_fills_best_effort(ctx, wallet, &sig, &intent).await;
+
+                        // Capture fill_out for immediate LockManager update (Fix: SIM_INSUFFICIENT_BALANCE)
+                        if intent.side == TradeSide::Buy {
+                            if let Some(ref fo) = fill_out {
+                                confirmed_buy_fill_out_raw = Some(fo.raw);
+                            }
+                        }
+
                         exec = exec
                             .with_fills(fill_in, fill_out)
                             .with_fill_diagnostics(fill_status, fill_reason);
@@ -6852,6 +6919,30 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             TradeSide::Buy => {
                 let prev = ctx.open_positions.fetch_add(1, Ordering::Relaxed);
                 OPEN_POSITIONS_GAUGE.store((prev + 1) as u64, Ordering::Relaxed);
+
+                // Immediately seed LockManager with bought token balance so that
+                // subsequent SELL intents don't fail with SIM_INSUFFICIENT_BALANCE.
+                // The Geyser pipeline (market-data → WalletBalanceSnapshot → NATS)
+                // will eventually deliver the authoritative balance, but there is
+                // latency; this optimistic update bridges the gap.
+                if let Some(fill_raw) = confirmed_buy_fill_out_raw {
+                    let mint_str = &intent.resources.output_mint;
+                    ctx.lock_manager
+                        .set_available_token_balance(mint_str.to_string(), fill_raw);
+                    info!(
+                        intent_id = %intent.intent_id,
+                        mint = %mint_str,
+                        fill_out_raw = fill_raw,
+                        "LockManager: seeded token balance from confirmed BUY fill"
+                    );
+                } else {
+                    warn!(
+                        intent_id = %intent.intent_id,
+                        mint = %intent.resources.output_mint,
+                        "LockManager: no fill_out available after confirmed BUY — \
+                         token balance NOT seeded (will rely on Geyser pipeline)"
+                    );
+                }
             }
             TradeSide::Sell => {
                 // Prevent underflow: only decrement if > 0
@@ -6862,6 +6953,18 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 } else {
                     OPEN_POSITIONS_GAUGE.store(0, Ordering::Relaxed);
                 }
+
+                // Clear token balance from LockManager after successful SELL.
+                // This prevents stale balances that would pass pre-flight checks
+                // for tokens we no longer hold.
+                let mint_str = &intent.resources.input_mint;
+                ctx.lock_manager
+                    .set_available_token_balance(mint_str.to_string(), 0);
+                info!(
+                    intent_id = %intent.intent_id,
+                    mint = %mint_str,
+                    "LockManager: cleared token balance after confirmed SELL"
+                );
             }
         }
 
