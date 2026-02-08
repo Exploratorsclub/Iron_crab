@@ -85,7 +85,8 @@ sd-notify = "0.4"
 # Yellowstone dependencies non-Windows only. Code that depends on Geyser has
 # Windows stubs that return a clear runtime error.
 #
-# TPU Direct Client is also Linux-only due to QUIC/UDP socket handling differences.
+# TPU Direct Client deps are also non-Windows (same cfg gate).
+# NOTE: These crates are currently unused in Rust code — kept for future TPU sender integration.
 [target.'cfg(not(windows))'.dependencies]
 yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc.git", branch = "master" }
 yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc.git", branch = "master" }
