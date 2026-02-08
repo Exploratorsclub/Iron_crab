@@ -19,7 +19,8 @@
 | Fix 5 | ExecutionResult Metadata + LockManager Seed + WSOL Logging | ✅ DEPLOYED | 3 | ~2h |
 | Fix 6 | Startup Owner-Scan: getTokenAccountsByOwner Discovery | ✅ DEPLOYED | 1 | ~1h |
 | Fix 7 | Token-2022 StateWithExtensions: Account-Unpack für Extensions | ✅ DEPLOYED | 1 | ~30min |
-| PR 3 | Vault-Balance-Reads aus Cache (Orca/Raydium/Meteora/CPMM) | 🔧 IN PROGRESS | 5 | ~5h |
+| PR 3 | Vault-Balance-Reads aus Cache (Orca/Raydium/Meteora/CPMM) | ✅ DEPLOYED | 5 | ~5h |
+| Fix 8 | LockManager BUY-Fill-Akkumulation + Live Token-Balance-Sync | 🔧 READY | 2 | ~1h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
 | PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
 
@@ -340,7 +341,7 @@ Die Geyser-basierte Wallet-Balance-Implementierung wurde geprüft und ist korrek
 ## PR 3: Vault-Balance-Reads aus Cache (Orca, Raydium, Meteora, CPMM)
 
 **Branch**: `architecture-rebuild`
-**Status**: 🔧 IN PROGRESS
+**Status**: ✅ DEPLOYED (2026-02-08)
 **Risiko**: Mittel
 **Eliminiert**: 2-4 RPC-Calls pro Quote bei jedem dieser DEXe
 
@@ -400,6 +401,53 @@ Jedes DEX-Modul bekommt:
 - [ ] WARN-Log bei jedem RPC-Fallback
 - [ ] Metriken zeigen Cache-Hit-Rate pro DEX
 - [ ] Liquidation funktioniert weiterhin
+
+---
+
+## Fix 8: LockManager BUY-Fill-Akkumulation + Live Token-Balance-Sync
+
+**Status**: 🔧 READY (2026-02-08)
+**Risiko**: Niedrig
+**Root Cause**: Multi-BUY-Szenario (probe + scale-in) → LockManager überschreibt statt akkumuliert
+
+### Problem
+
+Nach BUY #1 (probe) + BUY #2 (scale-in) enthielt der LockManager nur den Fill von BUY #2
+statt der Summe beider Fills. SELL-Intents versuchten die gesamte Position zu verkaufen,
+fanden aber weniger im LockManager → `SIM_INSUFFICIENT_BALANCE`.
+
+**Beispiel aus Logs:**
+- BUY #1: `fill_out_raw=6,556,083,309` → LockManager = 6.5B ✅
+- BUY #2: `fill_out_raw=20,529,004,728` → LockManager = 20.5B (ÜBERSCHRIEBEN!)
+- On-Chain: ~27B Token
+- SELL für 27B: `available=20.5B < required=27B` → REJECTED ❌
+
+Zusätzlich fehlte ein **Live Token-Balance-Sync** von Geyser → LockManager.
+JetStream `WALLET_SNAPSHOT` wurde nur beim Bootstrap konsumiert, nicht im laufenden Betrieb.
+
+### Aufgaben
+
+**Fix 8a: BUY-Fill-Akkumulation**
+- [x] `src/storage/locks.rs`: Neue Methode `add_available_token_balance(mint, additional_raw)` — addiert zum bestehenden Wert
+- [x] `src/bin/execution_engine.rs`: BUY-Fill-Seeding von `set_available_token_balance` → `add_available_token_balance`
+- [x] Logging erweitert: `total_available` zeigt den akkumulierten Gesamtwert
+
+**Fix 8b: Live JetStream Token-Balance-Consumer**
+- [x] `src/bin/execution_engine.rs`: Background-Task für JetStream `WALLET_SNAPSHOT` Consumer
+- [x] `DeliverPolicy::New` — nur neue Messages nach Bootstrap
+- [x] Autoritative Geyser-Balances überschreiben LockManager-Werte (korrigiert Diskrepanzen)
+- [x] DIFF-Logging: Alte/neue Balance bei Änderung
+- [x] Kein RPC — rein Geyser/NATS-basiert
+
+**Bekanntes Follow-up (nicht in diesem Fix):**
+- `IncorrectProgramId` bei Folge-BUYs für Token-2022: `momentum-bot` verliert `token_program` in Folge-Intents
+
+### Akzeptanzkriterien
+
+- [x] `cargo check` + `cargo clippy` erfolgreich
+- [ ] Multi-BUY (probe + scale-in) → SELL funktioniert ohne `SIM_INSUFFICIENT_BALANCE`
+- [ ] Geyser Token-Balance-Updates erreichen LockManager in Echtzeit
+- [ ] Liquidation nach Neustart funktioniert
 
 ---
 

@@ -4449,6 +4449,129 @@ async fn main() -> Result<()> {
             wallet = %treasury.pubkey(),
             "LockManager balance updater background task started"
         );
+
+        // === Live JetStream Token Balance Consumer ===
+        // Subscribes to WALLET_SNAPSHOT stream for real-time token balance updates.
+        // This ensures LockManager has authoritative Geyser-based token balances,
+        // correcting any discrepancies from accumulated BUY fills and covering
+        // cases where tokens are added/removed externally.
+        {
+            let wallet_str = treasury.pubkey().to_string();
+            let ctx_for_tokens = Arc::clone(&ctx);
+            let nats_url_tokens = args.nats_url.clone();
+            let shutdown_rx_tokens = shutdown_rx.clone();
+
+            tokio::spawn(async move {
+                use async_nats::jetstream;
+                use futures::StreamExt;
+
+                let nats_config = NatsConfig::new(&nats_url_tokens, "token-balance-sync");
+                let mut nats_client = NatsClient::new(nats_config);
+                if let Err(e) = nats_client.connect().await {
+                    warn!(error = %e, "Token balance sync: failed to connect to NATS");
+                    return;
+                }
+
+                let js = jetstream::new(nats_client.client().clone());
+                let stream = match js.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "Token balance sync: WALLET_SNAPSHOT stream not found");
+                        return;
+                    }
+                };
+
+                // DeliverPolicy::New — only receive messages published AFTER this consumer is created.
+                // Bootstrap already handled all historical snapshots; this handles live updates.
+                let consumer_config = jetstream::consumer::pull::Config {
+                    deliver_policy: jetstream::consumer::DeliverPolicy::New,
+                    ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                    max_ack_pending: 256,
+                    filter_subject: format!("ironcrab.wallet_snapshot.{}.*", wallet_str),
+                    ..Default::default()
+                };
+
+                let consumer = match stream.create_consumer(consumer_config).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(error = %e, "Token balance sync: failed to create JetStream consumer");
+                        return;
+                    }
+                };
+
+                info!(wallet = %wallet_str, "Token balance sync: live JetStream consumer started");
+
+                let mut shutdown = shutdown_rx_tokens;
+                loop {
+                    tokio::select! {
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                info!("Token balance sync: shutting down");
+                                break;
+                            }
+                        }
+                        result = consumer.fetch().max_messages(50).messages() => {
+                            match result {
+                                Ok(mut messages) => {
+                                    while let Some(msg) = messages.next().await {
+                                        let msg = match msg {
+                                            Ok(m) => m,
+                                            Err(e) => {
+                                                debug!(error = %e, "Token balance sync: fetch error");
+                                                continue;
+                                            }
+                                        };
+
+                                        let event: MarketEvent = match serde_json::from_slice(&msg.payload) {
+                                            Ok(e) => e,
+                                            Err(e) => {
+                                                debug!(error = %e, "Token balance sync: deserialize error");
+                                                let _ = msg.ack().await;
+                                                continue;
+                                            }
+                                        };
+
+                                        if let MarketEventKind::WalletBalanceSnapshot {
+                                            mint, balance_raw, ..
+                                        } = &event.kind
+                                        {
+                                            if mint != SOL_MINT && mint != WSOL_MINT {
+                                                let old = ctx_for_tokens.lock_manager.available_token_balance(mint);
+                                                ctx_for_tokens.lock_manager.set_available_token_balance(
+                                                    mint.clone(),
+                                                    *balance_raw,
+                                                );
+                                                if old != *balance_raw {
+                                                    info!(
+                                                        mint = %mint,
+                                                        old_balance = old,
+                                                        new_balance = *balance_raw,
+                                                        "Token balance sync: LockManager updated from Geyser"
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        let _ = msg.ack().await;
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(error = %e, "Token balance sync: batch fetch error");
+                                }
+                            }
+
+                            // Brief sleep between fetch batches to avoid busy-loop
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+            });
+
+            info!(
+                wallet = %treasury.pubkey(),
+                "Token balance sync: live JetStream consumer background task started"
+            );
+        }
     }
 
     // === AccountJanitor: Background cleanup of empty ATAs and dust ===
@@ -6922,20 +7045,25 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 let prev = ctx.open_positions.fetch_add(1, Ordering::Relaxed);
                 OPEN_POSITIONS_GAUGE.store((prev + 1) as u64, Ordering::Relaxed);
 
-                // Immediately seed LockManager with bought token balance so that
+                // Immediately update LockManager with bought token balance so that
                 // subsequent SELL intents don't fail with SIM_INSUFFICIENT_BALANCE.
-                // The Geyser pipeline (market-data → WalletBalanceSnapshot → NATS)
-                // will eventually deliver the authoritative balance, but there is
-                // latency; this optimistic update bridges the gap.
+                // IMPORTANT: Use ADD (accumulate) not SET — for multi-BUY scenarios
+                // (probe + scale-in), each fill is incremental. Using SET would
+                // overwrite the first BUY's balance with the second, leaving
+                // LockManager with less than the actual on-chain total.
+                // The Geyser pipeline will eventually deliver the authoritative
+                // balance via live JetStream consumer, correcting any discrepancies.
                 if let Some(fill_raw) = confirmed_buy_fill_out_raw {
                     let mint_str = &intent.resources.output_mint;
                     ctx.lock_manager
-                        .set_available_token_balance(mint_str.to_string(), fill_raw);
+                        .add_available_token_balance(mint_str.to_string(), fill_raw);
+                    let new_total = ctx.lock_manager.available_token_balance(mint_str);
                     info!(
                         intent_id = %intent.intent_id,
                         mint = %mint_str,
                         fill_out_raw = fill_raw,
-                        "LockManager: seeded token balance from confirmed BUY fill"
+                        total_available = new_total,
+                        "LockManager: accumulated token balance from confirmed BUY fill"
                     );
                 } else {
                     warn!(

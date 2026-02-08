@@ -391,6 +391,24 @@ impl LockManager {
             .insert(mint, effective_available);
     }
 
+    /// Add to an existing mint's available token balance (accumulate).
+    ///
+    /// Used after confirmed BUY fills where each fill is incremental.
+    /// Unlike `set_available_token_balance` (which replaces), this ADDS
+    /// `additional_raw` to whatever is already tracked for this mint.
+    /// This is critical for multi-BUY scenarios (probe + scale-in) where
+    /// each BUY delivers additional tokens on top of the existing balance.
+    pub fn add_available_token_balance(&self, mint: String, additional_raw: u64) {
+        let current = self
+            .available_tokens
+            .read()
+            .get(&mint)
+            .copied()
+            .unwrap_or(0);
+        let new_total = current.saturating_add(additional_raw);
+        self.available_tokens.write().insert(mint, new_total);
+    }
+
     /// Update wallet balances from WalletBalanceUpdate event (SOL + WSOL).
     ///
     /// This is called when market-data publishes balance updates via NATS.
