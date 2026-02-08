@@ -982,6 +982,20 @@ impl PumpFunDex {
         let (associated_bonding_curve, _bump2) =
             self.derive_associated_bonding_curve(&bonding_curve, &token_mint, &token_program_sdk);
 
+        // Guard: Reject builds for completed bonding curves (migrated to PumpSwap AMM).
+        // Without this check, the tx builds successfully and simulation may pass, but
+        // on-chain execution fails with Custom(2006) "A seeds constraint was violated"
+        // because the bonding curve PDA is no longer valid after migration.
+        if let Some(state) = self.get_bonding_curve_from_cache(&bonding_curve) {
+            if state.complete {
+                return Err(anyhow!(
+                    "pump.fun bonding curve completed (migrated to pump_amm) for mint {} — \
+                     cannot build swap instruction via bonding curve, use pump_amm instead",
+                    token_mint_str
+                ));
+            }
+        }
+
         // Creator resolution priority (GEYSER-FIRST, PR2):
         // 1. Explicit fallback_creator (from Geyser event/intent metadata)
         // 2. Cached creator (from DashMap, populated from previous lookups)
@@ -1020,6 +1034,14 @@ impl PumpFunDex {
             );
             let acct = self.rpc.get_account_retry(&bonding_curve).await?;
             let state = BondingCurveState::parse(&acct.data)?;
+            // Double-check: if RPC reveals complete, reject before wasting TX fees
+            if state.complete {
+                return Err(anyhow!(
+                    "pump.fun bonding curve completed (from RPC fallback) for mint {} — \
+                     cannot build swap instruction via bonding curve",
+                    token_mint_str
+                ));
+            }
             // Cache for future use
             self.cached_creators.insert(token_mint, state.creator);
             state.creator

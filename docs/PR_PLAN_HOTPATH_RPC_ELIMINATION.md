@@ -23,9 +23,9 @@
 | Fix 8 | LockManager BUY-Fill-Akkumulation + Live Token-Balance-Sync | ✅ DEPLOYED | 2 | ~1h |
 | Fix 9 | SELL-Amount Race-Condition + Recovery-Summierung + Partial-Sell | 🔧 READY | 2 | ~2h |
 | Fix 10 | LockManager Doppelzählung bei Geyser-Race | 🔧 READY | 1 | ~30min |
-| Bug 11 | momentum-bot: token_program fehlt in Scale-in TradeIntents | ⬜ TODO | 1 | ~1h |
-| Bug 12 | PumpFun Custom(2006): Seeds-Constraint bei State-Change | ⬜ TODO | 1 | ~1h |
-| Bug 13 | PumpFun Custom(6023): Complete Bonding-Curve Routing | ⬜ TODO | 1 | ~2h |
+| Fix 11 | token_program Persistence + Pump Token-2022 Guard | 🔧 READY | 1 | ~1h |
+| Fix 12 | PumpFun Custom(2006): Complete-Guard in build_swap_ix | 🔧 READY | 1 | ~30min |
+| Fix 13 | PumpSwap AMM pool_accounts Propagation + Liquidation Complete-Guard | 🔧 READY | 2 | ~1h |
 | Bug 14 | PnL-Diskrepanz: momentum-bot vs Dashboard bei Partial-Sell | ⬜ TODO | 1 | ~1h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
 | PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
@@ -548,63 +548,147 @@ BUY-Fill-Handler prüft jetzt den aktuellen Balance BEVOR er addiert:
 
 ---
 
-## Bug 11: momentum-bot token_program fehlt in Scale-in TradeIntents
+## Fix 11: token_program Persistence + Pump Token-2022 Guard
 
-**Status**: ⬜ TODO
-**Risiko**: Mittel (betrifft Token-2022 Token)
-**Problem**: Scale-in BUY-Intents von momentum-bot enthalten kein `token_program` in der Metadata. execution-engine defaultet auf `spl_token::id()`. Bei Token-2022 Mints → `IncorrectProgramId` bei ATA-Erstellung.
+**Branch**: `architecture-rebuild`
+**Status**: 🔧 READY (2026-02-08)
+**Risiko**: Mittel (betrifft Token-2022 Token, insbesondere PumpFun)
+**Problem**: BUY-Intents für Token-2022 Mints scheitern mit `IncorrectProgramId`. Scale-in und Recovery-Pfade verlieren `token_program`.
 
-### Root Cause
+### Root Cause (3 zusammenhängende Bugs)
 
-- `momentum-bot` speichert `token_program` nicht bei Position-Eröffnung
-- Folge-Intents (Scale-in) können es daher nicht in die Intent-Metadata einfügen
-- execution-engine `pumpfun.rs` → `create_associated_token_account` mit falschem Program
+1. **Pump Token-2022 Guard blockiert korrekte Info**: `generate_and_publish_buy_intent()` hatte einen Guard der `token_program = spl22` für Pump-Token verwarf wenn `mint_info_is_final == false` (supply==0, no authorities). Geyser-Daten sind aber autoritativ → Guard war zu restriktiv.
 
-### Geplanter Fix
+2. **`PositionTracker` speichert kein `token_program`**: Nach einem erfolgreichen Probe-BUY ging die Token-Program-Info verloren. Scale-in und SELL-Intents konnten sie nicht aus der Position ableiten.
 
-- `PositionTracker` um `token_program: String` Feld erweitern
-- Bei BUY-Confirmation `token_program` aus ExecutionResult-Metadata extrahieren
-- Scale-in Intent: `token_program` aus Position übernehmen
+3. **SELL-Intent nur von `mint_infos` abhängig**: `mint_infos` ist in-memory und überlebt keine Restarts. Nach Recovery hatte die Position kein `token_program` → SELL defaultet zu SPL Token → `IncorrectProgramId` für Token-2022.
+
+### Fix
+
+1. **Guard entfernt**: Geyser-sourced `token_program` (SPL oder Token-2022) wird direkt vertraut, kein `mint_info_is_final` Check mehr.
+
+2. **`PositionTracker` + `PersistedPosition` + `OpenPositionParams` erweitert** um `token_program: Option<String>`:
+   - Bei BUY-Confirmation: `token_program` aus ExecutionResult-Metadata (Priorität 1) oder `mint_infos` (Priorität 2)
+   - Bei Scale-in: Vorhandenes `token_program` wird beibehalten, fehlendes wird aufgefüllt
+   - Bei Recovery (JSONL): `token_program` aus Execution-Metadata extrahiert
+   - Bei Recovery (KV): `token_program` wird mit dem Rest der Position serialisiert/deserialisiert
+   - Bei Wallet-Snapshot-Reconciliation: `token_program` aus `mint_infos`
+
+3. **SELL-Intent-Generierung priorisiert Position**: `token_program` wird zuerst aus der persistierten Position gelesen, dann aus `mint_infos` als Fallback.
+
+### Aufgaben
+
+- [x] `src/bin/momentum_bot.rs`: `PositionTracker` um `token_program: Option<String>` erweitert
+- [x] `src/bin/momentum_bot.rs`: `PersistedPosition` um `token_program: Option<String>` erweitert (mit `#[serde(default)]`)
+- [x] `src/bin/momentum_bot.rs`: `OpenPositionParams` um `token_program` erweitert
+- [x] `src/bin/momentum_bot.rs`: `open_position()` — Token-Program setzen bei neuer Position, upgraden bei Scale-in
+- [x] `src/bin/momentum_bot.rs`: BUY-Confirmation — `token_program` aus `result.metadata` oder `mint_infos` extrahieren
+- [x] `src/bin/momentum_bot.rs`: SELL-Intent — `token_program` primär aus Position, Fallback `mint_infos`
+- [x] `src/bin/momentum_bot.rs`: JSONL-Recovery — `token_program` aus Execution-Metadata
+- [x] `src/bin/momentum_bot.rs`: Wallet-Snapshot-Recovery — `token_program` aus `mint_infos`
+- [x] `src/bin/momentum_bot.rs`: Pump Token-2022 Guard entfernt (Geyser ist autoritativ)
+- [x] `cargo check` + `cargo clippy` erfolgreich (0 errors, 0 warnings)
+- [ ] Deploy + Test
+
+### Akzeptanzkriterien
+
+- [ ] Token-2022 Probe-BUY: `token_program = spl22` wird korrekt an Intent übergeben
+- [ ] Token-2022 Scale-in-BUY: `token_program` aus Position übernommen
+- [ ] Token-2022 SELL: `token_program` aus Position (überlebt Restart)
+- [ ] Recovery (JSONL/KV): `token_program` wird korrekt restauriert
+- [ ] Kein `IncorrectProgramId` mehr für PumpFun Token-2022 Token
 
 ---
 
-## Bug 12: PumpFun Custom(2006) — Seeds-Constraint bei State-Change
+## Fix 12: PumpFun Custom(2006) — Complete-Guard in build_swap_ix
 
-**Status**: ⬜ TODO
-**Risiko**: Niedrig (Edge-Case bei Bonding-Curve-Migration)
+**Branch**: `architecture-rebuild`
+**Status**: 🔧 READY (2026-02-08)
+**Risiko**: Niedrig
 **Problem**: BUY-Simulation erfolgreich, aber On-Chain `FailedConfirmed` mit `Custom(2006)` ("A seeds constraint was violated"). Bonding-Curve-Status hat sich zwischen Simulation und Execution geändert.
 
 ### Root Cause
 
-- Bonding Curve war bei Simulation noch aktiv
-- Zwischen Simulation und TX-Execution: Migration zu PumpSwap AMM
-- PDA-Derivation für alte Bonding Curve scheitert → Seeds-Constraint verletzt
+- `quote_exact_in()` und `quote_exact_in_with_fallback()` prüften `complete` bereits → Quote = `None` für completed Curves
+- **`build_swap_ix_async_with_slippage()` hatte KEINEN `complete`-Check** → TX wurde gebaut und simuliert
+- Zwischen Simulation und On-Chain-Execution: Bonding Curve migriert zu PumpSwap AMM
+- PDA-Derivation für `associated_bonding_curve` scheitert → `Custom(2006) "A seeds constraint was violated"`
 
-### Geplanter Fix
+### Fix
 
-- Kurz vor TX-Send: Re-Check ob Bonding Curve noch `complete == false` (aus Cache)
-- Wenn `complete == true`: TX abbrechen, Intent als `Rejected(BONDING_CURVE_MIGRATED)` markieren
-- Kein erneuter RPC nötig wenn LivePoolCache `complete`-Status aktuell ist
+1. **Cache-Guard in `build_swap_ix_async_with_slippage()`**: Nach Bonding-Curve-PDA-Ableitung wird `get_bonding_curve_from_cache()` geprüft. Wenn `complete == true` → `Err(bonding curve completed)` → kein TX gebaut, keine Fees verschwendet.
+
+2. **RPC-Fallback-Guard**: Wenn der RPC-Fallback-Pfad für Creator-Resolution eine completed Bonding Curve findet → sofort Err statt TX bauen.
+
+### Aufgaben
+
+- [x] `src/solana/dex/pumpfun.rs`: `build_swap_ix_async_with_slippage()` — `complete`-Guard nach PDA-Ableitung
+- [x] `src/solana/dex/pumpfun.rs`: RPC-Fallback — `complete`-Check nach `BondingCurveState::parse()`
+- [x] `cargo check` + `cargo clippy` erfolgreich (0 errors, 0 warnings)
+- [ ] Deploy + Test
+
+### Akzeptanzkriterien
+
+- [ ] Completed Bonding Curves → `build_swap_ix` returned Error statt TX
+- [ ] Kein `Custom(2006)` / `FailedConfirmed` mehr für migrierte Bonding Curves
+- [ ] Quote-Phase weiterhin korrekt (bereits gefixt)
+- [ ] Kein neuer RPC-Call eingeführt (nur Cache-Check)
 
 ---
 
-## Bug 13: PumpFun Custom(6023) — Complete Bonding-Curve Routing
+## Fix 13: PumpSwap AMM pool_accounts Propagation + Liquidation Complete-Guard
 
-**Status**: ⬜ TODO
-**Risiko**: Mittel (betrifft Liquidation von PumpFun-Token nach Migration)
-**Problem**: Liquidation von PumpFun-Token scheitert mit `Custom(6023)` wenn die Bonding Curve already "complete" ist und der Token zu PumpSwap AMM migriert wurde.
+**Status**: 🔧 READY
+**Risiko**: Hoch (betrifft Liquidation aller PumpFun-Token nach Migration zu PumpSwap AMM)
+**Problem**: Liquidation von PumpFun-Token die zu PumpSwap AMM migriert sind scheitert komplett — kein DEX findet eine Route.
 
-### Root Cause
+### Root Cause (identifiziert)
 
-- Liquidation versucht über alte Bonding Curve zu routen
-- Bonding Curve ist already complete → PumpFun-Programm rejectiert mit 6023
-- Kein automatischer Fallback auf PumpSwap AMM
+Die Liquidation hat 3 Phasen für Route-Discovery:
+1. **Phase 1**: PumpFun Bonding Curve → korrekt `None` bei `complete=true` ✅
+2. **Phase 2**: PumpSwap AMM via `PumpFunAmmDex` mit RPC-Discovery (10s Timeout) → fragil, kann fehlschlagen
+3. **Phase 3**: LivePoolCache Fallback → **BROKEN** weil `pool_accounts` immer leer ist
 
-### Geplanter Fix
+**Kritische Lücke**: `parse_pumpamm_pool()` in `live_pool_cache.rs` erzeugt `PumpAmmState` mit `pool_accounts: vec![]` (Zeile 917: "Will be populated from DexPoolAccounts event"). Aber:
+- `market-data` publiziert `DexPoolAccounts` Events korrekt über NATS
+- `execution-engine` subscribt auf `TOPIC_MARKET_EVENTS`, verarbeitet aber **nur** `TokenMintInfo` — `DexPoolAccounts` werden ignoriert (Zeile 5043)
+- Dadurch bleiben `pool_accounts` für ALLE PumpSwap AMM Pools permanent leer
+- Phase 3 der Liquidation überspringt diese mit "cache=skip pump_amm no_pool_accounts"
 
-- Wenn `complete == true` im LivePoolCache: Route über PumpSwap AMM statt Bonding Curve
-- Fallback-Chain: PumpSwap AMM → Raydium → Orca (falls AMM-Migration bekannt)
-- Besseres Logging für Routing-Entscheidung
+**Zusätzlich**: Phase 3 prüft nicht `complete` bei PumpFun Bonding Curves → könnte theoretisch Intents für migrierte Bonding Curves erzeugen (wird aber durch `quote_calculator` abgefangen).
+
+### Implementierter Fix
+
+#### A) `LivePoolCache.set_pump_amm_pool_accounts()` (live_pool_cache.rs)
+- Neue Methode zum Setzen der `pool_accounts` für PumpAmm-Einträge
+- Logging ob der Eintrag leer war (erste Befüllung) oder Update
+
+#### B) `LivePoolCache.find_pump_amm_pool_by_base_mint()` (live_pool_cache.rs)
+- Hilfsmethode zum Finden eines PumpAmm-Pools anhand der base_mint
+
+#### C) execution-engine: DexPoolAccounts NATS-Handler (execution_engine.rs)
+- Erweitert den bestehenden `TOPIC_MARKET_EVENTS` Subscriber
+- Verarbeitet `MarketEventKind::DexPoolAccounts` für `pump_amm` / `PumpFunAmm`
+- Parst Account-Strings zu Pubkeys und ruft `cache.set_pump_amm_pool_accounts()` auf
+- Validierung: mindestens 12 gültige Accounts erforderlich
+
+#### D) Liquidation Phase 2: Discovery-Caching (execution_engine.rs)
+- Wenn `pump_amm.pool_accounts_v1_for_base_mint()` erfolgreich ist, werden die Accounts auch im LivePoolCache gecacht
+- Verhindert wiederholte RPC-Discovery bei nachfolgenden Liquidationen
+
+#### E) Phase 3: PumpFun `complete` Guard (execution_engine.rs)
+- `has_pair` Check für `PumpFun` Bonding Curves prüft jetzt auch `!s.complete`
+- Verhindert dass Intents für migrierte Bonding Curves erzeugt werden
+
+### Geänderte Dateien
+- `src/execution/live_pool_cache.rs` — 2 neue Methoden
+- `src/bin/execution_engine.rs` — DexPoolAccounts Handler + Liquidation Caching + complete Guard
+
+### Akzeptanzkriterien
+- [ ] `DexPoolAccounts` Events von market-data werden im LivePoolCache verarbeitet
+- [ ] PumpSwap AMM `pool_accounts` sind nach dem ersten Trade des Pools befüllt
+- [ ] Liquidation Phase 3 findet PumpSwap AMM Routen für migrierte Token
+- [ ] `cargo clippy` 0 Errors, 0 Warnings ✅
 
 ---
 

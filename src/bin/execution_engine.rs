@@ -1599,6 +1599,13 @@ impl ExecutionContext {
                             if let Some(pool_id) = q.route.first().cloned() {
                                 match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
                                     Ok(Some(accounts)) => {
+                                        // Cache pool_accounts in LivePoolCache for Phase 3 fallback
+                                        // and future liquidations (avoids repeated RPC discovery).
+                                        if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
+                                            if let Some(ref cache) = ctx.live_pool_cache {
+                                                cache.set_pump_amm_pool_accounts(&pool_pk, accounts.clone());
+                                            }
+                                        }
                                         let acct_strings: Vec<String> =
                                             accounts.into_iter().map(|p| p.to_string()).collect();
                                         quote_attempts.push(format!(
@@ -1786,7 +1793,9 @@ impl ExecutionContext {
                     for (pool_addr, state) in cache.iter() {
                         let has_pair = match &state {
                             CachedPoolState::PumpFun(s) => {
-                                s.token_mint == mint && s.creator != Pubkey::default()
+                                s.token_mint == mint
+                                    && s.creator != Pubkey::default()
+                                    && !s.complete // Skip completed bonding curves (migrated to PumpSwap AMM)
                             }
                             CachedPoolState::PumpAmm(s) => {
                                 (s.base_mint == mint && s.quote_mint == sol_mint_pk)
@@ -5014,33 +5023,66 @@ async fn main() -> Result<()> {
                             Err(_) => continue, // Not a MarketEvent, skip silently
                         };
 
-                        if let MarketEventKind::TokenMintInfo {
-                            mint,
-                            token_program,
-                            decimals,
-                            ..
-                        } = &event.kind
-                        {
-                            if let Ok(mint_pk) = Pubkey::from_str(mint) {
-                                cache.set_mint_decimals(mint_pk, *decimals);
+                        match &event.kind {
+                            MarketEventKind::TokenMintInfo {
+                                mint,
+                                token_program,
+                                decimals,
+                                ..
+                            } => {
+                                if let Ok(mint_pk) = Pubkey::from_str(mint) {
+                                    cache.set_mint_decimals(mint_pk, *decimals);
 
-                                // Also cache token_program (needed for ATA creation)
-                                if let Ok(program_pk) = Pubkey::from_str(token_program) {
-                                    cache.update_mint_program(&mint_pk, program_pk);
-                                }
+                                    // Also cache token_program (needed for ATA creation)
+                                    if let Ok(program_pk) = Pubkey::from_str(token_program) {
+                                        cache.update_mint_program(&mint_pk, program_pk);
+                                    }
 
-                                mint_info_count += 1;
-                                if mint_info_count % 100 == 1 {
-                                    debug!(
-                                        total = mint_info_count,
-                                        mint = %mint,
-                                        decimals,
-                                        "SLAVE CACHE: TokenMintInfo → decimals + token_program cached"
-                                    );
+                                    mint_info_count += 1;
+                                    if mint_info_count % 100 == 1 {
+                                        debug!(
+                                            total = mint_info_count,
+                                            mint = %mint,
+                                            decimals,
+                                            "SLAVE CACHE: TokenMintInfo → decimals + token_program cached"
+                                        );
+                                    }
                                 }
                             }
+                            MarketEventKind::DexPoolAccounts {
+                                dex,
+                                pool_address,
+                                accounts,
+                                ..
+                            } => {
+                                // Populate PumpAmm pool_accounts in LivePoolCache.
+                                // Without this, PumpAmm entries parsed from Geyser have empty pool_accounts,
+                                // making them unusable for tx building (liquidation, sells).
+                                if dex == "pump_amm" || dex == "PumpFunAmm" {
+                                    if let Ok(pool_pk) = Pubkey::from_str(pool_address) {
+                                        let parsed: Vec<Pubkey> = accounts
+                                            .iter()
+                                            .filter_map(|s| Pubkey::from_str(s).ok())
+                                            .collect();
+                                        if parsed.len() >= 12 {
+                                            cache.set_pump_amm_pool_accounts(&pool_pk, parsed);
+                                        } else {
+                                            debug!(
+                                                pool = %pool_address,
+                                                dex = %dex,
+                                                parsed_len = parsed.len(),
+                                                raw_len = accounts.len(),
+                                                "SLAVE CACHE: DexPoolAccounts skipped (too few valid accounts)"
+                                            );
+                                        }
+                                    }
+                                }
+                                // Other DEX types don't need pool_accounts in LivePoolCache
+                            }
+                            _ => {
+                                // Other MarketEvent types are handled by momentum-bot/arb-strategy
+                            }
                         }
-                        // All other MarketEvent types are silently ignored (they're for momentum-bot/arb-strategy)
                     }
                     warn!("MarketEvents subscription ended (TokenMintInfo cache disabled)");
                 });

@@ -396,6 +396,8 @@ struct PositionTracker {
     exit_generated_at: Option<Instant>,
     /// Origin of this position (live execution vs. wallet snapshot reconciliation)
     entry_source: PositionEntrySource,
+    /// Token program (SPL Token or Token-2022) — persisted for correct ATA handling on SELL
+    token_program: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -445,6 +447,9 @@ struct PersistedPosition {
     /// Origin of this position
     #[serde(default)]
     entry_source: PositionEntrySource,
+    /// Token program (SPL Token or Token-2022) — for correct ATA handling on SELL
+    #[serde(default)]
+    token_program: Option<String>,
     /// Schema version for forward compatibility
     schema_version: u8,
 }
@@ -481,6 +486,7 @@ impl PersistedPosition {
             exit_generated: tracker.exit_generated,
             exit_generated_at_unix_ms,
             entry_source: tracker.entry_source,
+            token_program: tracker.token_program.clone(),
             schema_version: Self::CURRENT_SCHEMA_VERSION,
         }
     }
@@ -521,6 +527,7 @@ impl PersistedPosition {
             exit_generated: self.exit_generated,
             exit_generated_at,
             entry_source: self.entry_source,
+            token_program: self.token_program.clone(),
         }
     }
 }
@@ -554,6 +561,7 @@ impl PositionTracker {
             exit_generated: false,
             exit_generated_at: None,
             entry_source: PositionEntrySource::Live,
+            token_program: None,
         }
     }
 
@@ -1585,6 +1593,7 @@ struct OpenPositionParams<'a> {
     token_decimals: u8,
     token_amount: u64,
     sol_invested: u64,
+    token_program: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1795,6 +1804,13 @@ impl MomentumContext {
         let mut tracker =
             PositionTracker::new(mint, &pool, &dex, entry_price, decimals, balance_raw, 0);
         tracker.entry_source = PositionEntrySource::WalletSnapshot;
+        // Resolve token_program from mint_infos for wallet snapshot reconciliation
+        tracker.token_program = self
+            .mint_infos
+            .read()
+            .get(mint)
+            .map(|m| m.token_program.clone())
+            .filter(|tp| !tp.is_empty());
 
         let config = self.config.read();
         if config.max_hold_time_secs > 0 {
@@ -2364,17 +2380,22 @@ impl MomentumContext {
                 if pos.token_decimals == 0 && p.token_decimals != 0 {
                     pos.token_decimals = p.token_decimals;
                 }
+                // Upgrade token_program if not yet known (e.g., probe had None, scale-in has Some)
+                if pos.token_program.is_none() && p.token_program.is_some() {
+                    pos.token_program = p.token_program.clone();
+                }
                 info!(
                     mint = %p.mint,
                     additional_sol = p.sol_invested,
                     additional_tokens_raw = p.token_amount,
                     total_sol = pos.sol_invested,
                     total_tokens_raw = pos.token_amount,
+                    token_program = ?pos.token_program,
                     "📈 Position scaled in"
                 );
                 pos.clone()
             } else {
-                let new_tracker = PositionTracker::new(
+                let mut new_tracker = PositionTracker::new(
                     p.mint,
                     p.pool,
                     p.dex,
@@ -2383,11 +2404,13 @@ impl MomentumContext {
                     p.token_amount,
                     p.sol_invested,
                 );
+                new_tracker.token_program = p.token_program.clone();
                 positions.insert(p.mint.to_string(), new_tracker.clone());
                 info!(
                     mint = %p.mint,
                     entry_price = p.entry_price,
                     sol_invested = p.sol_invested,
+                    token_program = ?p.token_program,
                     "📈 Position opened"
                 );
                 new_tracker
@@ -3036,6 +3059,23 @@ impl MomentumContext {
                             }
                         }
 
+                        // Resolve token_program for this mint:
+                        // 1. From ExecutionResult metadata (set by execution-engine in Fix 5)
+                        // 2. From mint_infos cache (Geyser TokenMintInfo)
+                        // 3. None (will be resolved at SELL-time from mint_infos)
+                        let resolved_token_program = result
+                            .metadata
+                            .get("token_program")
+                            .cloned()
+                            .filter(|tp| !tp.is_empty())
+                            .or_else(|| {
+                                self.mint_infos
+                                    .read()
+                                    .get(&pending.mint)
+                                    .map(|m| m.token_program.clone())
+                                    .filter(|tp| !tp.is_empty())
+                            });
+
                         self.open_position(OpenPositionParams {
                             mint: &pending.mint,
                             pool: &pending.pool,
@@ -3044,6 +3084,7 @@ impl MomentumContext {
                             token_decimals,
                             token_amount,
                             sol_invested,
+                            token_program: resolved_token_program,
                         });
                     }
                     TradeSide::Sell => {
@@ -4006,6 +4047,16 @@ async fn recover_positions_from_jsonl(
             tracker.entry_time = entry_time_estimate;
             tracker.current_price = entry_price; // Will update from market events
 
+            // Resolve token_program from execution metadata (best source for recovery)
+            tracker.token_program = execs
+                .iter()
+                .find_map(|exec| {
+                    exec.metadata
+                        .get("token_program")
+                        .cloned()
+                        .filter(|tp| !tp.is_empty())
+                });
+
             info!(
                 mint = %mint,
                 buy_fills = valid_fills,
@@ -4013,6 +4064,7 @@ async fn recover_positions_from_jsonl(
                 token_amount_ui = %tok_ui,
                 entry_price = %entry_price,
                 sol_invested_ui = %sol_ui,
+                token_program = ?tracker.token_program,
                 age_secs = %(Instant::now() - entry_time_estimate).as_secs(),
                 "🔄 Position recovered from JSONL (summed {} BUY fills)", valid_fills
             );
@@ -4943,16 +4995,11 @@ async fn generate_and_publish_buy_intent(
         )
     };
 
-    let (token_decimals_opt, token_program_opt, mint_supply_opt, has_authority) = {
+    let (token_decimals_opt, token_program_opt) = {
         let mint_infos = ctx.mint_infos.read();
         match mint_infos.get(&signal.mint) {
-            Some(m) => (
-                Some(m.decimals),
-                Some(m.token_program.clone()),
-                Some(m.supply),
-                m.mint_authority.is_some() || m.freeze_authority.is_some(),
-            ),
-            None => (None, None, None, false),
+            Some(m) => (Some(m.decimals), Some(m.token_program.clone())),
+            None => (None, None),
         }
     };
 
@@ -4981,31 +5028,15 @@ async fn generate_and_publish_buy_intent(
             .filter(|tp| !tp.is_empty())
             .map(|tp| tp.to_string());
 
-        let dex_lower = effective_dex.to_ascii_lowercase();
-        let is_pump = dex_lower.contains("pump");
         let spl = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
         let spl22 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
+        // Trust Geyser-sourced token_program for all known programs.
+        // Previous guard dropped Token-2022 for pump tokens when MintInfo wasn't "final"
+        // (supply==0, no authorities), causing IncorrectProgramId on BUY.
+        // Since this data comes from Geyser (authoritative on-chain state), we trust it.
         match token_program_opt.as_deref() {
-            Some(tp) if tp == spl => Some(tp.to_string()),
-            Some(tp) if tp == spl22 => {
-                if is_pump {
-                    let mint_info_is_final = mint_supply_opt.unwrap_or(0) > 0 || has_authority;
-                    if mint_info_is_final {
-                        Some(tp.to_string())
-                    } else {
-                        warn!(
-                            mint = %signal.mint,
-                            dex = %effective_dex,
-                            token_program = %tp,
-                            "Ignoring Token-2022 override for pump tokens; waiting for TokenMintInfo"
-                        );
-                        None
-                    }
-                } else {
-                    Some(tp.to_string())
-                }
-            }
+            Some(tp) if tp == spl || tp == spl22 => Some(tp.to_string()),
             Some(tp) => {
                 warn!(
                     mint = %signal.mint,
@@ -6188,15 +6219,23 @@ async fn generate_and_publish_exit_intent(
         _ => "EXIT_UNKNOWN",
     };
 
-    // Get token_program from mint_infos for Token-2022 support on SELL
-    // This is critical for pump.fun tokens which use Token-2022
+    // Get token_program for Token-2022 support on SELL.
+    // Priority: 1. From persisted position (survives restarts)
+    //           2. From mint_infos cache (Geyser TokenMintInfo, in-memory only)
     let token_program_for_sell = {
+        let positions = ctx.positions.read();
+        positions
+            .get(mint)
+            .and_then(|p| p.token_program.clone())
+            .filter(|tp| !tp.is_empty())
+    }
+    .or_else(|| {
         let mint_infos = ctx.mint_infos.read();
         mint_infos
             .get(mint)
             .map(|info| info.token_program.clone())
             .filter(|tp| !tp.is_empty())
-    };
+    });
 
     if token_program_for_sell.is_some() {
         debug!(

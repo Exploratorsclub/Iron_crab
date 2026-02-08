@@ -661,6 +661,56 @@ impl LivePoolCache {
         }
     }
 
+    /// Set PumpSwap AMM pool_accounts for an existing PumpAmm cache entry.
+    ///
+    /// Called when:
+    /// 1. execution-engine receives DexPoolAccounts events from market-data via NATS
+    /// 2. Liquidation Phase 2 discovers pool_accounts via RPC
+    ///
+    /// Without this, PumpAmm entries parsed from Geyser have empty pool_accounts,
+    /// making them unusable for tx building.
+    pub fn set_pump_amm_pool_accounts(&self, pool: &Pubkey, accounts: Vec<Pubkey>) {
+        if let Some(mut entry) = self.pools.get_mut(pool) {
+            if let CachedPoolState::PumpAmm(ref mut s) = entry.value_mut().state {
+                let was_empty = s.pool_accounts.is_empty();
+                s.pool_accounts = accounts.clone();
+                if was_empty {
+                    tracing::info!(
+                        pool = %pool,
+                        accounts_len = accounts.len(),
+                        "LivePoolCache: PumpAmm pool_accounts populated (was empty)"
+                    );
+                } else {
+                    tracing::debug!(
+                        pool = %pool,
+                        accounts_len = accounts.len(),
+                        "LivePoolCache: PumpAmm pool_accounts updated"
+                    );
+                }
+            }
+        } else {
+            tracing::debug!(
+                pool = %pool,
+                "LivePoolCache: set_pump_amm_pool_accounts called but pool not in cache"
+            );
+        }
+    }
+
+    /// Lookup PumpAmm pool by base_mint.
+    ///
+    /// Returns the pool address for a PumpAmm entry that has the given base_mint.
+    /// Used by liquidation to find PumpSwap AMM pools for tokens.
+    pub fn find_pump_amm_pool_by_base_mint(&self, base_mint: &Pubkey) -> Option<Pubkey> {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
+                if s.base_mint == *base_mint {
+                    return Some(*entry.key());
+                }
+            }
+        }
+        None
+    }
+
     // ========================================================================
     // Stats
     // ========================================================================
