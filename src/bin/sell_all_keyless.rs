@@ -260,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize DEX connectors (keyless) for route discovery only
     let raydium = Raydium::new(Arc::clone(&rpc));
-    let pumpfun = PumpFunDex::new(Arc::clone(&rpc))?;
+    let pumpfun = PumpFunDex::new(Arc::clone(&rpc), None)?;
     let pump_amm = PumpFunAmmDex::new(
         Arc::clone(&rpc),
         cfg.solana.rpc_url.clone(),

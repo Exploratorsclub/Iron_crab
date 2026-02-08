@@ -205,7 +205,7 @@ impl CrossDexHandler {
         info!("Initialized Raydium DEX connector (for IX building only)");
 
         // Initialize PumpFun (Bonding Curve) - for build_swap_ix() only
-        let mut pumpfun = PumpFunDex::new(Arc::clone(&self.rpc))?;
+        let mut pumpfun = PumpFunDex::new(Arc::clone(&self.rpc), None)?;
         if let Some(pk) = self.wallet_pubkey {
             pumpfun.set_user_authority(pk);
         }

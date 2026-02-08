@@ -12,7 +12,7 @@ async fn test_pumpfun_build_buy_ix_pure_derivation() {
     // It relies only on deterministic PDA + ATA derivations.
 
     let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:8899"));
-    let mut dex = PumpFunDex::new(rpc).expect("PumpFunDex::new");
+    let mut dex = PumpFunDex::new(rpc, None).expect("PumpFunDex::new");
 
     let wallet =
         Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM").expect("wallet pubkey");

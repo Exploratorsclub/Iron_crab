@@ -1366,7 +1366,8 @@ impl ExecutionContext {
 
         // Initialize DEX connectors for quote discovery.
         // Order priority: Pump.fun bonding curve (known pool) → multi-pool best quote
-        let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc)) {
+        let pumpfun_cache = ctx.live_pool_cache.as_ref().map(Arc::clone);
+        let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc), pumpfun_cache) {
             Ok(p) => Some(p),
             Err(e) => {
                 warn!(error = %e, "Failed to init PumpFunDex; continuing with other DEXes");
@@ -2333,7 +2334,8 @@ impl ExecutionContext {
 
         // Initialize DEX connectors for route validation.
         let raydium = Raydium::new(Arc::clone(&ctx.rpc));
-        let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc)) {
+        let burn_pumpfun_cache = ctx.live_pool_cache.as_ref().map(Arc::clone);
+        let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc), burn_pumpfun_cache) {
             Ok(p) => Some(p),
             Err(e) => {
                 warn!(error = %e, "Failed to init PumpFunDex in burn job; continuing with Raydium only");

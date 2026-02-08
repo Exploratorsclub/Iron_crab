@@ -18,7 +18,7 @@ async fn test_token(rpc: &Arc<SolanaRpc>, token_mint: &str, description: &str) -
     println!("Token: {}", token_mint);
     println!("{}", "=".repeat(60));
 
-    let pumpfun = PumpFunDex::new(rpc.clone())?;
+    let pumpfun = PumpFunDex::new(rpc.clone(), None)?;
     let token_pubkey = Pubkey::from_str(token_mint)?;
 
     // Step 1: Check if token mint exists

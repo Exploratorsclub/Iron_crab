@@ -541,7 +541,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize DEX connectors (keyless) for route discovery only
     let raydium = Raydium::new(Arc::clone(&rpc));
-    let pumpfun = PumpFunDex::new(Arc::clone(&rpc))?;
+    let pumpfun = PumpFunDex::new(Arc::clone(&rpc), None)?;
 
     // Raydium requires pool snapshots to quote + provide pool id
     info!("Refreshing Raydium pools (for route discovery)...");

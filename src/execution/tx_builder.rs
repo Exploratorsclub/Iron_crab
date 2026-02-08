@@ -859,7 +859,7 @@ pub async fn build_tx_plan(
     };
 
     // Currently we implement Pump.fun BUY (SOL->token) and SELL (token->SOL) plans.
-    let mut pumpfun = match PumpFunDex::new(rpc) {
+    let mut pumpfun = match PumpFunDex::new(rpc, cache.map(Arc::clone)) {
         Ok(d) => d,
         Err(e) => {
             return TxPlanOutcome::Unsupported(UnsupportedTxPlan {

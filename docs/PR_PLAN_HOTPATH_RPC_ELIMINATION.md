@@ -11,10 +11,11 @@
 | PR | Titel | Status | Dateien | Aufwand |
 |----|-------|--------|---------|---------|
 | PR 1 | Globaler Mint-Decimals-Cache (GEYSER-FIRST) | ✅ DEPLOYED | 6 | ~3h |
-| Fix 1 | Creator über NATS propagieren (Killswitch Bug) | 🔧 IN PROGRESS | 2 | ~1h |
-| Fix 2 | Simulation-Error Logging (Diagnose) | ✅ DONE | 1 | ~30min |
-| Fix 3 | Position-Tracking: Liquidation-Sells schließen Positionen | 🔧 IN PROGRESS | 2 | ~1h |
-| PR 2 | PumpFun Bonding-Curve Quotes aus Cache | ⬜ TODO | 2 | ~4h |
+| Fix 1 | Creator über NATS propagieren (Killswitch Bug) | ✅ DEPLOYED | 2 | ~1h |
+| Fix 2 | Simulation-Error Logging (Diagnose) | ✅ DEPLOYED | 1 | ~30min |
+| Fix 3 | Position-Tracking: Liquidation-Sells schließen Positionen | ✅ DEPLOYED | 2 | ~1h |
+| Fix 4 | Ghost-Balance-Fix: Wallet-Snapshot-Bootstrap schreibt balance=0 | ✅ DEPLOYED | 1 | ~30min |
+| PR 2 | PumpFun Bonding-Curve Quotes aus Cache | 🔧 IN PROGRESS | 2 | ~4h |
 | PR 3 | Vault-Balance-Reads aus Cache (Orca/Raydium/Meteora/CPMM) | ⬜ TODO | 5 | ~5h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
 | PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
@@ -68,7 +69,7 @@ Decimals fließen über **drei** Kanäle in den SLAVE Cache:
 ## Fix 1: Creator über NATS propagieren (Killswitch Bug Root Cause)
 
 **Branch**: `architecture-rebuild`
-**Status**: 🔧 IN PROGRESS
+**Status**: ✅ DEPLOYED (2026-02-07)
 **Risiko**: Niedrig
 **Problem**: `market-data` cached PumpFun/PumpSwap Creator korrekt im MASTER LivePoolCache, propagiert ihn aber NICHT über `PoolCacheUpdate.metadata` an den SLAVE Cache in `execution-engine`. → Killswitch kann PumpFun-Token nicht verkaufen weil `metadata.contains_key("creator")` fehlschlägt.
 
@@ -90,7 +91,7 @@ Decimals fließen über **drei** Kanäle in den SLAVE Cache:
 ## Fix 2: Besseres Simulation-Error Logging
 
 **Branch**: `architecture-rebuild`
-**Status**: 🔧 IN PROGRESS
+**Status**: ✅ DEPLOYED (2026-02-07)
 **Risiko**: Keins (nur Logging)
 **Problem**: Bei Simulation-Failures wird nur "Intent simulation failed" geloggt, ohne `error_code`, `logs_preview`, DEX oder Mint. Fehlerdiagnose ist praktisch unmöglich.
 
@@ -112,7 +113,7 @@ Decimals fließen über **drei** Kanäle in den SLAVE Cache:
 ## Fix 3: Position-Tracking: Liquidation-Sells schließen Positionen
 
 **Branch**: `architecture-rebuild`
-**Status**: 🔧 IN PROGRESS
+**Status**: ✅ DEPLOYED (2026-02-07)
 **Risiko**: Niedrig (nur Logging + Position-Cleanup bei confirmed sells)
 **Problem**: Liquidation-Sells werden von execution-engine erstellt, nicht von momentum-bot. momentum-bot kennt diese Intents nicht (`pending_intents` leer) → `close_position()` wird nie aufgerufen → Ghost Positions → `max_open_positions` blockiert neue Trades.
 
@@ -139,28 +140,69 @@ Decimals fließen über **drei** Kanäle in den SLAVE Cache:
 
 ---
 
+## Fix 4: Ghost-Balance-Fix: Wallet-Snapshot-Bootstrap schreibt balance=0
+
+**Branch**: `architecture-rebuild`
+**Status**: ✅ DEPLOYED (2026-02-08)
+**Risiko**: Niedrig
+**Problem**: `publish_wallet_snapshot()` in `market-data` übersprang das Publizieren von `balance_raw = 0` für Token deren ATA on-chain nicht mehr existiert. Stattdessen wurde die stale Balance aus JetStream beibehalten → permanente Ghost-Positionen die nie gecleaned werden konnten.
+
+### Root Cause
+
+- Zeile 747-754 in `market_data.rs`: Wenn `getMultipleAccounts` für die ATA `None` zurückgibt, prüfte der Code ob der letzte JetStream-Snapshot `balance_raw > 0` hatte. Falls ja: `continue` → kein `balance_raw = 0` publiziert.
+- Zusätzlich wurde der Mint zu `mints_in_wallet` hinzugefügt → `WalletSnapshotComplete` behauptete fälschlich, Token sei in der Wallet.
+- → `momentum-bot` erkannte den Ghost nicht → permanente Ghost-Position.
+
+### Fix
+
+- `continue`-Protection entfernt: Wenn ATA nicht on-chain existiert → `balance_raw = 0` wird publiziert.
+- Info-Log für gecleante stale Balances hinzugefügt.
+- Kommentar korrigiert: Kein periodischer Refresh nötig (Geyser-basierte Live-Updates sind korrekt).
+
+### Aufgaben
+
+- [x] `src/bin/market_data.rs`: Ghost-Balance-Protection entfernen, `balance_raw = 0` bei fehlender ATA publizieren
+- [x] `src/bin/market_data.rs`: Doc-Kommentar korrigieren (kein periodischer Refresh, Startup + Geyser reicht)
+- [x] `cargo check` + `cargo clippy` erfolgreich (0 errors, 0 warnings)
+- [x] Deploy + Killswitch-Test → Liquidation erfolgreich ✅
+
+### Verifizierung (Geyser Wallet-Tracking)
+
+Die Geyser-basierte Wallet-Balance-Implementierung wurde geprüft und ist korrekt:
+- **Startup**: `publish_wallet_snapshot()` per `getMultipleAccounts` (1 RPC-Call, legitimt)
+- **Live**: `ExecutionResult` → `market-data` tracked neue ATAs dynamisch → Geyser-Resubscribe
+- **Geyser**: Account-Updates für tracked ATAs → `WalletBalanceSnapshot` über NATS + JetStream
+- **Bekannte Lücke**: Geschlossene ATAs (Geyser meldet keine Deletions) → gefixt durch Startup-RPC-Call
+
+---
+
 ## PR 2: PumpFun Bonding-Curve Quotes aus LivePoolCache
 
-**Branch**: `fix/pumpfun-geyser-quotes`
-**Status**: ⬜ TODO
+**Branch**: `architecture-rebuild`
+**Status**: 🔧 IN PROGRESS
 **Risiko**: Mittel (Pump.fun = häufigster DEX)
 **Eliminiert**: 200-2000ms pro Quote + 500-2000ms im TX-Build
 
 ### Aufgaben
 
-- [ ] `src/solana/dex/pumpfun.rs`: `PumpFunDex::new()` um optionalen `SharedLivePoolCache` Parameter erweitern
-- [ ] `src/solana/dex/pumpfun.rs`: `quote_exact_in()` umbauen:
+- [x] `src/solana/dex/pumpfun.rs`: `PumpFunDex::new()` um optionalen `SharedLivePoolCache` Parameter erweitern
+- [x] `src/solana/dex/pumpfun.rs`: `get_bonding_curve_from_cache()` Hilfsmethode → `CachedPoolState::PumpFun` → `BondingCurveState`
+- [x] `src/solana/dex/pumpfun.rs`: `get_creator_from_cache()` Hilfsmethode → LivePoolCache Creator-Lookup
+- [x] `src/solana/dex/pumpfun.rs`: `quote_exact_in()` umbauen:
   - Zuerst: `cache.get(bonding_curve)` → `CachedPoolState::PumpFun` → Quote aus cached `virtual_*_reserves` berechnen
-  - Fallback: Bestehender RPC-Pfad (`fetch_bonding_curve_fast()`)
-- [ ] `src/solana/dex/pumpfun.rs`: `build_swap_ix()` Creator-Auflösung:
-  - Zuerst: `fallback_creator` Parameter (bereits vorhanden)
-  - Dann: `cache.get_pumpfun_creator()` (bereits implementiert in LivePoolCache)
-  - Letzter Fallback: RPC (mit WARN-Log, sollte in Produktion nicht passieren)
-- [ ] `src/bin/execution_engine.rs`: Cache an `PumpFunDex::new()` durchreichen in:
-  - `run_liquidation_job()` (Zeile ~1369)
-  - Intent-Processing / TX-Build-Pfad
-- [ ] Metrik: Counter `PUMPFUN_QUOTE_CACHE_HIT` vs `PUMPFUN_QUOTE_RPC_FALLBACK`
-- [ ] Testen: Quote-Ergebnisse Cache vs RPC vergleichen (sollten identisch sein bei gleichem Slot)
+  - Fallback: Bestehender RPC-Pfad (`fetch_bonding_curve_fast()`) mit WARN-Log
+- [x] `src/solana/dex/pumpfun.rs`: `build_swap_ix_async()` Creator-Auflösung erweitert:
+  - 1. `fallback_creator` (aus Intent-Metadata)
+  - 2. `cached_creators` DashMap (aus vorherigen Lookups)
+  - 3. `get_creator_from_cache()` (LivePoolCache, GEYSER-FIRST) ← NEU
+  - 4. RPC-Fallback (mit WARN-Log, sollte nicht passieren)
+- [x] `src/bin/execution_engine.rs`: Cache an `PumpFunDex::new()` durchreichen:
+  - `run_liquidation_job()` ✅
+  - `run_burn_job()` ✅
+- [x] `src/execution/tx_builder.rs`: Cache an `PumpFunDex::new()` durchreichen ✅
+- [x] Alle Call-Sites angepasst: `sell_all.rs`, `sell_all_keyless.rs`, `cross_dex_handler.rs`, Tests → `None`
+- [x] `cargo check` + `cargo clippy` erfolgreich (0 errors, 0 warnings)
+- [ ] Deploy + Test
 
 ### Akzeptanzkriterien
 

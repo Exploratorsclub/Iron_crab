@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::{Dex, Quote};
+use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
 use crate::solana::rpc::SolanaRpc;
 
 fn sdk_pubkey_to_spl(pk: &Pubkey) -> spl_token::solana_program::pubkey::Pubkey {
@@ -166,10 +167,12 @@ pub struct PumpFunDex {
     /// Key: token_mint, Value: creator pubkey
     /// This eliminates the need for RPC calls to fetch creator during build_swap_ix
     cached_creators: DashMap<Pubkey, Pubkey>,
+    /// Shared LivePoolCache for GEYSER-FIRST quote + creator resolution (PR2)
+    live_pool_cache: Option<SharedLivePoolCache>,
 }
 
 impl PumpFunDex {
-    pub fn new(rpc: Arc<SolanaRpc>) -> Result<Self> {
+    pub fn new(rpc: Arc<SolanaRpc>, live_pool_cache: Option<SharedLivePoolCache>) -> Result<Self> {
         Ok(Self {
             rpc,
             program_id: Pubkey::from_str(PUMPFUN_PROGRAM_ID)?,
@@ -178,6 +181,7 @@ impl PumpFunDex {
             event_authority: Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY)?,
             user_authority: None,
             cached_creators: DashMap::new(),
+            live_pool_cache,
         })
     }
 
@@ -194,6 +198,31 @@ impl PumpFunDex {
     /// Get cached creator for a token mint
     pub fn get_cached_creator(&self, token_mint: &Pubkey) -> Option<Pubkey> {
         self.cached_creators.get(token_mint).map(|r| *r)
+    }
+
+    /// Get bonding curve state from LivePoolCache (GEYSER-FIRST, no RPC).
+    /// Returns a BondingCurveState if the bonding curve is cached.
+    fn get_bonding_curve_from_cache(&self, bonding_curve: &Pubkey) -> Option<BondingCurveState> {
+        let cache = self.live_pool_cache.as_ref()?;
+        let cached_state = cache.get(bonding_curve)?;
+        if let CachedPoolState::PumpFun(state) = cached_state {
+            Some(BondingCurveState {
+                virtual_token_reserves: state.virtual_token_reserves,
+                virtual_sol_reserves: state.virtual_sol_reserves,
+                real_token_reserves: state.real_token_reserves,
+                real_sol_reserves: state.real_sol_reserves,
+                token_total_supply: 1_000_000_000_000_000, // PumpFun always 1B * 10^6
+                complete: state.complete,
+                creator: state.creator,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Get creator from LivePoolCache (GEYSER-FIRST, no RPC).
+    fn get_creator_from_cache(&self, bonding_curve: &Pubkey) -> Option<Pubkey> {
+        self.live_pool_cache.as_ref()?.get_pumpfun_creator(bonding_curve)
     }
 
     /// Derive bonding curve PDA for a token mint
@@ -717,17 +746,27 @@ impl Dex for PumpFunDex {
 
         let (bonding_curve, _bump) = self.derive_bonding_curve(&token_mint);
 
-        info!(
-            token_mint=%token_mint_str,
-            bonding_curve=%bonding_curve,
-            buy_token,
-            "pump.fun: attempting to fetch bonding curve"
-        );
+        // GEYSER-FIRST: Try LivePoolCache before any RPC call (PR2).
+        // Cache is populated by market-data via Geyser account subscriptions.
+        let state = if let Some(cached) = self.get_bonding_curve_from_cache(&bonding_curve) {
+            debug!(
+                token_mint=%token_mint_str,
+                bonding_curve=%bonding_curve,
+                buy_token,
+                source="cache",
+                "pump.fun: bonding curve from LivePoolCache (GEYSER-FIRST)"
+            );
+            cached
+        } else {
+            // RPC FALLBACK: Cache miss → fetch from RPC with retry.
+            // This should only happen for brand-new pools that Geyser hasn't indexed yet.
+            warn!(
+                token_mint=%token_mint_str,
+                bonding_curve=%bonding_curve,
+                buy_token,
+                "pump.fun: cache miss, falling back to RPC for bonding curve"
+            );
 
-        // Fetch bonding curve state with FAST retry for sniping
-        // Max 5 retries × 200ms = 1 second of retries (plus 2s timeout per attempt max)
-        // Total worst case: 5 × 2s = 10s, but typically much faster if RPC responds
-        let state = {
             const MAX_RETRIES: usize = 5;
             const RETRY_DELAY_MS: u64 = 200;
 
@@ -740,13 +779,7 @@ impl Dex for PumpFunDex {
                             token_mint=%token_mint_str,
                             bonding_curve=%bonding_curve,
                             attempt,
-                            "pump.fun: bonding curve fetch succeeded after retry"
-                        );
-                    } else {
-                        debug!(
-                            token_mint=%token_mint_str,
-                            bonding_curve=%bonding_curve,
-                            "pump.fun: bonding curve fetched on first try"
+                            "pump.fun: bonding curve RPC fetch succeeded after retry"
                         );
                     }
                     state_opt = Some(s);
@@ -756,7 +789,7 @@ impl Dex for PumpFunDex {
                         token_mint=%token_mint_str,
                         bonding_curve=%bonding_curve,
                         attempt,
-                        "pump.fun: bonding curve not found, retrying..."
+                        "pump.fun: bonding curve not found via RPC, retrying..."
                     );
                     tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
                 }
@@ -765,13 +798,10 @@ impl Dex for PumpFunDex {
             match state_opt {
                 Some(s) => s,
                 None => {
-                    // CRITICAL: Do NOT use fallback for sniping!
-                    // If bonding curve is not on-chain, the buy transaction WILL FAIL with error 3012.
-                    // Better to skip and let the next Geyser event trigger a retry.
                     info!(
                         token_mint=%token_mint_str,
                         bonding_curve=%bonding_curve,
-                        "pump.fun: bonding curve not found after {} fast retries - SKIPPING (account not yet on-chain)",
+                        "pump.fun: bonding curve not found after {} RPC retries - SKIPPING",
                         MAX_RETRIES
                     );
                     return Ok(None);
@@ -952,10 +982,11 @@ impl PumpFunDex {
         let (associated_bonding_curve, _bump2) =
             self.derive_associated_bonding_curve(&bonding_curve, &token_mint, &token_program_sdk);
 
-        // Creator resolution priority (GEYSER-FIRST):
-        // 1. Explicit fallback_creator (from Geyser event/intent)
-        // 2. Cached creator (from LivePoolCache via cache_creator())
-        // 3. RPC fallback (DEPRECATED - should not happen in production)
+        // Creator resolution priority (GEYSER-FIRST, PR2):
+        // 1. Explicit fallback_creator (from Geyser event/intent metadata)
+        // 2. Cached creator (from DashMap, populated from previous lookups)
+        // 3. LivePoolCache (GEYSER-FIRST, populated by market-data)
+        // 4. RPC fallback (DEPRECATED - should not happen in production)
         let creator = if let Some(c) = fallback_creator {
             debug!(
                 token_mint = %token_mint_str,
@@ -967,12 +998,21 @@ impl PumpFunDex {
             debug!(
                 token_mint = %token_mint_str,
                 creator = %c,
-                "pump.fun: using creator from cache (GEYSER-FIRST)"
+                "pump.fun: using creator from DashMap cache"
             );
+            c
+        } else if let Some(c) = self.get_creator_from_cache(&bonding_curve) {
+            debug!(
+                token_mint = %token_mint_str,
+                creator = %c,
+                "pump.fun: using creator from LivePoolCache (GEYSER-FIRST)"
+            );
+            // Also cache in DashMap for faster subsequent lookups
+            self.cached_creators.insert(token_mint, c);
             c
         } else {
             // RPC FALLBACK - This path should NOT be hit in production!
-            // If we're here, it means the LivePoolCache did not have the creator.
+            // If we're here, it means neither cache had the creator.
             warn!(
                 token_mint = %token_mint_str,
                 bonding_curve = %bonding_curve,
