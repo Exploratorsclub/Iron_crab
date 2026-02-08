@@ -2602,11 +2602,35 @@ impl MomentumContext {
                 .collect()
         };
 
+        // Collect mints with pending BUY intents to avoid generating exits
+        // while a scale-in BUY is still in-flight. Without this guard, the exit
+        // would snapshot pos.token_amount BEFORE the scale-in fill is applied,
+        // leading to partial sells that orphan tokens.
+        let pending_buy_mints: std::collections::HashSet<String> = self
+            .pending_intents
+            .read()
+            .values()
+            .filter(|p| p.side == TradeSide::Buy)
+            .map(|p| p.mint.clone())
+            .collect();
+
         let mut positions = self.positions.write();
         let mut exits = Vec::new();
 
         for (mint, pos) in positions.iter_mut() {
             if pos.exit_generated {
+                continue;
+            }
+
+            // Skip exit while a BUY intent (probe or scale-in) is pending for this mint.
+            // Once the BUY confirms and updates pos.token_amount, the next tick will
+            // re-evaluate with the correct total position size.
+            if pending_buy_mints.contains(mint) {
+                debug!(
+                    mint = %mint,
+                    token_amount = pos.token_amount,
+                    "⏸️ Exit check deferred: pending BUY intent for this mint"
+                );
                 continue;
             }
 
@@ -3023,17 +3047,64 @@ impl MomentumContext {
                         });
                     }
                     TradeSide::Sell => {
-                        // SELL confirmed - close position
-                        info!(
-                            intent_id = %result.intent_id,
-                            mint = %pending.mint,
-                            token_amount = pending.token_amount,
-                            signature = ?result.signature,
-                            pnl = ?result.pnl,
-                            "✅ SELL CONFIRMED - Closing position"
-                        );
+                        // SELL confirmed - close or reduce position.
+                        // Defense-in-depth: if only a partial amount was sold
+                        // (e.g., race between exit and scale-in), reduce the
+                        // position instead of closing to prevent orphaned tokens.
+                        let sold_amount = result
+                            .fill_in
+                            .as_ref()
+                            .map(|f| f.raw)
+                            .unwrap_or(pending.token_amount);
+                        let pos_total = self
+                            .positions
+                            .read()
+                            .get(&pending.mint)
+                            .map(|p| p.token_amount)
+                            .unwrap_or(0);
 
-                        self.close_position(&pending.mint);
+                        if pos_total > 0 && sold_amount < pos_total {
+                            // Partial sell — reduce position, do NOT close.
+                            // Reset exit_generated so the remainder can be sold on the next tick.
+                            let remaining = pos_total.saturating_sub(sold_amount);
+                            warn!(
+                                intent_id = %result.intent_id,
+                                mint = %pending.mint,
+                                sold_tokens = sold_amount,
+                                position_total = pos_total,
+                                remaining_tokens = remaining,
+                                signature = ?result.signature,
+                                "⚠️ PARTIAL SELL CONFIRMED - Reducing position (NOT closing)"
+                            );
+                            {
+                                let mut positions = self.positions.write();
+                                if let Some(pos) = positions.get_mut(&pending.mint) {
+                                    pos.token_amount = remaining;
+                                    pos.exit_generated = false;
+                                    pos.exit_generated_at = None;
+                                }
+                            }
+                            // Persist reduced position to KV
+                            if let Some(pos) = self.positions.read().get(&pending.mint) {
+                                let tracker = pos.clone();
+                                let mint_owned = pending.mint.clone();
+                                let ctx = Arc::clone(self);
+                                tokio::spawn(async move {
+                                    ctx.save_position_to_kv(&mint_owned, &tracker).await;
+                                });
+                            }
+                        } else {
+                            // Full sell — close position entirely
+                            info!(
+                                intent_id = %result.intent_id,
+                                mint = %pending.mint,
+                                token_amount = pending.token_amount,
+                                signature = ?result.signature,
+                                pnl = ?result.pnl,
+                                "✅ SELL CONFIRMED - Closing position"
+                            );
+                            self.close_position(&pending.mint);
+                        }
                     }
                 }
             }
@@ -3835,21 +3906,29 @@ async fn recover_positions_from_jsonl(
 
     // Now reconstruct PositionTracker for each open BUY
     for (mint, execs) in buys_by_mint.iter() {
-        // Take the most recent BUY for this mint
-        if let Some(exec) = execs.last() {
-            let fill_out = match exec.fill_out.as_ref() {
-                Some(f) => f,
-                None => {
-                    warn!(mint = %mint, "BUY execution missing fill_out, skipping");
-                    continue;
+        if execs.is_empty() {
+            continue;
+        }
+
+        // Sum ALL BUY fills for this mint (probe + scale-in).
+        // Previously only `execs.last()` was used, which would lose the probe
+        // fill when a scale-in existed, causing partial sells on recovery.
+        let mut token_amount: u64 = 0;
+        let mut token_decimals: u8 = 0;
+        let mut sol_invested: u64 = 0;
+        let mut valid_fills = 0u32;
+
+        for exec in execs.iter() {
+            if let Some(fill_out) = exec.fill_out.as_ref() {
+                token_amount = token_amount.saturating_add(fill_out.raw);
+                if fill_out.decimals > 0 {
+                    token_decimals = fill_out.decimals;
                 }
-            };
+                valid_fills += 1;
+            }
 
-            let token_amount = fill_out.raw;
-            let token_decimals = fill_out.decimals;
-
-            // Best-effort: estimate SOL invested and entry price
-            let sol_invested = exec
+            // Sum SOL invested from all BUYs
+            let exec_sol = exec
                 .fill_in
                 .as_ref()
                 .map(|f| f.raw)
@@ -3857,48 +3936,62 @@ async fn recover_positions_from_jsonl(
                     exec.wallet_sol_delta_lamports
                         .map(|d| d.unsigned_abs() as u64)
                 })
-                .unwrap_or(1_000_000_000); // Fallback: 1 SOL
+                .unwrap_or(0);
+            sol_invested = sol_invested.saturating_add(exec_sol);
+        }
 
-            let sol_ui = sol_invested as f64 / 1e9;
-            let tok_ui = token_amount as f64 / 10f64.powi(token_decimals as i32);
-            let entry_price = if sol_ui > 0.0 { tok_ui / sol_ui } else { 1.0 };
+        if valid_fills == 0 {
+            warn!(mint = %mint, buy_count = execs.len(), "All BUY executions missing fill_out, skipping");
+            continue;
+        }
 
-            // Estimate entry time from timestamp (ms)
-            let entry_time_estimate =
-                chrono::DateTime::from_timestamp_millis(exec.header.ts_unix_ms as i64)
-                    .map(|dt| {
-                        let elapsed = chrono::Utc::now().signed_duration_since(dt);
-                        Instant::now() - Duration::from_secs(elapsed.num_seconds().max(0) as u64)
-                    })
-                    .unwrap_or_else(Instant::now);
+        // Fallback if no SOL data at all
+        if sol_invested == 0 {
+            sol_invested = 1_000_000_000; // 1 SOL fallback
+        }
 
-            // Try to get pool/dex from original intent (if we have it cached)
-            let (pool, dex) = if let Some(intent) = intent_lookup.get(&exec.intent_id) {
-                let pool_from_intent = intent
-                    .get("resources")
-                    .and_then(|r| r.get("pools"))
-                    .and_then(|p| p.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("unknown_pool_{}", &mint[..12]));
+        let sol_ui = sol_invested as f64 / 1e9;
+        let tok_ui = token_amount as f64 / 10f64.powi(token_decimals as i32);
+        let entry_price = if sol_ui > 0.0 { tok_ui / sol_ui } else { 1.0 };
 
-                let dex_from_intent = intent
-                    .get("metadata")
-                    .and_then(|m| m.get("dex"))
-                    .and_then(|d| d.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
+        // Use the EARLIEST BUY for entry time (position open time)
+        let first_exec = execs.first().unwrap();
+        let entry_time_estimate =
+            chrono::DateTime::from_timestamp_millis(first_exec.header.ts_unix_ms as i64)
+                .map(|dt| {
+                    let elapsed = chrono::Utc::now().signed_duration_since(dt);
+                    Instant::now() - Duration::from_secs(elapsed.num_seconds().max(0) as u64)
+                })
+                .unwrap_or_else(Instant::now);
 
-                (pool_from_intent, dex_from_intent)
-            } else {
-                // Fallback: use placeholder (will work for exits but routing might fail)
-                (
-                    format!("unknown_pool_{}", &mint[..12]),
-                    "unknown".to_string(),
-                )
-            };
+        // Try to get pool/dex from the FIRST intent (probe BUY)
+        let (pool, dex) = if let Some(intent) = intent_lookup.get(&first_exec.intent_id) {
+            let pool_from_intent = intent
+                .get("resources")
+                .and_then(|r| r.get("pools"))
+                .and_then(|p| p.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("unknown_pool_{}", &mint[..12]));
 
+            let dex_from_intent = intent
+                .get("metadata")
+                .and_then(|m| m.get("dex"))
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            (pool_from_intent, dex_from_intent)
+        } else {
+            // Fallback: use placeholder (will work for exits but routing might fail)
+            (
+                format!("unknown_pool_{}", &mint[..12]),
+                "unknown".to_string(),
+            )
+        };
+
+        {
             let mut tracker = PositionTracker::new(
                 mint,
                 &pool,
@@ -3915,11 +4008,13 @@ async fn recover_positions_from_jsonl(
 
             info!(
                 mint = %mint,
+                buy_fills = valid_fills,
+                token_amount_raw = token_amount,
                 token_amount_ui = %tok_ui,
                 entry_price = %entry_price,
                 sol_invested_ui = %sol_ui,
                 age_secs = %(Instant::now() - entry_time_estimate).as_secs(),
-                "🔄 Position recovered from JSONL"
+                "🔄 Position recovered from JSONL (summed {} BUY fills)", valid_fills
             );
 
             positions.insert(mint.clone(), tracker);

@@ -7050,24 +7050,48 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
                 // Immediately update LockManager with bought token balance so that
                 // subsequent SELL intents don't fail with SIM_INSUFFICIENT_BALANCE.
-                // IMPORTANT: Use ADD (accumulate) not SET — for multi-BUY scenarios
-                // (probe + scale-in), each fill is incremental. Using SET would
-                // overwrite the first BUY's balance with the second, leaving
-                // LockManager with less than the actual on-chain total.
-                // The Geyser pipeline will eventually deliver the authoritative
-                // balance via live JetStream consumer, correcting any discrepancies.
+                //
+                // Strategy: Use ADD only when the current Geyser-sourced balance
+                // hasn't already accounted for this fill. The live JetStream consumer
+                // sets the authoritative balance via `set_available_token_balance`.
+                // If Geyser delivered the update BEFORE this handler runs, the current
+                // balance already includes this fill — adding would double-count.
+                //
+                // Detection: add the fill, then cap at max(current_before + fill, current_after_geyser).
+                // Practically: only add if current balance < expected accumulated total.
                 if let Some(fill_raw) = confirmed_buy_fill_out_raw {
                     let mint_str = &intent.resources.output_mint;
-                    ctx.lock_manager
-                        .add_available_token_balance(mint_str.to_string(), fill_raw);
-                    let new_total = ctx.lock_manager.available_token_balance(mint_str);
-                    info!(
-                        intent_id = %intent.intent_id,
-                        mint = %mint_str,
-                        fill_out_raw = fill_raw,
-                        total_available = new_total,
-                        "LockManager: accumulated token balance from confirmed BUY fill"
-                    );
+                    let current_before = ctx.lock_manager.available_token_balance(mint_str);
+
+                    // Heuristic: if the current balance is already >= the fill amount
+                    // AND we know Geyser has been active (balance > 0 before this fill),
+                    // then Geyser likely already includes this fill. Use max() to avoid
+                    // double-counting while still ensuring the balance is at least fill_raw.
+                    if current_before >= fill_raw && current_before > 0 {
+                        // Geyser likely already delivered the authoritative balance.
+                        // Don't add — just ensure it's at least fill_raw (defensive).
+                        info!(
+                            intent_id = %intent.intent_id,
+                            mint = %mint_str,
+                            fill_out_raw = fill_raw,
+                            current_balance = current_before,
+                            "LockManager: Geyser balance already >= fill, skipping add to prevent double-count"
+                        );
+                    } else {
+                        // Geyser hasn't caught up yet, or this is the first BUY.
+                        // Add the fill to bridge until Geyser delivers.
+                        ctx.lock_manager
+                            .add_available_token_balance(mint_str.to_string(), fill_raw);
+                        let new_total = ctx.lock_manager.available_token_balance(mint_str);
+                        info!(
+                            intent_id = %intent.intent_id,
+                            mint = %mint_str,
+                            fill_out_raw = fill_raw,
+                            balance_before = current_before,
+                            total_available = new_total,
+                            "LockManager: accumulated token balance from confirmed BUY fill"
+                        );
+                    }
                 } else {
                     warn!(
                         intent_id = %intent.intent_id,

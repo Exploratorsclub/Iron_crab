@@ -20,7 +20,13 @@
 | Fix 6 | Startup Owner-Scan: getTokenAccountsByOwner Discovery | ✅ DEPLOYED | 1 | ~1h |
 | Fix 7 | Token-2022 StateWithExtensions: Account-Unpack für Extensions | ✅ DEPLOYED | 1 | ~30min |
 | PR 3 | Vault-Balance-Reads aus Cache (Orca/Raydium/Meteora/CPMM) | ✅ DEPLOYED | 5 | ~5h |
-| Fix 8 | LockManager BUY-Fill-Akkumulation + Live Token-Balance-Sync | 🔧 READY | 2 | ~1h |
+| Fix 8 | LockManager BUY-Fill-Akkumulation + Live Token-Balance-Sync | ✅ DEPLOYED | 2 | ~1h |
+| Fix 9 | SELL-Amount Race-Condition + Recovery-Summierung + Partial-Sell | 🔧 READY | 2 | ~2h |
+| Fix 10 | LockManager Doppelzählung bei Geyser-Race | 🔧 READY | 1 | ~30min |
+| Bug 11 | momentum-bot: token_program fehlt in Scale-in TradeIntents | ⬜ TODO | 1 | ~1h |
+| Bug 12 | PumpFun Custom(2006): Seeds-Constraint bei State-Change | ⬜ TODO | 1 | ~1h |
+| Bug 13 | PumpFun Custom(6023): Complete Bonding-Curve Routing | ⬜ TODO | 1 | ~2h |
+| Bug 14 | PnL-Diskrepanz: momentum-bot vs Dashboard bei Partial-Sell | ⬜ TODO | 1 | ~1h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
 | PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
 
@@ -448,6 +454,179 @@ JetStream `WALLET_SNAPSHOT` wurde nur beim Bootstrap konsumiert, nicht im laufen
 - [ ] Multi-BUY (probe + scale-in) → SELL funktioniert ohne `SIM_INSUFFICIENT_BALANCE`
 - [ ] Geyser Token-Balance-Updates erreichen LockManager in Echtzeit
 - [ ] Liquidation nach Neustart funktioniert
+
+---
+
+## Fix 9: SELL-Amount Race-Condition + Recovery-Summierung + Partial-Sell (CRITICAL)
+
+**Branch**: `architecture-rebuild`
+**Status**: 🔧 READY (2026-02-08)
+**Risiko**: KRITISCH (betrifft korrekte Positionsgrößen bei SELLs)
+**Problem**: momentum-bot verkauft nur die Probe-Menge statt der gesamten Position nach Scale-in.
+
+### Root Cause (3 zusammenhängende Bugs)
+
+**9a: Race-Condition in `check_for_exits()`**
+- `strategy_interval` tick: `check_for_signals()` generiert Scale-in BUY → `pending_intents`
+- Selber tick: `check_for_exits()` liest `pos.token_amount` (nur Probe-Fill) → SELL-Intent mit Probe-Menge
+- Scale-in BUY wird bestätigt → `pos.token_amount` += Scale-in-Fill
+- SELL wird mit alter (zu kleiner) Menge ausgeführt → Tokens verwaist
+
+**Beispiel aus Logs:**
+- Probe BUY confirmed: `token_amount_raw=19,835,350,162`
+- Scale-in BUY confirmed: `total_tokens_raw=41,340,777,066`
+- SELL confirmed: `token_amount=19,835,350,162` ← NUR Probe-Menge!
+- Ergebnis: ~21.5B Tokens in Wallet ohne Position
+
+**9b: Recovery-Bug in `recover_positions_from_jsonl()`**
+- Verwendet nur `execs.last()` (letzter BUY) statt ALLE BUY-Fills zu summieren
+- Bei Probe + Scale-in wird nur Scale-in-Amount verwendet → falsche Positionsgröße
+- Betrifft Restart-Szenarios
+
+**9c: Kein Partial-Sell-Schutz in SELL-Confirmation**
+- `close_position()` wird bedingungslos aufgerufen
+- Wenn SELL-Menge < Position-Total → Position wird trotzdem geschlossen → Rest-Tokens verwaist
+
+### Fix
+
+**9a:** `check_for_exits()` sammelt jetzt `pending_buy_mints` aus `pending_intents` und überspringt Exits für Mints mit ausstehenden BUY-Intents.
+
+**9b:** `recover_positions_from_jsonl()` summiert jetzt `fill_out.raw` und SOL-Investment über ALLE BUY-Executions pro Mint. Entry-Time kommt vom ERSTEN BUY (Probe).
+
+**9c:** SELL-Confirmation prüft ob `sold_amount < pos.token_amount`. Falls ja: Position wird auf `remaining = total - sold` reduziert, `exit_generated` wird zurückgesetzt für Retry. Falls nein: Position wird wie bisher geschlossen.
+
+### Aufgaben
+
+- [x] `src/bin/momentum_bot.rs`: `check_for_exits()` — pending BUY intent guard
+- [x] `src/bin/momentum_bot.rs`: `recover_positions_from_jsonl()` — Sum alle BUY fills
+- [x] `src/bin/momentum_bot.rs`: SELL-Confirmation — Partial-Sell-Detection + Position reduce
+- [x] `cargo check` + `cargo clippy` erfolgreich (0 errors, 0 warnings)
+- [ ] Deploy + Test
+
+### Akzeptanzkriterien
+
+- [ ] SELL wird erst generiert wenn ALLE pending BUY-Intents für den Mint abgeschlossen sind
+- [ ] Nach Scale-in: SELL-Amount = gesamte Position (Probe + Scale-in)
+- [ ] Recovery: Summierte Position stimmt mit On-Chain-Wallet überein
+- [ ] Partial-Sell: Position wird reduziert statt geschlossen, Rest wird beim nächsten Tick verkauft
+- [ ] Keine verwaisten Tokens in Wallet nach SELL
+
+---
+
+## Fix 10: LockManager Doppelzählung bei Geyser-Race
+
+**Branch**: `architecture-rebuild`
+**Status**: 🔧 READY (2026-02-08)
+**Risiko**: Niedrig (LockManager ist nur Pre-Flight-Check, nicht SELL-sizing)
+**Problem**: Race zwischen live Geyser-Sync und BUY-Fill-Akkumulation verursacht inflationierte Balances.
+
+### Root Cause
+
+Timeline bei Scale-in BUY #2:
+1. BUY #2 confirmed on-chain
+2. market-data Geyser → `WalletBalanceSnapshot(balance=41.3B)` → JetStream
+3. Live Consumer in execution-engine → `set_available_token_balance(41.3B)` ✅
+4. 177ms später: BUY fill handler → `add_available_token_balance(21.5B)` → LockManager = 62.8B ❌
+
+### Fix
+
+BUY-Fill-Handler prüft jetzt den aktuellen Balance BEVOR er addiert:
+- Wenn `current_balance >= fill_raw` UND `current_balance > 0` → Geyser war schneller, skip add
+- Sonst: add normal (Geyser hat noch nicht geliefert)
+
+### Aufgaben
+
+- [x] `src/bin/execution_engine.rs`: BUY-Fill conditional add statt blind add
+- [x] `cargo check` + `cargo clippy` erfolgreich (0 errors, 0 warnings)
+- [ ] Deploy + Test
+
+### Akzeptanzkriterien
+
+- [ ] Multi-BUY: LockManager Balance ≤ On-Chain Balance (nie inflationiert)
+- [ ] Erste BUY: Balance wird korrekt geseeded (Geyser noch nicht da)
+- [ ] Geyser-Update korrigiert eventuelle Diskrepanzen
+
+---
+
+## Bug 11: momentum-bot token_program fehlt in Scale-in TradeIntents
+
+**Status**: ⬜ TODO
+**Risiko**: Mittel (betrifft Token-2022 Token)
+**Problem**: Scale-in BUY-Intents von momentum-bot enthalten kein `token_program` in der Metadata. execution-engine defaultet auf `spl_token::id()`. Bei Token-2022 Mints → `IncorrectProgramId` bei ATA-Erstellung.
+
+### Root Cause
+
+- `momentum-bot` speichert `token_program` nicht bei Position-Eröffnung
+- Folge-Intents (Scale-in) können es daher nicht in die Intent-Metadata einfügen
+- execution-engine `pumpfun.rs` → `create_associated_token_account` mit falschem Program
+
+### Geplanter Fix
+
+- `PositionTracker` um `token_program: String` Feld erweitern
+- Bei BUY-Confirmation `token_program` aus ExecutionResult-Metadata extrahieren
+- Scale-in Intent: `token_program` aus Position übernehmen
+
+---
+
+## Bug 12: PumpFun Custom(2006) — Seeds-Constraint bei State-Change
+
+**Status**: ⬜ TODO
+**Risiko**: Niedrig (Edge-Case bei Bonding-Curve-Migration)
+**Problem**: BUY-Simulation erfolgreich, aber On-Chain `FailedConfirmed` mit `Custom(2006)` ("A seeds constraint was violated"). Bonding-Curve-Status hat sich zwischen Simulation und Execution geändert.
+
+### Root Cause
+
+- Bonding Curve war bei Simulation noch aktiv
+- Zwischen Simulation und TX-Execution: Migration zu PumpSwap AMM
+- PDA-Derivation für alte Bonding Curve scheitert → Seeds-Constraint verletzt
+
+### Geplanter Fix
+
+- Kurz vor TX-Send: Re-Check ob Bonding Curve noch `complete == false` (aus Cache)
+- Wenn `complete == true`: TX abbrechen, Intent als `Rejected(BONDING_CURVE_MIGRATED)` markieren
+- Kein erneuter RPC nötig wenn LivePoolCache `complete`-Status aktuell ist
+
+---
+
+## Bug 13: PumpFun Custom(6023) — Complete Bonding-Curve Routing
+
+**Status**: ⬜ TODO
+**Risiko**: Mittel (betrifft Liquidation von PumpFun-Token nach Migration)
+**Problem**: Liquidation von PumpFun-Token scheitert mit `Custom(6023)` wenn die Bonding Curve already "complete" ist und der Token zu PumpSwap AMM migriert wurde.
+
+### Root Cause
+
+- Liquidation versucht über alte Bonding Curve zu routen
+- Bonding Curve ist already complete → PumpFun-Programm rejectiert mit 6023
+- Kein automatischer Fallback auf PumpSwap AMM
+
+### Geplanter Fix
+
+- Wenn `complete == true` im LivePoolCache: Route über PumpSwap AMM statt Bonding Curve
+- Fallback-Chain: PumpSwap AMM → Raydium → Orca (falls AMM-Migration bekannt)
+- Besseres Logging für Routing-Entscheidung
+
+---
+
+## Bug 14: PnL-Diskrepanz zwischen momentum-bot und Dashboard
+
+**Status**: ⬜ TODO
+**Risiko**: Niedrig (nur Anzeige)
+**Problem**: momentum-bot berechnet PnL korrekt als `(current_price - entry_price) / entry_price * 100%`. Dashboard zeigt anderen Wert, vermutlich basierend auf SOL-In vs SOL-Out Berechnung.
+
+### Root Cause (Vermutung)
+
+- momentum-bot: PnL basiert auf Preis-Basis (entry_price vs current_price)
+- Dashboard: PnL basiert möglicherweise auf SOL-Beträgen aus ExecutionResults
+- Bei Partial-Sell: momentum-bot sieht hohen %-Gewinn auf verkauften Teil, Dashboard sieht Gesamtposition
+- `pnl_pct=181.77%` (momentum-bot) vs `-30%` (Dashboard)
+
+### Geplanter Fix
+
+- Dashboard PnL-Berechnung analysieren
+- Einheitliche PnL-Basis definieren: Preis-basiert ODER SOL-basiert
+- Bei Partial-Sell: Dashboard muss Restposition berücksichtigen
+- Erst relevant wenn Fix 9 deployed und Partial-Sells nicht mehr auftreten
 
 ---
 
