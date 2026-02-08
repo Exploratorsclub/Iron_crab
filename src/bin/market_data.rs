@@ -840,7 +840,10 @@ async fn publish_wallet_snapshot(
         if observed.is_none() {
             if let Some(acc) = accounts_by_key.get(&ata_2022) {
                 if acc.owner.to_bytes() == spl_token_2022::ID.to_bytes() {
-                    if let Ok(ta) = spl_token_2022::state::Account::unpack(&acc.data) {
+                    // Token-2022 accounts may have extensions (data > 165 bytes).
+                    // Use StateWithExtensions instead of Pack::unpack to handle this.
+                    if let Ok(state) = StateWithExtensions::<spl_token_2022::state::Account>::unpack(&acc.data) {
+                        let ta = &state.base;
                         let mint_pk = Pubkey::new_from_array(ta.mint.to_bytes());
                         let owner_pk = Pubkey::new_from_array(ta.owner.to_bytes());
                         if mint_pk == *mint && owner_pk == *wallet {
@@ -1652,8 +1655,10 @@ async fn run_geyser_loop(
                                 Err(_) => continue,
                             }
                         } else {
-                            match spl_token_2022::state::Account::unpack(&account_update.data) {
-                                Ok(acc) => (Pubkey::new_from_array(acc.mint.to_bytes()), acc.amount),
+                            // Token-2022 accounts may have extensions (data > 165 bytes).
+                            // Use StateWithExtensions instead of Pack::unpack.
+                            match StateWithExtensions::<spl_token_2022::state::Account>::unpack(&account_update.data) {
+                                Ok(state) => (Pubkey::new_from_array(state.base.mint.to_bytes()), state.base.amount),
                                 Err(_) => continue,
                             }
                         };
