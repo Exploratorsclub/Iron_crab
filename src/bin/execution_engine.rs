@@ -4481,10 +4481,13 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                // DeliverPolicy::New — only receive messages published AFTER this consumer is created.
-                // Bootstrap already handled all historical snapshots; this handles live updates.
+                // DeliverPolicy::LastPerSubject — on first pull, get the latest snapshot
+                // for each mint (catches updates published between bootstrap and consumer
+                // creation), then continues with live updates. This is idempotent because
+                // set_available_token_balance replaces the value, and the re-read of
+                // already-bootstrapped values just confirms what's already there.
                 let consumer_config = jetstream::consumer::pull::Config {
-                    deliver_policy: jetstream::consumer::DeliverPolicy::New,
+                    deliver_policy: jetstream::consumer::DeliverPolicy::LastPerSubject,
                     ack_policy: jetstream::consumer::AckPolicy::Explicit,
                     max_ack_pending: 256,
                     filter_subject: format!("ironcrab.wallet_snapshot.{}.*", wallet_str),
