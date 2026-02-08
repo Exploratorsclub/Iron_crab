@@ -197,7 +197,7 @@ impl CrossDexHandler {
     /// Pool data comes from arb-strategy via Intent metadata.
     pub async fn init_dexes(&mut self) -> Result<()> {
         // Initialize Raydium - for build_swap_ix() only
-        let mut raydium = Raydium::new(Arc::clone(&self.rpc));
+        let mut raydium = Raydium::new_with_live_cache(Arc::clone(&self.rpc), self.pool_cache.clone());
         if let Some(pk) = self.wallet_pubkey {
             raydium.set_user_authority(pk);
         }
@@ -226,7 +226,7 @@ impl CrossDexHandler {
         }
 
         // Initialize Meteora DLMM - for build_swap_ix() only
-        let mut meteora = MeteoraDlmm::new(Arc::clone(&self.rpc));
+        let mut meteora = MeteoraDlmm::new_with_live_cache(Arc::clone(&self.rpc), self.pool_cache.clone());
         if let Some(pk) = self.wallet_pubkey {
             meteora.set_user_authority(pk);
         }
@@ -245,7 +245,7 @@ impl CrossDexHandler {
         info!("Initialized Meteora CPMM connector (for IX building only)");
 
         // Initialize Orca Whirlpool - for build_swap_ix() only
-        let orca = Orca::new(Arc::clone(&self.rpc));
+        let orca = Orca::new_with_cache(Arc::clone(&self.rpc), None, self.pool_cache.clone());
         if let Some(pk) = self.wallet_pubkey {
             orca.set_user_authority(pk);
         }

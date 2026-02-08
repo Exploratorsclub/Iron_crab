@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use super::orca_reserve_cache::{OrcaReserveCache, ReserveEntry};
 use super::{Dex, Quote};
+use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
 use crate::solana::rpc::SolanaRpc;
 use chrono::Utc;
 use solana_sdk::instruction::Instruction;
@@ -63,17 +64,23 @@ pub struct Orca {
     user_token_accounts: Arc<DashMap<Pubkey, Pubkey>>, // mint -> user token account (ATA)
     mint_index: Arc<DashMap<Pubkey, Vec<Pubkey>>>,     // mint -> pools containing it
     reserve_cache: Option<Arc<OrcaReserveCache>>,
+    /// Geyser-sourced LivePoolCache for real-time vault balances (GEYSER-FIRST)
+    live_pool_cache: Option<SharedLivePoolCache>,
     cache_hits: Arc<AtomicU64>,
     cache_misses: Arc<AtomicU64>,
 }
 
 impl Orca {
     pub fn new(rpc: Arc<SolanaRpc>) -> Self {
-        Self::new_with_cache(rpc, None)
+        Self::new_with_cache(rpc, None, None)
     }
 
-    /// Create Orca instance with optional persistent reserve cache.
-    pub fn new_with_cache(rpc: Arc<SolanaRpc>, cache_path: Option<String>) -> Self {
+    /// Create Orca instance with optional persistent reserve cache and LivePoolCache.
+    pub fn new_with_cache(
+        rpc: Arc<SolanaRpc>,
+        cache_path: Option<String>,
+        live_pool_cache: Option<SharedLivePoolCache>,
+    ) -> Self {
         let reserve_cache = cache_path
             .and_then(|path| OrcaReserveCache::new(&path, 300).ok())
             .map(Arc::new);
@@ -86,6 +93,7 @@ impl Orca {
             user_token_accounts: Arc::new(DashMap::new()),
             mint_index: Arc::new(DashMap::new()),
             reserve_cache,
+            live_pool_cache,
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
         }
@@ -397,13 +405,23 @@ impl Orca {
         }
     }
 
-    /// Lazy-load reserves from vaults with persistent SQLite cache fallback.
+    /// Lazy-load reserves from vaults with Geyser-first strategy.
     /// Returns (reserve_base, reserve_quote) or falls back to pool's static reserves.
-    /// Priority: (1) SQLite persistent cache (2) In-memory cache (3) RPC fetch
+    /// Priority: (0) LivePoolCache/Geyser (1) SQLite persistent cache (2) In-memory cache (3) RPC fetch
     async fn load_reserves_if_needed(&self, pool_id: &Pubkey, pool: &OrcaPool) -> (u128, u128) {
         const CACHE_TTL_SECS: u64 = 300; // 5 minutes
 
-        // Try persistent SQLite cache first (survives restarts)
+        // 0) LivePoolCache (Geyser real-time) — HIGHEST PRIORITY
+        if let Some(ref lpc) = self.live_pool_cache {
+            if let Some(CachedPoolState::Orca(state)) = lpc.get(pool_id) {
+                if let (Some(va), Some(vb)) = (state.vault_a_balance, state.vault_b_balance) {
+                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return (va as u128, vb as u128);
+                }
+            }
+        }
+
+        // 1) Try persistent SQLite cache (survives restarts)
         if let Some(ref db_cache) = self.reserve_cache {
             if let Ok(Some(entry)) = db_cache.get(pool_id) {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -425,8 +443,12 @@ impl Orca {
             }
         }
 
-        // Cache miss: Fetch fresh reserves from RPC
+        // Cache miss: Fetch fresh reserves from RPC (ARCHITECTURE VIOLATION: should come from Geyser)
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            pool = %pool_id,
+            "orca: RPC fallback for vault reserves (LivePoolCache miss)"
+        );
         match self
             .rpc
             .rpc

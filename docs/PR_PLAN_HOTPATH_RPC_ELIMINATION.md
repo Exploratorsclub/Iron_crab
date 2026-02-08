@@ -16,9 +16,10 @@
 | Fix 3 | Position-Tracking: Liquidation-Sells schließen Positionen | ✅ DEPLOYED | 2 | ~1h |
 | Fix 4 | Ghost-Balance-Fix: Wallet-Snapshot-Bootstrap schreibt balance=0 | ✅ DEPLOYED | 1 | ~30min |
 | PR 2 | PumpFun Bonding-Curve Quotes aus Cache | ✅ DEPLOYED | 2 | ~4h |
-| Fix 5 | ExecutionResult Metadata + LockManager Seed + WSOL Logging | 🔧 IN PROGRESS | 3 | ~2h |
-| Fix 6 | Startup Owner-Scan: getTokenAccountsByOwner Discovery | 🔧 IN PROGRESS | 1 | ~1h |
-| PR 3 | Vault-Balance-Reads aus Cache (Orca/Raydium/Meteora/CPMM) | ⬜ TODO | 5 | ~5h |
+| Fix 5 | ExecutionResult Metadata + LockManager Seed + WSOL Logging | ✅ DEPLOYED | 3 | ~2h |
+| Fix 6 | Startup Owner-Scan: getTokenAccountsByOwner Discovery | ✅ DEPLOYED | 1 | ~1h |
+| Fix 7 | Token-2022 StateWithExtensions: Account-Unpack für Extensions | ✅ DEPLOYED | 1 | ~30min |
+| PR 3 | Vault-Balance-Reads aus Cache (Orca/Raydium/Meteora/CPMM) | 🔧 IN PROGRESS | 5 | ~5h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
 | PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
 
@@ -219,7 +220,7 @@ Die Geyser-basierte Wallet-Balance-Implementierung wurde geprüft und ist korrek
 ## Fix 5: ExecutionResult Metadata + LockManager Seed + WSOL Logging
 
 **Branch**: `architecture-rebuild`
-**Status**: 🔧 IN PROGRESS
+**Status**: ✅ DEPLOYED (2026-02-08)
 **Risiko**: Mittel (betrifft Trade-Lifecycle: BUY → SELL Fähigkeit)
 **Problem**: Nach einem bestätigten BUY scheitern SELL-Intents an `SIM_INSUFFICIENT_BALANCE`. Dashboard zeigt SOL statt WSOL.
 
@@ -264,7 +265,7 @@ Die Geyser-basierte Wallet-Balance-Implementierung wurde geprüft und ist korrek
 ## Fix 6: Startup Owner-Scan: getTokenAccountsByOwner Discovery
 
 **Branch**: `architecture-rebuild`
-**Status**: 🔧 IN PROGRESS
+**Status**: ✅ DEPLOYED (2026-02-08)
 **Risiko**: Niedrig (nur Startup, kein Hot-Path)
 **Problem**: Der Startup-Wallet-Snapshot nutzte nur `getMultipleAccounts` auf bekannte Mints aus JetStream. Token die nie in JetStream gelandet sind (z.B. wegen Bug in ATA-Tracking, externe Käufe über Phantom/Jupiter) waren für den Bot unsichtbar → Liquidation fand 0 Token, Positionen wurden nicht erkannt.
 
@@ -304,10 +305,42 @@ Die Geyser-basierte Wallet-Balance-Implementierung wurde geprüft und ist korrek
 
 ---
 
+## Fix 7: Token-2022 StateWithExtensions — Account-Unpack für Extensions
+
+**Branch**: `architecture-rebuild`
+**Status**: ✅ DEPLOYED (2026-02-08)
+**Risiko**: Niedrig
+**Problem**: `spl_token_2022::state::Account::unpack()` (via `Pack` trait) erwartet exakt 165 Bytes. Token-2022 Accounts mit Extensions (z.B. `ImmutableOwner` bei PumpFun-Token) sind 170+ Bytes. → `unpack()` scheitert stillschweigend → Token-2022 Balances werden als 0 behandelt → Liquidation überspringt diese Token.
+
+### Root Cause
+
+- `Pack::unpack()` prüft `input.len() != Self::LEN` (165) → `Err(InvalidAccountData)` bei 170 Bytes
+- `if let Ok(ta) = ...unpack(...)` Pattern fängt den Error ab aber loggt ihn nicht → stilles Versagen
+- Betrifft sowohl Startup-Bootstrap als auch Geyser-Laufzeit-Updates für Token-2022
+
+### Fix
+
+- 2 Stellen in `src/bin/market_data.rs` von `Account::unpack()` auf `StateWithExtensions::<Account>::unpack()` umgestellt
+- `StateWithExtensions` extrahiert die Base-Account-Daten (165 Bytes) korrekt unabhängig von Extension-Daten
+
+### Aufgaben
+
+- [x] `src/bin/market_data.rs`: `publish_wallet_snapshot()` Token-2022 ATA-Verarbeitung → `StateWithExtensions`
+- [x] `src/bin/market_data.rs`: Geyser ATA-Balance-Tracking für Token-2022 → `StateWithExtensions`
+- [x] `cargo check` + `cargo clippy` erfolgreich (0 errors, 0 neue warnings)
+- [x] Deploy + Test → Liquidation erfolgreich für Token-2022 Token ✅
+
+### Verifizierung
+
+- Server-Test: Beide Token-2022 Token (`9NLRXSZu...pump`, `2wqczBTB...pump`) hatten `data_len=170` (Extensions vorhanden)
+- Nach Fix: Alle 3 Token korrekt liquidiert (1x SPL Token + 2x Token-2022)
+
+---
+
 ## PR 3: Vault-Balance-Reads aus Cache (Orca, Raydium, Meteora, CPMM)
 
-**Branch**: `fix/vault-balances-from-cache`
-**Status**: ⬜ TODO
+**Branch**: `architecture-rebuild`
+**Status**: 🔧 IN PROGRESS
 **Risiko**: Mittel
 **Eliminiert**: 2-4 RPC-Calls pro Quote bei jedem dieser DEXe
 
@@ -320,42 +353,45 @@ Jedes DEX-Modul bekommt:
 
 ### Aufgaben – Orca (`src/solana/dex/orca.rs`)
 
-- [ ] `Orca` Struct: `cache: Option<SharedLivePoolCache>` Feld
-- [ ] `Orca::new()`: Cache-Parameter
-- [ ] `load_reserves_if_needed()`: LivePoolCache `OrcaWhirlpoolState.vault_a_balance`/`vault_b_balance` als erste Lookup-Quelle
-- [ ] `batch_refresh_vault_balances()`: Skip wenn Cache frisch (Geyser liefert Updates)
-- [ ] Metrik: `ORCA_RESERVE_CACHE_HIT` vs `ORCA_RESERVE_RPC_FALLBACK`
+- [x] `Orca` Struct: `live_pool_cache: Option<SharedLivePoolCache>` Feld
+- [x] `Orca::new_with_cache()`: LivePoolCache-Parameter hinzugefügt
+- [x] `load_reserves_if_needed()`: LivePoolCache als höchste Priorität (vor SQLite + RPC)
+- [x] RPC-Fallback mit WARN-Log markiert
+- [ ] Metrik: `ORCA_RESERVE_CACHE_HIT` vs `ORCA_RESERVE_RPC_FALLBACK` (Future: Prometheus)
 
 ### Aufgaben – Raydium (`src/solana/dex/raydium.rs`)
 
-- [ ] `Raydium` Struct: `cache: Option<SharedLivePoolCache>` Feld
-- [ ] `Raydium::new()`: Cache-Parameter
-- [ ] `fetch_and_update_reserves()`: LivePoolCache `RaydiumAmmState.coin_reserve`/`pc_reserve` als erste Quelle
-- [ ] `load_pool_from_geyser()`: Account-Daten direkt aus Geyser-Event parsen, 20-Retry-RPC-Loop entfernen
-- [ ] Metrik: `RAYDIUM_RESERVE_CACHE_HIT` vs `RAYDIUM_RESERVE_RPC_FALLBACK`
+- [x] `Raydium` Struct: `live_pool_cache: Option<SharedLivePoolCache>` Feld
+- [x] `Raydium::new_with_live_cache()`: Cache-Parameter hinzugefügt
+- [x] `fetch_and_update_reserves()`: LivePoolCache als höchste Priorität (vor RPC)
+- [x] RPC-Fallback mit WARN-Log markiert
+- [ ] `load_pool_from_geyser()`: 20-Retry entfernen (separate PR, P2)
+- [ ] Metrik: `RAYDIUM_RESERVE_CACHE_HIT` vs `RAYDIUM_RESERVE_RPC_FALLBACK` (Future: Prometheus)
 
 ### Aufgaben – Meteora DLMM (`src/solana/dex/meteora_dlmm.rs`)
 
-- [ ] `MeteoraDlmm` Struct: `cache: Option<SharedLivePoolCache>` Feld
-- [ ] `MeteoraDlmm::new()`: Cache-Parameter
-- [ ] `update_reserve_balances()`: LivePoolCache `MeteoraState.reserve_x_balance`/`reserve_y_balance` als erste Quelle
-- [ ] Pool-Account-Fetch (Zeile 216): Cache-Lookup statt RPC
-- [ ] Metrik: `METEORA_RESERVE_CACHE_HIT` vs `METEORA_RESERVE_RPC_FALLBACK`
+- [x] `MeteoraDlmm` Struct: `live_pool_cache: Option<SharedLivePoolCache>` Feld
+- [x] `MeteoraDlmm::new_with_live_cache()`: Cache-Parameter hinzugefügt
+- [x] `update_reserve_balances()`: LivePoolCache als höchste Priorität (vor RPC)
+- [x] RPC-Fallback mit WARN-Log markiert
+- [ ] Metrik: `METEORA_RESERVE_CACHE_HIT` vs `METEORA_RESERVE_RPC_FALLBACK` (Future: Prometheus)
 
 ### Aufgaben – Raydium CPMM (`src/solana/dex/raydium_cpmm.rs`)
 
-- [ ] `RaydiumCpmm` Struct: `cache: Option<SharedLivePoolCache>` Feld
-- [ ] `RaydiumCpmm::new()`: Cache-Parameter
-- [ ] `update_reserve_balances()`: LivePoolCache `RaydiumCpmmState.reserve_0`/`reserve_1` als erste Quelle
-- [ ] Metrik: `CPMM_RESERVE_CACHE_HIT` vs `CPMM_RESERVE_RPC_FALLBACK`
+- [x] `RaydiumCpmm` Struct: `live_pool_cache: Option<SharedLivePoolCache>` Feld
+- [x] `RaydiumCpmm::new_with_live_cache()`: Cache-Parameter hinzugefügt
+- [x] `update_reserve_balances()`: LivePoolCache als höchste Priorität (vor RPC)
+- [x] RPC-Fallback mit WARN-Log markiert
+- [ ] Metrik: `CPMM_RESERVE_CACHE_HIT` vs `CPMM_RESERVE_RPC_FALLBACK` (Future: Prometheus)
 
-### Aufgaben – Execution Engine
+### Aufgaben – Execution Engine + tx_builder + cross_dex_handler
 
-- [ ] `src/bin/execution_engine.rs`: Cache an alle DEX-Konstruktoren durchreichen:
-  - `Orca::new()` mit Cache
-  - `Raydium::new()` mit Cache
-  - `MeteoraDlmm::new()` mit Cache
-  - In `run_liquidation_job()` und generellem Intent-Processing
+- [x] `src/bin/execution_engine.rs`: `run_liquidation_job()` — Cache an Orca, Raydium, Meteora
+- [x] `src/bin/execution_engine.rs`: `run_burn_job()` — Cache an Raydium
+- [x] `src/execution/tx_builder.rs`: Alle 6 DEX-Konstruktoren mit Cache (single-hop + multi-hop)
+- [x] `src/solana/cross_dex_handler.rs`: `init_dexes()` — Cache an Raydium, Meteora, Orca
+- [x] `src/bin/sell_all.rs`, `sell_all_keyless.rs`: Unverändert (`None`, Emergency-Tools ohne Cache)
+- [x] `cargo check` + `cargo clippy` erfolgreich (0 errors, 0 warnings)
 
 ### Akzeptanzkriterien
 

@@ -18,6 +18,8 @@ use std::sync::Arc;
 use tracing::warn;
 use tracing::{debug, info};
 
+use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
+
 use super::meteora_dlmm_layout::DlmmPool;
 use super::meteora_swap_builder::{MeteoraDlmmSwapBuilder, SwapDirection};
 use super::{Dex, Quote};
@@ -51,16 +53,24 @@ pub struct MeteoraDlmm {
     /// Extra data cache for GEYSER-FIRST compliance (e.g., token programs for Token-2022)
     /// Key: "token_program:<mint>" -> Value: token program ID
     extra_data: Arc<DashMap<String, String>>,
+    /// Geyser-sourced LivePoolCache for real-time vault balances (GEYSER-FIRST)
+    live_pool_cache: Option<SharedLivePoolCache>,
 }
 
 impl MeteoraDlmm {
     pub fn new(rpc: Arc<SolanaRpc>) -> Self {
+        Self::new_with_live_cache(rpc, None)
+    }
+
+    /// Create MeteoraDlmm instance with optional LivePoolCache for Geyser-first vault balances.
+    pub fn new_with_live_cache(rpc: Arc<SolanaRpc>, live_pool_cache: Option<SharedLivePoolCache>) -> Self {
         Self {
             rpc,
             pools: Arc::new(DashMap::new()),
             mint_index: Arc::new(DashMap::new()),
             user_authority: parking_lot::RwLock::new(None),
             extra_data: Arc::new(DashMap::new()),
+            live_pool_cache,
         }
     }
 
@@ -192,11 +202,25 @@ impl MeteoraDlmm {
     // If a pool is not in cache, it means market-data hasn't discovered it yet.
     // The intent should be rejected with reason_code="pool_not_cached".
 
-    /// Fetch reserve balances from vaults and update cache
-    ///
-    /// NOTE: This is used for IX building when pool is already in cache.
-    /// In production, reserve data should come from Geyser via intent metadata.
+    /// Fetch reserve balances from vaults and update cache.
+    /// Priority: (1) LivePoolCache/Geyser (2) RPC fallback.
     async fn update_reserve_balances(&self, pool_addr: &Pubkey) -> Result<(u64, u64)> {
+        // 1) LivePoolCache (Geyser real-time) — HIGHEST PRIORITY
+        if let Some(ref lpc) = self.live_pool_cache {
+            if let Some(CachedPoolState::Meteora(state)) = lpc.get(pool_addr) {
+                if let (Some(rx), Some(ry)) = (state.reserve_x_balance, state.reserve_y_balance) {
+                    // Update local cache
+                    if let Some(mut entry) = self.pools.get_mut(pool_addr) {
+                        entry.reserve_x_balance = Some(rx);
+                        entry.reserve_y_balance = Some(ry);
+                        entry.last_updated = std::time::SystemTime::now();
+                    }
+                    return Ok((rx, ry));
+                }
+            }
+        }
+
+        // 2) RPC fallback
         let pool = self
             .pools
             .get(pool_addr)
@@ -235,6 +259,11 @@ impl MeteoraDlmm {
                 }
             }
         }
+
+        tracing::warn!(
+            pool = %pool_addr,
+            "meteora_dlmm: RPC fallback for vault reserves (LivePoolCache miss)"
+        );
 
         // Fetch token account balances
         let acc_x = self.rpc.get_account_retry(&reserve_x).await.ok();

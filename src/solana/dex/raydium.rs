@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::{Dex, Quote};
+use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
 use crate::solana::rpc::SolanaRpc;
 use dashmap::DashMap;
 #[cfg(feature = "rpc_fallback")]
@@ -63,6 +64,8 @@ pub struct Raydium {
     pools: Arc<DashMap<Pubkey, SimplePool>>, // in-memory pool snapshot
     mint_index: Arc<DashMap<Pubkey, Vec<Pubkey>>>, // mint -> pools containing it
     user_authority: Option<Pubkey>,
+    /// Geyser-sourced LivePoolCache for real-time vault balances (GEYSER-FIRST)
+    live_pool_cache: Option<SharedLivePoolCache>,
 }
 
 /// Planned swap including the constructed instruction list plus metadata for future TX assembly.
@@ -135,11 +138,17 @@ struct SimplePool {
 
 impl Raydium {
     pub fn new(rpc: Arc<SolanaRpc>) -> Self {
+        Self::new_with_live_cache(rpc, None)
+    }
+
+    /// Create Raydium instance with optional LivePoolCache for Geyser-first vault balances.
+    pub fn new_with_live_cache(rpc: Arc<SolanaRpc>, live_pool_cache: Option<SharedLivePoolCache>) -> Self {
         Self {
             rpc,
             pools: Arc::new(DashMap::new()),
             mint_index: Arc::new(DashMap::new()),
             user_authority: None,
+            live_pool_cache,
         }
     }
 
@@ -1280,9 +1289,23 @@ impl Raydium {
         Ok(())
     }
 
-    /// Fetch pool vault reserves from RPC and update cache.
-    /// This is called on-demand when a pool needs reserves for swap calculation.
+    /// Fetch pool vault reserves and update cache.
+    /// Priority: (1) LivePoolCache/Geyser (2) RPC fallback.
     pub async fn fetch_and_update_reserves(&self, pool_address: &Pubkey) -> Result<()> {
+        // 1) LivePoolCache (Geyser real-time) — HIGHEST PRIORITY
+        if let Some(ref lpc) = self.live_pool_cache {
+            if let Some(CachedPoolState::RaydiumAmm(state)) = lpc.get(pool_address) {
+                if let (Some(coin), Some(pc)) = (state.coin_reserve, state.pc_reserve) {
+                    if let Some(mut pool) = self.pools.get_mut(pool_address) {
+                        pool.reserve_base = coin as u128;
+                        pool.reserve_quote = pc as u128;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // 2) RPC fallback (WARN: should come from Geyser)
         let (base_vault, quote_vault) = {
             let pool = self
                 .pools
@@ -1290,6 +1313,11 @@ impl Raydium {
                 .ok_or_else(|| anyhow!("pool not found in cache"))?;
             (pool.base_vault, pool.quote_vault)
         };
+
+        tracing::warn!(
+            pool = %pool_address,
+            "raydium: RPC fallback for vault reserves (LivePoolCache miss)"
+        );
 
         // Fetch both vault balances in parallel
         let (base_bal, quote_bal) = tokio::try_join!(
@@ -1314,7 +1342,7 @@ impl Raydium {
                 pool=%pool_address,
                 base=%base_amt,
                 quote=%quote_amt,
-                "fetched and updated pool reserves"
+                "raydium: fetched reserves via RPC fallback"
             );
         }
 

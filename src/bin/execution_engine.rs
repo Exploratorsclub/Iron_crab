@@ -1379,10 +1379,11 @@ impl ExecutionContext {
             ctx.rpc_url.clone(),
             ctx.helius_rpc_url.clone(),
         );
-        let mut meteora = MeteoraDlmm::new(Arc::clone(&ctx.rpc));
+        let lpc = ctx.live_pool_cache.as_ref().map(Arc::clone);
+        let mut meteora = MeteoraDlmm::new_with_live_cache(Arc::clone(&ctx.rpc), lpc.clone());
         meteora.set_user_authority(owner);
-        let raydium = Raydium::new(Arc::clone(&ctx.rpc));
-        let orca = Orca::new(Arc::clone(&ctx.rpc));
+        let raydium = Raydium::new_with_live_cache(Arc::clone(&ctx.rpc), lpc.clone());
+        let orca = Orca::new_with_cache(Arc::clone(&ctx.rpc), None, lpc);
         orca.set_user_authority(owner);
 
         if let Err(e) = raydium.refresh_pools().await {
@@ -2333,8 +2334,9 @@ impl ExecutionContext {
         maybe_ping_watchdog();
 
         // Initialize DEX connectors for route validation.
-        let raydium = Raydium::new(Arc::clone(&ctx.rpc));
-        let burn_pumpfun_cache = ctx.live_pool_cache.as_ref().map(Arc::clone);
+        let burn_lpc = ctx.live_pool_cache.as_ref().map(Arc::clone);
+        let raydium = Raydium::new_with_live_cache(Arc::clone(&ctx.rpc), burn_lpc.clone());
+        let burn_pumpfun_cache = burn_lpc;
         let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc), burn_pumpfun_cache) {
             Ok(p) => Some(p),
             Err(e) => {

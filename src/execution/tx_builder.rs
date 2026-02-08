@@ -408,7 +408,7 @@ pub async fn build_tx_plan(
             }
         };
 
-        let orca = Orca::new(Arc::clone(&rpc));
+        let orca = Orca::new_with_cache(Arc::clone(&rpc), None, cache.map(Arc::clone));
         orca.set_user_authority(wallet_pubkey);
 
         // Register ATAs for both mints (Orca build_swap_ix requires these mappings).
@@ -478,7 +478,7 @@ pub async fn build_tx_plan(
             }
         };
 
-        let mut raydium = Raydium::new(Arc::clone(&rpc));
+        let mut raydium = Raydium::new_with_live_cache(Arc::clone(&rpc), cache.map(Arc::clone));
         raydium.set_user_authority(wallet_pubkey);
 
         // Try cache first for pool state, fallback to RPC
@@ -718,7 +718,7 @@ pub async fn build_tx_plan(
             }
         };
 
-        let mut meteora = MeteoraDlmm::new(Arc::clone(&rpc));
+        let mut meteora = MeteoraDlmm::new_with_live_cache(Arc::clone(&rpc), cache.map(Arc::clone));
         meteora.set_user_authority(wallet_pubkey);
 
         // Meteora DLMM: If DexPoolAccounts missing, fallback to cache/RPC.
@@ -1238,7 +1238,7 @@ async fn build_hop_raydium(
     rpc: &Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
-    let mut raydium = Raydium::new(Arc::clone(rpc));
+    let mut raydium = Raydium::new_with_live_cache(Arc::clone(rpc), cache.map(Arc::clone));
 
     // Try to inject pool state from cache
     let mut used_cache = false;
@@ -1308,7 +1308,7 @@ async fn build_hop_orca(
     rpc: &Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
-    let orca = Orca::new(Arc::clone(rpc));
+    let orca = Orca::new_with_cache(Arc::clone(rpc), None, cache.map(Arc::clone));
     orca.set_user_authority(wallet_pubkey);
 
     // Get pool state from cache or RPC
@@ -1386,7 +1386,7 @@ async fn build_hop_meteora_dlmm(
     rpc: &Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
-    let mut meteora = MeteoraDlmm::new(Arc::clone(rpc));
+    let mut meteora = MeteoraDlmm::new_with_live_cache(Arc::clone(rpc), cache.map(Arc::clone));
     meteora.set_user_authority(wallet_pubkey);
 
     // Try to inject state from cache
