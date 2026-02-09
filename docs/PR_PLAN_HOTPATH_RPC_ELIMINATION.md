@@ -29,6 +29,7 @@
 | Fix 14 | real_reserves Propagation im PoolCacheUpdate + Defensive Validierung + AMM Skip | ✅ DEPLOYED | 5 | ~1.5h |
 | Fix 15 | PnL Unit-Mismatch (token_raw vs tok_ui) + Liquidation exit_type | ✅ DEPLOYED | 2 | ~1h |
 | Fix 16 | Zombie-KV-Positionen + Ghost-Cleanup Grace Period | 🔧 READY | 2 | ~30min |
+| Fix 17 | PnL via wallet_sol_delta + ATA-Close bei SELL | 🔧 READY | 4 | ~2h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
 | PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
 
@@ -873,6 +874,53 @@ Zusätzlich: `build_reconciled_position()` (Zeile 1799) hatte den gleichen Bug �
 - [x] `cargo check` kompiliert fehlerfrei ✅
 - [ ] Live-Test: Restart nach Kauf → Position bleibt erhalten
 - [ ] Live-Test: Keine Zombie-Positionen nach Restart
+
+---
+
+## Fix 17: PnL via wallet_sol_delta + ATA-Close bei SELL
+
+**Status**: 🔧 READY
+**Risiko**: **HOCH** (PnL-Berechnung war grundlegend falsch — ignorierte Fees, Rent, ATA-Kosten)
+**Problem**: Drei zusammenhängende Bugs:
+
+### Problem A: PnL basiert auf Swap-Beträgen statt Wallet-Impact
+
+**Symptom**: Dashboard PnL weicht vom realen Wallet-Impact ab. Probe-BUY zeigt Intent-Betrag (0.00125 SOL) statt echte Kosten (0.003267 SOL inkl. ATA-Rent).
+
+**Root Cause**: `fill_in` nutzte den Intent-Betrag bei ATA-Erstellung (`lamport_noise`-Gating), `wallet_sol_delta_lamports` war `None`. Die PnL-Berechnung ignorierte so ATA-Rent (~0.002 SOL), TX-Fees, und Slippage.
+
+**Fix**: `wallet_sol_delta_lamports` wird jetzt IMMER befüllt (kein `lamport_noise`-Gating mehr). momentum-bot verwendet `wallet_sol_delta_lamports` (abs) als `sol_invested` statt `fill_in.raw`.
+
+### Problem B: SELL-Transaktionen schließen Token-ATA nicht
+
+**Symptom**: Leere ATAs sammeln sich an, ~0.002 SOL Rent pro ATA wird nicht zurückgeholt. PnL zeigt nicht die echte Wallet-Auswirkung.
+
+**Fix**: Neue `close_token_ata: "true"` Flag in SELL-Intent-Metadata. `tx_builder` fügt `closeAccount`-Instruction nach dem Swap hinzu (für SPL Token und Token-2022). Die Rent fließt direkt in den `wallet_sol_delta` ein.
+
+### Problem C: Kein Realized PnL Logging
+
+**Symptom**: SELL confirmation log zeigt `pnl=None`. Kein Tracking der echten Gewinn/Verlust-Berechnung.
+
+**Fix**: Bei SELL confirmation berechnet momentum-bot:
+```
+realized_pnl = sell_wallet_sol_delta - cost_basis (sol_invested)
+realized_pnl_pct = realized_pnl / cost_basis * 100
+```
+
+### Geänderte Dateien
+- `src/bin/execution_engine.rs` — `wallet_sol_delta` immer befüllen (kein noise-gating)
+- `src/execution/tx_builder.rs` — ATA-Close Instruction bei SELL (PumpFun + andere DEXes)
+- `src/bin/momentum_bot.rs` — `wallet_sol_delta` für `sol_invested`, `close_token_ata` Flag, realized PnL Log
+
+### Akzeptanzkriterien
+- [x] `wallet_sol_delta_lamports` wird für jede TX befüllt (auch mit ATA-Erstellung) ✅
+- [x] SELL-TXs schließen Token-ATA (SPL Token + Token-2022) ✅
+- [x] `sol_invested` nutzt `wallet_sol_delta` (total cost inkl. Fees + Rent) ✅
+- [x] Realized PnL wird bei SELL confirmation geloggt ✅
+- [x] `cargo clippy` 0 Errors, 0 Warnings ✅
+- [ ] Live-Test: PnL im Log = echte SOL-Balance-Differenz
+- [ ] Live-Test: ATA wird nach SELL geschlossen (keine leeren ATAs)
+- [ ] Live-Test: Rent Recovery im `wallet_sol_delta` der SELL-TX sichtbar
 
 ---
 

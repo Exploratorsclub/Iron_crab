@@ -815,17 +815,71 @@ pub async fn build_tx_plan(
             let wsol_mint = Pubkey::from_str(SOL_MINT).expect("valid SOL_MINT");
             let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
             let wsol_mint_spl = SplProgramPubkey::new_from_array(wsol_mint.to_bytes());
-            let token_program_spl = spl_token::id();
+            let token_program_spl_wsol = spl_token::id();
             let ata_ix = prog_ix_to_sdk(
                 spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                     &payer_spl,
                     &payer_spl,
                     &wsol_mint_spl,
-                    &token_program_spl,
+                    &token_program_spl_wsol,
                 ),
             );
             let mut all_ixs = vec![ata_ix];
             all_ixs.extend(ixs);
+
+            // Close token ATA after full sell to recover rent (~0.002 SOL).
+            let close_ata = intent
+                .metadata
+                .get("close_token_ata")
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
+            if close_ata {
+                let token_mint =
+                    Pubkey::from_str(&intent.resources.input_mint).unwrap_or_default();
+                let token_mint_spl = SplProgramPubkey::new_from_array(token_mint.to_bytes());
+
+                let sell_token_program_spl = intent
+                    .resources
+                    .token_program
+                    .as_ref()
+                    .and_then(|tp| Pubkey::from_str(tp).ok())
+                    .map(|pk| SplProgramPubkey::new_from_array(pk.to_bytes()))
+                    .unwrap_or_else(spl_token::id);
+
+                let token_ata_spl =
+                    spl_associated_token_account::get_associated_token_address_with_program_id(
+                        &payer_spl,
+                        &token_mint_spl,
+                        &sell_token_program_spl,
+                    );
+
+                let close_ix = if sell_token_program_spl == spl_token::id() {
+                    prog_ix_to_sdk(
+                        spl_token::instruction::close_account(
+                            &sell_token_program_spl,
+                            &token_ata_spl,
+                            &payer_spl,
+                            &payer_spl,
+                            &[],
+                        )
+                        .expect("close_account instruction"),
+                    )
+                } else {
+                    prog_ix_to_sdk(
+                        spl_token_2022::instruction::close_account(
+                            &sell_token_program_spl,
+                            &token_ata_spl,
+                            &payer_spl,
+                            &payer_spl,
+                            &[],
+                        )
+                        .expect("close_account instruction"),
+                    )
+                };
+                all_ixs.push(close_ix);
+            }
+
             all_ixs
         };
 
@@ -926,6 +980,52 @@ pub async fn build_tx_plan(
 
         let mut all_ixs = vec![token_ata_ix];
         all_ixs.extend(ixs);
+
+        // Close token ATA after full sell to recover rent (~0.002 SOL).
+        // Only when the intent explicitly requests it (full sells from momentum-bot).
+        // The close will fail on-chain if the ATA still has tokens (partial sell safety).
+        let close_ata = intent
+            .metadata
+            .get("close_token_ata")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        if close_ata {
+            let token_ata_spl =
+                spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &payer_spl,
+                    &token_mint_spl,
+                    &token_program_spl,
+                );
+
+            // Use the correct token program for close_account
+            let close_ix = if token_program_spl == spl_token::id() {
+                prog_ix_to_sdk(
+                    spl_token::instruction::close_account(
+                        &token_program_spl,
+                        &token_ata_spl,
+                        &payer_spl, // destination for rent
+                        &payer_spl, // authority
+                        &[],
+                    )
+                    .expect("close_account instruction"),
+                )
+            } else {
+                // Token-2022
+                prog_ix_to_sdk(
+                    spl_token_2022::instruction::close_account(
+                        &token_program_spl,
+                        &token_ata_spl,
+                        &payer_spl,
+                        &payer_spl,
+                        &[],
+                    )
+                    .expect("close_account instruction"),
+                )
+            };
+            all_ixs.push(close_ix);
+        }
+
         return TxPlanOutcome::Planned(TxPlan {
             instructions: all_ixs,
         });

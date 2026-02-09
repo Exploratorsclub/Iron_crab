@@ -3003,12 +3003,12 @@ impl MomentumContext {
                             return;
                         };
 
-                        // Fill-in may be missing (e.g., SOL lamport delta gated due to rent noise).
-                        // Fall back to intended SOL spend from the pending intent.
+                        // Use wallet_sol_delta (total SOL impact including fees + rent) for accurate PnL.
+                        // Fall back to fill_in (swap amount) or intended SOL spend.
                         let sol_invested_raw = result
-                            .fill_in
-                            .as_ref()
-                            .map(|a| a.raw)
+                            .wallet_sol_delta_lamports
+                            .map(|d| d.unsigned_abs() as u64)  // BUY delta is negative → abs
+                            .or_else(|| result.fill_in.as_ref().map(|a| a.raw))
                             .unwrap_or(pending.sol_amount);
 
                         // Prefer decimals from market-data TokenMintInfo (Geyser), fall back to fill_out decimals.
@@ -3019,14 +3019,16 @@ impl MomentumContext {
                             .map(|m| m.decimals)
                             .unwrap_or(fill_out.decimals);
 
-                        let sol_ui = result
+                        // For entry_price (used for signal PnL), use swap amounts (fill_in/fill_out)
+                        // to track token price movement, not total cost with fees/rent.
+                        let sol_ui_for_price = result
                             .fill_in
                             .as_ref()
                             .map(|a| a.as_f64())
                             .unwrap_or(sol_invested_raw as f64 / 1_000_000_000.0)
                             .max(0.0);
                         let tok_ui = fill_out.as_f64().max(0.0);
-                        let entry_price = if sol_ui > 0.0 { tok_ui / sol_ui } else { 1.0 };
+                        let entry_price = if sol_ui_for_price > 0.0 { tok_ui / sol_ui_for_price } else { 1.0 };
 
                         let sol_invested = sol_invested_raw;
                         let token_amount = fill_out.raw;
@@ -3137,13 +3139,35 @@ impl MomentumContext {
                                 });
                             }
                         } else {
-                            // Full sell — close position entirely
+                            // Full sell — close position entirely.
+                            // Calculate realized PnL from wallet SOL delta.
+                            let sell_proceeds_lamports = result
+                                .wallet_sol_delta_lamports
+                                .unwrap_or(0);
+                            let cost_basis_lamports = {
+                                self.positions
+                                    .read()
+                                    .get(&pending.mint)
+                                    .map(|p| p.sol_invested as i128)
+                                    .unwrap_or(0)
+                            };
+                            let realized_pnl_lamports =
+                                sell_proceeds_lamports + (-cost_basis_lamports);
+                            let realized_pnl_pct = if cost_basis_lamports > 0 {
+                                (realized_pnl_lamports as f64 / cost_basis_lamports as f64) * 100.0
+                            } else {
+                                0.0
+                            };
+
                             info!(
                                 intent_id = %result.intent_id,
                                 mint = %pending.mint,
                                 token_amount = pending.token_amount,
                                 signature = ?result.signature,
-                                pnl = ?result.pnl,
+                                cost_basis_lamports = cost_basis_lamports,
+                                sell_proceeds_lamports = sell_proceeds_lamports,
+                                realized_pnl_lamports = realized_pnl_lamports,
+                                realized_pnl_pct = format!("{:.2}%", realized_pnl_pct),
                                 "✅ SELL CONFIRMED - Closing position"
                             );
                             self.close_position(&pending.mint);
@@ -3970,15 +3994,13 @@ async fn recover_positions_from_jsonl(
                 valid_fills += 1;
             }
 
-            // Sum SOL invested from all BUYs
+            // Sum SOL invested from all BUYs.
+            // Prefer wallet_sol_delta (total cost including fees + ATA rent) for accurate PnL.
+            // Fall back to fill_in (swap amount only) if delta unavailable.
             let exec_sol = exec
-                .fill_in
-                .as_ref()
-                .map(|f| f.raw)
-                .or_else(|| {
-                    exec.wallet_sol_delta_lamports
-                        .map(|d| d.unsigned_abs() as u64)
-                })
+                .wallet_sol_delta_lamports
+                .map(|d| d.unsigned_abs() as u64)
+                .or_else(|| exec.fill_in.as_ref().map(|f| f.raw))
                 .unwrap_or(0);
             sol_invested = sol_invested.saturating_add(exec_sol);
         }
@@ -6321,6 +6343,12 @@ async fn generate_and_publish_exit_intent(
         })?;
         intent.metadata.insert("creator".to_string(), creator);
     }
+
+    // Close token ATA after full sell to recover rent (~0.002 SOL) for accurate PnL.
+    // All momentum exits are full sells, so this is safe.
+    intent
+        .metadata
+        .insert("close_token_ata".to_string(), "true".to_string());
 
     // Include current open positions count for execution-engine risk check.
     // execution-engine uses this instead of tracking positions itself (Single Source of Truth).

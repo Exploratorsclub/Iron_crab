@@ -482,11 +482,10 @@ async fn compute_intent_fills_best_effort(
     }
 
     // Return wallet SOL delta (5th tuple element) unless gated by noise
-    let wallet_sol_delta = if !lamport_noise {
-        Some(payer_delta_lamports)
-    } else {
-        None
-    };
+    // Always return wallet SOL delta for accurate PnL tracking.
+    // Previously gated by !lamport_noise, but the delta IS the correct total cost
+    // (including ATA rent, fees, etc.) which is exactly what PnL needs.
+    let wallet_sol_delta = Some(payer_delta_lamports);
 
     (
         fill_in,
