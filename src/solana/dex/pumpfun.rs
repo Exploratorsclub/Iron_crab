@@ -642,6 +642,36 @@ impl PumpFunDex {
             return Ok(None);
         }
 
+        // SELL: Validate against real_token_reserves BEFORE quoting (same as quote_exact_in).
+        if !buy_token {
+            if state.real_token_reserves == 0 {
+                info!(
+                    token_mint=%token_mint_str,
+                    bonding_curve=%bonding_curve,
+                    "pump.fun: SELL skipped — real_token_reserves is 0"
+                );
+                return Ok(None);
+            }
+            if amount_in > state.real_token_reserves {
+                info!(
+                    token_mint=%token_mint_str,
+                    bonding_curve=%bonding_curve,
+                    amount_in,
+                    real_token_reserves=state.real_token_reserves,
+                    "pump.fun: SELL skipped — amount exceeds real_token_reserves (with_fallback)"
+                );
+                return Ok(None);
+            }
+            if state.real_sol_reserves == 0 {
+                info!(
+                    token_mint=%token_mint_str,
+                    bonding_curve=%bonding_curve,
+                    "pump.fun: SELL skipped — real_sol_reserves is 0 (with_fallback)"
+                );
+                return Ok(None);
+            }
+        }
+
         // Calculate output
         let amount_out = state.calculate_output(amount_in, buy_token);
 
@@ -651,6 +681,8 @@ impl PumpFunDex {
             amount_out,
             virtual_sol=state.virtual_sol_reserves,
             virtual_token=state.virtual_token_reserves,
+            real_sol=state.real_sol_reserves,
+            real_token=state.real_token_reserves,
             "pump.fun: calculated swap output (with_fallback)"
         );
 
@@ -815,6 +847,41 @@ impl Dex for PumpFunDex {
             return Ok(None);
         }
 
+        // SELL: Validate against real_token_reserves BEFORE quoting.
+        // PumpFun's on-chain sell function checks: `amount <= real_token_reserves`
+        // (error 6023: NotEnoughTokensToSell). Without this check, the quote succeeds
+        // but simulation fails, blocking multi-pool routing fallback.
+        if !buy_token {
+            if state.real_token_reserves == 0 {
+                info!(
+                    token_mint=%token_mint_str,
+                    bonding_curve=%bonding_curve,
+                    real_token_reserves=state.real_token_reserves,
+                    "pump.fun: SELL skipped — real_token_reserves is 0 (no tokens purchased from curve)"
+                );
+                return Ok(None);
+            }
+            if amount_in > state.real_token_reserves {
+                info!(
+                    token_mint=%token_mint_str,
+                    bonding_curve=%bonding_curve,
+                    amount_in,
+                    real_token_reserves=state.real_token_reserves,
+                    "pump.fun: SELL skipped — amount exceeds real_token_reserves (6023 would fail on-chain)"
+                );
+                return Ok(None);
+            }
+            if state.real_sol_reserves == 0 {
+                info!(
+                    token_mint=%token_mint_str,
+                    bonding_curve=%bonding_curve,
+                    real_sol_reserves=state.real_sol_reserves,
+                    "pump.fun: SELL skipped — real_sol_reserves is 0 (curve has no SOL to pay out)"
+                );
+                return Ok(None);
+            }
+        }
+
         // Calculate output
         let amount_out = state.calculate_output(amount_in, buy_token);
 
@@ -824,6 +891,8 @@ impl Dex for PumpFunDex {
             amount_out,
             virtual_sol=state.virtual_sol_reserves,
             virtual_token=state.virtual_token_reserves,
+            real_sol=state.real_sol_reserves,
+            real_token=state.real_token_reserves,
             "pump.fun: calculated swap output"
         );
 

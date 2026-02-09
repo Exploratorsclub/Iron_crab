@@ -389,6 +389,33 @@ fn calculate_pumpfun_quote(state: &PumpFunState, amount_in: u64, is_buy: bool) -
         Ok(amount_out as u64)
     } else {
         // SELL: Token in, SOL out
+        //
+        // CRITICAL: Validate against real_token_reserves before quoting.
+        // PumpFun's on-chain sell function checks: `amount <= real_token_reserves`
+        // (error 6023: NotEnoughTokensToSell). The real_token_reserves tracks tokens
+        // previously purchased from the curve — you can only sell back what was bought.
+        // Without this check, the quote succeeds but simulation fails with Custom(6023),
+        // and Phase 2 multi-pool routing is never tried.
+        if state.real_token_reserves == 0 {
+            return Err(anyhow!(
+                "pumpfun: real_token_reserves is zero (no tokens purchased from curve, sell impossible)"
+            ));
+        }
+        if amount_in > state.real_token_reserves {
+            return Err(anyhow!(
+                "pumpfun: sell amount {} exceeds real_token_reserves {} (curve cannot absorb this sell)",
+                amount_in,
+                state.real_token_reserves
+            ));
+        }
+
+        // Also validate real_sol_reserves: the curve needs SOL to pay the seller
+        if state.real_sol_reserves == 0 {
+            return Err(anyhow!(
+                "pumpfun: real_sol_reserves is zero (curve has no SOL to pay out)"
+            ));
+        }
+
         let sol_reserve = state.virtual_sol_reserves as u128;
         let token_reserve = state.virtual_token_reserves as u128;
 
@@ -400,6 +427,15 @@ fn calculate_pumpfun_quote(state: &PumpFunState, amount_in: u64, is_buy: bool) -
         let numerator = amount_in_u128 * sol_reserve;
         let denominator = token_reserve + amount_in_u128;
         let amount_out = numerator / denominator.max(1);
+
+        // Final check: ensure SOL output doesn't exceed what the curve actually has
+        if amount_out as u64 > state.real_sol_reserves {
+            return Err(anyhow!(
+                "pumpfun: calculated sol_output {} exceeds real_sol_reserves {} (curve underfunded)",
+                amount_out,
+                state.real_sol_reserves
+            ));
+        }
 
         Ok(amount_out as u64)
     }

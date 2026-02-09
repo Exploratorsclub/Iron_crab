@@ -25,7 +25,7 @@
 | Fix 10 | LockManager Doppelzählung bei Geyser-Race | 🔧 READY | 1 | ~30min |
 | Fix 11 | token_program Persistence + Pump Token-2022 Guard | 🔧 READY | 1 | ~1h |
 | Fix 12 | PumpFun Custom(2006): Complete-Guard in build_swap_ix | 🔧 READY | 1 | ~30min |
-| Fix 13 | PumpSwap AMM pool_accounts Propagation + Liquidation Complete-Guard | 🔧 READY | 2 | ~1h |
+| Fix 13 | PumpSwap AMM pool_accounts Propagation + real_reserves Validierung | 🔧 READY | 4 | ~2h |
 | Bug 14 | PnL-Diskrepanz: momentum-bot vs Dashboard bei Partial-Sell | ⬜ TODO | 1 | ~1h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
 | PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
@@ -636,11 +636,13 @@ BUY-Fill-Handler prüft jetzt den aktuellen Balance BEVOR er addiert:
 
 ---
 
-## Fix 13: PumpSwap AMM pool_accounts Propagation + Liquidation Complete-Guard
+## Fix 13: PumpSwap AMM pool_accounts Propagation + real_reserves Validierung
 
 **Status**: 🔧 READY
-**Risiko**: Hoch (betrifft Liquidation aller PumpFun-Token nach Migration zu PumpSwap AMM)
-**Problem**: Liquidation von PumpFun-Token die zu PumpSwap AMM migriert sind scheitert komplett — kein DEX findet eine Route.
+**Risiko**: Hoch (betrifft Liquidation aller PumpFun-Token)
+**Problem**: Liquidation von PumpFun-Token scheitert aus 2 Gründen:
+1. PumpSwap AMM pool_accounts sind im LivePoolCache immer leer (DexPoolAccounts Events werden ignoriert)
+2. PumpFun Bonding Curve Quote validiert NICHT gegen `real_token_reserves` → falsch-positive Quote blockiert Multi-Pool-Fallback → on-chain `Custom(6023): NotEnoughTokensToSell`
 
 ### Root Cause (identifiziert)
 
@@ -680,15 +682,31 @@ Die Liquidation hat 3 Phasen für Route-Discovery:
 - `has_pair` Check für `PumpFun` Bonding Curves prüft jetzt auch `!s.complete`
 - Verhindert dass Intents für migrierte Bonding Curves erzeugt werden
 
+#### F) PumpFun SELL Quote: `real_token_reserves` Validierung (pumpfun.rs + quote_calculator.rs)
+- `quote_exact_in()`: Vor der Quote-Berechnung wird für SELL geprüft:
+  - `real_token_reserves == 0` → return None (keine Tokens zum Zurückkaufen)
+  - `amount_in > real_token_reserves` → return None (6023 würde on-chain fehlschlagen)
+  - `real_sol_reserves == 0` → return None (Curve hat kein SOL zum Auszahlen)
+- `quote_exact_in_with_fallback()`: Gleiche Validierung hinzugefügt
+- `calculate_pumpfun_quote()` in quote_calculator.rs: Gleiche Prüfungen
+- Zusätzlich: `calculated_sol_output > real_sol_reserves` → Error (Curve underfunded)
+- Logging erweitert um `real_sol` und `real_token` für Diagnose
+
+**Effekt**: Wenn PumpFun Bonding Curve den SELL nicht ausführen kann, gibt die Quote `None` zurück → Phase 2 (Multi-Pool: PumpSwap AMM, Raydium, Meteora, Orca) wird korrekt als Fallback versucht.
+
 ### Geänderte Dateien
 - `src/execution/live_pool_cache.rs` — 2 neue Methoden
 - `src/bin/execution_engine.rs` — DexPoolAccounts Handler + Liquidation Caching + complete Guard
+- `src/solana/dex/pumpfun.rs` — real_reserves Validierung in quote_exact_in + with_fallback
+- `src/execution/quote_calculator.rs` — real_reserves Validierung in calculate_pumpfun_quote
 
 ### Akzeptanzkriterien
-- [ ] `DexPoolAccounts` Events von market-data werden im LivePoolCache verarbeitet
-- [ ] PumpSwap AMM `pool_accounts` sind nach dem ersten Trade des Pools befüllt
+- [x] `DexPoolAccounts` Events von market-data werden im LivePoolCache verarbeitet ✅
+- [x] PumpSwap AMM `pool_accounts` sind nach dem ersten Trade des Pools befüllt ✅
 - [ ] Liquidation Phase 3 findet PumpSwap AMM Routen für migrierte Token
-- [ ] `cargo clippy` 0 Errors, 0 Warnings ✅
+- [x] PumpFun SELL Quote prüft `real_token_reserves` → kein falsch-positives Routing
+- [ ] Token mit `Custom(6023)` Fehler werden korrekt an Multi-Pool-Routing weitergeleitet
+- [x] `cargo clippy` 0 Errors, 0 Warnings ✅
 
 ---
 
