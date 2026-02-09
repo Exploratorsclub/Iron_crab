@@ -1049,6 +1049,21 @@ fn select_best_route(candidates: Vec<RouteCandidate>) -> Option<RouteCandidate> 
     best
 }
 
+/// Cached blockhash from Geyser blocks_meta stream (via market-data NATS).
+/// Used to avoid RPC `getLatestBlockhash` calls in the hot path.
+#[derive(Debug, Clone)]
+struct CachedBlockhash {
+    hash: solana_sdk::hash::Hash,
+    slot: u64,
+    #[allow(dead_code)] // Kept for future freshness checks (e.g. last_valid_block_height)
+    block_height: u64,
+    received_at: std::time::Instant,
+}
+
+/// Maximum age (in seconds) before we fall back to RPC for blockhash.
+/// Solana blockhashes expire after ~150 slots (~60s). We use a conservative 30s.
+const MAX_BLOCKHASH_AGE_SECS: u64 = 30;
+
 /// Runtime context for execution-engine
 struct ExecutionContext {
     run_id: String,
@@ -1116,6 +1131,12 @@ struct ExecutionContext {
     /// Latest priority fee percentiles from market-data (None = use static config)
     dynamic_fee_percentiles: parking_lot::RwLock<Option<PriorityFeePercentiles>>,
 
+    // === PR 5: Cached blockhash from Geyser (via market-data NATS) ===
+    /// Latest confirmed blockhash from Geyser blocks_meta stream.
+    /// Tuple: (blockhash, slot, block_height, received_at)
+    /// Falls back to RPC if stale (> MAX_BLOCKHASH_AGE_SECS).
+    cached_blockhash: parking_lot::RwLock<Option<CachedBlockhash>>,
+
     // === Option C: Live Pool Cache (P0: fresh quotes, no RPC in hot path) ===
     /// Cache of pool states from Geyser for fresh quote calculation
     live_pool_cache: Option<Arc<ironcrab::execution::live_pool_cache::LivePoolCache>>,
@@ -1152,6 +1173,30 @@ struct BurnOpRecord {
 }
 
 impl ExecutionContext {
+    /// Get a recent blockhash, preferring the Geyser-cached version.
+    /// Falls back to RPC if cache is empty or stale (> MAX_BLOCKHASH_AGE_SECS).
+    async fn get_latest_blockhash(&self) -> Result<solana_sdk::hash::Hash, String> {
+        // Try cached blockhash first
+        if let Some(ref cached) = *self.cached_blockhash.read() {
+            let age_secs = cached.received_at.elapsed().as_secs();
+            if age_secs <= MAX_BLOCKHASH_AGE_SECS {
+                return Ok(cached.hash);
+            }
+            warn!(
+                age_secs,
+                slot = cached.slot,
+                "cached blockhash too old, falling back to RPC"
+            );
+        }
+
+        // RPC fallback
+        warn!("BLOCKHASH_SOURCE_RPC_FALLBACK: no fresh Geyser blockhash, using RPC");
+        self.rpc
+            .get_latest_blockhash_retry()
+            .await
+            .map_err(|e| format!("rpc_error:{e}"))
+    }
+
     /// Get current config (read lock)
     fn get_config(&self) -> ExecutionConfig {
         self.config.read().clone()
@@ -4264,6 +4309,8 @@ async fn main() -> Result<()> {
         tx_sender: None,
         // P2: Dynamic priority fees from Geyser (via market-data NATS)
         dynamic_fee_percentiles: parking_lot::RwLock::new(None),
+        // PR 5: Cached blockhash from Geyser blocks_meta (via market-data NATS)
+        cached_blockhash: parking_lot::RwLock::new(None),
         // Option C: LivePoolCache - for zero-RPC quote calculation
         live_pool_cache: live_pool_cache.clone(),
         // Metrics
@@ -5048,6 +5095,7 @@ async fn main() -> Result<()> {
                 );
                 let cache_for_mint_info: Option<Arc<ironcrab::execution::live_pool_cache::LivePoolCache>> =
                     ctx.live_pool_cache.as_ref().map(Arc::clone);
+                let ctx_for_blockhash = Arc::clone(&ctx);
                 tokio::spawn(async move {
                     let mut mint_info_count: u64 = 0;
                     while let Some(msg) = market_sub.next().await {
@@ -5118,6 +5166,29 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 // Other DEX types don't need pool_accounts in LivePoolCache
+                            }
+                            MarketEventKind::LatestBlockhash {
+                                blockhash,
+                                slot,
+                                block_height,
+                            } => {
+                                match solana_sdk::hash::Hash::from_str(blockhash) {
+                                    Ok(hash) => {
+                                        *ctx_for_blockhash.cached_blockhash.write() = Some(CachedBlockhash {
+                                            hash,
+                                            slot: *slot,
+                                            block_height: *block_height,
+                                            received_at: std::time::Instant::now(),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            blockhash,
+                                            error = %e,
+                                            "Failed to parse LatestBlockhash from NATS"
+                                        );
+                                    }
+                                }
                             }
                             _ => {
                                 // Other MarketEvent types are handled by momentum-bot/arb-strategy
@@ -6460,7 +6531,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 .expect("bundle_config gate ensures jito_client is present");
 
             let signer: &dyn Signer = treasury.signer_ref();
-            let blockhash = match ctx.rpc.get_latest_blockhash_retry().await {
+            let blockhash = match ctx.get_latest_blockhash().await {
                 Ok(bh) => bh,
                 Err(e) => {
                     let reason = RejectReason::BundleFailed;
@@ -6468,11 +6539,11 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         check_name: "send".to_string(),
                         passed: false,
                         reason_code: Some(reason.to_string()),
-                        details: Some(format!("rpc_error:{e}")),
+                        details: Some(format!("blockhash_error:{e}")),
                     });
                     ctx.record_intent_rejected();
                     INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    warn!(intent_id = %intent.intent_id, error = %e, "Failed to fetch blockhash for bundle send");
+                    warn!(intent_id = %intent.intent_id, error = %e, "Failed to get blockhash for bundle send");
                     // Allow retry
                     ctx.lock_manager.release_locks(&intent.intent_id);
                     return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -7458,13 +7529,13 @@ async fn simulate_transaction(
                 addresses: alt.accounts.clone(),
             };
 
-            // Get a recent blockhash for v0 message compilation
-            let blockhash = match ctx.rpc.rpc.get_latest_blockhash().await {
+            // Get a recent blockhash (Geyser cache → RPC fallback)
+            let blockhash = match ctx.get_latest_blockhash().await {
                 Ok(bh) => bh,
                 Err(e) => {
                     return SimulationResult {
                         success: false,
-                        error_code: Some(format!("rpc_error:blockhash:{e}")),
+                        error_code: Some(format!("blockhash_error:{e}")),
                         logs_preview: None,
                         compute_units_consumed: None,
                     };
@@ -7489,12 +7560,12 @@ async fn simulate_transaction(
             }
         } else {
             // Fallback to legacy transaction (will fail if too large)
-            let blockhash = match ctx.rpc.rpc.get_latest_blockhash().await {
+            let blockhash = match ctx.get_latest_blockhash().await {
                 Ok(bh) => bh,
                 Err(e) => {
                     return SimulationResult {
                         success: false,
-                        error_code: Some(format!("rpc_error:blockhash:{e}")),
+                        error_code: Some(format!("blockhash_error:{e}")),
                         logs_preview: None,
                         compute_units_consumed: None,
                     };
@@ -7590,11 +7661,7 @@ async fn send_transaction_rpc(
         .ok_or_else(|| "no_signer_configured".to_string())?;
 
     let signer: &dyn Signer = treasury.signer_ref();
-    let blockhash = ctx
-        .rpc
-        .get_latest_blockhash_retry()
-        .await
-        .map_err(|e| format!("rpc_error:{e}"))?;
+    let blockhash = ctx.get_latest_blockhash().await?;
 
     // Build Versioned Transaction with ALT if available
     let tx: VersionedTransaction = if let Some(ref alt) = ctx.address_lookup_table {
@@ -7670,11 +7737,7 @@ async fn send_transaction_with_fallback(
         .ok_or_else(|| "no_signer_configured".to_string())?;
 
     let signer: &dyn Signer = treasury.signer_ref();
-    let blockhash = ctx
-        .rpc
-        .get_latest_blockhash_retry()
-        .await
-        .map_err(|e| format!("rpc_error:{e}"))?;
+    let blockhash = ctx.get_latest_blockhash().await?;
 
     // Build legacy Transaction for TxSender (TxSender handles signing internally for TPU)
     // Note: We sign here because TxSender.send_with_fallback() expects a signed Transaction

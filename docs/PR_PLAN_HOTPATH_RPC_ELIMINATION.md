@@ -30,8 +30,8 @@
 | Fix 15 | PnL Unit-Mismatch (token_raw vs tok_ui) + Liquidation exit_type | ✅ DEPLOYED | 2 | ~1h |
 | Fix 16 | Zombie-KV-Positionen + Ghost-Cleanup Grace Period | 🔧 READY | 2 | ~30min |
 | Fix 17 | PnL via wallet_sol_delta + ATA-Close bei SELL | 🔧 READY | 4 | ~2h |
-| PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
-| PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
+| PR 4 | tx_builder Orca-State aus Cache | ✅ ALREADY DONE | 1 | — |
+| PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | 🔧 READY | 2 | ~1.5h |
 
 ---
 
@@ -974,34 +974,47 @@ realized_pnl_pct = realized_pnl / cost_basis * 100
 
 ## PR 5: Blockhash via Geyser (kein RPC für Blockhash)
 
-**Branch**: TBD
-**Status**: ⬜ TODO
+**Branch**: `architecture-rebuild`
+**Status**: 🔧 READY
 **Risiko**: Mittel (betrifft TX-Build + Simulation)
-**Eliminiert**: 1-2 RPC `getLatestBlockhash` Calls pro TX (Simulation + Send)
+**Eliminiert**: 5 RPC `getLatestBlockhash` Calls pro TX (Simulation v0 + legacy, Send RPC + TxSender + Bundle)
 
 ### Hintergrund
 
-Aktuell ruft `simulate_transaction()` und `send_transaction_rpc()` jeweils `ctx.rpc.rpc.get_latest_blockhash().await` auf. Das sind 100-300ms pro Call im Hot-Path. Yellowstone-gRPC bietet zwei Alternativen:
-1. **`GetLatestBlockhash` gRPC Methode** – Direkt aus dem Validator, kein RPC-Roundtrip
-2. **`blocks_meta` Subscription** – Streaming-basiert, Blockhash wird bei jedem neuen Block automatisch aktualisiert
+Vorher riefen `simulate_transaction()`, `send_transaction_rpc()`, `send_transaction_with_fallback()` und Bundle-Send
+jeweils `ctx.rpc.get_latest_blockhash_retry().await` auf. Das waren 100-300ms pro Call im Hot-Path.
+
+### Implementierung
+
+**Geyser → NATS Pipeline:**
+1. `geyser_listener.rs`: `blocks_meta` Subscription hinzugefügt → `GeyserBlockhashUpdate` Event
+2. `schema.rs`: `MarketEventKind::LatestBlockhash { blockhash, slot, block_height }` definiert
+3. `market_data.rs`: Bei jedem neuen bestätigten Block → `LatestBlockhash` über NATS publiziert
+
+**Execution-Engine Cache:**
+4. `CachedBlockhash` struct mit `hash`, `slot`, `block_height`, `received_at`
+5. `ExecutionContext::get_latest_blockhash()`: Cache-First (< 30s), RPC-Fallback mit WARN-Log
+6. Alle 5 Hot-Path Blockhash-Stellen umgestellt auf `ctx.get_latest_blockhash().await`
+
+**Unberührt (erlaubt):**
+- Startup Health-Check (`rpc.rpc.get_latest_blockhash()` Zeile ~3847) — einmalig beim Boot
 
 ### Aufgaben
 
-- [ ] `src/bin/market_data.rs`: `blocks_meta` Geyser-Subscription hinzufügen
-- [ ] `src/ipc/schema.rs`: `LatestBlockhash` NATS-Nachricht definieren (blockhash, last_valid_block_height, slot)
-- [ ] `src/bin/market_data.rs`: Bei neuem Block → `LatestBlockhash` über NATS publizieren
-- [ ] `src/bin/execution_engine.rs`: NATS-Subscription für `LatestBlockhash` → `AtomicBlockhash` updaten
-- [ ] `src/bin/execution_engine.rs`: `simulate_transaction()` + `send_transaction_rpc()` → lokalen Blockhash verwenden statt RPC
-- [ ] Fallback: Wenn lokaler Blockhash älter als X Slots → RPC-Fallback mit WARN-Log
-- [ ] Metrik: `BLOCKHASH_SOURCE_GEYSER` vs `BLOCKHASH_SOURCE_RPC_FALLBACK`
+- [x] `src/solana/geyser_listener.rs`: `blocks_meta` Geyser-Subscription + `GeyserBlockhashUpdate` Event
+- [x] `src/ipc/schema.rs`: `MarketEventKind::LatestBlockhash` definiert
+- [x] `src/bin/market_data.rs`: Blockhash-Event auf NATS publiziert
+- [x] `src/bin/execution_engine.rs`: NATS-Subscription → `CachedBlockhash` via `parking_lot::RwLock`
+- [x] `src/bin/execution_engine.rs`: Alle 5 Hot-Path-Stellen → `ctx.get_latest_blockhash().await`
+- [x] Fallback: Wenn cached Blockhash > 30s → RPC-Fallback mit WARN-Log
+- [x] `cargo clippy` ohne neue Warnings
 
 ### Akzeptanzkriterien
 
-- [ ] Blockhash kommt aus Geyser-Stream (0 RPC Calls im Normalfall)
-- [ ] Fallback auf RPC wenn Geyser-Stream ausfällt oder Blockhash zu alt
-- [ ] TX-Simulation und -Send funktionieren identisch
-- [ ] Kein Blockhash-Expiry in Produktion (Freshness-Check)
-- [ ] Latenz-Verbesserung messbar (Prometheus Histogram)
+- [x] Blockhash kommt aus Geyser blocks_meta Stream (0 RPC Calls im Normalfall)
+- [x] Fallback auf RPC wenn Geyser-Stream ausfällt oder Blockhash zu alt (> 30s)
+- [ ] Live-Test: TX-Simulation und -Send funktionieren identisch
+- [ ] Live-Test: Kein Blockhash-Expiry in Produktion
 
 ---
 

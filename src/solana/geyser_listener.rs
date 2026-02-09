@@ -21,7 +21,8 @@ use yellowstone_grpc_client::GeyserGrpcClient;
 #[cfg(not(windows))]
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-    SubscribeRequestFilterAccounts, SubscribeRequestFilterTransactions,
+    SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocksMeta,
+    SubscribeRequestFilterTransactions,
 };
 
 /// Event emitted when an account changes via Geyser
@@ -83,6 +84,14 @@ pub struct GeyserTransactionUpdate {
     pub compute_units_consumed: Option<u64>,
 }
 
+/// Event emitted when a new confirmed block is produced (from blocks_meta)
+#[derive(Debug, Clone)]
+pub struct GeyserBlockhashUpdate {
+    pub blockhash: String,
+    pub slot: u64,
+    pub block_height: u64,
+}
+
 pub struct GeyserListener {
     endpoint: String,
     program_ids: Vec<Pubkey>,
@@ -95,6 +104,8 @@ pub struct GeyserListener {
     account_tx: broadcast::Sender<GeyserAccountUpdate>,
     #[cfg_attr(windows, allow(dead_code))]
     transaction_tx: broadcast::Sender<GeyserTransactionUpdate>,
+    #[cfg_attr(windows, allow(dead_code))]
+    blockhash_tx: broadcast::Sender<GeyserBlockhashUpdate>,
 }
 
 impl GeyserListener {
@@ -109,10 +120,12 @@ impl GeyserListener {
         Self,
         broadcast::Receiver<GeyserAccountUpdate>,
         broadcast::Receiver<GeyserTransactionUpdate>,
+        broadcast::Receiver<GeyserBlockhashUpdate>,
     ) {
         // Large buffer for high-frequency updates
         let (account_tx, account_rx) = broadcast::channel(200000);
         let (transaction_tx, transaction_rx) = broadcast::channel(50000);
+        let (blockhash_tx, blockhash_rx) = broadcast::channel(100);
 
         (
             Self {
@@ -121,9 +134,11 @@ impl GeyserListener {
                 tracked_accounts_rx: None,
                 account_tx,
                 transaction_tx,
+                blockhash_tx,
             },
             account_rx,
             transaction_rx,
+            blockhash_rx,
         )
     }
 
@@ -139,10 +154,12 @@ impl GeyserListener {
         Self,
         broadcast::Receiver<GeyserAccountUpdate>,
         broadcast::Receiver<GeyserTransactionUpdate>,
+        broadcast::Receiver<GeyserBlockhashUpdate>,
     ) {
-        let (mut listener, account_rx, transaction_rx) = Self::new(endpoint, program_ids);
+        let (mut listener, account_rx, transaction_rx, blockhash_rx) =
+            Self::new(endpoint, program_ids);
         listener.tracked_accounts_rx = Some(tracked_accounts_rx);
-        (listener, account_rx, transaction_rx)
+        (listener, account_rx, transaction_rx, blockhash_rx)
     }
 
     /// Start listening to Geyser stream
@@ -240,13 +257,19 @@ impl GeyserListener {
                 }
             }
 
+            // Subscribe to blocks_meta for confirmed blockhash streaming
+            let blocks_meta_filter = HashMap::from([(
+                "blockhash".to_string(),
+                SubscribeRequestFilterBlocksMeta {},
+            )]);
+
             let request = SubscribeRequest {
                 accounts: accounts_filter,
                 slots: HashMap::new(),
                 transactions: transactions_filter,
                 transactions_status: HashMap::new(),
                 blocks: HashMap::new(),
-                blocks_meta: HashMap::new(),
+                blocks_meta: blocks_meta_filter,
                 entry: HashMap::new(),
                 commitment: Some(CommitmentLevel::Confirmed as i32),
                 accounts_data_slice: vec![],
@@ -586,6 +609,17 @@ impl GeyserListener {
                                         );
                                     }
                                 }
+                            }
+                            UpdateOneof::BlockMeta(block_meta) => {
+                                let event = GeyserBlockhashUpdate {
+                                    blockhash: block_meta.blockhash,
+                                    slot: block_meta.slot,
+                                    block_height: block_meta
+                                        .block_height
+                                        .map(|h| h.block_height)
+                                        .unwrap_or(0),
+                                };
+                                let _ = self.blockhash_tx.send(event);
                             }
                             UpdateOneof::Ping(_) => {
                                 // Keep-alive ping, ignore

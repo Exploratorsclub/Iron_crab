@@ -256,6 +256,15 @@ pub enum MarketEventKind {
     },
     /// Slot progression (heartbeat)
     SlotUpdate { current_slot: u64 },
+
+    /// Latest confirmed blockhash from Geyser blocks_meta stream.
+    /// Published by market-data on every new confirmed block.
+    /// Used by execution-engine to avoid RPC `getLatestBlockhash` calls.
+    LatestBlockhash {
+        blockhash: String,
+        slot: u64,
+        block_height: u64,
+    },
     /// Pool state update (vault balances changed via Geyser Account Subscription)
     ///
     /// Emitted by market-data when subscribed vault token accounts change.

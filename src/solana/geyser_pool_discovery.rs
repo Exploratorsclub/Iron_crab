@@ -30,7 +30,7 @@ impl GeyserPoolDiscovery {
         program_ids: Vec<Pubkey>,
         rpc: Arc<SolanaRpc>,
     ) -> (Self, broadcast::Receiver<PoolDiscoveryEvent>) {
-        let (listener, account_rx, transaction_rx) =
+        let (listener, account_rx, transaction_rx, _blockhash_rx) =
             GeyserListener::new(geyser_endpoint, program_ids);
 
         // Create event channel for pool discoveries

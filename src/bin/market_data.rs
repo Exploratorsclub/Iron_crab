@@ -1373,11 +1373,12 @@ async fn run_geyser_loop(
     }
 
     // Start legacy GeyserListener for transaction parsing (will be phased out in favor of pool discovery)
-    let (listener, mut account_rx, mut transaction_rx) = GeyserListener::new_with_tracked_accounts(
-        geyser_url.to_string(),
-        program_ids,
-        combined_tracked_rx,
-    );
+    let (listener, mut account_rx, mut transaction_rx, mut blockhash_rx) =
+        GeyserListener::new_with_tracked_accounts(
+            geyser_url.to_string(),
+            program_ids,
+            combined_tracked_rx,
+        );
 
     // Spawn Geyser listener task
     let listener_handle = tokio::spawn(async move {
@@ -2199,6 +2200,28 @@ async fn run_geyser_loop(
                     } else {
                         NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                         MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            // Blockhash updates from Geyser blocks_meta
+            Ok(bh_update) = blockhash_rx.recv() => {
+                let event = MarketEvent::new(
+                    "market-data",
+                    BUILD_VERSION,
+                    &ctx.run_id,
+                    format!("blockhash-{}", bh_update.slot),
+                    "geyser",
+                    Some(bh_update.slot),
+                    MarketEventKind::LatestBlockhash {
+                        blockhash: bh_update.blockhash,
+                        slot: bh_update.slot,
+                        block_height: bh_update.block_height,
+                    },
+                );
+                if let Some(ref nats) = ctx.nats {
+                    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
+                        warn!(error = %e, "Failed to publish LatestBlockhash to NATS");
                     }
                 }
             }
