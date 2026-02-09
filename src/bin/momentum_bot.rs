@@ -6737,12 +6737,17 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
 
             if *balance_raw == 0 {
                 // Remove ghost position if wallet balance is zero
-                let mut positions = ctx.positions.write();
-                if positions.remove(mint).is_some() {
+                let was_tracked = {
+                    let mut positions = ctx.positions.write();
+                    positions.remove(mint).is_some()
+                };
+                if was_tracked {
                     info!(
                         mint = %mint,
                         "🧹 Position auto-closed: WalletBalanceSnapshot shows balance=0 (manual sale or external transfer)"
                     );
+                    // Also delete from JetStream KV to prevent zombie positions on next restart
+                    ctx.delete_position_from_kv(mint).await;
                 } else {
                     debug!(
                         mint = %mint,
@@ -6798,9 +6803,15 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             let mints_set: std::collections::HashSet<&str> =
                 mints_in_wallet.iter().map(|s| s.as_str()).collect();
 
+            // Grace period: positions younger than 90s are protected from ghost cleanup
+            // to avoid race conditions where the wallet snapshot is stale after a restart
+            // but the token was just recently purchased.
+            const GHOST_CLEANUP_GRACE_SECS: u64 = 90;
+
             // Phase 1: Identify and remove ghost positions under the write lock (sync only).
             // Collect removed mints so we can delete from KV after releasing the lock.
             let mut ghost_mints: Vec<String> = Vec::new();
+            let mut skipped_fresh: Vec<String> = Vec::new();
             let positions_tracked;
             {
                 let mut positions = ctx.positions.write();
@@ -6809,12 +6820,23 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
 
                 for mint in position_mints {
                     if !mints_set.contains(mint.as_str()) {
+                        // Check grace period before removing
+                        let hold_secs = positions.get(&mint)
+                            .map(|p| p.entry_time.elapsed().as_secs())
+                            .unwrap_or(u64::MAX);
+
+                        if hold_secs < GHOST_CLEANUP_GRACE_SECS {
+                            // Position is too fresh — snapshot may be stale, skip for now
+                            skipped_fresh.push(mint);
+                            continue;
+                        }
+
                         if let Some(removed) = positions.remove(&mint) {
                             warn!(
                                 mint = %mint,
                                 pool = %removed.pool,
                                 dex = %removed.dex,
-                                hold_secs = removed.entry_time.elapsed().as_secs(),
+                                hold_secs = hold_secs,
                                 is_periodic = is_periodic,
                                 "👻 Ghost position closed: mint NOT in WalletSnapshotComplete (ATA was closed)"
                             );
@@ -6824,15 +6846,26 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 }
             } // write lock released here – safe to await
 
+            // Log skipped fresh positions
+            for mint in &skipped_fresh {
+                warn!(
+                    mint = %mint,
+                    grace_secs = GHOST_CLEANUP_GRACE_SECS,
+                    is_periodic = is_periodic,
+                    "⏳ Ghost cleanup skipped: position too fresh (grace period), will retry on next snapshot"
+                );
+            }
+
             // Phase 2: Delete from JetStream KV (async, no lock held)
             for mint in &ghost_mints {
                 ctx.delete_position_from_kv(mint).await;
             }
 
             let closed_count = ghost_mints.len();
-            if closed_count > 0 {
+            if closed_count > 0 || !skipped_fresh.is_empty() {
                 info!(
                     closed_count = closed_count,
+                    skipped_fresh = skipped_fresh.len(),
                     mints_in_wallet = mints_in_wallet.len(),
                     is_periodic = is_periodic,
                     "✅ WalletSnapshotComplete: reconciliation finished"

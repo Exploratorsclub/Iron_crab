@@ -26,8 +26,9 @@
 | Fix 11 | token_program Persistence + Pump Token-2022 Guard | ✅ DEPLOYED | 1 | ~1h |
 | Fix 12 | PumpFun Custom(2006): Complete-Guard in build_swap_ix | ✅ DEPLOYED | 1 | ~30min |
 | Fix 13 | PumpSwap AMM pool_accounts Propagation + real_reserves Validierung | ✅ DEPLOYED | 4 | ~2h |
-| Fix 14 | real_reserves Propagation im PoolCacheUpdate + Defensive Validierung + AMM Skip | 🔧 READY | 5 | ~1.5h |
-| Fix 15 | PnL Unit-Mismatch (token_raw vs tok_ui) + Liquidation exit_type | 🔧 READY | 2 | ~1h |
+| Fix 14 | real_reserves Propagation im PoolCacheUpdate + Defensive Validierung + AMM Skip | ✅ DEPLOYED | 5 | ~1.5h |
+| Fix 15 | PnL Unit-Mismatch (token_raw vs tok_ui) + Liquidation exit_type | ✅ DEPLOYED | 2 | ~1h |
+| Fix 16 | Zombie-KV-Positionen + Ghost-Cleanup Grace Period | 🔧 READY | 2 | ~30min |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
 | PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
 
@@ -827,6 +828,51 @@ Zusätzlich: `build_reconciled_position()` (Zeile 1799) hatte den gleichen Bug �
 - [x] Liquidation-Sells zeigen exit_type=LIQUIDATION im Dashboard ✅
 - [x] `cargo clippy` 0 Errors, 0 Warnings ✅
 - [ ] Live-Test: PnL-Werte im Dashboard stimmen mit echtem Gewinn/Verlust überein
+
+---
+
+## Fix 16: Zombie-KV-Positionen + Ghost-Cleanup Grace Period
+
+**Status**: 🔧 READY
+**Risiko**: **KRITISCH** (Positionen gehen nach Restart verloren, Token bleiben im Wallet)
+**Problem**: Zwei Bugs im Positions-Lifecycle:
+
+### Bug A: KV-Zombie-Positionen (WalletBalanceSnapshot balance=0 löscht nicht aus KV)
+
+**Symptom**: Nach jedem Restart werden 10+ Positionen aus KV recovered, obwohl nur 2 Token im Wallet sind. Die gleichen Zombie-Positionen kommen bei jedem Restart wieder.
+
+**Root Cause**: Der `WalletBalanceSnapshot balance=0` Handler in `momentum-bot` entfernt die Position aus dem Memory (`positions.remove(mint)`), ruft aber **nicht** `delete_position_from_kv()` auf. Im Gegensatz dazu löscht `close_position()` (Sell-Bestätigung) korrekt aus dem KV.
+
+**Ablauf des Bugs**:
+1. Token wird verkauft (Liquidation/Exit) → Sell wird on-chain bestätigt
+2. Bot wird neugestartet BEVOR `ExecutionResult` empfangen wird
+3. Position wird aus KV recovered (weil `close_position()` nie aufgerufen wurde)
+4. `WalletBalanceSnapshot balance=0` kommt → Position aus Memory entfernt
+5. KV wird **nicht** gelöscht → Zombie bleibt
+6. Nächster Restart → gleiche Position wird wieder recovered → **endlose Schleife**
+
+**Fix**: `delete_position_from_kv()` im `balance_raw == 0` Handler aufrufen.
+
+### Bug B: Ghost-Cleanup Race Condition (frische Positionen fälschlicherweise geschlossen)
+
+**Symptom**: Token `64J7AeeHGBg...` wurde 15 Sekunden vor einem Restart gekauft. Nach dem Restart wurde die Position korrekt aus KV recovered, aber sofort als "Ghost position" geschlossen, obwohl der Token im Wallet war.
+
+**Root Cause**: `WalletSnapshotComplete` von `market-data` enthielt den gerade erstellten ATA nicht (stale RPC-Snapshot). Der Ghost-Cleanup verglich die tracked Positionen gegen diese unvollständige Liste und entfernte die frische Position.
+
+**Beweis**: `execution-engine` fand den Token korrekt (`open_positions=2`), aber `momentum-bot`'s `WalletSnapshotComplete` hatte ihn nicht.
+
+**Fix**: Grace Period von 90 Sekunden — Positionen die jünger als 90s sind werden beim Ghost-Cleanup übersprungen. Warnung wird geloggt, nächster Snapshot-Zyklus prüft erneut.
+
+### Geänderte Dateien
+- `src/bin/momentum_bot.rs` — KV-Löschung bei balance=0 + Ghost-Cleanup Grace Period
+
+### Akzeptanzkriterien
+- [x] `WalletBalanceSnapshot balance=0` löscht Position aus Memory UND KV ✅
+- [x] Positionen < 90s werden beim Ghost-Cleanup übersprungen ✅
+- [x] Übersprungene Positionen werden geloggt (WARN) ✅
+- [x] `cargo check` kompiliert fehlerfrei ✅
+- [ ] Live-Test: Restart nach Kauf → Position bleibt erhalten
+- [ ] Live-Test: Keine Zombie-Positionen nach Restart
 
 ---
 
