@@ -1796,9 +1796,11 @@ impl MomentumContext {
         decimals: u8,
     ) -> Option<PositionTracker> {
         let (pool, dex, ratio_opt) = self.select_reconcile_pool(mint)?;
+        // ratio = sol_lamports / token_raw (raw units)
+        // entry_price should be tokens_UI / SOL_UI = (1/ratio) * 10^(9 - decimals)
         let entry_price = ratio_opt
             .filter(|r| *r > 0.0)
-            .map(|r| 1.0 / r)
+            .map(|r| (1.0 / r) * 10f64.powi(9_i32 - decimals as i32))
             .unwrap_or(1.0);
 
         let mut tracker =
@@ -6606,9 +6608,14 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 }
             }
 
-            // Update open position price estimate (tokens per SOL) based on trade ratio.
+            // Update open position price estimate (tokens_UI per SOL_UI) based on trade ratio.
+            // CRITICAL: Use UI-normalized amounts (raw / 10^decimals) to match entry_price units.
+            // Without this, PnL is off by 10^decimals (e.g. 10^6 → false +100M% gain).
             if sol_lamports > 0 && token_raw > 0 {
-                let tokens_per_sol = (token_raw as f64) / (sol_lamports as f64 / 1_000_000_000.0);
+                let token_decimals = ctx.mint_infos.read().get(mint).map(|m| m.decimals).unwrap_or(6);
+                let tok_ui = token_raw as f64 / 10f64.powi(token_decimals as i32);
+                let sol_ui = sol_lamports as f64 / 1_000_000_000.0;
+                let tokens_per_sol = tok_ui / sol_ui;
                 let trade = TradeEvent {
                     timestamp: Instant::now(),
                     trader: trader.to_string(),

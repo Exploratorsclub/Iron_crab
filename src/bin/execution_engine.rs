@@ -1485,8 +1485,13 @@ impl ExecutionContext {
             metadata.insert("mint_decimals".to_string(), decimals.to_string());
             metadata.insert("token_account".to_string(), ta_pubkey.to_string());
             metadata.insert("token_program".to_string(), token_program.to_string());
+            // Exit type/reason for Grafana dashboard display
+            metadata.insert("exit_type".to_string(), "LIQUIDATION".to_string());
             if let Some(r) = &reason {
                 metadata.insert("kill_reason".to_string(), r.clone());
+                metadata.insert("exit_reason".to_string(), format!("Kill switch: {}", r));
+            } else {
+                metadata.insert("exit_reason".to_string(), "Kill switch liquidation".to_string());
             }
 
             let mut resources = TradeResources {

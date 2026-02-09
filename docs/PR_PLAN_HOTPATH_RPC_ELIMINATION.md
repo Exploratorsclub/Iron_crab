@@ -27,7 +27,7 @@
 | Fix 12 | PumpFun Custom(2006): Complete-Guard in build_swap_ix | ✅ DEPLOYED | 1 | ~30min |
 | Fix 13 | PumpSwap AMM pool_accounts Propagation + real_reserves Validierung | ✅ DEPLOYED | 4 | ~2h |
 | Fix 14 | real_reserves Propagation im PoolCacheUpdate + Defensive Validierung + AMM Skip | 🔧 READY | 5 | ~1.5h |
-| Bug 15 | PnL-Diskrepanz: momentum-bot vs Dashboard bei Partial-Sell | ⬜ TODO | 1 | ~1h |
+| Fix 15 | PnL Unit-Mismatch (token_raw vs tok_ui) + Liquidation exit_type | 🔧 READY | 2 | ~1h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
 | PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
 
@@ -768,25 +768,65 @@ Zusätzliches Problem: PumpSwap AMM Discovery wartet 10 Sekunden auf einen RPC-T
 
 ---
 
-## Bug 15: PnL-Diskrepanz zwischen momentum-bot und Dashboard
+## Fix 15: PnL Unit-Mismatch (token_raw vs tok_ui) + Liquidation exit_type
 
-**Status**: ⬜ TODO
-**Risiko**: Niedrig (nur Anzeige)
-**Problem**: momentum-bot berechnet PnL korrekt als `(current_price - entry_price) / entry_price * 100%`. Dashboard zeigt anderen Wert, vermutlich basierend auf SOL-In vs SOL-Out Berechnung.
+**Status**: 🔧 READY
+**Risiko**: **KRITISCH** (Bot verkauft sofort mit Verlust, weil PnL +100M% anzeigt)
+**Problem**: Zwei Bugs:
+1. **PnL-Berechnung falscher Unit-Mix**: `entry_price` nutzt tokens_UI/SOL_UI, aber `current_price` nutzt tokens_RAW/SOL_UI → Faktor 10^decimals Abweichung → jede Position zeigt +100M% PnL → Take Profit triggert sofort → Sell mit Verlust
+2. **Liquidation exit_type fehlt**: Dashboard zeigt `null` für Exit Type/Reason bei Liquidation-Sells
 
-### Root Cause (Vermutung)
+### Root Cause (identifiziert — Unit-Mismatch)
 
-- momentum-bot: PnL basiert auf Preis-Basis (entry_price vs current_price)
-- Dashboard: PnL basiert möglicherweise auf SOL-Beträgen aus ExecutionResults
-- Bei Partial-Sell: momentum-bot sieht hohen %-Gewinn auf verkauften Teil, Dashboard sieht Gesamtposition
-- `pnl_pct=181.77%` (momentum-bot) vs `-30%` (Dashboard)
+**entry_price** (Position Open, Zeile 3027):
+```
+tok_ui = fill_out.as_f64()          → 19835.35  (raw / 10^6)
+sol_ui = 0.00125
+entry_price = 19835.35 / 0.00125    = 15,868,280  (tokens_UI / SOL_UI)
+```
 
-### Geplanter Fix
+**current_price** (Trade Update, Zeile 6611):
+```
+tokens_per_sol = token_raw / (sol_lamports / 1e9)
+               = 19835350162 / 0.00125
+               = 15,868,280,130,000  (tokens_RAW / SOL_UI) ❌
+```
 
-- Dashboard PnL-Berechnung analysieren
-- Einheitliche PnL-Basis definieren: Preis-basiert ODER SOL-basiert
-- Bei Partial-Sell: Dashboard muss Restposition berücksichtigen
-- Erst relevant wenn Fix 9 deployed und Partial-Sells nicht mehr auftreten
+**Verhältnis**: `current_price / entry_price ≈ 10^6` (= Token Decimals)
+**PnL**: `((10^6 * X - X) / X) * 100 ≈ 100,000,000%` → Take Profit bei +100% triggert sofort
+
+**Beweis aus Logs**: `reason_detail: "Take profit hit: +100388376.5% gain (target: +100.0%)"`
+
+Zusätzlich: `build_reconciled_position()` (Zeile 1799) hatte den gleichen Bug — `1/ratio` ohne UI-Normalisierung.
+
+### Implementierter Fix
+
+#### A) `update_position_price` — Token Raw zu UI konvertieren (momentum_bot.rs, Zeile ~6611)
+- `token_raw` wird jetzt mit `mint_infos[mint].decimals` zu `tok_ui` konvertiert
+- `tokens_per_sol = tok_ui / sol_ui` statt `token_raw / sol_ui`
+- Convention: **tokens_UI per SOL_UI** konsistent in allen Pfaden
+
+#### B) `build_reconciled_position` — Entry Price UI-normalisiert (momentum_bot.rs, Zeile ~1799)
+- `ratio = sol_lamports / token_raw` (raw units)
+- Konvertierung: `entry_price = (1/ratio) * 10^(9 - decimals)` → korrekte UI-Einheiten
+- `decimals` Parameter war bereits verfügbar
+
+#### C) Liquidation `exit_type` + `exit_reason` (execution_engine.rs)
+- `exit_type: "LIQUIDATION"` in Liquidation-Intent Metadata
+- `exit_reason: "Kill switch: {reason}"` für Dashboard-Anzeige
+
+### Geänderte Dateien
+- `src/bin/momentum_bot.rs` — PnL Unit-Fix an 2 Stellen
+- `src/bin/execution_engine.rs` — Liquidation exit_type/exit_reason Metadata
+
+### Akzeptanzkriterien
+- [x] `entry_price` und `current_price` verwenden gleiche Einheit (tokens_UI / SOL_UI) ✅
+- [x] PnL-Berechnung gibt realistische Werte (nicht +100M%) ✅
+- [x] Take Profit triggert nur bei echtem Gewinn ✅
+- [x] Stop Loss triggert bei echtem Verlust ✅
+- [x] Liquidation-Sells zeigen exit_type=LIQUIDATION im Dashboard ✅
+- [x] `cargo clippy` 0 Errors, 0 Warnings ✅
+- [ ] Live-Test: PnL-Werte im Dashboard stimmen mit echtem Gewinn/Verlust überein
 
 ---
 
