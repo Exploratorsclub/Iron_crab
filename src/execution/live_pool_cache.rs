@@ -622,6 +622,19 @@ impl LivePoolCache {
         None
     }
 
+    /// Check if a PumpFun bonding curve for a given mint is marked as `complete`.
+    /// Returns Some(true) if complete, Some(false) if not, None if not found.
+    pub fn is_pumpfun_complete_for_mint(&self, mint: &Pubkey) -> Option<bool> {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpFun(s) = &entry.value().state {
+                if s.token_mint == *mint {
+                    return Some(s.complete);
+                }
+            }
+        }
+        None
+    }
+
     /// Update token program for a mint (called when Geyser receives mint account update)
     /// The owner of a mint account IS the token program (SPL Token or Token-2022)
     pub fn update_mint_program(&self, mint: &Pubkey, token_program: Pubkey) {

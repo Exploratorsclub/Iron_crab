@@ -21,12 +21,13 @@
 | Fix 7 | Token-2022 StateWithExtensions: Account-Unpack für Extensions | ✅ DEPLOYED | 1 | ~30min |
 | PR 3 | Vault-Balance-Reads aus Cache (Orca/Raydium/Meteora/CPMM) | ✅ DEPLOYED | 5 | ~5h |
 | Fix 8 | LockManager BUY-Fill-Akkumulation + Live Token-Balance-Sync | ✅ DEPLOYED | 2 | ~1h |
-| Fix 9 | SELL-Amount Race-Condition + Recovery-Summierung + Partial-Sell | 🔧 READY | 2 | ~2h |
-| Fix 10 | LockManager Doppelzählung bei Geyser-Race | 🔧 READY | 1 | ~30min |
-| Fix 11 | token_program Persistence + Pump Token-2022 Guard | 🔧 READY | 1 | ~1h |
-| Fix 12 | PumpFun Custom(2006): Complete-Guard in build_swap_ix | 🔧 READY | 1 | ~30min |
-| Fix 13 | PumpSwap AMM pool_accounts Propagation + real_reserves Validierung | 🔧 READY | 4 | ~2h |
-| Bug 14 | PnL-Diskrepanz: momentum-bot vs Dashboard bei Partial-Sell | ⬜ TODO | 1 | ~1h |
+| Fix 9 | SELL-Amount Race-Condition + Recovery-Summierung + Partial-Sell | ✅ DEPLOYED | 2 | ~2h |
+| Fix 10 | LockManager Doppelzählung bei Geyser-Race | ✅ DEPLOYED | 1 | ~30min |
+| Fix 11 | token_program Persistence + Pump Token-2022 Guard | ✅ DEPLOYED | 1 | ~1h |
+| Fix 12 | PumpFun Custom(2006): Complete-Guard in build_swap_ix | ✅ DEPLOYED | 1 | ~30min |
+| Fix 13 | PumpSwap AMM pool_accounts Propagation + real_reserves Validierung | ✅ DEPLOYED | 4 | ~2h |
+| Fix 14 | real_reserves Propagation im PoolCacheUpdate + Defensive Validierung + AMM Skip | 🔧 READY | 5 | ~1.5h |
+| Bug 15 | PnL-Diskrepanz: momentum-bot vs Dashboard bei Partial-Sell | ⬜ TODO | 1 | ~1h |
 | PR 4 | tx_builder Orca-State aus Cache | ⬜ TODO | 1 | ~1h |
 | PR 5 | Blockhash via Geyser (kein RPC für Blockhash) | ⬜ TODO | 2 | ~3h |
 
@@ -710,7 +711,64 @@ Die Liquidation hat 3 Phasen für Route-Discovery:
 
 ---
 
-## Bug 14: PnL-Diskrepanz zwischen momentum-bot und Dashboard
+## Fix 14: real_reserves Propagation im PoolCacheUpdate + Defensive Validierung + AMM Skip
+
+**Status**: 🔧 READY
+**Risiko**: Hoch (betrifft Liquidation aller PumpFun-Token — direkte Fortsetzung von Fix 13)
+**Problem**: Liquidation scheitert trotz Fix 13, weil `real_token_reserves=0` im SLAVE-Cache der execution-engine.
+
+### Root Cause (identifiziert)
+
+On-chain haben die Bonding Curves korrekte `real_token_reserves` (z.B. 788T für Token 1, 671T für Token 2).
+Aber der LivePoolCache in der execution-engine zeigt `real_token_reserves=0`. Grund:
+
+1. **market-data** (MASTER) hat korrekte Daten via Geyser, propagiert aber nur `virtual_token_reserves` und `virtual_sol_reserves` als `base_reserve`/`quote_reserve` im `PoolCacheUpdate`. Die `real_*` Werte werden NICHT ins Metadata geschrieben.
+2. **execution-engine** (SLAVE) baut `PumpFunState` aus `PoolCacheUpdate` mit `real_sol_reserves: 0` und `real_token_reserves: 0` (hardcoded in `build_minimal_pool_state()`).
+3. Fix 13's `real_token_reserves == 0` Validierung blockt den Sell fälschlicherweise, weil der Cache-Wert (0) nicht den on-chain Wert (788T) widerspiegelt.
+
+Zusätzliches Problem: PumpSwap AMM Discovery wartet 10 Sekunden auf einen RPC-Timeout für Token, deren Bonding Curve NICHT `complete` ist (keine Migration → kein AMM Pool existiert).
+
+### Implementierter Fix
+
+#### A) market-data: `real_reserves` in PoolCacheUpdate Metadata (market_data.rs)
+- PumpFun Metadata wird jetzt IMMER geschrieben (nicht nur wenn `creator != default`)
+- Neue Metadata-Felder: `real_token_reserves`, `real_sol_reserves`
+- Bestehende Felder bleiben: `creator`, `associated_bonding_curve`, `complete`
+
+#### B) execution-engine: `real_reserves` aus Metadata lesen (execution_engine.rs)
+- `build_minimal_pool_state()` liest `real_token_reserves` und `real_sol_reserves` aus dem Metadata-HashMap
+- Fallback auf `0` wenn nicht vorhanden (Abwärtskompatibilität mit älteren market-data Versionen)
+
+#### C) Defensive Validierung: Cache-Stale-Detection (pumpfun.rs + quote_calculator.rs)
+- Wenn `real_reserves == 0` aber `virtual_reserves > 0`: Cache als "möglicherweise stale" behandeln
+- In diesem Fall werden die `real_reserves` Checks übersprungen und die Simulation fängt echte on-chain Fehler ab
+- Nur wenn `real_reserves > 0` (bekanntermaßen populated): strikte Validierung gegen `amount_in > real_token_reserves`
+- Warnung geloggt wenn Stale-Cache erkannt wird
+
+#### D) PumpSwap AMM Discovery Skip (execution_engine.rs)
+- Neue Methode `LivePoolCache.is_pumpfun_complete_for_mint()` 
+- Wenn Bonding Curve `complete=false` UND kein PumpAmm-Pool im Cache: Discovery wird übersprungen
+- Spart 10 Sekunden RPC-Timeout pro Token bei der Liquidation
+- Wenn Bonding Curve `complete=true` ODER ein PumpAmm-Pool bereits im Cache: Discovery wird normal ausgeführt
+
+### Geänderte Dateien
+- `src/bin/market_data.rs` — real_reserves in PumpFun PoolCacheUpdate Metadata
+- `src/bin/execution_engine.rs` — real_reserves aus Metadata lesen + AMM Discovery Skip
+- `src/execution/live_pool_cache.rs` — neue Methode `is_pumpfun_complete_for_mint()`
+- `src/solana/dex/pumpfun.rs` — defensive real_reserves Validierung (stale-cache-aware)
+- `src/execution/quote_calculator.rs` — defensive real_reserves Validierung (stale-cache-aware)
+
+### Akzeptanzkriterien
+- [x] market-data propagiert `real_token_reserves` und `real_sol_reserves` im PoolCacheUpdate Metadata ✅
+- [x] execution-engine liest real_reserves aus Metadata (nicht mehr hardcoded 0) ✅
+- [x] Cache-Stale-Detection: real_reserves=0 + virtual>0 → Sell wird trotzdem versucht ✅
+- [x] PumpSwap AMM Discovery wird übersprungen für nicht-migrierte Token ✅
+- [ ] Liquidation von PumpFun-Token mit korrekten real_reserves funktioniert on-chain
+- [x] `cargo clippy` 0 Errors, 0 Warnings ✅
+
+---
+
+## Bug 15: PnL-Diskrepanz zwischen momentum-bot und Dashboard
 
 **Status**: ⬜ TODO
 **Risiko**: Niedrig (nur Anzeige)

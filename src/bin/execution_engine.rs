@@ -1583,16 +1583,39 @@ impl ExecutionContext {
                     };
 
                 // PumpSwap (Pump.fun AMM) with timeout guard.
-                let pump_amm_quote = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    pump_amm.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in),
-                )
-                .await;
+                // Skip RPC-heavy discovery if the bonding curve is NOT complete
+                // (no migration → no PumpSwap AMM pool exists).
+                let bonding_curve_complete = ctx.live_pool_cache.as_ref()
+                    .and_then(|c| c.is_pumpfun_complete_for_mint(&mint))
+                    .unwrap_or(false);
+
+                let pump_amm_quote = if !bonding_curve_complete {
+                    // Check if we already have a PumpAmm pool in cache for this mint
+                    let has_cached_pump_amm = ctx.live_pool_cache.as_ref()
+                        .and_then(|c| c.find_pump_amm_pool_by_base_mint(&mint))
+                        .is_some();
+                    if has_cached_pump_amm {
+                        // Pool exists in cache (from DexPoolAccounts event), proceed with quote
+                        Some(tokio::time::timeout(
+                            Duration::from_secs(10),
+                            pump_amm.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in),
+                        ).await)
+                    } else {
+                        quote_attempts.push("pump_amm=skip (bonding_curve not complete, no cached pool)".to_string());
+                        None
+                    }
+                } else {
+                    Some(tokio::time::timeout(
+                        Duration::from_secs(10),
+                        pump_amm.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in),
+                    ).await)
+                };
                 match pump_amm_quote {
-                    Err(_timeout) => {
+                    None => {} // Already logged above
+                    Some(Err(_timeout)) => {
                         quote_attempts.push("pump_amm=timeout (10s)".to_string());
                     }
-                    Ok(inner) => match inner {
+                    Some(Ok(inner)) => match inner {
                         Ok(Some(q)) => {
                             #[cfg(unix)]
                             maybe_ping_watchdog();
@@ -3314,11 +3337,24 @@ fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, CachedP
                 .map(|s| s == "true")
                 .unwrap_or(false);
 
+            // Read real_reserves from metadata (propagated by market-data from Geyser).
+            // These are critical for PumpFun SELL validation (6023 guard).
+            let real_token_reserves = update.metadata.as_ref()
+                .and_then(|m| m.get("real_token_reserves"))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let real_sol_reserves = update.metadata.as_ref()
+                .and_then(|m| m.get("real_sol_reserves"))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+
             if creator != Pubkey::default() {
                 debug!(
                     pool = %pool_addr,
                     creator = %creator,
-                    "SLAVE CACHE: Creator extracted from PoolCacheUpdate metadata"
+                    real_token_reserves,
+                    real_sol_reserves,
+                    "SLAVE CACHE: PumpFun state from PoolCacheUpdate metadata"
                 );
             }
 
@@ -3328,8 +3364,8 @@ fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, CachedP
                 associated_bonding_curve,
                 virtual_sol_reserves: update.quote_reserve,
                 virtual_token_reserves: update.base_reserve,
-                real_sol_reserves: 0,
-                real_token_reserves: 0,
+                real_sol_reserves,
+                real_token_reserves,
                 complete,
                 creator,
             })

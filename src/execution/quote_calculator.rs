@@ -390,30 +390,27 @@ fn calculate_pumpfun_quote(state: &PumpFunState, amount_in: u64, is_buy: bool) -
     } else {
         // SELL: Token in, SOL out
         //
-        // CRITICAL: Validate against real_token_reserves before quoting.
+        // Validate against real_token_reserves before quoting.
         // PumpFun's on-chain sell function checks: `amount <= real_token_reserves`
-        // (error 6023: NotEnoughTokensToSell). The real_token_reserves tracks tokens
-        // previously purchased from the curve — you can only sell back what was bought.
-        // Without this check, the quote succeeds but simulation fails with Custom(6023),
-        // and Phase 2 multi-pool routing is never tried.
-        if state.real_token_reserves == 0 {
-            return Err(anyhow!(
-                "pumpfun: real_token_reserves is zero (no tokens purchased from curve, sell impossible)"
-            ));
-        }
-        if amount_in > state.real_token_reserves {
-            return Err(anyhow!(
-                "pumpfun: sell amount {} exceeds real_token_reserves {} (curve cannot absorb this sell)",
-                amount_in,
-                state.real_token_reserves
-            ));
-        }
-
-        // Also validate real_sol_reserves: the curve needs SOL to pay the seller
-        if state.real_sol_reserves == 0 {
-            return Err(anyhow!(
-                "pumpfun: real_sol_reserves is zero (curve has no SOL to pay out)"
-            ));
+        // (error 6023: NotEnoughTokensToSell).
+        //
+        // IMPORTANT: If real_reserves=0 but virtual_reserves are populated, the cache
+        // may be stale (PoolCacheUpdate from older market-data without real_reserves).
+        // In that case, skip the real_reserves validation and let simulation catch failures.
+        let real_reserves_populated = state.real_token_reserves > 0 || state.real_sol_reserves > 0;
+        if real_reserves_populated {
+            if amount_in > state.real_token_reserves {
+                return Err(anyhow!(
+                    "pumpfun: sell amount {} exceeds real_token_reserves {} (curve cannot absorb this sell)",
+                    amount_in,
+                    state.real_token_reserves
+                ));
+            }
+            if state.real_sol_reserves == 0 {
+                return Err(anyhow!(
+                    "pumpfun: real_sol_reserves is zero (curve has no SOL to pay out)"
+                ));
+            }
         }
 
         let sol_reserve = state.virtual_sol_reserves as u128;
@@ -429,7 +426,8 @@ fn calculate_pumpfun_quote(state: &PumpFunState, amount_in: u64, is_buy: bool) -
         let amount_out = numerator / denominator.max(1);
 
         // Final check: ensure SOL output doesn't exceed what the curve actually has
-        if amount_out as u64 > state.real_sol_reserves {
+        // (only if real_reserves are populated — otherwise cache is stale)
+        if real_reserves_populated && amount_out as u64 > state.real_sol_reserves {
             return Err(anyhow!(
                 "pumpfun: calculated sol_output {} exceeds real_sol_reserves {} (curve underfunded)",
                 amount_out,

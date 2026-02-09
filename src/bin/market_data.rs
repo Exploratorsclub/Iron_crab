@@ -2050,13 +2050,17 @@ async fn run_geyser_loop(
                         // without needing RPC fallbacks.
                         match &cached_state {
                             CachedPoolState::PumpFun(s) => {
+                                // Always propagate real_reserves + complete for SELL validation
+                                // in execution-engine's SLAVE cache.
+                                let mut meta = std::collections::HashMap::new();
                                 if s.creator != Pubkey::default() {
-                                    let mut meta = std::collections::HashMap::new();
                                     meta.insert("creator".to_string(), s.creator.to_string());
-                                    meta.insert("associated_bonding_curve".to_string(), s.associated_bonding_curve.to_string());
-                                    meta.insert("complete".to_string(), s.complete.to_string());
-                                    pool_update.metadata = Some(meta);
                                 }
+                                meta.insert("associated_bonding_curve".to_string(), s.associated_bonding_curve.to_string());
+                                meta.insert("complete".to_string(), s.complete.to_string());
+                                meta.insert("real_token_reserves".to_string(), s.real_token_reserves.to_string());
+                                meta.insert("real_sol_reserves".to_string(), s.real_sol_reserves.to_string());
+                                pool_update.metadata = Some(meta);
                             }
                             CachedPoolState::PumpAmm(s) => {
                                 if let Some(creator) = s.creator {

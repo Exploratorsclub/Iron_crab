@@ -642,33 +642,36 @@ impl PumpFunDex {
             return Ok(None);
         }
 
-        // SELL: Validate against real_token_reserves BEFORE quoting (same as quote_exact_in).
+        // SELL: Validate against real_token_reserves (same logic as quote_exact_in).
+        // If real_reserves=0 but virtual_reserves populated, cache may be stale — proceed.
         if !buy_token {
-            if state.real_token_reserves == 0 {
-                info!(
+            let real_reserves_populated = state.real_token_reserves > 0 || state.real_sol_reserves > 0;
+            if real_reserves_populated {
+                if amount_in > state.real_token_reserves {
+                    info!(
+                        token_mint=%token_mint_str,
+                        bonding_curve=%bonding_curve,
+                        amount_in,
+                        real_token_reserves=state.real_token_reserves,
+                        "pump.fun: SELL skipped — amount exceeds real_token_reserves (with_fallback)"
+                    );
+                    return Ok(None);
+                }
+                if state.real_sol_reserves == 0 {
+                    info!(
+                        token_mint=%token_mint_str,
+                        bonding_curve=%bonding_curve,
+                        "pump.fun: SELL skipped — real_sol_reserves is 0 (with_fallback)"
+                    );
+                    return Ok(None);
+                }
+            } else if state.virtual_token_reserves > 0 {
+                warn!(
                     token_mint=%token_mint_str,
                     bonding_curve=%bonding_curve,
-                    "pump.fun: SELL skipped — real_token_reserves is 0"
+                    virtual_token=state.virtual_token_reserves,
+                    "pump.fun: real_reserves=0 but virtual populated — cache stale, proceeding (with_fallback)"
                 );
-                return Ok(None);
-            }
-            if amount_in > state.real_token_reserves {
-                info!(
-                    token_mint=%token_mint_str,
-                    bonding_curve=%bonding_curve,
-                    amount_in,
-                    real_token_reserves=state.real_token_reserves,
-                    "pump.fun: SELL skipped — amount exceeds real_token_reserves (with_fallback)"
-                );
-                return Ok(None);
-            }
-            if state.real_sol_reserves == 0 {
-                info!(
-                    token_mint=%token_mint_str,
-                    bonding_curve=%bonding_curve,
-                    "pump.fun: SELL skipped — real_sol_reserves is 0 (with_fallback)"
-                );
-                return Ok(None);
             }
         }
 
@@ -851,34 +854,39 @@ impl Dex for PumpFunDex {
         // PumpFun's on-chain sell function checks: `amount <= real_token_reserves`
         // (error 6023: NotEnoughTokensToSell). Without this check, the quote succeeds
         // but simulation fails, blocking multi-pool routing fallback.
+        //
+        // IMPORTANT: If real_reserves are 0 but virtual_reserves are populated,
+        // the cache may be stale (PoolCacheUpdate from older market-data without real_reserves).
+        // In that case, proceed with the quote and let simulation catch any on-chain failures.
         if !buy_token {
-            if state.real_token_reserves == 0 {
-                info!(
+            let real_reserves_populated = state.real_token_reserves > 0 || state.real_sol_reserves > 0;
+            if real_reserves_populated {
+                if amount_in > state.real_token_reserves {
+                    info!(
+                        token_mint=%token_mint_str,
+                        bonding_curve=%bonding_curve,
+                        amount_in,
+                        real_token_reserves=state.real_token_reserves,
+                        "pump.fun: SELL skipped — amount exceeds real_token_reserves (6023 would fail on-chain)"
+                    );
+                    return Ok(None);
+                }
+                if state.real_sol_reserves == 0 {
+                    info!(
+                        token_mint=%token_mint_str,
+                        bonding_curve=%bonding_curve,
+                        real_sol_reserves=state.real_sol_reserves,
+                        "pump.fun: SELL skipped — real_sol_reserves is 0 (curve has no SOL to pay out)"
+                    );
+                    return Ok(None);
+                }
+            } else if state.virtual_token_reserves > 0 {
+                warn!(
                     token_mint=%token_mint_str,
                     bonding_curve=%bonding_curve,
-                    real_token_reserves=state.real_token_reserves,
-                    "pump.fun: SELL skipped — real_token_reserves is 0 (no tokens purchased from curve)"
+                    virtual_token=state.virtual_token_reserves,
+                    "pump.fun: real_reserves=0 but virtual_reserves populated — cache may be stale, proceeding with quote"
                 );
-                return Ok(None);
-            }
-            if amount_in > state.real_token_reserves {
-                info!(
-                    token_mint=%token_mint_str,
-                    bonding_curve=%bonding_curve,
-                    amount_in,
-                    real_token_reserves=state.real_token_reserves,
-                    "pump.fun: SELL skipped — amount exceeds real_token_reserves (6023 would fail on-chain)"
-                );
-                return Ok(None);
-            }
-            if state.real_sol_reserves == 0 {
-                info!(
-                    token_mint=%token_mint_str,
-                    bonding_curve=%bonding_curve,
-                    real_sol_reserves=state.real_sol_reserves,
-                    "pump.fun: SELL skipped — real_sol_reserves is 0 (curve has no SOL to pay out)"
-                );
-                return Ok(None);
             }
         }
 
