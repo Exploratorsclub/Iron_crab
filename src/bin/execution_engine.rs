@@ -1553,6 +1553,18 @@ impl ExecutionContext {
             "Liquidation: inventory filtered (non-zero, non-SOL/WSOL)"
         );
 
+        // Seed LockManager with RPC-discovered balances so that the
+        // SIM_INSUFFICIENT_BALANCE preflight check passes for SELL intents.
+        for (mint_str, balance_raw, _decimals, _token_prog, _ta_pubkey) in &inventory {
+            ctx.lock_manager
+                .set_available_token_balance(mint_str.clone(), *balance_raw);
+            info!(
+                mint = %mint_str,
+                balance_raw = balance_raw,
+                "Liquidation: seeded LockManager with RPC balance"
+            );
+        }
+
         let mut liquidation_intents: Vec<TradeIntent> = Vec::new();
 
         for (mint_str, balance_raw, decimals, token_program_str, ta_pubkey_str) in &inventory {
