@@ -724,6 +724,62 @@ impl LivePoolCache {
         None
     }
 
+    /// Mark a PumpFun bonding curve as `complete` for a given mint.
+    /// Called when on-chain simulation returns 6005 (BondingCurveComplete) so
+    /// subsequent attempts use Multi-Pool (PumpSwap AMM) instead.
+    pub fn mark_pumpfun_complete_for_mint(&self, mint: &Pubkey) -> bool {
+        for mut entry in self.pools.iter_mut() {
+            if let CachedPoolState::PumpFun(ref mut s) = entry.value_mut().state {
+                if s.token_mint == *mint && !s.complete {
+                    s.complete = true;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Get PumpAmm reserves (base, quote) for a given base_mint from cache.
+    ///
+    /// Returns `Some((base_reserve, quote_reserve, pool_market))` if both reserves
+    /// are available in the cache, `None` otherwise.
+    /// This allows PumpFunAmmDex to skip RPC `get_vault_amount` calls when the cache
+    /// already has fresh Geyser data.
+    pub fn get_pump_amm_reserves_by_base_mint(
+        &self,
+        base_mint: &Pubkey,
+    ) -> Option<(u64, u64, Pubkey)> {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
+                if s.base_mint == *base_mint {
+                    if let (Some(base_r), Some(quote_r)) = (s.base_reserve, s.quote_reserve) {
+                        return Some((base_r, quote_r, *entry.key()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Get PumpAmm pool_accounts for a given base_mint from cache.
+    ///
+    /// Returns `Some(Vec<Pubkey>)` if the pool_accounts are non-empty in the cache.
+    /// This allows PumpFunAmmDex to skip the expensive RPC-based `discover_pool_static`
+    /// when DexPoolAccounts have already been received from Geyser/market-data.
+    pub fn get_pump_amm_pool_accounts_by_base_mint(
+        &self,
+        base_mint: &Pubkey,
+    ) -> Option<Vec<Pubkey>> {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
+                if s.base_mint == *base_mint && !s.pool_accounts.is_empty() {
+                    return Some(s.pool_accounts.clone());
+                }
+            }
+        }
+        None
+    }
+
     // ========================================================================
     // Stats
     // ========================================================================

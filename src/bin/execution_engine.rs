@@ -1418,12 +1418,21 @@ impl ExecutionContext {
                 None
             }
         };
-        let pump_amm = PumpFunAmmDex::new(
-            Arc::clone(&ctx.rpc),
-            ctx.rpc_url.clone(),
-            ctx.helius_rpc_url.clone(),
-        );
         let lpc = ctx.live_pool_cache.as_ref().map(Arc::clone);
+        let pump_amm = if let Some(ref cache) = lpc {
+            PumpFunAmmDex::new_with_cache(
+                Arc::clone(&ctx.rpc),
+                ctx.rpc_url.clone(),
+                ctx.helius_rpc_url.clone(),
+                Arc::clone(cache),
+            )
+        } else {
+            PumpFunAmmDex::new(
+                Arc::clone(&ctx.rpc),
+                ctx.rpc_url.clone(),
+                ctx.helius_rpc_url.clone(),
+            )
+        };
         let mut meteora = MeteoraDlmm::new_with_live_cache(Arc::clone(&ctx.rpc), lpc.clone());
         meteora.set_user_authority(owner);
         let raydium = Raydium::new_with_live_cache(Arc::clone(&ctx.rpc), lpc.clone());
@@ -7578,7 +7587,9 @@ async fn emit_sim_failed_decision(
         "Intent simulation failed | logs: {logs_truncated}"
     );
 
-    Ok(())
+    // Return Err so callers (e.g. liquidation 6005-retry) can detect and act on sim failures.
+    // Decision record is already persisted above; this Err propagates the failure signal.
+    Err(anyhow::anyhow!("Simulation failed: {}", sim_error_str))
 }
 
 /// Real RPC simulation (RS-3.1).

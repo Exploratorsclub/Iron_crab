@@ -1,3 +1,4 @@
+use crate::execution::live_pool_cache::LivePoolCache;
 use crate::solana::dex::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 use anyhow::{anyhow, Context, Result};
@@ -143,6 +144,12 @@ pub struct PumpFunAmmDex {
     user_accounts: DashMap<(Pubkey, Pubkey), PumpAmmUserAccounts>, // (pool_market, user)
     // Extra cached data (e.g., token_program:<mint> → program_id)
     cached_data: DashMap<String, String>,
+
+    /// Optional reference to the Geyser-fed LivePoolCache.
+    /// When present, quote_exact_in() reads reserves from cache instead of RPC,
+    /// and discover_pool_static() checks for cached pool_accounts first.
+    /// This is the primary mechanism for eliminating RPC calls from the hot path.
+    live_pool_cache: Option<Arc<LivePoolCache>>,
 }
 
 impl PumpFunAmmDex {
@@ -167,7 +174,21 @@ impl PumpFunAmmDex {
             pools_by_market: DashMap::new(),
             user_accounts: DashMap::new(),
             cached_data: DashMap::new(),
+            live_pool_cache: None,
         }
+    }
+
+    /// Create a new PumpFunAmmDex with a LivePoolCache reference for Geyser-first quoting.
+    /// When the cache is provided, quote_exact_in() reads reserves from cache instead of RPC.
+    pub fn new_with_cache(
+        rpc: Arc<SolanaRpc>,
+        rpc_url: String,
+        helius_rpc_url: Option<String>,
+        live_pool_cache: Arc<LivePoolCache>,
+    ) -> Self {
+        let mut dex = Self::new(rpc, rpc_url, helius_rpc_url);
+        dex.live_pool_cache = Some(live_pool_cache);
+        dex
     }
 
     fn is_helius_endpoint(&self, endpoint: &str) -> bool {
@@ -237,6 +258,23 @@ impl PumpFunAmmDex {
         &self,
         base_mint: Pubkey,
     ) -> Result<Option<Vec<Pubkey>>> {
+        // GEYSER-FIRST: Check LivePoolCache for pre-cached pool_accounts before RPC discovery.
+        // These come from DexPoolAccounts events (parsed from verified on-chain swap txs)
+        // and are more reliable than the heuristic-based RPC discovery.
+        if let Some(ref cache) = self.live_pool_cache {
+            if let Some(accounts) = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint) {
+                if accounts.len() >= 12 {
+                    debug!(
+                        base_mint = %base_mint,
+                        accounts_len = accounts.len(),
+                        "pump_amm: pool_accounts from LivePoolCache (ZERO RPC)"
+                    );
+                    return Ok(Some(accounts));
+                }
+            }
+        }
+
+        // RPC FALLBACK: Cache miss — discover pool via RPC heuristics.
         let pool = match self.discover_pool_static(base_mint).await? {
             Some(p) => p,
             None => return Ok(None),
@@ -707,14 +745,32 @@ impl PumpFunAmmDex {
         pool_market: Pubkey,
         expected_base_mint: Pubkey,
     ) -> Result<Option<PumpAmmPoolStatic>> {
+        self.try_parse_pool_static_from_market_account_inner(pool_market, expected_base_mint, None)
+            .await
+    }
+
+    /// Parse PumpSwap AMM pool structure from on-chain market account.
+    /// If `prefetched_data` is Some, use it instead of re-fetching via RPC.
+    /// This avoids transient RPC inconsistencies when the account was already fetched.
+    async fn try_parse_pool_static_from_market_account_inner(
+        &self,
+        pool_market: Pubkey,
+        expected_base_mint: Pubkey,
+        prefetched_data: Option<(Pubkey, bool, Vec<u8>)>,
+    ) -> Result<Option<PumpAmmPoolStatic>> {
         let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
         let expected_quote_mint = Pubkey::from_str(WSOL_MINT)?;
 
-        let Some((owner, executable, data)) = self
-            .rpc_get_account_owner_executable_and_data(pool_market)
-            .await?
-        else {
-            return Ok(None);
+        let (owner, executable, data) = if let Some(pf) = prefetched_data {
+            pf
+        } else {
+            let Some(r) = self
+                .rpc_get_account_owner_executable_and_data(pool_market)
+                .await?
+            else {
+                return Ok(None);
+            };
+            r
         };
         if executable || owner != pump_amm_program {
             return Ok(None);
@@ -1085,20 +1141,14 @@ impl PumpFunAmmDex {
                     {
                         (auth, ta)
                     } else {
-                        let combined_list = combined
-                            .iter()
-                            .map(|p| p.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",");
                         // Cannot construct swap instruction without protocol_fee_recipient_ta.
                         // Skip this pool rather than failing hard.
-                        eprintln!(
-                            "pump_amm market parse: no protocol fee recipient token account, skipping pool. \
-                             market={pool_market} global_config={global_config} tried_mints=[{quote_mint},{base_mint}] \
-                             authority_candidates_count={} authority_candidates=[{}] fallback={}",
+                        warn!(
+                            pool = %pool_market,
+                            "pump_amm market parse FAIL: no protocol fee recipient token account \
+                             (global_config={global_config} tried_mints=[{quote_mint},{base_mint}] \
+                             authority_candidates_count={} fallback={fallback_recipient})",
                             combined.len(),
-                            combined_list,
-                            fallback_recipient,
                         );
                         return Ok(None);
                     }
@@ -1147,9 +1197,12 @@ impl PumpFunAmmDex {
                     {
                         Some(_) => (derived_authority, derived_ata),
                         None => {
-                            eprintln!(
-                                "pump_amm market parse: no creator vault token account (no embedded creator ATA; no ATA found; PDA derivation failed). \
-                                 market={pool_market} base_mint={base_mint} authority_candidates_count={}",
+                            warn!(
+                                pool = %pool_market,
+                                base_mint = %base_mint,
+                                "pump_amm market parse FAIL: no creator vault token account \
+                                 (no embedded creator ATA; PDA derivation ATA does not exist; \
+                                 authority_candidates_count={})",
                                 authority_candidates.len()
                             );
                             return Ok(None);
@@ -1157,9 +1210,12 @@ impl PumpFunAmmDex {
                     }
                 }
                 None => {
-                    eprintln!(
-                        "pump_amm market parse: no creator vault token account (no embedded creator ATA; no ATA found; no valid PDA). \
-                         market={pool_market} base_mint={base_mint} authority_candidates_count={}",
+                    warn!(
+                        pool = %pool_market,
+                        base_mint = %base_mint,
+                        "pump_amm market parse FAIL: no creator vault token account \
+                         (no embedded ATA; no ATA found; no valid PDA; \
+                         authority_candidates_count={})",
                         authority_candidates.len()
                     );
                     return Ok(None);
@@ -1239,6 +1295,12 @@ impl PumpFunAmmDex {
         };
 
         if fee_config == Pubkey::default() || global_volume_accumulator == Pubkey::default() {
+            warn!(
+                pool = %pool_market,
+                fee_config_default = (fee_config == Pubkey::default()),
+                vol_accum_default = (global_volume_accumulator == Pubkey::default()),
+                "pump_amm market parse FAIL: fee_config or global_volume_accumulator is default"
+            );
             return Ok(None);
         }
 
@@ -1269,9 +1331,10 @@ impl PumpFunAmmDex {
                 {
                     Some(v) => v,
                     None => {
-                        eprintln!(
-                            "pump_amm market parse: could not derive protocol_fee_recipient PDA, skipping pool. \
-                             market={pool_market} fee_program={fee_program} fee_config={fee_config}",
+                        warn!(
+                            pool = %pool_market,
+                            "pump_amm market parse FAIL: could not derive protocol_fee_recipient PDA \
+                             (fee_program={fee_program} fee_config={fee_config})"
                         );
                         return Ok(None);
                     }
@@ -1287,9 +1350,10 @@ impl PumpFunAmmDex {
                 {
                     Some(_) => (derived_recipient, derived_ta),
                     None => {
-                        eprintln!(
-                            "pump_amm market parse: derived protocol_fee_recipient_ta does not exist, skipping pool. \
-                             recipient={derived_recipient} ta={derived_ta} market={pool_market}",
+                        warn!(
+                            pool = %pool_market,
+                            "pump_amm market parse FAIL: derived protocol_fee_recipient_ta does not exist \
+                             (recipient={derived_recipient} ta={derived_ta})"
                         );
                         return Ok(None);
                     }
@@ -2342,9 +2406,16 @@ impl Dex for PumpFunAmmDex {
             ));
         }
 
-        // Use existing method to parse full pool structure
+        // Use existing method to parse full pool structure.
+        // Pass pre-fetched data to avoid redundant RPC call that can fail
+        // due to transient RPC endpoint inconsistencies.
+        let prefetched = (account.owner, account.executable, account.data);
         match self
-            .try_parse_pool_static_from_market_account(*pool_address, base_mint)
+            .try_parse_pool_static_from_market_account_inner(
+                *pool_address,
+                base_mint,
+                Some(prefetched),
+            )
             .await
         {
             Ok(Some(pool)) => {
@@ -2356,15 +2427,72 @@ impl Dex for PumpFunAmmDex {
                 );
                 Ok(())
             }
-            Ok(None) => Err(anyhow!(
-                "pump_amm pool {} could not be parsed (returned None)",
-                pool_address
-            )),
-            Err(e) => Err(anyhow!(
-                "pump_amm pool {} parse failed: {}",
-                pool_address,
-                e
-            )),
+            Ok(None) => {
+                // Market-account heuristics failed (common for Token-2022 pools or
+                // pools with non-standard account layouts).
+                // Fallback: parse instruction accounts from a real on-chain swap tx.
+                warn!(
+                    pool = %pool_address,
+                    base_mint = %base_mint,
+                    "pump_amm load_pool_by_address: market-account parse returned None, trying TX-history fallback"
+                );
+                match self
+                    .discover_pool_static_via_tx_history_market_only(*pool_address, base_mint)
+                    .await
+                {
+                    Ok(Some(pool)) => {
+                        info!(
+                            pool = %pool_address,
+                            base_mint = %base_mint,
+                            "pump_amm load_pool_by_address: TX-history fallback SUCCESS"
+                        );
+                        self.pools_by_base.insert(base_mint, pool.clone());
+                        self.pools_by_market.insert(*pool_address, base_mint);
+                        Ok(())
+                    }
+                    Ok(None) => Err(anyhow!(
+                        "pump_amm pool {} could not be parsed (market-account returned None, TX-history also None)",
+                        pool_address
+                    )),
+                    Err(e) => Err(anyhow!(
+                        "pump_amm pool {} market-account returned None, TX-history fallback failed: {}",
+                        pool_address,
+                        e
+                    )),
+                }
+            }
+            Err(e) => {
+                // Market-account parse produced an error. Also try TX-history.
+                warn!(
+                    pool = %pool_address,
+                    base_mint = %base_mint,
+                    error = %e,
+                    "pump_amm load_pool_by_address: market-account parse error, trying TX-history fallback"
+                );
+                match self
+                    .discover_pool_static_via_tx_history_market_only(*pool_address, base_mint)
+                    .await
+                {
+                    Ok(Some(pool)) => {
+                        info!(
+                            pool = %pool_address,
+                            base_mint = %base_mint,
+                            "pump_amm load_pool_by_address: TX-history fallback SUCCESS (after market-account error)"
+                        );
+                        self.pools_by_base.insert(base_mint, pool.clone());
+                        self.pools_by_market.insert(*pool_address, base_mint);
+                        Ok(())
+                    }
+                    Ok(None) => Err(anyhow!(
+                        "pump_amm pool {} parse failed: {} (TX-history also None)",
+                        pool_address, e
+                    )),
+                    Err(e2) => Err(anyhow!(
+                        "pump_amm pool {} parse failed: {} (TX-history also failed: {})",
+                        pool_address, e, e2
+                    )),
+                }
+            }
         }
     }
 
@@ -2496,6 +2624,60 @@ impl Dex for PumpFunAmmDex {
         };
 
         let base_mint = Pubkey::from_str(base_mint_str).context("invalid base mint")?;
+
+        // GEYSER-FIRST: Try LivePoolCache for reserves before any RPC call.
+        // The cache is populated by market-data via Geyser account subscriptions
+        // and propagated to execution-engine via PoolCacheUpdate JetStream events.
+        if let Some(ref cache) = self.live_pool_cache {
+            if let Some((base_r, quote_r, pool_market)) =
+                cache.get_pump_amm_reserves_by_base_mint(&base_mint)
+            {
+                let base_reserve = base_r as u128;
+                let quote_reserve = quote_r as u128;
+
+                let (in_reserve, out_reserve) = if is_buy {
+                    (quote_reserve, base_reserve)
+                } else {
+                    (base_reserve, quote_reserve)
+                };
+
+                let (amount_out, price_impact_bps) =
+                    self.quote_cp(amount_in, in_reserve, out_reserve, DEFAULT_TOTAL_FEE_BPS);
+                if amount_out == 0 {
+                    return Ok(None);
+                }
+
+                debug!(
+                    base_mint = %base_mint_str,
+                    pool = %pool_market,
+                    base_reserve = base_r,
+                    quote_reserve = quote_r,
+                    amount_out,
+                    "pump_amm: quote from LivePoolCache (ZERO RPC)"
+                );
+
+                return Ok(Some(Quote {
+                    amount_out,
+                    price_impact_bps,
+                    route: vec![pool_market.to_string()],
+                    fee_bps: DEFAULT_TOTAL_FEE_BPS,
+                    in_reserve,
+                    out_reserve,
+                    input_mint: input_mint.to_string(),
+                    output_mint: output_mint.to_string(),
+                    tick_spacing: None,
+                }));
+            }
+        }
+
+        // RPC FALLBACK: Cache miss — discover pool and fetch vault reserves via RPC.
+        // This should only happen for pools that Geyser hasn't indexed yet or after restart
+        // before PoolCacheUpdate events arrive.
+        warn!(
+            base_mint = %base_mint_str,
+            "pump_amm: LivePoolCache miss, falling back to RPC for quote"
+        );
+
         let pool = match self.discover_pool_static(base_mint).await? {
             Some(p) => p,
             None => return Ok(None),

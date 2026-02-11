@@ -666,12 +666,17 @@ impl PumpFunDex {
                     return Ok(None);
                 }
             } else if state.virtual_token_reserves > 0 {
-                warn!(
+                // Both real_token_reserves and real_sol_reserves are 0, but virtual reserves
+                // are populated. For SELL, this almost certainly means the bonding curve has
+                // been migrated to PumpSwap AMM. Reject and let multi-pool routing handle it.
+                info!(
                     token_mint=%token_mint_str,
                     bonding_curve=%bonding_curve,
                     virtual_token=state.virtual_token_reserves,
-                    "pump.fun: real_reserves=0 but virtual populated — cache stale, proceeding (with_fallback)"
+                    virtual_sol=state.virtual_sol_reserves,
+                    "pump.fun: SELL skipped — real_reserves both 0, likely migrated (with_fallback)"
                 );
+                return Ok(None);
             }
         }
 
@@ -881,12 +886,19 @@ impl Dex for PumpFunDex {
                     return Ok(None);
                 }
             } else if state.virtual_token_reserves > 0 {
-                warn!(
+                // Both real_token_reserves and real_sol_reserves are 0, but virtual reserves
+                // are populated. For SELL, this almost certainly means the bonding curve has
+                // been migrated to PumpSwap AMM. Generating a quote from stale virtual reserves
+                // would succeed locally but fail on-chain with Custom(6023).
+                // Reject the SELL and let multi-pool routing find the correct DEX (PumpSwap AMM).
+                info!(
                     token_mint=%token_mint_str,
                     bonding_curve=%bonding_curve,
                     virtual_token=state.virtual_token_reserves,
-                    "pump.fun: real_reserves=0 but virtual_reserves populated — cache may be stale, proceeding with quote"
+                    virtual_sol=state.virtual_sol_reserves,
+                    "pump.fun: SELL skipped — real_reserves both 0 (likely migrated to PumpSwap AMM)"
                 );
+                return Ok(None);
             }
         }
 

@@ -214,7 +214,16 @@ impl CrossDexHandler {
 
         // Initialize PumpSwap AMM (pump_amm) - for build_swap_ix() only
         if let Some(ref rpc_url) = self.rpc_url {
-            let mut pump_amm = PumpFunAmmDex::new(Arc::clone(&self.rpc), rpc_url.clone(), None);
+            let mut pump_amm = if let Some(ref cache) = self.pool_cache {
+                PumpFunAmmDex::new_with_cache(
+                    Arc::clone(&self.rpc),
+                    rpc_url.clone(),
+                    None,
+                    Arc::clone(cache),
+                )
+            } else {
+                PumpFunAmmDex::new(Arc::clone(&self.rpc), rpc_url.clone(), None)
+            };
             if let Some(pk) = self.wallet_pubkey {
                 pump_amm.set_user_authority(pk);
             }
