@@ -83,7 +83,17 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 print(f"Error reading {jsonl_path}: {e}")
         
-        # Compute running PnL using wallet deltas (fees included)
+        # Compute running PnL using fill-based value_sol.
+        #
+        # IMPORTANT: We use value_sol (derived from fill_in/fill_out) instead of
+        # wallet_sol_delta for PnL calculation. wallet_sol_delta measures native SOL
+        # balance change which does NOT account for WSOL flows (e.g., sells via
+        # PumpSwap AMM receive WSOL in an ATA, not native SOL). Using wallet_delta
+        # as "proceeds" gives wildly wrong PnL (>100% loss on successful sells).
+        #
+        # For BUY:  cost = value_sol (SOL spent on swap from fill_in)
+        # For SELL: proceeds = value_sol (SOL/WSOL received from swap from fill_out)
+        # PnL = proceeds - proportional_cost (can be negative but never < -100%)
         trades.sort(key=lambda t: t.get('timestamp_ms', 0))
         positions = {}
         for trade in trades:
@@ -97,6 +107,7 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 continue
 
             if action == "BUY":
+                # Cost: prefer wallet_delta (includes all fees), fallback to value_sol
                 cost_sol = abs(wallet_delta) if wallet_delta is not None else value_sol
                 if cost_sol is None:
                     continue
@@ -107,9 +118,12 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 trade["pnl_sol"] = 0.0
                 trade["pnl_pct"] = None
             elif action == "SELL":
-                proceeds_sol = wallet_delta if wallet_delta is not None else value_sol
-                if proceeds_sol is None:
-                    continue
+                # Proceeds: use value_sol (from fill_out, the actual swap output).
+                # NOT wallet_delta which can be negative due to ATA rent for WSOL.
+                proceeds_sol = value_sol
+                if proceeds_sol is None or proceeds_sol == 0:
+                    # Last resort: try positive wallet_delta
+                    proceeds_sol = wallet_delta if (wallet_delta is not None and wallet_delta > 0) else 0
                 pos = positions.get(mint_full)
                 if pos and pos["tokens"] > 0:
                     avg_cost = pos["cost_sol"] / pos["tokens"]
@@ -263,74 +277,74 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 }
             
             # ============ BUY / SELL ============
-            # 1. Use explicit side from metadata if available (most reliable,
-            #    set by execution-engine from intent.side).
-            # 2. Prefer wallet_sol_delta to classify action (most robust across token decimals):
-            #    - BUY spends SOL => wallet delta negative
-            #    - SELL receives SOL => wallet delta positive
-            # 3. Override for liquidation: always SELL (liquidation may have negative
-            #    wallet delta when fees exceed micro-value token sell proceeds).
+            # Determine action (BUY or SELL) using the most reliable signal available:
+            #   1. Explicit side from metadata (set by execution-engine from intent.side)
+            #   2. wallet_sol_delta heuristic (positive = received SOL = SELL)
+            #   3. Fill amount heuristics (which side is SOL?)
+            #   4. Override for liquidation (always SELL)
+            #
+            # Determine value_sol (SOL amount of the trade) using FILLS, not wallet_delta:
+            #   - BUY:  value_sol = fill_in (SOL spent on the swap)
+            #   - SELL: value_sol = fill_out (SOL/WSOL received from the swap)
+            #
+            # IMPORTANT: wallet_sol_delta measures native SOL balance change, which does NOT
+            # account for WSOL flows. For SELL trades via PumpSwap AMM, the output is WSOL
+            # in an ATA (not native SOL). wallet_sol_delta shows the ATA rent cost (negative!),
+            # not the actual sell proceeds. Using it for value_sol gives wrong results.
+
+            # Step 1: Determine action
             explicit_side = metadata.get('side', '').upper()
             if explicit_side in ('BUY', 'SELL'):
                 action = explicit_side
-                value_sol = abs(wallet_sol_delta_sol) if wallet_sol_delta_sol is not None else 0
-                token_raw, token_decimals = (
-                    (fill_out_raw, fill_out_decimals) if action == "BUY" else (fill_in_raw, fill_in_decimals)
-                )
-                amount_tokens = (
-                    token_raw / (10 ** token_decimals)
-                    if token_raw and token_decimals is not None
-                    else 0
-                )
             elif wallet_sol_delta_lamports is not None and wallet_sol_delta_lamports != 0:
                 action = "SELL" if wallet_sol_delta_lamports > 0 else "BUY"
-                value_sol = abs(wallet_sol_delta_sol) if wallet_sol_delta_sol is not None else 0
-
-                token_raw, token_decimals = (
-                    (fill_out_raw, fill_out_decimals) if action == "BUY" else (fill_in_raw, fill_in_decimals)
-                )
-                amount_tokens = (
-                    token_raw / (10 ** token_decimals)
-                    if token_raw and token_decimals is not None
-                    else 0
-                )
             else:
-                # Fallback without wallet delta: treat SOL as 9 decimals.
+                # Fallback: use fill decimals to guess which side is SOL
                 fill_in_is_sol = fill_in_raw > 0 and fill_in_decimals == 9
                 fill_out_is_sol = fill_out_raw > 0 and fill_out_decimals == 9
-
                 if fill_out_is_sol and not fill_in_is_sol:
-                    # Sent tokens, received SOL = SELL
                     action = "SELL"
-                    amount_tokens = fill_in_raw / (10 ** fill_in_decimals) if fill_in_raw > 0 else 0
-                    value_sol = fill_out_raw / 1e9 if fill_out_decimals == 9 else 0
                 elif fill_in_is_sol and not fill_out_is_sol:
-                    # Paid SOL, received tokens = BUY
                     action = "BUY"
-                    amount_tokens = fill_out_raw / (10 ** fill_out_decimals) if fill_out_raw > 0 else 0
-                    value_sol = fill_in_raw / 1e9 if fill_in_decimals == 9 else 0
+                elif fill_out_raw > fill_in_raw * 100:
+                    action = "BUY"
                 else:
-                    # Last-resort heuristics
-                    if fill_out_raw > fill_in_raw * 100:
-                        action = "BUY"
-                        amount_tokens = fill_out_raw / (10 ** fill_out_decimals) if fill_out_raw > 0 else 0
-                        value_sol = fill_in_raw / 1e9 if fill_in_decimals == 9 else 0
-                    else:
-                        action = "SELL"
-                        amount_tokens = fill_in_raw / (10 ** fill_in_decimals) if fill_in_raw > 0 else 0
-                        value_sol = fill_out_raw / 1e9 if fill_out_decimals == 9 else 0
-            
-            # Override action for liquidations: they are ALWAYS sells.
-            # wallet_sol_delta can be negative for micro-value tokens where fees
-            # exceed the sell proceeds, causing the heuristic above to misclassify as BUY.
-            if is_liquidation and action != "SELL":
+                    action = "SELL"
+
+            # Override for liquidations: always SELL
+            if is_liquidation:
                 action = "SELL"
-                # Recalculate token amount using fill_in (tokens sold)
+
+            # Step 2: Determine value_sol and amount_tokens from fills
+            if action == "BUY":
+                # BUY: spent SOL (fill_in), received tokens (fill_out)
+                amount_tokens = (
+                    fill_out_raw / (10 ** fill_out_decimals)
+                    if fill_out_raw and fill_out_decimals is not None
+                    else 0
+                )
+                # value_sol: prefer fill_in (actual SOL spent on swap), fallback to wallet_delta
+                if fill_in_raw > 0 and fill_in_decimals == 9:
+                    value_sol = fill_in_raw / 1e9
+                elif wallet_sol_delta_sol is not None:
+                    value_sol = abs(wallet_sol_delta_sol)
+                else:
+                    value_sol = 0
+            else:
+                # SELL: sent tokens (fill_in), received SOL/WSOL (fill_out)
                 amount_tokens = (
                     fill_in_raw / (10 ** fill_in_decimals)
                     if fill_in_raw and fill_in_decimals is not None
                     else 0
                 )
+                # value_sol: prefer fill_out (actual SOL/WSOL received from swap),
+                # fallback to positive wallet_delta, then 0
+                if fill_out_raw > 0 and fill_out_decimals == 9:
+                    value_sol = fill_out_raw / 1e9
+                elif wallet_sol_delta_sol is not None and wallet_sol_delta_sol > 0:
+                    value_sol = wallet_sol_delta_sol
+                else:
+                    value_sol = 0
 
             # Truncate token mint for display (keep first 8 + last 4 chars)
             if token_mint and len(token_mint) > 15:
