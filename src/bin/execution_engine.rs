@@ -1471,34 +1471,95 @@ impl ExecutionContext {
 
         let sol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
 
-        // RPC-FREE liquidation inventory:
-        // Use wallet snapshots from market-data (JetStream, last-per-mint) instead of RPC owner scans.
-        let Some(ref nats) = ctx.nats else {
-            warn!(
-                "Liquidation requested but NATS is not configured; cannot fetch wallet snapshots"
-            );
-            return;
-        };
-        let snapshot_entries = match fetch_wallet_snapshot_entries_from_jetstream(nats, &owner)
+        // Liquidation inventory: RPC-based (getTokenAccountsByOwner).
+        // Liquidation is a manual safety action — RPC calls are acceptable here.
+        // This bypasses JetStream snapshot staleness and ATA derivation issues.
+        let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            .expect("valid token program");
+        let token_2022_program_id =
+            Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+                .expect("valid token-2022 program");
+
+        info!(wallet = %owner, "Liquidation: fetching wallet inventory via RPC (getTokenAccountsByOwner)");
+
+        let mut rpc_token_accounts = ctx
+            .rpc
+            .rpc
+            .get_token_accounts_by_owner(
+                &owner,
+                TokenAccountsFilter::ProgramId(token_program_id),
+            )
+            .await
+            .unwrap_or_default();
+
+        if let Ok(mut accounts_2022) = ctx
+            .rpc
+            .rpc
+            .get_token_accounts_by_owner(
+                &owner,
+                TokenAccountsFilter::ProgramId(token_2022_program_id),
+            )
             .await
         {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "Liquidation: failed to fetch wallet snapshots from JetStream");
-                return;
+            rpc_token_accounts.append(&mut accounts_2022);
+        }
+
+        info!(
+            wallet = %owner,
+            spl_plus_t22_accounts = rpc_token_accounts.len(),
+            "Liquidation: RPC owner-scan complete"
+        );
+
+        // Parse RPC results into (mint, balance, decimals, token_program, token_account_pubkey)
+        let mut inventory: Vec<(String, u64, u8, String, String)> = Vec::new();
+        for ta in &rpc_token_accounts {
+            let parsed = match &ta.account.data {
+                UiAccountData::Json(parsed) => parsed,
+                _ => continue,
+            };
+            let info = match parsed.parsed.get("info") {
+                Some(v) => v,
+                None => continue,
+            };
+            let mint_str = info
+                .get("mint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let balance_str = info
+                .get("tokenAmount")
+                .and_then(|v| v.get("amount"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("0");
+            let balance_raw: u64 = balance_str.parse().unwrap_or(0);
+            let decimals = info
+                .get("tokenAmount")
+                .and_then(|v| v.get("decimals"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(6) as u8;
+            let token_prog_str = ta.account.owner.clone();
+            let ta_pubkey_str = ta.pubkey.clone();
+
+            if balance_raw > 0
+                && mint_str != SOL_MINT
+                && mint_str != WSOL_MINT
+            {
+                inventory.push((mint_str, balance_raw, decimals, token_prog_str, ta_pubkey_str));
             }
-        };
+        }
+
+        info!(
+            non_zero_positions = inventory.len(),
+            "Liquidation: inventory filtered (non-zero, non-SOL/WSOL)"
+        );
 
         let mut liquidation_intents: Vec<TradeIntent> = Vec::new();
 
-        for (mint_str, balance_raw, decimals, token_program_str) in snapshot_entries {
+        for (mint_str, balance_raw, decimals, token_program_str, ta_pubkey_str) in &inventory {
+            let balance_raw = *balance_raw;
+            let decimals = *decimals;
             #[cfg(unix)]
             maybe_ping_watchdog();
-
-            // Skip non-positions
-            if balance_raw == 0 || mint_str == SOL_MINT || mint_str == WSOL_MINT {
-                continue;
-            }
 
             let mint = match Pubkey::from_str(&mint_str) {
                 Ok(m) => m,
@@ -1510,14 +1571,16 @@ impl ExecutionContext {
             let token_program = match Pubkey::from_str(&token_program_str) {
                 Ok(p) => p,
                 Err(_) => {
-                    // Defensive: should not happen (market-data publishes token_program)
                     Self::token_program_for_mint_cached(ctx.live_pool_cache.as_deref(), &mint, None)
                 }
             };
             #[cfg(unix)]
             maybe_ping_watchdog();
-            let ata = Self::ata_for_owner_mint(&owner, &mint, &token_program);
-            let ta_pubkey = ata;
+            // Use the actual token account pubkey from RPC (not derived ATA)
+            let ta_pubkey = match Pubkey::from_str(&ta_pubkey_str) {
+                Ok(p) => p,
+                Err(_) => Self::ata_for_owner_mint(&owner, &mint, &token_program),
+            };
             let amount_in: u64 = balance_raw;
             #[cfg(unix)]
             maybe_ping_watchdog();
