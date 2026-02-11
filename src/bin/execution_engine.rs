@@ -1624,8 +1624,18 @@ impl ExecutionContext {
             let mut min_out_sol: Option<u64> = None;
             let mut quote_attempts: Vec<String> = Vec::new();
 
-            // Prefer Pump.fun if quote exists.
-            if min_out_sol.is_none() {
+            // Check if the bonding curve is known to be complete (migrated to PumpSwap AMM).
+            // This check is done BEFORE attempting the PumpFun quote to avoid accepting
+            // a stale/theoretical quote from a completed bonding curve that will fail
+            // on-chain with error 6005 (BondingCurveComplete).
+            let bonding_curve_known_complete = ctx.live_pool_cache.as_ref()
+                .and_then(|c| c.is_pumpfun_complete_for_mint(&mint))
+                .unwrap_or(false);
+
+            // Prefer Pump.fun bonding curve if quote exists AND curve is NOT complete.
+            // If the curve IS complete, skip directly to multi-pool routing where
+            // PumpSwap AMM (the migration target) will be tried.
+            if min_out_sol.is_none() && !bonding_curve_known_complete {
                 if let Some(ref pumpfun) = pumpfun {
                     match pumpfun
                         .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
@@ -1689,6 +1699,10 @@ impl ExecutionContext {
                         }
                     }
                 }
+            } else if bonding_curve_known_complete {
+                quote_attempts.push(format!(
+                    "pumpfun=skip bonding_curve_complete (migrated to AMM, will try multi-pool)"
+                ));
             }
 
             // Fallback to multi-pool routing (PumpSwap + Meteora + Raydium + Orca).
@@ -1709,11 +1723,8 @@ impl ExecutionContext {
                 // PumpSwap (Pump.fun AMM) with timeout guard.
                 // Skip RPC-heavy discovery if the bonding curve is NOT complete
                 // (no migration → no PumpSwap AMM pool exists).
-                let bonding_curve_complete = ctx.live_pool_cache.as_ref()
-                    .and_then(|c| c.is_pumpfun_complete_for_mint(&mint))
-                    .unwrap_or(false);
-
-                let pump_amm_quote = if !bonding_curve_complete {
+                // Reuse bonding_curve_known_complete from earlier check (avoids redundant cache lookup).
+                let pump_amm_quote = if !bonding_curve_known_complete {
                     // Check if we already have a PumpAmm pool in cache for this mint
                     let has_cached_pump_amm = ctx.live_pool_cache.as_ref()
                         .and_then(|c| c.find_pump_amm_pool_by_base_mint(&mint))
