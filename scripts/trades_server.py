@@ -263,10 +263,26 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 }
             
             # ============ BUY / SELL ============
-            # Prefer wallet_sol_delta to classify action (most robust across token decimals):
-            # - BUY spends SOL => wallet delta negative
-            # - SELL receives SOL => wallet delta positive
-            if wallet_sol_delta_lamports is not None and wallet_sol_delta_lamports != 0:
+            # 1. Use explicit side from metadata if available (most reliable,
+            #    set by execution-engine from intent.side).
+            # 2. Prefer wallet_sol_delta to classify action (most robust across token decimals):
+            #    - BUY spends SOL => wallet delta negative
+            #    - SELL receives SOL => wallet delta positive
+            # 3. Override for liquidation: always SELL (liquidation may have negative
+            #    wallet delta when fees exceed micro-value token sell proceeds).
+            explicit_side = metadata.get('side', '').upper()
+            if explicit_side in ('BUY', 'SELL'):
+                action = explicit_side
+                value_sol = abs(wallet_sol_delta_sol) if wallet_sol_delta_sol is not None else 0
+                token_raw, token_decimals = (
+                    (fill_out_raw, fill_out_decimals) if action == "BUY" else (fill_in_raw, fill_in_decimals)
+                )
+                amount_tokens = (
+                    token_raw / (10 ** token_decimals)
+                    if token_raw and token_decimals is not None
+                    else 0
+                )
+            elif wallet_sol_delta_lamports is not None and wallet_sol_delta_lamports != 0:
                 action = "SELL" if wallet_sol_delta_lamports > 0 else "BUY"
                 value_sol = abs(wallet_sol_delta_sol) if wallet_sol_delta_sol is not None else 0
 
@@ -304,6 +320,18 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                         amount_tokens = fill_in_raw / (10 ** fill_in_decimals) if fill_in_raw > 0 else 0
                         value_sol = fill_out_raw / 1e9 if fill_out_decimals == 9 else 0
             
+            # Override action for liquidations: they are ALWAYS sells.
+            # wallet_sol_delta can be negative for micro-value tokens where fees
+            # exceed the sell proceeds, causing the heuristic above to misclassify as BUY.
+            if is_liquidation and action != "SELL":
+                action = "SELL"
+                # Recalculate token amount using fill_in (tokens sold)
+                amount_tokens = (
+                    fill_in_raw / (10 ** fill_in_decimals)
+                    if fill_in_raw and fill_in_decimals is not None
+                    else 0
+                )
+
             # Truncate token mint for display (keep first 8 + last 4 chars)
             if token_mint and len(token_mint) > 15:
                 display_mint = token_mint[:8] + "..." + token_mint[-4:]

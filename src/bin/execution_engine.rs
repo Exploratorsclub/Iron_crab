@@ -7156,6 +7156,17 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             )
             .with_metadata(intent.metadata.clone());
 
+            // Always include the trade side in execution result metadata so downstream
+            // consumers (trades_server, Grafana) can reliably determine BUY/SELL
+            // without heuristics based on wallet_sol_delta_lamports.
+            exec.metadata.insert(
+                "side".to_string(),
+                match intent.side {
+                    TradeSide::Buy => "BUY".to_string(),
+                    TradeSide::Sell => "SELL".to_string(),
+                },
+            );
+
             // Ensure market-data can track the new ATA via Geyser after a BUY.
             // The intent already carries token_program (from TradeResources) and the
             // output_mint + wallet_pubkey are known — so we derive the ATA deterministically
