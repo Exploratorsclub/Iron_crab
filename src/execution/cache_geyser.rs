@@ -28,7 +28,7 @@ use tracing::{debug, warn};
 use tracing::{error, info};
 
 #[cfg(not(windows))]
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 #[cfg(not(windows))]
 use std::collections::HashMap;
 #[cfg(not(windows))]
@@ -181,70 +181,17 @@ async fn run_cache_subscription(
     let mut last_stats_log = std::time::Instant::now();
 
     loop {
-        // Build subscription request
-        let mut accounts_filter = HashMap::new();
+        let request = build_cache_subscribe_request(
+            &dex_programs,
+            &current_vaults,
+            &current_mints,
+            config.subscribe_vaults,
+            config.vault_chunk_size,
+        );
 
-        // Subscribe to all DEX program accounts (pool state updates)
-        for (idx, program_id) in dex_programs.iter().enumerate() {
-            accounts_filter.insert(
-                format!("dex_pools_{}", idx),
-                SubscribeRequestFilterAccounts {
-                    account: vec![],
-                    owner: vec![program_id.to_string()],
-                    filters: vec![],
-                    nonempty_txn_signature: None,
-                },
-            );
-        }
-
-        // Subscribe to specific vault accounts (for reserve balance updates)
-        if config.subscribe_vaults && !current_vaults.is_empty() {
-            for (chunk_idx, chunk) in current_vaults.chunks(config.vault_chunk_size).enumerate() {
-                accounts_filter.insert(
-                    format!("vaults_{}", chunk_idx),
-                    SubscribeRequestFilterAccounts {
-                        account: chunk.iter().map(|p| p.to_string()).collect(),
-                        owner: vec![],
-                        filters: vec![],
-                        nonempty_txn_signature: None,
-                    },
-                );
-            }
-        }
-
-        // Subscribe to specific mint accounts (for token program detection)
-        // The owner of a mint account IS the token program (SPL Token or Token-2022)
-        if !current_mints.is_empty() {
-            for (chunk_idx, chunk) in current_mints.chunks(config.vault_chunk_size).enumerate() {
-                accounts_filter.insert(
-                    format!("mints_{}", chunk_idx),
-                    SubscribeRequestFilterAccounts {
-                        account: chunk.iter().map(|p| p.to_string()).collect(),
-                        owner: vec![],
-                        filters: vec![],
-                        nonempty_txn_signature: None,
-                    },
-                );
-            }
-        }
-
-        let request = SubscribeRequest {
-            accounts: accounts_filter,
-            slots: HashMap::new(),
-            transactions: HashMap::new(),
-            transactions_status: HashMap::new(),
-            blocks: HashMap::new(),
-            blocks_meta: HashMap::new(),
-            entry: HashMap::new(),
-            commitment: Some(CommitmentLevel::Confirmed as i32),
-            accounts_data_slice: vec![],
-            ping: None,
-            from_slot: None,
-        };
-
-        // Subscribe
-        let mut stream = client
-            .subscribe_once(request)
+        // Subscribe with bidirectional channel: Sink for updates, Stream for data
+        let (mut subscribe_tx, mut stream) = client
+            .subscribe_with_request(Some(request))
             .await
             .map_err(|e| anyhow!("Failed to subscribe: {}", e))?;
 
@@ -366,14 +313,14 @@ async fn run_cache_subscription(
                     }
                 }
 
-                // Vault list updated - need to resubscribe
+                // Vault list updated - send incremental update via Sink
                 new_vaults = vault_changed_fut => {
                     if let Some(vaults) = new_vaults {
                         if vaults != current_vaults {
                             info!(
                                 old_count = current_vaults.len(),
                                 new_count = vaults.len(),
-                                "cache_geyser: vault list changed, resubscribing"
+                                "cache_geyser: vault list changed, updating subscription"
                             );
                             current_vaults = vaults;
 
@@ -389,12 +336,97 @@ async fn run_cache_subscription(
                                 current_mints = new_mints;
                             }
 
-                            break; // Break inner loop to resubscribe
+                            let updated_request = build_cache_subscribe_request(
+                                &dex_programs,
+                                &current_vaults,
+                                &current_mints,
+                                config.subscribe_vaults,
+                                config.vault_chunk_size,
+                            );
+                            if let Err(e) = subscribe_tx.send(updated_request).await {
+                                warn!("cache_geyser: failed to send subscription update: {e}, reconnecting");
+                                break; // Fallback: reconnect on Sink send error
+                            }
+                            info!(
+                                vaults = current_vaults.len(),
+                                mints = current_mints.len(),
+                                "cache_geyser: subscription updated (NO reconnect)"
+                            );
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// Build a SubscribeRequest for cache Geyser subscriptions.
+/// Extracted so it can be reused for initial subscription and incremental updates.
+#[cfg(not(windows))]
+fn build_cache_subscribe_request(
+    dex_programs: &[Pubkey],
+    current_vaults: &[Pubkey],
+    current_mints: &[Pubkey],
+    subscribe_vaults: bool,
+    vault_chunk_size: usize,
+) -> SubscribeRequest {
+    let mut accounts_filter = HashMap::new();
+
+    // Subscribe to all DEX program accounts (pool state updates)
+    for (idx, program_id) in dex_programs.iter().enumerate() {
+        accounts_filter.insert(
+            format!("dex_pools_{}", idx),
+            SubscribeRequestFilterAccounts {
+                account: vec![],
+                owner: vec![program_id.to_string()],
+                filters: vec![],
+                nonempty_txn_signature: None,
+            },
+        );
+    }
+
+    // Subscribe to specific vault accounts (for reserve balance updates)
+    if subscribe_vaults && !current_vaults.is_empty() {
+        for (chunk_idx, chunk) in current_vaults.chunks(vault_chunk_size).enumerate() {
+            accounts_filter.insert(
+                format!("vaults_{}", chunk_idx),
+                SubscribeRequestFilterAccounts {
+                    account: chunk.iter().map(|p| p.to_string()).collect(),
+                    owner: vec![],
+                    filters: vec![],
+                    nonempty_txn_signature: None,
+                },
+            );
+        }
+    }
+
+    // Subscribe to specific mint accounts (for token program detection)
+    if !current_mints.is_empty() {
+        for (chunk_idx, chunk) in current_mints.chunks(vault_chunk_size).enumerate() {
+            accounts_filter.insert(
+                format!("mints_{}", chunk_idx),
+                SubscribeRequestFilterAccounts {
+                    account: chunk.iter().map(|p| p.to_string()).collect(),
+                    owner: vec![],
+                    filters: vec![],
+                    nonempty_txn_signature: None,
+                },
+            );
+        }
+    }
+
+    SubscribeRequest {
+        accounts: accounts_filter,
+        slots: HashMap::new(),
+        transactions: HashMap::new(),
+        transactions_status: HashMap::new(),
+        blocks: HashMap::new(),
+        blocks_meta: HashMap::new(),
+        entry: HashMap::new(),
+        commitment: Some(CommitmentLevel::Confirmed as i32),
+        accounts_data_slice: vec![],
+        ping: None,
+        from_slot: None,
     }
 }
 

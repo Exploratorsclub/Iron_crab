@@ -10,7 +10,7 @@
 //! - HashMap lookup is O(1) - even 100k updates/sec are handled efficiently
 //! - Auto-unsubscribes when ATA confirmation received or timed out
 
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
@@ -200,6 +200,35 @@ impl GeyserTxConfirm {
         }
     }
 
+    /// Build a SubscribeRequest for the given ATA list.
+    /// Extracted so it can be reused for initial subscription and incremental updates.
+    fn build_ata_subscribe_request(atas: &[Pubkey]) -> SubscribeRequest {
+        let mut accounts_filter = HashMap::new();
+        accounts_filter.insert(
+            "ata_watch".to_string(),
+            SubscribeRequestFilterAccounts {
+                account: atas.iter().map(|a| a.to_string()).collect(),
+                owner: vec![], // Don't filter by owner - we want specific accounts
+                filters: vec![],
+                nonempty_txn_signature: None,
+            },
+        );
+
+        SubscribeRequest {
+            accounts: accounts_filter,
+            slots: HashMap::new(),
+            transactions: HashMap::new(),
+            transactions_status: HashMap::new(),
+            blocks: HashMap::new(),
+            blocks_meta: HashMap::new(),
+            entry: HashMap::new(),
+            commitment: Some(CommitmentLevel::Confirmed as i32),
+            accounts_data_slice: vec![],
+            ping: None,
+            from_slot: None,
+        }
+    }
+
     /// Subscribe to specific ATAs and process updates
     async fn subscribe_and_watch(
         geyser_url: &str,
@@ -215,35 +244,11 @@ impl GeyserTxConfirm {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to Geyser: {}", e))?;
 
-        // Build subscription for specific ATA addresses
-        // This is the KEY efficiency: we only subscribe to the exact accounts we care about!
-        let mut accounts_filter = HashMap::new();
-        accounts_filter.insert(
-            "ata_watch".to_string(),
-            SubscribeRequestFilterAccounts {
-                account: atas.iter().map(|a| a.to_string()).collect(),
-                owner: vec![], // Don't filter by owner - we want specific accounts
-                filters: vec![],
-                nonempty_txn_signature: None,
-            },
-        );
+        let request = Self::build_ata_subscribe_request(atas);
 
-        let request = SubscribeRequest {
-            accounts: accounts_filter,
-            slots: HashMap::new(),
-            transactions: HashMap::new(),
-            transactions_status: HashMap::new(),
-            blocks: HashMap::new(),
-            blocks_meta: HashMap::new(),
-            entry: HashMap::new(),
-            commitment: Some(CommitmentLevel::Confirmed as i32),
-            accounts_data_slice: vec![],
-            ping: None,
-            from_slot: None,
-        };
-
-        let mut stream = client
-            .subscribe_once(request)
+        // Subscribe with bidirectional channel: Sink for updates, Stream for data
+        let (mut subscribe_tx, mut stream) = client
+            .subscribe_with_request(Some(request))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to subscribe: {}", e))?;
 
@@ -252,7 +257,7 @@ impl GeyserTxConfirm {
             "geyser_tx_confirm: subscribed to ATA updates"
         );
 
-        // Process updates until watch list changes or shutdown
+        // Process updates until shutdown or error
         loop {
             tokio::select! {
                 // Check for commands (add/remove ATA, shutdown)
@@ -260,12 +265,27 @@ impl GeyserTxConfirm {
                     match cmd {
                         Some(WatcherCommand::Watch(ata)) => {
                             watched_atas.write().insert(ata);
-                            // Resubscribe with new ATA list
-                            return Ok(());
+                            // Send updated subscription via Sink (NO reconnect!)
+                            let current_atas: Vec<Pubkey> = watched_atas.read().iter().copied().collect();
+                            let updated_request = Self::build_ata_subscribe_request(&current_atas);
+                            if let Err(e) = subscribe_tx.send(updated_request).await {
+                                warn!("geyser_tx_confirm: failed to send subscription update: {e}, reconnecting");
+                                return Ok(()); // Fallback: reconnect
+                            }
+                            info!(
+                                ata_count = current_atas.len(),
+                                "geyser_tx_confirm: subscription updated for new ATA (NO reconnect)"
+                            );
                         }
                         Some(WatcherCommand::Unwatch(ata)) => {
                             watched_atas.write().remove(&ata);
-                            // Continue with current subscription
+                            // Send updated subscription via Sink
+                            let current_atas: Vec<Pubkey> = watched_atas.read().iter().copied().collect();
+                            let updated_request = Self::build_ata_subscribe_request(&current_atas);
+                            if let Err(e) = subscribe_tx.send(updated_request).await {
+                                warn!("geyser_tx_confirm: failed to send subscription update on unwatch: {e}, reconnecting");
+                                return Ok(());
+                            }
                         }
                         Some(WatcherCommand::Shutdown) | None => {
                             return Err(anyhow::anyhow!("Shutdown requested"));

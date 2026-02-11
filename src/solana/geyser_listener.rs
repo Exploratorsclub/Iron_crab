@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use tokio::sync::watch;
 
 #[cfg(not(windows))]
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 #[cfg(not(windows))]
 use solana_sdk::bs58;
 #[cfg(not(windows))]
@@ -179,6 +179,83 @@ impl GeyserListener {
         }
     }
 
+    /// Build a SubscribeRequest for the given programs and tracked accounts.
+    /// Extracted so it can be reused for initial subscription and incremental updates.
+    #[cfg(not(windows))]
+    fn build_subscribe_request(
+        program_ids: &[Pubkey],
+        tracked_accounts: &[Pubkey],
+    ) -> SubscribeRequest {
+        const TRACKED_ACCOUNTS_CHUNK: usize = 1000;
+
+        let mut accounts_filter = HashMap::new();
+        let mut transactions_filter = HashMap::new();
+
+        for (idx, program_id) in program_ids.iter().enumerate() {
+            // Account updates for pool state changes
+            accounts_filter.insert(
+                format!("dex_accounts_{}", idx),
+                SubscribeRequestFilterAccounts {
+                    account: vec![],
+                    owner: vec![program_id.to_string()],
+                    filters: vec![],
+                    nonempty_txn_signature: None,
+                },
+            );
+
+            // Transactions for swaps / pool creation
+            transactions_filter.insert(
+                format!("dex_transactions_{}", idx),
+                SubscribeRequestFilterTransactions {
+                    vote: Some(false),
+                    failed: Some(false),
+                    signature: None,
+                    account_include: vec![program_id.to_string()],
+                    account_exclude: vec![],
+                    account_required: vec![],
+                },
+            );
+        }
+
+        // Additional explicit account subscriptions, chunked.
+        if !tracked_accounts.is_empty() {
+            for (chunk_idx, chunk) in tracked_accounts
+                .chunks(TRACKED_ACCOUNTS_CHUNK)
+                .enumerate()
+            {
+                accounts_filter.insert(
+                    format!("tracked_accounts_{}", chunk_idx),
+                    SubscribeRequestFilterAccounts {
+                        account: chunk.iter().map(|p| p.to_string()).collect(),
+                        owner: vec![],
+                        filters: vec![],
+                        nonempty_txn_signature: None,
+                    },
+                );
+            }
+        }
+
+        // Subscribe to blocks_meta for confirmed blockhash streaming
+        let blocks_meta_filter = HashMap::from([(
+            "blockhash".to_string(),
+            SubscribeRequestFilterBlocksMeta {},
+        )]);
+
+        SubscribeRequest {
+            accounts: accounts_filter,
+            slots: HashMap::new(),
+            transactions: transactions_filter,
+            transactions_status: HashMap::new(),
+            blocks: HashMap::new(),
+            blocks_meta: blocks_meta_filter,
+            entry: HashMap::new(),
+            commitment: Some(CommitmentLevel::Confirmed as i32),
+            accounts_data_slice: vec![],
+            ping: None,
+            from_slot: None,
+        }
+    }
+
     #[cfg(not(windows))]
     async fn start_impl(self) -> Result<()> {
         info!(
@@ -196,8 +273,6 @@ impl GeyserListener {
 
         info!("geyser_listener: connected successfully");
 
-        const TRACKED_ACCOUNTS_CHUNK: usize = 1000;
-
         let mut tracked_accounts_rx = self.tracked_accounts_rx;
         let mut tracked_accounts_current: Vec<Pubkey> = tracked_accounts_rx
             .as_ref()
@@ -209,77 +284,14 @@ impl GeyserListener {
         let mut last_log = std::time::Instant::now();
 
         loop {
-            // Build subscription request
-            let mut accounts_filter = HashMap::new();
-            let mut transactions_filter = HashMap::new();
+            let request = Self::build_subscribe_request(
+                &self.program_ids,
+                &tracked_accounts_current,
+            );
 
-            for (idx, program_id) in self.program_ids.iter().enumerate() {
-                // Account updates for pool state changes
-                accounts_filter.insert(
-                    format!("dex_accounts_{}", idx),
-                    SubscribeRequestFilterAccounts {
-                        account: vec![],
-                        owner: vec![program_id.to_string()],
-                        filters: vec![],
-                        nonempty_txn_signature: None,
-                    },
-                );
-
-                // Transactions for swaps / pool creation
-                transactions_filter.insert(
-                    format!("dex_transactions_{}", idx),
-                    SubscribeRequestFilterTransactions {
-                        vote: Some(false),
-                        failed: Some(false),
-                        signature: None,
-                        account_include: vec![program_id.to_string()],
-                        account_exclude: vec![],
-                        account_required: vec![],
-                    },
-                );
-            }
-
-            // Additional explicit account subscriptions, chunked.
-            if !tracked_accounts_current.is_empty() {
-                for (chunk_idx, chunk) in tracked_accounts_current
-                    .chunks(TRACKED_ACCOUNTS_CHUNK)
-                    .enumerate()
-                {
-                    accounts_filter.insert(
-                        format!("tracked_accounts_{}", chunk_idx),
-                        SubscribeRequestFilterAccounts {
-                            account: chunk.iter().map(|p| p.to_string()).collect(),
-                            owner: vec![],
-                            filters: vec![],
-                            nonempty_txn_signature: None,
-                        },
-                    );
-                }
-            }
-
-            // Subscribe to blocks_meta for confirmed blockhash streaming
-            let blocks_meta_filter = HashMap::from([(
-                "blockhash".to_string(),
-                SubscribeRequestFilterBlocksMeta {},
-            )]);
-
-            let request = SubscribeRequest {
-                accounts: accounts_filter,
-                slots: HashMap::new(),
-                transactions: transactions_filter,
-                transactions_status: HashMap::new(),
-                blocks: HashMap::new(),
-                blocks_meta: blocks_meta_filter,
-                entry: HashMap::new(),
-                commitment: Some(CommitmentLevel::Confirmed as i32),
-                accounts_data_slice: vec![],
-                ping: None,
-                from_slot: None,
-            };
-
-            // Subscribe and process stream
-            let mut stream = client
-                .subscribe_once(request)
+            // Subscribe with bidirectional channel: Sink for updates, Stream for data
+            let (mut subscribe_tx, mut stream) = client
+                .subscribe_with_request(Some(request))
                 .await
                 .map_err(|e| anyhow!("Failed to subscribe: {}", e))?;
 
@@ -640,8 +652,18 @@ impl GeyserListener {
                         if let Some(new_list) = maybe_new {
                             if new_list != tracked_accounts_current {
                                 tracked_accounts_current = new_list;
-                                info!(tracked_accounts = tracked_accounts_current.len(), "geyser_listener: tracked accounts changed; resubscribing");
-                                break;
+                                let updated_request = Self::build_subscribe_request(
+                                    &self.program_ids,
+                                    &tracked_accounts_current,
+                                );
+                                if let Err(e) = subscribe_tx.send(updated_request).await {
+                                    warn!("geyser_listener: failed to send subscription update: {e}, reconnecting");
+                                    break; // Fallback: reconnect on Sink send error
+                                }
+                                info!(
+                                    tracked_accounts = tracked_accounts_current.len(),
+                                    "geyser_listener: subscription updated (NO reconnect)"
+                                );
                             }
                         }
                     }
