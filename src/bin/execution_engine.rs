@@ -1624,90 +1624,18 @@ impl ExecutionContext {
             let mut min_out_sol: Option<u64> = None;
             let mut quote_attempts: Vec<String> = Vec::new();
 
-            // Check if the bonding curve is known to be complete (migrated to PumpSwap AMM).
-            // This check is done BEFORE attempting the PumpFun quote to avoid accepting
-            // a stale/theoretical quote from a completed bonding curve that will fail
-            // on-chain with error 6005 (BondingCurveComplete).
-            let bonding_curve_known_complete = ctx.live_pool_cache.as_ref()
-                .and_then(|c| c.is_pumpfun_complete_for_mint(&mint))
-                .unwrap_or(false);
+            // LIQUIDATION ROUTING STRATEGY (Cold Path):
+            // 1. ALWAYS try multi-pool (PumpSwap AMM, Meteora, Raydium, Orca) FIRST.
+            //    This is the most reliable path because PumpSwap AMM is the migration target
+            //    for completed bonding curves, and we can't rely on LivePoolCache knowing
+            //    whether a curve is complete (the bot may not have been running during migration).
+            // 2. Only try PumpFun bonding curve as LAST RESORT if no multi-pool route found.
+            //    The PumpFun quoter computes theoretical quotes from cached reserves even for
+            //    completed curves, which causes on-chain 6005 (BondingCurveComplete) failures.
+            // 3. RPC calls are acceptable here (cold path, safety > speed).
 
-            // Prefer Pump.fun bonding curve if quote exists AND curve is NOT complete.
-            // If the curve IS complete, skip directly to multi-pool routing where
-            // PumpSwap AMM (the migration target) will be tried.
-            if min_out_sol.is_none() && !bonding_curve_known_complete {
-                if let Some(ref pumpfun) = pumpfun {
-                    match pumpfun
-                        .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
-                        .await
-                    {
-                        Ok(Some(q)) => {
-                            #[cfg(unix)]
-                            maybe_ping_watchdog();
-
-                            // For Pump.fun, we include the bonding-curve account pubkey as
-                            // `resources.pools[0]` to keep tx planning deterministic and to satisfy the
-                            // tx_builder invariant that exactly one pool id is provided.
-                            if let Some(bc_str) = q.route.first() {
-                                resources.pools = vec![bc_str.clone()];
-
-                                // Try to get creator from LivePoolCache first (Geyser-first)
-                                let mut _creator_found = false;
-                                if let Ok(bc) = Pubkey::from_str(bc_str) {
-                                    if let Some(cache) = ctx.live_pool_cache.as_ref() {
-                                        if let Some(creator) = cache.get_pumpfun_creator(&bc) {
-                                            metadata
-                                                .insert("creator".to_string(), creator.to_string());
-                                            _creator_found = true;
-                                        }
-                                    }
-                                }
-                            }
-                            #[cfg(unix)]
-                            maybe_ping_watchdog();
-
-                            if metadata.contains_key("creator") && resources.pools.len() == 1 {
-                                metadata.insert("sell_routing".to_string(), "primary".to_string());
-                                metadata.insert("dex".to_string(), "pumpfun".to_string());
-                                min_out_sol = Some(Self::apply_slippage_min_out(
-                                    q.amount_out,
-                                    max_slippage_bps,
-                                ));
-                                quote_attempts.push(format!(
-                                    "pumpfun=ok amount_out={} route={}",
-                                    q.amount_out,
-                                    resources
-                                        .pools
-                                        .first()
-                                        .map(|s| s.as_str())
-                                        .unwrap_or("<none>")
-                                ));
-                            } else {
-                                quote_attempts.push(format!(
-                                    "pumpfun=skip missing_creator_or_pool creator_present={} pools_len={}"
-                                    ,
-                                    metadata.contains_key("creator"),
-                                    resources.pools.len()
-                                ));
-                            }
-                        }
-                        Ok(None) => {
-                            quote_attempts.push("pumpfun=none".to_string());
-                        }
-                        Err(e) => {
-                            quote_attempts.push(format!("pumpfun=err {e:#}"));
-                        }
-                    }
-                }
-            } else if bonding_curve_known_complete {
-                quote_attempts.push(format!(
-                    "pumpfun=skip bonding_curve_complete (migrated to AMM, will try multi-pool)"
-                ));
-            }
-
-            // Fallback to multi-pool routing (PumpSwap + Meteora + Raydium + Orca).
-            // Pump.fun bonding curve is handled above as the known pool.
-            if min_out_sol.is_none() {
+            // --- Phase 1: Multi-pool routing (preferred for liquidation) ---
+            {
                 let mut candidates: Vec<RouteCandidate> = Vec::new();
                 let mut record_candidate =
                     |dex: &str, amount_out: u64, pool_id: String, accounts: Vec<String>| {
@@ -1721,30 +1649,13 @@ impl ExecutionContext {
                     };
 
                 // PumpSwap (Pump.fun AMM) with timeout guard.
-                // Skip RPC-heavy discovery if the bonding curve is NOT complete
-                // (no migration → no PumpSwap AMM pool exists).
-                // Reuse bonding_curve_known_complete from earlier check (avoids redundant cache lookup).
-                let pump_amm_quote = if !bonding_curve_known_complete {
-                    // Check if we already have a PumpAmm pool in cache for this mint
-                    let has_cached_pump_amm = ctx.live_pool_cache.as_ref()
-                        .and_then(|c| c.find_pump_amm_pool_by_base_mint(&mint))
-                        .is_some();
-                    if has_cached_pump_amm {
-                        // Pool exists in cache (from DexPoolAccounts event), proceed with quote
-                        Some(tokio::time::timeout(
-                            Duration::from_secs(10),
-                            pump_amm.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in),
-                        ).await)
-                    } else {
-                        quote_attempts.push("pump_amm=skip (bonding_curve not complete, no cached pool)".to_string());
-                        None
-                    }
-                } else {
-                    Some(tokio::time::timeout(
-                        Duration::from_secs(10),
-                        pump_amm.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in),
-                    ).await)
-                };
+                // For LIQUIDATION: always try PumpSwap AMM regardless of bonding_curve_known_complete.
+                // The LivePoolCache may not know the curve is complete, but PumpSwap AMM
+                // might still have a pool. The RPC-based discovery in quote_exact_in handles this.
+                let pump_amm_quote = Some(tokio::time::timeout(
+                    Duration::from_secs(10),
+                    pump_amm.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in),
+                ).await);
                 match pump_amm_quote {
                     None => {} // Already logged above
                     Some(Err(_timeout)) => {
@@ -2110,6 +2021,72 @@ impl ExecutionContext {
                             "cache=best dex={} min_out={} pool={}",
                             best_route.dex, best_route.amount_out, best_route.pool_id
                         ));
+                    }
+                }
+            }
+
+            // --- Phase 3: PumpFun bonding curve as LAST RESORT ---
+            // Only try if no multi-pool or cache route was found. The PumpFun quoter may
+            // return a valid-looking quote even for completed curves (from cached reserves),
+            // which will fail on-chain with 6005. But if nothing else works, it's worth trying
+            // (e.g. for tokens still on an active bonding curve that have no AMM pool yet).
+            if min_out_sol.is_none() {
+                if let Some(ref pumpfun) = pumpfun {
+                    match pumpfun
+                        .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in)
+                        .await
+                    {
+                        Ok(Some(q)) => {
+                            #[cfg(unix)]
+                            maybe_ping_watchdog();
+
+                            if let Some(bc_str) = q.route.first() {
+                                resources.pools = vec![bc_str.clone()];
+
+                                let mut _creator_found = false;
+                                if let Ok(bc) = Pubkey::from_str(bc_str) {
+                                    if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                                        if let Some(creator) = cache.get_pumpfun_creator(&bc) {
+                                            metadata
+                                                .insert("creator".to_string(), creator.to_string());
+                                            _creator_found = true;
+                                        }
+                                    }
+                                }
+                            }
+                            #[cfg(unix)]
+                            maybe_ping_watchdog();
+
+                            if metadata.contains_key("creator") && resources.pools.len() == 1 {
+                                metadata.insert("sell_routing".to_string(), "pumpfun_fallback".to_string());
+                                metadata.insert("dex".to_string(), "pumpfun".to_string());
+                                min_out_sol = Some(Self::apply_slippage_min_out(
+                                    q.amount_out,
+                                    max_slippage_bps,
+                                ));
+                                quote_attempts.push(format!(
+                                    "pumpfun_fallback=ok amount_out={} route={}",
+                                    q.amount_out,
+                                    resources
+                                        .pools
+                                        .first()
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("<none>")
+                                ));
+                            } else {
+                                quote_attempts.push(format!(
+                                    "pumpfun_fallback=skip missing_creator_or_pool creator_present={} pools_len={}",
+                                    metadata.contains_key("creator"),
+                                    resources.pools.len()
+                                ));
+                            }
+                        }
+                        Ok(None) => {
+                            quote_attempts.push("pumpfun_fallback=none".to_string());
+                        }
+                        Err(e) => {
+                            quote_attempts.push(format!("pumpfun_fallback=err {e:#}"));
+                        }
                     }
                 }
             }
