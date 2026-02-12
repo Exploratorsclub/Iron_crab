@@ -188,6 +188,7 @@ Component name: `momentum-bot`
 | `momentum_exit_buy_ratio` | f64 | 0.4 | 0.0-1.0 | Min buy ratio to stay in position |
 | `momentum_exit_window_secs` | u64 | 30 | > 0 | Check last N seconds for momentum |
 | `momentum_exit_min_trades` | u64 | 5 | > 0 | Min trades needed to evaluate exit |
+| `bonding_curve_exit_pct` | f64 | 98.0 | 0.0-100.0 | Bonding curve exit threshold (%). Exit when PumpFun curve reaches this completion. 0 = disabled. Hot-reload: yes |
 
 ### Validation Rules
 - Liquidity values must be >= 0 (0 means disabled)

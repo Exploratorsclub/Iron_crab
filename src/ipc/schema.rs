@@ -309,6 +309,20 @@ pub enum MarketEventKind {
         /// Slot when this update was observed
         update_slot: u64,
     },
+    /// PumpFun bonding curve progress update (via Geyser account parsing)
+    ///
+    /// Emitted by market-data when a PumpFun bonding curve account changes.
+    /// Used by momentum-bot to trigger exit before curve completion / migration.
+    BondingCurveProgress {
+        /// Token mint address
+        mint: String,
+        /// Bonding curve account address
+        bonding_curve: String,
+        /// Curve completion in basis points (0-10000, e.g. 9800 = 98%)
+        progress_bps: u32,
+        /// Whether the curve is fully complete (migrated)
+        complete: bool,
+    },
     /// Raw account update from Geyser
     AccountUpdate {
         pubkey: String,

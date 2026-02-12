@@ -205,6 +205,9 @@ struct MomentumConfig {
     /// Max slippage BPS for EXIT trades. Default: 9500 (95%)
     /// High value ensures sells succeed even at loss - prevents stuck positions.
     exit_max_slippage_bps: u32,
+    /// Bonding curve exit: threshold in percent (e.g. 98.0 = exit when 98% complete).
+    /// Set to 0.0 to disable. Default: 98.0
+    bonding_curve_exit_pct: f64,
 }
 
 impl Default for MomentumConfig {
@@ -278,6 +281,7 @@ impl Default for MomentumConfig {
             momentum_exit_window_secs: 30, // Check last 30s of trades
             momentum_exit_min_trades: 5,   // Need 5+ trades to evaluate
             exit_max_slippage_bps: 9500,   // 95% - sell at any price rather than hold
+            bonding_curve_exit_pct: 98.0,  // Exit when bonding curve is 98% complete
         }
     }
 }
@@ -332,6 +336,7 @@ impl MomentumConfig {
             momentum_exit_window_secs: cfg.momentum_exit_window_secs,
             momentum_exit_min_trades: cfg.momentum_exit_min_trades,
             exit_max_slippage_bps: cfg.exit_max_slippage_bps,
+            bonding_curve_exit_pct: cfg.bonding_curve_exit_pct.unwrap_or(98.0),
         }
     }
 }
@@ -398,6 +403,8 @@ struct PositionTracker {
     entry_source: PositionEntrySource,
     /// Token program (SPL Token or Token-2022) — persisted for correct ATA handling on SELL
     token_program: Option<String>,
+    /// Current bonding curve progress (basis points, 0-10000). None if not PumpFun.
+    bonding_curve_progress_bps: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -450,6 +457,9 @@ struct PersistedPosition {
     /// Token program (SPL Token or Token-2022) — for correct ATA handling on SELL
     #[serde(default)]
     token_program: Option<String>,
+    /// Bonding curve progress (basis points, 0-10000). None if not PumpFun.
+    #[serde(default)]
+    bonding_curve_progress_bps: Option<u32>,
     /// Schema version for forward compatibility
     schema_version: u8,
 }
@@ -487,6 +497,7 @@ impl PersistedPosition {
             exit_generated_at_unix_ms,
             entry_source: tracker.entry_source,
             token_program: tracker.token_program.clone(),
+            bonding_curve_progress_bps: tracker.bonding_curve_progress_bps,
             schema_version: Self::CURRENT_SCHEMA_VERSION,
         }
     }
@@ -528,6 +539,7 @@ impl PersistedPosition {
             exit_generated_at,
             entry_source: self.entry_source,
             token_program: self.token_program.clone(),
+            bonding_curve_progress_bps: self.bonding_curve_progress_bps,
         }
     }
 }
@@ -562,6 +574,7 @@ impl PositionTracker {
             exit_generated_at: None,
             entry_source: PositionEntrySource::Live,
             token_program: None,
+            bonding_curve_progress_bps: None,
         }
     }
 
@@ -644,6 +657,24 @@ impl PositionTracker {
                     pnl, config.take_profit_pct
                 ),
             ));
+        }
+
+        // 2b. Bonding Curve Exit - curve nearing completion, sell before migration
+        if config.bonding_curve_exit_pct > 0.0 {
+            if let Some(progress_bps) = self.bonding_curve_progress_bps {
+                let threshold_bps = (config.bonding_curve_exit_pct * 100.0) as u32;
+                if progress_bps >= threshold_bps {
+                    return Some((
+                        "BONDING_CURVE_EXIT".to_string(),
+                        format!(
+                            "Bonding curve {:.1}% complete (threshold: {:.1}%), P&L: {:.1}%",
+                            progress_bps as f64 / 100.0,
+                            config.bonding_curve_exit_pct,
+                            pnl
+                        ),
+                    ));
+                }
+            }
         }
 
         // 3. Trailing Stop - activate after profit threshold
@@ -3798,6 +3829,19 @@ impl MomentumContext {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
+                "bonding_curve_exit_pct" => {
+                    if let Some(v) = value.as_f64() {
+                        if (0.0..=100.0).contains(&v) {
+                            config.bonding_curve_exit_pct = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 0.0-100.0".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
 
                 _ => {
                     rejected.push((key.clone(), format!("Unknown config key: {}", key)));
@@ -6904,6 +6948,22 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     positions_tracked = positions_tracked,
                     is_periodic = is_periodic,
                     "WalletSnapshotComplete: no ghost positions found"
+                );
+            }
+        }
+
+        MarketEventKind::BondingCurveProgress { mint, progress_bps, complete, .. } => {
+            // Update the position tracker if we hold this mint
+            let mut positions = ctx.positions.write();
+            if let Some(pos) = positions.get_mut(mint.as_str()) {
+                let old = pos.bonding_curve_progress_bps;
+                pos.bonding_curve_progress_bps = Some(*progress_bps);
+                debug!(
+                    mint = %mint,
+                    progress_bps = progress_bps,
+                    complete = complete,
+                    old_bps = ?old,
+                    "Updated bonding curve progress for position"
                 );
             }
         }

@@ -183,6 +183,7 @@ const CONFIG_DESCRIPTIONS: Record<string, Record<string, string>> = {
     momentum_exit_buy_ratio: 'EXIT: Min buy ratio to stay in (0.0-1.0)',
     momentum_exit_window_secs: 'EXIT: Check last N seconds for momentum',
     momentum_exit_min_trades: 'EXIT: Min trades needed to evaluate exit',
+    bonding_curve_exit_pct: 'EXIT: Bonding curve exit threshold (%). Exit when PumpFun curve reaches this completion. 0 = disabled. Default: 98%',
   },
   'arb-strategy': {
     // 2-Hop Arbitrage
@@ -327,6 +328,7 @@ const CONFIG_GROUPS: Record<string, Record<string, string[]>> = {
       'momentum_exit_buy_ratio',
       'momentum_exit_window_secs',
       'momentum_exit_min_trades',
+      'bonding_curve_exit_pct',
     ],
   },
   'arb-strategy': {
@@ -467,6 +469,7 @@ const DEFAULT_CONFIGS: Record<string, ComponentConfig> = {
     momentum_exit_buy_ratio: 0.4,
     momentum_exit_window_secs: 30,
     momentum_exit_min_trades: 5,
+    bonding_curve_exit_pct: 98.0,
   },
   'arb-strategy': {
     // 2-Hop Arbitrage

@@ -653,6 +653,9 @@ pub struct MomentumCfg {
     /// High value ensures sells succeed even at loss - prevents stuck positions.
     #[serde(default = "default_exit_max_slippage_bps")]
     pub exit_max_slippage_bps: u32,
+    /// Bonding curve exit: threshold in percent (e.g. 98.0 = exit when 98% complete).
+    /// Set to 0.0 to disable. Default: 98.0
+    pub bonding_curve_exit_pct: Option<f64>,
 
     // === Buyer Quality (anti-bot / concentration) ===
     /// Cap for top-1 buyer share (0.0..=1.0) within the buyer window.
@@ -899,6 +902,7 @@ impl Default for MomentumCfg {
             momentum_exit_window_secs: default_momentum_exit_window(),
             momentum_exit_min_trades: default_momentum_exit_min_trades(),
             exit_max_slippage_bps: default_exit_max_slippage_bps(),
+            bonding_curve_exit_pct: Some(98.0),
             top1_buyer_share_cap: default_top1_buyer_share_cap(),
             top3_buyer_share_cap: default_top3_buyer_share_cap(),
             repeat_buyer_min_ratio: default_repeat_buyer_min_ratio(),

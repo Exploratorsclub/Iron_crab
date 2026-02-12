@@ -236,6 +236,10 @@ struct MarketDataContext {
 
     /// Dedup execution results we already processed (in-memory, bounded).
     execution_results_deduper: parking_lot::Mutex<ExecutionResultDeduper>,
+
+    /// Throttling for BondingCurveProgress events: last emitted progress_bps per bonding curve.
+    /// Only emit when progress changes by >= 50 bps or complete flag changes.
+    last_emitted_curve_progress: parking_lot::RwLock<std::collections::HashMap<Pubkey, (u32, bool)>>,
 }
 
 #[derive(Debug, Default)]
@@ -1138,6 +1142,7 @@ async fn main() -> Result<()> {
         tracked_wallet_token_accounts: parking_lot::RwLock::new(std::collections::HashSet::new()),
         tracked_wallet_mint_decimals: parking_lot::RwLock::new(std::collections::HashMap::new()),
         execution_results_deduper: parking_lot::Mutex::new(ExecutionResultDeduper::default()),
+        last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -2062,6 +2067,55 @@ async fn run_geyser_loop(
                                 meta.insert("real_token_reserves".to_string(), s.real_token_reserves.to_string());
                                 meta.insert("real_sol_reserves".to_string(), s.real_sol_reserves.to_string());
                                 pool_update.metadata = Some(meta);
+
+                                // === BondingCurveProgress event for momentum-bot exit signal ===
+                                // PumpFun initial real_token_reserves = 793_100_000_000_000
+                                const INITIAL_REAL_TOKEN_RESERVES: u64 = 793_100_000_000_000;
+                                let tokens_sold = INITIAL_REAL_TOKEN_RESERVES.saturating_sub(s.real_token_reserves);
+                                let progress_bps = ((tokens_sold as u128 * 10_000) / INITIAL_REAL_TOKEN_RESERVES as u128) as u32;
+                                let progress_bps = progress_bps.min(10_000);
+
+                                // Throttle: only emit when progress changes by >= 50 bps or complete changes
+                                let should_emit = {
+                                    let cache = ctx.last_emitted_curve_progress.read();
+                                    match cache.get(&account_update.pubkey) {
+                                        Some(&(last_bps, last_complete)) => {
+                                            progress_bps.abs_diff(last_bps) >= 50 || s.complete != last_complete
+                                        }
+                                        None => true,
+                                    }
+                                };
+
+                                if should_emit {
+                                    ctx.last_emitted_curve_progress.write()
+                                        .insert(account_update.pubkey, (progress_bps, s.complete));
+
+                                    let curve_event = MarketEvent::new(
+                                        "market-data",
+                                        BUILD_VERSION,
+                                        run_id,
+                                        ctx.next_event_id(),
+                                        "geyser_bonding_curve",
+                                        Some(account_update.slot),
+                                        MarketEventKind::BondingCurveProgress {
+                                            mint: s.token_mint.to_string(),
+                                            bonding_curve: account_update.pubkey.to_string(),
+                                            progress_bps,
+                                            complete: s.complete,
+                                        },
+                                    );
+
+                                    if let Err(e) = ctx.jsonl_writer.write(&curve_event) {
+                                        error!(error = %e, "Failed to write BondingCurveProgress event to JSONL");
+                                    }
+
+                                    if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &curve_event).await {
+                                        warn!(error = %e, "Failed to publish BondingCurveProgress to NATS");
+                                    } else {
+                                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                        MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
                             }
                             CachedPoolState::PumpAmm(s) => {
                                 if let Some(creator) = s.creator {
