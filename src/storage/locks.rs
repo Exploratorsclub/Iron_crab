@@ -707,6 +707,15 @@ impl LockManager {
         available.saturating_add(locked)
     }
 
+    /// Get current WSOL balance (from Geyser WalletBalanceUpdate).
+    ///
+    /// This is the most reliable WSOL source because it's updated by the
+    /// same WalletBalanceUpdate event that sets native SOL, ensuring both
+    /// values are consistent for wallet total calculations.
+    pub fn wsol_balance(&self) -> u64 {
+        *self.available_wsol.read()
+    }
+
     /// Get active lock count
     pub fn active_lock_count(&self) -> (usize, usize) {
         (

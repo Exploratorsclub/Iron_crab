@@ -506,6 +506,11 @@ impl WsolManager {
         let wsol_balance = self.get_wsol_balance(&wsol_mint).await.unwrap_or(0);
         self.wsol_balance.store(wsol_balance, Ordering::Relaxed);
         self.wsol_initialized.store(true, Ordering::Relaxed);
+        // NOTE: We intentionally do NOT update WSOL_BALANCE_LAMPORTS here.
+        // The Prometheus gauge is updated via NATS WalletBalanceUpdate events (handle_balance_update),
+        // and wallet total (WALLET_TOTAL_SOL_LAMPORTS) reads from LockManager which is also
+        // updated via NATS. Updating the gauge here without also updating LockManager would
+        // cause a divergence between the two.
 
         debug!(
             sol = sol_balance as f64 / LAMPORTS_PER_SOL as f64,

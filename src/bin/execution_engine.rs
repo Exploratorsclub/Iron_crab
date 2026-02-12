@@ -76,7 +76,7 @@ use ironcrab::metrics::{
     OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK,
     REJECT_SEND_FAILED, REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL,
     TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL,
-    TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS, WSOL_BALANCE_LAMPORTS,
+    TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, slave_consumer_config, wallet_snapshot_consumer_config,
@@ -5528,10 +5528,12 @@ async fn main() -> Result<()> {
                     AVAILABLE_SOL_LAMPORTS.store(available_capital, Ordering::Relaxed);
 
                     // Wallet total = native SOL (available + locked) + WSOL
-                    // Uses total_native_sol() to include locked capital, giving
-                    // the true on-chain balance for PnL / wallet delta tracking.
+                    // Both values come from LockManager (fed by WalletBalanceUpdate events),
+                    // ensuring they're consistent (same event source, same update timing).
+                    // Do NOT use WSOL_BALANCE_LAMPORTS here - it's from WsolManager which
+                    // updates independently and can be stale or 0 during startup.
                     let total_native_sol = ctx.lock_manager.total_native_sol();
-                    let wsol = WSOL_BALANCE_LAMPORTS.load(Ordering::Relaxed);
+                    let wsol = ctx.lock_manager.wsol_balance();
                     WALLET_TOTAL_SOL_LAMPORTS.store(total_native_sol.saturating_add(wsol), Ordering::Relaxed);
 
                     info!(
