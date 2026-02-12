@@ -388,7 +388,27 @@ Emergency-Tools – hier sind RPC-Calls akzeptabel, da dies keine Hot-Path-Binar
 
 **Status**: ❌ UNVERÄNDERT
 
-### BUG G (NEU): PumpFun SELL generiert stale Quote für migrierte Tokens
+### BUG G (NEU): Stale JetStream Wallet-Snapshots → Ghost Open Positions
+
+**Problem**: `MAX_BOOTSTRAP_MINTS = 30` in `market_data.rs` begrenzt den Bootstrap auf 30 Mints. JetStream hat aber 99+ Einträge akkumuliert. Mints jenseits des Limits werden beim Restart NICHT mit aktuellen Balancen überschrieben. Alte non-zero Einträge für bereits verkaufte/geschlossene ATAs bleiben bestehen. `execution_engine` liest beim Bootstrap ALLE JetStream-Einträge und zählt die stale non-zero Einträge fälschlicherweise als offene Positionen.
+
+**Ursache**: Wenn ein Token verkauft und das ATA geschlossen wird, publiziert Geyser ein zero-balance Update. Wenn aber market-data in der Zwischenzeit neugestartet wurde und das ATA on-chain nicht mehr existiert, findet der Owner-Scan das ATA nicht → kein zero-balance Override → stale Eintrag bleibt.
+
+**Fix**: Step 2.5 in market-data Bootstrap: Nach Publizierung der Snapshots für `known_mints` werden ALLE verbleibenden JetStream-Einträge enumeriert und zero-balance Overrides für nicht abgedeckte non-zero Mints publiziert. Scoped via `filter_subject` auf das aktuelle Wallet. Keine zusätzlichen RPC-Calls.
+
+**Status**: ✅ BEHOBEN (Commit `43941752`)
+
+### BUG H (NEU): Meteora DLMM / Raydium CPMM hardcoded SOL quote_mint → false arbitrage
+
+**Problem**: `parse_meteora_transaction()` in `dex_parser.rs` (Zeile ~1372) setzt `quote_mint = SOL_MINT_PUBKEY` mit einem TODO-Kommentar, statt den tatsächlichen quote_mint aus dem Pool-State zu extrahieren. Gleiches Problem bei `parse_raydium_cpmm_transaction()` (Zeile ~1494) und `parse_raydium_v4_swap()` (Zeile ~408).
+
+**Auswirkung**: Meteora DLMM Pools mit non-SOL Quotes (z.B. TOKEN/USDC) passieren den `quote_mint != SOL_MINT` Filter in `arb_strategy.rs` (Zeile ~922, ~1395) unerkannt. Preise von TOKEN/USDC Pools werden fälschlicherweise mit TOKEN/SOL Pools verglichen → falsche Arb-Signale. Dies ist exakt der Bug der im CHANGELOG als "cross-DEX price comparison bug" dokumentiert wurde.
+
+**Betroffen**: `src/solana/dex_parser.rs` — `parse_meteora_transaction()`, `parse_raydium_cpmm_transaction()`, `parse_raydium_v4_swap()`
+
+**Status**: ❌ OFFEN — TODO-Kommentar vorhanden aber nicht implementiert. Benötigt Pool-State-Lookup oder Account-Key-basierte quote_mint-Erkennung.
+
+### BUG I (vormals G): PumpFun SELL generiert stale Quote für migrierte Tokens
 
 **`pumpfun.rs` Zeile ~881**: Wenn `real_reserves == 0` aber `virtual_reserves > 0`, generiert der Quoter trotzdem ein Quote. On-chain scheitert dies mit Error 6023.
 
