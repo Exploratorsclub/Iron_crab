@@ -4443,11 +4443,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        warn!(error = %e, "WsolManager failed to connect to NATS (running without events)");
-                        // Run anyway - will use periodic fallback polling
-                        if let Err(e) = wsol_manager.run_polling_only(shutdown_rx_wsol).await {
-                            error!(error = %e, "WsolManager polling task failed");
-                        }
+                        error!(error = %e, "WsolManager failed to connect to NATS, cannot run without events");
                     }
                 }
             });

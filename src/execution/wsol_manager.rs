@@ -336,15 +336,9 @@ impl WsolManager {
             "WsolManager starting"
         );
 
-        // Initial balance fetch
-        if let Err(e) = self.fetch_and_update_balances().await {
-            warn!(error = %e, "Failed to fetch initial balances");
-        } else {
-            // Check if we need to wrap on startup
-            if let Err(e) = self.check_and_act().await {
-                warn!(error = %e, "Failed initial balance check");
-            }
-        }
+        // No startup RPC — WsolManager starts with balance 0 and waits for
+        // the first Geyser-driven WalletBalanceUpdate via NATS (typically <3 s).
+        // With sol_balance=0 no wrap can be triggered, so this is safe.
 
         // Subscribe to wallet balance updates
         use crate::nats::wallet_balance_topic;
@@ -375,7 +369,7 @@ impl WsolManager {
                     }
                 }
 
-                // Process NATS messages
+                // Process NATS messages (sole source of balance data)
                 msg = subscription.next() => {
                     match msg {
                         Some(nats_msg) => {
@@ -388,64 +382,6 @@ impl WsolManager {
                             // Small delay before retry
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
-                    }
-                }
-
-                // Periodic fallback check (every 60s in case we miss NATS messages)
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                    if let Err(e) = self.fetch_and_update_balances().await {
-                        debug!(error = %e, "Periodic balance fetch failed");
-                    } else if let Err(e) = self.check_and_act().await {
-                        debug!(error = %e, "Periodic balance check failed");
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Run WSOL manager in polling-only mode (without NATS)
-    ///
-    /// Useful when NATS is unavailable - will check balances every 30 seconds.
-    pub async fn run_polling_only(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
-        if !self.config.enabled {
-            info!("WsolManager disabled by config");
-            return Ok(());
-        }
-
-        info!(
-            wallet = %self.wallet_pubkey,
-            min_wsol = self.config.min_wsol_sol,
-            target_wsol = self.config.target_wsol_sol,
-            max_wsol = self.config.max_wsol_sol,
-            dry_run = self.config.dry_run,
-            "WsolManager starting (polling-only mode)"
-        );
-
-        // Initial balance fetch
-        if let Err(e) = self.fetch_and_update_balances().await {
-            warn!(error = %e, "Failed to fetch initial balances");
-        } else if let Err(e) = self.check_and_act().await {
-            warn!(error = %e, "Failed initial balance check");
-        }
-
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        info!("WsolManager shutting down (polling mode)");
-                        break;
-                    }
-                }
-
-                _ = interval.tick() => {
-                    if let Err(e) = self.fetch_and_update_balances().await {
-                        debug!(error = %e, "Periodic balance fetch failed");
-                    } else if let Err(e) = self.check_and_act().await {
-                        debug!(error = %e, "Periodic balance check failed");
                     }
                 }
             }
@@ -471,16 +407,9 @@ impl WsolManager {
             self.wsol_initialized.store(true, Ordering::Relaxed);
             // Update Prometheus gauge
             WSOL_BALANCE_LAMPORTS.store(wsol, Ordering::Relaxed);
-        } else if !self.wsol_initialized.load(Ordering::Relaxed) {
-            // If WSOL was never initialized, do a one-time RPC snapshot.
-            info!(
-                wallet = %self.wallet_pubkey,
-                "WSOL not initialized from Geyser; running one-time RPC snapshot"
-            );
-            if let Err(e) = self.fetch_and_update_balances().await {
-                debug!(error = %e, "WSOL snapshot RPC failed");
-            }
         }
+        // If update has no WSOL data, we simply wait for the next event that does.
+        // No RPC fallback — Geyser-first architecture.
 
         debug!(
             sol = update.sol_lamports as f64 / LAMPORTS_PER_SOL as f64,
@@ -493,52 +422,6 @@ impl WsolManager {
 
         // Check if action needed
         self.check_and_act().await
-    }
-
-    /// Fetch current balances from RPC (fallback)
-    async fn fetch_and_update_balances(&self) -> Result<()> {
-        // Fetch native SOL
-        let sol_balance = self.rpc.rpc.get_balance(&self.wallet_pubkey).await?;
-        self.sol_balance.store(sol_balance, Ordering::Relaxed);
-
-        // Fetch WSOL balance
-        let wsol_mint = Pubkey::from_str(WSOL_MINT)?;
-        let wsol_balance = self.get_wsol_balance(&wsol_mint).await.unwrap_or(0);
-        self.wsol_balance.store(wsol_balance, Ordering::Relaxed);
-        self.wsol_initialized.store(true, Ordering::Relaxed);
-        // NOTE: We intentionally do NOT update WSOL_BALANCE_LAMPORTS here.
-        // The Prometheus gauge is updated via NATS WalletBalanceUpdate events (handle_balance_update),
-        // and wallet total (WALLET_TOTAL_SOL_LAMPORTS) reads from LockManager which is also
-        // updated via NATS. Updating the gauge here without also updating LockManager would
-        // cause a divergence between the two.
-
-        debug!(
-            sol = sol_balance as f64 / LAMPORTS_PER_SOL as f64,
-            wsol = wsol_balance as f64 / LAMPORTS_PER_SOL as f64,
-            "Fetched balances from RPC"
-        );
-
-        Ok(())
-    }
-
-    /// Get WSOL token account balance
-    async fn get_wsol_balance(&self, wsol_mint: &Pubkey) -> Result<u64> {
-        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
-            &spl_token::solana_program::pubkey::Pubkey::new_from_array(
-                self.wallet_pubkey.to_bytes(),
-            ),
-            &spl_token::solana_program::pubkey::Pubkey::new_from_array(wsol_mint.to_bytes()),
-            &spl_token::id(),
-        );
-        let ata_sdk = Pubkey::new_from_array(ata.to_bytes());
-
-        match self.rpc.rpc.get_token_account_balance(&ata_sdk).await {
-            Ok(balance) => {
-                let amount_str = balance.amount;
-                Ok(amount_str.parse::<u64>().unwrap_or(0))
-            }
-            Err(_) => Ok(0), // ATA doesn't exist
-        }
     }
 
     /// Check current balances and wrap/unwrap if needed
