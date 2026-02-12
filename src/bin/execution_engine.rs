@@ -2054,11 +2054,52 @@ impl ExecutionContext {
 
                                 let mut _creator_found = false;
                                 if let Ok(bc) = Pubkey::from_str(bc_str) {
+                                    // 1) Try LivePoolCache first (Geyser-fed, zero latency)
                                     if let Some(cache) = ctx.live_pool_cache.as_ref() {
                                         if let Some(creator) = cache.get_pumpfun_creator(&bc) {
                                             metadata
                                                 .insert("creator".to_string(), creator.to_string());
                                             _creator_found = true;
+                                        }
+                                    }
+
+                                    // 2) LIQUIDATION ONLY: RPC fallback for creator (cold path, security > speed)
+                                    // This handles the case where the LivePoolCache consumer hasn't
+                                    // caught up yet or the bonding curve was never cached.
+                                    if !_creator_found {
+                                        warn!(
+                                            mint = %mint,
+                                            bonding_curve = %bc,
+                                            "LIQUIDATION: Creator not in cache, falling back to RPC"
+                                        );
+                                        match ctx.rpc.get_account(&bc).await {
+                                            Ok(account) => {
+                                                if account.data.len() >= 81 {
+                                                    let creator_bytes: [u8; 32] = account.data[49..81]
+                                                        .try_into()
+                                                        .expect("slice is exactly 32 bytes");
+                                                    let creator = Pubkey::new_from_array(creator_bytes);
+                                                    if creator != Pubkey::default() {
+                                                        metadata.insert(
+                                                            "creator".to_string(),
+                                                            creator.to_string(),
+                                                        );
+                                                        _creator_found = true;
+                                                        info!(
+                                                            mint = %mint,
+                                                            creator = %creator,
+                                                            "LIQUIDATION: Creator fetched via RPC fallback"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    error = %e,
+                                                    mint = %mint,
+                                                    "LIQUIDATION: RPC fallback for creator failed"
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -3513,11 +3554,15 @@ fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, CachedP
 ///
 /// # Returns
 ///
-/// Number of pools recovered from JetStream
+/// Returns (pools_recovered, consumer) so the caller can reuse the consumer
+/// in the main loop instead of creating a new one (which would replay all messages).
 async fn bootstrap_pool_cache_from_jetstream(
     nats_client: &NatsClient,
     live_pool_cache: &ironcrab::execution::live_pool_cache::LivePoolCache,
-) -> Result<usize> {
+) -> Result<(
+    usize,
+    Option<async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>>,
+)> {
     use async_nats::jetstream;
     use futures::StreamExt;
 
@@ -3530,7 +3575,7 @@ async fn bootstrap_pool_cache_from_jetstream(
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, stream = STREAM_NAME, "JetStream stream not found (market-data may not be running)");
-            return Ok(0);
+            return Ok((0, None));
         }
     };
 
@@ -3597,7 +3642,7 @@ async fn bootstrap_pool_cache_from_jetstream(
     }
 
     info!(pools_recovered, "SLAVE CACHE BOOTSTRAP: Complete");
-    Ok(pools_recovered)
+    Ok((pools_recovered, Some(consumer)))
 }
 
 /// Bootstrap open positions count from wallet snapshots (JetStream)
@@ -4250,19 +4295,25 @@ async fn main() -> Result<()> {
         });
 
     // Bootstrap LivePoolCache from JetStream (state recovery after restart)
-    if let (Some(ref nats_client), Some(ref cache)) = (&nats, &live_pool_cache) {
+    // The consumer is returned so it can be reused in the main loop,
+    // avoiding a second LastPerSubject replay of ~579k messages.
+    let bootstrap_consumer = if let (Some(ref nats_client), Some(ref cache)) = (&nats, &live_pool_cache) {
         match bootstrap_pool_cache_from_jetstream(nats_client, cache).await {
-            Ok(pools_recovered) => {
+            Ok((pools_recovered, consumer)) => {
                 info!(
                     pools_recovered,
                     "SLAVE CACHE: State recovered from JetStream"
                 );
+                consumer
             }
             Err(e) => {
                 warn!(error = %e, "SLAVE CACHE: JetStream bootstrap failed (will rely on incremental updates)");
+                None
             }
         }
-    }
+    } else {
+        None
+    };
 
     let mut ctx = ExecutionContext {
         run_id: run_id.clone(),
@@ -5196,19 +5247,36 @@ async fn main() -> Result<()> {
     }
 
     // Subscribe to PoolCacheUpdates from JetStream (Single Source of Truth)
-    let pool_cache_consumer = if let Some(ref nats) = ctx.nats {
+    // CRITICAL: Reuse the bootstrap consumer if available. Creating a NEW ephemeral
+    // consumer with LastPerSubject would replay ALL ~579k messages again at 100/tick,
+    // taking ~97 minutes before new updates (e.g. from purchased tokens) are processed.
+    let pool_cache_consumer = if let Some(consumer) = bootstrap_consumer {
+        info!(
+            stream = STREAM_NAME,
+            "Reusing bootstrap consumer for live PoolCacheUpdate sync (no duplicate replay)"
+        );
+        Some(consumer)
+    } else if let Some(ref nats) = ctx.nats {
         use async_nats::jetstream;
 
         let jetstream = jetstream::new(nats.client().clone());
 
         match jetstream.get_stream(STREAM_NAME).await {
             Ok(stream) => {
-                // Create durable consumer for live updates (picks up where bootstrap left off)
-                match stream.create_consumer(slave_consumer_config()).await {
+                // No bootstrap ran → create consumer with DeliverPolicy::New to avoid
+                // replaying all historical messages (the cache is empty anyway).
+                let config = async_nats::jetstream::consumer::pull::Config {
+                    deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::New,
+                    ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+                    max_ack_pending: 1000,
+                    filter_subject: "ironcrab.pool_cache.>".to_string(),
+                    ..Default::default()
+                };
+                match stream.create_consumer(config).await {
                     Ok(consumer) => {
                         info!(
                             stream = STREAM_NAME,
-                            "Subscribed to JetStream PoolCacheUpdates (SLAVE cache sync from market-data MASTER)"
+                            "Created NEW JetStream consumer (no bootstrap, DeliverPolicy::New)"
                         );
                         Some(consumer)
                     }
