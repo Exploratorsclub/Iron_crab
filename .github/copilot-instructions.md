@@ -168,7 +168,7 @@ Wenn du *alle* relevanten Ports (Control Plane + Grafana + Prometheus + Metrics)
 
 Windows (SSH Tunnel + Vite UI in separatem Prozess):
 ```powershell
-.\run_local.ps1 -Action start -Host <server> -User ironcrab -Port 2222
+.\run_local.ps1 -Action start -Host <SERVER_IP> -User <USERNAME> -Port <PORT>
 .\run_local.ps1 -Action start -Host ironcrab-prod
 .\run_local.ps1 -Action status
 .\run_local.ps1 -Action stop

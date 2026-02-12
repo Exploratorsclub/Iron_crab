@@ -264,6 +264,9 @@ pub static NATS_MESSAGES_RECEIVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU6
 pub static NATS_RECONNECTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static NATS_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+// --- Wallet total (SOL + WSOL combined) ---
+pub static WALLET_TOTAL_SOL_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
 // --- WsolManager metrics ---
 pub static WSOL_BALANCE_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static WSOL_WRAP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -857,6 +860,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "available_sol_lamports",
         AVAILABLE_SOL_LAMPORTS.load(Ordering::Relaxed)
+    );
+    line!(
+        "wallet_total_sol_lamports",
+        WALLET_TOTAL_SOL_LAMPORTS.load(Ordering::Relaxed)
     );
     line!(
         "active_capital_locks",

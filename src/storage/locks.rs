@@ -692,6 +692,21 @@ impl LockManager {
         *self.available_sol.read()
     }
 
+    /// Get total native SOL balance (available + locked).
+    ///
+    /// This represents the true on-chain balance and should be used for
+    /// wallet-level metrics (PnL tracking), NOT for trading decisions.
+    pub fn total_native_sol(&self) -> u64 {
+        let available = *self.available_sol.read();
+        let locked: u64 = self
+            .capital_locks
+            .read()
+            .values()
+            .map(|l| l.sol_lamports)
+            .sum();
+        available.saturating_add(locked)
+    }
+
     /// Get active lock count
     pub fn active_lock_count(&self) -> (usize, usize) {
         (

@@ -291,6 +291,99 @@
       "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } } }
     },
     {
+      "type": "stat",
+      "title": "Wallet SOL+WSOL",
+      "description": "Combined native SOL + WSOL balance",
+      "targets": [{ "expr": "wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} / 1e9", "refId": "A" }],
+      "gridPos": {"h":4,"w":4,"x":4,"y":33},
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 4 } }
+    },
+    {
+      "type": "stat",
+      "title": "24h Wallet Delta",
+      "description": "Wallet value change (SOL+WSOL) over last 24 hours",
+      "targets": [{ "expr": "(wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} - wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} offset 24h) / 1e9", "refId": "A" }],
+      "gridPos": {"h":4,"w":4,"x":8,"y":33},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 4,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "24h Realized PnL",
+      "description": "Sum of realized PnL from all SELL trades in the last 24 hours",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "bf7ze18vokflsf"
+      },
+      "targets": [{
+        "refId": "A",
+        "type": "json",
+        "source": "url",
+        "format": "table",
+        "url": "/pnl_24h",
+        "url_options": { "method": "GET", "data": "" },
+        "columns": [
+          { "selector": "realized_pnl_sol", "text": "PnL", "type": "number" }
+        ]
+      }],
+      "gridPos": {"h":4,"w":4,"x":12,"y":33},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 4,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "24h Wins / Losses",
+      "description": "Win/Loss count from realized trades in last 24h",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "bf7ze18vokflsf"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "/pnl_24h",
+          "url_options": { "method": "GET", "data": "" },
+          "columns": [
+            { "selector": "wins", "text": "Wins", "type": "number" },
+            { "selector": "losses", "text": "Losses", "type": "number" },
+            { "selector": "trade_count", "text": "Total", "type": "number" }
+          ]
+        }
+      ],
+      "gridPos": {"h":4,"w":4,"x":16,"y":33},
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
       "type": "piechart",
       "title": "Intent Rejection Reasons",
       "targets": [{ "expr": "intent_rejection_by_reason{job=\"ironcrab-execution-engine\"}", "refId": "A", "legendFormat": "{{reason}}" }],
@@ -334,7 +427,7 @@
     },
     {
       "type": "table",
-      "title": "📋 Recent Trades (Last 20)",
+      "title": "📋 Recent Trades (Current Run)",
       "gridPos": {"h":12,"w":24,"x":0,"y":43},
       "datasource": {
         "type": "yesoreyeram-infinity-datasource",
@@ -345,7 +438,7 @@
         "type": "json",
         "source": "url",
         "format": "table",
-        "url": "/trades",
+        "url": "/trades?mode=run",
         "url_options": {
           "method": "GET",
           "data": ""
@@ -486,7 +579,8 @@
                   { "type": "value", "options": { "LP_REMOVAL": { "color": "purple", "text": "🟣 LP_REMOVAL" } } },
                   { "type": "value", "options": { "TIME_EXIT": { "color": "blue", "text": "🔵 TIMED_EXIT" } } },
                   { "type": "value", "options": { "TRAILING_STOP": { "color": "yellow", "text": "🟡 TRAILING_STOP" } } },
-                  { "type": "value", "options": { "MOMENTUM_EXIT": { "color": "purple", "text": "🟣 MOMENTUM_EXIT" } } }
+                  { "type": "value", "options": { "MOMENTUM_EXIT": { "color": "purple", "text": "🟣 MOMENTUM_EXIT" } } },
+                  { "type": "value", "options": { "BONDING_CURVE_EXIT": { "color": "yellow", "text": "🟡 BONDING_CURVE_EXIT" } } }
                 ]
               }
             ]
