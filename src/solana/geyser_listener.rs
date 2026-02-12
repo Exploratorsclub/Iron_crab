@@ -660,7 +660,7 @@ impl GeyserListener {
                                     warn!("geyser_listener: failed to send subscription update: {e}, reconnecting");
                                     break; // Fallback: reconnect on Sink send error
                                 }
-                                info!(
+                                warn!(
                                     tracked_accounts = tracked_accounts_current.len(),
                                     "geyser_listener: subscription updated (NO reconnect)"
                                 );

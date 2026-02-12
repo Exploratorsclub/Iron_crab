@@ -272,7 +272,7 @@ impl GeyserTxConfirm {
                                 warn!("geyser_tx_confirm: failed to send subscription update: {e}, reconnecting");
                                 return Ok(()); // Fallback: reconnect
                             }
-                            info!(
+                            warn!(
                                 ata_count = current_atas.len(),
                                 "geyser_tx_confirm: subscription updated for new ATA (NO reconnect)"
                             );

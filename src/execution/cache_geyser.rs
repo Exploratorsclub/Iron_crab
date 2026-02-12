@@ -347,7 +347,7 @@ async fn run_cache_subscription(
                                 warn!("cache_geyser: failed to send subscription update: {e}, reconnecting");
                                 break; // Fallback: reconnect on Sink send error
                             }
-                            info!(
+                            warn!(
                                 vaults = current_vaults.len(),
                                 mints = current_mints.len(),
                                 "cache_geyser: subscription updated (NO reconnect)"
