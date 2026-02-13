@@ -364,10 +364,6 @@ fn parse_raydium_swap(
             .unwrap_or_default()
     };
 
-    // Note: quote_mint not needed anymore - SELL path uses native balance
-    let _quote_mint =
-        Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default(); // SOL
-
     // Calculate actual amounts from token balance changes
     let (sol_amount, token_amount) = if is_buy {
         // BUY: User pays SOL, receives tokens
@@ -402,10 +398,15 @@ fn parse_raydium_swap(
 
     let token_decimals = get_token_decimals(&update.post_token_balances, &base_mint);
 
+    // Extract actual quote_mint from token balance changes.
+    // For non-SOL pairs (e.g., TOKEN/USDC), this correctly identifies the
+    // quote_mint so arb-strategy can filter them out.
+    let quote_mint = extract_quote_mint(&update.post_token_balances, &base_mint);
+
     Some(ParsedDexEvent::Trade {
         pool_address,
         mint: base_mint,
-        quote_mint: *SOL_MINT_PUBKEY,
+        quote_mint,
         trader,
         dex: DexType::RaydiumAmmV4,
         is_buy,
@@ -1085,6 +1086,23 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     })
 }
 
+/// Extract the quote_mint from token balance records by finding the mint that
+/// is different from `base_mint`. In a swap, exactly 2 mints are involved:
+/// the base token and the quote token. This returns the one that isn't `base_mint`.
+///
+/// Falls back to SOL_MINT_PUBKEY if no other mint is found (e.g., if balances
+/// are missing or the transaction only involves a single mint).
+fn extract_quote_mint(
+    balances: &[crate::solana::geyser_listener::TokenBalance],
+    base_mint: &Pubkey,
+) -> Pubkey {
+    balances
+        .iter()
+        .filter_map(|b| Pubkey::from_str(&b.mint).ok())
+        .find(|m| m != base_mint)
+        .unwrap_or(*SOL_MINT_PUBKEY)
+}
+
 /// Calculate token balance change for a specific mint
 /// Returns positive value for increase (received), negative for decrease (sent)
 fn calculate_token_balance_change(
@@ -1310,10 +1328,6 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
     let _min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
 
     // Determine direction from balance changes
-    // Note: quote_mint not needed anymore - SELL path uses native balance
-    let _quote_mint =
-        Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default();
-
     // Find which token increased (that's what user received)
     let base_mint = update
         .post_token_balances
@@ -1366,10 +1380,11 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
 
     let token_decimals = get_token_decimals(&update.post_token_balances, &base_mint);
 
-    // DLMM can have non-SOL quotes (e.g., USDC), but for now we assume SOL.
-    // The arb-strategy filters by quote_mint anyway, so non-SOL pairs will be excluded.
-    // TODO: Extract actual quote_mint from pool state or token balances.
-    let quote_mint = *SOL_MINT_PUBKEY;
+    // Extract actual quote_mint from token balance changes.
+    // In a swap, exactly 2 mints are involved: base and quote.
+    // For non-SOL pairs (e.g., TOKEN/USDC), this correctly identifies the
+    // quote_mint so arb-strategy can filter them out.
+    let quote_mint = extract_quote_mint(&update.post_token_balances, &base_mint);
 
     Some(ParsedDexEvent::Trade {
         pool_address,
@@ -1443,17 +1458,25 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
     let vault_0_mint = update.instruction_accounts.get(10).copied()?;
     let vault_1_mint = update.instruction_accounts.get(11).copied()?;
 
-    let quote_mint =
-        Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap_or_default();
+    let sol_mint = *SOL_MINT_PUBKEY;
 
     // Determine which is base (non-SOL) and which is quote (SOL)
-    let (base_mint, is_buy) = if vault_0_mint == quote_mint {
+    let (base_mint, is_buy) = if vault_0_mint == sol_mint {
         (vault_1_mint, true) // Vault 0 = SOL, so buying vault 1 token
-    } else if vault_1_mint == quote_mint {
+    } else if vault_1_mint == sol_mint {
         (vault_0_mint, false) // Vault 1 = SOL, so selling vault 0 token
     } else {
         // Non-SOL pair, use first vault as base
         (vault_0_mint, true)
+    };
+
+    // Derive actual quote_mint from vault mints (instead of hardcoding SOL).
+    // For non-SOL pairs (e.g., TOKEN/USDC) this ensures arb-strategy correctly
+    // filters them out instead of comparing incompatible quote currencies.
+    let quote_mint = if base_mint == vault_0_mint {
+        vault_1_mint
+    } else {
+        vault_0_mint
     };
 
     // Calculate actual amounts from balance changes
@@ -1488,10 +1511,6 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
     );
 
     let token_decimals = get_token_decimals(&update.post_token_balances, &base_mint);
-
-    // CPMM can have non-SOL quotes, but for now we assume SOL.
-    // The arb-strategy filters by quote_mint anyway.
-    let quote_mint = *SOL_MINT_PUBKEY;
 
     Some(ParsedDexEvent::Trade {
         pool_address,
