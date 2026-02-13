@@ -4836,21 +4836,35 @@ async fn main() -> Result<()> {
         }
     }
 
-    // === FIX-21: Bootstrap SLAVE LivePoolCache from JetStream ===
-    let bootstrap_consumer = if let Some(ref nats) = ctx.nats {
-        match pool_cache_sync::bootstrap_pool_cache_from_jetstream(nats, &ctx.live_pool_cache).await
-        {
-            Ok((recovered, consumer)) => {
-                info!(pools_recovered = recovered, "MOMENTUM SLAVE CACHE: bootstrap complete");
-                consumer
-            }
-            Err(e) => {
-                warn!(error = %e, "MOMENTUM SLAVE CACHE: bootstrap failed");
-                None
-            }
+    // === FIX-21: Bootstrap SLAVE LivePoolCache from JetStream (ASYNC) ===
+    // Bootstrap runs in a background task to avoid blocking startup.
+    // With 688k+ pool entries, synchronous bootstrap takes >90s which
+    // exceeds systemd's startup timeout. The service starts immediately;
+    // until bootstrap completes, find_best_*_pool() falls back to last_trade_ratio.
+    let bootstrap_consumer_rx = {
+        let (tx, rx) = tokio::sync::oneshot::channel::<
+            Option<async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>>,
+        >();
+
+        if ctx.nats.is_some() {
+            let ctx_clone = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let nats = ctx_clone.nats.as_ref().unwrap();
+                match pool_cache_sync::bootstrap_pool_cache_from_jetstream(nats, &ctx_clone.live_pool_cache).await {
+                    Ok((recovered, consumer)) => {
+                        info!(pools_recovered = recovered, "MOMENTUM SLAVE CACHE: bootstrap complete (async)");
+                        let _ = tx.send(consumer);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "MOMENTUM SLAVE CACHE: bootstrap failed");
+                        let _ = tx.send(None);
+                    }
+                }
+            });
+        } else {
+            let _ = tx.send(None);
         }
-    } else {
-        None
+        rx
     };
 
     // === CRITICAL: Check for immediate exits after position recovery ===
@@ -5048,49 +5062,13 @@ async fn main() -> Result<()> {
     };
 
     // FIX-21: JetStream consumer for incremental PoolCacheUpdates (SLAVE cache sync)
-    // Reuse bootstrap consumer to avoid replaying all historical messages.
-    let pool_cache_consumer = if let Some(consumer) = bootstrap_consumer {
-        info!(
-            stream = STREAM_NAME,
-            "Reusing bootstrap consumer for live PoolCacheUpdate sync"
-        );
-        Some(consumer)
-    } else if let Some(ref nats) = ctx.nats {
-        use async_nats::jetstream;
-
-        let jetstream = jetstream::new(nats.client().clone());
-        match jetstream.get_stream(STREAM_NAME).await {
-            Ok(stream) => {
-                let config = async_nats::jetstream::consumer::pull::Config {
-                    deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::New,
-                    ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
-                    max_ack_pending: 1000,
-                    filter_subject: "ironcrab.pool_cache.>".to_string(),
-                    ..Default::default()
-                };
-                match stream.create_consumer(config).await {
-                    Ok(consumer) => {
-                        info!(
-                            stream = STREAM_NAME,
-                            "Created NEW JetStream consumer for PoolCacheUpdates (DeliverPolicy::New)"
-                        );
-                        Some(consumer)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to create JetStream consumer for PoolCacheUpdates");
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, stream = STREAM_NAME, "JetStream stream not found");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mut pool_cache_consumer_opt = pool_cache_consumer;
+    // The bootstrap runs asynchronously. We start with no consumer and wait for
+    // the bootstrap to finish, then reuse its consumer for incremental updates.
+    // This avoids replaying all 688k+ messages twice.
+    let mut pool_cache_consumer_opt: Option<
+        async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>,
+    > = None;
+    let mut bootstrap_consumer_rx = Some(bootstrap_consumer_rx);
 
     // Heartbeat and stats tracking
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -5314,6 +5292,29 @@ async fn main() -> Result<()> {
                         Err(e) => {
                             warn!(error = %e, "Failed to deserialize ExecutionResult");
                         }
+                    }
+                }
+            }
+
+            // FIX-21: Receive bootstrap consumer when async bootstrap completes
+            result = async {
+                match bootstrap_consumer_rx.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Consume the rx so this arm doesn't fire again
+                bootstrap_consumer_rx = None;
+                match result {
+                    Ok(Some(consumer)) => {
+                        info!(stream = STREAM_NAME, "SLAVE CACHE: bootstrap consumer ready, switching to incremental sync");
+                        pool_cache_consumer_opt = Some(consumer);
+                    }
+                    Ok(None) => {
+                        debug!("SLAVE CACHE: bootstrap completed without consumer");
+                    }
+                    Err(_) => {
+                        warn!("SLAVE CACHE: bootstrap task dropped (sender gone)");
                     }
                 }
             }
