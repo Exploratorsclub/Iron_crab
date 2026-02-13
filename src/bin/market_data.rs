@@ -666,6 +666,9 @@ async fn publish_wallet_snapshot(
     // mints, and ensures the startup snapshot reflects the true on-chain wallet state.
     // This is a legitimate startup-only RPC call (2 calls: SPL Token + Token-2022).
     // It runs at every startup but NOT for periodic refreshes.
+    // Capture WSOL balance from owner-scan for initial WalletBalanceUpdate (set inside if !is_periodic)
+    let mut bootstrap_wsol_balance: Option<u64> = None;
+
     if !is_periodic {
         use solana_client::rpc_request::TokenAccountsFilter;
 
@@ -688,7 +691,10 @@ async fn publish_wallet_snapshot(
                                 .unwrap_or(6) as u8;
                             if let Ok(mint_pk) = Pubkey::from_str(mint_str) {
                                 let balance: u64 = balance_str.parse().unwrap_or(0);
-                                if balance > 0 && mint_str != WSOL_MINT {
+                                if mint_str == WSOL_MINT {
+                                    // Capture WSOL balance for initial WalletBalanceUpdate
+                                    bootstrap_wsol_balance = Some(balance);
+                                } else if balance > 0 {
                                     discovered_from_owner_scan.push((mint_pk, balance, token_program));
                                     // Also cache decimals for later
                                     cached_mint_meta.entry(mint_pk).or_insert((decimals_val, token_program, 0));
@@ -1122,6 +1128,62 @@ async fn publish_wallet_snapshot(
     }
     if let Err(e) = ctx.jsonl_writer.write(&complete_event) {
         warn!(error = %e, "Failed to write WalletSnapshotComplete (bootstrap) to JSONL");
+    }
+
+    // 5) Publish initial WalletBalanceUpdate so execution-engine/WsolManager get correct
+    //    SOL + WSOL balances immediately at startup (before any Geyser event arrives).
+    //    Without this, execution-engine stays at the default 1.0 SOL until the first on-chain
+    //    wallet transaction triggers a Geyser update.
+    if !is_periodic {
+        if let Some(ref tracked_wallet) = ctx.tracked_wallet {
+            if let Some(ref nats) = ctx.nats {
+                // Fetch native SOL balance (1 lightweight RPC call during bootstrap)
+                match rpc.rpc.get_balance(wallet).await {
+                    Ok(sol_lamports) => {
+                        let wsol_lamports = bootstrap_wsol_balance;
+
+                        // Seed TrackedWallet so subsequent Geyser events correctly detect changes
+                        tracked_wallet
+                            .last_sol_balance
+                            .store(sol_lamports, Ordering::Relaxed);
+                        if let Some(wsol) = wsol_lamports {
+                            tracked_wallet
+                                .last_wsol_balance
+                                .store(wsol, Ordering::Relaxed);
+                            tracked_wallet.wsol_seen.store(true, Ordering::Relaxed);
+                        }
+
+                        let update = WalletBalanceUpdate {
+                            header: RecordHeader::new("market-data", BUILD_VERSION, &ctx.run_id),
+                            wallet: wallet_str.clone(),
+                            sol_lamports,
+                            wsol_lamports,
+                            slot: 0, // Bootstrap, no specific slot
+                        };
+
+                        let topic = wallet_balance_topic(&wallet_str);
+                        if let Err(e) = nats.publish(&topic, &update).await {
+                            warn!(error = %e, "Failed to publish initial WalletBalanceUpdate");
+                        } else {
+                            info!(
+                                wallet = %wallet_str,
+                                sol_lamports,
+                                wsol_lamports = ?wsol_lamports,
+                                sol = sol_lamports as f64 / 1e9,
+                                wsol = wsol_lamports.map(|w| w as f64 / 1e9),
+                                "✅ Initial WalletBalanceUpdate published (bootstrap)"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Failed to fetch SOL balance for initial WalletBalanceUpdate (will rely on Geyser events)"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     info!(
