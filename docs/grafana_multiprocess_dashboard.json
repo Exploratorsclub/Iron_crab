@@ -301,7 +301,7 @@
     {
       "type": "stat",
       "title": "24h Wallet Delta",
-      "description": "Wallet value change (SOL+WSOL) over last 24 hours",
+      "description": "Wallet value change (SOL+WSOL) over last 24 hours. Requires 24h continuous uptime for accuracy — shows incorrect values after restarts until 24h of data accumulates.",
       "targets": [{ "expr": "(wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} - wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} offset 24h) / 1e9", "refId": "A" }],
       "gridPos": {"h":4,"w":4,"x":8,"y":33},
       "fieldConfig": {
@@ -453,7 +453,8 @@
           { "selector": "value_sol", "text": "Value (SOL)", "type": "number" },
           { "selector": "pnl_sol", "text": "PnL (SOL)", "type": "number" },
           { "selector": "pnl_pct", "text": "PnL %", "type": "number" },
-          { "selector": "reason", "text": "Reason", "type": "string" }
+          { "selector": "reason", "text": "Reason", "type": "string" },
+          { "selector": "reason_detail", "text": "Detail", "type": "string" }
         ]
       }],
       "fieldConfig": {
@@ -580,9 +581,17 @@
                   { "type": "value", "options": { "TIME_EXIT": { "color": "blue", "text": "🔵 TIMED_EXIT" } } },
                   { "type": "value", "options": { "TRAILING_STOP": { "color": "yellow", "text": "🟡 TRAILING_STOP" } } },
                   { "type": "value", "options": { "MOMENTUM_EXIT": { "color": "purple", "text": "🟣 MOMENTUM_EXIT" } } },
-                  { "type": "value", "options": { "BONDING_CURVE_EXIT": { "color": "yellow", "text": "🟡 BONDING_CURVE_EXIT" } } }
+                  { "type": "value", "options": { "BONDING_CURVE_EXIT": { "color": "yellow", "text": "🟡 BONDING_CURVE_EXIT" } } },
+                  { "type": "value", "options": { "ENTER_PROBE": { "color": "blue", "text": "🔵 ENTER_PROBE" } } },
+                  { "type": "value", "options": { "ENTER_SCALE_IN": { "color": "purple", "text": "🟣 ENTER_SCALE_IN" } } }
                 ]
               }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Detail" },
+            "properties": [
+              { "id": "custom.width", "value": 300 }
             ]
           }
         ]

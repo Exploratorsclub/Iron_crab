@@ -577,15 +577,30 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 display_mint = token_mint or "-"
             
             # Unified reason field for dashboard:
-            # - BUY: entry reason (reason_detail when available)
+            # - BUY: short entry category (ENTER_PROBE / ENTER_SCALE_IN)
             # - SELL: exit category (exit_type), with liquidation fallback
+            # reason_detail: full detail text for both BUY and SELL (shown in tooltip column)
             exit_type = metadata.get('exit_type')
-            reason_detail = metadata.get('reason_detail')
+            raw_reason_detail = metadata.get('reason_detail')
             reason_code = metadata.get('reason_code')
+            entry_kind = metadata.get('entry_kind', '')
 
             reason = None
+            detail = None
             if action == "BUY":
-                reason = reason_detail or reason_code
+                # Short reason for display: extract category prefix
+                if entry_kind == 'scale_in':
+                    reason = "ENTER_SCALE_IN"
+                elif entry_kind == 'probe':
+                    reason = "ENTER_PROBE"
+                elif raw_reason_detail:
+                    # Extract prefix before ':' (e.g., "ENTER_PROBE_BUY: All filters..." → "ENTER_PROBE_BUY")
+                    colon_idx = raw_reason_detail.find(':')
+                    reason = raw_reason_detail[:colon_idx].strip() if colon_idx > 0 else raw_reason_detail[:30]
+                else:
+                    reason = reason_code or "BUY"
+                # Full detail for tooltip
+                detail = raw_reason_detail or reason_code
             elif action == "SELL":
                 reason = exit_type
                 if not reason:
@@ -596,7 +611,9 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                     elif reason_code and str(reason_code).startswith("EXIT_"):
                         reason = str(reason_code).removeprefix("EXIT_")
                     else:
-                        reason = reason_detail or reason_code
+                        reason = raw_reason_detail or reason_code
+                # Full detail for tooltip
+                detail = raw_reason_detail
             
             return {
                 "timestamp_ms": ts_ms,
@@ -611,8 +628,9 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 "wallet_sol_delta": wallet_sol_delta_sol,
                 "mint_full": token_mint,
                 "reason": reason,
+                "reason_detail": detail,
                 "exit_type": exit_type,
-                "exit_reason": reason_detail,
+                "exit_reason": raw_reason_detail,
                 "run_id": run_id,
             }
         except Exception as e:
