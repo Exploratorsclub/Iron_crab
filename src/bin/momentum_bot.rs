@@ -2980,7 +2980,122 @@ impl MomentumContext {
                         "Liquidation sell confirmed but token_mint missing in ExecutionResult"
                     );
                 }
-            } else {
+            }
+            // === Orphaned buy recovery ===
+            // If a confirmed BUY arrives after cleanup_stale_pending() removed
+            // the pending intent (>2min), recover the position from the
+            // ExecutionResult + TokenTracker data.
+            else if result.status == ExecutionStatus::Confirmed
+                && result.metadata.get("side").map(|s| s.as_str()) == Some("BUY")
+            {
+                if let Some(ref mint) = result.token_mint {
+                    if let Some(ref fill_out) = result.fill_out {
+                        // Position may already exist (e.g., scale-in recovered on restart)
+                        let already_has_position = self.positions.read().contains_key(mint);
+                        if !already_has_position {
+                            // Reconstruct pool/dex from TokenTracker (still alive in memory)
+                            let tracker_info: Option<(String, String)> = {
+                                let trackers = self.token_trackers.read();
+                                trackers.get(mint).map(|tr| (tr.pool.clone(), tr.dex.clone()))
+                            };
+
+                            if let Some((pool, dex)) = tracker_info {
+                                let sol_invested = result
+                                    .wallet_sol_delta_lamports
+                                    .map(|d| d.unsigned_abs() as u64)
+                                    .or_else(|| result.fill_in.as_ref().map(|a| a.raw))
+                                    .unwrap_or(0);
+
+                                let token_decimals = self
+                                    .mint_infos
+                                    .read()
+                                    .get(mint)
+                                    .map(|m| m.decimals)
+                                    .unwrap_or(fill_out.decimals);
+
+                                let sol_ui = result
+                                    .fill_in
+                                    .as_ref()
+                                    .map(|a| a.as_f64())
+                                    .unwrap_or(sol_invested as f64 / 1e9)
+                                    .max(0.0);
+                                let tok_ui = fill_out.as_f64().max(0.0);
+                                let entry_price = if sol_ui > 0.0 { tok_ui / sol_ui } else { 1.0 };
+
+                                let token_program = result
+                                    .metadata
+                                    .get("token_program")
+                                    .cloned()
+                                    .filter(|tp| !tp.is_empty())
+                                    .or_else(|| {
+                                        self.mint_infos
+                                            .read()
+                                            .get(mint)
+                                            .map(|m| m.token_program.clone())
+                                            .filter(|tp| !tp.is_empty())
+                                    });
+
+                                warn!(
+                                    intent_id = %result.intent_id,
+                                    mint = %mint,
+                                    pool = %pool,
+                                    dex = %dex,
+                                    sol_invested,
+                                    token_amount = fill_out.raw,
+                                    "⚠️ ORPHANED BUY RECOVERED — pending intent expired, \
+                                     creating position from ExecutionResult"
+                                );
+
+                                self.open_position(OpenPositionParams {
+                                    mint,
+                                    pool: &pool,
+                                    dex: &dex,
+                                    entry_price,
+                                    token_decimals,
+                                    token_amount: fill_out.raw,
+                                    sol_invested,
+                                    token_program,
+                                });
+                            } else {
+                                warn!(
+                                    intent_id = %result.intent_id,
+                                    mint = %mint,
+                                    "Orphaned BUY confirmed but no TokenTracker found — \
+                                     cannot recover position (pool/dex unknown)"
+                                );
+                            }
+                        }
+                    } else {
+                        warn!(
+                            intent_id = %result.intent_id,
+                            mint = %mint,
+                            "Orphaned BUY confirmed but fill_out missing — \
+                             cannot recover position"
+                        );
+                    }
+                }
+            }
+            // === Orphaned sell failure recovery ===
+            // If a SELL failure arrives after pending intent was cleaned up,
+            // reset exit_generated to allow retry.
+            else if (result.status == ExecutionStatus::Failed
+                || result.status == ExecutionStatus::Timeout)
+                && result.metadata.get("side").map(|s| s.as_str()) == Some("SELL")
+            {
+                if let Some(ref mint) = result.token_mint {
+                    let mut positions = self.positions.write();
+                    if let Some(pos) = positions.get_mut(mint.as_str()) {
+                        pos.exit_generated = false;
+                        pos.exit_generated_at = None;
+                        warn!(
+                            intent_id = %result.intent_id,
+                            mint = %mint,
+                            "Reset exit_generated for orphaned sell failure — will retry"
+                        );
+                    }
+                }
+            }
+            else {
                 debug!(intent_id = %result.intent_id, "No pending intent found for execution result");
             }
             return;
@@ -3223,6 +3338,18 @@ impl MomentumContext {
                             pending.entry_kind.unwrap_or(EntryKind::Probe)
                         ));
                     }
+                } else if pending.side == TradeSide::Sell {
+                    // Reset exit_generated so the next strategy tick retries the sell.
+                    let mut positions = self.positions.write();
+                    if let Some(pos) = positions.get_mut(&pending.mint) {
+                        pos.exit_generated = false;
+                        pos.exit_generated_at = None;
+                        warn!(
+                            mint = %pending.mint,
+                            error = ?result.error_message,
+                            "Reset exit_generated after sell FAILURE — will retry on next tick"
+                        );
+                    }
                 }
             }
             ExecutionStatus::Timeout => {
@@ -3239,6 +3366,17 @@ impl MomentumContext {
                             "Entry execution timeout ({:?})",
                             pending.entry_kind.unwrap_or(EntryKind::Probe)
                         ));
+                    }
+                } else if pending.side == TradeSide::Sell {
+                    // Reset exit_generated so the next strategy tick retries the sell.
+                    let mut positions = self.positions.write();
+                    if let Some(pos) = positions.get_mut(&pending.mint) {
+                        pos.exit_generated = false;
+                        pos.exit_generated_at = None;
+                        warn!(
+                            mint = %pending.mint,
+                            "Reset exit_generated after sell TIMEOUT — will retry on next tick"
+                        );
                     }
                 }
             }
