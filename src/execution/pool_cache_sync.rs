@@ -1,0 +1,292 @@
+//! Shared Pool Cache Sync — JetStream Bootstrap & Incremental Updates
+//!
+//! This module provides shared functions for building and maintaining a SLAVE
+//! LivePoolCache from JetStream PoolCacheUpdate events. Used by both
+//! execution-engine and momentum-bot.
+//!
+//! # Architecture
+//!
+//! ```text
+//! market-data (MASTER LivePoolCache)
+//!     │
+//!     ├── publishes PoolCacheUpdate on JetStream
+//!     │
+//!     ├──→ execution-engine (SLAVE LivePoolCache)
+//!     │
+//!     └──→ momentum-bot    (SLAVE LivePoolCache)
+//! ```
+
+use solana_sdk::pubkey::Pubkey;
+use std::str::FromStr;
+use tracing::{debug, info, warn};
+
+use crate::execution::live_pool_cache::{
+    CachedPoolState, LivePoolCache, MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState,
+    RaydiumAmmState, RaydiumCpmmState,
+};
+use crate::ipc::{PoolCacheUpdate, PoolCacheUpdateType};
+use crate::nats::{slave_consumer_config, NatsClient, STREAM_NAME};
+
+/// Build minimal CachedPoolState from PoolCacheUpdate (for JetStream bootstrap/sync)
+///
+/// Since PoolCacheUpdate only contains reserves (not full account data), we create
+/// minimal state structures. Full account updates from Geyser will refresh these later.
+pub fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, CachedPoolState)> {
+    let pool_addr = Pubkey::from_str(&update.pool_address).ok()?;
+    let base_mint = Pubkey::from_str(&update.base_mint).ok()?;
+    let quote_mint = Pubkey::from_str(&update.quote_mint).ok()?;
+
+    // Build minimal state based on DEX type
+    let state = match update.dex.as_str() {
+        "orca" => CachedPoolState::Orca(OrcaWhirlpoolState {
+            token_mint_a: base_mint,
+            token_mint_b: quote_mint,
+            token_vault_a: Pubkey::default(),
+            token_vault_b: Pubkey::default(),
+            tick_current_index: 0,
+            sqrt_price: 0,
+            liquidity: 0,
+            fee_rate: 0,
+            protocol_fee_rate: 0,
+            tick_spacing: 0,
+            vault_a_balance: Some(update.base_reserve),
+            vault_b_balance: Some(update.quote_reserve),
+            token_a_program: None,
+            token_b_program: None,
+        }),
+        "raydium_amm" | "raydium" => CachedPoolState::RaydiumAmm(RaydiumAmmState {
+            base_mint,
+            quote_mint,
+            coin_vault: Pubkey::default(),
+            pc_vault: Pubkey::default(),
+            base_decimals: 0,
+            quote_decimals: 0,
+            coin_reserve: Some(update.base_reserve),
+            pc_reserve: Some(update.quote_reserve),
+            market_id: Pubkey::default(),
+            serum_bids: None,
+            serum_asks: None,
+            serum_event_queue: None,
+        }),
+        "raydium_cpmm" => CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+            token_0_mint: base_mint,
+            token_1_mint: quote_mint,
+            token_0_vault: Pubkey::default(),
+            token_1_vault: Pubkey::default(),
+            reserve_0: Some(update.base_reserve),
+            reserve_1: Some(update.quote_reserve),
+        }),
+        "meteora_cpmm" | "meteora_dlmm" => CachedPoolState::Meteora(MeteoraState {
+            token_x_mint: base_mint,
+            token_y_mint: quote_mint,
+            reserve_x: Pubkey::default(),
+            reserve_y: Pubkey::default(),
+            active_id: 0,
+            bin_step: 0,
+            reserve_x_balance: Some(update.base_reserve),
+            reserve_y_balance: Some(update.quote_reserve),
+        }),
+        "pump_amm" => {
+            let creator = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("creator"))
+                .and_then(|s| Pubkey::from_str(s).ok());
+
+            let pool_accounts: Vec<Pubkey> = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("pool_accounts"))
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|a| Pubkey::from_str(a).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint,
+                pool_base_token_account: Pubkey::default(),
+                pool_quote_token_account: Pubkey::default(),
+                base_reserve: Some(update.base_reserve),
+                quote_reserve: Some(update.quote_reserve),
+                pool_accounts,
+                creator,
+            })
+        }
+        "pumpfun" => {
+            let creator = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("creator"))
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .unwrap_or_default();
+
+            let associated_bonding_curve = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("associated_bonding_curve"))
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .unwrap_or_default();
+
+            let complete = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("complete"))
+                .map(|s| s == "true")
+                .unwrap_or(false);
+
+            let real_token_reserves = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("real_token_reserves"))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let real_sol_reserves = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("real_sol_reserves"))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+
+            if creator != Pubkey::default() {
+                debug!(
+                    pool = %pool_addr,
+                    creator = %creator,
+                    real_token_reserves,
+                    real_sol_reserves,
+                    "SLAVE CACHE: PumpFun state from PoolCacheUpdate metadata"
+                );
+            }
+
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: base_mint,
+                bonding_curve: pool_addr,
+                associated_bonding_curve,
+                virtual_sol_reserves: update.quote_reserve,
+                virtual_token_reserves: update.base_reserve,
+                real_sol_reserves,
+                real_token_reserves,
+                complete,
+                creator,
+            })
+        }
+        _ => {
+            debug!(dex = %update.dex, "Unsupported DEX type for minimal state");
+            return None;
+        }
+    };
+
+    Some((pool_addr, state))
+}
+
+/// Apply a single PoolCacheUpdate to a LivePoolCache.
+///
+/// Returns true if the cache was modified.
+pub fn apply_pool_cache_update(
+    cache: &LivePoolCache,
+    update: &PoolCacheUpdate,
+) -> bool {
+    match update.update_type {
+        PoolCacheUpdateType::PoolDiscovered | PoolCacheUpdateType::BalanceUpdated => {
+            if let Some((pool_addr, minimal_state)) = build_minimal_pool_state(update) {
+                cache.upsert(pool_addr, minimal_state, update.geyser_slot);
+                return true;
+            }
+        }
+        PoolCacheUpdateType::PoolRemoved => {
+            // Skip removed pools
+        }
+    }
+    false
+}
+
+/// Bootstrap LivePoolCache from JetStream (state recovery after restart)
+///
+/// Pulls the last PoolCacheUpdate for each pool from JetStream, giving
+/// immediate state recovery. After bootstrap, the caller should reuse
+/// the returned consumer for incremental updates.
+///
+/// # Returns
+///
+/// Returns (pools_recovered, consumer) so the caller can reuse the consumer
+/// in the main loop instead of creating a new one (which would replay all messages).
+pub async fn bootstrap_pool_cache_from_jetstream(
+    nats_client: &NatsClient,
+    live_pool_cache: &LivePoolCache,
+) -> anyhow::Result<(
+    usize,
+    Option<async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>>,
+)> {
+    use async_nats::jetstream;
+    use futures::StreamExt;
+
+    info!("SLAVE CACHE BOOTSTRAP: Pulling state from JetStream...");
+
+    let jetstream = jetstream::new(nats_client.client().clone());
+
+    // Get stream (must already exist, created by market-data)
+    let stream = match jetstream.get_stream(STREAM_NAME).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, stream = STREAM_NAME, "JetStream stream not found (market-data may not be running)");
+            return Ok((0, None));
+        }
+    };
+
+    // Create ephemeral consumer with LastPerSubject deliver policy
+    let consumer_config = slave_consumer_config();
+    let consumer = stream.create_consumer(consumer_config).await?;
+
+    let mut pools_recovered = 0;
+    let batch_size = 1000;
+
+    // Fetch all available messages in batches until exhausted
+    loop {
+        let mut messages = consumer
+            .fetch()
+            .max_messages(batch_size)
+            .messages()
+            .await?;
+        let mut batch_count = 0;
+
+        while let Some(msg) = messages.next().await {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "Error fetching message from JetStream");
+                    continue;
+                }
+            };
+
+            batch_count += 1;
+
+            let pool_update: PoolCacheUpdate = match serde_json::from_slice(&msg.payload) {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(error = %e, "Failed to deserialize PoolCacheUpdate from JetStream");
+                    if let Err(ack_err) = msg.ack().await {
+                        warn!(error = %ack_err, "Failed to ack message");
+                    }
+                    continue;
+                }
+            };
+
+            if apply_pool_cache_update(live_pool_cache, &pool_update) {
+                pools_recovered += 1;
+            }
+
+            if let Err(ack_err) = msg.ack().await {
+                warn!(error = %ack_err, "Failed to ack message");
+            }
+        }
+
+        if batch_count < batch_size {
+            break;
+        }
+    }
+
+    info!(pools_recovered, "SLAVE CACHE BOOTSTRAP: Complete");
+    Ok((pools_recovered, Some(consumer)))
+}

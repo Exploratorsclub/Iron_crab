@@ -126,6 +126,115 @@ pub fn apply_slippage(amount_out: u64, slippage_bps: u32) -> u64 {
     ((amount_out as u128 * keep as u128) / 10000u128) as u64
 }
 
+/// Calculate output amount for a pool given input amount and input_mint.
+///
+/// This is a lower-level API than `calculate_fresh_min_out` — it does NOT
+/// require a `TradeIntent` and works directly with `CachedPoolState`.
+/// Useful for multi-pool comparison in strategy bots (e.g. momentum-bot).
+///
+/// Returns `Ok(amount_out)` (before slippage) or an error if the pool
+/// cannot provide a quote (e.g. zero reserves, completed PumpFun curve).
+pub fn quote_output_amount(
+    state: &CachedPoolState,
+    amount_in: u64,
+    input_mint: &Pubkey,
+) -> Result<u64> {
+    match state {
+        CachedPoolState::PumpFun(s) => {
+            let is_buy = *input_mint != s.token_mint; // SOL in → buy tokens
+            calculate_pumpfun_quote(s, amount_in, is_buy)
+        }
+        CachedPoolState::PumpAmm(s) => {
+            let base_to_quote = *input_mint == s.base_mint;
+            let (reserve_in, reserve_out) = if base_to_quote {
+                (s.base_reserve.unwrap_or(0) as u128, s.quote_reserve.unwrap_or(0) as u128)
+            } else {
+                (s.quote_reserve.unwrap_or(0) as u128, s.base_reserve.unwrap_or(0) as u128)
+            };
+            if reserve_in == 0 || reserve_out == 0 {
+                return Err(anyhow!("pump_amm: missing reserves"));
+            }
+            const FEE_BPS: u128 = 100;
+            let a = amount_in as u128;
+            let after_fee = a * (10000 - FEE_BPS) / 10000;
+            let out = (after_fee * reserve_out) / (reserve_in + after_fee);
+            Ok(out as u64)
+        }
+        CachedPoolState::Orca(s) => {
+            let a_to_b = *input_mint == s.token_mint_a;
+            let (ri, ro) = if a_to_b {
+                (s.vault_a_balance.unwrap_or(0) as u128, s.vault_b_balance.unwrap_or(0) as u128)
+            } else {
+                (s.vault_b_balance.unwrap_or(0) as u128, s.vault_a_balance.unwrap_or(0) as u128)
+            };
+            if ri == 0 || ro == 0 { return Err(anyhow!("orca: missing vault balances")); }
+            let fee_bps = s.fee_rate as u128 / 100;
+            let a = amount_in as u128;
+            let after_fee = a * (10000 - fee_bps) / 10000;
+            Ok(((after_fee * ro) / (ri + after_fee)) as u64)
+        }
+        CachedPoolState::RaydiumAmm(s) => {
+            let base_to_quote = *input_mint == s.base_mint;
+            let (ri, ro) = if base_to_quote {
+                (s.coin_reserve.unwrap_or(0) as u128, s.pc_reserve.unwrap_or(0) as u128)
+            } else {
+                (s.pc_reserve.unwrap_or(0) as u128, s.coin_reserve.unwrap_or(0) as u128)
+            };
+            if ri == 0 || ro == 0 { return Err(anyhow!("raydium_amm: missing reserves")); }
+            const FEE: u128 = 25;
+            let a = amount_in as u128;
+            let after_fee = a * (10000 - FEE) / 10000;
+            let k = ri * ro;
+            let new_ri = ri + after_fee;
+            Ok(ro.saturating_sub(k / new_ri) as u64)
+        }
+        CachedPoolState::RaydiumCpmm(s) => {
+            let zero_to_one = *input_mint == s.token_0_mint;
+            let (ri, ro) = if zero_to_one {
+                (s.reserve_0.unwrap_or(0) as u128, s.reserve_1.unwrap_or(0) as u128)
+            } else {
+                (s.reserve_1.unwrap_or(0) as u128, s.reserve_0.unwrap_or(0) as u128)
+            };
+            if ri == 0 || ro == 0 { return Err(anyhow!("raydium_cpmm: missing reserves")); }
+            const FEE: u128 = 25;
+            let a = amount_in as u128;
+            let after_fee = a * (10000 - FEE) / 10000;
+            let k = ri * ro;
+            let new_ri = ri + after_fee;
+            Ok(ro.saturating_sub(k / new_ri) as u64)
+        }
+        CachedPoolState::Meteora(s) => {
+            let x_to_y = *input_mint == s.token_x_mint;
+            let (ri, ro) = if x_to_y {
+                (s.reserve_x_balance.unwrap_or(0) as u128, s.reserve_y_balance.unwrap_or(0) as u128)
+            } else {
+                (s.reserve_y_balance.unwrap_or(0) as u128, s.reserve_x_balance.unwrap_or(0) as u128)
+            };
+            if ri == 0 || ro == 0 { return Err(anyhow!("meteora: missing reserves")); }
+            let fee_bps = (s.bin_step as u128).min(100);
+            let a = amount_in as u128;
+            let after_fee = a * (10000 - fee_bps) / 10000;
+            Ok(((after_fee * ro) / (ri + after_fee)) as u64)
+        }
+        CachedPoolState::MeteoraCpmm(s) => {
+            let is_token_0 = *input_mint == s.token_0_mint;
+            let (ri, ro) = if is_token_0 {
+                (s.reserve_0 as u128, s.reserve_1 as u128)
+            } else {
+                (s.reserve_1 as u128, s.reserve_0 as u128)
+            };
+            if ri == 0 || ro == 0 { return Err(anyhow!("meteora_cpmm: missing reserves")); }
+            let fee: u128 = 25;
+            let a = amount_in as u128;
+            let fm = 10000 - fee;
+            let num = ro * a * fm;
+            let den = ri * 10000 + a * fm;
+            if den == 0 { return Err(anyhow!("meteora_cpmm: denominator zero")); }
+            Ok((num / den) as u64)
+        }
+    }
+}
+
 // ============================================================================
 // DEX-specific quote calculations
 // ============================================================================

@@ -408,11 +408,11 @@ Emergency-Tools – hier sind RPC-Calls akzeptabel, da dies keine Hot-Path-Binar
 
 **Status**: ❌ OFFEN — TODO-Kommentar vorhanden aber nicht implementiert. Benötigt Pool-State-Lookup oder Account-Key-basierte quote_mint-Erkennung.
 
-### BUG I (vormals G): PumpFun SELL generiert stale Quote für migrierte Tokens
+### ~~BUG I (vormals G): PumpFun SELL generiert stale Quote für migrierte Tokens~~ ✅ BEHOBEN
 
-**`pumpfun.rs` Zeile ~881**: Wenn `real_reserves == 0` aber `virtual_reserves > 0`, generiert der Quoter trotzdem ein Quote. On-chain scheitert dies mit Error 6023.
+**`pumpfun.rs` Zeile ~888**: Guard für `real_reserves == 0 && virtual_reserves > 0` existiert wieder im Code (`return Ok(None)`). Multi-Pool-Routing wird korrekt getriggert.
 
-**Status**: ❌ REGRESSION DURCH REVERT — Der Fix (`return Ok(None)` statt stale Quote) wurde mit dem Revert entfernt. Multi-Pool-Routing wird nicht korrekt getriggert für migrierte Tokens bei normalen SELL-Intents.
+**Status**: ✅ BEHOBEN — Guard in `pumpfun.rs` (Zeile 888-902) und `quote_calculator.rs` (Zeile 400-407) aktiv. Verbleibende Sell-Probleme (stale Cache, kein Pool-Failure-Tracking) werden unter BUG-A / FIX-20 adressiert.
 
 ---
 

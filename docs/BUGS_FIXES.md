@@ -91,6 +91,25 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Fix**: market-data publiziert beim Bootstrap ein initiales `WalletBalanceUpdate` mit SOL+WSOL-Balances.
 **Commit**: `c1e8d667`
 
+### FIX-17: fill_in/fill_out Accuracy (False Take-Profit Triggers)
+**Datum**: 2026-02-13
+**Schweregrad**: CRITICAL
+**Problem**: Bei BUY mit `lamport_noise=true` fiel `fill_in` auf `intent.required_capital` zurück → bis zu 29x falsch. SELL `fill_out` war immer `None` bei ATA-Lifecycle. Falsche entry_price → falsche Take-Profit/Stop-Loss Entscheidungen.
+**Fix**: Dreistufige Fallback-Kette: (1) Inner-Instruction-Parsing für System.transfer, (2) Rent-Adjusted Lamport Delta, (3) intent capital als letzter Ausweg. Dashboard PnL konsistent auf wallet_delta umgestellt.
+**Dateien**: `src/bin/execution_engine.rs`, `scripts/trades_server.py`
+
+### FIX-18: Bug B — Orphaned Buy Recovery
+**Datum**: 2026-02-13
+**Problem**: Race Condition: `cleanup_stale_pending()` entfernte pending intent bevor `ExecutionResult` ankam → Position nie erstellt → kein Sell.
+**Fix**: Orphaned Buy Recovery: Wenn confirmed BUY ohne pending intent → Position aus ExecutionResult + TokenTracker rekonstruieren.
+**Dateien**: `src/bin/momentum_bot.rs`
+
+### FIX-19: Bug C — Sell-Retry nach Failure/Timeout
+**Datum**: 2026-02-13
+**Problem**: `exit_generated` wurde bei Sell-Failures nicht zurückgesetzt → kein Retry bis `max_hold_time` + `reconcile_timed_exits()`.
+**Fix**: Unconditional Reset von `exit_generated` in Failed/Timeout Handlern für Sell-Side. Gilt für normalen und orphaned Pfad.
+**Dateien**: `src/bin/momentum_bot.rs`
+
 ---
 
 ## 2. OFFENE BUGS (Analyse erforderlich / Fix ausstehend)
@@ -99,84 +118,261 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Schweregrad**: HOCH
 **Betroffene Tokens** (2026-02-13 Run): `64HemTH7`, `34c3bPRz`
 **Symptom**: Momentum-Bot Sell-Versuche scheitern wiederholt mit `Custom(6023)` ("NotEnoughTokensToSell"), obwohl Liquidation auf denselben Tokens erfolgreich ist.
-**Analyse**:
-- Momentum-Bot verwendet `sell_routing=primary` → Quote basiert auf gecachten `real_token_reserves`
-- Liquidation verwendet `sell_routing=pumpfun_fallback` → frisches RPC-Quote mit Slippage
-- Cache-Wert von `real_token_reserves` kann veraltet sein → on-chain Reject
-- Zusammenhang mit **BUG-I** im Architecture Audit (stale Quote für migrierte Tokens)
-**Status**: ❌ OFFEN
-**Nächster Schritt**: Fix aus Architecture Audit A.5 (SELL bei migrierten Tokens → `return Ok(None)`) re-implementieren
 
-### BUG-B: Momentum-Bot verliert Position — Kein Sell-Intent generiert
-**Schweregrad**: KRITISCH
-**Betroffener Token** (2026-02-13 Run): `JBzDdsaB`
-**Symptom**: Bot kauft Token (Buy-Intent bestätigt), generiert aber danach **keinerlei Sell-Intents**. Position wird komplett "vergessen".
+**Root Cause (detailliert)**:
 
-**Root Cause**: Race Condition zwischen `cleanup_stale_pending()` und `ExecutionResult`-Verarbeitung.
+Drei zusammenwirkende Probleme verhindern erfolgreiche SELLs bei migrierten PumpFun-Tokens:
 
-1. Buy-Intent wird in `pending_intents` registriert (Zeile 2900)
-2. `cleanup_stale_pending()` (Zeile 3252) entfernt den Intent nach **2 Minuten** (`Duration::from_secs(120)`)
-3. Wenn das `ExecutionResult` erst nach dem Cleanup eintrifft, gibt `pending_intents.remove(&result.intent_id)` `None` zurück (Zeile 2947)
-4. Der Early-Return-Pfad (Zeile 2983-2986) behandelt nur Liquidation-Confirms — alle anderen werden mit `debug!` geloggt und verworfen
-5. `open_position()` (Zeile 3114) wird **nie aufgerufen** → kein `PositionTracker` erstellt → kein Sell je generiert
+1. **`find_best_sell_pool()` ist DEX-agnostisch** — Die Pool-Auswahl im Momentum-Bot basiert nur auf `last_trade_ratio` und `last_updated`. Es gibt **keinen Check ob eine PumpFun Bonding Curve `complete=true`** ist. Wenn ein Token migriert wird, hat der PumpFun-Pool oft noch aktuelle Trade-Daten (von vor der Migration) und wird weiter als "bester" Pool ausgewählt.
 
-**Betroffene Code-Stellen**:
-- `cleanup_stale_pending()`: Zeile 3252-3262
-- `handle_execution_result()` Early Return: Zeile 2950-2986
-- `open_position()`: nur erreichbar wenn `pending_opt` `Some` ist (Zeile 3114)
+2. **Kein Pool-Failure-Tracking** — Wenn ein SELL auf einem Pool scheitert, wird `exit_generated=false` zurückgesetzt (Bug-C Fix), aber der gescheiterte Pool wird **nicht markiert**. Beim nächsten Tick wählt `find_best_sell_pool()` denselben Pool erneut aus → endlose Wiederholung des selben Fehlers.
 
-**Fix-Vorschlag**:
-1. Wenn ein `ExecutionResult` mit `status == Confirmed` und `side == Buy` eintrifft, aber kein `pending_intent` existiert → Position trotzdem erstellen anhand von `result.token_mint` und `result.fill_out`
-2. Alternativ: Cleanup-Timeout erhöhen oder nur für fehlgeschlagene/rejected Intents anwenden
-3. Logging von `warn!` statt `debug!` wenn ein bestätigter Buy ohne pending Intent verworfen wird
+3. **Kein Multi-Pool-Fallback in der Execution Engine für normale SELLs** — Die Liquidation hat einen 3-Phasen-Routing-Pfad (Multi-Pool → LivePoolCache → PumpFun-Fallback). Normale SELL-Intents vom Momentum-Bot verwenden **nur** den vom Intent spezifizierten DEX. Wenn dieser scheitert, wird der Intent abgelehnt — kein automatischer Versuch mit alternativen DEXes.
 
-**Status**: ❌ OFFEN — Root Cause identifiziert, Fix ausstehend
+**Warum Liquidation funktioniert**: Der `handle_sell_liquidation()`-Pfad probiert in Phase 1 zuerst PumpSwap AMM, Meteora, Raydium und Orca. Für migrierte Tokens findet er den PumpSwap-AMM-Pool und verkauft dort erfolgreich.
 
-### BUG-C: Momentum-Bot Retry-Bug — Ein Versuch, dann Aufgabe
-**Schweregrad**: HOCH
-**Betroffener Token** (2026-02-13 Run): `ANe7aVGP`
-**Symptom**: Bot versucht einen einzigen Sell (scheitert mit `Custom(6003)` / `TooLittleSolReceived`), danach werden keine weiteren Sell-Versuche unternommen. Über 1 Stunde ohne Retry, obwohl andere Tokens im selben Zeitraum dutzende Retries hatten.
+**Hinweis BUG-I**: Der Guard in `pumpfun.rs` (Zeile 888-902: `real_reserves == 0 && virtual_reserves > 0 → return Ok(None)`) **existiert bereits** im aktuellen Code. Der Architecture Audit Status "REGRESSION DURCH REVERT" ist **veraltet**. Dieser Guard fängt den Fall ab, wenn die Migration im Cache sichtbar ist. Bug-A tritt auf, wenn die Migration im Cache **noch nicht sichtbar** ist oder `real_token_reserves` nur stale (nicht 0) sind.
 
-**Root Cause**: `exit_generated` wird bei Sell-Failures **nicht zurückgesetzt**.
+**Status**: ✅ BEHOBEN — FIX-20 (Pool-Migration & Failure-Tracking) + FIX-21 (Reserve-basiertes Quoting)
 
-1. Sell-Intent wird publiziert → `mark_exit_generated()` setzt `exit_generated = true` (Zeile 4954)
-2. Sell scheitert mit `Custom(6003)` → `ExecutionStatus::Failed` Handler (Zeile 3209-3227) behandelt nur Buy-Failures mit Tracker-Reject, aber **resettet `exit_generated` nicht** für Sell-Failures
-3. Nächster Strategy-Tick: `check_for_exits()` iteriert über Positionen → `if pos.exit_generated { continue; }` (Zeile 2677) **überspringt die Position**
-4. Einziger verbleibender Retry-Pfad: `reconcile_timed_exits()` (Zeile 2752), der aber erfordert:
-   - `hold_secs >= max_hold_time_secs` (erst nach Ablauf der maximalen Haltezeit)
-   - Hard-coded `TIME_EXIT` als Exit-Typ
-   - 60-Sekunden-Cooldown zwischen Retries
+---
 
-**Warum andere Tokens retried haben (`64HemTH7`, `34c3bPRz`)**:
-- Diese Tokens haben vermutlich `max_hold_time_secs` überschritten → wurden von `reconcile_timed_exits()` erfasst
-- Oder es gab Partial-Fills (Zeile 3156-3161), die `exit_generated = false` setzen — der einzige Pfad der Sell-Retries ermöglicht
+#### FIX-20 Plan: Bug-A — PumpFun Sell-Failure mit Pool-Migration & Failure-Tracking
 
-**Betroffene Code-Stellen**:
-- `mark_exit_generated()`: Zeile 2866 — setzt `exit_generated = true`
-- `check_for_exits()`: Zeile 2677 — überspringt wenn `exit_generated == true`
-- `ExecutionStatus::Failed` Handler: Zeile 3209-3227 — **kein Reset** für Sell-Failures
-- Partial-Fill Reset: Zeile 3156-3161 — **einziger Pfad** der `exit_generated = false` setzt
-- `reconcile_timed_exits()`: Zeile 2752 — Fallback-Retry, aber nur für TIME_EXIT nach max_hold
+**Ziel**: Momentum-Bot soll migrierte PumpFun-Pools automatisch meiden und bei wiederholten Sell-Fehlern auf alternative Pools wechseln.
 
-**Fix-Vorschlag**:
+**Keine RPC-Calls im Hot Path.** Alle Daten kommen aus Geyser/NATS Events.
+
+---
+
+**Teil 1: `PoolInfo` struct erweitern** (momentum_bot.rs)
+
 ```rust
-ExecutionStatus::Failed => {
-    warn!(..., "❌ Execution FAILED");
-    if pending.side == TradeSide::Buy {
-        // ... existing buy failure handling
-    } else if pending.side == TradeSide::Sell {
-        // Reset exit_generated to allow retry on next tick
-        let mut positions = self.positions.write();
-        if let Some(pos) = positions.get_mut(&pending.mint) {
-            pos.exit_generated = false;
-            pos.exit_generated_at = None;
-            warn!(mint = %pending.mint, "Reset exit_generated after sell failure - will retry");
+struct PoolInfo {
+    pool_address: String,
+    dex: String,
+    dex_pool_accounts: Option<Vec<String>>,
+    first_seen_slot: u64,
+    last_trade_slot: u64,
+    last_trade_ratio: Option<f64>,
+    last_updated: std::time::Instant,
+    // --- NEU ---
+    /// PumpFun bonding curve complete flag (None = nicht PumpFun oder unbekannt)
+    bonding_curve_complete: Option<bool>,
+    /// Anzahl fehlgeschlagener SELL-Versuche auf diesem Pool
+    sell_fail_count: u32,
+    /// Zeitpunkt des letzten SELL-Fehlers
+    last_sell_fail_at: Option<std::time::Instant>,
+}
+```
+
+`PoolInfo::new()` initialisiert die neuen Felder mit `None`/`0`/`None`.
+
+---
+
+**Teil 2: BondingCurveProgress → Pool-Migration erkennen** (momentum_bot.rs)
+
+Im `MarketEventKind::BondingCurveProgress` Handler (~Zeile 7093):
+
+```rust
+MarketEventKind::BondingCurveProgress { mint, progress_bps, complete, .. } => {
+    // Bestehend: Position-Tracker updaten
+    let mut positions = ctx.positions.write();
+    if let Some(pos) = positions.get_mut(mint.as_str()) {
+        pos.bonding_curve_progress_bps = Some(*progress_bps);
+    }
+    drop(positions);
+
+    // NEU: Pool-Migration-Status in mint_pools aktualisieren
+    if *complete {
+        let mut pools = ctx.mint_pools.write();
+        if let Some(pool_list) = pools.get_mut(mint.as_str()) {
+            for pool in pool_list.iter_mut() {
+                if pool.dex == "pumpfun" {
+                    pool.bonding_curve_complete = Some(true);
+                    warn!(
+                        mint = %mint,
+                        pool = %pool.pool_address,
+                        "PumpFun pool marked as migrated (bonding curve complete)"
+                    );
+                }
+            }
         }
     }
 }
 ```
 
-**Status**: ❌ OFFEN — Root Cause identifiziert, Fix ausstehend
+---
+
+**Teil 3: Sell-Failure → Pool-Failure-Count erhöhen** (momentum_bot.rs)
+
+Im `ExecutionStatus::Failed` und `ExecutionStatus::Timeout` Handler für Sell-Side:
+(Im bestehenden Block der Bug-C Fix-Logik, nach `exit_generated = false`)
+
+```rust
+} else if pending.side == TradeSide::Sell {
+    // [Bestehend: Bug-C Fix] Reset exit_generated
+    let mut positions = self.positions.write();
+    if let Some(pos) = positions.get_mut(&pending.mint) {
+        pos.exit_generated = false;
+        pos.exit_generated_at = None;
+    }
+    drop(positions);
+
+    // NEU: Pool-Failure-Count erhöhen
+    let mut pools = self.mint_pools.write();
+    if let Some(pool_list) = pools.get_mut(&pending.mint) {
+        if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pending.pool) {
+            pool_info.sell_fail_count += 1;
+            pool_info.last_sell_fail_at = Some(Instant::now());
+            warn!(
+                mint = %pending.mint,
+                pool = %pending.pool,
+                dex = %pending.dex,
+                sell_fail_count = pool_info.sell_fail_count,
+                "Pool sell failure tracked — will prefer alternatives on retry"
+            );
+        }
+    }
+}
+```
+
+**Wichtig**: Auch im Orphaned-Sell-Recovery-Pfad (wenn `pending_opt.is_none()` und `exit_generated` Reset erfolgt) den gleichen Pool-Failure-Count inkrementieren. Dafür muss der Pool aus dem `ExecutionResult`-Metadaten oder aus der Position extrahiert werden.
+
+---
+
+**Teil 4: `find_best_sell_pool()` — Exclusion-Logik** (momentum_bot.rs)
+
+```rust
+fn find_best_sell_pool(&self, mint: &str, token_amount: u64, original_pool: &str)
+    -> Result<(String, String, Vec<String>, f64, usize)>
+{
+    let pools = self.mint_pools.read();
+    let candidates = pools
+        .get(mint)
+        .ok_or_else(|| anyhow::anyhow!("No pools known for mint {}", mint))?;
+
+    let now = std::time::Instant::now();
+    let max_age = std::time::Duration::from_secs(300);
+    let fail_cooldown = std::time::Duration::from_secs(120);  // NEU
+    const MAX_FAIL_COUNT: u32 = 3;                             // NEU
+
+    // Phase 1: Filter gültige Pools
+    let valid: Vec<_> = candidates
+        .iter()
+        .filter(|p| {
+            p.dex_pool_accounts.is_some()
+                && p.last_trade_ratio.is_some()
+                && now.duration_since(p.last_updated) < max_age
+        })
+        .collect();
+
+    // Phase 2: Exclusion (migrierte + kürzlich gescheiterte Pools)
+    let preferred: Vec<_> = valid.iter()
+        .filter(|p| {
+            // Skip: PumpFun-Pool mit bestätigter Migration
+            if p.bonding_curve_complete == Some(true) {
+                return false;
+            }
+            // Skip: Pool mit >= MAX_FAIL_COUNT Fehlern im Cooldown-Fenster
+            if p.sell_fail_count >= MAX_FAIL_COUNT {
+                if let Some(last_fail) = p.last_sell_fail_at {
+                    if now.duration_since(last_fail) < fail_cooldown {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .collect();
+
+    // Phase 3: Wenn alle excludiert → Fallback auf Pool mit niedrigstem fail_count
+    let usable = if preferred.is_empty() {
+        warn!(mint = %mint, valid_count = valid.len(),
+            "All pools excluded by migration/failure — using best-available fallback");
+        &valid
+    } else {
+        &preferred
+    };
+
+    // [Bestehender Code: Quotes berechnen, beste Route wählen]
+    // ...
+}
+```
+
+---
+
+**Teil 5: Sell-Success → Failure-Count zurücksetzen** (momentum_bot.rs)
+
+Im `ExecutionStatus::Confirmed` Handler für `TradeSide::Sell`:
+
+```rust
+// NEU: Bei erfolgreichem Sell den Failure-Count des Pools zurücksetzen
+let mut pools = self.mint_pools.write();
+if let Some(pool_list) = pools.get_mut(&pending.mint) {
+    if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pending.pool) {
+        if pool_info.sell_fail_count > 0 {
+            info!(
+                mint = %pending.mint, pool = %pending.pool,
+                old_fail_count = pool_info.sell_fail_count,
+                "Sell succeeded — resetting pool failure count"
+            );
+            pool_info.sell_fail_count = 0;
+            pool_info.last_sell_fail_at = None;
+        }
+    }
+}
+```
+
+---
+
+**Zusammenfassung der Änderungen**:
+
+| Datei | Änderung | Risiko |
+|-------|----------|--------|
+| `src/bin/momentum_bot.rs` | `PoolInfo` struct: 3 neue Felder | Minimal — rein additiv |
+| `src/bin/momentum_bot.rs` | `BondingCurveProgress` Handler: Pool-Migration-Flag setzen | Minimal — nur Metadata |
+| `src/bin/momentum_bot.rs` | `ExecutionStatus::Failed/Timeout` Sell: Pool-Fail-Count | Niedrig — neben bestehendem Bug-C Fix |
+| `src/bin/momentum_bot.rs` | `find_best_sell_pool()`: Exclusion-Filter | Mittel — Kern-Routing-Logik, aber mit Fallback |
+| `src/bin/momentum_bot.rs` | `ExecutionStatus::Confirmed` Sell: Fail-Count Reset | Minimal — rein additiv |
+
+**Kein RPC im Hot Path. Keine neuen NATS Topics. Keine Architektur-Änderung.**
+
+**Erwartete Wirkung**: Migrierte PumpFun-Pools werden nach dem `BondingCurveProgress` Event sofort gemieden. Selbst ohne dieses Event werden Pools nach 3 gescheiterten Sells für 120s ausgeschlossen, sodass der Bot auf PumpSwap AMM, Meteora, Raydium oder Orca wechselt.
+
+---
+
+#### FIX-21: Reserve-basiertes Multi-Pool-Routing (SLAVE LivePoolCache)
+**Datum**: 2026-02-13
+**Problem**: FIX-20 behebt die Exclusion-Logik, aber `find_best_sell_pool()` und `find_best_buy_pool()` nutzen weiterhin `last_trade_ratio` (grobe Approximation aus dem letzten beobachteten Trade) statt echter Reserve-basierter Quotes. Das führt zu suboptimaler Pool-Auswahl.
+
+**Root Cause**: Der Momentum-Bot hatte keinen Zugriff auf den `LivePoolCache`, der in `market-data` (MASTER) und `execution-engine` (SLAVE) vorhanden war. Die Pool-Auswahl war daher nicht datengetrieben.
+
+**Lösung**:
+1. **Shared Modul** `src/execution/pool_cache_sync.rs` — Extrahiert `build_minimal_pool_state()`, `apply_pool_cache_update()` und `bootstrap_pool_cache_from_jetstream()` aus `execution_engine.rs` in ein wiederverwendbares Modul.
+2. **SLAVE LivePoolCache im Momentum-Bot** — `MomentumContext` bekommt einen eigenen `LivePoolCache`, der beim Start aus JetStream gebootstrapt und laufend per `PoolCacheUpdate` Events aktualisiert wird.
+3. **Reserve-basiertes Quoting** — Neue `quote_output_amount()` API in `quote_calculator.rs` berechnet Output-Beträge direkt aus `CachedPoolState` (ohne `TradeIntent`). `find_best_sell_pool()` und `find_best_buy_pool()` nutzen primär Cache-Quotes, Fallback auf `last_trade_ratio`.
+
+**Dateien**:
+| Datei | Änderung |
+|-------|----------|
+| `src/execution/pool_cache_sync.rs` | NEU — Shared Bootstrap/Sync |
+| `src/execution/mod.rs` | Modul registriert |
+| `src/execution/quote_calculator.rs` | `quote_output_amount()` API |
+| `src/bin/execution_engine.rs` | Nutzt shared Modul |
+| `src/bin/momentum_bot.rs` | LivePoolCache + JetStream Consumer + reserve-basierte Quotes |
+
+**Kein RPC im Hot Path. Keine neuen NATS Topics. Architektur-konform (SLAVE Cache Pattern).**
+
+### ~~BUG-B: Momentum-Bot verliert Position — Kein Sell-Intent generiert~~ ✅ BEHOBEN
+**Schweregrad**: KRITISCH → **BEHOBEN** (2026-02-13)
+**Fix**: Orphaned Buy Recovery in `handle_execution_result()`: Wenn ein `ExecutionResult` mit `status == Confirmed` und `side == BUY` eintrifft aber kein `pending_intent` existiert, wird die Position aus `ExecutionResult` Metadaten + `TokenTracker` rekonstruiert.
+**Dateien**: `src/bin/momentum_bot.rs`
+
+### ~~BUG-C: Momentum-Bot Retry-Bug — Ein Versuch, dann Aufgabe~~ ✅ BEHOBEN
+**Schweregrad**: HOCH → **BEHOBEN** (2026-02-13)
+**Fix**: `exit_generated` wird jetzt in `ExecutionStatus::Failed` und `ExecutionStatus::Timeout` Handlern für Sell-Side-Trades zurückgesetzt. Gilt sowohl für den normalen Pending-Intent-Pfad als auch für den Orphaned-Sell-Recovery-Pfad (konsistentes unconditional Reset).
+**Dateien**: `src/bin/momentum_bot.rs`
 
 ### BUG-D: Falscher Creator im LivePoolCache
 **Schweregrad**: MITTEL
@@ -210,7 +406,7 @@ Diese Bugs sind im Detail in `docs/ARCHITECTURE_AUDIT_2026-02-07.md` dokumentier
 | Audit-F | Orca Reserve-Fetching 5min TTL + RPC | ❌ OFFEN | Priorität 3 |
 | Audit-G | Stale JetStream Wallet-Snapshots | ✅ BEHOBEN | FIX-14 |
 | Audit-H | Hardcoded quote_mint in DEX-Parsern | ✅ BEHOBEN | FIX-15 |
-| Audit-I | PumpFun SELL stale Quote für migrierte Tokens | ❌ OFFEN | Verknüpft mit BUG-A |
+| Audit-I | PumpFun SELL stale Quote für migrierte Tokens | ✅ BEHOBEN | Guard in pumpfun.rs (Z.888-902). Restprobleme → BUG-A/FIX-20 |
 
 ---
 
@@ -266,8 +462,8 @@ ATA-Rent hebt sich auf. Dashboard zeigt realen Wallet-Impact inklusive aller Fee
 |-----------|-------------|--------|
 | **CRITICAL** | fill_in/fill_out Accuracy (FIX-17) | ✅ FIXED |
 | P1 | PumpSwap AMM Geyser-First Integration | ❌ FEHLT |
-| P1 | PumpFun SELL migrierte Tokens → `Ok(None)` | ❌ FEHLT |
-| P1 | `emit_sim_failed_decision()` → `Err` für Retry | ❌ FEHLT |
+| P1 | PumpFun SELL migrierte Tokens → `Ok(None)` | ✅ FIXED (Guard existiert in pumpfun.rs Z.888-902) |
+| P1 | `emit_sim_failed_decision()` → `Err` für Retry | ✅ FIXED (Zeile 7799) |
 | P2 | Creator-Handling & DEX-Normalisierung | ❌ FEHLT |
 | P2 | Market-Data WSOL-Seeding & Pool-Propagation | ⚠️ TEILWEISE (FIX-16) |
 | P2 | TX-Builder Cache-capped min_out | ❌ FEHLT |

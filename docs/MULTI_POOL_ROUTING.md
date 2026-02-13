@@ -1,7 +1,7 @@
 # Multi-Pool Routing
 
-**Status**: ✅ Complete (SELL + BUY Optimization)  
-**Implemented**: Januar 2025  
+**Status**: ✅ Complete (SELL + BUY Optimization + Reserve-Based Quoting)  
+**Implemented**: Januar 2025, aktualisiert Feb 2026 (FIX-20 + FIX-21)  
 
 ---
 
@@ -147,11 +147,38 @@ async fn generate_and_publish_buy_intent(...) {
 
 ---
 
+## FIX-20: Pool-Exclusion (Feb 2026)
+
+Migrierte PumpFun-Pools und wiederholt fehlschlagende Pools werden ausgeschlossen:
+
+- `bonding_curve_complete == Some(true)` → Pool überspringen
+- `sell_fail_count >= 3` innerhalb 120s Cooldown → Pool überspringen
+- Fallback: Wenn alle preferred Pools excluded → best-available aus valid
+
+## FIX-21: Reserve-Based Quoting (Feb 2026)
+
+**Vorher**: `find_best_sell_pool()` nutzte `last_trade_ratio` (SOL/Token aus letztem beobachteten Trade). Ungenau, stale, keine echten Reserves.
+
+**Nachher**: SLAVE `LivePoolCache` im Momentum-Bot, gespeist aus JetStream `PoolCacheUpdate` Events (gleiche Datenquelle wie Execution-Engine). Quotes werden mit `quote_calculator::quote_output_amount()` aus echten Reserves berechnet. Fallback auf `last_trade_ratio` wenn Cache leer.
+
+**Architektur**:
+```
+market-data (MASTER LivePoolCache)
+    │  publishes PoolCacheUpdate on JetStream
+    ├──→ execution-engine (SLAVE LivePoolCache)
+    └──→ momentum-bot    (SLAVE LivePoolCache) ← FIX-21
+```
+
+**Shared Code**: `src/execution/pool_cache_sync.rs` — `bootstrap_pool_cache_from_jetstream()`, `apply_pool_cache_update()`, `build_minimal_pool_state()`
+
+---
+
 ## Future Work
 
-1. **Simulation-based selection**: Statt cached ratio echte Simulation
+1. ~~**Simulation-based selection**: Statt cached ratio echte Simulation~~ → **Erledigt** (FIX-21: Reserve-basiert)
 2. **Multi-hop routing**: Token → USDC → SOL
 3. **Liquidity weighting**: Prefer deeper pools
+4. **Execution-Engine Multi-Pool für reguläre SELLs**: Aktuell nur für Liquidation; reguläre SELL-Intents nutzen nur den vom Intent spezifizierten DEX
 
 ---
 
@@ -159,3 +186,4 @@ async fn generate_and_publish_buy_intent(...) {
 
 - [DEX_IMPLEMENTATION.md](DEX_IMPLEMENTATION.md) - Supported DEXes
 - [TARGET_ARCHITECTURE.md](TARGET_ARCHITECTURE.md) - System architecture
+- [BUGS_FIXES.md](BUGS_FIXES.md) - FIX-20 und FIX-21 Details

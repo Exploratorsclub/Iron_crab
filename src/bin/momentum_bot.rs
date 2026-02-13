@@ -29,6 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -46,9 +47,12 @@ use ironcrab::metrics::{
     MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
     NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
+use ironcrab::execution::live_pool_cache::LivePoolCache;
+use ironcrab::execution::pool_cache_sync;
+use ironcrab::execution::quote_calculator;
 use ironcrab::nats::{
     config_consumer_config, config_subject, wallet_snapshot_consumer_config, NatsClient,
-    NatsConfig, CONFIG_STREAM_NAME, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
+    NatsConfig, CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
     TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
@@ -1656,6 +1660,14 @@ struct PoolInfo {
     last_trade_slot: u64,
     last_trade_ratio: Option<f64>, // SOL per token (for quotes)
     last_updated: std::time::Instant,
+    /// PumpFun bonding curve complete flag (None = not PumpFun or unknown)
+    /// When Some(true), the curve has migrated to PumpSwap AMM and SELLs
+    /// through this pool will fail with Custom(6023).
+    bonding_curve_complete: Option<bool>,
+    /// Number of consecutive SELL failures on this pool (reset on success)
+    sell_fail_count: u32,
+    /// Timestamp of the last SELL failure (for cooldown calculation)
+    last_sell_fail_at: Option<std::time::Instant>,
 }
 
 impl PoolInfo {
@@ -1668,6 +1680,9 @@ impl PoolInfo {
             last_trade_slot: slot,
             last_trade_ratio: None,
             last_updated: std::time::Instant::now(),
+            bonding_curve_complete: None,
+            sell_fail_count: 0,
+            last_sell_fail_at: None,
         }
     }
 }
@@ -1698,6 +1713,9 @@ struct MomentumContext {
     pending_intents: parking_lot::RwLock<HashMap<String, PendingIntent>>,
     /// Multi-pool registry: All known pools per mint (mint -> Vec<PoolInfo>)
     mint_pools: parking_lot::RwLock<HashMap<String, Vec<PoolInfo>>>,
+    /// SLAVE LivePoolCache — populated from JetStream PoolCacheUpdate events.
+    /// Provides reserve-based quoting for multi-pool routing (FIX-21).
+    live_pool_cache: LivePoolCache,
     /// JetStream KV Store for position persistence (initialized lazily)
     position_kv: tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
     /// Stats
@@ -1857,6 +1875,11 @@ impl MomentumContext {
 
     /// Find best pool for selling tokens (highest SOL output)
     /// Returns (pool_address, dex, accounts, expected_sol_out, alternatives_checked)
+    ///
+    /// FIX-20: Exclusion logic for migrated PumpFun pools and recently-failed pools.
+    /// Phase 1: Basic validity filter (accounts, trade data, age)
+    /// Phase 2: Exclude migrated curves + pools with repeated failures
+    /// Phase 3: Fallback if all preferred pools excluded → use best-available
     fn find_best_sell_pool(
         &self,
         mint: &str,
@@ -1871,7 +1894,11 @@ impl MomentumContext {
         let now = std::time::Instant::now();
         let max_age = std::time::Duration::from_secs(300); // Only use pools with trades in last 5min
 
-        // Filter: must have dex_pool_accounts AND recent trade data
+        // FIX-20 constants
+        let fail_cooldown = std::time::Duration::from_secs(120);
+        const MAX_FAIL_COUNT: u32 = 3;
+
+        // Phase 1: Basic validity filter (must have accounts AND recent trade data)
         let valid: Vec<_> = candidates
             .iter()
             .filter(|p| {
@@ -1885,21 +1912,89 @@ impl MomentumContext {
             anyhow::bail!("No pools with recent trade data and accounts available");
         }
 
-        // Quote each pool using cached last_trade_ratio
-        let mut quotes: Vec<_> = valid
-            .iter()
-            .filter_map(|p| {
-                p.last_trade_ratio.map(|ratio| {
-                    let expected_sol = (token_amount as f64) * ratio;
-                    (
-                        p.pool_address.clone(),
-                        p.dex.clone(),
-                        p.dex_pool_accounts.clone().unwrap(),
-                        expected_sol,
-                    )
-                })
+        // Phase 2 (FIX-20): Exclude migrated PumpFun pools + pools with repeated failures
+        let preferred: Vec<_> = valid.iter().copied()
+            .filter(|p| {
+                // Skip: PumpFun pool with confirmed migration (would fail with 6023)
+                if p.bonding_curve_complete == Some(true) {
+                    debug!(
+                        mint = %mint,
+                        pool = %p.pool_address,
+                        "find_best_sell_pool: skipping migrated PumpFun pool"
+                    );
+                    return false;
+                }
+                // Skip: Pool with >= MAX_FAIL_COUNT failures within cooldown window
+                if p.sell_fail_count >= MAX_FAIL_COUNT {
+                    if let Some(last_fail) = p.last_sell_fail_at {
+                        if now.duration_since(last_fail) < fail_cooldown {
+                            debug!(
+                                mint = %mint,
+                                pool = %p.pool_address,
+                                dex = %p.dex,
+                                sell_fail_count = p.sell_fail_count,
+                                "find_best_sell_pool: skipping pool ({}x failures in cooldown)",
+                                p.sell_fail_count
+                            );
+                            return false;
+                        }
+                    }
+                }
+                true
             })
             .collect();
+
+        // Phase 3 (FIX-20): Fallback if all preferred pools excluded
+        let usable = if preferred.is_empty() {
+            warn!(
+                mint = %mint,
+                valid_count = valid.len(),
+                "FIX-20: All pools excluded by migration/failure filters — using best-available fallback"
+            );
+            &valid
+        } else {
+            &preferred
+        };
+
+        // FIX-21: Quote each pool using RESERVE-BASED calculation from LivePoolCache.
+        // Fallback to last_trade_ratio only when cache has no data for a pool.
+        let token_mint_pubkey = solana_sdk::pubkey::Pubkey::from_str(mint).ok();
+
+        let mut quotes: Vec<(String, String, Vec<String>, f64, &str)> = Vec::new();
+        for p in usable {
+            let pool_pubkey = solana_sdk::pubkey::Pubkey::from_str(&p.pool_address).ok();
+
+            // Try reserve-based quote from LivePoolCache first
+            let cache_quote = pool_pubkey.and_then(|pk| {
+                let state = self.live_pool_cache.get(&pk)?;
+                // For SELL: input_mint = token_mint, output = SOL
+                let input_mint = token_mint_pubkey.as_ref()?;
+                match quote_calculator::quote_output_amount(&state, token_amount, input_mint) {
+                    Ok(sol_out) if sol_out > 0 => Some(sol_out as f64),
+                    _ => None,
+                }
+            });
+
+            if let Some(expected_sol) = cache_quote {
+                quotes.push((
+                    p.pool_address.clone(),
+                    p.dex.clone(),
+                    p.dex_pool_accounts.clone().unwrap(),
+                    expected_sol,
+                    "cache",
+                ));
+            } else if let Some(ratio) = p.last_trade_ratio {
+                // Fallback: approximate from last observed trade ratio
+                let expected_sol = (token_amount as f64) * ratio;
+                quotes.push((
+                    p.pool_address.clone(),
+                    p.dex.clone(),
+                    p.dex_pool_accounts.clone().unwrap(),
+                    expected_sol,
+                    "ratio",
+                ));
+            }
+        }
 
         if quotes.is_empty() {
             anyhow::bail!("No pools with valid quotes");
@@ -1913,6 +2008,7 @@ impl MomentumContext {
         let best = &quotes[0];
         let best_pool = &best.0;
         let expected_sol = best.3;
+        let quote_source = best.4;
 
         // Log if we're switching pools
         if best_pool != original_pool && alternatives_checked > 1 {
@@ -1929,11 +2025,22 @@ impl MomentumContext {
                     original_pool = %original_pool,
                     best_pool = %best_pool,
                     best_dex = %best.1,
+                    quote_source = %quote_source,
                     improvement_pct = %format!("{:.2}%", improvement_pct),
                     alternatives = alternatives_checked,
-                    "🎯 Switching to better pool for exit"
+                    "🎯 Switching to better pool for exit (FIX-21)"
                 );
             }
+        } else if alternatives_checked > 1 {
+            debug!(
+                mint = %mint,
+                best_pool = %best_pool,
+                best_dex = %best.1,
+                quote_source = %quote_source,
+                expected_sol_lamports = expected_sol as u64,
+                alternatives = alternatives_checked,
+                "find_best_sell_pool: selected (FIX-21)"
+            );
         }
 
         Ok((
@@ -1976,26 +2083,47 @@ impl MomentumContext {
             anyhow::bail!("No pools with recent trade data and accounts available");
         }
 
-        // Quote each pool using cached last_trade_ratio
-        // For BUY: expected_tokens = sol_amount / ratio (ratio is SOL per token)
-        let mut quotes: Vec<_> = valid
-            .iter()
-            .filter_map(|p| {
-                p.last_trade_ratio.and_then(|ratio| {
-                    if ratio > 0.0 {
-                        let expected_tokens = (sol_amount as f64) / ratio;
-                        Some((
-                            p.pool_address.clone(),
-                            p.dex.clone(),
-                            p.dex_pool_accounts.clone().unwrap(),
-                            expected_tokens,
-                        ))
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
+        // FIX-21: Quote each pool using RESERVE-BASED calculation from LivePoolCache.
+        // For BUY: input = SOL, output = tokens
+        // Fallback to last_trade_ratio only when cache has no data.
+        let sol_mint_pubkey = solana_sdk::pubkey::Pubkey::from_str(
+            "So11111111111111111111111111111111111111112",
+        )
+        .unwrap();
+
+        let mut quotes: Vec<(String, String, Vec<String>, f64)> = Vec::new();
+        for p in &valid {
+            let pool_pubkey = solana_sdk::pubkey::Pubkey::from_str(&p.pool_address).ok();
+
+            // Try reserve-based quote from LivePoolCache
+            let cache_quote = pool_pubkey.and_then(|pk| {
+                let state = self.live_pool_cache.get(&pk)?;
+                // For BUY: input_mint = SOL
+                match quote_calculator::quote_output_amount(&state, sol_amount, &sol_mint_pubkey) {
+                    Ok(tokens_out) if tokens_out > 0 => Some(tokens_out as f64),
+                    _ => None,
+                }
+            });
+
+            if let Some(expected_tokens) = cache_quote {
+                quotes.push((
+                    p.pool_address.clone(),
+                    p.dex.clone(),
+                    p.dex_pool_accounts.clone().unwrap(),
+                    expected_tokens,
+                ));
+            } else if let Some(ratio) = p.last_trade_ratio {
+                if ratio > 0.0 {
+                    let expected_tokens = (sol_amount as f64) / ratio;
+                    quotes.push((
+                        p.pool_address.clone(),
+                        p.dex.clone(),
+                        p.dex_pool_accounts.clone().unwrap(),
+                        expected_tokens,
+                    ));
+                }
+            }
+        }
 
         if quotes.is_empty() {
             anyhow::bail!("No pools with valid quotes");
@@ -2027,7 +2155,7 @@ impl MomentumContext {
                     best_dex = %best.1,
                     improvement_pct = %format!("{:.2}%", improvement_pct),
                     alternatives = alternatives_checked,
-                    "🎯 Switching to better pool for scale-in buy"
+                    "🎯 Switching to better pool for scale-in buy (FIX-21)"
                 );
             }
         }
@@ -3093,6 +3221,28 @@ impl MomentumContext {
                             "Reset exit_generated for orphaned sell failure — will retry"
                         );
                     }
+                    drop(positions);
+
+                    // FIX-20: Track pool failure for orphaned sell path too.
+                    // Extract pool from execution result metadata or position tracker.
+                    let pool_addr = result.metadata.get("pool")
+                        .or_else(|| result.metadata.get("pools"))
+                        .cloned();
+                    if let Some(ref pool) = pool_addr {
+                        let mut pools = self.mint_pools.write();
+                        if let Some(pool_list) = pools.get_mut(mint.as_str()) {
+                            if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == *pool) {
+                                pool_info.sell_fail_count += 1;
+                                pool_info.last_sell_fail_at = Some(Instant::now());
+                                warn!(
+                                    mint = %mint,
+                                    pool = %pool,
+                                    sell_fail_count = pool_info.sell_fail_count,
+                                    "FIX-20: Orphaned sell failure — pool tracked for exclusion"
+                                );
+                            }
+                        }
+                    }
                 }
             }
             else {
@@ -3238,6 +3388,26 @@ impl MomentumContext {
                         });
                     }
                     TradeSide::Sell => {
+                        // FIX-20: Reset pool failure count on successful sell.
+                        {
+                            let mut pools = self.mint_pools.write();
+                            if let Some(pool_list) = pools.get_mut(&pending.mint) {
+                                if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pending.pool) {
+                                    if pool_info.sell_fail_count > 0 {
+                                        info!(
+                                            mint = %pending.mint,
+                                            pool = %pending.pool,
+                                            dex = %pending.dex,
+                                            old_fail_count = pool_info.sell_fail_count,
+                                            "FIX-20: Sell succeeded — resetting pool failure count"
+                                        );
+                                        pool_info.sell_fail_count = 0;
+                                        pool_info.last_sell_fail_at = None;
+                                    }
+                                }
+                            }
+                        }
+
                         // SELL confirmed - close or reduce position.
                         // Defense-in-depth: if only a partial amount was sold
                         // (e.g., race between exit and scale-in), reduce the
@@ -3350,6 +3520,23 @@ impl MomentumContext {
                             "Reset exit_generated after sell FAILURE — will retry on next tick"
                         );
                     }
+                    drop(positions);
+
+                    // FIX-20: Track pool failure so find_best_sell_pool() prefers alternatives.
+                    let mut pools = self.mint_pools.write();
+                    if let Some(pool_list) = pools.get_mut(&pending.mint) {
+                        if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pending.pool) {
+                            pool_info.sell_fail_count += 1;
+                            pool_info.last_sell_fail_at = Some(Instant::now());
+                            warn!(
+                                mint = %pending.mint,
+                                pool = %pending.pool,
+                                dex = %pending.dex,
+                                sell_fail_count = pool_info.sell_fail_count,
+                                "FIX-20: Pool sell failure tracked — will prefer alternatives on retry"
+                            );
+                        }
+                    }
                 }
             }
             ExecutionStatus::Timeout => {
@@ -3377,6 +3564,23 @@ impl MomentumContext {
                             mint = %pending.mint,
                             "Reset exit_generated after sell TIMEOUT — will retry on next tick"
                         );
+                    }
+                    drop(positions);
+
+                    // FIX-20: Track pool failure so find_best_sell_pool() prefers alternatives.
+                    let mut pools = self.mint_pools.write();
+                    if let Some(pool_list) = pools.get_mut(&pending.mint) {
+                        if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pending.pool) {
+                            pool_info.sell_fail_count += 1;
+                            pool_info.last_sell_fail_at = Some(Instant::now());
+                            warn!(
+                                mint = %pending.mint,
+                                pool = %pending.pool,
+                                dex = %pending.dex,
+                                sell_fail_count = pool_info.sell_fail_count,
+                                "FIX-20: Pool sell timeout tracked — will prefer alternatives on retry"
+                            );
+                        }
                     }
                 }
             }
@@ -4600,6 +4804,9 @@ async fn main() -> Result<()> {
         positions
     };
 
+    // FIX-21: Create SLAVE LivePoolCache for reserve-based quoting
+    let live_pool_cache = LivePoolCache::new();
+
     let ctx = Arc::new(MomentumContext {
         run_id: run_id.clone(),
         config: parking_lot::RwLock::new(momentum_config),
@@ -4614,6 +4821,7 @@ async fn main() -> Result<()> {
         positions: parking_lot::RwLock::new(recovered_positions),
         pending_intents: parking_lot::RwLock::new(HashMap::new()),
         mint_pools: parking_lot::RwLock::new(HashMap::new()),
+        live_pool_cache,
         position_kv: tokio::sync::OnceCell::new(),
         tokens_tracked: std::sync::atomic::AtomicU64::new(0),
         tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
@@ -4627,6 +4835,23 @@ async fn main() -> Result<()> {
             debug!("No wallet snapshots recovered from JetStream");
         }
     }
+
+    // === FIX-21: Bootstrap SLAVE LivePoolCache from JetStream ===
+    let bootstrap_consumer = if let Some(ref nats) = ctx.nats {
+        match pool_cache_sync::bootstrap_pool_cache_from_jetstream(nats, &ctx.live_pool_cache).await
+        {
+            Ok((recovered, consumer)) => {
+                info!(pools_recovered = recovered, "MOMENTUM SLAVE CACHE: bootstrap complete");
+                consumer
+            }
+            Err(e) => {
+                warn!(error = %e, "MOMENTUM SLAVE CACHE: bootstrap failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // === CRITICAL: Check for immediate exits after position recovery ===
     // Recovered positions might already violate max_hold_time or stop-loss
@@ -4821,6 +5046,51 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // FIX-21: JetStream consumer for incremental PoolCacheUpdates (SLAVE cache sync)
+    // Reuse bootstrap consumer to avoid replaying all historical messages.
+    let pool_cache_consumer = if let Some(consumer) = bootstrap_consumer {
+        info!(
+            stream = STREAM_NAME,
+            "Reusing bootstrap consumer for live PoolCacheUpdate sync"
+        );
+        Some(consumer)
+    } else if let Some(ref nats) = ctx.nats {
+        use async_nats::jetstream;
+
+        let jetstream = jetstream::new(nats.client().clone());
+        match jetstream.get_stream(STREAM_NAME).await {
+            Ok(stream) => {
+                let config = async_nats::jetstream::consumer::pull::Config {
+                    deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::New,
+                    ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
+                    max_ack_pending: 1000,
+                    filter_subject: "ironcrab.pool_cache.>".to_string(),
+                    ..Default::default()
+                };
+                match stream.create_consumer(config).await {
+                    Ok(consumer) => {
+                        info!(
+                            stream = STREAM_NAME,
+                            "Created NEW JetStream consumer for PoolCacheUpdates (DeliverPolicy::New)"
+                        );
+                        Some(consumer)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to create JetStream consumer for PoolCacheUpdates");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, stream = STREAM_NAME, "JetStream stream not found");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut pool_cache_consumer_opt = pool_cache_consumer;
 
     // Heartbeat and stats tracking
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -5047,6 +5317,41 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+
+            // FIX-21: Process incremental PoolCacheUpdates (SLAVE cache sync)
+            _ = async {
+                use futures::StreamExt;
+                if let Some(ref mut consumer) = pool_cache_consumer_opt {
+                    match consumer.fetch().max_messages(100).expires(std::time::Duration::from_millis(50)).messages().await {
+                        Ok(mut messages) => {
+                            let mut msg_count = 0u32;
+                            while let Some(msg_result) = messages.next().await {
+                                match msg_result {
+                                    Ok(msg) => {
+                                        if let Ok(update) = serde_json::from_slice::<ironcrab::ipc::PoolCacheUpdate>(&msg.payload) {
+                                            pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &update);
+                                            msg_count += 1;
+                                        }
+                                        let _ = msg.ack().await;
+                                    }
+                                    Err(e) => {
+                                        trace!(error = %e, "PoolCacheUpdate fetch error");
+                                    }
+                                }
+                            }
+                            if msg_count > 0 {
+                                trace!(updates = msg_count, "SLAVE CACHE: processed PoolCacheUpdates");
+                            }
+                        }
+                        Err(e) => {
+                            trace!(error = %e, "PoolCacheUpdate consumer fetch error");
+                        }
+                    }
+                } else {
+                    // No consumer — wait forever (other arms will fire)
+                    std::future::pending::<()>().await;
+                }
+            } => {}
 
             // Strategy evaluation tick (entry + exits) - frequent enough for probe/scale windows.
             _ = strategy_interval.tick() => {
@@ -5678,6 +5983,7 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
@@ -5925,6 +6231,7 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
@@ -6023,6 +6330,7 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
@@ -6089,6 +6397,7 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
@@ -6143,6 +6452,7 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
@@ -6209,6 +6519,7 @@ mod tests {
             positions: parking_lot::RwLock::new(HashMap::new()),
             pending_intents: parking_lot::RwLock::new(HashMap::new()),
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
@@ -7103,6 +7414,26 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     old_bps = ?old,
                     "Updated bonding curve progress for position"
                 );
+            }
+            drop(positions);
+
+            // FIX-20: Mark PumpFun pools as migrated when bonding curve completes.
+            // This prevents find_best_sell_pool() from selecting a completed PumpFun
+            // bonding curve, which would fail on-chain with Custom(6023).
+            if *complete {
+                let mut pools = ctx.mint_pools.write();
+                if let Some(pool_list) = pools.get_mut(mint.as_str()) {
+                    for pool in pool_list.iter_mut() {
+                        if pool.dex == "pumpfun" && pool.bonding_curve_complete != Some(true) {
+                            pool.bonding_curve_complete = Some(true);
+                            warn!(
+                                mint = %mint,
+                                pool = %pool.pool_address,
+                                "FIX-20: PumpFun pool marked as migrated (bonding curve complete) — will prefer alternatives for SELL"
+                            );
+                        }
+                    }
+                }
             }
         }
 
