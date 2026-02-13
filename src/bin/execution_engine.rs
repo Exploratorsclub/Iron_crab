@@ -218,10 +218,18 @@ fn find_message_account_index(
     None
 }
 
+/// Returns (delta, fee, has_lifecycle_noise, rent_adjustment).
+///
+/// `rent_adjustment` is the sum of lamports the wallet spent on creating new accounts
+/// minus the lamports received from closing accounts.  Subtracting this from the raw
+/// delta isolates the swap + fee portion of the lamport change.
+///
+/// Positive rent_adjustment = wallet paid rent (accounts created).
+/// Negative rent_adjustment = wallet received rent back (accounts closed).
 fn compute_wallet_lamport_delta_best_effort(
     tx: &EncodedConfirmedTransactionWithStatusMeta,
     wallet: &Pubkey,
-) -> Option<(i128, u64, bool)> {
+) -> Option<(i128, u64, bool, i128)> {
     let meta = tx.transaction.meta.as_ref()?;
     let wallet_index = find_message_account_index(tx, wallet)?;
 
@@ -232,6 +240,8 @@ fn compute_wallet_lamport_delta_best_effort(
     // Heuristic: if the tx funds a brand new account or zeroes an account in the message,
     // payer lamport delta is likely polluted by rent / account lifecycle noise.
     let mut has_account_lifecycle_noise = false;
+    // Track rent paid (accounts created) and rent refunded (accounts closed).
+    let mut rent_adjustment: i128 = 0;
     for (i, (pre_i, post_i)) in meta
         .pre_balances
         .iter()
@@ -243,16 +253,141 @@ fn compute_wallet_lamport_delta_best_effort(
             continue;
         }
         if pre_i == 0 && post_i > 0 {
+            // New account created — wallet likely paid rent = post_i lamports
             has_account_lifecycle_noise = true;
-            break;
+            rent_adjustment += post_i as i128;
         }
         if pre_i > 0 && post_i == 0 {
+            // Account closed — wallet likely received rent refund = pre_i lamports
             has_account_lifecycle_noise = true;
-            break;
+            rent_adjustment -= pre_i as i128;
         }
     }
 
-    Some((delta, meta.fee, has_account_lifecycle_noise))
+    Some((delta, meta.fee, has_account_lifecycle_noise, rent_adjustment))
+}
+
+/// Extract SOL swap amounts from parsed inner instructions.
+///
+/// Parses `meta.inner_instructions` for System program `transfer` instructions
+/// involving the wallet.  Returns `(sol_out, sol_in)` where:
+/// - `sol_out`: total lamports transferred FROM wallet via `transfer` (not `createAccount`)
+/// - `sol_in`:  total lamports transferred TO wallet via `transfer`
+///
+/// `createAccount` instructions are excluded because they represent ATA rent, not swap payments.
+/// This gives a much more accurate swap amount than the raw lamport delta.
+fn extract_swap_sol_from_inner_instructions(
+    tx: &EncodedConfirmedTransactionWithStatusMeta,
+    wallet: &Pubkey,
+) -> (u64, u64) {
+    let wallet_str = wallet.to_string();
+    let mut sol_out: u64 = 0; // lamports FROM wallet (e.g., swap payment on BUY)
+    let mut sol_in: u64 = 0; // lamports TO wallet (e.g., swap proceeds on SELL)
+
+    let meta = match tx.transaction.meta.as_ref() {
+        Some(m) => m,
+        None => return (0, 0),
+    };
+
+    // Serialize inner_instructions to JSON for easy traversal.
+    // The Solana SDK uses nested enums (UiInstruction → UiParsedInstruction → ParsedInstruction)
+    // which are cumbersome to match through.  JSON traversal is simpler and resilient to
+    // SDK version differences.
+    let inner_json = match serde_json::to_value(&meta.inner_instructions) {
+        Ok(v) => v,
+        Err(_) => return (0, 0),
+    };
+
+    let groups = match inner_json.as_array() {
+        Some(g) => g,
+        None => return (0, 0),
+    };
+
+    for group in groups {
+        let instructions = match group.get("instructions").and_then(|v| v.as_array()) {
+            Some(ixs) => ixs,
+            None => continue,
+        };
+
+        for ix in instructions {
+            // We want fully-parsed System program instructions.
+            // In JsonParsed encoding these appear as:
+            //   { "parsed": { "type": "transfer", "info": { "source", "destination", "lamports" } },
+            //     "program": "system", "programId": "1111..." }
+            // OR nested inside a "Parsed"/"Compiled" wrapper depending on SDK serialization.
+
+            // Try direct access first (common for inner instructions)
+            let parsed_obj = ix
+                .get("parsed")
+                // Also handle the case where the SDK wraps in { "Parsed": { "parsed": ... } }
+                .or_else(|| {
+                    ix.get("Parsed")
+                        .and_then(|p| p.get("parsed"))
+                });
+
+            let program = ix
+                .get("program")
+                .and_then(|p| p.as_str())
+                .or_else(|| {
+                    ix.get("Parsed")
+                        .and_then(|p| p.get("program"))
+                        .and_then(|p| p.as_str())
+                });
+
+            let program_id = ix
+                .get("programId")
+                .and_then(|p| p.as_str())
+                .or_else(|| {
+                    ix.get("Parsed")
+                        .and_then(|p| p.get("programId"))
+                        .and_then(|p| p.as_str())
+                });
+
+            // Must be System program
+            let is_system = program == Some("system")
+                || program_id == Some("11111111111111111111111111111111");
+            if !is_system {
+                continue;
+            }
+
+            let parsed = match parsed_obj {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let ix_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let info = match parsed.get("info") {
+                Some(i) => i,
+                None => continue,
+            };
+
+            // Skip createAccount — that's ATA rent, not swap
+            if ix_type == "createAccount" || ix_type == "createAccountWithSeed" {
+                continue;
+            }
+
+            if ix_type == "transfer" {
+                let source = info.get("source").and_then(|s| s.as_str()).unwrap_or("");
+                let destination = info
+                    .get("destination")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
+                let lamports = info.get("lamports").and_then(|l| l.as_u64()).unwrap_or(0);
+
+                if lamports == 0 {
+                    continue;
+                }
+
+                if source == wallet_str && destination != wallet_str {
+                    sol_out = sol_out.saturating_add(lamports);
+                } else if destination == wallet_str && source != wallet_str {
+                    sol_in = sol_in.saturating_add(lamports);
+                }
+            }
+        }
+    }
+
+    (sol_out, sol_in)
 }
 
 async fn compute_intent_fills_best_effort(
@@ -311,18 +446,18 @@ async fn compute_intent_fills_best_effort(
 
     // Get native SOL (lamport) delta for wallet - used for fees and native SOL tracking
     let mut lamport_reason: Option<FillUnavailableReason> = None;
-    let (payer_delta_lamports, fee_lamports, lamport_noise) =
+    let (payer_delta_lamports, fee_lamports, lamport_noise, rent_adjustment) =
         match compute_wallet_lamport_delta_best_effort(&tx, &wallet) {
-            Some((d, f, noise)) => {
+            Some((d, f, noise, rent)) => {
                 if noise {
                     lamport_reason =
                         Some(FillUnavailableReason::LamportDeltaGatedAccountLifecycleNoise);
                 }
-                (d, f, noise)
+                (d, f, noise, rent)
             }
             None => {
                 lamport_reason = Some(FillUnavailableReason::WalletAccountIndexMissing);
-                (0, 0, true)
+                (0, 0, true, 0)
             }
         };
 
@@ -406,6 +541,16 @@ async fn compute_intent_fills_best_effort(
     let input_token_delta = extract_owner_mint_delta_raw(&tx, &wallet, input_mint);
     let output_token_delta = extract_owner_mint_delta_raw(&tx, &wallet, output_mint);
 
+    // Pre-compute inner-instruction SOL transfers for the lamport_noise fallback paths.
+    // Only needed when one leg is native SOL and token-balance deltas are unavailable.
+    let (ix_sol_out, ix_sol_in) = if (input_mint == SOL_MINT || output_mint == SOL_MINT)
+        && (input_token_delta.is_none() || output_token_delta.is_none())
+    {
+        extract_swap_sol_from_inner_instructions(&tx, &wallet)
+    } else {
+        (0, 0)
+    };
+
     let fill_in = if let Some((decimals, delta)) = input_token_delta {
         if delta < 0 {
             Some(ExplicitAmount::new((-delta) as u64, decimals))
@@ -413,7 +558,7 @@ async fn compute_intent_fills_best_effort(
             None
         }
     } else if input_mint == SOL_MINT && !lamport_noise && payer_delta_lamports < 0 {
-        // Approximate: amount spent excluding network fee.
+        // No lifecycle noise: use payer delta minus fee as swap approximation.
         let spent_total = (-payer_delta_lamports) as u64;
         let spent_ex_fee = spent_total.saturating_sub(fee_lamports);
         if spent_ex_fee > 0 {
@@ -422,10 +567,53 @@ async fn compute_intent_fills_best_effort(
             None
         }
     } else if input_mint == SOL_MINT && lamport_noise {
-        // BUY with account lifecycle noise (new ATA created):
-        // Use intent's required_capital as fill_in (this is the SOL amount we intended to spend).
-        // This is accurate for BUYs since the intent specifies the exact SOL input amount.
-        Some(intent.required_capital.clone())
+        // BUY with account lifecycle noise (new ATA created).
+        //
+        // Priority 1: Inner-instruction parsing — sum of System.transfer OUT from wallet.
+        //   This includes swap payment + DEX fees + Jito tips but excludes ATA rent
+        //   (createAccount instructions are filtered out).
+        //   For normal trades, the swap is the dominant transfer.
+        //
+        // Priority 2: Rent-adjusted lamport delta — removes ATA rent from raw delta.
+        //   Still includes priority fees and program-level fees but vastly more accurate
+        //   than intent.required_capital.
+        //
+        // Priority 3 (last resort): intent.required_capital — can be 29x wrong when
+        //   the DEX only accepts a fraction of the intended SOL (e.g., bonding curve
+        //   nearly complete).
+        if ix_sol_out > 0 {
+            debug!(
+                ix_sol_out = ix_sol_out,
+                intent_capital = intent.required_capital.raw,
+                "fill_in from inner instructions (System.transfer OUT, excl. createAccount)"
+            );
+            Some(ExplicitAmount::new(ix_sol_out, 9))
+        } else {
+            // Rent-adjusted fallback: |delta| - rent_paid - fee ≈ swap + program-level fees
+            // rent_adjustment is positive when wallet paid rent (ATA created), so subtract it.
+            let adjusted = ((-payer_delta_lamports) - rent_adjustment)
+                .saturating_sub(fee_lamports as i128);
+            if adjusted > 0 {
+                debug!(
+                    adjusted = adjusted,
+                    raw_delta = payer_delta_lamports,
+                    rent_adjustment = rent_adjustment,
+                    fee = fee_lamports,
+                    intent_capital = intent.required_capital.raw,
+                    "fill_in from rent-adjusted lamport delta"
+                );
+                Some(ExplicitAmount::new(adjusted as u64, 9))
+            } else {
+                // Last resort — can be wildly wrong (documented in BUGS_FIXES.md)
+                warn!(
+                    intent_capital = intent.required_capital.raw,
+                    raw_delta = payer_delta_lamports,
+                    rent_adjustment = rent_adjustment,
+                    "fill_in falling back to intent.required_capital — may be inaccurate!"
+                );
+                Some(intent.required_capital.clone())
+            }
+        }
     } else {
         None
     };
@@ -437,13 +625,39 @@ async fn compute_intent_fills_best_effort(
             None
         }
     } else if output_mint == SOL_MINT && !lamport_noise && payer_delta_lamports > 0 {
-        // Approximate: amount received before fees (add back network fee).
+        // No lifecycle noise: use payer delta plus fee as swap approximation.
         let received_total = payer_delta_lamports as u64;
         let received_plus_fee = received_total.saturating_add(fee_lamports);
         if received_plus_fee > 0 {
             Some(ExplicitAmount::new(received_plus_fee, 9))
         } else {
             None
+        }
+    } else if output_mint == SOL_MINT && lamport_noise {
+        // SELL with account lifecycle noise (ATA closed, rent refunded).
+        // Same priority chain as BUY fill_in but for the incoming SOL side.
+        if ix_sol_in > 0 {
+            debug!(
+                ix_sol_in = ix_sol_in,
+                "fill_out from inner instructions (System.transfer IN)"
+            );
+            Some(ExplicitAmount::new(ix_sol_in, 9))
+        } else {
+            // Rent-adjusted: raw_delta - rent_refund + fee ≈ swap proceeds
+            let adjusted = (payer_delta_lamports + rent_adjustment)
+                .saturating_add(fee_lamports as i128);
+            if adjusted > 0 {
+                debug!(
+                    adjusted = adjusted,
+                    raw_delta = payer_delta_lamports,
+                    rent_adjustment = rent_adjustment,
+                    fee = fee_lamports,
+                    "fill_out from rent-adjusted lamport delta"
+                );
+                Some(ExplicitAmount::new(adjusted as u64, 9))
+            } else {
+                None
+            }
         }
     } else {
         None

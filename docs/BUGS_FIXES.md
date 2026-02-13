@@ -214,10 +214,57 @@ Diese Bugs sind im Detail in `docs/ARCHITECTURE_AUDIT_2026-02-07.md` dokumentier
 
 ---
 
+## FIX-17: CRITICAL — fill_in/fill_out Accuracy (False Take-Profit Triggers)
+
+**Datum**: 2026-02-13  
+**Schweregrad**: CRITICAL — Bot traf Trading-Entscheidungen auf Basis falscher Preisdaten
+
+### Problem
+Bei BUY-Trades mit `lamport_noise=true` (ATA wird erstellt) fiel `fill_in` auf `intent.required_capital` zurück.
+Dies war katastrophal falsch wenn die DEX weniger SOL akzeptiert als beabsichtigt (z.B. PumpFun Bonding Curve fast voll):
+
+- **D39XKvFT**: `fill_in` = 0.00125 SOL (intent), **real**: 0.000043 SOL → **28.6x Fehler**
+- Falsche `entry_price` → Momentum-Bot sah +2949.3% Gain statt real ~6.5%
+- Take-Profit wurde fälschlicherweise ausgelöst, Token mit Verlust verkauft
+
+Bei SELL-Trades war `fill_out` immer `None` wenn `lamport_noise=true` (ATA geschlossen), weil der
+native SOL Fallback durch das Lifecycle-Noise-Gate blockiert wurde.
+
+### Root Cause
+`compute_intent_fills_best_effort()` in `execution_engine.rs`:
+- Zeile 424-428 (alt): `lamport_noise → fill_in = intent.required_capital` (kann 29x falsch sein)
+- Zeile 439 (alt): `lamport_noise → fill_out = None` (SELL SOL-Erlös fehlt komplett)
+
+### Fix
+Neue dreistufige Fallback-Kette für native SOL-Legs mit `lamport_noise`:
+
+1. **Inner Instruction Parsing** (`extract_swap_sol_from_inner_instructions`):
+   - Parst `meta.inner_instructions` nach System Program `transfer` Instruktionen
+   - Filtert `createAccount` aus (das ist ATA-Rent, kein Swap)
+   - Genaueste Methode: erfasst Swap-Betrag + DEX-Fees (ohne ATA-Rent)
+
+2. **Rent-Adjusted Lamport Delta**:
+   - `compute_wallet_lamport_delta_best_effort` gibt jetzt auch `rent_adjustment` zurück
+   - Bereinigtes Delta = `raw_delta + rent_created - rent_refunded`
+   - Entfernt ~96% des Errors (ATA-Rent ist ~2.04M lamports)
+
+3. **intent.required_capital** (letzter Ausweg mit WARN-Log)
+
+### Dashboard PnL
+`trades_server.py`: SELL proceeds nutzt jetzt explizit `wallet_delta` (konsistent mit BUY cost).
+ATA-Rent hebt sich auf. Dashboard zeigt realen Wallet-Impact inklusive aller Fees.
+
+### Dateien
+- `src/bin/execution_engine.rs`: `compute_wallet_lamport_delta_best_effort`, `extract_swap_sol_from_inner_instructions`, `compute_intent_fills_best_effort`
+- `scripts/trades_server.py`: PnL-Berechnung in 3 Blöcken (run, last, 24h)
+
+---
+
 ## 4. VERLORENE ÄNDERUNGEN DURCH REVERT (Cherry-Pick Status)
 
 | Priorität | Beschreibung | Status |
 |-----------|-------------|--------|
+| **CRITICAL** | fill_in/fill_out Accuracy (FIX-17) | ✅ FIXED |
 | P1 | PumpSwap AMM Geyser-First Integration | ❌ FEHLT |
 | P1 | PumpFun SELL migrierte Tokens → `Ok(None)` | ❌ FEHLT |
 | P1 | `emit_sim_failed_decision()` → `Err` für Retry | ❌ FEHLT |
