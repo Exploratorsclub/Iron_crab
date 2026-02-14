@@ -1873,6 +1873,61 @@ impl MomentumContext {
         Some(tracker)
     }
 
+    /// FIX-22: Cross-check creator from TokenTracker against LivePoolCache.
+    /// LivePoolCache creator comes from on-chain bonding curve account data (bytes 49-80)
+    /// and is authoritative. TokenTracker creator may come from instruction_accounts[7]
+    /// which can be wrong for CPI/bundler-created tokens.
+    /// Returns the best available creator, preferring LivePoolCache when available.
+    fn resolve_authoritative_creator(&self, mint: &str, tracker_creator: Option<String>) -> Option<String> {
+        // Try LivePoolCache (authoritative: from Geyser bonding curve account data)
+        let cache_creator = {
+            if let Ok(mint_pk) = solana_sdk::pubkey::Pubkey::from_str(mint) {
+                let (bonding_curve, _) =
+                    ironcrab::solana::dex::pumpfun::PumpFunDex::derive_bonding_curve_static(&mint_pk);
+                self.live_pool_cache
+                    .get_pumpfun_creator(&bonding_curve)
+                    .map(|pk| pk.to_string())
+            } else {
+                None
+            }
+        };
+
+        match (&cache_creator, &tracker_creator) {
+            (Some(cache), Some(tracker)) if cache != tracker => {
+                warn!(
+                    mint = %mint,
+                    tracker_creator = %tracker,
+                    cache_creator = %cache,
+                    "FIX-22: Creator mismatch! LivePoolCache (authoritative) differs from TokenTracker — using cache value"
+                );
+                // Correct the TokenTracker for future calls
+                let config = self.config.read().clone();
+                let mut trackers = self.token_trackers.write();
+                if let Some(t) = trackers.get_mut(mint) {
+                    t.set_dev_info(cache, 0.0, &config);
+                }
+                cache_creator
+            }
+            (Some(_cache), Some(_tracker)) => {
+                // Both present and identical — use cache (authoritative)
+                cache_creator
+            }
+            (Some(cache), None) => {
+                debug!(
+                    mint = %mint,
+                    cache_creator = %cache,
+                    "Creator resolved from LivePoolCache (TokenTracker had none)"
+                );
+                Some(cache.clone())
+            }
+            (None, Some(_)) => {
+                // Only tracker has it — use it (LivePoolCache may not have this token)
+                tracker_creator
+            }
+            (None, None) => None,
+        }
+    }
+
     /// Find best pool for selling tokens (highest SOL output)
     /// Returns (pool_address, dex, accounts, expected_sol_out, alternatives_checked)
     ///
@@ -5498,13 +5553,15 @@ async fn generate_and_publish_buy_intent(
         }
     };
 
+    // FIX-22: Cross-check creator with LivePoolCache (authoritative)
     let (creator_opt, last_trade_ratio_opt) = {
         let trackers = ctx.token_trackers.read();
         let tracker = trackers.get(&signal.mint);
-        (
-            tracker.and_then(|t| t.dev_wallet.clone()),
-            tracker.and_then(|t| t.last_trade_ratio()),
-        )
+        let tracker_creator = tracker.and_then(|t| t.dev_wallet.clone());
+        let ratio = tracker.and_then(|t| t.last_trade_ratio());
+        drop(trackers);
+        let resolved_creator = ctx.resolve_authoritative_creator(&signal.mint, tracker_creator);
+        (resolved_creator, ratio)
     };
 
     let (token_decimals_opt, token_program_opt) = {
@@ -6648,13 +6705,15 @@ async fn generate_and_publish_exit_intent(
 
     let intent_id = ctx.next_intent_id();
 
+    // FIX-22: Cross-check creator with LivePoolCache (authoritative)
     let (creator_opt, last_trade_ratio_opt) = {
         let trackers = ctx.token_trackers.read();
         let tracker = trackers.get(mint);
-        (
-            tracker.and_then(|t| t.dev_wallet.clone()),
-            tracker.and_then(|t| t.last_trade_ratio()),
-        )
+        let tracker_creator = tracker.and_then(|t| t.dev_wallet.clone());
+        let ratio = tracker.and_then(|t| t.last_trade_ratio());
+        drop(trackers);
+        let resolved_creator = ctx.resolve_authoritative_creator(mint, tracker_creator);
+        (resolved_creator, ratio)
     };
 
     let (last_sol_lamports, last_token_amount) = match last_trade_ratio_opt {

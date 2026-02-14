@@ -2365,32 +2365,47 @@ async fn run_geyser_loop(
                     let pool_str = pool_address.to_string();
                     let creator_str = creator.to_string();
 
-                    // Cache pool -> creator mapping
+                    // Cache pool -> creator mapping (AUTHORITATIVE: bonding curve account data)
+                    // FIX-22: Always overwrite — on-chain account data is the source of truth.
                     {
                         let mut pool_creator = ctx.pool_creator_cache.write();
-                        if !pool_creator.contains_key(&pool_str) {
-                            pool_creator.insert(pool_str.clone(), creator_str.clone());
-                            debug!(
-                                pool = %pool_str,
-                                creator = %creator_str,
-                                "Cached creator from BondingCurveUpdate (pool_creator_cache)"
-                            );
-                        }
+                        pool_creator.insert(pool_str.clone(), creator_str.clone());
                     }
 
                     // If we know the mint for this pool, also update creator_cache (mint -> creator)
-                    // and emit DevWalletIdentified event
+                    // and emit DevWalletIdentified event.
+                    // FIX-22: Always overwrite cache with authoritative bonding curve data.
+                    // PoolCreated events may set a wrong creator (instruction_accounts[7] can differ
+                    // from on-chain creator for CPI/bundler creates). BondingCurveUpdate is authoritative.
                     if let Some(mint) = ctx.pool_mint_map.read().get(&pool_str).cloned() {
                         let mut creator_cache = ctx.creator_cache.write();
-                        if !creator_cache.contains_key(&mint) {
-                            creator_cache.insert(mint.clone(), creator_str.clone());
-                            drop(creator_cache); // Release lock before async operations
+                        let existing = creator_cache.get(&mint).cloned();
+                        creator_cache.insert(mint.clone(), creator_str.clone());
+                        drop(creator_cache); // Release lock before async operations
 
+                        // Emit DevWalletIdentified if creator is new or CHANGED (correction)
+                        let should_emit = match &existing {
+                            None => true,
+                            Some(old) if old != &creator_str => {
+                                warn!(
+                                    mint = %mint,
+                                    pool = %pool_str,
+                                    old_creator = %old,
+                                    new_creator = %creator_str,
+                                    "FIX-22: Creator mismatch detected — BondingCurve account data overwrites stale cache value"
+                                );
+                                true
+                            }
+                            _ => false,
+                        };
+
+                        if should_emit {
                             info!(
                                 mint = %mint,
                                 pool = %pool_str,
                                 creator = %creator_str,
-                                "Creator cached from BondingCurve account update"
+                                corrected = existing.is_some(),
+                                "Creator cached from BondingCurve account update (authoritative)"
                             );
 
                             // Emit DevWalletIdentified event

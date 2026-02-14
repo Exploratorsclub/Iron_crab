@@ -374,21 +374,56 @@ if let Some(pool_list) = pools.get_mut(&pending.mint) {
 **Fix**: `exit_generated` wird jetzt in `ExecutionStatus::Failed` und `ExecutionStatus::Timeout` Handlern für Sell-Side-Trades zurückgesetzt. Gilt sowohl für den normalen Pending-Intent-Pfad als auch für den Orphaned-Sell-Recovery-Pfad (konsistentes unconditional Reset).
 **Dateien**: `src/bin/momentum_bot.rs`
 
-### BUG-D: Falscher Creator im LivePoolCache
-**Schweregrad**: MITTEL
+### ~~BUG-D: Falscher Creator im Cache → ConstraintSeeds bei SELL~~ ✅ BEHOBEN
+**Schweregrad**: HOCH → **BEHOBEN** (2026-02-14, FIX-22)
 **Betroffene Tokens** (2026-02-13 Run): `64HemTH7`, `34c3bPRz`
-**Symptom**: Der Creator der beim Buy gespeichert wurde (aus `token_tracker.dev_wallet`) unterscheidet sich vom Creator der bei der Liquidation verwendet wurde (aus `LivePoolCache`/RPC-Fallback).
-**Analyse**:
-- Momentum-Bot speichert Creator aus dem `TokenTracker` (stammt vermutlich aus dem initialen Discovery-Event)
-- Liquidation lädt Creator frisch per RPC (seit FIX-13)
-- Der RPC-geladene Creator hat funktioniert (Liquidation erfolgreich)
-- Der im Momentum-Bot gespeicherte Creator hat nicht funktioniert (alle Sells gescheitert)
-- Mögliche Ursachen:
-  1. `dev_wallet` im TokenTracker wird aus einem falschen Feld des Discovery-Events befüllt
-  2. Cache-Corruption bei PumpFun Bonding-Curve Account-Updates
-  3. Race Condition: Creator wird aus einem Event überschrieben, das nicht den echten Creator enthält
-**Status**: ❌ OFFEN — Ursachenanalyse erforderlich
-**Nächster Schritt**: Prüfen wie `dev_wallet` in TokenTracker gesetzt wird. Vergleich der Creator-Werte zwischen Buy-Zeit und Liquidations-Zeit.
+**Symptom**: Alle Momentum-Bot SELL-Versuche scheiterten mit `Custom(2006)` (ConstraintSeeds) weil der `creator_vault` PDA aus einem falschen Creator abgeleitet wurde. Liquidation per RPC-Fallback funktionierte.
+
+**Root Cause (detailliert)**:
+
+Zwei zusammenwirkende Fehler:
+
+1. **`instruction_accounts[7]` ist nicht immer der Creator**: `parse_pumpfun_create()` und `geyser_pool_discovery` extrahieren den Creator aus `instruction_accounts[7]` der CREATE-Transaktion. Bei Tokens die über CPI (Bundler, Launchpads) erstellt werden, kann der Account an Index 7 von der Bonding-Curve-Account-Daten (`data[49..81]`) abweichen.
+
+2. **First-Write-Wins Cache blockiert Korrektur**: In `market_data.rs`:
+   - `PoolCreated` Handler schreibt `creator_cache[mint]` **unconditional** (Zeile 2638)
+   - `BondingCurveUpdate` Handler hat `contains_key`-Guard → **SKIP** wenn PoolCreated zuerst kam
+   - `DevWalletIdentified` aus BondingCurveUpdate wird **nicht emittiert** → autoritativer Creator erreicht Momentum-Bot nie
+
+**Server-Log-Evidenz**:
+
+| Token | Momentum-Bot Creator | Korrekter Creator (RPC) | Sell-Ergebnis |
+|-------|---------------------|------------------------|---------------|
+| `64HemTH7` | `Ca8hHy...WMynz` | `B62Dvk...JhMYo` | ~20x `Custom(2006)` |
+| `34c3bPRz` | `E77jVj...q1UP` | `GfBB85...4dqf` | ~20x `Custom(2006)` |
+
+**Fix**: FIX-22 (siehe unten)
+
+#### FIX-22: Autoritative Creator-Quelle + LivePoolCache Cross-Check
+**Datum**: 2026-02-14
+**Problem**: Falscher Creator in `creator_cache` und `TokenTracker.dev_wallet` durch nicht-autoritativen `instruction_accounts[7]` bei CPI-erstellten Tokens. `BondingCurveUpdate` (autoritativ) wurde durch `contains_key`-Guard blockiert.
+
+**Lösung (2 Teile)**:
+
+1. **market_data.rs — BondingCurveUpdate als autoritative Quelle**:
+   - `pool_creator_cache`: `contains_key`-Guard entfernt → immer überschreiben
+   - `creator_cache`: `contains_key`-Guard ersetzt durch Mismatch-Detection → immer überschreiben
+   - `DevWalletIdentified`: Wird emittiert wenn Creator neu oder **anders** (Korrektur-Event)
+   - WARN-Log bei Mismatch für Produktions-Diagnostik
+
+2. **momentum_bot.rs — LivePoolCache Cross-Check**:
+   - Neue Methode `resolve_authoritative_creator()` auf `MomentumContext`
+   - Bei Entry- und Exit-Intents: Creator aus `TokenTracker.dev_wallet` wird gegen `LivePoolCache.get_pumpfun_creator()` geprüft
+   - LivePoolCache-Wert (Geyser-Account-Daten) hat Vorrang → korrigiert auch TokenTracker
+   - Fallback: TokenTracker-Wert wenn LivePoolCache den Token nicht kennt
+
+**Dateien**:
+| Datei | Änderung |
+|-------|----------|
+| `src/bin/market_data.rs` | BondingCurveUpdate: autoritative Cache-Writes + Mismatch-WARN |
+| `src/bin/momentum_bot.rs` | `resolve_authoritative_creator()` + Cross-Check bei Entry/Exit |
+
+**Kein RPC im Hot Path. Keine neuen NATS Topics.**
 
 ---
 
