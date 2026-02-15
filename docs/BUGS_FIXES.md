@@ -110,6 +110,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Fix**: Unconditional Reset von `exit_generated` in Failed/Timeout Handlern für Sell-Side. Gilt für normalen und orphaned Pfad.
 **Dateien**: `src/bin/momentum_bot.rs`
 
+### FIX-23: PumpSwap AMM Geyser-First Discovery (P1 Cherry-Pick)
+**Datum**: 2026-02-14
+**Problem**: `discover_pool_static()` ging direkt zu RPC (`getProgramAccounts` + `getMultipleAccounts`) — ~500-3000ms Latenz — obwohl der LivePoolCache bereits alle 14 Pool-Accounts hatte.
+**Fix**: LivePoolCache-Check am Anfang von `discover_pool_static()`: Konstruiert `PumpAmmPoolStatic` direkt aus den 14 gecachten `pool_accounts` (ZERO RPC). RPC-Fallback bleibt für uncached Pools.
+**Dateien**: `src/solana/dex/pumpfun_amm.rs`
+
 ---
 
 ## 2. OFFENE BUGS (Analyse erforderlich / Fix ausstehend)
@@ -496,7 +502,7 @@ ATA-Rent hebt sich auf. Dashboard zeigt realen Wallet-Impact inklusive aller Fee
 | Priorität | Beschreibung | Status |
 |-----------|-------------|--------|
 | **CRITICAL** | fill_in/fill_out Accuracy (FIX-17) | ✅ FIXED |
-| P1 | PumpSwap AMM Geyser-First Integration | ❌ FEHLT |
+| P1 | PumpSwap AMM Geyser-First Integration | ✅ FIXED (FIX-23: `discover_pool_static()` LivePoolCache-First) |
 | P1 | PumpFun SELL migrierte Tokens → `Ok(None)` | ✅ FIXED (Guard existiert in pumpfun.rs Z.888-902) |
 | P1 | `emit_sim_failed_decision()` → `Err` für Retry | ✅ FIXED (Zeile 7799) |
 | P2 | Creator-Handling & DEX-Normalisierung | ❌ FEHLT |

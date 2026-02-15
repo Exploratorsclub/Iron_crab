@@ -263,7 +263,7 @@ impl PumpFunAmmDex {
         // and are more reliable than the heuristic-based RPC discovery.
         if let Some(ref cache) = self.live_pool_cache {
             if let Some(accounts) = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint) {
-                if accounts.len() >= 12 {
+                if accounts.len() >= 14 {
                     debug!(
                         base_mint = %base_mint,
                         accounts_len = accounts.len(),
@@ -1770,12 +1770,55 @@ impl PumpFunAmmDex {
             return Ok(Some(v.clone()));
         }
 
+        // FIX-23: GEYSER-FIRST — Construct PumpAmmPoolStatic from LivePoolCache before any RPC.
+        // The cache contains all 14 pool_accounts from DexPoolAccounts events (parsed from
+        // verified on-chain swap txs). This eliminates getProgramAccounts + getMultipleAccounts
+        // RPC calls (~500-3000ms) in the hot path.
+        if let Some(ref cache) = self.live_pool_cache {
+            if let Some(accounts) = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint) {
+                if accounts.len() >= 14 {
+                    let pool = PumpAmmPoolStatic {
+                        pool_market:                  accounts[0],
+                        global_config:                accounts[1],
+                        base_mint:                    accounts[2],
+                        quote_mint:                   accounts[3],
+                        pool_base_vault:              accounts[4],
+                        pool_quote_vault:             accounts[5],
+                        protocol_fee_recipient:       accounts[6],
+                        protocol_fee_recipient_ta:    accounts[7],
+                        event_authority:              accounts[8],
+                        coin_creator_vault_ata:       accounts[9],
+                        coin_creator_vault_authority:  accounts[10],
+                        global_volume_accumulator:    accounts[11],
+                        fee_config:                   accounts[12],
+                        fee_program:                  accounts[13],
+                    };
+                    // Cache internally for build_swap_ix() (sync path)
+                    self.pools_by_base.insert(base_mint, pool.clone());
+                    self.pools_by_market.insert(pool.pool_market, base_mint);
+                    info!(
+                        base_mint = %base_mint,
+                        pool_market = %pool.pool_market,
+                        "pump_amm: PumpAmmPoolStatic from LivePoolCache (ZERO RPC discovery)"
+                    );
+                    return Ok(Some(pool));
+                }
+            }
+        }
+
         // Avoid concurrent discovery attempts for the same base mint.
         // This significantly reduces RPC rate-limits when `parallel_exits` is enabled.
         let _guard = self.discovery_lock.lock().await;
         if let Some(v) = self.pools_by_base.get(&base_mint) {
             return Ok(Some(v.clone()));
         }
+
+        // RPC FALLBACK: LivePoolCache miss (new pool not yet indexed by Geyser, or cold start
+        // before PoolCacheUpdate events arrive). This is the cold path — acceptable per architecture.
+        warn!(
+            base_mint = %base_mint,
+            "pump_amm: LivePoolCache miss for pool discovery, falling back to RPC"
+        );
 
         let mut discovery_err: Option<anyhow::Error> = None;
         let markets = match self
