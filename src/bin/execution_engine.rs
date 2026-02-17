@@ -3772,11 +3772,15 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
             } = &event.kind
             {
                 observed += 1;
-                if mint == SOL_MINT {
+                if mint == "NATIVE_SOL" {
+                    // Sentinel for native SOL (system account lamports)
                     bootstrap_sol = Some(*balance_raw);
                 } else if mint == WSOL_MINT {
+                    // WSOL SPL token balance (same mint address as SOL_MINT)
                     bootstrap_wsol = Some(*balance_raw);
-                } else {
+                } else if mint != SOL_MINT {
+                    // Regular token balance (skip SOL_MINT which equals WSOL_MINT
+                    // but could appear from old JetStream entries)
                     lock_manager.set_available_token_balance(mint.clone(), *balance_raw);
                 }
             }
@@ -5398,7 +5402,17 @@ async fn main() -> Result<()> {
                                         match serde_json::from_slice::<MarketEvent>(&msg.payload) {
                                             Ok(event) => {
                                                 if let MarketEventKind::WalletBalanceSnapshot { mint, balance_raw, decimals, .. } = &event.kind {
-                                                    if mint != SOL_MINT && mint != WSOL_MINT {
+                                                    if mint == "NATIVE_SOL" {
+                                                        // Native SOL sentinel: update LockManager wallet balance
+                                                        let wsol = ctx.lock_manager.wsol_balance();
+                                                        let wsol_opt = if wsol > 0 { Some(wsol) } else { None };
+                                                        ctx.lock_manager.update_wallet_balances(*balance_raw, wsol_opt);
+                                                    } else if mint == WSOL_MINT || mint == SOL_MINT {
+                                                        // WSOL balance update: update LockManager wallet balance
+                                                        let sol = ctx.lock_manager.total_native_sol();
+                                                        ctx.lock_manager.update_wallet_balances(sol, Some(*balance_raw));
+                                                    } else {
+                                                        // Regular token: update balance + track open_positions
                                                         let old = ctx.lock_manager.available_token_balance(mint);
                                                         ctx.lock_manager.set_available_token_balance(
                                                             mint.clone(),
@@ -5407,7 +5421,6 @@ async fn main() -> Result<()> {
 
                                                         // Track open_positions on balance transitions
                                                         if old > 0 && *balance_raw == 0 {
-                                                            // Position closed: token balance dropped to 0
                                                             let prev = ctx.open_positions.load(Ordering::Relaxed);
                                                             if prev > 0 {
                                                                 ctx.open_positions.fetch_sub(1, Ordering::Relaxed);
@@ -5420,7 +5433,6 @@ async fn main() -> Result<()> {
                                                                 );
                                                             }
                                                         } else if old == 0 && *balance_raw > 0 {
-                                                            // New position: token appeared in wallet
                                                             let prev = ctx.open_positions.fetch_add(1, Ordering::Relaxed);
                                                             OPEN_POSITIONS_GAUGE.store((prev + 1) as u64, Ordering::Relaxed);
                                                             info!(

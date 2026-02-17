@@ -1174,6 +1174,63 @@ async fn publish_wallet_snapshot(
                                 "✅ Initial WalletBalanceUpdate published (bootstrap)"
                             );
                         }
+
+                        // Also publish SOL + WSOL as WalletBalanceSnapshot to JetStream
+                        // so execution-engine can bootstrap wallet balances from JetStream
+                        // (persistent) instead of relying on the core NATS WalletBalanceUpdate
+                        // above which is fire-and-forget and may be missed.
+                        //
+                        // NOTE: Native SOL uses sentinel "NATIVE_SOL" as mint key because
+                        // SOL_MINT == WSOL_MINT (same address). Without this, a single
+                        // JetStream subject would be shared and one would overwrite the other.
+                        {
+                            let sol_snapshot = MarketEvent::new(
+                                "market-data",
+                                BUILD_VERSION,
+                                &ctx.run_id,
+                                "wallet_snapshot_bootstrap_NATIVE_SOL".to_string(),
+                                "wallet_bootstrap",
+                                None,
+                                MarketEventKind::WalletBalanceSnapshot {
+                                    mint: "NATIVE_SOL".to_string(),
+                                    balance_raw: sol_lamports,
+                                    decimals: 9,
+                                    token_program: "system".to_string(),
+                                },
+                            );
+                            let sol_subject = wallet_snapshot_subject(&wallet_str, "NATIVE_SOL");
+                            if let Err(e) = nats.jetstream_publish(&sol_subject, &sol_snapshot).await {
+                                warn!(error = %e, "Failed to publish native SOL WalletBalanceSnapshot to JetStream");
+                            }
+
+                            if let Some(wsol_bal) = wsol_lamports {
+                                let wsol_snapshot = MarketEvent::new(
+                                    "market-data",
+                                    BUILD_VERSION,
+                                    &ctx.run_id,
+                                    "wallet_snapshot_bootstrap_WSOL".to_string(),
+                                    "wallet_bootstrap",
+                                    None,
+                                    MarketEventKind::WalletBalanceSnapshot {
+                                        mint: WSOL_MINT.to_string(),
+                                        balance_raw: wsol_bal,
+                                        decimals: 9,
+                                        token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+                                    },
+                                );
+                                let wsol_subject = wallet_snapshot_subject(&wallet_str, WSOL_MINT);
+                                if let Err(e) = nats.jetstream_publish(&wsol_subject, &wsol_snapshot).await {
+                                    warn!(error = %e, "Failed to publish WSOL WalletBalanceSnapshot to JetStream");
+                                }
+                            }
+
+                            info!(
+                                wallet = %wallet_str,
+                                sol_lamports,
+                                wsol_lamports = ?wsol_lamports,
+                                "SOL/WSOL WalletBalanceSnapshot published to JetStream (persistent bootstrap)"
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!(
