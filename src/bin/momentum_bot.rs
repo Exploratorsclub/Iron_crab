@@ -385,13 +385,13 @@ struct PositionTracker {
     dex: String,
     /// Entry time
     entry_time: Instant,
-    /// Entry price (token per SOL, estimated from trade)
+    /// Entry price (tokens_per_sol — LOWER = more valuable token)
     entry_price: f64,
     /// Amount of tokens held (raw)
     token_amount: u64,
     /// SOL invested (lamports)
     sol_invested: u64,
-    /// Highest price seen since entry
+    /// Best price seen since entry (lowest tokens_per_sol = ATH for holder)
     highest_price: f64,
     /// Current estimated price
     current_price: f64,
@@ -582,10 +582,12 @@ impl PositionTracker {
         }
     }
 
-    /// Update price and track ATH
+    /// Update price and track ATH (best price for holder).
+    /// Prices are in tokens_per_sol: LOWER tps = each token worth MORE SOL = better price.
+    /// So ATH (highest_price) tracks the LOWEST tps seen (best SOL value per token).
     fn update_price(&mut self, new_price: f64) {
         self.current_price = new_price;
-        if new_price > self.highest_price {
+        if new_price < self.highest_price {
             self.highest_price = new_price;
         }
     }
@@ -605,7 +607,8 @@ impl PositionTracker {
 
         self.sol_invested = self.sol_invested.saturating_add(additional_sol);
         self.entry_price = new_entry;
-        self.highest_price = self.highest_price.max(self.current_price);
+        // ATH = lowest tps (best price for holder)
+        self.highest_price = self.highest_price.min(self.current_price);
     }
 
     /// Record a trade for momentum tracking
@@ -617,20 +620,29 @@ impl PositionTracker {
         }
     }
 
-    /// Calculate current P&L percentage
+    /// Calculate current P&L percentage.
+    /// Prices are in tokens_per_sol: LOWER tps = more valuable token.
+    /// SOL value of position = token_amount / tokens_per_sol.
+    /// PnL = (entry_tps / current_tps - 1) * 100
+    ///   - Token gets cheaper (current_tps UP): negative PnL (loss)
+    ///   - Token gets more expensive (current_tps DOWN): positive PnL (gain)
     fn pnl_pct(&self) -> f64 {
-        if self.entry_price <= 0.0 {
+        if self.entry_price <= 0.0 || self.current_price <= 0.0 {
             return 0.0;
         }
-        ((self.current_price - self.entry_price) / self.entry_price) * 100.0
+        ((self.entry_price / self.current_price) - 1.0) * 100.0
     }
 
-    /// Calculate drawdown from ATH percentage
+    /// Calculate drawdown from ATH (best price) percentage.
+    /// highest_price tracks the LOWEST tps seen (= best SOL value per token).
+    /// Drawdown = how much worse current price is vs ATH.
+    /// Positive = loss from ATH, zero = at ATH.
     fn drawdown_from_ath_pct(&self) -> f64 {
-        if self.highest_price <= 0.0 {
+        if self.highest_price <= 0.0 || self.current_price <= 0.0 {
             return 0.0;
         }
-        ((self.highest_price - self.current_price) / self.highest_price) * 100.0
+        // current_tps > highest_tps means token got cheaper (worse) → positive drawdown
+        ((self.current_price / self.highest_price) - 1.0) * 100.0
     }
 
     /// Check if we should exit this position
