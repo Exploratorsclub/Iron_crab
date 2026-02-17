@@ -497,6 +497,32 @@ ATA-Rent hebt sich auf. Dashboard zeigt realen Wallet-Impact inklusive aller Fee
 
 ---
 
+### FIX-24: Ghost Open Positions + Wallet Balance Bootstrap
+**Datum**: 2026-02-11
+**Problem A — Ghost Open Positions**: Nach einem Neustart zeigte `OPEN_POSITIONS_GAUGE` 8-10 statt der tatsächlich offenen Positionen (~1). Bootstrap las stale JetStream Wallet-Snapshots mit Non-Zero-Balances für bereits verkaufte Tokens → `open_positions = 8`. Geyser korrigierte die Balances auf 0 in LockManager, aber `open_positions` wurde NUR bei bestätigten BUY/SELL Trades aktualisiert, nicht bei Balance-Transitionen via Geyser.
+
+**Problem B — Wallet Balance Start = 1.0 SOL**: `initial_sol_lamports` CLI-Argument hatte Default 1 SOL (hardcoded). Die initiale `WalletBalanceUpdate` von market-data ging über Core NATS (fire-and-forget), execution-engine hatte ggf. noch nicht subscribed → Message verloren. Erst ~4 Minuten später kam die erste Geyser-basierte Korrektur.
+
+**Problem C — Doppelter JetStream Consumer**: Zwei unabhängige Consumers für `WALLET_SNAPSHOT`-Stream: Background-Task (tokio::spawn) + Main-Loop-Handler. Redundant und verwirrend.
+
+### Root Cause
+1. `open_positions` wird nur in `handle_execution_result` bei confirmed BUY (+1) / SELL (-1) aktualisiert, nicht bei Geyser Balance-Updates
+2. SOL/WSOL Balance wird aus JetStream WalletBalanceSnapshot ignoriert (skip SOL_MINT/WSOL_MINT), stattdessen hardcoded 1 SOL
+3. Core NATS initial WalletBalanceUpdate ist fire-and-forget, Race Condition bei Startup
+
+### Fix
+1. **Main-Loop Balance-Transitionen**: Wallet-Snapshot-Handler im `select!`-Loop trackt jetzt Balance-Übergänge:
+   - `non-zero → 0`: `open_positions.fetch_sub(1)` + Gauge update (Position geschlossen)
+   - `0 → non-zero`: `open_positions.fetch_add(1)` + Gauge update (Neue Position)
+2. **SOL/WSOL JetStream Bootstrap**: `bootstrap_token_balances_from_wallet_snapshot()` liest jetzt auch SOL- und WSOL-Snapshots aus JetStream und initialisiert LockManager damit. Ersetzt den hardcoded 1 SOL Default.
+3. **Redundanten Background-Task entfernt**: Token-Balance-Sync wird ausschließlich im Main-Loop-Handler verarbeitet (single consumer).
+4. **Prometheus Metrics nach Bootstrap aktualisiert**: `AVAILABLE_SOL_LAMPORTS` und `WALLET_TOTAL_SOL_LAMPORTS` werden sofort nach dem Bootstrap gesetzt.
+
+### Dateien
+- `src/bin/execution_engine.rs`: Main-Loop Wallet-Snapshot-Handler (open_positions Tracking), `bootstrap_token_balances_from_wallet_snapshot()` (SOL/WSOL), Background-Task entfernt
+
+---
+
 ## 4. VERLORENE ÄNDERUNGEN DURCH REVERT (Cherry-Pick Status)
 
 | Priorität | Beschreibung | Status |

@@ -3705,10 +3705,14 @@ async fn bootstrap_open_positions_from_wallet_snapshot(
     Ok(Some(mints.len()))
 }
 
-/// Bootstrap token balances from wallet snapshots (JetStream).
+/// Bootstrap token balances AND wallet SOL/WSOL from wallet snapshots (JetStream).
 ///
 /// Uses last-per-subject WalletBalanceSnapshot events to seed LockManager.available_tokens
-/// without any RPC calls. Live updates continue via JetStream consumer in the main loop.
+/// AND LockManager wallet balances (SOL + WSOL) without any RPC calls.
+/// This replaces the hardcoded 1 SOL default and eliminates the race condition where
+/// market-data's initial WalletBalanceUpdate (core NATS, fire-and-forget) could be
+/// missed if execution-engine hadn't subscribed yet.
+/// Live updates continue via JetStream consumer in the main loop.
 async fn bootstrap_token_balances_from_wallet_snapshot(
     nats_client: &NatsClient,
     wallet: &Pubkey,
@@ -3737,6 +3741,8 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
     let consumer = stream.create_consumer(consumer_config).await?;
     let batch_size = 1000;
     let mut observed = 0usize;
+    let mut bootstrap_sol: Option<u64> = None;
+    let mut bootstrap_wsol: Option<u64> = None;
 
     loop {
         let mut messages = consumer.fetch().max_messages(batch_size).messages().await?;
@@ -3766,7 +3772,11 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
             } = &event.kind
             {
                 observed += 1;
-                if mint != SOL_MINT && mint != WSOL_MINT {
+                if mint == SOL_MINT {
+                    bootstrap_sol = Some(*balance_raw);
+                } else if mint == WSOL_MINT {
+                    bootstrap_wsol = Some(*balance_raw);
+                } else {
                     lock_manager.set_available_token_balance(mint.clone(), *balance_raw);
                 }
             }
@@ -3777,6 +3787,21 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
         if batch_count < batch_size {
             break;
         }
+    }
+
+    // Update LockManager with authoritative SOL/WSOL from JetStream
+    if bootstrap_sol.is_some() || bootstrap_wsol.is_some() {
+        let sol = bootstrap_sol.unwrap_or_else(|| lock_manager.total_native_sol());
+        let wsol = bootstrap_wsol;
+        lock_manager.update_wallet_balances(sol, wsol);
+        info!(
+            wallet = %wallet_str,
+            sol_lamports = sol,
+            wsol_lamports = ?wsol,
+            sol = sol as f64 / 1e9,
+            wsol = wsol.map(|w| w as f64 / 1e9),
+            "Wallet snapshot bootstrap: SOL/WSOL balances seeded into LockManager from JetStream"
+        );
     }
 
     if observed > 0 {
@@ -4229,13 +4254,27 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Seed token balances from wallet snapshot stream (JetStream) so SELL preflight is RPC-free.
+    // Seed token balances AND SOL/WSOL from wallet snapshot stream (JetStream).
+    // This also replaces the hardcoded 1 SOL default with the actual on-chain balance
+    // from JetStream (persistent), avoiding the race condition with core NATS
+    // WalletBalanceUpdate (fire-and-forget, can be missed if not yet subscribed).
     if let (Some(ref nats_client), Some(wallet)) = (&nats, wallet_pubkey) {
         if let Err(e) =
             bootstrap_token_balances_from_wallet_snapshot(nats_client, &wallet, &lock_manager).await
         {
             warn!(error = %e, "Wallet snapshot bootstrap: failed to seed token balances");
         }
+        // Refresh Prometheus metrics after bootstrap to reflect correct wallet balances
+        let available_capital = lock_manager.available_trading_capital();
+        AVAILABLE_SOL_LAMPORTS.store(available_capital, Ordering::Relaxed);
+        let total_native_sol = lock_manager.total_native_sol();
+        let wsol = lock_manager.wsol_balance();
+        WALLET_TOTAL_SOL_LAMPORTS.store(total_native_sol.saturating_add(wsol), Ordering::Relaxed);
+        info!(
+            available_capital = available_capital as f64 / 1e9,
+            total_sol_wsol = (total_native_sol.saturating_add(wsol)) as f64 / 1e9,
+            "Prometheus metrics refreshed after wallet snapshot bootstrap"
+        );
     }
 
     // Kill-switch persistence: survives restarts and is independent of day.
@@ -4545,131 +4584,10 @@ async fn main() -> Result<()> {
             "LockManager balance updater background task started"
         );
 
-        // === Live JetStream Token Balance Consumer ===
-        // Subscribes to WALLET_SNAPSHOT stream for real-time token balance updates.
-        // This ensures LockManager has authoritative Geyser-based token balances,
-        // correcting any discrepancies from accumulated BUY fills and covering
-        // cases where tokens are added/removed externally.
-        {
-            let wallet_str = treasury.pubkey().to_string();
-            let ctx_for_tokens = Arc::clone(&ctx);
-            let nats_url_tokens = args.nats_url.clone();
-            let shutdown_rx_tokens = shutdown_rx.clone();
-
-            tokio::spawn(async move {
-                use async_nats::jetstream;
-                use futures::StreamExt;
-
-                let nats_config = NatsConfig::new(&nats_url_tokens, "token-balance-sync");
-                let mut nats_client = NatsClient::new(nats_config);
-                if let Err(e) = nats_client.connect().await {
-                    warn!(error = %e, "Token balance sync: failed to connect to NATS");
-                    return;
-                }
-
-                let js = jetstream::new(nats_client.client().clone());
-                let stream = match js.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!(error = %e, "Token balance sync: WALLET_SNAPSHOT stream not found");
-                        return;
-                    }
-                };
-
-                // DeliverPolicy::LastPerSubject — on first pull, get the latest snapshot
-                // for each mint (catches updates published between bootstrap and consumer
-                // creation), then continues with live updates. This is idempotent because
-                // set_available_token_balance replaces the value, and the re-read of
-                // already-bootstrapped values just confirms what's already there.
-                let consumer_config = jetstream::consumer::pull::Config {
-                    deliver_policy: jetstream::consumer::DeliverPolicy::LastPerSubject,
-                    ack_policy: jetstream::consumer::AckPolicy::Explicit,
-                    max_ack_pending: 256,
-                    filter_subject: format!("ironcrab.wallet_snapshot.{}.*", wallet_str),
-                    ..Default::default()
-                };
-
-                let consumer = match stream.create_consumer(consumer_config).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!(error = %e, "Token balance sync: failed to create JetStream consumer");
-                        return;
-                    }
-                };
-
-                info!(wallet = %wallet_str, "Token balance sync: live JetStream consumer started");
-
-                let mut shutdown = shutdown_rx_tokens;
-                loop {
-                    tokio::select! {
-                        _ = shutdown.changed() => {
-                            if *shutdown.borrow() {
-                                info!("Token balance sync: shutting down");
-                                break;
-                            }
-                        }
-                        result = consumer.fetch().max_messages(50).messages() => {
-                            match result {
-                                Ok(mut messages) => {
-                                    while let Some(msg) = messages.next().await {
-                                        let msg = match msg {
-                                            Ok(m) => m,
-                                            Err(e) => {
-                                                debug!(error = %e, "Token balance sync: fetch error");
-                                                continue;
-                                            }
-                                        };
-
-                                        let event: MarketEvent = match serde_json::from_slice(&msg.payload) {
-                                            Ok(e) => e,
-                                            Err(e) => {
-                                                debug!(error = %e, "Token balance sync: deserialize error");
-                                                let _ = msg.ack().await;
-                                                continue;
-                                            }
-                                        };
-
-                                        if let MarketEventKind::WalletBalanceSnapshot {
-                                            mint, balance_raw, ..
-                                        } = &event.kind
-                                        {
-                                            if mint != SOL_MINT && mint != WSOL_MINT {
-                                                let old = ctx_for_tokens.lock_manager.available_token_balance(mint);
-                                                ctx_for_tokens.lock_manager.set_available_token_balance(
-                                                    mint.clone(),
-                                                    *balance_raw,
-                                                );
-                                                if old != *balance_raw {
-                                                    info!(
-                                                        mint = %mint,
-                                                        old_balance = old,
-                                                        new_balance = *balance_raw,
-                                                        "Token balance sync: LockManager updated from Geyser"
-                                                    );
-                                                }
-                                            }
-                                        }
-
-                                        let _ = msg.ack().await;
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!(error = %e, "Token balance sync: batch fetch error");
-                                }
-                            }
-
-                            // Brief sleep between fetch batches to avoid busy-loop
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        }
-                    }
-                }
-            });
-
-            info!(
-                wallet = %treasury.pubkey(),
-                "Token balance sync: live JetStream consumer background task started"
-            );
-        }
+        // NOTE: Redundant background JetStream token-balance-sync task was removed.
+        // Token balance sync is now handled exclusively in the main select! loop
+        // (wallet_snapshot_consumer_opt), which also updates open_positions on
+        // balance transitions (non-zero→0 = position closed, 0→non-zero = new position).
     }
 
     // === AccountJanitor: Background cleanup of empty ATAs and dust ===
@@ -5462,6 +5380,8 @@ async fn main() -> Result<()> {
 
                 // Process WalletBalanceSnapshot updates from JetStream (token balances).
                 // Same non-blocking pattern as PoolCacheUpdates to avoid freezing the select! loop.
+                // Also tracks open_positions: balance transitions (non-zero→0 = closed,
+                // 0→non-zero = opened) keep the gauge accurate even for stale bootstrap data.
                 if let Some(ref mut consumer) = wallet_snapshot_consumer_opt {
                     use futures::StreamExt;
                     match consumer
@@ -5479,11 +5399,47 @@ async fn main() -> Result<()> {
                                             Ok(event) => {
                                                 if let MarketEventKind::WalletBalanceSnapshot { mint, balance_raw, decimals, .. } = &event.kind {
                                                     if mint != SOL_MINT && mint != WSOL_MINT {
+                                                        let old = ctx.lock_manager.available_token_balance(mint);
                                                         ctx.lock_manager.set_available_token_balance(
                                                             mint.clone(),
                                                             *balance_raw,
                                                         );
-                                                        // Cache decimals from Geyser-resolved wallet snapshots (PR1: decimals cache)
+
+                                                        // Track open_positions on balance transitions
+                                                        if old > 0 && *balance_raw == 0 {
+                                                            // Position closed: token balance dropped to 0
+                                                            let prev = ctx.open_positions.load(Ordering::Relaxed);
+                                                            if prev > 0 {
+                                                                ctx.open_positions.fetch_sub(1, Ordering::Relaxed);
+                                                                OPEN_POSITIONS_GAUGE.store((prev - 1) as u64, Ordering::Relaxed);
+                                                                info!(
+                                                                    mint = %mint,
+                                                                    old_balance = old,
+                                                                    open_positions = prev - 1,
+                                                                    "Token balance sync: position closed (balance → 0), open_positions decremented"
+                                                                );
+                                                            }
+                                                        } else if old == 0 && *balance_raw > 0 {
+                                                            // New position: token appeared in wallet
+                                                            let prev = ctx.open_positions.fetch_add(1, Ordering::Relaxed);
+                                                            OPEN_POSITIONS_GAUGE.store((prev + 1) as u64, Ordering::Relaxed);
+                                                            info!(
+                                                                mint = %mint,
+                                                                new_balance = *balance_raw,
+                                                                open_positions = prev + 1,
+                                                                "Token balance sync: new position detected (balance 0 → {}), open_positions incremented",
+                                                                balance_raw
+                                                            );
+                                                        } else if old != *balance_raw {
+                                                            info!(
+                                                                mint = %mint,
+                                                                old_balance = old,
+                                                                new_balance = *balance_raw,
+                                                                "Token balance sync: LockManager updated from Geyser"
+                                                            );
+                                                        }
+
+                                                        // Cache decimals from Geyser-resolved wallet snapshots
                                                         if let (Some(cache), Ok(mint_pk)) = (ctx.live_pool_cache.as_ref(), Pubkey::from_str(mint)) {
                                                             cache.set_mint_decimals(mint_pk, *decimals);
                                                         }
