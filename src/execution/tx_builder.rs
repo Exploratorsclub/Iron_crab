@@ -301,47 +301,63 @@ pub async fn build_tx_plan(
         });
     }
 
-    // Get min_out from intent, or calculate fresh from cache if not provided
-    // This is the core of Option C: execution-engine calculates min_out from live cache
-    let min_out: u64 = match min_out_raw_from_intent(intent) {
-        Some(v) => {
-            tracing::debug!(min_out = v, "tx_plan: using min_out from intent");
+    // FIX-28: Get min_out from intent, calculate fresh from cache, and cap with
+    // the more conservative (lower) value. This prevents Error 6002 when the
+    // bonding curve shifts between intent creation and TX build.
+    let intent_min_out = min_out_raw_from_intent(intent);
+    let cache_min_out = cache.and_then(|c| {
+        match super::quote_calculator::calculate_fresh_min_out(c, intent) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "tx_plan: cache min_out calculation failed");
+                None
+            }
+        }
+    });
+
+    let min_out: u64 = match (intent_min_out, cache_min_out) {
+        (Some(from_intent), Some(from_cache)) => {
+            let capped = from_intent.min(from_cache);
+            if capped < from_intent {
+                tracing::info!(
+                    intent_min_out = from_intent,
+                    cache_min_out = from_cache,
+                    capped,
+                    delta_pct = format_args!("{:.1}", (1.0 - capped as f64 / from_intent as f64) * 100.0),
+                    "tx_plan: capped intent min_out with fresh cache quote"
+                );
+            } else {
+                tracing::debug!(
+                    intent_min_out = from_intent,
+                    cache_min_out = from_cache,
+                    "tx_plan: intent min_out already conservative (cache agrees or higher)"
+                );
+            }
+            capped
+        }
+        (Some(v), None) => {
+            tracing::debug!(min_out = v, "tx_plan: using min_out from intent (no cache quote)");
             v
         }
-        None => {
-            // No min_out in intent - try to calculate from cache
-            if let Some(cache) = cache {
-                match super::quote_calculator::calculate_fresh_min_out(cache, intent) {
-                    Ok(Some(fresh_min_out)) => {
-                        tracing::info!(
-                            fresh_min_out,
-                            amount_in = intent.required_capital.raw,
-                            slippage_bps = intent.max_slippage_bps,
-                            "tx_plan: calculated fresh min_out from cache"
-                        );
-                        fresh_min_out
-                    }
-                    Ok(None) => {
-                        return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                            reason: RejectReason::UnsupportedIntent,
-                            details: "no min_out in intent and cache calculation returned None (pool not cached or zero output)".to_string(),
-                        });
-                    }
-                    Err(e) => {
-                        return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                            reason: RejectReason::UnsupportedIntent,
-                            details: format!(
-                                "no min_out in intent and cache calculation failed: {e}"
-                            ),
-                        });
-                    }
-                }
+        (None, Some(v)) => {
+            tracing::info!(
+                fresh_min_out = v,
+                amount_in = intent.required_capital.raw,
+                slippage_bps = intent.max_slippage_bps,
+                "tx_plan: calculated fresh min_out from cache (no intent min_out)"
+            );
+            v
+        }
+        (None, None) => {
+            if cache.is_some() {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: "no min_out in intent and cache calculation returned None (pool not cached or zero output)".to_string(),
+                });
             } else {
                 return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                     reason: RejectReason::UnsupportedIntent,
-                    details:
-                        "missing execution.min_out and no cache available for fresh calculation"
-                            .to_string(),
+                    details: "missing execution.min_out and no cache available for fresh calculation".to_string(),
                 });
             }
         }

@@ -148,6 +148,36 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Dateien**: `src/bin/execution_engine.rs`, `src/bin/market_data.rs`
 **Commits**: `5b359806`, `e5b2a0eb`
 
+### FIX-26: Market-Data WSOL-Seeding & Pool-Propagation (Rest)
+**Datum**: 2026-02-18
+**Problem**: Nach FIX-16 + FIX-24 waren noch 4 Punkte aus dem P2 Cherry-Pick "WSOL-Seeding & Pool-Propagation" offen:
+
+1. **SELL → JetStream zero-balance + ATA Untracking**: Geyser liefert keine Updates für geschlossene/gelöschte Token Accounts. Bei einem confirmed SELL mit `close_token_ata=true` blieb ein staler non-zero JetStream-Eintrag bestehen → Ghost Positions nach Restart.
+2. **PumpAmm `pool_accounts` an `creator` gekoppelt**: `PoolCacheUpdate` Metadata für PumpAmm wurde nur propagiert wenn `creator` vorhanden war. Downstream (SLAVE Caches) benötigen `pool_accounts` unabhängig vom Creator.
+3. **Kein MASTER LivePoolCache Fallback**: Wenn Geyser-Parse leere `pool_accounts` lieferte, gab es keinen Fallback auf den MASTER Cache.
+4. **Stille `continue` bei fehlender Metadata**: Fehlende `token_account`/`token_program` in `ExecutionResult` wurde ohne Warnung übersprungen.
+
+**Fix**:
+1. Im ExecutionResult-Handler: Bei confirmed SELL → `WalletBalanceSnapshot(balance_raw: 0)` an JetStream + Core NATS publizieren + ATA aus Geyser-Tracking entfernen
+2. PumpAmm PoolCacheUpdate Metadata: `pool_accounts` und `creator` jetzt unabhängig voneinander propagiert
+3. DexPoolAccounts → MASTER LivePoolCache populieren; PoolCacheUpdate-Builder nutzt Fallback auf MASTER Cache via `get_pump_amm_pool_accounts()`
+4. `warn!` Logs bei fehlender `token_account`/`token_program` Metadata
+
+**Dateien**: `src/bin/market_data.rs`, `src/execution/live_pool_cache.rs`
+
+### FIX-28: TX-Builder Cache-capped min_out (P2 Cherry-Pick)
+**Datum**: 2026-02-18
+**Problem**: Bei PumpFun BUY-Transaktionen wurde `min_out` aus dem TradeIntent direkt übernommen, ohne gegen einen frischen Cache-Quote zu prüfen. Wenn sich die Bonding Curve zwischen Intent-Erstellung und TX-Build verschob (schnelle Kursbewegungen), war `min_out` zu hoch → Error 6002 ("Too much SOL required" / SlippageExceeded) on-chain.
+**Root Cause**: `build_tx_plan()` nutzte `min_out` aus dem Intent ohne Capping. Die `calculate_fresh_min_out()` Infrastruktur existierte bereits, wurde aber nur aufgerufen wenn `min_out` im Intent **fehlte**.
+**Fix**: Beide Werte (Intent + Cache) werden berechnet. Bei zwei vorhandenen Werten wird das Minimum (konservativere) verwendet. Logging zeigt das Delta in Prozent wenn gecappt wird. Kein Fallback geändert — wenn nur ein Wert verfügbar ist, wird er wie bisher verwendet.
+**Datei**: `src/execution/tx_builder.rs`
+
+### FIX-27: Fehlende `[[bin]]` Einträge in Cargo.toml
+**Datum**: 2026-02-18
+**Problem**: `autobins = false` in `Cargo.toml` deaktiviert automatische Binary-Erkennung. `src/bin/burn_manual_keyless.rs` und `src/bin/manual_swap.rs` hatten gültige `#[tokio::main] async fn main()` Funktionen, waren aber nicht in den `[[bin]]` Sektionen deklariert → konnten nicht gebaut werden.
+**Fix**: `[[bin]]` Einträge für `burn-manual-keyless` und `manual-swap` hinzugefügt.
+**Datei**: `Cargo.toml`
+
 ### FIX-25: DEX-Normalisierung + Creator-Scope (P2 Cherry-Pick)
 **Datum**: 2026-02-18
 **Problem 1 — Nicht-kanonische DEX-Namen**: Drei separate `DexType` Enums mit unterschiedlichen `to_string()` Outputs. `arbitrage/types.rs` produzierte `"raydium_amm_v4"` (statt `"raydium"`) und `"pump_swap_amm"` (statt `"pump_amm"`). Consumer-Code hatte ~25 defensive Multi-Varianten-Checks für Varianten die nie ankamen.
@@ -736,6 +766,6 @@ ATA-Rent hebt sich auf. Dashboard zeigt realen Wallet-Impact inklusive aller Fee
 | P1 | `emit_sim_failed_decision()` → `Err` für Retry | ✅ FIXED |
 | P1 | Ghost Positions + Wallet Balance Bootstrap | ✅ FIXED (FIX-24) |
 | P2 | Creator-Handling & DEX-Normalisierung | ✅ FIXED (FIX-25) |
-| P2 | Market-Data WSOL-Seeding & Pool-Propagation | ⚠️ TEILWEISE (FIX-16 + FIX-24) |
-| P2 | TX-Builder Cache-capped min_out | ❌ FEHLT |
+| P2 | Market-Data WSOL-Seeding & Pool-Propagation | ✅ FIXED (FIX-16 + FIX-24 + FIX-26) |
+| P2 | TX-Builder Cache-capped min_out | ✅ FIXED (FIX-28) |
 | P3 | `available_trading_capital_lamports` Metrik | ❌ FEHLT |
