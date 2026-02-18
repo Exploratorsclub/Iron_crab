@@ -181,10 +181,10 @@ impl Raydium {
     /// Load a pool from Geyser discovery event into the cache.
     /// This allows the bot to trade on newly detected pools immediately.
     pub async fn load_pool_from_geyser(&self, pool_address: &Pubkey) -> Result<()> {
-        // Fetch the full pool account data from RPC with retry for brand new pools
-        // Extended retry window: 20 attempts × 500ms = 10 seconds total
-        const MAX_RETRIES: usize = 20;
-        const RETRY_DELAY_MS: u64 = 500;
+        // FIX-29: Reduced from 20x500ms (10s) to 3x300ms (0.9s).
+        // LivePoolCache should have the pool in 99% of cases — this is a rare fallback.
+        const MAX_RETRIES: usize = 3;
+        const RETRY_DELAY_MS: u64 = 300;
 
         let account = {
             let mut last_error = None;
@@ -362,6 +362,18 @@ impl Raydium {
             has_serum_accounts = serum_bids.is_some(),
             "injected raydium pool from live cache"
         );
+    }
+
+    /// Get Serum/OpenBook accounts for a cached pool (if populated).
+    pub fn get_serum_accounts(
+        &self,
+        pool_address: &Pubkey,
+    ) -> Option<(Pubkey, Pubkey, Pubkey)> {
+        let pool = self.pools.get(pool_address)?;
+        match (pool.serum_bids, pool.serum_asks, pool.serum_event_queue) {
+            (Some(b), Some(a), Some(eq)) => Some((b, a, eq)),
+            _ => None,
+        }
     }
 
     /// Check if a pool is already cached
@@ -1166,7 +1178,7 @@ impl Raydium {
     ///  - bids != asks, vaults distinct
     ///    If multiple templates match we return the first.
     #[allow(clippy::type_complexity)]
-    fn parse_serum_market_accounts(
+    pub fn parse_serum_market_accounts(
         data: &[u8],
     ) -> Option<(
         Option<Pubkey>,

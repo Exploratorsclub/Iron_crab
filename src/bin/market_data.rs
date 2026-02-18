@@ -221,6 +221,10 @@ struct MarketDataContext {
     /// Used as secondary lookup when creator_cache (mint -> creator) misses.
     pool_creator_cache: parking_lot::RwLock<std::collections::HashMap<String, String>>,
 
+    /// FIX-29: Raydium pools for which Serum accounts have already been fetched.
+    /// Serum accounts are static — one RPC call per pool lifetime is sufficient.
+    raydium_serum_fetched: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+
     /// === WsolManager Support: Wallet Balance Tracking ===
     /// Wallet pubkey to track for balance updates (for WsolManager in execution-engine).
     /// Set via IRONCRAB_WALLET_PUBKEY env var.
@@ -1407,6 +1411,7 @@ async fn main() -> Result<()> {
         creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
         tracked_wallet,
         tracked_wallet_tx,
         tracked_wallet_token_accounts: parking_lot::RwLock::new(std::collections::HashSet::new()),
@@ -2309,6 +2314,42 @@ async fn run_geyser_loop(
                     // Update MASTER LivePoolCache (Single Source of Truth)
                     ctx.live_pool_cache.upsert(account_update.pubkey, cached_state.clone(), account_update.slot);
 
+                    // FIX-29: One-time Cold Path RPC to fetch Serum/OpenBook accounts for Raydium AMM.
+                    // These are static (never change) — fetch once, cache forever.
+                    if let CachedPoolState::RaydiumAmm(ref s) = cached_state {
+                        if s.serum_bids.is_none() && s.market_id != Pubkey::default() {
+                            let pool_pk = account_update.pubkey;
+                            let already_fetched = ctx.raydium_serum_fetched.read().contains(&pool_pk);
+                            if !already_fetched {
+                                ctx.raydium_serum_fetched.write().insert(pool_pk);
+                                let rpc = Arc::clone(&rpc);
+                                let cache = Arc::clone(&ctx.live_pool_cache);
+                                let market_id = s.market_id;
+                                tokio::spawn(async move {
+                                    match rpc.get_account_retry(&market_id).await {
+                                        Ok(account) => {
+                                            if let Some((bids, asks, eq, _bv, _qv)) =
+                                                ironcrab::solana::dex::raydium::Raydium::parse_serum_market_accounts(&account.data)
+                                            {
+                                                if let (Some(b), Some(a), Some(e)) = (bids, asks, eq) {
+                                                    cache.set_raydium_serum_accounts(&pool_pk, b, a, e);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                pool = %pool_pk,
+                                                market_id = %market_id,
+                                                error = %e,
+                                                "FIX-29: Failed to fetch serum market account (will retry on next trade)"
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+
                     // Extract mint and reserve info from cached_state for PoolCacheUpdate
                     let (base_mint, quote_mint, base_reserve, quote_reserve) = match &cached_state {
                         CachedPoolState::Orca(s) => {
@@ -2470,7 +2511,25 @@ async fn run_geyser_loop(
                                     pool_update.metadata = Some(meta);
                                 }
                             }
-                            _ => {} // Other DEXes: no extra metadata needed yet
+                            CachedPoolState::RaydiumAmm(s) => {
+                                // FIX-29: Always propagate market_id (from Geyser parse),
+                                // plus serum accounts when available (from async RPC fetch)
+                                let mut meta = std::collections::HashMap::new();
+                                if s.market_id != Pubkey::default() {
+                                    meta.insert("market_id".to_string(), s.market_id.to_string());
+                                }
+                                if let (Some(bids), Some(asks), Some(eq)) =
+                                    (s.serum_bids, s.serum_asks, s.serum_event_queue)
+                                {
+                                    meta.insert("serum_bids".to_string(), bids.to_string());
+                                    meta.insert("serum_asks".to_string(), asks.to_string());
+                                    meta.insert("serum_event_queue".to_string(), eq.to_string());
+                                }
+                                if !meta.is_empty() {
+                                    pool_update.metadata = Some(meta);
+                                }
+                            }
+                            _ => {}
                         }
                         let subject = pool_subject(&account_update.pubkey.to_string());
                         if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {

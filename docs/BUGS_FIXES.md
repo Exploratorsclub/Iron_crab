@@ -165,6 +165,24 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 **Dateien**: `src/bin/market_data.rs`, `src/execution/live_pool_cache.rs`
 
+### FIX-29: Audit-B — Raydium RPC-Elimination (Serum-Account Caching)
+**Datum**: 2026-02-18
+**Problem**: Raydium Swaps hatten zwei RPC-Bottlenecks im Hot Path:
+1. `load_pool_from_geyser()` mit 20 RPC-Retries × 500ms = bis zu 10s Latenz
+2. `fetch_and_populate_serum_accounts()` wurde **immer** aufgerufen (auch bei Cache-Hit), obwohl Serum/OpenBook Accounts statisch sind
+
+**Root Cause**: Serum/OpenBook Market Accounts (bids, asks, event_queue) wurden nie gecacht. Jeder Raydium Trade brauchte einen RPC-Call für diese statischen Daten.
+
+**Fix**:
+1. `live_pool_cache.rs`: `set_raydium_serum_accounts()` Methode hinzugefügt
+2. `pool_cache_sync.rs`: Serum-Metadata (`serum_bids`, `serum_asks`, `serum_event_queue`, `market_id`) aus PoolCacheUpdate parsen
+3. `tx_builder.rs`: Serum-Accounts aus Cache nutzen, RPC nur bei Cache-Miss. Nach RPC-Fetch in SLAVE Cache zurückschreiben
+4. `market_data.rs`: Einmaliger Cold Path RPC pro Pool via `tokio::spawn`, Ergebnis in MASTER Cache + PoolCacheUpdate Metadata propagiert. `raydium_serum_fetched` Set verhindert doppelte Fetches
+5. `raydium.rs`: Retry-Count 20→3, Delay 500→300ms. Max Latenz 10s→0.9s
+
+**Ergebnis**: Raydium Swaps auf bekannten Pools: **ZERO RPC-Calls im Hot Path**. Neue Pools: 1x RPC in market-data (Cold Path), danach gecacht und via NATS propagiert.
+**Dateien**: `src/execution/live_pool_cache.rs`, `src/execution/pool_cache_sync.rs`, `src/execution/tx_builder.rs`, `src/bin/market_data.rs`, `src/solana/dex/raydium.rs`
+
 ### FIX-28: TX-Builder Cache-capped min_out (P2 Cherry-Pick)
 **Datum**: 2026-02-18
 **Problem**: Bei PumpFun BUY-Transaktionen wurde `min_out` aus dem TradeIntent direkt übernommen, ohne gegen einen frischen Cache-Quote zu prüfen. Wenn sich die Bonding Curve zwischen Intent-Erstellung und TX-Build verschob (schnelle Kursbewegungen), war `min_out` zu hoch → Error 6002 ("Too much SOL required" / SlippageExceeded) on-chain.
@@ -696,7 +714,7 @@ Diese Bugs sind im Detail in `docs/ARCHITECTURE_AUDIT_2026-02-07.md` dokumentier
 | ID | Problem | Schweregrad | Status |
 |----|---------|-------------|--------|
 | Audit-A | Killswitch-Liquidation überspringt Tokens | ⚠️ TEILWEISE BEHOBEN | FIX-02, FIX-12, FIX-13 |
-| Audit-B | `load_pool_from_geyser()` macht 20 RPC-Retries | ❌ OFFEN | Priorität 3 |
+| Audit-B | `load_pool_from_geyser()` macht 20 RPC-Retries | ✅ FIXED (FIX-29) | Serum-Caching, RPC-Elimination Hot Path |
 | Audit-C | PumpFunAmmDex eigene RPC-Infrastruktur | ❌ OFFEN | Priorität 3 |
 | Audit-D | Token-Decimals immer per RPC | ❌ OFFEN | Priorität 3 |
 | Audit-E | `cleanup_wallet_after_liquidation()` per RPC | ❌ OFFEN | Priorität 3 |
@@ -768,4 +786,4 @@ ATA-Rent hebt sich auf. Dashboard zeigt realen Wallet-Impact inklusive aller Fee
 | P2 | Creator-Handling & DEX-Normalisierung | ✅ FIXED (FIX-25) |
 | P2 | Market-Data WSOL-Seeding & Pool-Propagation | ✅ FIXED (FIX-16 + FIX-24 + FIX-26) |
 | P2 | TX-Builder Cache-capped min_out | ✅ FIXED (FIX-28) |
-| P3 | `available_trading_capital_lamports` Metrik | ❌ FEHLT |
+| P3 | `available_trading_capital_lamports` Metrik | ✅ FIXED (Grafana Label bereits korrigiert auf "Available WSOL") |

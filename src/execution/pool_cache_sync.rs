@@ -54,20 +54,44 @@ pub fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, Cac
             token_a_program: None,
             token_b_program: None,
         }),
-        "raydium" => CachedPoolState::RaydiumAmm(RaydiumAmmState {
-            base_mint,
-            quote_mint,
-            coin_vault: Pubkey::default(),
-            pc_vault: Pubkey::default(),
-            base_decimals: 0,
-            quote_decimals: 0,
-            coin_reserve: Some(update.base_reserve),
-            pc_reserve: Some(update.quote_reserve),
-            market_id: Pubkey::default(),
-            serum_bids: None,
-            serum_asks: None,
-            serum_event_queue: None,
-        }),
+        "raydium" => {
+            let serum_bids = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("serum_bids"))
+                .and_then(|s| Pubkey::from_str(s).ok());
+            let serum_asks = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("serum_asks"))
+                .and_then(|s| Pubkey::from_str(s).ok());
+            let serum_event_queue = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("serum_event_queue"))
+                .and_then(|s| Pubkey::from_str(s).ok());
+            let market_id = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("market_id"))
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .unwrap_or_default();
+
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint,
+                quote_mint,
+                coin_vault: Pubkey::default(),
+                pc_vault: Pubkey::default(),
+                base_decimals: 0,
+                quote_decimals: 0,
+                coin_reserve: Some(update.base_reserve),
+                pc_reserve: Some(update.quote_reserve),
+                market_id,
+                serum_bids,
+                serum_asks,
+                serum_event_queue,
+            })
+        }
         "raydium_cpmm" => CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
             token_0_mint: base_mint,
             token_1_mint: quote_mint,

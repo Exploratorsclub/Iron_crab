@@ -499,17 +499,19 @@ pub async fn build_tx_plan(
 
         // Try cache first for pool state, fallback to RPC
         let mut used_cache = false;
+        let mut has_serum_from_cache = false;
         if let Some(cache) = cache {
             if let Some((state, slot, age_ms)) = cache.get_with_metadata(&pool_id) {
                 match state {
                     CachedPoolState::RaydiumAmm(amm_state) => {
+                        has_serum_from_cache = amm_state.serum_bids.is_some();
                         tracing::debug!(
                             pool = %pool_id,
                             slot,
                             age_ms,
+                            has_serum = has_serum_from_cache,
                             "raydium: using cached pool state"
                         );
-                        // Inject cached state into Raydium adapter
                         raydium.inject_cached_amm_state(
                             pool_id,
                             amm_state.base_mint,
@@ -544,13 +546,20 @@ pub async fn build_tx_plan(
             }
         }
 
-        // Raydium tx building needs Serum/OpenBook market accounts.
-        // Note: These are static and could be cached, but for now we still fetch if not in cache
-        if let Err(e) = raydium.fetch_and_populate_serum_accounts(&pool_id).await {
-            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                reason: RejectReason::UnsupportedIntent,
-                details: format!("raydium fetch_serum_accounts failed: {e}"),
-            });
+        // FIX-29: Serum accounts are static — skip RPC if already in cache
+        if !has_serum_from_cache {
+            if let Err(e) = raydium.fetch_and_populate_serum_accounts(&pool_id).await {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!("raydium fetch_serum_accounts failed: {e}"),
+                });
+            }
+            // Write back to SLAVE LivePoolCache for subsequent trades
+            if let Some(cache) = cache {
+                if let Some((b, a, eq)) = raydium.get_serum_accounts(&pool_id) {
+                    cache.set_raydium_serum_accounts(&pool_id, b, a, eq);
+                }
+            }
         }
 
         let ixs = match raydium.build_swap_ix(
@@ -1358,10 +1367,13 @@ async fn build_hop_raydium(
 
     // Try to inject pool state from cache
     let mut used_cache = false;
+    let mut has_serum_from_cache = false;
     if let Some(cache) = cache {
         if let Some(CachedPoolState::RaydiumAmm(amm_state)) = cache.get(pool_address) {
+            has_serum_from_cache = amm_state.serum_bids.is_some();
             tracing::debug!(
                 pool = %pool_address,
+                has_serum = has_serum_from_cache,
                 "multi-hop raydium: using cached pool state"
             );
             raydium.inject_cached_amm_state(
@@ -1393,16 +1405,24 @@ async fn build_hop_raydium(
 
     raydium.set_user_authority(wallet_pubkey);
 
-    // Raydium needs Serum accounts if not already populated
-    if let Err(e) = raydium
-        .fetch_and_populate_serum_accounts(pool_address)
-        .await
-    {
-        tracing::warn!(
-            pool = %pool_address,
-            error = %e,
-            "raydium: serum account fetch failed (non-fatal, may already be populated)"
-        );
+    // FIX-29: Serum accounts are static — skip RPC if already in cache
+    if !has_serum_from_cache {
+        if let Err(e) = raydium
+            .fetch_and_populate_serum_accounts(pool_address)
+            .await
+        {
+            tracing::warn!(
+                pool = %pool_address,
+                error = %e,
+                "raydium: serum account fetch failed (non-fatal, may already be populated)"
+            );
+        }
+        // Write back to SLAVE LivePoolCache for subsequent trades
+        if let Some(cache) = cache {
+            if let Some((b, a, eq)) = raydium.get_serum_accounts(pool_address) {
+                cache.set_raydium_serum_accounts(pool_address, b, a, eq);
+            }
+        }
     }
 
     let ixs = raydium

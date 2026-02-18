@@ -709,6 +709,37 @@ impl LivePoolCache {
         }
     }
 
+    /// Set Raydium AMM Serum/OpenBook accounts (bids, asks, event_queue).
+    ///
+    /// These accounts are static (never change for a given pool) and only need
+    /// to be fetched once per pool lifetime. Called after a one-time RPC fetch
+    /// in tx_builder or market-data.
+    pub fn set_raydium_serum_accounts(
+        &self,
+        pool: &Pubkey,
+        serum_bids: Pubkey,
+        serum_asks: Pubkey,
+        serum_event_queue: Pubkey,
+    ) {
+        if let Some(mut entry) = self.pools.get_mut(pool) {
+            if let CachedPoolState::RaydiumAmm(ref mut s) = entry.value_mut().state {
+                let was_none = s.serum_bids.is_none();
+                s.serum_bids = Some(serum_bids);
+                s.serum_asks = Some(serum_asks);
+                s.serum_event_queue = Some(serum_event_queue);
+                if was_none {
+                    tracing::info!(
+                        pool = %pool,
+                        bids = %serum_bids,
+                        asks = %serum_asks,
+                        event_queue = %serum_event_queue,
+                        "LivePoolCache: Raydium serum accounts populated"
+                    );
+                }
+            }
+        }
+    }
+
     /// Get PumpAmm pool_accounts by pool Pubkey from cache.
     ///
     /// Returns `Some(Vec<Pubkey>)` if the pool exists and has non-empty pool_accounts.
