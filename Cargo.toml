@@ -158,3 +158,11 @@ path = "src/bin/pump_amm_tx_probe.rs"
 name = "setup-alt"
 path = "src/bin/setup_alt.rs"
 
+[[bin]]
+name = "burn-manual-keyless"
+path = "src/bin/burn_manual_keyless.rs"
+
+[[bin]]
+name = "manual-swap"
+path = "src/bin/manual_swap.rs"
+

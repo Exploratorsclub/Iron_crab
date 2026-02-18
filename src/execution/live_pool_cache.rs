@@ -709,6 +709,21 @@ impl LivePoolCache {
         }
     }
 
+    /// Get PumpAmm pool_accounts by pool Pubkey from cache.
+    ///
+    /// Returns `Some(Vec<Pubkey>)` if the pool exists and has non-empty pool_accounts.
+    /// Used by market-data as fallback when Geyser-parsed state has empty pool_accounts.
+    pub fn get_pump_amm_pool_accounts(&self, pool: &Pubkey) -> Option<Vec<Pubkey>> {
+        if let Some(entry) = self.pools.get(pool) {
+            if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
+                if !s.pool_accounts.is_empty() {
+                    return Some(s.pool_accounts.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// Lookup PumpAmm pool by base_mint.
     ///
     /// Returns the pool address for a PumpAmm entry that has the given base_mint.

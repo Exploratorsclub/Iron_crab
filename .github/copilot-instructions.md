@@ -34,10 +34,10 @@ Wenn lokal ein SSH-Config Alias existiert (z. B. `ironcrab-prod`), dann bevorzug
 Minimaler Config-Block (Windows/Linux/macOS):
 ```sshconfig
 Host ironcrab-prod
-    HostName 109.230.239.43
+    HostName .....
     User ironcrab
-    Port 2222
-    IdentityFile ~/.ssh/id_ed25519
+    Port ....
+    IdentityFile ~/.ssh/id_ed.....
     IdentitiesOnly yes
 ```
 

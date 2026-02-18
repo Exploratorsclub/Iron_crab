@@ -31,8 +31,9 @@ use uuid::Uuid;
 use ironcrab::config::WalletTrackerCfg;
 use ironcrab::execution::wsol_manager::WalletBalanceUpdate;
 use ironcrab::ipc::{
-    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult, IntentTier,
-    MarketEvent, MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles, RecordHeader,
+    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult,
+    ExecutionStatus, IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate,
+    PriorityFeePercentiles, RecordHeader,
 };
 use ironcrab::metrics::{
     serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
@@ -1772,16 +1773,25 @@ async fn run_geyser_loop(
 
                     let ata_str = match exec.metadata.get("token_account") {
                         Some(s) => s,
-                        None => continue,
+                        None => {
+                            warn!(execution_id = %exec.execution_id, "ExecutionResult missing metadata.token_account — cannot track ATA");
+                            continue;
+                        }
                     };
                     let ata = match Pubkey::from_str(ata_str) {
                         Ok(a) => a,
-                        Err(_) => continue,
+                        Err(_) => {
+                            warn!(execution_id = %exec.execution_id, ata = %ata_str, "ExecutionResult metadata.token_account is not a valid Pubkey");
+                            continue;
+                        }
                     };
 
                     let token_program_str = match exec.metadata.get("token_program") {
                         Some(s) => s,
-                        None => continue,
+                        None => {
+                            warn!(execution_id = %exec.execution_id, "ExecutionResult missing metadata.token_program — cannot track ATA");
+                            continue;
+                        }
                     };
                     let token_program = match Pubkey::from_str(token_program_str) {
                         Ok(p) => p,
@@ -1838,6 +1848,9 @@ async fn run_geyser_loop(
                         let _ = ctx.tracked_wallet_tx.send(accounts);
                     }
 
+                    let is_confirmed_sell = exec.status == ExecutionStatus::Confirmed
+                        && exec.metadata.get("side").map(|s| s.as_str()) == Some("SELL");
+
                     info!(
                         execution_id = %exec.execution_id,
                         mint = %mint,
@@ -1846,8 +1859,58 @@ async fn run_geyser_loop(
                         mint_decimals = ?mint_decimals,
                         added_ata,
                         added_mint,
+                        is_confirmed_sell,
                         "ExecutionResult: tracked wallet ATA/mint"
                     );
+
+                    // 5) For confirmed SELLs: write zero-balance snapshot to JetStream
+                    //    and untrack ATA. Geyser does NOT send updates for closed/deleted
+                    //    token accounts, so without this, stale non-zero balances persist
+                    //    in JetStream and cause ghost positions after restart.
+                    if is_confirmed_sell {
+                        let wallet_str = tracked_wallet.wallet.to_string();
+                        let snapshot = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            &ctx.run_id,
+                            format!("wallet_snapshot_sell_{}", exec.execution_id),
+                            "execution_result_sell",
+                            None,
+                            MarketEventKind::WalletBalanceSnapshot {
+                                mint: mint_str.to_string(),
+                                balance_raw: 0,
+                                decimals: mint_decimals.unwrap_or(9),
+                                token_program: token_program_str.clone(),
+                            },
+                        );
+                        if let Some(ref nats) = ctx.nats {
+                            let subject = wallet_snapshot_subject(&wallet_str, mint_str);
+                            if let Err(e) = nats.jetstream_publish(&subject, &snapshot).await {
+                                warn!(error = %e, mint = %mint_str, "Failed to publish zero-balance snapshot to JetStream after SELL");
+                            }
+                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &snapshot).await {
+                                warn!(error = %e, mint = %mint_str, "Failed to publish zero-balance snapshot to Core NATS after SELL");
+                            }
+                        }
+
+                        // Untrack ATA from Geyser subscription (account is closed)
+                        let mut set = ctx.tracked_wallet_token_accounts.write();
+                        if set.remove(&ata) {
+                            let mut accounts: Vec<Pubkey> = Vec::new();
+                            accounts.push(tracked_wallet.wallet);
+                            accounts.push(tracked_wallet.wsol_ata);
+                            accounts.extend(set.iter().copied());
+                            accounts.sort();
+                            accounts.dedup();
+                            let _ = ctx.tracked_wallet_tx.send(accounts);
+                            info!(
+                                mint = %mint_str,
+                                ata = %ata,
+                                remaining_tracked = set.len(),
+                                "Untracked ATA after confirmed SELL"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -2387,13 +2450,23 @@ async fn run_geyser_loop(
                                 }
                             }
                             CachedPoolState::PumpAmm(s) => {
+                                let mut meta = std::collections::HashMap::new();
                                 if let Some(creator) = s.creator {
-                                    let mut meta = std::collections::HashMap::new();
                                     meta.insert("creator".to_string(), creator.to_string());
-                                    if !s.pool_accounts.is_empty() {
-                                        let accounts_str: Vec<String> = s.pool_accounts.iter().map(|p| p.to_string()).collect();
-                                        meta.insert("pool_accounts".to_string(), accounts_str.join(","));
-                                    }
+                                }
+                                // FIX-26: pool_accounts from Geyser parse, or fallback to MASTER cache
+                                let effective_pool_accounts = if !s.pool_accounts.is_empty() {
+                                    s.pool_accounts.clone()
+                                } else {
+                                    ctx.live_pool_cache
+                                        .get_pump_amm_pool_accounts(&account_update.pubkey)
+                                        .unwrap_or_default()
+                                };
+                                if !effective_pool_accounts.is_empty() {
+                                    let accounts_str: Vec<String> = effective_pool_accounts.iter().map(|p| p.to_string()).collect();
+                                    meta.insert("pool_accounts".to_string(), accounts_str.join(","));
+                                }
+                                if !meta.is_empty() {
                                     pool_update.metadata = Some(meta);
                                 }
                             }
@@ -2878,6 +2951,13 @@ async fn run_geyser_loop(
                             NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                             MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                         }
+                    }
+
+                    // FIX-26: Also populate MASTER LivePoolCache with pool_accounts.
+                    // Ensures the Geyser PoolCacheUpdate builder can use these as fallback
+                    // when the parsed Geyser state has empty pool_accounts.
+                    if pool_accounts.len() >= 14 {
+                        ctx.live_pool_cache.set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
                     }
                 }
 
