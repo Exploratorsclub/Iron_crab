@@ -169,8 +169,10 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 ### ISSUE-1: `duplicate field slot` Deserialisierungsfehler
 **Schweregrad**: NIEDRIG (Warn-Level, verhindert einzelne Events)
 **Symptom**: `Failed to deserialize MarketEvent error=duplicate field 'slot' at line 1 column 295` in momentum-bot und arb-strategy.
-**Root Cause**: `MarketEvent` hat `slot: Option<u64>` auf Top-Level UND `#[serde(flatten)]` auf `kind: MarketEventKind`. Wenn ein `MarketEventKind`-Variant ein eigenes `slot`-Feld hat (z.B. `LatestBlockhash { slot: u64 }`), kollidieren die beiden `slot`-Felder beim Serialisieren/Deserialisieren.
-**Status**: ❌ OFFEN — Erfordert Umbenennung des inneren `slot`-Feldes oder Entfernung des Top-Level `slot` zugunsten des variant-spezifischen Feldes.
+**Root Cause**: `MarketEvent` hat `slot: Option<u64>` auf Top-Level UND `#[serde(flatten)]` auf `kind: MarketEventKind`. `LatestBlockhash { slot: u64 }` kollidierte mit dem Top-Level `slot` beim Serialisieren.
+**Fix**: `#[serde(rename = "blockhash_slot")]` auf `LatestBlockhash.slot` — JSON-Feld heißt jetzt `"blockhash_slot"`, Rust-Feld bleibt `slot`.
+**Status**: ✅ BEHOBEN
+**Datei**: `src/ipc/schema.rs`
 
 ### ISSUE-2: DEX-Name Inkonsistenz + Creator für pump_amm unnötig (P2 Cherry-Pick)
 **Schweregrad**: MITTEL — Führt zu Ad-hoc-Workarounds, potentiellen Routing-Fehlern und unnötigen Creator-Lookups

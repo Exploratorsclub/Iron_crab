@@ -262,6 +262,7 @@ pub enum MarketEventKind {
     /// Used by execution-engine to avoid RPC `getLatestBlockhash` calls.
     LatestBlockhash {
         blockhash: String,
+        #[serde(rename = "blockhash_slot")]
         slot: u64,
         block_height: u64,
     },
