@@ -1531,10 +1531,8 @@ impl ExecutionContext {
             }
         }
 
-        // Fallback: pump.fun/pumpfun/pump_amm always use SPL Token
         if let Some(dex) = dex_hint {
-            let dex_lower = dex.to_lowercase();
-            if dex_lower.contains("pump") || dex_lower == "pumpfun" || dex_lower == "pump_amm" {
+            if dex == "pumpfun" || dex == "pump_amm" {
                 return spl;
             }
         }
@@ -5067,7 +5065,7 @@ async fn main() -> Result<()> {
                                 // Populate PumpAmm pool_accounts in LivePoolCache.
                                 // Without this, PumpAmm entries parsed from Geyser have empty pool_accounts,
                                 // making them unusable for tx building (liquidation, sells).
-                                if dex == "pump_amm" || dex == "PumpFunAmm" {
+                                if dex == "pump_amm" {
                                     if let Ok(pool_pk) = Pubkey::from_str(pool_address) {
                                         let parsed: Vec<Pubkey> = accounts
                                             .iter()

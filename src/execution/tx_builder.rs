@@ -1180,7 +1180,7 @@ async fn build_hop_instructions(
             )
             .await
         }
-        "raydium" | "raydium_amm" | "raydium_amm_v4" => {
+        "raydium" => {
             build_hop_raydium(
                 wallet_pubkey,
                 hop,
@@ -1202,7 +1202,7 @@ async fn build_hop_instructions(
                 ),
             })
         }
-        "orca" | "orca_whirlpool" => {
+        "orca" => {
             build_hop_orca(
                 wallet_pubkey,
                 hop,
@@ -1214,7 +1214,7 @@ async fn build_hop_instructions(
             )
             .await
         }
-        "meteora_dlmm" | "meteora" => {
+        "meteora_dlmm" => {
             build_hop_meteora_dlmm(
                 wallet_pubkey,
                 hop,

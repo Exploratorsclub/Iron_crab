@@ -113,12 +113,236 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 ### FIX-23: PumpSwap AMM Geyser-First Discovery (P1 Cherry-Pick)
 **Datum**: 2026-02-14
 **Problem**: `discover_pool_static()` ging direkt zu RPC (`getProgramAccounts` + `getMultipleAccounts`) — ~500-3000ms Latenz — obwohl der LivePoolCache bereits alle 14 Pool-Accounts hatte.
-**Fix**: LivePoolCache-Check am Anfang von `discover_pool_static()`: Konstruiert `PumpAmmPoolStatic` direkt aus den 14 gecachten `pool_accounts` (ZERO RPC). RPC-Fallback bleibt für uncached Pools.
+**Fix**: LivePoolCache-Check am Anfang von `discover_pool_static()`: Konstruiert `PumpAmmPoolStatic` direkt aus den 14 gecachten `pool_accounts` (ZERO RPC). RPC-Fallback bleibt für uncached Pools. Zusätzlich: Bounds-Check in `pool_accounts_v1_for_base_mint()` von `>= 12` auf `>= 14` korrigiert (verhindert Out-of-Bounds Panics).
 **Dateien**: `src/solana/dex/pumpfun_amm.rs`
+
+### FIX-PNL: CRITICAL — Invertierte PnL-Formel (tokens_per_sol)
+**Datum**: 2026-02-14
+**Schweregrad**: CRITICAL — Alle Exit-Signale (Take-Profit, Stop-Loss, Drawdown) waren invertiert
+**Problem**: `pnl_pct()`, `update_price()`, `drawdown_from_ath_pct()` und `add_investment()` in `momentum_bot.rs` verwendeten Formeln für `SOL_per_token` Preise, obwohl intern `tokens_per_SOL` Preise verwendet werden (höherer Wert = billigerer Token). Folge:
+- Take-Profit feuerte bei Verlusten, Stop-Loss bei Gewinnen
+- `highest_price` trackte den teuersten Preis (höchster `tokens_per_sol` = billigster Token) statt den besten Preis für den Holder
+- Server-Log-Evidenz: "TAKE_PROFIT +167%" bei tatsächlich -20% PnL
+
+**Fix**:
+- `pnl_pct()`: `((current - entry) / entry) * 100` → `((entry / current) - 1) * 100`
+- `update_price()`: `if new > highest` → `if new < highest` (niedrigster tokens_per_sol = bester Preis)
+- `drawdown_from_ath_pct()`: `((highest - current) / highest) * 100` → `((current / highest) - 1) * 100`
+- `add_investment()`: `.max()` → `.min()` für highest_price Tracking
+**Dateien**: `src/bin/momentum_bot.rs`
+**Commit**: `31b0d56c`
+
+### FIX-24: Ghost Open Positions + Wallet Balance Bootstrap
+**Datum**: 2026-02-17
+**Problem A — Ghost Open Positions**: Nach einem Neustart zeigte `OPEN_POSITIONS_GAUGE` 8-10 statt der tatsächlich offenen Positionen (~1). Bootstrap las stale JetStream Wallet-Snapshots mit Non-Zero-Balances für bereits verkaufte Tokens → `open_positions = 8`. Geyser korrigierte die Balances auf 0 in LockManager, aber `open_positions` wurde NUR bei bestätigten BUY/SELL Trades aktualisiert, nicht bei Balance-Transitionen via Geyser.
+
+**Problem B — Wallet Balance Start = 1.0 SOL**: `initial_sol_lamports` CLI-Argument hatte Default 1 SOL (hardcoded). Die initiale `WalletBalanceUpdate` von market-data ging über Core NATS (fire-and-forget), execution-engine hatte ggf. noch nicht subscribed → Message verloren.
+
+**Problem C — Doppelter JetStream Consumer**: Zwei unabhängige Consumers für `WALLET_SNAPSHOT`-Stream: Background-Task (tokio::spawn) + Main-Loop-Handler. Redundant.
+
+**Fix**:
+1. Main-Loop Balance-Transitionen: `non-zero → 0` decrementiert `open_positions`, `0 → non-zero` inkrementiert
+2. SOL/WSOL JetStream Bootstrap: `bootstrap_token_balances_from_wallet_snapshot()` liest jetzt auch SOL (`NATIVE_SOL` Sentinel) und WSOL aus JetStream
+3. market-data publiziert SOL/WSOL als WalletBalanceSnapshot zu JetStream (persistent, kein fire-and-forget)
+4. Redundanten Background-Task entfernt (single consumer im Main-Loop)
+**Dateien**: `src/bin/execution_engine.rs`, `src/bin/market_data.rs`
+**Commits**: `5b359806`, `e5b2a0eb`
+
+### FIX-25: DEX-Normalisierung + Creator-Scope (P2 Cherry-Pick)
+**Datum**: 2026-02-18
+**Problem 1 — Nicht-kanonische DEX-Namen**: Drei separate `DexType` Enums mit unterschiedlichen `to_string()` Outputs. `arbitrage/types.rs` produzierte `"raydium_amm_v4"` (statt `"raydium"`) und `"pump_swap_amm"` (statt `"pump_amm"`). Consumer-Code hatte ~25 defensive Multi-Varianten-Checks für Varianten die nie ankamen.
+
+**Problem 2 — Creator für pump_amm erzwungen**: `momentum_bot.rs` erzwang Creator für `pump_amm`/`pumpswap`/`PumpFunAmm` bei BUY und SELL Intents (`ok_or_else → Error`), obwohl `tx_builder.rs` den Creator NUR für `pumpfun` (Bonding Curve) verwendet. PumpSwap AMM nutzt `pool_accounts` (14 Accounts), nicht den Creator.
+
+**Fix**:
+1. `arbitrage/types.rs`: `as_str()` auf kanonische Namen korrigiert (`"raydium"`, `"pump_amm"`)
+2. `market_data.rs`: Hardcoded `"pump_amm"` → `DexType::PumpFunAmm.to_string()`
+3. `momentum_bot.rs`: SELL Creator-Scope korrigiert — Creator nur für `"pumpfun"` Pflicht, optional für andere DEXes
+4. `ipc/schema.rs`: Doc-Kommentar aktualisiert
+5. Viele Consumer-Bereinigungen waren bereits in früheren Fixes erfolgt (execution_engine, cross_dex_handler, tx_builder, pool_cache_sync)
+**Dateien**: `src/arbitrage/types.rs`, `src/bin/market_data.rs`, `src/bin/momentum_bot.rs`, `src/ipc/schema.rs`
 
 ---
 
-## 2. OFFENE BUGS (Analyse erforderlich / Fix ausstehend)
+## 2. BEKANNTE OFFENE ISSUES
+
+### ISSUE-1: `duplicate field slot` Deserialisierungsfehler
+**Schweregrad**: NIEDRIG (Warn-Level, verhindert einzelne Events)
+**Symptom**: `Failed to deserialize MarketEvent error=duplicate field 'slot' at line 1 column 295` in momentum-bot und arb-strategy.
+**Root Cause**: `MarketEvent` hat `slot: Option<u64>` auf Top-Level UND `#[serde(flatten)]` auf `kind: MarketEventKind`. Wenn ein `MarketEventKind`-Variant ein eigenes `slot`-Feld hat (z.B. `LatestBlockhash { slot: u64 }`), kollidieren die beiden `slot`-Felder beim Serialisieren/Deserialisieren.
+**Status**: ❌ OFFEN — Erfordert Umbenennung des inneren `slot`-Feldes oder Entfernung des Top-Level `slot` zugunsten des variant-spezifischen Feldes.
+
+### ISSUE-2: DEX-Name Inkonsistenz + Creator für pump_amm unnötig (P2 Cherry-Pick)
+**Schweregrad**: MITTEL — Führt zu Ad-hoc-Workarounds, potentiellen Routing-Fehlern und unnötigen Creator-Lookups
+**Status**: ✅ BEHOBEN — FIX-25
+
+---
+
+#### Analyse
+
+**Root Cause**: Drei separate `DexType` Enums mit unterschiedlichen String-Outputs:
+
+| Enum | Datei | Raydium V4 | PumpSwap AMM |
+|------|-------|------------|--------------|
+| `dex_parser::DexType` | `dex_parser.rs:118` | `"raydium"` ✅ | `"pump_amm"` ✅ |
+| `geyser_pool_discovery::DexType` | `geyser_pool_discovery.rs:707` | `"raydium"` ✅ | (kein PumpFunAmm) |
+| `arbitrage::types::DexType` | `arbitrage/types.rs:23` | `"raydium_amm_v4"` ❌ | `"pump_swap_amm"` ❌ |
+
+Die Quellen (`market-data` via `dex_parser::DexType::to_string()`) produzieren **bereits korrekte kanonische Namen**. Das Chaos entsteht durch:
+
+1. **`arbitrage/types.rs` ist eine QUELLE nicht-kanonischer Namen** — `as_str()` (Z.52) gibt `"raydium_amm_v4"` statt `"raydium"` zurück, (Z.57) gibt `"pump_swap_amm"` statt `"pump_amm"` zurück
+2. **Defensive Multi-Varianten-Checks im momentum_bot** — akzeptieren Varianten die nie ankommen (`"pumpswap"`, `"PumpFunAmm"`, `"pumpfunamm"`, `"pump-amm"`, `"meteora-dlmm"`, `"meteoradlmm"`)
+3. **`contains("pump")` Wildcard-Match** — in `execution_engine.rs:1537` und `cross_dex_handler.rs:114` (unsauber)
+4. **Creator fälschlich für pump_amm erzwungen** — `momentum_bot.rs` Z.5826-5829 und Z.6901-6904 erzwingen Creator für `pump_amm`, obwohl `tx_builder.rs` ihn NUR für `pumpfun` benötigt
+
+**Alle 25+ nicht-kanonischen Referenzen** (gruppiert):
+
+| Datei | Zeile(n) | Nicht-kanonische Varianten | Art |
+|-------|----------|---------------------------|-----|
+| `arbitrage/types.rs` | 37 | `"raydium_amm"`, `"raydium_amm_v4"` | Consumer (from_str) |
+| `arbitrage/types.rs` | 39 | `"orca_whirlpool"` | Consumer (from_str) |
+| `arbitrage/types.rs` | 40 | `"meteora"` | Consumer (from_str) |
+| `arbitrage/types.rs` | 42 | `"pumpswap"`, `"pump_swap_amm"` | Consumer (from_str) |
+| `arbitrage/types.rs` | 52 | `"raydium_amm_v4"` | **SOURCE** (as_str) |
+| `arbitrage/types.rs` | 57 | `"pump_swap_amm"` | **SOURCE** (as_str) |
+| `momentum_bot.rs` | 2251-2257 | `"pumpfunamm"`, `"pumpswap"`, `"pump-amm"`, `"meteora-dlmm"`, `"meteoradlmm"` | Consumer |
+| `momentum_bot.rs` | 2285-2288 | `"pumpfunamm"`, `"pumpswap"`, `"pump-amm"` | Consumer |
+| `momentum_bot.rs` | 5683-5686 | `"pumpfunamm"`, `"pumpswap"`, `"pump-amm"` | Consumer |
+| `momentum_bot.rs` | 5827-5829 | `"pump_amm"`, `"pumpswap"`, `"PumpFunAmm"` (case-insensitive) | Consumer |
+| `momentum_bot.rs` | 6679 | `"pump_amm"` (case-insensitive) | Consumer |
+| `momentum_bot.rs` | 6902-6904 | `"pump_amm"`, `"pumpswap"`, `"PumpFunAmm"` (case-insensitive) | Consumer |
+| `execution_engine.rs` | 1537 | `contains("pump")` | Consumer (Wildcard) |
+| `execution_engine.rs` | 5070 | `"PumpFunAmm"` | Consumer |
+| `cross_dex_handler.rs` | 114 | `contains("pump")` | Consumer (Wildcard) |
+| `tx_builder.rs` | 1183 | `"raydium_amm"`, `"raydium_amm_v4"` | Consumer |
+| `tx_builder.rs` | 1205 | `"orca_whirlpool"` | Consumer |
+| `tx_builder.rs` | 1217 | `"meteora"` | Consumer |
+| `pool_cache_sync.rs` | 57 | `"raydium_amm"` | Consumer |
+| `market_data.rs` | 2832 | `"pump_amm"` (hardcoded statt DexType) | Source (korrekt aber inkonsistent) |
+
+---
+
+#### FIX-25 Plan: DEX-Normalisierung an der Quelle + Consumer-Bereinigung
+
+**Ziel**: Alle Quellen produzieren kanonische Namen. Alle Consumer vergleichen nur mit kanonischen Namen. Kein neues Workaround-Modul — das Problem wird an der Wurzel behoben.
+
+**Keine RPC-Calls. Keine neuen NATS Topics. Keine Architektur-Änderung.**
+
+---
+
+**Teil 1: Quellen korrigieren** — Nicht-kanonische SOURCES fixen
+
+| Datei | Zeile | Alt | Neu |
+|-------|-------|-----|-----|
+| `arbitrage/types.rs` | 52 | `Self::RaydiumAmmV4 => "raydium_amm_v4"` | `Self::RaydiumAmmV4 => "raydium"` |
+| `arbitrage/types.rs` | 57 | `Self::PumpSwapAmm => "pump_swap_amm"` | `Self::PumpSwapAmm => "pump_amm"` |
+| `market_data.rs` | 2832 | `dex: "pump_amm".to_string()` | `dex: DexType::PumpFunAmm.to_string()` |
+
+**Risiko**: Minimal — Die Consumer akzeptieren bereits die kanonischen Namen.
+
+---
+
+**Teil 2: Consumer bereinigen** — Multi-Varianten-Checks durch einfache `==` ersetzen
+
+Da alle Quellen nach Teil 1 kanonische Namen produzieren, können die defensiven Fallback-Varianten entfernt werden.
+
+**`momentum_bot.rs`** (~6 Stellen):
+
+| Zeile (ca.) | Alt | Neu |
+|-------------|-----|-----|
+| 2247-2258 | `dex_requires_pool_accounts()` mit `to_ascii_lowercase()` + 7 Varianten | `dex == "pump_amm" \|\| dex == "meteora_dlmm"` |
+| 2284-2288 | `is_pump_amm` mit `to_ascii_lowercase()` + 4 Varianten | `dex == "pump_amm"` |
+| 5682-5686 | `is_pump_amm` mit `to_ascii_lowercase()` + 4 Varianten | `dex == "pump_amm"` |
+| 5826-5829 | `eq_ignore_ascii_case()` für 3 Varianten | `dex == "pumpfun"` (siehe Teil 3) |
+| 6679 | `eq_ignore_ascii_case("pump_amm")` | `dex == "pump_amm"` |
+| 6901-6904 | `eq_ignore_ascii_case()` für 3 Varianten | `dex == "pumpfun"` (siehe Teil 3) |
+
+**`execution_engine.rs`** (2 Stellen):
+
+| Zeile | Alt | Neu |
+|-------|-----|-----|
+| 1537 | `dex_lower.contains("pump") \|\| dex_lower == "pumpfun" \|\| dex_lower == "pump_amm"` | `dex == "pumpfun" \|\| dex == "pump_amm"` |
+| 5070 | `dex == "pump_amm" \|\| dex == "PumpFunAmm"` | `dex == "pump_amm"` |
+
+**`cross_dex_handler.rs`** (1 Stelle):
+
+| Zeile | Alt | Neu |
+|-------|-----|-----|
+| 114 | `dex_lower.contains("pump") \|\| dex_lower == "pumpfun" \|\| dex_lower == "pump_amm"` | `dex == "pumpfun" \|\| dex == "pump_amm"` |
+
+**`tx_builder.rs`** (3 Stellen):
+
+| Zeile | Alt | Neu |
+|-------|-----|-----|
+| 1183 | `"raydium" \| "raydium_amm" \| "raydium_amm_v4"` | `"raydium"` |
+| 1205 | `"orca" \| "orca_whirlpool"` | `"orca"` |
+| 1217 | `"meteora_dlmm" \| "meteora"` | `"meteora_dlmm"` |
+
+**`pool_cache_sync.rs`** (1 Stelle):
+
+| Zeile | Alt | Neu |
+|-------|-----|-----|
+| 57 | `"raydium_amm" \| "raydium"` | `"raydium"` |
+
+**`arbitrage/types.rs`** (from_str — hier bewusst Toleranz behalten):
+
+Die `from_str()` Varianten (`"raydium_amm"`, `"pumpswap"`, etc.) können optional bleiben als Parsing-Toleranz für alte JetStream-Einträge. Da `as_str()` (Teil 1) jetzt kanonisch ist, fließen keine neuen nicht-kanonischen Strings mehr ins System.
+
+---
+
+**Teil 3: Creator-Scope korrigieren** (momentum_bot.rs — 2 Stellen)
+
+**Problem**: Creator wird für `pump_amm` erzwungen (Error wenn fehlend), obwohl `tx_builder.rs` ihn NUR für `pumpfun` verwendet. PumpSwap AMM nutzt `pool_accounts` (14 Accounts), nicht den Creator.
+
+**`generate_and_publish_entry_intent()`** (Z.~5826):
+```rust
+// ALT: Creator Pflicht für pumpfun + pump_amm + pumpswap + PumpFunAmm
+if effective_dex == "pumpfun"
+    || effective_dex.eq_ignore_ascii_case("pump_amm")
+    || effective_dex.eq_ignore_ascii_case("pumpswap")
+    || effective_dex.eq_ignore_ascii_case("PumpFunAmm")
+{
+    let creator = creator_opt.ok_or_else(|| ...)?;  // ERROR wenn fehlt
+    intent.metadata.insert("creator", creator);
+}
+
+// NEU: Creator Pflicht NUR für pumpfun (Bonding Curve)
+if effective_dex == "pumpfun" {
+    let creator = creator_opt.ok_or_else(|| ...)?;
+    intent.metadata.insert("creator".to_string(), creator);
+} else if let Some(creator) = creator_opt {
+    intent.metadata.insert("creator".to_string(), creator);
+}
+```
+
+**`generate_and_publish_exit_intent()`** (Z.~6901): Identische Änderung.
+
+---
+
+**Zusammenfassung**:
+
+| Datei | Änderungen | Risiko |
+|-------|------------|--------|
+| `src/arbitrage/types.rs` | `as_str()` auf kanonische Namen korrigieren | Minimal — Consumer akzeptieren bereits |
+| `src/bin/market_data.rs` | Hardcoded String → `DexType::to_string()` | Minimal — selber Wert |
+| `src/bin/momentum_bot.rs` | ~6 Multi-Varianten-Checks vereinfachen + Creator-Scope (2 Stellen) | Mittel — mechanisch |
+| `src/bin/execution_engine.rs` | 2 Stellen: `contains("pump")` + `"PumpFunAmm"` entfernen | Niedrig |
+| `src/solana/cross_dex_handler.rs` | 1 Stelle: `contains("pump")` entfernen | Niedrig |
+| `src/execution/tx_builder.rs` | 3 Stellen: Fallback-Varianten entfernen | Niedrig |
+| `src/execution/pool_cache_sync.rs` | 1 Stelle: `"raydium_amm"` Fallback entfernen | Niedrig |
+
+**Kein neues Modul. Kein Workaround. Korrektur an der Wurzel.**
+
+**Erwartete Wirkung**:
+- Alle DEX-Quellen produzieren kanonische Namen → keine Normalisierung nötig
+- ~25 nicht-kanonische Referenzen entfernt → Code lesbarer und wartbarer
+- Creator nur noch für `pumpfun` (Bonding Curve) erzwungen
+- `pump_amm` Intents funktionieren auch ohne Creator (aktueller Fehler behoben)
+- `arb_strategy` erhält korrekte DEX-Namen (kein separater Fix nötig)
+
+---
+
+## 3. OFFENE BUGS (Analyse erforderlich / Fix ausstehend)
 
 ### BUG-A: PumpFun Custom(6023) — Intermittierende Sell-Fehler
 **Schweregrad**: HOCH
@@ -433,7 +657,7 @@ Zwei zusammenwirkende Fehler:
 
 ---
 
-## 3. BEKANNTE ARCHITEKTUR-PROBLEME (aus Architecture Audit)
+## 4. BEKANNTE ARCHITEKTUR-PROBLEME (aus Architecture Audit)
 
 Diese Bugs sind im Detail in `docs/ARCHITECTURE_AUDIT_2026-02-07.md` dokumentiert:
 
@@ -497,41 +721,19 @@ ATA-Rent hebt sich auf. Dashboard zeigt realen Wallet-Impact inklusive aller Fee
 
 ---
 
-### FIX-24: Ghost Open Positions + Wallet Balance Bootstrap
-**Datum**: 2026-02-11
-**Problem A — Ghost Open Positions**: Nach einem Neustart zeigte `OPEN_POSITIONS_GAUGE` 8-10 statt der tatsächlich offenen Positionen (~1). Bootstrap las stale JetStream Wallet-Snapshots mit Non-Zero-Balances für bereits verkaufte Tokens → `open_positions = 8`. Geyser korrigierte die Balances auf 0 in LockManager, aber `open_positions` wurde NUR bei bestätigten BUY/SELL Trades aktualisiert, nicht bei Balance-Transitionen via Geyser.
-
-**Problem B — Wallet Balance Start = 1.0 SOL**: `initial_sol_lamports` CLI-Argument hatte Default 1 SOL (hardcoded). Die initiale `WalletBalanceUpdate` von market-data ging über Core NATS (fire-and-forget), execution-engine hatte ggf. noch nicht subscribed → Message verloren. Erst ~4 Minuten später kam die erste Geyser-basierte Korrektur.
-
-**Problem C — Doppelter JetStream Consumer**: Zwei unabhängige Consumers für `WALLET_SNAPSHOT`-Stream: Background-Task (tokio::spawn) + Main-Loop-Handler. Redundant und verwirrend.
-
-### Root Cause
-1. `open_positions` wird nur in `handle_execution_result` bei confirmed BUY (+1) / SELL (-1) aktualisiert, nicht bei Geyser Balance-Updates
-2. SOL/WSOL Balance wird aus JetStream WalletBalanceSnapshot ignoriert (skip SOL_MINT/WSOL_MINT), stattdessen hardcoded 1 SOL
-3. Core NATS initial WalletBalanceUpdate ist fire-and-forget, Race Condition bei Startup
-
-### Fix
-1. **Main-Loop Balance-Transitionen**: Wallet-Snapshot-Handler im `select!`-Loop trackt jetzt Balance-Übergänge:
-   - `non-zero → 0`: `open_positions.fetch_sub(1)` + Gauge update (Position geschlossen)
-   - `0 → non-zero`: `open_positions.fetch_add(1)` + Gauge update (Neue Position)
-2. **SOL/WSOL JetStream Bootstrap**: `bootstrap_token_balances_from_wallet_snapshot()` liest jetzt auch SOL- und WSOL-Snapshots aus JetStream und initialisiert LockManager damit. Ersetzt den hardcoded 1 SOL Default.
-3. **Redundanten Background-Task entfernt**: Token-Balance-Sync wird ausschließlich im Main-Loop-Handler verarbeitet (single consumer).
-4. **Prometheus Metrics nach Bootstrap aktualisiert**: `AVAILABLE_SOL_LAMPORTS` und `WALLET_TOTAL_SOL_LAMPORTS` werden sofort nach dem Bootstrap gesetzt.
-
-### Dateien
-- `src/bin/execution_engine.rs`: Main-Loop Wallet-Snapshot-Handler (open_positions Tracking), `bootstrap_token_balances_from_wallet_snapshot()` (SOL/WSOL), Background-Task entfernt
-
 ---
 
-## 4. VERLORENE ÄNDERUNGEN DURCH REVERT (Cherry-Pick Status)
+## 5. VERLORENE ÄNDERUNGEN DURCH REVERT (Cherry-Pick Status)
 
 | Priorität | Beschreibung | Status |
 |-----------|-------------|--------|
 | **CRITICAL** | fill_in/fill_out Accuracy (FIX-17) | ✅ FIXED |
-| P1 | PumpSwap AMM Geyser-First Integration | ✅ FIXED (FIX-23: `discover_pool_static()` LivePoolCache-First) |
-| P1 | PumpFun SELL migrierte Tokens → `Ok(None)` | ✅ FIXED (Guard existiert in pumpfun.rs Z.888-902) |
-| P1 | `emit_sim_failed_decision()` → `Err` für Retry | ✅ FIXED (Zeile 7799) |
-| P2 | Creator-Handling & DEX-Normalisierung | ❌ FEHLT |
-| P2 | Market-Data WSOL-Seeding & Pool-Propagation | ⚠️ TEILWEISE (FIX-16) |
+| **CRITICAL** | Invertierte PnL-Formel (FIX-PNL) | ✅ FIXED |
+| P1 | PumpSwap AMM Geyser-First Integration | ✅ FIXED (FIX-23) |
+| P1 | PumpFun SELL migrierte Tokens → `Ok(None)` | ✅ FIXED (Guard in pumpfun.rs) |
+| P1 | `emit_sim_failed_decision()` → `Err` für Retry | ✅ FIXED |
+| P1 | Ghost Positions + Wallet Balance Bootstrap | ✅ FIXED (FIX-24) |
+| P2 | Creator-Handling & DEX-Normalisierung | ✅ FIXED (FIX-25) |
+| P2 | Market-Data WSOL-Seeding & Pool-Propagation | ⚠️ TEILWEISE (FIX-16 + FIX-24) |
 | P2 | TX-Builder Cache-capped min_out | ❌ FEHLT |
 | P3 | `available_trading_capital_lamports` Metrik | ❌ FEHLT |

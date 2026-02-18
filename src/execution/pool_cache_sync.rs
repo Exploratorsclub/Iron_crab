@@ -54,7 +54,7 @@ pub fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, Cac
             token_a_program: None,
             token_b_program: None,
         }),
-        "raydium_amm" | "raydium" => CachedPoolState::RaydiumAmm(RaydiumAmmState {
+        "raydium" => CachedPoolState::RaydiumAmm(RaydiumAmmState {
             base_mint,
             quote_mint,
             coin_vault: Pubkey::default(),

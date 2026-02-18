@@ -953,7 +953,7 @@ pub struct TradeResources {
 pub struct PoolAlternative {
     /// Pool address (base58)
     pub pool_address: String,
-    /// DEX type identifier (e.g., "raydium_amm_v4", "orca", "meteora_dlmm")
+    /// DEX type identifier: "raydium", "raydium_cpmm", "orca", "meteora_dlmm", "meteora_cpmm", "pumpfun", "pump_amm"
     pub dex: String,
     /// Pre-computed expected output for this alternative (may differ from primary).
     /// Set to 0 if not pre-computed; execution-engine will quote on-the-fly.

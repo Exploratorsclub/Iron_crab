@@ -2829,7 +2829,7 @@ async fn run_geyser_loop(
                                 pool_address: pool_address.to_string(),
                                 base_mint: base_mint.clone(),
                                 quote_mint: quote_mint.clone(),
-                                dex: "pump_amm".to_string(),
+                                dex: DexType::PumpFunAmm.to_string(),
                                 initial_liquidity_sol: None, // Not available from trade
                             },
                         );

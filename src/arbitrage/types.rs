@@ -49,12 +49,12 @@ impl DexType {
     /// Convert to string for serialization
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::RaydiumAmmV4 => "raydium_amm_v4",
+            Self::RaydiumAmmV4 => "raydium",
             Self::RaydiumCpmm => "raydium_cpmm",
             Self::Orca => "orca",
             Self::MeteoraDlmm => "meteora_dlmm",
             Self::MeteoraCpmm => "meteora_cpmm",
-            Self::PumpSwapAmm => "pump_swap_amm",
+            Self::PumpSwapAmm => "pump_amm",
         }
     }
 }

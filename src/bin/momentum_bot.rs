@@ -839,7 +839,7 @@ struct TokenTracker {
     /// Dev supply percentage at creation
     dev_supply_pct: Option<f64>,
 
-    /// DEX-specific static accounts needed for deterministic tx building (e.g. PumpFunAmm).
+    /// DEX-specific static accounts needed for deterministic tx building (e.g. pump_amm).
     /// Expected to be the v1 ordered list (len=14) from MarketEventKind::DexPoolAccounts.
     dex_pool_accounts: Option<Vec<String>>,
 
@@ -2238,24 +2238,8 @@ impl MomentumContext {
 
     /// Returns true if the DEX requires DexPoolAccounts in Intent.resources.accounts
     /// for deterministic TX building (no RPC in hot path).
-    ///
-    /// DEXes that need accounts:
-    /// - pump_amm/pumpswap: Always requires 14 accounts (pool, vaults, mints, etc.)
-    /// - meteora_dlmm: Needs lb_pair, vaults, mints, active_id, bin_step, bitmap_extension
-    /// - raydium: Needs AMM accounts (less critical - has LivePoolCache fallback)
-    /// - orca: Needs whirlpool accounts (less critical - has LivePoolCache fallback)
     fn dex_requires_pool_accounts(dex: &str) -> bool {
-        let dex_lower = dex.to_ascii_lowercase();
-        matches!(
-            dex_lower.as_str(),
-            "pumpfunamm"
-                | "pump_amm"
-                | "pumpswap"
-                | "pump-amm"
-                | "meteora_dlmm"
-                | "meteora-dlmm"
-                | "meteoradlmm"
-        )
+        dex == "pump_amm" || dex == "meteora_dlmm"
     }
 
     fn try_get_dex_pool_accounts_for_mint(&self, mint: &str) -> Option<Vec<String>> {
@@ -2277,15 +2261,7 @@ impl MomentumContext {
         quote_mint: &str,
         accounts: &[String],
     ) {
-        // Validate account format based on DEX type
-        // - pump_amm/pumpswap: exactly 14 accounts
-        // - meteora_dlmm: at least 3 (pool, token_x_mint, token_y_mint) + optional vaults + tagged values
-        // - other DEXes: at least 3 accounts
-        let dex_lower = dex.to_ascii_lowercase();
-        let is_pump_amm = dex_lower == "pump_amm"
-            || dex_lower == "pumpfunamm"
-            || dex_lower == "pumpswap"
-            || dex_lower == "pump-amm";
+        let is_pump_amm = dex == "pump_amm";
 
         // PumpSwap always requires exactly 14 accounts; all other DEXes need at least 3
         let min_accounts = if is_pump_amm { 14 } else { 3 };
@@ -5676,14 +5652,7 @@ async fn generate_and_publish_buy_intent(
             anyhow::bail!("cannot generate intent: invalid DexPoolAccounts")
         }
 
-        // Validate minimum account count based on DEX
-        // - pump_amm: exactly 14 accounts
-        // - meteora_dlmm: at least 3 (pool, mints) + optional tagged values
-        let dex_lower = effective_dex.to_ascii_lowercase();
-        let is_pump_amm = dex_lower == "pump_amm"
-            || dex_lower == "pumpfunamm"
-            || dex_lower == "pumpswap"
-            || dex_lower == "pump-amm";
+        let is_pump_amm = effective_dex == "pump_amm";
 
         if is_pump_amm && accounts.len() != 14 {
             warn!(
@@ -5822,18 +5791,14 @@ async fn generate_and_publish_buy_intent(
         }
     }
 
-    // Pump.fun and PumpSwap tx building require the creator/dev wallet.
-    if effective_dex == "pumpfun"
-        || effective_dex.eq_ignore_ascii_case("pump_amm")
-        || effective_dex.eq_ignore_ascii_case("pumpswap")
-        || effective_dex.eq_ignore_ascii_case("PumpFunAmm")
-    {
+    if effective_dex == "pumpfun" {
         let creator = creator_opt.ok_or_else(|| {
             anyhow::anyhow!(
-                "cannot generate {} intent: missing dev_wallet/creator",
-                effective_dex
+                "cannot generate pumpfun intent: missing dev_wallet/creator"
             )
         })?;
+        intent.metadata.insert("creator".to_string(), creator);
+    } else if let Some(creator) = creator_opt {
         intent.metadata.insert("creator".to_string(), creator);
     }
 
@@ -6676,7 +6641,7 @@ async fn generate_and_publish_exit_intent(
                 }
             };
 
-            let routing = if original_dex.eq_ignore_ascii_case("pump_amm") {
+            let routing = if original_dex == "pump_amm" {
                 "pumpswap_fallback"
             } else {
                 "primary"
@@ -6897,15 +6862,14 @@ async fn generate_and_publish_exit_intent(
         .metadata
         .insert("exit_type".to_string(), exit_type.to_string());
 
-    // Pump.fun and PumpSwap sell tx building require the creator/dev wallet.
-    if dex == "pumpfun"
-        || dex.eq_ignore_ascii_case("pump_amm")
-        || dex.eq_ignore_ascii_case("pumpswap")
-        || dex.eq_ignore_ascii_case("PumpFunAmm")
-    {
+    // PumpFun bonding curve tx building requires the creator/dev wallet for PDA derivation.
+    // pump_amm (PumpSwap) does NOT need creator — it uses pool_accounts instead.
+    if dex == "pumpfun" {
         let creator = creator_opt.ok_or_else(|| {
-            anyhow::anyhow!("cannot generate {} exit: missing dev_wallet/creator", dex)
+            anyhow::anyhow!("cannot generate pumpfun exit: missing dev_wallet/creator")
         })?;
+        intent.metadata.insert("creator".to_string(), creator);
+    } else if let Some(creator) = creator_opt {
         intent.metadata.insert("creator".to_string(), creator);
     }
 

@@ -108,10 +108,8 @@ fn get_token_program_for_mint_cached(
         }
     }
 
-    // Priority 3: DEX hint (pump.fun/pumpfun/pump_amm always use SPL Token)
     if let Some(dex) = dex_hint {
-        let dex_lower = dex.to_lowercase();
-        if dex_lower.contains("pump") || dex_lower == "pumpfun" || dex_lower == "pump_amm" {
+        if dex == "pumpfun" || dex == "pump_amm" {
             return spl_token::id();
         }
     }
