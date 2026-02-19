@@ -1904,8 +1904,11 @@ impl MomentumContext {
         balance_raw: u64,
         decimals: u8,
     ) -> Option<PositionTracker> {
-        // FIX-36: WSOL is the quote currency, never a tradeable position
-        if mint == "So11111111111111111111111111111111111111112" {
+        // FIX-36: SOL/WSOL is the quote currency, never a tradeable position
+        if mint == "So11111111111111111111111111111111111111112"
+            || mint == "NATIVE_SOL"
+            || mint == "11111111111111111111111111111111"
+        {
             return None;
         }
         let (pool, dex, ratio_opt) = self.select_reconcile_pool(mint)?;
@@ -7362,9 +7365,12 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             // Published by market-data at startup AND periodically to sync wallet state.
             // Handles: manual sales, emergency liquidations, external transfers.
 
-            // FIX-36: Never track WSOL as a token position — it's the quote currency
-            if mint == "So11111111111111111111111111111111111111112" {
-                debug!(mint = %mint, balance_raw = *balance_raw, "Ignoring WSOL WalletBalanceSnapshot (not a tradeable position)");
+            // FIX-36: Never track SOL/WSOL as a token position — it's the quote currency
+            if mint == "So11111111111111111111111111111111111111112"
+                || mint == "NATIVE_SOL"
+                || mint == "11111111111111111111111111111111"
+            {
+                debug!(mint = %mint, balance_raw = *balance_raw, "Ignoring SOL/WSOL WalletBalanceSnapshot (not a tradeable position)");
                 return Ok(());
             }
 

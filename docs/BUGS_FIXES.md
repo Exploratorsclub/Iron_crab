@@ -878,7 +878,8 @@ Alle drei Pfade erstellen WSOL-ATA bei SELLs (für empfangene SOL).
 
 **Fix**: 
 1. Early-return im `WalletBalanceSnapshot`-Handler: SOL-Mint wird sofort übersprungen
-2. Guard in `build_reconciled_position()`: gibt `None` zurück für WSOL
+2. Guard in `build_reconciled_position()`: gibt `None` zurück für SOL/WSOL
+3. Erkennt alle drei SOL-Varianten: `So11111111111111111111111111111111111111112` (WSOL), `NATIVE_SOL` (market-data Label), `11111111111111111111111111111111` (System Program)
 
 **Dateien**: `src/bin/momentum_bot.rs`
 
