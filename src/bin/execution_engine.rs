@@ -3742,7 +3742,11 @@ async fn bootstrap_open_positions_from_wallet_snapshot(
             } = &event.kind
             {
                 observed += 1;
-                if mint == SOL_MINT {
+                // FIX-36: Skip SOL/WSOL — they're the quote currency, not tradeable positions
+                if mint == SOL_MINT
+                    || mint == "NATIVE_SOL"
+                    || mint == "11111111111111111111111111111111"
+                {
                     continue;
                 }
                 if *balance_raw > 0 {
