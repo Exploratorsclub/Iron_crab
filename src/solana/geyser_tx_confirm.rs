@@ -273,7 +273,7 @@ impl GeyserTxConfirm {
 
         loop {
             // Connect to Geyser
-            let client = match GeyserGrpcClient::build_from_shared(geyser_url.clone()) {
+            let mut client = match GeyserGrpcClient::build_from_shared(geyser_url.clone()) {
                 Ok(builder) => match builder.connect().await {
                     Ok(c) => c,
                     Err(e) => {
