@@ -1739,6 +1739,9 @@ struct MomentumContext {
     live_pool_cache: LivePoolCache,
     /// JetStream KV Store for position persistence (initialized lazily)
     position_kv: tokio::sync::OnceCell<async_nats::jetstream::kv::Store>,
+    /// Mints with non-zero wallet balance that could not be reconciled at bootstrap
+    /// because no pool was known yet. Checked when new pools are registered.
+    orphaned_mints: parking_lot::RwLock<HashMap<String, (u64, u8)>>,
     /// Stats
     tokens_tracked: std::sync::atomic::AtomicU64,
     tokens_blacklisted: std::sync::atomic::AtomicU64,
@@ -1777,23 +1780,78 @@ impl MomentumContext {
         infos.insert(mint.to_string(), info);
     }
 
-    /// Register or update a pool in the multi-pool registry
+    /// Register or update a pool in the multi-pool registry.
+    /// Also checks orphaned_mints for lazy reconciliation.
     fn register_pool(&self, mint: &str, pool_address: &str, dex: &str, slot: u64) {
+        {
+            let mut pools = self.mint_pools.write();
+            let pool_list = pools.entry(mint.to_string()).or_default();
+
+            if let Some(existing) = pool_list
+                .iter_mut()
+                .find(|p| p.pool_address == pool_address)
+            {
+                if slot > existing.last_trade_slot {
+                    existing.last_trade_slot = slot;
+                    existing.last_updated = std::time::Instant::now();
+                }
+            } else {
+                pool_list.push(PoolInfo::new(
+                    pool_address.to_string(),
+                    dex.to_string(),
+                    slot,
+                ));
+                debug!(
+                    mint = %mint,
+                    pool = %pool_address,
+                    dex = %dex,
+                    total_pools = pool_list.len(),
+                    "📍 Pool registered in multi-pool registry"
+                );
+            }
+        } // release mint_pools write lock before reconciliation
+
+        // FIX-35: Check if this mint was orphaned during bootstrap
+        let orphan_data = self.orphaned_mints.write().remove(mint);
+        if let Some((balance_raw, decimals)) = orphan_data {
+            if let Some(reconciled) = self.build_reconciled_position(mint, balance_raw, decimals) {
+                let hold_secs = reconciled.entry_time.elapsed().as_secs();
+                self.positions
+                    .write()
+                    .insert(mint.to_string(), reconciled.clone());
+                info!(
+                    mint = %mint,
+                    pool = %reconciled.pool,
+                    dex = %reconciled.dex,
+                    balance_raw,
+                    hold_secs,
+                    "🧭 Orphaned mint reconciled into position (pool now known)"
+                );
+            }
+        }
+    }
+
+    /// Update pool trade data (ratio + slot).
+    /// If the pool is not yet registered in mint_pools, auto-register it so
+    /// exit intents can later find it via `find_best_sell_pool`.
+    fn update_pool_trade_data(
+        &self,
+        mint: &str,
+        pool_address: &str,
+        dex: &str,
+        sol_amount: u64,
+        token_amount: u64,
+        slot: u64,
+    ) {
         let mut pools = self.mint_pools.write();
         let pool_list = pools.entry(mint.to_string()).or_default();
 
-        // Check if pool already exists
-        if let Some(existing) = pool_list
+        let pool_info = if let Some(existing) = pool_list
             .iter_mut()
             .find(|p| p.pool_address == pool_address)
         {
-            // Update last_trade_slot
-            if slot > existing.last_trade_slot {
-                existing.last_trade_slot = slot;
-                existing.last_updated = std::time::Instant::now();
-            }
+            existing
         } else {
-            // New pool for this mint
             pool_list.push(PoolInfo::new(
                 pool_address.to_string(),
                 dex.to_string(),
@@ -1803,35 +1861,16 @@ impl MomentumContext {
                 mint = %mint,
                 pool = %pool_address,
                 dex = %dex,
-                total_pools = pool_list.len(),
-                "📍 Pool registered in multi-pool registry"
+                "Pool auto-registered via trade event"
             );
-        }
-    }
+            pool_list.last_mut().unwrap()
+        };
 
-    /// Update pool trade data (ratio + slot)
-    fn update_pool_trade_data(
-        &self,
-        mint: &str,
-        pool_address: &str,
-        sol_amount: u64,
-        token_amount: u64,
-        slot: u64,
-    ) {
-        let mut pools = self.mint_pools.write();
-        if let Some(pool_list) = pools.get_mut(mint) {
-            if let Some(pool_info) = pool_list
-                .iter_mut()
-                .find(|p| p.pool_address == pool_address)
-            {
-                // Calculate SOL per token ratio
-                if token_amount > 0 {
-                    pool_info.last_trade_ratio = Some(sol_amount as f64 / token_amount as f64);
-                }
-                pool_info.last_trade_slot = slot;
-                pool_info.last_updated = std::time::Instant::now();
-            }
+        if token_amount > 0 {
+            pool_info.last_trade_ratio = Some(sol_amount as f64 / token_amount as f64);
         }
+        pool_info.last_trade_slot = slot;
+        pool_info.last_updated = std::time::Instant::now();
     }
 
     /// Update pool accounts (for swap instruction building)
@@ -4867,6 +4906,7 @@ async fn main() -> Result<()> {
         mint_pools: parking_lot::RwLock::new(HashMap::new()),
         live_pool_cache,
         position_kv: tokio::sync::OnceCell::new(),
+        orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
         tokens_tracked: std::sync::atomic::AtomicU64::new(0),
         tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
         intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -6034,6 +6074,7 @@ mod tests {
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -6282,6 +6323,7 @@ mod tests {
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -6381,6 +6423,7 @@ mod tests {
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -6448,6 +6491,7 @@ mod tests {
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -6503,6 +6547,7 @@ mod tests {
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -6570,6 +6615,7 @@ mod tests {
             mint_pools: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: LivePoolCache::new(),
             position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
             tokens_tracked: std::sync::atomic::AtomicU64::new(0),
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
@@ -6578,7 +6624,7 @@ mod tests {
 
         // Seed pool registry so reconciliation can pick a pool.
         ctx.register_pool("mint", "pool", "raydium", 1);
-        ctx.update_pool_trade_data("mint", "pool", 1_000_000_000, 1_000_000, 1);
+        ctx.update_pool_trade_data("mint", "pool", "raydium", 1_000_000_000, 1_000_000, 1);
         ctx.update_pool_accounts(
             "mint",
             "pool",
@@ -6641,19 +6687,25 @@ async fn generate_and_publish_exit_intent(
                 "⚠️  Multi-pool routing failed, using original pool"
             );
 
-            // Get accounts for original pool
-            let accounts = match ctx.try_get_dex_pool_accounts_for_mint(mint) {
-                Some(accounts) => accounts,
-                None => {
-                    warn!(
-                        mint = %mint,
-                        pool = %original_pool,
-                        dex = %original_dex,
-                        "Missing DexPoolAccounts for exit intent; falling back to empty accounts"
-                    );
-                    Vec::new()
-                }
-            };
+            // Get accounts: try mint_pools for the specific pool first,
+            // then try_get_dex_pool_accounts_for_mint, then empty fallback
+            let accounts = {
+                let pools = ctx.mint_pools.read();
+                pools
+                    .get(mint)
+                    .and_then(|list| list.iter().find(|p| p.pool_address == original_pool))
+                    .and_then(|p| p.dex_pool_accounts.clone())
+            }
+            .or_else(|| ctx.try_get_dex_pool_accounts_for_mint(mint))
+            .unwrap_or_else(|| {
+                warn!(
+                    mint = %mint,
+                    pool = %original_pool,
+                    dex = %original_dex,
+                    "Missing DexPoolAccounts for exit intent; EE will resolve from LivePoolCache"
+                );
+                Vec::new()
+            });
 
             let routing = if original_dex == "pump_amm" {
                 "pumpswap_fallback"
@@ -7077,7 +7129,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             let sig = signature.clone().unwrap_or_default();
 
             // Update trade data in multi-pool registry
-            ctx.update_pool_trade_data(mint, pool_address, sol_lamports, token_raw, event.slot.unwrap_or(0));
+            ctx.update_pool_trade_data(mint, pool_address, event_dex, sol_lamports, token_raw, event.slot.unwrap_or(0));
 
             // Check if this trader is the dev wallet and record dev behavior
             let is_dev = {
@@ -7312,12 +7364,13 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     let mut positions = ctx.positions.write();
                     positions.remove(mint).is_some()
                 };
+                // FIX-35: Also remove from orphaned_mints if it was waiting for reconciliation
+                ctx.orphaned_mints.write().remove(mint);
                 if was_tracked {
                     info!(
                         mint = %mint,
                         "🧹 Position auto-closed: WalletBalanceSnapshot shows balance=0 (manual sale or external transfer)"
                     );
-                    // Also delete from JetStream KV to prevent zombie positions on next restart
                     ctx.delete_position_from_kv(mint).await;
                 } else {
                     debug!(
@@ -7352,11 +7405,13 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     );
                     ctx.save_position_to_kv(mint, &reconciled).await;
                 } else {
-                    // Wallet has tokens but we're not tracking a position and no pool is known.
+                    // Wallet has tokens but no pool known yet. Store as orphaned so
+                    // we can reconcile later when PoolCreated/DexPoolAccounts arrives.
+                    ctx.orphaned_mints.write().insert(mint.to_string(), (*balance_raw, *decimals));
                     warn!(
                         mint = %mint,
                         balance_raw = *balance_raw,
-                        "WalletBalanceSnapshot: tokens present but no known pool to reconcile"
+                        "WalletBalanceSnapshot: tokens present but no known pool — added to orphaned_mints for lazy reconciliation"
                     );
                 }
             }

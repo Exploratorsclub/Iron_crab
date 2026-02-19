@@ -428,8 +428,15 @@ pub async fn build_tx_plan(
         orca.set_user_authority(wallet_pubkey);
 
         // Register ATAs for both mints (Orca build_swap_ix requires these mappings).
+        // Use token_program from intent for Token-2022 support.
         let owner_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
-        let token_program_spl = spl_token::id();
+        let token_program_spl = intent
+            .resources
+            .token_program
+            .as_ref()
+            .and_then(|tp| Pubkey::from_str(tp).ok())
+            .map(|pk| SplProgramPubkey::new_from_array(pk.to_bytes()))
+            .unwrap_or_else(spl_token::id);
         for mint in [
             intent.resources.input_mint.as_str(),
             intent.resources.output_mint.as_str(),
@@ -444,11 +451,16 @@ pub async fn build_tx_plan(
                 }
             };
             let mint_spl = SplProgramPubkey::new_from_array(mint_sdk.to_bytes());
+            let tp = if mint == SOL_MINT {
+                spl_token::id()
+            } else {
+                token_program_spl
+            };
             let ata_spl =
                 spl_associated_token_account::get_associated_token_address_with_program_id(
                     &owner_spl,
                     &mint_spl,
-                    &token_program_spl,
+                    &tp,
                 );
             let ata_sdk = Pubkey::new_from_array(ata_spl.to_bytes());
             orca.set_user_token_account(mint_sdk, ata_sdk);
@@ -476,9 +488,38 @@ pub async fn build_tx_plan(
 
         // NOTE: No in-TX wrap for BUYs!
         // WsolManager maintains WSOL buffer outside of trades.
-        // This saves ~2000-3000 CU and avoids lamport noise that breaks fill_in detection.
+        let mut final_ixs = ixs;
+        if intent.side == TradeSide::Buy {
+            // BUY: create token ATA for receiving bought tokens (Token-2022 aware)
+            let token_mint = Pubkey::from_str(&intent.resources.output_mint).unwrap_or_default();
+            let token_mint_spl = SplProgramPubkey::new_from_array(token_mint.to_bytes());
+            let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
+            let ata_ix = prog_ix_to_sdk(
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &payer_spl,
+                    &payer_spl,
+                    &token_mint_spl,
+                    &token_program_spl,
+                ),
+            );
+            final_ixs.insert(0, ata_ix);
+        } else {
+            // SELL: ensure WSOL ATA exists
+            let wsol_mint = Pubkey::from_str(SOL_MINT).expect("valid SOL_MINT");
+            let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
+            let wsol_mint_spl = SplProgramPubkey::new_from_array(wsol_mint.to_bytes());
+            let ata_ix = prog_ix_to_sdk(
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &payer_spl,
+                    &payer_spl,
+                    &wsol_mint_spl,
+                    &spl_token::id(),
+                ),
+            );
+            final_ixs.insert(0, ata_ix);
+        }
 
-        return TxPlanOutcome::Planned(TxPlan { instructions: ixs });
+        return TxPlanOutcome::Planned(TxPlan { instructions: final_ixs });
     }
 
     if dex_hint == DexHint::Raydium {
@@ -579,9 +620,45 @@ pub async fn build_tx_plan(
 
         // NOTE: No in-TX wrap for BUYs!
         // WsolManager maintains WSOL buffer outside of trades.
-        // This saves ~2000-3000 CU and avoids lamport noise that breaks fill_in detection.
+        let mut final_ixs = ixs;
+        if intent.side == TradeSide::Buy {
+            // BUY: create token ATA for receiving bought tokens (Token-2022 aware)
+            let token_mint = Pubkey::from_str(&intent.resources.output_mint).unwrap_or_default();
+            let token_mint_spl = SplProgramPubkey::new_from_array(token_mint.to_bytes());
+            let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
+            let token_program_spl = intent
+                .resources
+                .token_program
+                .as_ref()
+                .and_then(|tp| Pubkey::from_str(tp).ok())
+                .map(|pk| SplProgramPubkey::new_from_array(pk.to_bytes()))
+                .unwrap_or_else(spl_token::id);
+            let ata_ix = prog_ix_to_sdk(
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &payer_spl,
+                    &payer_spl,
+                    &token_mint_spl,
+                    &token_program_spl,
+                ),
+            );
+            final_ixs.insert(0, ata_ix);
+        } else {
+            // SELL: ensure WSOL ATA exists
+            let wsol_mint = Pubkey::from_str(SOL_MINT).expect("valid SOL_MINT");
+            let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
+            let wsol_mint_spl = SplProgramPubkey::new_from_array(wsol_mint.to_bytes());
+            let ata_ix = prog_ix_to_sdk(
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &payer_spl,
+                    &payer_spl,
+                    &wsol_mint_spl,
+                    &spl_token::id(),
+                ),
+            );
+            final_ixs.insert(0, ata_ix);
+        }
 
-        return TxPlanOutcome::Planned(TxPlan { instructions: ixs });
+        return TxPlanOutcome::Planned(TxPlan { instructions: final_ixs });
     }
 
     if dex_hint == DexHint::PumpAmm {
@@ -710,8 +787,29 @@ pub async fn build_tx_plan(
         // NOTE: No in-TX wrap for BUYs!
         // WsolManager maintains WSOL buffer outside of trades.
         // This saves ~2000-3000 CU and avoids lamport noise that breaks fill_in detection.
-        // For SELL trades, ensure WSOL ATA exists (for receiving output).
-        if intent.side == TradeSide::Sell {
+        if intent.side == TradeSide::Buy {
+            // BUY: create token ATA for receiving bought tokens (Token-2022 aware)
+            let token_mint = Pubkey::from_str(&intent.resources.output_mint).unwrap_or_default();
+            let token_mint_spl = SplProgramPubkey::new_from_array(token_mint.to_bytes());
+            let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
+            let token_program_spl = intent
+                .resources
+                .token_program
+                .as_ref()
+                .and_then(|tp| Pubkey::from_str(tp).ok())
+                .map(|pk| SplProgramPubkey::new_from_array(pk.to_bytes()))
+                .unwrap_or_else(spl_token::id);
+            let ata_ix = prog_ix_to_sdk(
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &payer_spl,
+                    &payer_spl,
+                    &token_mint_spl,
+                    &token_program_spl,
+                ),
+            );
+            ixs.insert(0, ata_ix);
+        } else {
+            // SELL: ensure WSOL ATA exists (for receiving output)
             let wsol_mint = Pubkey::from_str(SOL_MINT).expect("valid SOL_MINT");
             let payer_spl = SplProgramPubkey::new_from_array(wallet_pubkey.to_bytes());
             let wsol_mint_spl = SplProgramPubkey::new_from_array(wsol_mint.to_bytes());

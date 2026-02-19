@@ -822,6 +822,52 @@ TX Confirmation nutzt `get_signature_statuses()` Polling mit exponential Backoff
 
 14. **Neue Metriken**: `TX_CONFIRM_GEYSER_TOTAL`, `TX_CONFIRM_RPC_FALLBACK_TOTAL`, `TX_CONFIRM_LATENCY_MS`, `TPU_RECONNECT_TOTAL`, `TPU_CACHE_STALE_TOTAL`, `GEYSER_TX_WATCHER_CONNECTED`.
 
+### FIX-33: Fehlende DexPoolAccounts bei SELL Exits
+
+**Datum**: 2026-02-11  
+**Schweregrad**: CRITICAL — Gekaufte Tokens konnten nicht verkauft werden  
+**Symptom**: `Custom(6023)` ("NotEnoughTokensToSell") und `Custom(11)` bei SELL-Transaktionen. Logs: "Missing DexPoolAccounts for exit intent; falling back to empty accounts".
+
+**Root Cause**: `update_pool_trade_data()` aktualisierte nur existierende Einträge in `mint_pools`, erstellte aber keine neuen. Pools die nur über Trade-Events entdeckt wurden fehlten. Zusätzlich nutzte `generate_and_publish_exit_intent()` den PositionTracker nicht als Fallback.
+
+**Fix (3 Ebenen)**:
+
+1. **Pool-Auto-Registrierung** (`momentum_bot.rs`): `update_pool_trade_data()` erstellt jetzt automatisch neue `PoolInfo`-Einträge wenn ein Pool für einen Mint unbekannt ist.
+2. **PositionTracker-Fallback** (`momentum_bot.rs`): `generate_and_publish_exit_intent()` nutzt jetzt `mint_pools` für den spezifischen Pool als primäre Quelle, dann `try_get_dex_pool_accounts_for_mint()`, mit Warnung statt Abbruch wenn beides fehlt.
+3. **TX-Builder Fallback** (`tx_builder.rs`): Bereits implementiert für PumpSwap AMM (LivePoolCache-Fallback Z.605-614). Keine zusätzlichen Änderungen nötig.
+
+**Dateien**: `src/bin/momentum_bot.rs`
+
+### FIX-34: Token ATA-Erstellung für BUY bei 3 DEX-Pfaden (Token-2022)
+
+**Datum**: 2026-02-11  
+**Schweregrad**: CRITICAL — BUY-Transaktionen scheiterten an fehlender ATA  
+**Symptom**: `Custom(2)` auf `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL` (Associated Token Program) bei BUY-Simulationen.
+
+**Root Cause**: PumpSwap AMM, Orca und Raydium BUY-Pfade in `tx_builder.rs` erstellten keine Token-ATA vor dem Swap. Für Token-2022 muss `create_associated_token_account_idempotent` mit der korrekten `token_program_id` aufgerufen werden.
+
+**Fix**:
+
+- **FIX-34a PumpSwap AMM**: `create_associated_token_account_idempotent` als erste Instruction bei BUYs, mit `intent.resources.token_program` für Token-2022.
+- **FIX-34b Orca**: ATA-Erstellung bei BUYs + hardcoded `spl_token::id()` durch dynamisches `intent.resources.token_program` ersetzt.
+- **FIX-34c Raydium**: ATA-Erstellung bei BUYs + hardcoded `spl_token::id()` durch dynamisches `intent.resources.token_program` ersetzt.
+
+Alle drei Pfade erstellen WSOL-ATA bei SELLs (für empfangene SOL).
+
+**Dateien**: `src/execution/tx_builder.rs`
+
+### FIX-35: Position-Reconciliation nach Restart (Lazy Reconciliation)
+
+**Datum**: 2026-02-11  
+**Schweregrad**: MEDIUM — Alte Positionen wurden nach Restart nicht getracked  
+**Symptom**: Tokens im Wallet sichtbar aber nicht vom Bot verwaltet. `build_reconciled_position()` scheitert wenn `mint_pools` nach Restart noch leer ist.
+
+**Root Cause**: `mint_pools` ist in-memory. Nach Restart sind Pool-Infos erst verfügbar wenn PoolCreated/DexPoolAccounts Events eintreffen. WalletBalanceSnapshots können aber vorher verarbeitet werden.
+
+**Fix**: `orphaned_mints: HashMap<String, (u64, u8)>` im `MomentumContext`. Wenn `build_reconciled_position()` scheitert, wird der Mint mit `(balance_raw, decimals)` gespeichert. Bei jedem `register_pool()` wird geprüft ob ein orphaned Mint jetzt reconciled werden kann. Balance=0 Snapshots entfernen Mints aus dem Set.
+
+**Dateien**: `src/bin/momentum_bot.rs`
+
 ---
 
 ## 4. BEKANNTE ARCHITEKTUR-PROBLEME (aus Architecture Audit)
