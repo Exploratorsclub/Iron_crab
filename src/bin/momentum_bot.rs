@@ -1843,34 +1843,59 @@ impl MomentumContext {
         token_amount: u64,
         slot: u64,
     ) {
-        let mut pools = self.mint_pools.write();
-        let pool_list = pools.entry(mint.to_string()).or_default();
-
-        let pool_info = if let Some(existing) = pool_list
-            .iter_mut()
-            .find(|p| p.pool_address == pool_address)
+        let mut is_new_pool = false;
         {
-            existing
-        } else {
-            pool_list.push(PoolInfo::new(
-                pool_address.to_string(),
-                dex.to_string(),
-                slot,
-            ));
-            debug!(
-                mint = %mint,
-                pool = %pool_address,
-                dex = %dex,
-                "Pool auto-registered via trade event"
-            );
-            pool_list.last_mut().unwrap()
-        };
+            let mut pools = self.mint_pools.write();
+            let pool_list = pools.entry(mint.to_string()).or_default();
 
-        if token_amount > 0 {
-            pool_info.last_trade_ratio = Some(sol_amount as f64 / token_amount as f64);
+            let pool_info = if let Some(existing) = pool_list
+                .iter_mut()
+                .find(|p| p.pool_address == pool_address)
+            {
+                existing
+            } else {
+                is_new_pool = true;
+                pool_list.push(PoolInfo::new(
+                    pool_address.to_string(),
+                    dex.to_string(),
+                    slot,
+                ));
+                debug!(
+                    mint = %mint,
+                    pool = %pool_address,
+                    dex = %dex,
+                    "Pool auto-registered via trade event"
+                );
+                pool_list.last_mut().unwrap()
+            };
+
+            if token_amount > 0 {
+                pool_info.last_trade_ratio = Some(sol_amount as f64 / token_amount as f64);
+            }
+            pool_info.last_trade_slot = slot;
+            pool_info.last_updated = std::time::Instant::now();
+        } // release mint_pools write lock
+
+        // FIX-35/37: Check orphaned_mints when a new pool is auto-registered via trade data.
+        // Previously only register_pool() (from PoolCreated events) checked orphans,
+        // but pools discovered via trades (FIX-33) bypassed this path entirely.
+        if is_new_pool {
+            let orphan_data = self.orphaned_mints.write().remove(mint);
+            if let Some((balance_raw, decimals)) = orphan_data {
+                if let Some(reconciled) = self.build_reconciled_position(mint, balance_raw, decimals) {
+                    self.positions
+                        .write()
+                        .insert(mint.to_string(), reconciled.clone());
+                    info!(
+                        mint = %mint,
+                        pool = %reconciled.pool,
+                        dex = %reconciled.dex,
+                        balance_raw,
+                        "Orphaned mint reconciled into position (pool discovered via trade)"
+                    );
+                }
+            }
         }
-        pool_info.last_trade_slot = slot;
-        pool_info.last_updated = std::time::Instant::now();
     }
 
     /// Update pool accounts (for swap instruction building)
