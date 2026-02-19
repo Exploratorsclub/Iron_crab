@@ -868,6 +868,20 @@ Alle drei Pfade erstellen WSOL-ATA bei SELLs (für empfangene SOL).
 
 **Dateien**: `src/bin/momentum_bot.rs`
 
+### FIX-36: WSOL wird als tradeable Position getrackt
+
+**Datum**: 2026-02-11  
+**Schweregrad**: HIGH — Verursacht falsche "Open Positions", Endlos-SELL-Intents und Intent-Rejections  
+**Symptom**: WSOL (`So11111111111111111111111111111111111111112`) wurde durch `WalletBalanceSnapshot` als Token-Position reconciled. Daraufhin versuchte der Bot wiederholt WSOL per `TIMED_EXIT` zu verkaufen, was jedes Mal mit `SIM_INSUFFICIENT_BALANCE` oder `Custom(11)` scheiterte. Dies verfälschte die "Open Positions"-Anzeige und flutete den Intent-Stream mit sinnlosen Sells.
+
+**Root Cause**: `WalletBalanceSnapshot`-Handler und `build_reconciled_position()` filterten WSOL nicht aus. Da WSOL immer eine Wallet-Balance hat, wurde es als unbekannte Position interpretiert und reconciled.
+
+**Fix**: 
+1. Early-return im `WalletBalanceSnapshot`-Handler: SOL-Mint wird sofort übersprungen
+2. Guard in `build_reconciled_position()`: gibt `None` zurück für WSOL
+
+**Dateien**: `src/bin/momentum_bot.rs`
+
 ---
 
 ## 4. BEKANNTE ARCHITEKTUR-PROBLEME (aus Architecture Audit)

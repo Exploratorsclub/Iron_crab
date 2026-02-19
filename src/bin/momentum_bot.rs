@@ -1904,6 +1904,10 @@ impl MomentumContext {
         balance_raw: u64,
         decimals: u8,
     ) -> Option<PositionTracker> {
+        // FIX-36: WSOL is the quote currency, never a tradeable position
+        if mint == "So11111111111111111111111111111111111111112" {
+            return None;
+        }
         let (pool, dex, ratio_opt) = self.select_reconcile_pool(mint)?;
         // ratio = sol_lamports / token_raw (raw units)
         // entry_price should be tokens_UI / SOL_UI = (1/ratio) * 10^(9 - decimals)
@@ -7357,6 +7361,12 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             // P0: Position Reconciliation after restart
             // Published by market-data at startup AND periodically to sync wallet state.
             // Handles: manual sales, emergency liquidations, external transfers.
+
+            // FIX-36: Never track WSOL as a token position — it's the quote currency
+            if mint == "So11111111111111111111111111111111111111112" {
+                debug!(mint = %mint, balance_raw = *balance_raw, "Ignoring WSOL WalletBalanceSnapshot (not a tradeable position)");
+                return Ok(());
+            }
 
             if *balance_raw == 0 {
                 // Remove ghost position if wallet balance is zero
