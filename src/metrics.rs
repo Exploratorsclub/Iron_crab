@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Recent trade record for dashboard display
@@ -246,6 +246,13 @@ pub static TX_SEND_JITO_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0))
 pub static TX_SEND_RPC_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_CONFIRMED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_CONFIRM_TIMEOUT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// FIX-32: Geyser-based TX confirmation breakdown
+pub static TX_CONFIRM_GEYSER_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_CONFIRM_RPC_FALLBACK_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_CONFIRM_LATENCY_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TPU_RECONNECT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TPU_CACHE_STALE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static GEYSER_TX_WATCHER_CONNECTED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 pub static AVAILABLE_SOL_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ACTIVE_CAPITAL_LOCKS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ACTIVE_RESOURCE_LOCKS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -326,6 +333,7 @@ pub static RPC_CONCURRENCY_ADJUSTMENTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| Ato
 pub static RPC_INFLIGHT_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static RPC_ALLOWED_CONCURRENCY: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static OPEN_POSITIONS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static CONCURRENT_INTENTS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static DAILY_REALIZED_PNL_SOL_MICRO: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static LIQUIDITY_ESTIMATE_SOL_MICRO: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // Histogram (swap latency) simplified: we keep bucket counters manually (ns)
@@ -853,6 +861,31 @@ async fn metrics_response() -> Response<Body> {
         "tx_confirm_timeout_total",
         TX_CONFIRM_TIMEOUT_TOTAL.load(Ordering::Relaxed)
     );
+    // FIX-32: Geyser-based TX confirmation breakdown
+    line!(
+        "tx_confirm_geyser_total",
+        TX_CONFIRM_GEYSER_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "tx_confirm_rpc_fallback_total",
+        TX_CONFIRM_RPC_FALLBACK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "tx_confirm_latency_ms",
+        TX_CONFIRM_LATENCY_MS.load(Ordering::Relaxed)
+    );
+    line!(
+        "tpu_reconnect_total",
+        TPU_RECONNECT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "tpu_cache_stale_total",
+        TPU_CACHE_STALE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "geyser_tx_watcher_connected",
+        GEYSER_TX_WATCHER_CONNECTED.load(Ordering::Relaxed) as u64
+    );
     line!(
         "simulation_failures_total",
         SIMULATION_FAILURES_TOTAL.load(Ordering::Relaxed)
@@ -1087,6 +1120,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "open_positions",
         OPEN_POSITIONS_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "concurrent_intents",
+        CONCURRENT_INTENTS_GAUGE.load(Ordering::Relaxed)
     );
     line!(
         "daily_realized_pnl_sol",

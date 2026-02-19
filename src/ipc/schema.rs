@@ -155,6 +155,7 @@ pub enum MarketEventKind {
     PoolCreated {
         pool_address: String,
         base_mint: String,
+        #[serde(default = "default_sol_mint")]
         quote_mint: String,
         dex: String,
         initial_liquidity_sol: Option<Decimal>,
@@ -180,6 +181,7 @@ pub enum MarketEventKind {
         dex: String,
         pool_address: String,
         base_mint: String,
+        #[serde(default = "default_sol_mint")]
         quote_mint: String,
         accounts: Vec<String>,
     },
@@ -221,6 +223,7 @@ pub enum MarketEventKind {
     PriceUpdate {
         pool_address: String,
         base_mint: String,
+        #[serde(default = "default_sol_mint")]
         quote_mint: String,
         price: Decimal,
         liquidity_sol: Option<Decimal>,
@@ -281,6 +284,7 @@ pub enum MarketEventKind {
         /// Base mint for context
         base_mint: String,
         /// Quote mint for context
+        #[serde(default = "default_sol_mint")]
         quote_mint: String,
         /// Slot when this update was observed
         update_slot: u64,

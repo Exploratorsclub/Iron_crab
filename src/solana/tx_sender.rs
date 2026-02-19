@@ -353,8 +353,7 @@ impl TxSender {
         // Health check: check leader cache staleness and reconnect if needed
         if let Err(e) = tpu.check_leader_cache_health() {
             warn!(error = %e, "Leader cache stale, attempting reconnect");
-            // Only reconnect if enough time has passed (30s minimum between reconnects)
-            if tpu.can_reconnect(30_000) {
+            if tpu.can_reconnect(15_000) {
                 if let Err(reconnect_err) = tpu.reconnect().await {
                     warn!(error = %reconnect_err, "TPU reconnect failed, continuing with stale cache");
                 }
@@ -368,7 +367,7 @@ impl TxSender {
                 threshold = self.config.tpu_reconnect_failure_threshold,
                 "TPU client has many failures, attempting reconnect"
             );
-            if tpu.can_reconnect(30_000) {
+            if tpu.can_reconnect(15_000) {
                 if let Err(e) = tpu.reconnect().await {
                     warn!(error = %e, "TPU reconnect failed");
                 }
@@ -551,7 +550,7 @@ impl TxSender {
                     // Check leader cache health
                     if let Err(e) = tpu.check_leader_cache_health() {
                         warn!(error = %e, "TPU health check: leader cache stale");
-                        if tpu.can_reconnect(30_000) {
+                        if tpu.can_reconnect(15_000) {
                             info!("TPU health check: triggering reconnect");
                             if let Err(reconnect_err) = tpu.reconnect().await {
                                 error!(error = %reconnect_err, "TPU health check: reconnect failed");

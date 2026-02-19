@@ -37,7 +37,6 @@ use solana_message::{v0, AddressLookupTableAccount, VersionedMessage};
 use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding, UiTransactionTokenBalance,
@@ -73,8 +72,10 @@ use ironcrab::metrics::{
     AVAILABLE_SOL_LAMPORTS, INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
     JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL,
     JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
-    OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK,
+    CONCURRENT_INTENTS_GAUGE, OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE,
+    REJECT_RESOURCE_LOCK,
     REJECT_SEND_FAILED, REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL,
+    TX_CONFIRM_GEYSER_TOTAL, TX_CONFIRM_LATENCY_MS, TX_CONFIRM_RPC_FALLBACK_TOTAL,
     TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL,
     TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
 };
@@ -1038,6 +1039,18 @@ struct ExecutionConfig {
     wsol_cooldown_secs: u64,
     wsol_dry_run: bool,
 
+    // === FIX-31: Parallel Intent Processing ===
+    /// Maximum number of intents processed concurrently. Startup-only (restart required).
+    max_concurrent_intents: u32,
+
+    // === FIX-32: Geyser TX Confirmation ===
+    /// Use Geyser for TX confirmation instead of RPC polling (requires geyser_grpc_url)
+    geyser_confirm_enabled: bool,
+    /// Rebroadcast interval during confirmation wait (ms)
+    rebroadcast_interval_ms: u64,
+    /// Max rebroadcasts per TX during confirmation
+    max_rebroadcasts: u32,
+
     // === Account Janitor Config (hot-reloadable) ===
     janitor_enabled: bool,
     janitor_close_ata_interval_secs: u64,
@@ -1064,7 +1077,7 @@ impl Default for ExecutionConfig {
             max_slippage_bps: 500,                   // max 5% slippage allowed
             // Operational
             simulation_timeout_ms: 2000,
-            confirmation_timeout_ms: 30_000,
+            confirmation_timeout_ms: 15_000,
             send_skip_preflight: true,
             send_preflight_commitment: None,
             send_enabled: false, // Default: simulate only
@@ -1088,6 +1101,12 @@ impl Default for ExecutionConfig {
             wsol_min_native_sol: 0.1,
             wsol_cooldown_secs: 30,
             wsol_dry_run: false,
+            // FIX-31: Parallel intent processing
+            max_concurrent_intents: 4,
+            // FIX-32: Geyser TX confirmation defaults
+            geyser_confirm_enabled: true,
+            rebroadcast_interval_ms: 2_000,
+            max_rebroadcasts: 5,
             // Account Janitor defaults
             janitor_enabled: false,
             janitor_close_ata_interval_secs: 3600,
@@ -1354,6 +1373,14 @@ struct ExecutionContext {
     // === Option C: Live Pool Cache (P0: fresh quotes, no RPC in hot path) ===
     /// Cache of pool states from Geyser for fresh quote calculation
     live_pool_cache: Option<Arc<ironcrab::execution::live_pool_cache::LivePoolCache>>,
+
+    // === FIX-31: Parallel Intent Processing ===
+    /// Semaphore limiting how many intents run concurrently (sized from config at startup)
+    intent_semaphore: Arc<tokio::sync::Semaphore>,
+
+    // === FIX-32: Geyser TX Confirmation ===
+    /// Geyser-based TX confirmation tracker (Geyser-first, RPC-polling fallback)
+    tx_confirm: Arc<ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm>,
 
     // Metrics
     intents_received: std::sync::atomic::AtomicU64,
@@ -3198,6 +3225,41 @@ impl ExecutionContext {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
+                "geyser_confirm_enabled" => {
+                    if let Some(v) = value.as_bool() {
+                        config.geyser_confirm_enabled = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "rebroadcast_interval_ms" => {
+                    if let Some(v) = value.as_u64() {
+                        if (500..=30_000).contains(&v) {
+                            config.rebroadcast_interval_ms = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 500-30000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "max_rebroadcasts" => {
+                    if let Some(v) = value.as_u64() {
+                        if (0..=20).contains(&v) {
+                            config.max_rebroadcasts = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 0-20".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
                 "skip_preflight" => {
                     if let Some(v) = value.as_bool() {
                         config.send_skip_preflight = v;
@@ -3334,6 +3396,19 @@ impl ExecutionContext {
                         info!(key = %key, new_value = %v, "Config updated");
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                // === FIX-31: Parallel Intent Processing ===
+                "max_concurrent_intents" => {
+                    if let Some(v) = value.as_u64() {
+                        if (1..=16).contains(&v) {
+                            info!(key = %key, new_value = %v, "Config acknowledged (restart required to take effect)");
+                            applied.push(key.clone());
+                        } else {
+                            rejected.push((key.clone(), "Out of range (1-16)".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
                 // === Account Janitor Config ===
@@ -4316,6 +4391,33 @@ async fn main() -> Result<()> {
         None
     };
 
+    // FIX-32: Initialize Geyser-based TX confirmation tracker
+    let tx_confirm = {
+        let geyser_url = app_config
+            .as_ref()
+            .and_then(|c| c.solana.geyser_grpc_url.as_ref());
+        if exec_config.geyser_confirm_enabled {
+            if let (Some(url), Some(ref wpk)) = (geyser_url, &wallet_pubkey) {
+                info!("FIX-32: Initializing Geyser-based TX confirmation (wallet={})", wpk);
+                Arc::new(ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::with_geyser(
+                    exec_config.confirmation_timeout_ms / 1000,
+                    url.clone(),
+                    *wpk,
+                ))
+            } else {
+                info!("FIX-32: Geyser TX confirm disabled (no geyser URL or wallet)");
+                Arc::new(ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::new(
+                    exec_config.confirmation_timeout_ms / 1000,
+                ))
+            }
+        } else {
+            info!("FIX-32: Geyser TX confirm disabled by config");
+            Arc::new(ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::new(
+                exec_config.confirmation_timeout_ms / 1000,
+            ))
+        }
+    };
+
     let mut ctx = ExecutionContext {
         run_id: run_id.clone(),
         rpc_url: args.rpc_url.clone(),
@@ -4323,6 +4425,9 @@ async fn main() -> Result<()> {
         wallet_pubkey,
         treasury,
         config_snapshot_id: parking_lot::RwLock::new(exec_config.snapshot_id()),
+        intent_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            exec_config.max_concurrent_intents as usize,
+        )),
         config: parking_lot::RwLock::new(exec_config),
         nats,
         decision_writer,
@@ -4357,6 +4462,8 @@ async fn main() -> Result<()> {
         cached_blockhash: parking_lot::RwLock::new(None),
         // Option C: LivePoolCache - for zero-RPC quote calculation
         live_pool_cache: live_pool_cache.clone(),
+        // FIX-32: Geyser-based TX confirmation
+        tx_confirm,
         // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
@@ -5224,14 +5331,31 @@ async fn main() -> Result<()> {
 
     let mut wallet_snapshot_consumer_opt = wallet_snapshot_consumer;
 
+    // FIX-31: Track spawned intent tasks for graceful shutdown
+    let mut task_set = tokio::task::JoinSet::new();
+
     loop {
         tokio::select! {
-            // Receive TradeIntents from channel (buffered from dedicated subscription task)
+            // FIX-31: Spawn intent processing as a parallel task (was: blocking await)
             Some(intent) = intent_rx.recv() => {
                 info!(intent_id = %intent.intent_id, source = %intent.source, "Received TradeIntent from NATS");
-                if let Err(e) = process_intent(&ctx, intent).await {
-                    error!(error = %e, "Failed to process intent");
-                }
+                let ctx_clone = Arc::clone(&ctx);
+                let sem = Arc::clone(&ctx.intent_semaphore);
+                task_set.spawn(async move {
+                    let _permit = match sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            warn!(intent_id = %intent.intent_id, "Intent semaphore closed, dropping intent");
+                            return;
+                        }
+                    };
+                    CONCURRENT_INTENTS_GAUGE.fetch_add(1, Ordering::Relaxed);
+                    let result = process_intent(&ctx_clone, intent).await;
+                    CONCURRENT_INTENTS_GAUGE.fetch_sub(1, Ordering::Relaxed);
+                    if let Err(e) = result {
+                        error!(error = %e, "Failed to process intent");
+                    }
+                });
             }
 
             // Receive Config Updates from channel
@@ -5326,6 +5450,13 @@ async fn main() -> Result<()> {
 
             _ = interval.tick() => {
                 simulated_tick += 1;
+
+                // FIX-31: Drain completed intent tasks to prevent memory leaks
+                while let Some(result) = task_set.try_join_next() {
+                    if let Err(e) = result {
+                        error!(error = %e, "Intent task panicked");
+                    }
+                }
 
                 // Keep /ready fresh even when no intents flow.
                 ironcrab::metrics::record_activity();
@@ -5549,9 +5680,33 @@ async fn main() -> Result<()> {
                 }
             }
             _ = &mut shutdown => {
-                info!("Shutdown signal received, stopping background tasks");
+                info!(in_flight = task_set.len(), "Shutdown signal received, draining in-flight intents");
                 // Signal shutdown to background tasks (WsolManager, etc.)
                 let _ = shutdown_tx.send(true);
+                // FIX-31: Prevent new intent tasks from acquiring the semaphore
+                ctx.intent_semaphore.close();
+                // FIX-31: Wait for in-flight intent tasks with a timeout
+                let shutdown_deadline = tokio::time::sleep(Duration::from_secs(60));
+                tokio::pin!(shutdown_deadline);
+                loop {
+                    tokio::select! {
+                        result = task_set.join_next() => {
+                            match result {
+                                Some(Err(e)) => error!(error = %e, "Intent task panicked during shutdown"),
+                                Some(Ok(())) => {}
+                                None => {
+                                    info!("All in-flight intents completed");
+                                    break;
+                                }
+                            }
+                        }
+                        _ = &mut shutdown_deadline => {
+                            warn!(remaining = task_set.len(), "Shutdown timeout (60s), aborting remaining intent tasks");
+                            task_set.abort_all();
+                            break;
+                        }
+                    }
+                }
                 break;
             }
         }
@@ -6515,7 +6670,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 .as_ref()
                 .expect("bundle_config gate ensures jito_client is present");
 
-            let signer: &dyn Signer = treasury.signer_ref();
+            let signer = treasury.signer_ref();
             let blockhash = match ctx.get_latest_blockhash().await {
                 Ok(bh) => bh,
                 Err(e) => {
@@ -7658,7 +7813,7 @@ async fn send_transaction_rpc(
         .as_ref()
         .ok_or_else(|| "no_signer_configured".to_string())?;
 
-    let signer: &dyn Signer = treasury.signer_ref();
+    let signer = treasury.signer_ref();
     let blockhash = ctx.get_latest_blockhash().await?;
 
     // Build Versioned Transaction with ALT if available
@@ -7734,7 +7889,7 @@ async fn send_transaction_with_fallback(
         .as_ref()
         .ok_or_else(|| "no_signer_configured".to_string())?;
 
-    let signer: &dyn Signer = treasury.signer_ref();
+    let signer = treasury.signer_ref();
     let blockhash = ctx.get_latest_blockhash().await?;
 
     // Build legacy Transaction for TxSender (TxSender handles signing internally for TPU)
@@ -7834,38 +7989,142 @@ enum ConfirmOutcome {
     TimeoutSent { details: String },
 }
 
-/// Confirmation polling (RS-4.2).
+/// FIX-32: Geyser-first TX confirmation with RPC-polling fallback.
 ///
-/// Maps outcome per roadmap:
-/// - confirmed => Confirmed
-/// - status err => FailedConfirmed
-/// - timeout/ambiguous => Sent (TimeoutSent)
+/// If Geyser TX watcher is connected, registers the signature and waits for a
+/// Geyser `transactions_status` notification (sub-200ms typical). Falls back to
+/// RPC polling if Geyser is unavailable or the channel drops.
+///
+/// Rebroadcasts run in a parallel task regardless of confirmation strategy.
 async fn confirm_signature_status(
     ctx: &ExecutionContext,
     signature_base58: &str,
     timeout_ms: u64,
     rebroadcast_tx: Option<&Transaction>,
 ) -> std::result::Result<ConfirmOutcome, String> {
+    let start = std::time::Instant::now();
+    let deadline = Duration::from_millis(timeout_ms.max(1));
+    let config = ctx.config.read().clone();
+
+    // Spawn rebroadcast task (runs in parallel for both strategies)
+    let rebroadcast_handle = if let Some(tx) = rebroadcast_tx {
+        let rpc = Arc::clone(&ctx.rpc);
+        let sig_str = signature_base58.to_string();
+        let tx_clone = tx.clone();
+        let interval_ms = config.rebroadcast_interval_ms;
+        let max_rebroadcasts = config.max_rebroadcasts;
+        Some(tokio::spawn(async move {
+            spawn_rebroadcast_loop(rpc, &sig_str, tx_clone, deadline, interval_ms, max_rebroadcasts).await;
+        }))
+    } else {
+        None
+    };
+
+    let outcome = if ctx.tx_confirm.is_geyser_enabled() && config.geyser_confirm_enabled {
+        confirm_via_geyser(ctx, signature_base58, deadline, start).await
+    } else {
+        confirm_via_rpc_polling(ctx, signature_base58, deadline, start).await
+    };
+
+    // Cancel rebroadcast task on completion
+    if let Some(handle) = rebroadcast_handle {
+        handle.abort();
+    }
+
+    outcome
+}
+
+/// Geyser-based confirmation: register TX, wait for oneshot notification or timeout.
+async fn confirm_via_geyser(
+    ctx: &ExecutionContext,
+    signature_base58: &str,
+    deadline: Duration,
+    start: std::time::Instant,
+) -> std::result::Result<ConfirmOutcome, String> {
+    let rx = ctx.tx_confirm.register_tx(signature_base58.to_string(), None);
+    let remaining = deadline.saturating_sub(start.elapsed());
+
+    tokio::select! {
+        result = rx => {
+            match result {
+                Ok(confirm) if confirm.confirmed => {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    TX_CONFIRMED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    TX_CONFIRM_GEYSER_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
+                    Ok(ConfirmOutcome::Confirmed {
+                        details: format!(
+                            "method=geyser slot={} elapsed_ms={elapsed_ms} signature={signature_base58}",
+                            confirm.slot,
+                        ),
+                    })
+                }
+                Ok(confirm) if confirm.error.is_some() => {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
+                    Ok(ConfirmOutcome::FailedConfirmed {
+                        details: format!(
+                            "method=geyser err={} slot={} elapsed_ms={elapsed_ms} signature={signature_base58}",
+                            confirm.error.as_deref().unwrap_or("unknown"),
+                            confirm.slot,
+                        ),
+                    })
+                }
+                Ok(_confirm) => {
+                    // Timeout from cleanup_timeouts() in the TX watcher
+                    TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    Ok(ConfirmOutcome::TimeoutSent {
+                        details: format!(
+                            "method=geyser_timeout elapsed_ms={} signature={signature_base58}",
+                            start.elapsed().as_millis()
+                        ),
+                    })
+                }
+                Err(_) => {
+                    // Channel dropped — Geyser watcher may have disconnected.
+                    // Fall back to RPC polling with remaining time.
+                    warn!(sig=%signature_base58, "Geyser confirm channel dropped, falling back to RPC polling");
+                    TX_CONFIRM_RPC_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    confirm_via_rpc_polling(ctx, signature_base58, deadline, start).await
+                }
+            }
+        }
+        _ = tokio::time::sleep(remaining) => {
+            TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            Ok(ConfirmOutcome::TimeoutSent {
+                details: format!(
+                    "method=geyser_deadline elapsed_ms={} signature={signature_base58}",
+                    start.elapsed().as_millis()
+                ),
+            })
+        }
+    }
+}
+
+/// RPC-polling fallback: exponential backoff polling of `get_signature_statuses()`.
+async fn confirm_via_rpc_polling(
+    ctx: &ExecutionContext,
+    signature_base58: &str,
+    deadline: Duration,
+    start: std::time::Instant,
+) -> std::result::Result<ConfirmOutcome, String> {
     let signature =
         Signature::from_str(signature_base58).map_err(|e| format!("invalid_signature:{e}"))?;
 
-    let start = std::time::Instant::now();
-    let deadline = Duration::from_millis(timeout_ms.max(1));
     let mut attempt: u32 = 0;
-    let mut rebroadcasts: u32 = 0;
 
     loop {
         if start.elapsed() >= deadline {
             TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
             return Ok(ConfirmOutcome::TimeoutSent {
                 details: format!(
-                    "timeout_ms={timeout_ms} elapsed_ms={} signature={signature_base58} rebroadcasts={rebroadcasts}",
+                    "method=rpc_polling timeout_ms={} elapsed_ms={} signature={signature_base58}",
+                    deadline.as_millis(),
                     start.elapsed().as_millis()
                 ),
             });
         }
 
-        // Poll signature status
         let res = ctx
             .rpc
             .rpc
@@ -7879,7 +8138,7 @@ async fn confirm_signature_status(
             if let Some(err) = st.err {
                 return Ok(ConfirmOutcome::FailedConfirmed {
                     details: format!(
-                        "err={err:?} confirmations={:?} confirmation_status={:?} elapsed_ms={}",
+                        "method=rpc_polling err={err:?} confirmations={:?} confirmation_status={:?} elapsed_ms={}",
                         st.confirmations,
                         st.confirmation_status,
                         start.elapsed().as_millis()
@@ -7887,8 +8146,6 @@ async fn confirm_signature_status(
                 });
             }
 
-            // Treat Confirmed or Finalized as confirmed.
-            // Some RPCs return confirmations=None when rooted/finalized.
             let is_confirmed = match st.confirmation_status {
                 Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed)
                 | Some(solana_transaction_status::TransactionConfirmationStatus::Finalized) => true,
@@ -7897,59 +8154,75 @@ async fn confirm_signature_status(
             };
 
             if is_confirmed {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
                 TX_CONFIRMED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                TX_CONFIRM_RPC_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+                TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
                 return Ok(ConfirmOutcome::Confirmed {
                     details: format!(
-                        "confirmations={:?} confirmation_status={:?} elapsed_ms={}",
+                        "method=rpc_polling confirmations={:?} confirmation_status={:?} elapsed_ms={elapsed_ms}",
                         st.confirmations,
                         st.confirmation_status,
-                        start.elapsed().as_millis()
                     ),
                 });
             }
         }
 
-        // If the status is still missing/only processed, rebroadcast occasionally.
-        // This helps when initial send was accepted but not propagated.
-        if let Some(tx) = rebroadcast_tx {
-            // Roughly every ~500ms-1s depending on backoff. Hard cap to avoid spamming.
-            if rebroadcasts < 5 && attempt > 0 && attempt % 10 == 0 {
-                let cfg = RpcSendTransactionConfig {
-                    skip_preflight: true,
-                    preflight_commitment: None,
-                    encoding: Some(UiTransactionEncoding::Base64),
-                    max_retries: Some(3),
-                    min_context_slot: None,
-                };
-
-                let vtx = solana_sdk::transaction::VersionedTransaction::from(tx.clone());
-                match ctx.rpc.rpc.send_transaction_with_config(&vtx, cfg).await {
-                    Ok(sig) => {
-                        rebroadcasts = rebroadcasts.saturating_add(1);
-                        info!(
-                            signature = %sig,
-                            original_signature = %signature_base58,
-                            rebroadcasts = rebroadcasts,
-                            "Rebroadcasted TX during confirm polling"
-                        );
-                    }
-                    Err(e) => {
-                        rebroadcasts = rebroadcasts.saturating_add(1);
-                        warn!(
-                            error = %e,
-                            original_signature = %signature_base58,
-                            rebroadcasts = rebroadcasts,
-                            "Rebroadcast attempt failed during confirm polling"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Backoff: small, bounded.
         attempt = attempt.saturating_add(1);
         let sleep_ms = (50u64 * attempt.min(20) as u64).min(1_000);
         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+    }
+}
+
+/// Periodic rebroadcast loop running in a parallel task.
+/// Aborted by the caller when confirmation arrives.
+async fn spawn_rebroadcast_loop(
+    rpc: Arc<ironcrab::solana::rpc::SolanaRpc>,
+    signature_base58: &str,
+    tx: Transaction,
+    deadline: Duration,
+    interval_ms: u64,
+    max_rebroadcasts: u32,
+) {
+    let start = std::time::Instant::now();
+    let mut rebroadcasts: u32 = 0;
+    let interval = Duration::from_millis(interval_ms);
+
+    // Wait one interval before first rebroadcast
+    tokio::time::sleep(interval).await;
+
+    while rebroadcasts < max_rebroadcasts && start.elapsed() < deadline {
+        let cfg = RpcSendTransactionConfig {
+            skip_preflight: true,
+            preflight_commitment: None,
+            encoding: Some(UiTransactionEncoding::Base64),
+            max_retries: Some(3),
+            min_context_slot: None,
+        };
+
+        let vtx = solana_sdk::transaction::VersionedTransaction::from(tx.clone());
+        match rpc.rpc.send_transaction_with_config(&vtx, cfg).await {
+            Ok(sig) => {
+                rebroadcasts += 1;
+                info!(
+                    signature = %sig,
+                    original_signature = %signature_base58,
+                    rebroadcasts = rebroadcasts,
+                    "Rebroadcasted TX during confirmation wait"
+                );
+            }
+            Err(e) => {
+                rebroadcasts += 1;
+                warn!(
+                    error = %e,
+                    original_signature = %signature_base58,
+                    rebroadcasts = rebroadcasts,
+                    "Rebroadcast attempt failed"
+                );
+            }
+        }
+
+        tokio::time::sleep(interval).await;
     }
 }
 

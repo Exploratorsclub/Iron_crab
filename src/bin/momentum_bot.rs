@@ -720,6 +720,8 @@ impl PositionTracker {
         }
 
         // 5. Momentum Exit - selling pressure detected
+        // FIX-30d: Volume-weighted momentum ratio instead of trade-count ratio.
+        // Prevents small bot-sells from overwhelming real buy volume.
         let momentum_window = Duration::from_secs(config.momentum_exit_window_secs);
         let now = Instant::now();
         let recent: Vec<_> = self
@@ -731,17 +733,24 @@ impl PositionTracker {
         if recent.len() >= config.momentum_exit_min_trades as usize {
             let buy_count = recent.iter().filter(|t| t.is_buy).count();
             let total = recent.len();
-            let buy_ratio = buy_count as f64 / total as f64;
+            let buy_vol: u64 = recent.iter().filter(|t| t.is_buy).map(|t| t.sol_amount).sum();
+            let total_vol: u64 = recent.iter().map(|t| t.sol_amount).sum();
+
+            let buy_ratio = if total_vol > 0 {
+                buy_vol as f64 / total_vol as f64
+            } else {
+                buy_count as f64 / total as f64
+            };
 
             if buy_ratio < config.momentum_exit_buy_ratio {
                 return Some((
                     "MOMENTUM_EXIT".to_string(),
                     format!(
-                        "Momentum fading: buy ratio {:.0}% < {:.0}% ({}b/{}t), P&L: {:.1}%",
+                        "Momentum fading: buy vol ratio {:.0}% < {:.0}% ({}b/{}t, buy_vol={:.4}SOL/total={:.4}SOL), P&L: {:.1}%",
                         buy_ratio * 100.0,
                         config.momentum_exit_buy_ratio * 100.0,
-                        buy_count,
-                        total,
+                        buy_count, total,
+                        buy_vol as f64 / 1e9, total_vol as f64 / 1e9,
                         pnl
                     ),
                 ));
@@ -2829,35 +2838,16 @@ impl MomentumContext {
                 .collect()
         };
 
-        // Collect mints with pending BUY intents to avoid generating exits
-        // while a scale-in BUY is still in-flight. Without this guard, the exit
-        // would snapshot pos.token_amount BEFORE the scale-in fill is applied,
-        // leading to partial sells that orphan tokens.
-        let pending_buy_mints: std::collections::HashSet<String> = self
-            .pending_intents
-            .read()
-            .values()
-            .filter(|p| p.side == TradeSide::Buy)
-            .map(|p| p.mint.clone())
-            .collect();
+        // FIX-30b: No longer block exit checks on pending BUY intents.
+        // All exits fire immediately. If momentum fades, we exit now rather than
+        // waiting for a scale-in that no longer makes sense. Orphaned Buy Recovery
+        // (handle_execution_result) handles any BUY that confirms after exit.
 
         let mut positions = self.positions.write();
         let mut exits = Vec::new();
 
         for (mint, pos) in positions.iter_mut() {
             if pos.exit_generated {
-                continue;
-            }
-
-            // Skip exit while a BUY intent (probe or scale-in) is pending for this mint.
-            // Once the BUY confirms and updates pos.token_amount, the next tick will
-            // re-evaluate with the correct total position size.
-            if pending_buy_mints.contains(mint) {
-                debug!(
-                    mint = %mint,
-                    token_amount = pos.token_amount,
-                    "⏸️ Exit check deferred: pending BUY intent for this mint"
-                );
                 continue;
             }
 
@@ -2916,6 +2906,16 @@ impl MomentumContext {
                 ));
             }
         }
+        drop(positions);
+
+        // FIX-30b: Cancel pending BUY intents for mints that are exiting.
+        // Scale-in makes no sense when we're trying to exit.
+        if !exits.is_empty() {
+            let exit_mints: std::collections::HashSet<&str> =
+                exits.iter().map(|(m, ..)| m.as_str()).collect();
+            let mut pending = self.pending_intents.write();
+            pending.retain(|_, p| !(exit_mints.contains(p.mint.as_str()) && p.side == TradeSide::Buy));
+        }
 
         exits
     }
@@ -2947,21 +2947,22 @@ impl MomentumContext {
                 continue;
             }
 
-            if !pos.exit_generated {
-                continue;
-            }
-
             if pending_sells.contains(mint) {
                 continue;
             }
 
+            // FIX-30c: Reconcile both cases:
+            // a) exit_generated==true but never confirmed (retry after cooldown)
+            // b) exit_generated==false — exit was never generated (e.g. was blocked)
             let last_exit_age = pos
                 .exit_generated_at
                 .and_then(|ts| now.checked_duration_since(ts).map(|d| d.as_secs()));
 
-            if let Some(age) = last_exit_age {
-                if age < retry_after.as_secs() {
-                    continue;
+            if pos.exit_generated {
+                if let Some(age) = last_exit_age {
+                    if age < retry_after.as_secs() {
+                        continue;
+                    }
                 }
             }
 
@@ -5374,6 +5375,19 @@ async fn main() -> Result<()> {
                                     Ok(msg) => {
                                         if let Ok(update) = serde_json::from_slice::<ironcrab::ipc::PoolCacheUpdate>(&msg.payload) {
                                             pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &update);
+                                            // FIX-30a: Update position price from pool reserves
+                                            if update.base_reserve > 0 && update.quote_reserve > 0 {
+                                                let decimals = ctx.mint_infos.read()
+                                                    .get(&update.base_mint)
+                                                    .map(|m| m.decimals)
+                                                    .unwrap_or(6);
+                                                let base_ui = update.base_reserve as f64 / 10f64.powi(decimals as i32);
+                                                let quote_ui = update.quote_reserve as f64 / 1_000_000_000.0;
+                                                if quote_ui > 0.0 {
+                                                    let tokens_per_sol = base_ui / quote_ui;
+                                                    ctx.update_position_price(&update.base_mint, tokens_per_sol, None);
+                                                }
+                                            }
                                             msg_count += 1;
                                         }
                                         let _ = msg.ack().await;

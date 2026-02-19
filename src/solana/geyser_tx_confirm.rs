@@ -10,17 +10,20 @@
 //! - HashMap lookup is O(1) - even 100k updates/sec are handled efficiently
 //! - Auto-unsubscribes when ATA confirmation received or timed out
 
+use crate::metrics::{GEYSER_TX_WATCHER_CONNECTED, TX_CONFIRM_LATENCY_MS};
 use futures::{SinkExt, StreamExt};
 use parking_lot::RwLock;
+use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-    SubscribeRequestFilterAccounts,
+    SubscribeRequestFilterAccounts, SubscribeRequestFilterTransactions,
 };
 
 /// Pending transaction waiting for confirmation
@@ -49,6 +52,8 @@ pub struct TxConfirmationResult {
     pub signature: String,
     pub slot: u64,
     pub confirmed: bool,
+    pub error: Option<String>,
+    pub elapsed_ms: u64,
 }
 
 /// Result of ATA balance check
@@ -62,12 +67,14 @@ pub enum AtaBalanceResult {
     Error(String),
 }
 
-/// Command to the background Geyser watcher
+/// Command to the background Geyser watchers (ATA + TX)
 enum WatcherCommand {
     /// Add an ATA to watch
     Watch(Pubkey),
     /// Remove an ATA from watch list
     Unwatch(Pubkey),
+    /// Add a TX signature to watch for confirmation
+    WatchTx(String),
     /// Shutdown the watcher
     Shutdown,
 }
@@ -75,8 +82,8 @@ enum WatcherCommand {
 /// Geyser-based transaction confirmation tracker
 ///
 /// ## Efficiency Design
-/// - Maintains a **separate Geyser stream** dedicated to ATA watching
-/// - Only subscribes to specific ATA addresses we're interested in
+/// - Maintains **two separate Geyser streams**: one for ATA watching, one for TX confirmation
+/// - TX stream uses `transactions_status` with `account_include` filter (wallet pubkey only)
 /// - HashMap lookup for incoming updates is O(1)
 /// - Automatically resubscribes when watch list changes
 pub struct GeyserTxConfirm {
@@ -88,8 +95,10 @@ pub struct GeyserTxConfirm {
     watched_atas: Arc<RwLock<HashSet<Pubkey>>>,
     /// Timeout for confirmations (default 30s)
     timeout_secs: u64,
-    /// Channel to send commands to the background watcher
+    /// Channel to send commands to the ATA background watcher
     watcher_tx: Option<mpsc::Sender<WatcherCommand>>,
+    /// Channel to send commands to the TX background watcher
+    tx_watcher_tx: Option<mpsc::Sender<WatcherCommand>>,
     /// Geyser endpoint URL
     geyser_url: Option<String>,
 }
@@ -103,21 +112,25 @@ impl GeyserTxConfirm {
             watched_atas: Arc::new(RwLock::new(HashSet::new())),
             timeout_secs,
             watcher_tx: None,
+            tx_watcher_tx: None,
             geyser_url: None,
         }
     }
 
-    /// Create new tracker with Geyser support for efficient ATA watching
+    /// Create new tracker with Geyser support for ATA watching and TX confirmation.
     ///
-    /// This spawns a background task that maintains a Geyser subscription
-    /// for all watched ATAs. Much more efficient than RPC polling!
-    pub fn with_geyser(timeout_secs: u64, geyser_url: String) -> Self {
+    /// Spawns two background tasks:
+    /// 1. ATA watcher: subscribes to specific ATA account updates
+    /// 2. TX watcher: subscribes to `transactions_status` filtered by `wallet_pubkey`
+    pub fn with_geyser(timeout_secs: u64, geyser_url: String, wallet_pubkey: Pubkey) -> Self {
         let (watcher_tx, watcher_rx) = mpsc::channel(100);
+        let (tx_watcher_tx, tx_watcher_rx) = mpsc::channel(256);
 
+        let pending_txs = Arc::new(RwLock::new(HashMap::new()));
         let pending_atas = Arc::new(RwLock::new(HashMap::new()));
         let watched_atas = Arc::new(RwLock::new(HashSet::new()));
 
-        // Spawn background watcher
+        // Spawn ATA background watcher
         let pending_atas_clone = pending_atas.clone();
         let watched_atas_clone = watched_atas.clone();
         let geyser_url_clone = geyser_url.clone();
@@ -132,12 +145,27 @@ impl GeyserTxConfirm {
             .await;
         });
 
+        // Spawn TX confirmation background watcher
+        let pending_txs_clone = pending_txs.clone();
+        let geyser_url_clone2 = geyser_url.clone();
+
+        tokio::spawn(async move {
+            Self::run_tx_watcher(
+                geyser_url_clone2,
+                tx_watcher_rx,
+                pending_txs_clone,
+                wallet_pubkey,
+            )
+            .await;
+        });
+
         Self {
-            pending_txs: Arc::new(RwLock::new(HashMap::new())),
+            pending_txs,
             pending_atas,
             watched_atas,
             timeout_secs,
             watcher_tx: Some(watcher_tx),
+            tx_watcher_tx: Some(tx_watcher_tx),
             geyser_url: Some(geyser_url),
         }
     }
@@ -197,6 +225,211 @@ impl GeyserTxConfirm {
                 warn!(error=%e, "geyser_tx_confirm: Geyser subscription failed, retrying in 1s");
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
+        }
+    }
+
+    /// Build a SubscribeRequest for TX status confirmation.
+    /// Filters by wallet pubkey so we only receive our own transactions.
+    fn build_tx_status_subscribe_request(wallet_pubkey: &Pubkey) -> SubscribeRequest {
+        let mut tx_status_filter = HashMap::new();
+        tx_status_filter.insert(
+            "tx_confirm".to_string(),
+            SubscribeRequestFilterTransactions {
+                vote: Some(false),
+                failed: None, // we want both success and failure
+                signature: None,
+                account_include: vec![wallet_pubkey.to_string()],
+                account_exclude: vec![],
+                account_required: vec![],
+            },
+        );
+
+        SubscribeRequest {
+            accounts: HashMap::new(),
+            slots: HashMap::new(),
+            transactions: HashMap::new(),
+            transactions_status: tx_status_filter,
+            blocks: HashMap::new(),
+            blocks_meta: HashMap::new(),
+            entry: HashMap::new(),
+            commitment: Some(CommitmentLevel::Confirmed as i32),
+            accounts_data_slice: vec![],
+            ping: None,
+            from_slot: None,
+        }
+    }
+
+    /// Background task that maintains a Geyser `transactions_status` subscription
+    /// for real-time TX confirmation. Filters by wallet pubkey.
+    async fn run_tx_watcher(
+        geyser_url: String,
+        mut cmd_rx: mpsc::Receiver<WatcherCommand>,
+        pending_txs: Arc<RwLock<HashMap<String, PendingTx>>>,
+        wallet_pubkey: Pubkey,
+    ) {
+        info!(wallet=%wallet_pubkey, "geyser_tx_confirm: TX watcher starting");
+        let timeout = std::time::Duration::from_secs(30);
+
+        loop {
+            // Connect to Geyser
+            let client = match GeyserGrpcClient::build_from_shared(geyser_url.clone()) {
+                Ok(builder) => match builder.connect().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!(error=%e, "geyser_tx_confirm: TX watcher connect failed, retrying in 2s");
+                        GEYSER_TX_WATCHER_CONNECTED.store(false, Ordering::Relaxed);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    error!(error=%e, "geyser_tx_confirm: TX watcher build failed, retrying in 2s");
+                    GEYSER_TX_WATCHER_CONNECTED.store(false, Ordering::Relaxed);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
+            let request = Self::build_tx_status_subscribe_request(&wallet_pubkey);
+
+            let (_, mut stream) = match client.subscribe_with_request(Some(request)).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    error!(error=%e, "geyser_tx_confirm: TX watcher subscribe failed, retrying in 2s");
+                    GEYSER_TX_WATCHER_CONNECTED.store(false, Ordering::Relaxed);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
+            info!("geyser_tx_confirm: TX watcher connected and subscribed");
+            GEYSER_TX_WATCHER_CONNECTED.store(true, Ordering::Relaxed);
+
+            // Process stream until error/shutdown
+            let stream_err = loop {
+                tokio::select! {
+                    cmd = cmd_rx.recv() => {
+                        match cmd {
+                            Some(WatcherCommand::WatchTx(_sig)) => {
+                                // No dynamic subscription update needed;
+                                // we subscribe to ALL wallet TXs and match by HashMap lookup.
+                            }
+                            Some(WatcherCommand::Shutdown) | None => {
+                                info!("geyser_tx_confirm: TX watcher shutting down");
+                                GEYSER_TX_WATCHER_CONNECTED.store(false, Ordering::Relaxed);
+                                return;
+                            }
+                            _ => {} // ATA commands are for the other watcher
+                        }
+                    }
+
+                    msg = stream.next() => {
+                        match msg {
+                            Some(Ok(update)) => {
+                                let (sig_bytes, slot, is_err) = match &update.update_oneof {
+                                    Some(UpdateOneof::TransactionStatus(ts)) => {
+                                        let err = ts.error.as_ref().map(|e| e.err.clone());
+                                        (ts.signature.clone(), ts.slot, err)
+                                    }
+                                    Some(UpdateOneof::Transaction(tx_update)) => {
+                                        if let Some(ref tx_info) = tx_update.transaction {
+                                            let err_str = tx_info.meta.as_ref().and_then(|m| {
+                                                if !m.err.is_empty() {
+                                                    Some(String::from_utf8_lossy(&m.err).to_string())
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                            (tx_info.signature.clone(), tx_update.slot, err_str)
+                                        } else {
+                                            continue;
+                                        }
+                                    }
+                                    _ => continue,
+                                };
+
+                                if sig_bytes.is_empty() {
+                                    continue;
+                                }
+                                let sig_str = bs58::encode(&sig_bytes).into_string();
+
+                                // O(1) lookup: is this a TX we're waiting for?
+                                if let Some(pending) = pending_txs.write().remove(&sig_str) {
+                                    let elapsed = pending.submitted_at.elapsed();
+                                    let elapsed_ms = elapsed.as_millis() as u64;
+                                    TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
+
+                                    if let Some(ref err_msg) = is_err {
+                                        warn!(
+                                            sig=%sig_str,
+                                            slot=slot,
+                                            elapsed_ms=elapsed_ms,
+                                            error=%err_msg,
+                                            "geyser_tx_confirm: TX failed on-chain via Geyser"
+                                        );
+                                        let _ = pending.notify.send(TxConfirmationResult {
+                                            signature: sig_str,
+                                            slot,
+                                            confirmed: false,
+                                            error: Some(err_msg.clone()),
+                                            elapsed_ms,
+                                        });
+                                    } else {
+                                        info!(
+                                            sig=%sig_str,
+                                            slot=slot,
+                                            elapsed_ms=elapsed_ms,
+                                            mint=?pending.mint,
+                                            "geyser_tx_confirm: TX confirmed via Geyser"
+                                        );
+                                        let _ = pending.notify.send(TxConfirmationResult {
+                                            signature: sig_str,
+                                            slot,
+                                            confirmed: true,
+                                            error: None,
+                                            elapsed_ms,
+                                        });
+                                    }
+                                }
+                            }
+                            Some(Err(e)) => {
+                                break format!("stream error: {e}");
+                            }
+                            None => {
+                                break "stream ended".to_string();
+                            }
+                        }
+                    }
+
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                        // Periodic cleanup of timed-out TXs
+                        let mut pending = pending_txs.write();
+                        let timed_out: Vec<String> = pending
+                            .iter()
+                            .filter(|(_, v)| v.submitted_at.elapsed() > timeout)
+                            .map(|(k, _)| k.clone())
+                            .collect();
+
+                        for sig in timed_out {
+                            if let Some(ptx) = pending.remove(&sig) {
+                                let elapsed_ms = ptx.submitted_at.elapsed().as_millis() as u64;
+                                warn!(sig=%sig, elapsed_ms=elapsed_ms, "geyser_tx_confirm: TX watcher timeout");
+                                let _ = ptx.notify.send(TxConfirmationResult {
+                                    signature: sig,
+                                    slot: 0,
+                                    confirmed: false,
+                                    error: None,
+                                    elapsed_ms,
+                                });
+                            }
+                        }
+                    }
+                }
+            };
+
+            warn!(error=%stream_err, "geyser_tx_confirm: TX watcher disconnected, reconnecting in 1s");
+            GEYSER_TX_WATCHER_CONNECTED.store(false, Ordering::Relaxed);
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
     }
 
@@ -362,8 +595,9 @@ impl GeyserTxConfirm {
         }
     }
 
-    /// Register a transaction to wait for confirmation
-    /// Returns a receiver that will get the result when confirmed
+    /// Register a transaction to wait for confirmation.
+    /// If the TX watcher Geyser stream is active, confirmation happens via Geyser.
+    /// Otherwise the caller should fall back to RPC polling.
     pub fn register_tx(
         &self,
         signature: String,
@@ -380,7 +614,13 @@ impl GeyserTxConfirm {
         self.pending_txs
             .write()
             .insert(signature.clone(), pending_tx);
-        debug!(sig=%signature, "geyser_tx_confirm: registered TX for confirmation");
+
+        if let Some(ref tx_watcher) = self.tx_watcher_tx {
+            let _ = tx_watcher.try_send(WatcherCommand::WatchTx(signature.clone()));
+            debug!(sig=%signature, "geyser_tx_confirm: registered TX for Geyser-based confirmation");
+        } else {
+            debug!(sig=%signature, "geyser_tx_confirm: registered TX (no Geyser, RPC fallback)");
+        }
 
         rx
     }
@@ -414,9 +654,9 @@ impl GeyserTxConfirm {
         rx
     }
 
-    /// Check if Geyser-based watching is enabled
+    /// Check if Geyser-based TX confirmation is enabled
     pub fn is_geyser_enabled(&self) -> bool {
-        self.watcher_tx.is_some()
+        self.tx_watcher_tx.is_some()
     }
 
     /// Get the Geyser endpoint URL (if configured)
@@ -429,20 +669,47 @@ impl GeyserTxConfirm {
     pub fn on_transaction(&self, signature: &str, slot: u64) {
         if let Some(pending) = self.pending_txs.write().remove(signature) {
             let elapsed = pending.submitted_at.elapsed();
+            let elapsed_ms = elapsed.as_millis() as u64;
+            TX_CONFIRM_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
 
             info!(
                 sig=%signature,
                 slot=slot,
-                elapsed_ms=elapsed.as_millis(),
+                elapsed_ms=elapsed_ms,
                 mint=?pending.mint,
                 "geyser_tx_confirm: TX confirmed via Geyser"
             );
 
-            // Notify the waiter
             let _ = pending.notify.send(TxConfirmationResult {
                 signature: signature.to_string(),
                 slot,
                 confirmed: true,
+                error: None,
+                elapsed_ms,
+            });
+        }
+    }
+
+    /// Called when a transaction is seen but failed on-chain
+    pub fn on_transaction_failed(&self, signature: &str, slot: u64, error: &str) {
+        if let Some(pending) = self.pending_txs.write().remove(signature) {
+            let elapsed = pending.submitted_at.elapsed();
+            let elapsed_ms = elapsed.as_millis() as u64;
+
+            warn!(
+                sig=%signature,
+                slot=slot,
+                elapsed_ms=elapsed_ms,
+                error=%error,
+                "geyser_tx_confirm: TX failed on-chain"
+            );
+
+            let _ = pending.notify.send(TxConfirmationResult {
+                signature: signature.to_string(),
+                slot,
+                confirmed: false,
+                error: Some(error.to_string()),
+                elapsed_ms,
             });
         }
     }
@@ -504,6 +771,7 @@ impl GeyserTxConfirm {
 
             for sig in timed_out {
                 if let Some(pending_tx) = pending.remove(&sig) {
+                    let elapsed_ms = pending_tx.submitted_at.elapsed().as_millis() as u64;
                     warn!(
                         sig=%sig,
                         timeout_secs=self.timeout_secs,
@@ -515,6 +783,8 @@ impl GeyserTxConfirm {
                         signature: sig,
                         slot: 0,
                         confirmed: false,
+                        error: None,
+                        elapsed_ms,
                     });
                 }
             }
@@ -571,10 +841,13 @@ impl GeyserTxConfirm {
         self.pending_atas.read().contains_key(ata)
     }
 
-    /// Shutdown the background watcher gracefully
+    /// Shutdown both background watchers gracefully
     pub fn shutdown(&self) {
         if let Some(watcher_tx) = &self.watcher_tx {
             let _ = watcher_tx.try_send(WatcherCommand::Shutdown);
+        }
+        if let Some(tx_watcher_tx) = &self.tx_watcher_tx {
+            let _ = tx_watcher_tx.try_send(WatcherCommand::Shutdown);
         }
     }
 }

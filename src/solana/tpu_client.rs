@@ -219,6 +219,7 @@ impl TpuSubmitter {
 
         // Check staleness
         if cached_slot > 0 && current_slot > cached_slot + self.config.cache_stale_threshold {
+            crate::metrics::TPU_CACHE_STALE_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(
                 current_slot = current_slot,
                 cached_slot = cached_slot,
@@ -302,6 +303,7 @@ impl TpuSubmitter {
         self.consecutive_failures
             .store(0, std::sync::atomic::Ordering::Relaxed);
 
+        crate::metrics::TPU_RECONNECT_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         info!(
             current_slot = current_slot,
             "TPU client reconnected successfully"

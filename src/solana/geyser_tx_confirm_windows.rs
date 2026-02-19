@@ -15,6 +15,8 @@ pub struct TxConfirmationResult {
     pub signature: String,
     pub slot: u64,
     pub confirmed: bool,
+    pub error: Option<String>,
+    pub elapsed_ms: u64,
 }
 
 /// Result of ATA balance check
@@ -43,13 +45,32 @@ impl GeyserTxConfirm {
     /// Create new tracker with Geyser support.
     ///
     /// On Windows this is a stub and behaves like `new()`.
-    pub fn with_geyser(timeout_secs: u64, _geyser_url: String) -> Self {
+    pub fn with_geyser(timeout_secs: u64, _geyser_url: String, _wallet_pubkey: Pubkey) -> Self {
         Self::new(timeout_secs)
     }
 
     /// Returns whether Geyser is enabled.
     pub fn is_geyser_enabled(&self) -> bool {
         false
+    }
+
+    /// Register a TX for confirmation.
+    ///
+    /// On Windows this immediately returns a not-confirmed result (RPC fallback will be used).
+    pub fn register_tx(
+        &self,
+        signature: String,
+        _mint: Option<Pubkey>,
+    ) -> oneshot::Receiver<TxConfirmationResult> {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(TxConfirmationResult {
+            signature,
+            slot: 0,
+            confirmed: false,
+            error: Some("Geyser not supported on Windows".to_string()),
+            elapsed_ms: 0,
+        });
+        rx
     }
 
     /// Register an ATA to watch.
@@ -67,4 +88,20 @@ impl GeyserTxConfirm {
     pub fn timeout_secs(&self) -> u64 {
         self.timeout_secs
     }
+
+    pub fn pending_tx_count(&self) -> usize {
+        0
+    }
+
+    pub fn pending_ata_count(&self) -> usize {
+        0
+    }
+
+    pub fn cleanup_timeouts(&self) {}
+
+    pub fn on_transaction(&self, _signature: &str, _slot: u64) {}
+
+    pub fn on_transaction_failed(&self, _signature: &str, _slot: u64, _error: &str) {}
+
+    pub fn shutdown(&self) {}
 }

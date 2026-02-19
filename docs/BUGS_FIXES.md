@@ -707,6 +707,123 @@ Zwei zusammenwirkende Fehler:
 
 ---
 
+### BUG-30: Exit-Logic Gesamtproblem — Take Profit feuert nicht, Timed Exit überschritten, Momentum unzuverlässig
+**Schweregrad**: KRITISCH
+**Datum**: 2026-02-19
+**Symptome**:
+- Take Profit bei +81% PnL nicht ausgelöst (Config war 30%)
+- Timed Exit bei 656s statt max 300s
+- Momentum Exit unzuverlässig (5 Bot-Sells überstimmen 2 echte Buys)
+
+**Root Cause — 6 miteinander verflochtene Bugs:**
+
+**BUG-30a: Position Price nur aus Trade Events (KRITISCH — Phase 1)**
+`current_price` wird ausschließlich von `MarketEventKind::Trade` Events aktualisiert (`momentum_bot.rs` Z.7184). Kein Update aus `PoolCacheUpdate` Reserves. Wenn keine Trades für einen Token kommen, bleibt `current_price` bei `entry_price` → PnL = 0% → Take Profit feuert nie. Das Dashboard zeigt korrekte PnL aus Fill-Daten, der Bot berechnet intern 0%.
+
+**BUG-30b: Pending BUY blockiert ALLE Exit-Checks (KRITISCH — Phase 1)**
+`check_for_exits()` überspringt Positionen mit pending BUY komplett (`momentum_bot.rs` Z.2855: `continue`), inklusive STOP_LOSS, TAKE_PROFIT und TIME_EXIT. Wenn ein Scale-In-BUY pending ist und die Execution Engine sequentiell arbeitet (BUG-30e), kann der BUY minutenlang pending bleiben. In dieser Zeit feuert kein Exit.
+
+**BUG-30c: Reconciliation erfordert exit_generated==true (HOCH — Phase 1)**
+`collect_timed_exit_reconcile_candidates()` überspringt Positionen mit `exit_generated==false` (`momentum_bot.rs` Z.2950). Wenn der initiale Exit wegen pending BUY (BUG-30b) nie generiert wurde, greift die Reconciliation nicht. Diese Positionen bleiben indefinit offen.
+
+**BUG-30d: Momentum Exit nur Count-basiert, kein Volumen (MITTEL — Phase 1)**
+`buy_ratio = buy_count / total` (`momentum_bot.rs` Z.732-734) ignoriert das SOL-Volumen der Trades. `TradeEvent.sol_amount` existiert, wird aber nicht genutzt. 5 Bot-Sells à 0.001 SOL überstimmen 2 echte Buys à 10 SOL. Volumengewichtete Berechnung erkennt echte Kaufkraft vs. Wash Trading.
+
+**BUG-30e: Sequentielle Intent-Verarbeitung in Execution Engine (KRITISCH — Phase 2)**
+`process_intent()` in `execution_engine.rs` awaits `confirm_signature_status()` (bis 30s Timeout) pro Intent. Bei Queue-Tiefe 5 wartet Intent #5 bis zu 150s. Dies verstärkt BUG-30b massiv: Pending BUYs bleiben minutenlang in der Queue, während alle Exits blockiert sind. Fix: Fire-and-Forget TX Sending + Parallele Verarbeitung.
+
+**BUG-30f: RPC-Polling TX Confirmation + TPU Leader Cache Stale (HOCH — Phase 3)**
+TX Confirmation nutzt `get_signature_statuses()` Polling mit exponential Backoff statt Geyser Subscription. `GeyserTxConfirm` Modul existiert (`geyser_tx_confirm.rs`), wird aber nur für ATA-Watching genutzt. TPU WebSocket hat kein Keepalive → Leader Cache wird stale → TX an falschen Validator → 7-100s bis Landing. Fix: Geyser-basierte Confirmation + TPU WS Keepalive.
+
+**Status**: BUG-30a bis BUG-30d → ✅ BEHOBEN (FIX-30, Phase 1) | BUG-30e → ✅ BEHOBEN (FIX-31, Phase 2) | BUG-30f → ✅ BEHOBEN (FIX-32, Phase 3)
+
+---
+
+### FIX-30: Phase 1 — Exit-Logic Überholung (BUG-30a bis BUG-30d)
+**Datum**: 2026-02-19
+
+**Änderungen in `src/bin/momentum_bot.rs`:**
+
+1. **Preis-Update aus Pool-Reserves** (BUG-30a): Nach `apply_pool_cache_update()` im PoolCacheUpdate-Processing wird `tokens_per_sol` aus `base_reserve / quote_reserve` berechnet und `update_position_price()` aufgerufen. Take Profit, Stop Loss und Trailing Stop reagieren sofort auf Preisänderungen aus Geyser Pool-State.
+
+2. **Exit-Checks nicht bei pending BUY blockieren** (BUG-30b): `pending_buy_mints` Block in `check_for_exits()` komplett entfernt. Alle Exits feuern sofort. Bei Exit wird der pending BUY für die betroffene Mint aus `pending_intents` entfernt. Orphaned Buy Recovery (Z.3155-3247) fängt später confirmte BUYs ab.
+
+3. **Reconciliation-Fix** (BUG-30c): `collect_timed_exit_reconcile_candidates()` behandelt jetzt auch Positionen mit `exit_generated==false`. Bestehende `pending_sells`-Prüfung verhindert doppelte SELLs.
+
+4. **Volumengewichtete Momentum-Berechnung** (BUG-30d): `buy_ratio` in `should_exit()` nutzt `buy_sol_volume / total_sol_volume` statt `buy_count / total_count`. Fallback auf Count bei `total_vol == 0`.
+
+---
+
+### FIX-31: Phase 2 — Parallele Intent-Verarbeitung (BUG-30e)
+**Datum**: 2026-02-19
+
+**Problem**: `process_intent()` blockierte die Main-Loop der Execution Engine komplett, weil `confirm_signature_status()` (RPC-Polling) bis zu 30s pro Intent wartete. Bei 5 queued Intents dauerte es bis zu 150s bis der letzte verarbeitet wurde. Dies verstärkte BUG-30b massiv (Exits wurden durch blockierte Main-Loop verzögert).
+
+**Änderungen in `src/bin/execution_engine.rs`:**
+
+1. **Neues Config-Feld `max_concurrent_intents`** (u32, default: 4, range: 1-16): Startup-only Parameter, steuert die maximale Anzahl parallel verarbeiteter Intents. Hot-Reload wird acknowledged aber erfordert Neustart.
+
+2. **Semaphore-basierte Concurrency-Kontrolle**: `intent_semaphore: Arc<tokio::sync::Semaphore>` in `ExecutionContext` begrenzt parallele Verarbeitung. LockManager's `try_lock_resource()` / `try_lock_capital()` verhindert Konflikte bei gleichzeitigen Intents für denselben Mint oder bei Kapitalüberschreitung.
+
+3. **tokio::spawn + JoinSet**: Intents werden via `task_set.spawn()` parallel verarbeitet statt sequentiell awaited. Completed Tasks werden im Periodic Tick via `try_join_next()` gedraint.
+
+4. **Graceful Shutdown**: Bei Shutdown wird `intent_semaphore.close()` aufgerufen (verhindert neue Akquisen), dann werden alle In-Flight Tasks mit 60s Timeout via `task_set.join_next()` abgewartet. Bei Timeout: `task_set.abort_all()`.
+
+5. **Signer Send-Safety**: `let signer: &dyn Signer` Typ-Annotationen entfernt — `treasury.signer_ref()` gibt `&(dyn Signer + Send + Sync)` zurück, die explizite Annotation auf `&dyn Signer` strippte die Send+Sync Bounds und verhinderte `tokio::spawn`.
+
+**Änderungen in `src/metrics.rs`:**
+
+6. **Neue Metrik `CONCURRENT_INTENTS_GAUGE`** (AtomicU64): Zeigt die aktuelle Anzahl parallel laufender Intents im Prometheus-Endpoint (`ironcrab_concurrent_intents`).
+
+**Thread-Safety**: Alle shared State in `ExecutionContext` war bereits thread-safe (LockManager: `parking_lot::RwLock`, RPC: `Arc<SolanaRpc>` mit AdaptiveLimiter, JSONL Writers: `Mutex`, alle Prometheus-Counter: `Atomic*`, Config: `RwLock`). `process_intent()` selbst brauchte keine internen Änderungen.
+
+---
+
+### FIX-32: Phase 3 — TX Latenz Optimierung / Geyser-basierte Confirmation (BUG-30f)
+**Datum**: 2026-02-19
+
+**Problem**: TX Confirmation nutzte `get_signature_statuses()` RPC-Polling mit exponentiellem Backoff (50ms→1000ms). Beobachtete Latenzen: 7-100s. Zusätzlich: TPU WebSocket hatte kein proaktives Keepalive, Leader Cache wurde stale, TXs gingen an falsche Validatoren.
+
+**Änderungen in `src/solana/geyser_tx_confirm.rs`:**
+
+1. **Zweiter Geyser-Stream für TX Confirmation**: `run_tx_watcher()` startet einen dedizierten Geyser `transactions_status`-Stream gefiltert auf `account_include: [wallet_pubkey]`. Verarbeitet `UpdateOneof::TransactionStatus` und `UpdateOneof::Transaction`. O(1) HashMap-Lookup für Signature-Matching.
+
+2. **Erweitertes `TxConfirmationResult`**: Neue Felder `error: Option<String>` (Fehlergrund bei failed TX) und `elapsed_ms: u64` (Latenz für Metriken).
+
+3. **`with_geyser()` erweitert**: Nimmt jetzt `wallet_pubkey: Pubkey` als Parameter. Startet sowohl ATA-Watcher als auch TX-Watcher.
+
+4. **`register_tx()` sendet `WatchTx` Command**: Informiert den TX-Watcher-Task über neue Signatures (aktuell subscribed der Stream alle Wallet-TXs und matcht per HashMap).
+
+5. **`on_transaction_failed()`**: Neue Methode für on-chain fehlgeschlagene TXs (Slippage, etc.).
+
+6. **Auto-Reconnect und Timeout-Cleanup**: TX-Watcher reconnected automatisch bei Stream-Disconnects. Periodischer Cleanup alle 5s für timed-out Signatures.
+
+**Änderungen in `src/bin/execution_engine.rs`:**
+
+7. **`confirm_signature_status()` refactored**: Geyser-First Strategie mit RPC-Polling Fallback. `confirm_via_geyser()` nutzt `tokio::select!` auf oneshot::Receiver vs. Timeout. `confirm_via_rpc_polling()` enthält die bisherige Polling-Logik als Fallback.
+
+8. **Separate Rebroadcast-Task**: `spawn_rebroadcast_loop()` läuft parallel zur Confirmation (konfigurierbar: `rebroadcast_interval_ms`, `max_rebroadcasts`).
+
+9. **Neue Config-Felder**: `geyser_confirm_enabled` (bool, default: true), `rebroadcast_interval_ms` (u64, default: 2000), `max_rebroadcasts` (u32, default: 5). Alle hot-reloadable.
+
+10. **`tx_confirm: Arc<GeyserTxConfirm>` in ExecutionContext**: Initialisiert beim Startup mit Geyser URL und Wallet-Pubkey falls verfügbar.
+
+**Änderungen in `src/solana/tpu_client.rs`:**
+
+11. **`TPU_CACHE_STALE_TOTAL` Metrik**: Inkrementiert in `check_leader_cache_health()` bei Staleness-Detection.
+
+12. **`TPU_RECONNECT_TOTAL` Metrik**: Inkrementiert in `reconnect()` bei erfolgreichem Reconnect.
+
+**Änderungen in `src/solana/tx_sender.rs`:**
+
+13. **Reconnect Rate-Limit gesenkt**: Von 30s auf 15s in `send_via_tpu()` und `spawn_health_check_task()`.
+
+**Änderungen in `src/metrics.rs`:**
+
+14. **Neue Metriken**: `TX_CONFIRM_GEYSER_TOTAL`, `TX_CONFIRM_RPC_FALLBACK_TOTAL`, `TX_CONFIRM_LATENCY_MS`, `TPU_RECONNECT_TOTAL`, `TPU_CACHE_STALE_TOTAL`, `GEYSER_TX_WATCHER_CONNECTED`.
+
+---
+
 ## 4. BEKANNTE ARCHITEKTUR-PROBLEME (aus Architecture Audit)
 
 Diese Bugs sind im Detail in `docs/ARCHITECTURE_AUDIT_2026-02-07.md` dokumentiert:
