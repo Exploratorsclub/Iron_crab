@@ -200,6 +200,7 @@ impl GeyserTxConfirm {
                             Some(WatcherCommand::Unwatch(ata)) => {
                                 watched_atas.write().remove(&ata);
                             }
+                            Some(WatcherCommand::WatchTx(_)) => {}
                             Some(WatcherCommand::Shutdown) | None => {
                                 info!("geyser_tx_confirm: ATA watcher shutting down");
                                 return;
@@ -328,17 +329,17 @@ impl GeyserTxConfirm {
                             Some(Ok(update)) => {
                                 let (sig_bytes, slot, is_err) = match &update.update_oneof {
                                     Some(UpdateOneof::TransactionStatus(ts)) => {
-                                        let err = ts.error.as_ref().map(|e| e.err.clone());
+                                        let err = ts.err.as_ref().map(|e| {
+                                            String::from_utf8_lossy(&e.err).to_string()
+                                        });
                                         (ts.signature.clone(), ts.slot, err)
                                     }
                                     Some(UpdateOneof::Transaction(tx_update)) => {
                                         if let Some(ref tx_info) = tx_update.transaction {
                                             let err_str = tx_info.meta.as_ref().and_then(|m| {
-                                                if !m.err.is_empty() {
-                                                    Some(String::from_utf8_lossy(&m.err).to_string())
-                                                } else {
-                                                    None
-                                                }
+                                                m.err.as_ref().map(|e| {
+                                                    String::from_utf8_lossy(&e.err).to_string()
+                                                })
                                             });
                                             (tx_info.signature.clone(), tx_update.slot, err_str)
                                         } else {
@@ -520,6 +521,7 @@ impl GeyserTxConfirm {
                                 return Ok(());
                             }
                         }
+                        Some(WatcherCommand::WatchTx(_)) => {}
                         Some(WatcherCommand::Shutdown) | None => {
                             return Err(anyhow::anyhow!("Shutdown requested"));
                         }
