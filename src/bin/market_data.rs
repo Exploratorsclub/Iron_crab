@@ -745,11 +745,13 @@ async fn publish_wallet_snapshot(
             }
         }
 
-        // Merge discovered mints into known_mints (dedup)
+        // FIX-37: Owner-scan mints with real balance ALWAYS take priority over stale
+        // JetStream entries. Previously, MAX_BOOTSTRAP_MINTS could be filled entirely
+        // by stale JetStream snapshots, causing real wallet tokens to be ignored.
         let known_set: HashSet<Pubkey> = known_mints.iter().copied().collect();
         let mut newly_discovered = 0usize;
         for (mint_pk, _balance, _token_prog) in &discovered_from_owner_scan {
-            if !known_set.contains(mint_pk) && known_mints.len() < MAX_BOOTSTRAP_MINTS {
+            if !known_set.contains(mint_pk) {
                 known_mints.push(*mint_pk);
                 newly_discovered += 1;
             }
@@ -760,7 +762,8 @@ async fn publish_wallet_snapshot(
                 wallet = %wallet_str,
                 newly_discovered,
                 total_known = known_mints.len(),
-                "Wallet snapshot bootstrap: owner-scan discovered unknown tokens"
+                cap = MAX_BOOTSTRAP_MINTS,
+                "Wallet snapshot bootstrap: owner-scan discovered unknown tokens (bypassing cap for real wallet tokens)"
             );
         } else if !discovered_from_owner_scan.is_empty() {
             debug!(

@@ -883,6 +883,18 @@ Alle drei Pfade erstellen WSOL-ATA bei SELLs (für empfangene SOL).
 
 **Dateien**: `src/bin/momentum_bot.rs`
 
+### FIX-37: Owner-Scan Mints werden bei vollem Bootstrap-Cap ignoriert
+
+**Datum**: 2026-02-19  
+**Schweregrad**: HIGH — Wallet-Tokens werden beim Startup nicht erkannt  
+**Symptom**: Nach Restart zeigt Bot 0 Positionen obwohl 2 Token-2022 Tokens (ANDREW, TRUMPIUS) in der Wallet sind. `mints_in_wallet=0` im Log obwohl `getTokenAccountsByOwner` die Tokens findet.
+
+**Root Cause**: `MAX_BOOTSTRAP_MINTS = 30`. JetStream Recovery füllt 30 Plätze mit stale Mints aus alten Snapshots. Die anschließende Owner-Scan Merge-Logik prüft `known_mints.len() < MAX_BOOTSTRAP_MINTS` — da bereits 30 Mints vorhanden, werden reale Wallet-Tokens nicht hinzugefügt und somit nie verarbeitet.
+
+**Fix**: Owner-Scan Mints mit realer Wallet-Balance umgehen das `MAX_BOOTSTRAP_MINTS`-Cap. Sie repräsentieren tatsächliche Wallet-Inhalte und haben immer Vorrang vor stale JetStream-Einträgen.
+
+**Dateien**: `src/bin/market_data.rs`
+
 ---
 
 ## 4. BEKANNTE ARCHITEKTUR-PROBLEME (aus Architecture Audit)
