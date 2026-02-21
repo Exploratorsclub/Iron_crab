@@ -656,6 +656,14 @@ impl PositionTracker {
 
         // 1. Hard Stop Loss - immediate exit
         if pnl <= -config.hard_stop_loss_pct {
+            // DIAG: Log raw values to trace PnL inversion (STOP_LOSS showing gain in Dashboard)
+            trace!(
+                mint = %self.mint,
+                entry_price = self.entry_price,
+                current_price = self.current_price,
+                pnl_pct = pnl,
+                "STOP_LOSS trigger"
+            );
             return Some((
                 "STOP_LOSS".to_string(),
                 format!(
@@ -667,6 +675,14 @@ impl PositionTracker {
 
         // 2. Take Profit - lock in gains
         if pnl >= config.take_profit_pct {
+            // DIAG: Log raw values to trace PnL inversion (TAKE_PROFIT showing loss in Dashboard)
+            trace!(
+                mint = %self.mint,
+                entry_price = self.entry_price,
+                current_price = self.current_price,
+                pnl_pct = pnl,
+                "TAKE_PROFIT trigger"
+            );
             return Some((
                 "TAKE_PROFIT".to_string(),
                 format!(
