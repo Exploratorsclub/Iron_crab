@@ -69,6 +69,7 @@ use ironcrab::ipc::{
 use ironcrab::ipc::{ControlRequest, ControlRequestKind};
 use ironcrab::metrics::{
     record_recent_trade, serve_metrics, RecentTrade, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS,
+    KILL_SWITCH_ACTIVE,
     AVAILABLE_SOL_LAMPORTS, INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
     JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL,
     JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
@@ -4479,6 +4480,9 @@ async fn main() -> Result<()> {
         arb_executed: std::sync::atomic::AtomicU64::new(0),
     };
 
+    // Sync kill switch to global metric so control plane /status can display correct state after restarts
+    KILL_SWITCH_ACTIVE.store(initial_kill_switch_active, Ordering::Relaxed);
+
     // Initialize cross-DEX handler (keyless: uses treasury pubkey for user authority).
     // If this fails, we keep it disabled and cross-DEX arb intents will be rejected with
     // ARB_HANDLER_NOT_CONFIGURED.
@@ -5426,6 +5430,7 @@ async fn main() -> Result<()> {
                     match req.kind {
                         ControlRequestKind::KillSwitch { active, reason, liquidate_positions, max_slippage_bps, ttl_ms } => {
                             ctx.kill_switch_active.store(active, Ordering::Relaxed);
+                            KILL_SWITCH_ACTIVE.store(active, Ordering::Relaxed);
                             info!(active, liquidate_positions, reason = ?reason, "Kill switch updated");
                             if active {
                                 ctx.set_kill_switch_context(Some(KillSwitchContext {
@@ -5462,6 +5467,7 @@ async fn main() -> Result<()> {
                         }
                         ControlRequestKind::ResetKillSwitch => {
                             ctx.kill_switch_active.store(false, Ordering::Relaxed);
+                            KILL_SWITCH_ACTIVE.store(false, Ordering::Relaxed);
                             info!("Kill switch reset");
                             ctx.set_kill_switch_context(None);
 

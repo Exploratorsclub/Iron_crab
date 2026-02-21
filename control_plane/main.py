@@ -415,6 +415,7 @@ class ControlPlaneState:
         self.decisions_lock = asyncio.Lock()
         self.max_cached_decisions: int = 1000
         self.decision_subscriber_task: Optional[asyncio.Task] = None
+        self.kill_switch_sync_task: Optional[asyncio.Task] = None
         # P1: Component config storage (persistent hot-reload state)
         self.component_configs: Dict[str, Dict[str, Any]] = {}
         self.config_file: str = "control_plane_configs.json"
@@ -453,6 +454,33 @@ class ControlPlaneState:
         """Get current config for a component"""
         return self.component_configs.get(component, {})
     
+    async def sync_kill_switch_from_execution_engine(self):
+        """Sync kill switch state from execution-engine (authoritative source).
+        Ensures UI shows correct status after control-plane or execution-engine restart."""
+        if not self.http_client:
+            return
+        try:
+            response = await self.http_client.get(f"{config.EXECUTION_ENGINE_URL}/status")
+            if response.status_code == 200:
+                data = response.json()
+                active = data.get("kill_switch_active", False)
+                self.kill_switch_active = active
+                if active:
+                    self.kill_switch_reason = data.get("kill_switch_reason") or "restored from execution-engine"
+                    ts = data.get("kill_switch_time")
+                    try:
+                        self.kill_switch_time = (
+                            datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else datetime.now(timezone.utc)
+                        )
+                    except (ValueError, TypeError):
+                        self.kill_switch_time = datetime.now(timezone.utc)
+                else:
+                    self.kill_switch_reason = None
+                    self.kill_switch_time = None
+                logger.info(f"Synced kill switch from execution-engine: active={active}")
+        except Exception as e:
+            logger.warning(f"Could not sync kill switch from execution-engine: {e}")
+
     async def connect_nats(self):
         if not HAS_NATS:
             logger.warning("NATS not available (install with: pip install nats-py)")
@@ -467,6 +495,8 @@ class ControlPlaneState:
             
             # Start decision record subscriber
             self.decision_subscriber_task = asyncio.create_task(self._subscribe_decisions())
+            # Start periodic kill switch sync from execution-engine (every 30s)
+            self.kill_switch_sync_task = asyncio.create_task(self._periodic_kill_switch_sync())
             # Broadcast persisted configs to all components on startup (via JetStream)
             await self._broadcast_persisted_configs()
         except Exception as e:
@@ -585,8 +615,26 @@ class ControlPlaneState:
                 logger.error(f"Decision subscriber error: {e}")
         except Exception as e:
             logger.error(f"Failed to connect to NATS: {e}")
+
+    async def _periodic_kill_switch_sync(self):
+        """Background task: sync kill switch from execution-engine every 30s."""
+        while True:
+            try:
+                await asyncio.sleep(30)
+                await self.sync_kill_switch_from_execution_engine()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Kill switch sync error: {e}")
     
     async def disconnect_nats(self):
+        if self.kill_switch_sync_task:
+            self.kill_switch_sync_task.cancel()
+            try:
+                await self.kill_switch_sync_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Kill switch sync task stopped")
         if self.decision_subscriber_task:
             self.decision_subscriber_task.cancel()
             try:
@@ -726,6 +774,8 @@ async def lifespan(app: FastAPI):
     state.http_client = httpx.AsyncClient(timeout=5.0)
     state.startup_time = datetime.now(timezone.utc)  # Track uptime
     await state.connect_nats()
+    # Sync kill switch from execution-engine (authoritative source) so UI shows correct state after restarts
+    await state.sync_kill_switch_from_execution_engine()
     logger.info("Control plane ready")
     
     yield
@@ -1031,15 +1081,20 @@ async def trigger_kill_switch(
 
 @app.post("/kill/reset")
 async def reset_kill_switch(user: User = Depends(require_admin)):
-    """Reset kill switch (requires: admin)"""
-    if not state.kill_switch_active:
-        return {"status": "kill_switch_not_active"}
-    
-    logger.info(f"Kill switch reset requested by {user.name}")
-    audit_logger.info(f"KILL_SWITCH_RESET: user={user.name}, previous_reason='{state.kill_switch_reason}'")
-    state.kill_switch_active = False
+    """Reset kill switch (requires: admin).
+    Always sends reset to execution-engine so it works even when UI state was out of sync
+    (e.g. after restart when control-plane showed inactive but execution-engine had it active)."""
+    previous_reason = state.kill_switch_reason
+    previous_time = state.kill_switch_time
+    was_active = state.kill_switch_active
 
-    # Preferred: versioned control request
+    logger.info(f"Kill switch reset requested by {user.name}")
+    audit_logger.info(f"KILL_SWITCH_RESET: user={user.name}, previous_reason='{previous_reason}'")
+    state.kill_switch_active = False
+    state.kill_switch_reason = None
+    state.kill_switch_time = None
+
+    # Preferred: versioned control request (always send so execution-engine resets even when we were out of sync)
     reset_req = {
         **_control_request_header(),
         "request_id": str(uuid.uuid4()),
@@ -1060,8 +1115,9 @@ async def reset_kill_switch(user: User = Depends(require_admin)):
     
     return {
         "status": "kill_switch_reset",
-        "previous_reason": state.kill_switch_reason,
-        "previous_time": state.kill_switch_time.isoformat() if state.kill_switch_time else None,
+        "was_active": was_active,
+        "previous_reason": previous_reason,
+        "previous_time": previous_time.isoformat() if previous_time else None,
     }
 
 @app.post("/command/{component}")

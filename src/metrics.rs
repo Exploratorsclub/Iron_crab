@@ -274,6 +274,11 @@ pub static NATS_ERRORS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 // --- Wallet total (SOL + WSOL combined) ---
 pub static WALLET_TOTAL_SOL_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+// --- Kill switch (execution-engine only; used for /status API) ---
+/// When true: kill switch is active (BUYs blocked). Updated by execution-engine.
+/// Control plane queries this via /status to sync UI display after restarts.
+pub static KILL_SWITCH_ACTIVE: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+
 // --- WsolManager metrics ---
 pub static WSOL_BALANCE_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static WSOL_WRAP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -1484,6 +1489,20 @@ pub async fn serve_metrics(addr: SocketAddr) -> anyhow::Result<()> {
             if path == "/live" {
                 record_activity();
                 return Ok::<_, hyper::Error>(Response::new(Body::from("ok")));
+            }
+            if path == "/status" {
+                // JSON status for control plane (kill switch sync after restarts)
+                record_activity();
+                let active = KILL_SWITCH_ACTIVE.load(Ordering::Relaxed);
+                let json = format!(r#"{{"kill_switch_active":{}}}"#, active);
+                return Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .status(200)
+                        .header("Content-Type", "application/json")
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(Body::from(json))
+                        .unwrap(),
+                );
             }
             if path == "/ready" {
                 let now = SystemTime::now()
