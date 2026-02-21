@@ -62,18 +62,28 @@ grep -h "rejected\|Reject" ~/Iron_crab/trade_logs/decisions/decision_records-$(d
 
 ## Bekannte Code-Ursachen
 
-### A) Custom(11) / Token-2022 CloseAccount bei Teileverkäufen
+### A) Probe+Scale getrennt statt Gesamtposition (Aggregations-Bug)
+
+**Symptom:** SELL-Intent verkauft nur Teil der Position (z.B. required=4.5B bei available=9.5B). Custom(11) oder Reject wegen Teileverkauf.
+
+**Ursache:** Position sollte immer Probe+Scale als Gesamtposition haben. Beim Restart wurde bisher JetStream KV bevorzugt; KV kann veraltet sein (nur nach Probe gespeichert, bevor Scale-In verarbeitet war). JSONL (`execution_results`) summiert korrekt alle BUY-Fills, wurde aber nur als Fallback bei leerem KV genutzt.
+
+**Fix (implementiert):** Beide Quellen werden geladen. JSONL ist maßgeblich für `token_amount` (summiert Probe+Scale). Bei Mints in beiden Quellen wird JSONL verwendet. Stale KV-Einträge werden korrigiert und zurückgeschrieben.
+
+---
+
+### B) Custom(11) / Token-2022 CloseAccount bei Teileverkäufen
 
 **Symptom:** Simulation schlägt fehl mit `UiTransactionError(InstructionError(2, Custom(11)))`. Log:
 `Program log: Error: Non-native account can only be closed if its balance is zero`.
 
-**Ursache:** Das `close_token_ata`-Flag triggert eine CloseAccount-Anweisung nach dem Sell, um Rent (~0.002 SOL) zurückzuholen. CloseAccount schlägt fehl, wenn die ATA noch Token-Restbestand hat (Teileverkauf). Custom(11) = SPL Token `NonNativeHasBalance`.
+**Ursache:** Das `close_token_ata`-Flag triggert eine CloseAccount-Anweisung nach dem Sell. CloseAccount schlägt fehl, wenn die ATA noch Token-Restbestand hat (Teileverkauf). Custom(11) = SPL Token `NonNativeHasBalance`.
 
-**Fix (implementiert):** CloseAccount wird nur noch hinzugefügt, wenn `sell_balance_hint` bestätigt, dass `available == required` (Vollverkauf). Bei Teileverkäufen (z.B. reconcile mit abweichender Position) wird CloseAccount nicht mehr eingebaut.
+**Fix (implementiert):** CloseAccount nur wenn `sell_balance_hint` bestätigt `available == required` (Vollverkauf).
 
 ---
 
-### B) 5-Minuten-Filter in `find_best_sell_pool`
+### C) 5-Minuten-Filter in `find_best_sell_pool`
 
 Pools werden verworfen, wenn `last_updated` älter als 5 Minuten ist:
 
@@ -90,7 +100,7 @@ Wenn der Token nach dem Kauf inaktiv ist (keine neuen Trades), ist `last_updated
 
 ---
 
-### C) Leere `mint_pools`
+### D) Leere `mint_pools`
 
 Falls `mint_pools` für den Mint leer ist:
 - `find_best_sell_pool` bricht mit `No pools known for mint` ab.
@@ -105,7 +115,7 @@ if !pos.pool.is_empty() && !pos.dex.is_empty() { ... } else { continue; }
 
 ---
 
-### D) Fehlende `dex_pool_accounts`
+### E) Fehlende `dex_pool_accounts`
 
 Wenn Pool-Registrierung ohne `dex_pool_accounts` erfolgte (z.B. nur über Trades):
 - `valid.is_empty()` wegen `p.dex_pool_accounts.is_some()`
@@ -117,4 +127,4 @@ Wenn Pool-Registrierung ohne `dex_pool_accounts` erfolgte (z.B. nur über Trades
 
 1. Nach `No pools`, `Failed to generate`, `Multi-pool routing failed` in momentum-bot-Logs suchen.
 2. Rejected-Intents in execution-engine-Logs prüfen.
-3. Bei Bestätigung von B) den 5-Minuten-Filter für TIME_EXIT anpassen.
+3. Bei Bestätigung von C) den 5-Minuten-Filter für TIME_EXIT anpassen.

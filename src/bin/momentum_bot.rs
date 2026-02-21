@@ -4832,86 +4832,95 @@ async fn main() -> Result<()> {
     };
 
     // === P0: Recover open positions ===
-    // Priority: JetStream KV (preferred) -> JSONL fallback (legacy)
+    // FIX: Probe + Scale must be aggregated. JSONL sums ALL BUY fills (probe+scale) from
+    // execution_results. KV can be stale (saved after probe, before scale processed).
+    // Merge: JSONL authoritative for token_amount when available; KV for rest.
     let recovered_positions = {
-        let mut positions = HashMap::new();
-        let mut from_kv = false;
+        let mut kv_positions = HashMap::new();
+        let mut jsonl_positions = HashMap::new();
 
-        // Try JetStream KV first
+        // Load from JetStream KV
         if let Some(ref nats_client) = nats {
-            match nats_client
+            if let Ok(store) = nats_client
                 .get_or_create_kv_bucket(POSITION_KV_BUCKET)
                 .await
             {
-                Ok(store) => match nats_client.kv_get_all::<PersistedPosition>(&store).await {
-                    Ok(persisted_positions) => {
-                        for (mint, persisted) in persisted_positions {
-                            let tracker = persisted.to_tracker();
-                            let hold_secs = tracker.entry_time.elapsed().as_secs();
-                            info!(
-                                mint = %mint,
-                                pool = %tracker.pool,
-                                dex = %tracker.dex,
-                                entry_price = tracker.entry_price,
-                                sol_invested = tracker.sol_invested,
-                                hold_secs = hold_secs,
-                                "🔄 Position recovered from JetStream KV"
-                            );
-                            positions.insert(mint, tracker);
-                        }
-                        if !positions.is_empty() {
-                            from_kv = true;
-                            info!(
-                                recovered = positions.len(),
-                                "✅ Positions recovered from JetStream KV (preferred)"
-                            );
-                        }
+                if let Ok(persisted_positions) =
+                    nats_client.kv_get_all::<PersistedPosition>(&store).await
+                {
+                    for (mint, persisted) in persisted_positions {
+                        kv_positions.insert(mint, persisted.to_tracker());
                     }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to load positions from KV");
+                    if !kv_positions.is_empty() {
+                        info!(
+                            count = kv_positions.len(),
+                            "Loaded positions from JetStream KV"
+                        );
                     }
-                },
-                Err(e) => {
-                    warn!(error = %e, "Failed to get position KV bucket");
+                } else {
+                    warn!("Failed to load positions from KV");
                 }
             }
         }
 
-        // Fallback to JSONL if no KV positions found
-        if !from_kv {
-            info!("No positions in JetStream KV, trying JSONL fallback...");
-            match recover_positions_from_jsonl(&log_dir).await {
-                Ok(jsonl_positions) => {
-                    if !jsonl_positions.is_empty() {
-                        info!(
-                            recovered = jsonl_positions.len(),
-                            "⚠️ Positions recovered from JSONL (legacy fallback)"
-                        );
-                        // Migrate to KV for future restarts
-                        if let Some(ref nats_client) = nats {
-                            if let Ok(store) = nats_client
-                                .get_or_create_kv_bucket(POSITION_KV_BUCKET)
-                                .await
-                            {
-                                for (mint, tracker) in &jsonl_positions {
-                                    let persisted = PersistedPosition::from_tracker(tracker);
-                                    if let Err(e) =
-                                        nats_client.kv_put(&store, mint, &persisted).await
-                                    {
-                                        warn!(mint = %mint, error = %e, "Failed to migrate position to KV");
-                                    }
-                                }
-                                info!(
-                                    "Migrated {} positions from JSONL to JetStream KV",
-                                    jsonl_positions.len()
-                                );
-                            }
-                        }
-                        positions = jsonl_positions;
-                    }
+        // Always try JSONL — sums probe+scale from execution_results (authoritative)
+        match recover_positions_from_jsonl(&log_dir).await {
+            Ok(positions) => {
+                if !positions.is_empty() {
+                    info!(count = positions.len(), "Loaded positions from JSONL (execution records)");
+                    jsonl_positions = positions;
                 }
-                Err(e) => {
-                    warn!(error = %e, "Failed to recover positions from JSONL, starting with empty state");
+            }
+            Err(e) => {
+                debug!(error = %e, "No JSONL recovery (optional merge source)");
+            }
+        }
+
+        // Merge: JSONL authoritative (sums probe+scale from execution_results). KV for mints not in JSONL.
+        let mut positions = HashMap::new();
+        let mut merged_count = 0u32;
+        for (mint, jsonl_tracker) in &jsonl_positions {
+            let tracker = if let Some(kv_tracker) = kv_positions.get(mint) {
+                // Both sources: prefer JSONL — it sums ALL BUY fills (probe+scale).
+                // KV can be stale (saved after probe, before scale was processed).
+                if jsonl_tracker.token_amount > kv_tracker.token_amount {
+                    merged_count += 1;
+                    info!(
+                        mint = %mint,
+                        kv_tokens = kv_tracker.token_amount,
+                        jsonl_tokens = jsonl_tracker.token_amount,
+                        "Probe+Scale merge: JSONL has full amount (KV was probe-only)"
+                    );
+                }
+                jsonl_tracker.clone()
+            } else {
+                jsonl_tracker.clone()
+            };
+            positions.insert(mint.clone(), tracker);
+        }
+        for (mint, kv_tracker) in kv_positions {
+            if !positions.contains_key(&mint) {
+                positions.insert(mint, kv_tracker);
+            }
+        }
+        if merged_count > 0 {
+            info!(merged = merged_count, "Corrected probe-only KV positions using JSONL");
+        }
+
+        // Persist merged state to KV for future restarts
+        if !positions.is_empty() && merged_count > 0 {
+            if let Some(ref nats_client) = nats {
+                if let Ok(store) = nats_client
+                    .get_or_create_kv_bucket(POSITION_KV_BUCKET)
+                    .await
+                {
+                    for (mint, tracker) in &positions {
+                        let persisted = PersistedPosition::from_tracker(tracker);
+                        if let Err(e) = nats_client.kv_put(&store, mint, &persisted).await {
+                            warn!(mint = %mint, error = %e, "Failed to update KV with merged position");
+                        }
+                    }
+                    info!("Updated JetStream KV with merged probe+scale positions");
                 }
             }
         }
