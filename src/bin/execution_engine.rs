@@ -4354,7 +4354,7 @@ async fn main() -> Result<()> {
         let wsol = lock_manager.wsol_balance();
         WALLET_TOTAL_SOL_LAMPORTS.store(total_native_sol.saturating_add(wsol), Ordering::Relaxed);
         info!(
-            available_capital = available_capital as f64 / 1e9,
+            available_wsol = wsol as f64 / 1e9,
             total_sol_wsol = (total_native_sol.saturating_add(wsol)) as f64 / 1e9,
             "Prometheus metrics refreshed after wallet snapshot bootstrap"
         );
@@ -6004,7 +6004,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     }
 
     // Check 3e: SELL token balance preflight (avoid emitting SELL intents we cannot fulfill)
-    if intent.side == TradeSide::Sell {
+    // sell_balance_hint: passed to tx_builder so CloseAccount is only added for full sells.
+    let sell_balance_hint: Option<(u64, u64)> = if intent.side == TradeSide::Sell {
         let mint_str = intent.resources.input_mint.clone();
         let required_raw = intent.required_capital.raw;
 
@@ -6044,7 +6045,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 available_raw, required_raw, mint_str
             )),
         });
-    }
+        Some((available_raw, required_raw))
+    } else {
+        None
+    };
 
     // === P1: Fee/Compute Policy Checks ===
     let mut effective_fee_policy = config.fee_policy.clone();
@@ -6481,6 +6485,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 wallet_pubkey,
                 Arc::clone(&ctx.rpc),
                 ctx.live_pool_cache.as_ref(),
+                sell_balance_hint,
             )
             .await
             {

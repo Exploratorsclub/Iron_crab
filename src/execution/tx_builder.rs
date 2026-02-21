@@ -234,11 +234,14 @@ async fn fetch_orca_from_rpc(
     }
 }
 
+/// Optional hint for SELL: (available_balance_raw, required_amount_raw).
+/// When provided and available != required, CloseAccount is NOT added (partial sell safety).
 pub async fn build_tx_plan(
     intent: &TradeIntent,
     wallet_pubkey: Pubkey,
     rpc: Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
+    sell_balance_hint: Option<(u64, u64)>,
 ) -> TxPlanOutcome {
     // === Multi-hop detection (takes priority over single-hop) ===
     // Multi-hop intents have swap_path with multiple hops for atomic arbitrage
@@ -951,13 +954,18 @@ pub async fn build_tx_plan(
             all_ixs.extend(ixs);
 
             // Close token ATA after full sell to recover rent (~0.002 SOL).
+            // Only when sell_balance_hint confirms full sell (available == required).
+            // Otherwise Custom(11) "Non-native account can only be closed if its balance is zero".
             let close_ata = intent
                 .metadata
                 .get("close_token_ata")
                 .map(|v| v == "true")
                 .unwrap_or(false);
+            let full_sell_verified = sell_balance_hint
+                .map(|(available, required)| available == required)
+                .unwrap_or(false);
 
-            if close_ata {
+            if close_ata && full_sell_verified {
                 let token_mint =
                     Pubkey::from_str(&intent.resources.input_mint).unwrap_or_default();
                 let token_mint_spl = SplProgramPubkey::new_from_array(token_mint.to_bytes());
@@ -1105,15 +1113,18 @@ pub async fn build_tx_plan(
         all_ixs.extend(ixs);
 
         // Close token ATA after full sell to recover rent (~0.002 SOL).
-        // Only when the intent explicitly requests it (full sells from momentum-bot).
-        // The close will fail on-chain if the ATA still has tokens (partial sell safety).
+        // Only when sell_balance_hint confirms full sell (available == required).
+        // Otherwise Token-2022 Custom(11): "Non-native account can only be closed if its balance is zero".
         let close_ata = intent
             .metadata
             .get("close_token_ata")
             .map(|v| v == "true")
             .unwrap_or(false);
+        let full_sell_verified = sell_balance_hint
+            .map(|(available, required)| available == required)
+            .unwrap_or(false);
 
-        if close_ata {
+        if close_ata && full_sell_verified {
             let token_ata_spl =
                 spl_associated_token_account::get_associated_token_address_with_program_id(
                     &payer_spl,
