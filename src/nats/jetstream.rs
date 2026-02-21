@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use async_nats::jetstream;
 use tracing::{info, warn};
 
-use super::TOPIC_WALLET_SNAPSHOT_PATTERN;
+use super::{TOPIC_TRADE_INTENTS, TOPIC_WALLET_SNAPSHOT_PATTERN};
 
 /// JetStream stream name for pool cache updates
 pub const STREAM_NAME: &str = "POOL_CACHE";
@@ -32,6 +32,9 @@ pub const CONFIG_STREAM_NAME: &str = "CONFIG_UPDATES";
 
 /// JetStream stream name for wallet balance snapshots
 pub const WALLET_SNAPSHOT_STREAM_NAME: &str = "WALLET_SNAPSHOT";
+
+/// JetStream stream name for trade intents (persistent, avoids startup race with Core NATS)
+pub const TRADE_INTENTS_STREAM_NAME: &str = "TRADE_INTENTS";
 
 /// Subject pattern for pool cache (subject-per-pool for compaction)
 pub const SUBJECT_PATTERN: &str = "ironcrab.pool_cache.*";
@@ -196,6 +199,46 @@ pub async fn ensure_config_stream(client: &async_nats::Client) -> Result<()> {
     }
 }
 
+/// Create or update the TRADE_INTENTS stream
+///
+/// Persists intents so execution-engine can consume them even when it starts
+/// after momentum_bot (fixes Core NATS fire-and-forget race).
+pub async fn ensure_trade_intents_stream(client: &async_nats::Client) -> Result<()> {
+    let jetstream = jetstream::new(client.clone());
+
+    let stream_config = jetstream::stream::Config {
+        name: TRADE_INTENTS_STREAM_NAME.to_string(),
+        subjects: vec![TOPIC_TRADE_INTENTS.to_string()],
+        retention: jetstream::stream::RetentionPolicy::Limits,
+        max_age: std::time::Duration::from_secs(24 * 60 * 60), // 24h
+        storage: jetstream::stream::StorageType::File,
+        num_replicas: 1,
+        discard: jetstream::stream::DiscardPolicy::Old,
+        ..Default::default() // no max_messages_per_subject — keep all intents
+    };
+
+    match jetstream.get_or_create_stream(stream_config).await {
+        Ok(mut stream) => {
+            let info = stream.info().await?;
+            info!(
+                stream_name = %TRADE_INTENTS_STREAM_NAME,
+                subject = TOPIC_TRADE_INTENTS,
+                num_messages = info.state.messages,
+                "JetStream TRADE_INTENTS stream ready"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                stream_name = %TRADE_INTENTS_STREAM_NAME,
+                error = %e,
+                "Failed to create/update TRADE_INTENTS stream"
+            );
+            Err(e).context("TRADE_INTENTS stream creation failed")
+        }
+    }
+}
+
 /// Get config subject for a specific component
 pub fn config_subject(component: &str) -> String {
     format!("ironcrab.config.{}", component)
@@ -261,6 +304,18 @@ pub fn wallet_snapshot_consumer_config() -> jetstream::consumer::pull::Config {
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
         max_ack_pending: 1000,
         filter_subject: "ironcrab.wallet_snapshot.>".to_string(),
+        ..Default::default()
+    }
+}
+
+/// Consumer config for trade intents (All = includes intents published before we subscribed)
+pub fn trade_intents_consumer_config() -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::All,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        durable_name: Some("execution-engine".to_string()),
+        max_ack_pending: 1000,
+        filter_subject: TOPIC_TRADE_INTENTS.to_string(),
         ..Default::default()
     }
 }

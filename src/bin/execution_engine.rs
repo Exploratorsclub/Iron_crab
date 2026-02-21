@@ -81,10 +81,11 @@ use ironcrab::metrics::{
     TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
 };
 use ironcrab::nats::{
-    config_consumer_config, config_subject, wallet_snapshot_consumer_config,
-    NatsClient, NatsConfig, CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS,
-    TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
-    TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
+    config_consumer_config, config_subject, ensure_trade_intents_stream,
+    wallet_snapshot_consumer_config, NatsClient, NatsConfig, CONFIG_STREAM_NAME, STREAM_NAME,
+    TOPIC_CONTROL_REQUESTS, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
+    TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, TRADE_INTENTS_STREAM_NAME,
+    WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
@@ -4864,15 +4865,43 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Subscribe to TradeIntents if NATS connected
-    let intent_subscription = if let Some(ref nats) = ctx.nats {
-        match nats.subscribe(TOPIC_TRADE_INTENTS).await {
-            Ok(sub) => {
-                info!(topic = TOPIC_TRADE_INTENTS, "Subscribed to TradeIntents");
-                Some(sub)
-            }
+    // Ensure TRADE_INTENTS JetStream stream exists (momentum_bot publishes here)
+    if let Some(ref nats) = ctx.nats {
+        if let Err(e) = ensure_trade_intents_stream(nats.client()).await {
+            warn!(error = %e, "Failed to ensure TRADE_INTENTS stream; intents may be lost");
+        }
+    }
+
+    // JetStream consumer for TradeIntents (persistent, survives startup race)
+    let intent_js_consumer = if let Some(ref nats) = ctx.nats {
+        use async_nats::jetstream;
+        use ironcrab::nats::trade_intents_consumer_config;
+
+        let jetstream = jetstream::new(nats.client().clone());
+        match jetstream.get_stream(TRADE_INTENTS_STREAM_NAME).await {
+            Ok(stream) => match stream
+                .create_consumer(trade_intents_consumer_config())
+                .await
+            {
+                Ok(consumer) => {
+                    info!(
+                        stream = TRADE_INTENTS_STREAM_NAME,
+                        subject = TOPIC_TRADE_INTENTS,
+                        "Subscribed to TradeIntents via JetStream (persistent)"
+                    );
+                    Some(consumer)
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to create trade intents consumer");
+                    None
+                }
+            },
             Err(e) => {
-                warn!(error = %e, "Failed to subscribe to TradeIntents");
+                warn!(
+                    error = %e,
+                    stream = TRADE_INTENTS_STREAM_NAME,
+                    "Failed to get trade intents stream"
+                );
                 None
             }
         }
@@ -5005,20 +5034,42 @@ async fn main() -> Result<()> {
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ControlRequest>(10);
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<ConfigUpdate>(10);
 
-    // Spawn dedicated task for TradeIntents subscription
-    if let Some(mut intent_sub) = intent_subscription {
+    // Spawn dedicated task for TradeIntents JetStream consumer
+    if let Some(intent_consumer) = intent_js_consumer {
         let tx = intent_tx.clone();
         tokio::spawn(async move {
-            while let Some(msg) = intent_sub.next().await {
-                match msg.deserialize::<TradeIntent>() {
-                    Ok(intent) => {
-                        if tx.send(intent).await.is_err() {
-                            warn!("TradeIntent channel closed, stopping subscription");
-                            break;
+            use futures::StreamExt;
+            loop {
+                match intent_consumer
+                    .fetch()
+                    .max_messages(10)
+                    .expires(std::time::Duration::from_secs(5))
+                    .messages()
+                    .await
+                {
+                    Ok(mut messages) => {
+                        while let Some(msg_result) = messages.next().await {
+                            if let Ok(msg) = msg_result {
+                                match serde_json::from_slice::<TradeIntent>(&msg.payload) {
+                                    Ok(intent) => {
+                                        if tx.send(intent).await.is_err() {
+                                            warn!("TradeIntent channel closed, stopping JetStream consumer");
+                                            return;
+                                        }
+                                        if let Err(e) = msg.ack().await {
+                                            warn!(error = %e, "Failed to ack trade intent");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "Failed to deserialize TradeIntent");
+                                        let _ = msg.ack().await;
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(e) => {
-                        warn!(error = %e, "Failed to deserialize TradeIntent");
+                        debug!(error = %e, "JetStream trade intents fetch returned (expected when no new messages)");
                     }
                 }
             }

@@ -52,9 +52,9 @@ use ironcrab::execution::pool_cache_sync;
 use ironcrab::execution::quote_calculator;
 use ironcrab::solana::dex_parser::SOL_MINT_PUBKEY;
 use ironcrab::nats::{
-    config_consumer_config, config_subject, wallet_snapshot_consumer_config, NatsClient,
-    NatsConfig, CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
-    TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
+    config_consumer_config, config_subject, ensure_trade_intents_stream,
+    wallet_snapshot_consumer_config, NatsClient, NatsConfig, CONFIG_STREAM_NAME, STREAM_NAME,
+    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
@@ -4869,6 +4869,10 @@ async fn main() -> Result<()> {
             None
         } else {
             info!(url = %args.nats_url, "Connected to NATS");
+            // Ensure TRADE_INTENTS JetStream stream exists (avoids Core NATS startup race)
+            if let Err(e) = ensure_trade_intents_stream(client.client()).await {
+                warn!(error = %e, "Failed to ensure TRADE_INTENTS stream (intents may be lost)");
+            }
             Some(client)
         }
     };
@@ -5979,15 +5983,15 @@ async fn generate_and_publish_buy_intent(
     // Write to JSONL (P0 requirement)
     ctx.jsonl_writer.write(&intent)?;
 
-    // Publish to NATS
+    // Publish to JetStream (persistent; avoids execution-engine startup race with Core NATS)
     if let Some(ref nats) = ctx.nats {
-        match nats.publish(TOPIC_TRADE_INTENTS, &intent).await {
+        match nats.jetstream_publish(TOPIC_TRADE_INTENTS, &intent).await {
             Ok(true) => {
                 NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
             }
             Ok(false) => {
                 NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                anyhow::bail!("NATS publish dropped/failed topic={}", TOPIC_TRADE_INTENTS);
+                anyhow::bail!("JetStream publish dropped/failed topic={}", TOPIC_TRADE_INTENTS);
             }
             Err(e) => {
                 NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -7060,15 +7064,15 @@ async fn generate_and_publish_exit_intent(
     // Write to JSONL (P0 requirement)
     ctx.jsonl_writer.write(&intent)?;
 
-    // Publish to NATS
+    // Publish to JetStream (persistent; avoids execution-engine startup race with Core NATS)
     if let Some(ref nats) = ctx.nats {
-        match nats.publish(TOPIC_TRADE_INTENTS, &intent).await {
+        match nats.jetstream_publish(TOPIC_TRADE_INTENTS, &intent).await {
             Ok(true) => {
                 NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
             }
             Ok(false) => {
                 NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                anyhow::bail!("NATS publish dropped/failed topic={}", TOPIC_TRADE_INTENTS);
+                anyhow::bail!("JetStream publish dropped/failed topic={}", TOPIC_TRADE_INTENTS);
             }
             Err(e) => {
                 NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
