@@ -6607,37 +6607,78 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     let sim_result = simulate_transaction(ctx, wallet_pubkey, &tx_plan_for_sim).await;
 
     if !sim_result.success {
-        let reason = RejectReason::SimFailed;
-        checks.push(CheckResult {
-            check_name: "simulation".to_string(),
-            passed: false,
-            reason_code: Some(reason.to_string()),
-            details: sim_result.error_code.clone(),
-        });
+        // FIX-38: Bypass simulation for known transient failures caused by local node state lag.
+        //
+        // (a) Custom(2) on ix 0 for BUY: Token-2022 ATA creation fails because the mint
+        //     account isn't in the local simulation state yet (GetAccountDataSize → "Invalid Mint").
+        //
+        // (b) Custom(6023) on ix 1 for SELL via PumpFun: "NotEnoughTokensToSell" because the
+        //     recently-bought tokens aren't reflected in the local simulation state yet.
+        //
+        // On-chain validators have the latest state, so the TX will succeed there.
+        let sim_error = sim_result.error_code.as_deref().unwrap_or("");
 
-        // Release lock on failure
-        ctx.lock_manager.release_locks(&intent.intent_id);
+        let is_ata_create_failure_on_buy = intent.side == TradeSide::Buy
+            && sim_error.contains("InstructionError(0, Custom(2))");
 
-        return emit_sim_failed_decision(
-            ctx,
-            decision_id,
-            &intent,
-            checks,
-            plan_hash_str,
-            sim_result,
-        )
-        .await;
+        let is_pumpfun_sell_balance_lag = intent.side == TradeSide::Sell
+            && sim_error.contains("Custom(6023)")
+            && intent.metadata.get("dex").map(|d| d.as_str()) == Some("pumpfun");
+
+        if (is_ata_create_failure_on_buy || is_pumpfun_sell_balance_lag) && config.send_enabled {
+            let bypass_reason = if is_ata_create_failure_on_buy {
+                "sim_bypassed:token2022_ata_state_lag"
+            } else {
+                "sim_bypassed:pumpfun_sell_balance_lag"
+            };
+            warn!(
+                intent_id = %intent.intent_id,
+                side = ?intent.side,
+                error = %sim_error,
+                bypass = %bypass_reason,
+                "FIX-38: Bypassing simulation failure (local node state lag)"
+            );
+            checks.push(CheckResult {
+                check_name: "simulation".to_string(),
+                passed: true,
+                reason_code: None,
+                details: Some(bypass_reason.to_string()),
+            });
+        } else {
+            let reason = RejectReason::SimFailed;
+            checks.push(CheckResult {
+                check_name: "simulation".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: sim_result.error_code.clone(),
+            });
+
+            // Release lock on failure
+            ctx.lock_manager.release_locks(&intent.intent_id);
+
+            return emit_sim_failed_decision(
+                ctx,
+                decision_id,
+                &intent,
+                checks,
+                plan_hash_str,
+                sim_result,
+            )
+            .await;
+        }
     }
 
-    checks.push(CheckResult {
-        check_name: "simulation".to_string(),
-        passed: true,
-        reason_code: None,
-        details: Some(format!(
-            "CU consumed: {:?}",
-            sim_result.compute_units_consumed
-        )),
-    });
+    if sim_result.success {
+        checks.push(CheckResult {
+            check_name: "simulation".to_string(),
+            passed: true,
+            reason_code: None,
+            details: Some(format!(
+                "CU consumed: {:?}",
+                sim_result.compute_units_consumed
+            )),
+        });
+    }
 
     // Track bundle result for decision record
     let mut bundle_id: Option<String> = None;

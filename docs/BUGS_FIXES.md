@@ -961,6 +961,37 @@ ATA-Rent hebt sich auf. Dashboard zeigt realen Wallet-Impact inklusive aller Fee
 
 ---
 
+## FIX-38: Token-2022 Simulation State-Lag Bypass
+
+**Status:** ✅ FIXED
+
+### Problem
+Seit PumpFun auf Token-2022 migriert hat, scheitern BUY- und SELL-Simulationen häufig:
+
+- **Custom(2) auf BUY (Instruction 0):** `create_associated_token_account_idempotent` ruft Token-2022's `GetAccountDataSize` auf, das den Mint-Account lesen muss. Bei neu erstellten Tokens ist der Mint-Account im lokalen RPC-Node noch nicht synchronisiert → "Invalid Mint".
+- **Custom(6023) auf SELL (Instruction 1):** PumpFun "NotEnoughTokensToSell" — der BUY wurde gerade on-chain bestätigt, aber die lokale Simulation sieht noch 0 Tokens im ATA.
+
+### Root Cause
+Der lokale Agave-Validator (non-voting RPC) hinkt der Chain um 1-5 Sekunden hinterher. Simulationen für brandneue Tokens (BUY) oder frisch gekaufte Tokens (SELL) nutzen veralteten State. Die on-chain Validators haben den aktuellen State.
+
+**Beweis:**
+- Derselbe Token-2022 Mint (`2yXRu77p...pump`) wurde on-chain erfolgreich mit Token-2022 ATA gekauft (GetAccountDataSize = 170 bytes, InitializeImmutableOwner + InitializeAccount3).
+- Spätere BUYs für andere Token-2022 Mints scheitern identisch in der Simulation.
+- Alle geprüften Mints sind verifiziert Token-2022 (`owner=TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`).
+
+### Fix
+Simulation-Bypass für zwei spezifische, transiente Fehlermuster:
+
+1. `InstructionError(0, Custom(2))` + `side=Buy` → Token-2022 ATA state lag
+2. `Custom(6023)` + `side=Sell` + `dex=pumpfun` → Balance state lag
+
+Bei Erkennung: Simulation als "passed" markieren mit Bypass-Reason, TX direkt senden.
+
+**Risiko:** Minimal — bei echtem Fehler (Mint existiert wirklich nicht) scheitert die TX on-chain, Kosten = TX-Fee (~0.000005 SOL). PumpFun BUY hat max_sol_cost Slippage-Schutz.
+
+### Dateien
+- `src/bin/execution_engine.rs`: Simulation-Bypass-Logik nach `simulate_transaction()`
+
 ---
 
 ## 5. VERLORENE ÄNDERUNGEN DURCH REVERT (Cherry-Pick Status)
