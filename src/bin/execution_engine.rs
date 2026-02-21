@@ -4620,6 +4620,37 @@ async fn main() -> Result<()> {
                 dry_run = wsol_config.dry_run,
                 "WsolManager background task started"
             );
+
+            // Seed WsolManager with bootstrap balances so it can wrap immediately.
+            // Without this, WsolManager may never receive WalletBalanceUpdate (ephemeral NATS)
+            // if market-data bootstrapped before execution-engine started.
+            if let Some(ref nats) = ctx.nats {
+                use ironcrab::execution::wsol_manager::WalletBalanceUpdate;
+                use ironcrab::nats::wallet_balance_topic;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let wallet_str = treasury.pubkey().to_string();
+                let sol = ctx.lock_manager.total_native_sol();
+                let wsol = ctx.lock_manager.available_wsol();
+                let update = WalletBalanceUpdate {
+                    header: RecordHeader::new("execution-engine", BUILD_VERSION, &run_id),
+                    wallet: wallet_str.clone(),
+                    sol_lamports: sol,
+                    wsol_lamports: Some(wsol),
+                    slot: 0,
+                };
+                let topic = wallet_balance_topic(&wallet_str);
+                if let Err(e) = nats.publish(&topic, &update).await {
+                    warn!(error = %e, "Failed to publish bootstrap WalletBalanceUpdate for WsolManager");
+                } else {
+                    info!(
+                        sol = sol,
+                        wsol = wsol,
+                        sol_sol = sol as f64 / 1e9,
+                        wsol_sol = wsol as f64 / 1e9,
+                        "Bootstrapped WsolManager with WalletBalanceUpdate from JetStream"
+                    );
+                }
+            }
         } else {
             info!("WsolManager disabled by config");
         }
