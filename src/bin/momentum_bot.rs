@@ -50,6 +50,7 @@ use ironcrab::metrics::{
 use ironcrab::execution::live_pool_cache::LivePoolCache;
 use ironcrab::execution::pool_cache_sync;
 use ironcrab::execution::quote_calculator;
+use ironcrab::solana::dex_parser::SOL_MINT_PUBKEY;
 use ironcrab::nats::{
     config_consumer_config, config_subject, wallet_snapshot_consumer_config, NatsClient,
     NatsConfig, CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
@@ -1866,7 +1867,13 @@ impl MomentumContext {
                     dex = %dex,
                     "Pool auto-registered via trade event"
                 );
-                pool_list.last_mut().unwrap()
+                match pool_list.last_mut() {
+                    Some(pi) => pi,
+                    None => {
+                        error!(mint = %mint, pool = %pool_address, "record_trade: pool_list empty after push (defensive)");
+                        return;
+                    }
+                }
             };
 
             if token_amount > 0 {
@@ -2123,23 +2130,31 @@ impl MomentumContext {
             });
 
             if let Some(expected_sol) = cache_quote {
-                quotes.push((
-                    p.pool_address.clone(),
-                    p.dex.clone(),
-                    p.dex_pool_accounts.clone().unwrap(),
-                    expected_sol,
-                    "cache",
-                ));
+                if let Some(accounts) = p.dex_pool_accounts.clone() {
+                    quotes.push((
+                        p.pool_address.clone(),
+                        p.dex.clone(),
+                        accounts,
+                        expected_sol,
+                        "cache",
+                    ));
+                } else {
+                    warn!(pool = %p.pool_address, "find_best_sell_pool: skipping pool (dex_pool_accounts None, filter mismatch)");
+                }
             } else if let Some(ratio) = p.last_trade_ratio {
                 // Fallback: approximate from last observed trade ratio
-                let expected_sol = (token_amount as f64) * ratio;
-                quotes.push((
-                    p.pool_address.clone(),
-                    p.dex.clone(),
-                    p.dex_pool_accounts.clone().unwrap(),
-                    expected_sol,
-                    "ratio",
-                ));
+                if let Some(accounts) = p.dex_pool_accounts.clone() {
+                    let expected_sol = (token_amount as f64) * ratio;
+                    quotes.push((
+                        p.pool_address.clone(),
+                        p.dex.clone(),
+                        accounts,
+                        expected_sol,
+                        "ratio",
+                    ));
+                } else {
+                    warn!(pool = %p.pool_address, "find_best_sell_pool: skipping pool (dex_pool_accounts None, filter mismatch)");
+                }
             }
         }
 
@@ -2233,10 +2248,7 @@ impl MomentumContext {
         // FIX-21: Quote each pool using RESERVE-BASED calculation from LivePoolCache.
         // For BUY: input = SOL, output = tokens
         // Fallback to last_trade_ratio only when cache has no data.
-        let sol_mint_pubkey = solana_sdk::pubkey::Pubkey::from_str(
-            "So11111111111111111111111111111111111111112",
-        )
-        .unwrap();
+        let sol_mint_pubkey = *SOL_MINT_PUBKEY;
 
         let mut quotes: Vec<(String, String, Vec<String>, f64)> = Vec::new();
         for p in &valid {
@@ -2253,21 +2265,29 @@ impl MomentumContext {
             });
 
             if let Some(expected_tokens) = cache_quote {
-                quotes.push((
-                    p.pool_address.clone(),
-                    p.dex.clone(),
-                    p.dex_pool_accounts.clone().unwrap(),
-                    expected_tokens,
-                ));
-            } else if let Some(ratio) = p.last_trade_ratio {
-                if ratio > 0.0 {
-                    let expected_tokens = (sol_amount as f64) / ratio;
+                if let Some(accounts) = p.dex_pool_accounts.clone() {
                     quotes.push((
                         p.pool_address.clone(),
                         p.dex.clone(),
-                        p.dex_pool_accounts.clone().unwrap(),
+                        accounts,
                         expected_tokens,
                     ));
+                } else {
+                    warn!(pool = %p.pool_address, "find_best_buy_pool: skipping pool (dex_pool_accounts None, filter mismatch)");
+                }
+            } else if let Some(ratio) = p.last_trade_ratio {
+                if ratio > 0.0 {
+                    if let Some(accounts) = p.dex_pool_accounts.clone() {
+                        let expected_tokens = (sol_amount as f64) / ratio;
+                        quotes.push((
+                            p.pool_address.clone(),
+                            p.dex.clone(),
+                            accounts,
+                            expected_tokens,
+                        ));
+                    } else {
+                        warn!(pool = %p.pool_address, "find_best_buy_pool: skipping pool (dex_pool_accounts None, filter mismatch)");
+                    }
                 }
             }
         }
@@ -4521,7 +4541,13 @@ async fn recover_positions_from_jsonl(
         let entry_price = if sol_ui > 0.0 { tok_ui / sol_ui } else { 1.0 };
 
         // Use the EARLIEST BUY for entry time (position open time)
-        let first_exec = execs.first().unwrap();
+        let first_exec = match execs.first() {
+            Some(e) => e,
+            None => {
+                warn!(mint = %mint, "buys_by_mint: execs empty despite guard (defensive skip)");
+                continue;
+            }
+        };
         let entry_time_estimate =
             chrono::DateTime::from_timestamp_millis(first_exec.header.ts_unix_ms as i64)
                 .map(|dt| {
@@ -4974,7 +5000,14 @@ async fn main() -> Result<()> {
         if ctx.nats.is_some() {
             let ctx_clone = Arc::clone(&ctx);
             tokio::spawn(async move {
-                let nats = ctx_clone.nats.as_ref().unwrap();
+                let nats = match ctx_clone.nats.as_ref() {
+                    Some(n) => n,
+                    None => {
+                        warn!("NATS cleared before bootstrap started, skipping pool cache sync");
+                        let _ = tx.send(None);
+                        return;
+                    }
+                };
                 match pool_cache_sync::bootstrap_pool_cache_from_jetstream(nats, &ctx_clone.live_pool_cache).await {
                     Ok((recovered, consumer)) => {
                         info!(pools_recovered = recovered, "MOMENTUM SLAVE CACHE: bootstrap complete (async)");
