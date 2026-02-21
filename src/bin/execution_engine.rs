@@ -3873,7 +3873,9 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
     // Update LockManager with authoritative SOL/WSOL from JetStream
     if bootstrap_sol.is_some() || bootstrap_wsol.is_some() {
         let sol = bootstrap_sol.unwrap_or_else(|| lock_manager.total_native_sol());
-        let wsol = bootstrap_wsol;
+        // If we have SOL but no WSOL in JetStream (e.g. market-data not run yet), assume 0
+        // rather than leaving available_wsol uninitialized (which would show wrong metrics).
+        let wsol = bootstrap_wsol.or(if bootstrap_sol.is_some() { Some(0) } else { None });
         lock_manager.update_wallet_balances(sol, wsol);
         info!(
             wallet = %wallet_str,
@@ -4228,8 +4230,8 @@ async fn main() -> Result<()> {
         "Lock manager initialized with wallet balances"
     );
 
-    // Update metrics with real balance (WSOL if available, else SOL)
-    AVAILABLE_SOL_LAMPORTS.store(initial_wsol.unwrap_or(initial_sol), Ordering::Relaxed);
+    // Grafana "Available WSOL" shows actual WSOL only; 0 when no WSOL ATA exists.
+    AVAILABLE_SOL_LAMPORTS.store(initial_wsol.unwrap_or(0), Ordering::Relaxed);
 
     // P1: Load state snapshot if available (DoD K)
     let snapshot = StateSnapshot::load(log_base.as_path());
@@ -4345,9 +4347,9 @@ async fn main() -> Result<()> {
         {
             warn!(error = %e, "Wallet snapshot bootstrap: failed to seed token balances");
         }
-        // Refresh Prometheus metrics after bootstrap to reflect correct wallet balances
-        let available_capital = lock_manager.available_trading_capital();
-        AVAILABLE_SOL_LAMPORTS.store(available_capital, Ordering::Relaxed);
+        // "Available WSOL" metric: always actual WSOL (0 when no ATA), never native SOL fallback.
+        let wsol = lock_manager.available_wsol();
+        AVAILABLE_SOL_LAMPORTS.store(wsol, Ordering::Relaxed);
         let total_native_sol = lock_manager.total_native_sol();
         let wsol = lock_manager.wsol_balance();
         WALLET_TOTAL_SOL_LAMPORTS.store(total_native_sol.saturating_add(wsol), Ordering::Relaxed);
@@ -5633,8 +5635,6 @@ async fn main() -> Result<()> {
                     let received = ctx.intents_received.load(std::sync::atomic::Ordering::Relaxed);
                     let rejected = ctx.intents_rejected.load(std::sync::atomic::Ordering::Relaxed);
                     let sim_fail = ctx.sim_failures.load(std::sync::atomic::Ordering::Relaxed);
-                    // Use available_trading_capital() which returns WSOL (used for trades)
-                    // Falls back to native SOL if WSOL not yet initialized
                     let available_capital = ctx.lock_manager.available_trading_capital();
 
                     // Update Prometheus metrics
@@ -5644,7 +5644,8 @@ async fn main() -> Result<()> {
                     OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
                     ACTIVE_CAPITAL_LOCKS.store(cap_locks as u64, Ordering::Relaxed);
                     ACTIVE_RESOURCE_LOCKS.store(res_locks as u64, Ordering::Relaxed);
-                    AVAILABLE_SOL_LAMPORTS.store(available_capital, Ordering::Relaxed);
+                    // "Available WSOL" panel: actual WSOL only (0 when no ATA)
+                    AVAILABLE_SOL_LAMPORTS.store(ctx.lock_manager.available_wsol(), Ordering::Relaxed);
 
                     // Wallet total = native SOL (available + locked) + WSOL
                     // Both values come from LockManager (fed by WalletBalanceUpdate events),
@@ -5662,7 +5663,8 @@ async fn main() -> Result<()> {
                         sim_failures = sim_fail,
                         active_capital_locks = cap_locks,
                         active_resource_locks = res_locks,
-                        available_wsol = available_capital,
+                        available_wsol = ctx.lock_manager.available_wsol(),
+                        trading_capital = available_capital,
                         native_sol = total_native_sol,
                         "Execution-engine heartbeat"
                     );

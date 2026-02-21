@@ -1148,7 +1148,9 @@ async fn publish_wallet_snapshot(
                 // Fetch native SOL balance (1 lightweight RPC call during bootstrap)
                 match rpc.rpc.get_balance(wallet).await {
                     Ok(sol_lamports) => {
-                        let wsol_lamports = bootstrap_wsol_balance;
+                        // Always send explicit WSOL: Some(0) when no ATA exists, so WsolManager
+                        // knows to wrap and JetStream doesn't retain stale WSOL from previous runs.
+                        let wsol_lamports = Some(bootstrap_wsol_balance.unwrap_or(0));
 
                         // Seed TrackedWallet so subsequent Geyser events correctly detect changes
                         tracked_wallet
@@ -1211,25 +1213,26 @@ async fn publish_wallet_snapshot(
                                 warn!(error = %e, "Failed to publish native SOL WalletBalanceSnapshot to JetStream");
                             }
 
-                            if let Some(wsol_bal) = wsol_lamports {
-                                let wsol_snapshot = MarketEvent::new(
-                                    "market-data",
-                                    BUILD_VERSION,
-                                    &ctx.run_id,
-                                    "wallet_snapshot_bootstrap_WSOL".to_string(),
-                                    "wallet_bootstrap",
-                                    None,
-                                    MarketEventKind::WalletBalanceSnapshot {
-                                        mint: WSOL_MINT.to_string(),
-                                        balance_raw: wsol_bal,
-                                        decimals: 9,
-                                        token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
-                                    },
-                                );
-                                let wsol_subject = wallet_snapshot_subject(&wallet_str, WSOL_MINT);
-                                if let Err(e) = nats.jetstream_publish(&wsol_subject, &wsol_snapshot).await {
-                                    warn!(error = %e, "Failed to publish WSOL WalletBalanceSnapshot to JetStream");
-                                }
+                            // Always publish WSOL (including 0) so JetStream has authoritative
+                            // state; otherwise LastPerSubject returns stale WSOL from previous runs.
+                            let wsol_bal = wsol_lamports.unwrap_or(0);
+                            let wsol_snapshot = MarketEvent::new(
+                                "market-data",
+                                BUILD_VERSION,
+                                &ctx.run_id,
+                                "wallet_snapshot_bootstrap_WSOL".to_string(),
+                                "wallet_bootstrap",
+                                None,
+                                MarketEventKind::WalletBalanceSnapshot {
+                                    mint: WSOL_MINT.to_string(),
+                                    balance_raw: wsol_bal,
+                                    decimals: 9,
+                                    token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+                                },
+                            );
+                            let wsol_subject = wallet_snapshot_subject(&wallet_str, WSOL_MINT);
+                            if let Err(e) = nats.jetstream_publish(&wsol_subject, &wsol_snapshot).await {
+                                warn!(error = %e, "Failed to publish WSOL WalletBalanceSnapshot to JetStream");
                             }
 
                             info!(
@@ -1898,6 +1901,27 @@ async fn run_geyser_loop(
                             }
                             if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &snapshot).await {
                                 warn!(error = %e, mint = %mint_str, "Failed to publish zero-balance snapshot to Core NATS after SELL");
+                            }
+
+                            // When WSOL ATA was closed, notify WsolManager/LockManager immediately
+                            // so they know WSOL=0 and can wrap. Geyser does NOT send updates for
+                            // closed accounts.
+                            if mint_str == WSOL_MINT {
+                                tracked_wallet.last_wsol_balance.store(0, Ordering::Relaxed);
+                                let sol = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
+                                let wsol_update = WalletBalanceUpdate {
+                                    header: RecordHeader::new("market-data", BUILD_VERSION, run_id),
+                                    wallet: wallet_str.clone(),
+                                    sol_lamports: sol,
+                                    wsol_lamports: Some(0),
+                                    slot: 0,
+                                };
+                                let topic = wallet_balance_topic(&wallet_str);
+                                if let Err(e) = nats.publish(&topic, &wsol_update).await {
+                                    warn!(error = %e, "Failed to publish WalletBalanceUpdate(WSOL=0) after SELL");
+                                } else {
+                                    info!(sol, "WalletBalanceUpdate(WSOL=0) published after SELL (ATA closed)");
+                                }
                             }
                         }
 

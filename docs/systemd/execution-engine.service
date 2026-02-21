@@ -1,6 +1,6 @@
 [Unit]
 Description=IronCrab Execution Engine (Single Signer)
-After=network-online.target nats.service
+After=network-online.target nats.service market-data.service
 Wants=network-online.target
 PartOf=ironcrab.target
 # P1 Crash Isolation: NO hard dependencies - execution-engine runs independently
