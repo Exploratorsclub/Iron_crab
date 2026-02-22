@@ -4329,12 +4329,18 @@ async fn main() -> Result<()> {
                 if reconciled != initial_positions {
                     info!(
                         previous = initial_positions,
-                        reconciled, "Open positions reconciled from wallet snapshot"
+                        reconciled,
+                        "Open positions reconciled from wallet snapshot"
                     );
                 }
                 initial_positions = reconciled;
             }
-            Ok(None) => {}
+            Ok(None) => {
+                info!(
+                    persisted = initial_positions,
+                    "Wallet snapshot bootstrap: no JetStream data (market-data may start after execution-engine); using persisted open_positions"
+                );
+            }
             Err(e) => {
                 warn!(error = %e, "Wallet snapshot bootstrap failed (keeping persisted open_positions)");
             }

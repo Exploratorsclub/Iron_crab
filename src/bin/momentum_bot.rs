@@ -3100,21 +3100,38 @@ impl MomentumContext {
         }
 
         for candidate in candidates {
-            let reason = match candidate.last_exit_age_secs {
-                Some(age) => format!(
-                    "Timed exit reconcile: hold={}s, last_exit_age={}s",
-                    candidate.hold_secs, age
-                ),
-                None => format!("Timed exit reconcile: hold={}s", candidate.hold_secs),
+            // FIX: Call should_exit to get actual exit type (STOP_LOSS/TAKE_PROFIT) instead of
+            // always TIME_EXIT. Dashboard then shows correct reason for high-loss exits.
+            let config = self.config.read().clone();
+            let (exit_type, reason) = {
+                let mut positions = self.positions.write();
+                if let Some(pos) = positions.get_mut(&candidate.mint) {
+                    pos.should_exit(&config).unwrap_or_else(|| {
+                        (
+                            "TIME_EXIT".to_string(),
+                            match candidate.last_exit_age_secs {
+                                Some(age) => format!(
+                                    "Timed exit reconcile: hold={}s, last_exit_age={}s",
+                                    candidate.hold_secs, age
+                                ),
+                                None => format!("Timed exit reconcile: hold={}s", candidate.hold_secs),
+                            },
+                        )
+                    })
+                } else {
+                    // Position removed, skip
+                    continue;
+                }
             };
 
             info!(
                 mint = %candidate.mint,
                 pool = %candidate.pool,
                 dex = %candidate.dex,
+                exit_type = %exit_type,
                 hold_secs = candidate.hold_secs,
                 last_exit_age_secs = candidate.last_exit_age_secs,
-                "♻️  Retrying timed exit"
+                "♻️  Retrying exit (reconcile)"
             );
 
             if let Err(e) = generate_and_publish_exit_intent(
@@ -3122,7 +3139,7 @@ impl MomentumContext {
                 &candidate.mint,
                 &candidate.pool,
                 &candidate.dex,
-                "TIME_EXIT",
+                &exit_type,
                 &reason,
                 candidate.token_amount,
             )
@@ -5510,16 +5527,31 @@ async fn main() -> Result<()> {
                                         if let Ok(update) = serde_json::from_slice::<ironcrab::ipc::PoolCacheUpdate>(&msg.payload) {
                                             pool_cache_sync::apply_pool_cache_update(&ctx.live_pool_cache, &update);
                                             // FIX-30a: Update position price from pool reserves
+                                            // tokens_per_sol = token_amount / sol_amount (higher = cheaper token)
+                                            // Convention: base=token, quote=SOL. If base=SOL (inverted DEX convention),
+                                            // swap so we always compute token/sol for the position's token.
                                             if update.base_reserve > 0 && update.quote_reserve > 0 {
-                                                let decimals = ctx.mint_infos.read()
-                                                    .get(&update.base_mint)
-                                                    .map(|m| m.decimals)
-                                                    .unwrap_or(6);
-                                                let base_ui = update.base_reserve as f64 / 10f64.powi(decimals as i32);
-                                                let quote_ui = update.quote_reserve as f64 / 1_000_000_000.0;
-                                                if quote_ui > 0.0 {
-                                                    let tokens_per_sol = base_ui / quote_ui;
-                                                    ctx.update_position_price(&update.base_mint, tokens_per_sol, None);
+                                                const SOL_WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+                                                let (token_mint, token_reserve, sol_reserve, token_decimals) = if update.base_mint == SOL_WSOL_MINT {
+                                                    // Base is SOL → quote is token. tokens_per_sol = quote/base.
+                                                    let decimals = ctx.mint_infos.read()
+                                                        .get(&update.quote_mint)
+                                                        .map(|m| m.decimals)
+                                                        .unwrap_or(6);
+                                                    (update.quote_mint.clone(), update.quote_reserve, update.base_reserve, decimals)
+                                                } else {
+                                                    // Normal: base is token, quote is SOL.
+                                                    let decimals = ctx.mint_infos.read()
+                                                        .get(&update.base_mint)
+                                                        .map(|m| m.decimals)
+                                                        .unwrap_or(6);
+                                                    (update.base_mint.clone(), update.base_reserve, update.quote_reserve, decimals)
+                                                };
+                                                let token_ui = token_reserve as f64 / 10f64.powi(token_decimals as i32);
+                                                let sol_ui = sol_reserve as f64 / 1_000_000_000.0;
+                                                if sol_ui > 0.0 {
+                                                    let tokens_per_sol = token_ui / sol_ui;
+                                                    ctx.update_position_price(&token_mint, tokens_per_sol, None);
                                                 }
                                             }
                                             msg_count += 1;

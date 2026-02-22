@@ -15,6 +15,7 @@
 ```rust
 // FIX-36: Skip SOL/WSOL — they're the quote currency, not tradeable positions
 if mint == SOL_MINT
+    || mint == WSOL_MINT
     || mint == "NATIVE_SOL"
     || mint == "11111111111111111111111111111111"
 {
