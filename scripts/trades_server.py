@@ -96,13 +96,14 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
         
         # Compute running PnL.
         #
-        # BUY cost: abs(wallet_delta) — total SOL leaving (swap + fees + ATA rent)
+        # BUY cost: PREFER value_sol (fill_in = actual SOL spent on swap). Fallback: abs(wallet_delta).
+        #   For BUY with WSOL: wallet_delta = native SOL only (rent/fees), NOT swap amount.
+        #   Using value_sol ensures consistency with SELL (both use fills).
         #
         # SELL proceeds: PREFER value_sol (fill_out) over wallet_delta!
-        # For PumpSwap/PumpFun SELL: output is WSOL (token), NOT native SOL. wallet_delta
-        # only shows rent refund - fees (~0.002), NOT the actual swap proceeds. Using
-        # wallet_delta as proceeds would show false losses for TAKE_PROFIT trades.
-        # value_sol = fill_out = actual SOL/WSOL received from swap.
+        #   For PumpSwap/PumpFun SELL: output is WSOL (token), NOT native SOL. wallet_delta
+        #   only shows rent refund - fees (~0.002), NOT the actual swap proceeds.
+        # value_sol = fill_in (BUY) or fill_out (SELL) = actual swap amount.
         # PnL = proceeds - proportional_cost
         trades.sort(key=lambda t: t.get('timestamp_ms', 0))
         positions = {}
@@ -117,9 +118,12 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 continue
 
             if action == "BUY":
-                # Cost: wallet_delta (total SOL spent including fees + ATA rent)
-                cost_sol = abs(wallet_delta) if wallet_delta is not None else value_sol
-                if cost_sol is None:
+                # Cost: PREFER value_sol (fill_in) — actual swap amount. For WSOL BUY,
+                # wallet_delta ≠ swap amount (only rent/fees). Fallback: abs(wallet_delta).
+                cost_sol = value_sol if (value_sol is not None and value_sol > 0) else None
+                if cost_sol is None and wallet_delta is not None:
+                    cost_sol = abs(wallet_delta)
+                if cost_sol is None or cost_sol <= 0:
                     continue
                 pos = positions.get(mint_full, {"tokens": 0.0, "cost_sol": 0.0})
                 pos["tokens"] += amount_tokens
@@ -222,8 +226,11 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 continue
 
             if action == "BUY":
-                cost_sol = abs(wallet_delta) if wallet_delta is not None else value_sol
-                if cost_sol is None:
+                # Cost: PREFER value_sol (fill_in) — actual swap amount
+                cost_sol = value_sol if (value_sol is not None and value_sol > 0) else None
+                if cost_sol is None and wallet_delta is not None:
+                    cost_sol = abs(wallet_delta)
+                if cost_sol is None or cost_sol <= 0:
                     continue
                 pos = positions.get(mint_full, {"tokens": 0.0, "cost_sol": 0.0})
                 pos["tokens"] += amount_tokens
@@ -328,8 +335,11 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 continue
 
             if action == "BUY":
-                cost_sol = abs(wallet_delta) if wallet_delta is not None else value_sol
-                if cost_sol is None:
+                # Cost: PREFER value_sol (fill_in) — actual swap amount
+                cost_sol = value_sol if (value_sol is not None and value_sol > 0) else None
+                if cost_sol is None and wallet_delta is not None:
+                    cost_sol = abs(wallet_delta)
+                if cost_sol is None or cost_sol <= 0:
                     continue
                 pos = positions.get(mint_full, {"tokens": 0.0, "cost_sol": 0.0})
                 pos["tokens"] += amount_tokens

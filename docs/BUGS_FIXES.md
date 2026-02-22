@@ -1051,6 +1051,45 @@ SELL `proceeds_sol` nutzt jetzt **value_sol (fill_out)** als primäre Quelle —
 
 ---
 
+## FIX-43: Momentum falscher TAKE_PROFIT — current_price von falschem Pool
+
+**Status:** ✅ FIXED  
+**Datum:** 2026-02-23
+
+### Problem
+Der Momentum-Bot triggert TAKE_PROFIT mit „+173 % gain“, aber der tatsächliche Verkauf on-chain ergibt Verlust. Der Bot nutzt die falsche Preisquelle für `current_price`.
+
+### Root Cause
+`current_price` wurde aus **allen** Pools aktualisiert, die den Token enthalten: PoolCacheUpdates und Trade-Events von Meteora, PumpSwap, etc. Wir kaufen auf PumpFun-Bonding-Curve — ein anderer Pool mit abweichendem Preis liefert fälschlich hohe „Gewinne“ und triggert TAKE_PROFIT.
+
+### Fix
+`update_position_price_from_pool(mint, pool, new_price)` — Preis nur updaten, wenn `pos.pool == pool`. PoolCacheUpdate- und Trade-Handler nutzen diese gefilterte Variante.
+
+### Dateien
+- `src/bin/momentum_bot.rs`: `update_position_price_from_pool()`, PoolCacheUpdate- und Trade-Handler
+
+---
+
+## FIX-42: TAKE_PROFIT falsche Verluste (Dashboard) — BUY cost nutzte wallet_delta statt fill_in
+
+**Status:** ✅ FIXED  
+**Datum:** 2026-02-23
+
+### Problem
+TAKE_PROFIT-Trades zeigten weiterhin fälschlich hohe Verluste (z.B. -64 %), obwohl der Bot „+173 % gain“ meldete. FIX-39 hatte nur SELL proceeds auf value_sol umgestellt; BUY cost nutzte weiterhin wallet_delta.
+
+### Root Cause
+Asymmetrie: BUY cost = wallet_delta (native SOL), SELL proceeds = value_sol (fill_out). Bei WSOL-BUYs misst wallet_delta nicht den Swap-Betrag (nur Rent/Fees) → falsche Cost-Basis → systematische PnL-Fehler.
+
+### Fix
+BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap verwendete SOL/WSOL-Menge. wallet_delta nur als Fallback. BUY und SELL verwenden damit konsistent die Fills.
+
+### Dateien
+- `scripts/trades_server.py`: BUY cost = value_sol (fill_in) bevorzugt in allen 3 PnL-Blöcken
+- `docs/TAKE_PROFIT_PNL_ANALYSIS_20260223.md`: Analyse
+
+---
+
 ## 5. VERLORENE ÄNDERUNGEN DURCH REVERT (Cherry-Pick Status)
 
 | Priorität | Beschreibung | Status |

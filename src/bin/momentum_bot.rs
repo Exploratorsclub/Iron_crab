@@ -2744,7 +2744,7 @@ impl MomentumContext {
         });
     }
 
-    /// Update position price from market trade
+    /// Update position price from market trade (any pool).
     fn update_position_price(&self, mint: &str, new_price: f64, trade: Option<TradeEvent>) {
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(mint) {
@@ -2752,6 +2752,29 @@ impl MomentumContext {
             if let Some(t) = trade {
                 pos.record_trade(t);
             }
+        }
+    }
+
+    /// Update position price ONLY when the update originates from the SAME pool we hold.
+    /// FIX-43: Using price from a different pool (e.g. Meteora) when we bought on PumpFun
+    /// causes false TAKE_PROFIT triggers — we think we have +173% gain, but the actual
+    /// sell on our pool yields a loss.
+    fn update_position_price_from_pool(
+        &self,
+        mint: &str,
+        pool: &str,
+        new_price: f64,
+        trade: Option<TradeEvent>,
+    ) {
+        let mut positions = self.positions.write();
+        if let Some(pos) = positions.get_mut(mint) {
+            if pos.pool == pool {
+                pos.update_price(new_price);
+                if let Some(t) = trade {
+                    pos.record_trade(t);
+                }
+            }
+            // Skip update from wrong pool — different pool = different price/market
         }
     }
 
@@ -5593,7 +5616,12 @@ async fn main() -> Result<()> {
                                                 let sol_ui = sol_reserve as f64 / 1_000_000_000.0;
                                                 if sol_ui > 0.0 {
                                                     let tokens_per_sol = token_ui / sol_ui;
-                                                    ctx.update_position_price(&token_mint, tokens_per_sol, None);
+                                                    ctx.update_position_price_from_pool(
+                                                        &token_mint,
+                                                        &update.pool_address,
+                                                        tokens_per_sol,
+                                                        None,
+                                                    );
                                                 }
                                             }
                                             msg_count += 1;
@@ -7384,7 +7412,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
 
             // Update open position price estimate (tokens_UI per SOL_UI) based on trade ratio.
             // CRITICAL: Use UI-normalized amounts (raw / 10^decimals) to match entry_price units.
-            // Without this, PnL is off by 10^decimals (e.g. 10^6 → false +100M% gain).
+            // FIX-43: Only update from SAME pool — trades on other pools have different prices.
             if sol_lamports > 0 && token_raw > 0 {
                 let token_decimals = ctx.mint_infos.read().get(mint).map(|m| m.decimals).unwrap_or(6);
                 let tok_ui = token_raw as f64 / 10f64.powi(token_decimals as i32);
@@ -7398,7 +7426,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     token_amount: token_raw,
                     signature: sig.clone(),
                 };
-                ctx.update_position_price(mint, tokens_per_sol, Some(trade));
+                ctx.update_position_price_from_pool(mint, pool_address, tokens_per_sol, Some(trade));
             }
 
             if is_dev {
