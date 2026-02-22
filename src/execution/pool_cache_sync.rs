@@ -27,11 +27,50 @@ use crate::execution::live_pool_cache::{
 use crate::ipc::{PoolCacheUpdate, PoolCacheUpdateType};
 use crate::nats::{slave_consumer_config, NatsClient, STREAM_NAME};
 
+/// Extract base_reserve and quote_reserve from CachedPoolState (for merge logic).
+fn extract_reserves(state: &CachedPoolState) -> (u64, u64) {
+    match state {
+        CachedPoolState::Orca(s) => (
+            s.vault_a_balance.unwrap_or(0),
+            s.vault_b_balance.unwrap_or(0),
+        ),
+        CachedPoolState::RaydiumAmm(s) => (
+            s.coin_reserve.unwrap_or(0),
+            s.pc_reserve.unwrap_or(0),
+        ),
+        CachedPoolState::RaydiumCpmm(s) => (
+            s.reserve_0.unwrap_or(0),
+            s.reserve_1.unwrap_or(0),
+        ),
+        CachedPoolState::Meteora(s) => (
+            s.reserve_x_balance.unwrap_or(0),
+            s.reserve_y_balance.unwrap_or(0),
+        ),
+        CachedPoolState::PumpAmm(s) => (
+            s.base_reserve.unwrap_or(0),
+            s.quote_reserve.unwrap_or(0),
+        ),
+        CachedPoolState::PumpFun(s) => (s.virtual_token_reserves, s.virtual_sol_reserves),
+        CachedPoolState::MeteoraCpmm(_) => (0, 0),
+    }
+}
+
 /// Build minimal CachedPoolState from PoolCacheUpdate (for JetStream bootstrap/sync)
 ///
 /// Since PoolCacheUpdate only contains reserves (not full account data), we create
 /// minimal state structures. Full account updates from Geyser will refresh these later.
+///
+/// Use `base_reserve` and `quote_reserve` when provided (for merge); otherwise uses update values.
 pub fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, CachedPoolState)> {
+    build_minimal_pool_state_with_reserves(update, update.base_reserve, update.quote_reserve)
+}
+
+/// Build minimal state with explicit reserves (used for BalanceUpdated merge).
+fn build_minimal_pool_state_with_reserves(
+    update: &PoolCacheUpdate,
+    base_reserve: u64,
+    quote_reserve: u64,
+) -> Option<(Pubkey, CachedPoolState)> {
     let pool_addr = Pubkey::from_str(&update.pool_address).ok()?;
     let base_mint = Pubkey::from_str(&update.base_mint).ok()?;
     let quote_mint = Pubkey::from_str(&update.quote_mint).ok()?;
@@ -49,8 +88,8 @@ pub fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, Cac
             fee_rate: 0,
             protocol_fee_rate: 0,
             tick_spacing: 0,
-            vault_a_balance: Some(update.base_reserve),
-            vault_b_balance: Some(update.quote_reserve),
+            vault_a_balance: Some(base_reserve),
+            vault_b_balance: Some(quote_reserve),
             token_a_program: None,
             token_b_program: None,
         }),
@@ -84,8 +123,8 @@ pub fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, Cac
                 pc_vault: Pubkey::default(),
                 base_decimals: 0,
                 quote_decimals: 0,
-                coin_reserve: Some(update.base_reserve),
-                pc_reserve: Some(update.quote_reserve),
+                coin_reserve: Some(base_reserve),
+                pc_reserve: Some(quote_reserve),
                 market_id,
                 serum_bids,
                 serum_asks,
@@ -97,8 +136,8 @@ pub fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, Cac
             token_1_mint: quote_mint,
             token_0_vault: Pubkey::default(),
             token_1_vault: Pubkey::default(),
-            reserve_0: Some(update.base_reserve),
-            reserve_1: Some(update.quote_reserve),
+            reserve_0: Some(base_reserve),
+            reserve_1: Some(quote_reserve),
         }),
         "meteora_cpmm" | "meteora_dlmm" => CachedPoolState::Meteora(MeteoraState {
             token_x_mint: base_mint,
@@ -107,8 +146,8 @@ pub fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, Cac
             reserve_y: Pubkey::default(),
             active_id: 0,
             bin_step: 0,
-            reserve_x_balance: Some(update.base_reserve),
-            reserve_y_balance: Some(update.quote_reserve),
+            reserve_x_balance: Some(base_reserve),
+            reserve_y_balance: Some(quote_reserve),
         }),
         "pump_amm" => {
             let creator = update
@@ -133,8 +172,8 @@ pub fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, Cac
                 quote_mint,
                 pool_base_token_account: Pubkey::default(),
                 pool_quote_token_account: Pubkey::default(),
-                base_reserve: Some(update.base_reserve),
-                quote_reserve: Some(update.quote_reserve),
+                base_reserve: Some(base_reserve),
+                quote_reserve: Some(quote_reserve),
                 pool_accounts,
                 creator,
             })
@@ -188,8 +227,8 @@ pub fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, Cac
                 token_mint: base_mint,
                 bonding_curve: pool_addr,
                 associated_bonding_curve,
-                virtual_sol_reserves: update.quote_reserve,
-                virtual_token_reserves: update.base_reserve,
+                virtual_sol_reserves: quote_reserve,
+                virtual_token_reserves: base_reserve,
                 real_sol_reserves,
                 real_token_reserves,
                 complete,
@@ -207,15 +246,47 @@ pub fn build_minimal_pool_state(update: &PoolCacheUpdate) -> Option<(Pubkey, Cac
 
 /// Apply a single PoolCacheUpdate to a LivePoolCache.
 ///
+/// For BalanceUpdated: merges partial updates (one vault at a time) with existing cache state.
+/// If the update has only base or only quote (the other is 0), we preserve the existing value
+/// for the other reserve to avoid "out=0" quote failures (e.g. meteora: missing reserves).
+///
 /// Returns true if the cache was modified.
 pub fn apply_pool_cache_update(
     cache: &LivePoolCache,
     update: &PoolCacheUpdate,
 ) -> bool {
     match update.update_type {
-        PoolCacheUpdateType::PoolDiscovered | PoolCacheUpdateType::BalanceUpdated => {
+        PoolCacheUpdateType::PoolDiscovered => {
             if let Some((pool_addr, minimal_state)) = build_minimal_pool_state(update) {
                 cache.upsert(pool_addr, minimal_state, update.geyser_slot);
+                return true;
+            }
+        }
+        PoolCacheUpdateType::BalanceUpdated => {
+            let pool_addr = match Pubkey::from_str(&update.pool_address) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            let (base_reserve, quote_reserve) = if let Some(existing) = cache.get(&pool_addr) {
+                let (eb, eq) = extract_reserves(&existing);
+                let base = if update.base_reserve > 0 {
+                    update.base_reserve
+                } else {
+                    eb
+                };
+                let quote = if update.quote_reserve > 0 {
+                    update.quote_reserve
+                } else {
+                    eq
+                };
+                (base, quote)
+            } else {
+                (update.base_reserve, update.quote_reserve)
+            };
+            if let Some((addr, minimal_state)) =
+                build_minimal_pool_state_with_reserves(update, base_reserve, quote_reserve)
+            {
+                cache.upsert(addr, minimal_state, update.geyser_slot);
                 return true;
             }
         }

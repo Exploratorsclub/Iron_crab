@@ -5525,6 +5525,37 @@ async fn main() -> Result<()> {
                             if let Err(e) = ctx.save_state() {
                                 warn!(error = %e, "Failed to persist state after kill switch reset");
                             }
+
+                            // Publish WalletBalanceUpdate so WsolManager runs check_and_act immediately.
+                            // Without this, WsolManager only reacts on the next Geyser-driven update (after a trade).
+                            if let (Some(ref nats), Some(ref treasury)) = (&ctx.nats, &ctx.treasury) {
+                                use ironcrab::execution::wsol_manager::WalletBalanceUpdate;
+                                use ironcrab::nats::wallet_balance_topic;
+                                let wallet_str = treasury.pubkey().to_string();
+                                let sol = ctx.lock_manager.total_native_sol();
+                                let wsol = ctx.lock_manager.available_wsol();
+                                let update = WalletBalanceUpdate {
+                                    header: RecordHeader::new(
+                                        "execution-engine",
+                                        BUILD_VERSION,
+                                        &ctx.run_id,
+                                    ),
+                                    wallet: wallet_str.clone(),
+                                    sol_lamports: sol,
+                                    wsol_lamports: Some(wsol),
+                                    slot: 0,
+                                };
+                                let topic = wallet_balance_topic(&wallet_str);
+                                if let Err(e) = nats.publish(&topic, &update).await {
+                                    warn!(error = %e, "Failed to publish WalletBalanceUpdate after kill switch reset");
+                                } else {
+                                    info!(
+                                        sol = sol as f64 / 1e9,
+                                        wsol = wsol as f64 / 1e9,
+                                        "Published WalletBalanceUpdate after kill switch reset (WsolManager can wrap now)"
+                                    );
+                                }
+                            }
                         }
                         ControlRequestKind::BurnTokenAccounts { owner_pubkey, token_accounts, close_accounts, reason } => {
                             ExecutionContext::run_manual_burn_job(
@@ -7477,8 +7508,12 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         }
     }
 
-    // Dashboard alignment: count executions only when we have a confirmed on-chain outcome.
-    if matches!(decision.outcome, DecisionOutcome::Confirmed) {
+    // Dashboard alignment: count executions when we have an on-chain outcome (success or failed).
+    // FailedConfirmed = TX was sent and confirmed on-chain but failed (e.g. slippage).
+    if matches!(
+        decision.outcome,
+        DecisionOutcome::Confirmed | DecisionOutcome::FailedConfirmed
+    ) {
         INTENTS_EXECUTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 
         // Update execution-engine's own open_positions counter.

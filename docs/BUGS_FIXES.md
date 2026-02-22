@@ -994,6 +994,45 @@ Bei Erkennung: Simulation als "passed" markieren mit Bypass-Reason, TX direkt se
 
 ---
 
+## FIX-40: INTENTS_EXECUTED nur Confirmed + WsolManager erst nach Trade
+
+**Status:** ✅ FIXED
+
+### Problem 1: Keine "executed" Intents bei Slippage-TX
+TX on-chain mit Slippage = `FailedConfirmed`. `INTENTS_EXECUTED_TOTAL` zählte nur `Confirmed`, nicht `FailedConfirmed`.
+
+### Problem 2: WsolManager wickelt erst nach dem ersten Trade
+WsolManager ist event-getrieben und führt `check_and_act()` nur bei `WalletBalanceUpdate`-NATS-Nachricht aus. Nach Killswitch-Reset wurde keine WalletBalanceUpdate gesendet → WsolManager wartet auf die nächste Geyser-Update (nach Trade) → keine WSOL vor dem ersten Trade.
+
+### Fix
+1. `INTENTS_EXECUTED_TOTAL`: Zählt jetzt `Confirmed` **und** `FailedConfirmed` (TX on-chain = executed).
+2. Bei `ResetKillSwitch`: Publish `WalletBalanceUpdate` mit aktuellen LockManager-Balances an `wallet_balance_topic` → WsolManager erhält sofort Trigger und kann wrap.
+
+### Dateien
+- `src/bin/execution_engine.rs`: INTENTS_EXECUTED_TOTAL-Logik; WalletBalanceUpdate bei ResetKillSwitch
+- `docs/INTENTS_EXECUTED_AND_WSOL_KILLSWITCH_ANALYSIS.md`: Analyse
+
+---
+
+## FIX-41: Meteora DLMM „out=0“ / BalanceUpdated partielle Updates überschreiben Reserves
+
+**Status:** ✅ FIXED  
+**Datum:** 2026-02-22
+
+### Problem
+Quote-Berechnung schlug fehl mit `meteora: missing reserves (in=19892667585, out=0)`. Der SLAVE LivePoolCache erhielt `PoolCacheUpdate::BalanceUpdated` mit nur einem Vault (base oder quote); der andere Wert war 0. Durch vollständiges Ersetzen des Pool-States wurde die andere Reserve mit 0 überschrieben → Quote-Calculator bekam `out=0`.
+
+### Root Cause
+market-data publiziert BalanceUpdated, wenn ein einzelnes Vault ein Geyser-Update erhält. Wenn das andere Vault noch nicht aktualisiert wurde, steht in `tracked_vaults` dafür `last_balance=0`. Das ergibt partielle Updates `(base, 0)` oder `(0, quote)`. `apply_pool_cache_update` hat den kompletten Pool-State ersetzt statt zu mergen.
+
+### Fix
+Bei `BalanceUpdated`: Vor dem Upsert mit dem bestehenden Cache-Stand mergen. Wenn `update.base_reserve > 0` und `update.quote_reserve == 0`, wird der bestehende `quote_reserve` aus dem Cache beibehalten (und umgekehrt). So wird kein bekannter Wert mit 0 überschrieben.
+
+### Dateien
+- `src/execution/pool_cache_sync.rs`: `extract_reserves()`, `build_minimal_pool_state_with_reserves()`, Merge-Logik in `apply_pool_cache_update()`
+
+---
+
 ## FIX-39: TAKE_PROFIT Dashboard PnL invertiert (SELL proceeds falsch)
 
 **Status:** ✅ FIXED
