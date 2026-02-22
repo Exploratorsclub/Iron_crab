@@ -71,6 +71,27 @@ use sd_notify::NotifyState;
 /// Build version for decision records
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// #region agent log
+fn dbg_log(location: &str, message: &str, data: serde_json::Value, hypothesis_id: &str) {
+    if let Ok(path) = std::env::current_dir().map(|p| p.join("debug-79f8ff.log")) {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let payload = serde_json::json!({
+            "sessionId": "79f8ff",
+            "id": format!("log_{}_x", ts),
+            "timestamp": ts,
+            "location": location,
+            "message": message,
+            "data": data,
+            "hypothesisId": hypothesis_id
+        });
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", payload);
+        }
+    }
+}
+// #endregion
+
 #[derive(Parser, Debug)]
 #[command(name = "momentum-bot")]
 #[command(about = "IronCrab Strategy Plane – Momentum policy and TradeIntent generation")]
@@ -675,6 +696,22 @@ impl PositionTracker {
 
         // 2. Take Profit - lock in gains
         if pnl >= config.take_profit_pct {
+            // #region agent log
+            dbg_log(
+                "momentum_bot.rs:should_exit_TAKE_PROFIT",
+                "TAKE_PROFIT trigger - capturing pnl inputs",
+                serde_json::json!({
+                    "mint": self.mint,
+                    "entry_price": self.entry_price,
+                    "current_price": self.current_price,
+                    "highest_price": self.highest_price,
+                    "pnl_pct": pnl,
+                    "take_profit_pct": config.take_profit_pct,
+                    "ratio_entry_over_current": self.entry_price / self.current_price
+                }),
+                "H-ALL",
+            );
+            // #endregion
             // DIAG: info-level for forensic PnL debugging (entry/current mismatch → inversion)
             info!(
                 mint = %self.mint,
@@ -2744,7 +2781,7 @@ impl MomentumContext {
         });
     }
 
-    /// Update position price from market trade (any pool).
+    /// Update position price from market trade or pool reserves.
     fn update_position_price(&self, mint: &str, new_price: f64, trade: Option<TradeEvent>) {
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(mint) {
@@ -2752,29 +2789,6 @@ impl MomentumContext {
             if let Some(t) = trade {
                 pos.record_trade(t);
             }
-        }
-    }
-
-    /// Update position price ONLY when the update originates from the SAME pool we hold.
-    /// FIX-43: Using price from a different pool (e.g. Meteora) when we bought on PumpFun
-    /// causes false TAKE_PROFIT triggers — we think we have +173% gain, but the actual
-    /// sell on our pool yields a loss.
-    fn update_position_price_from_pool(
-        &self,
-        mint: &str,
-        pool: &str,
-        new_price: f64,
-        trade: Option<TradeEvent>,
-    ) {
-        let mut positions = self.positions.write();
-        if let Some(pos) = positions.get_mut(mint) {
-            if pos.pool == pool {
-                pos.update_price(new_price);
-                if let Some(t) = trade {
-                    pos.record_trade(t);
-                }
-            }
-            // Skip update from wrong pool — different pool = different price/market
         }
     }
 
@@ -3605,6 +3619,21 @@ impl MomentumContext {
                                     .filter(|tp| !tp.is_empty())
                             });
 
+                        // #region agent log
+                        dbg_log(
+                            "momentum_bot.rs:open_position",
+                            "BUY CONFIRMED opening position",
+                            serde_json::json!({
+                                "mint": pending.mint,
+                                "entry_price": entry_price,
+                                "sol_ui_for_price": sol_ui_for_price,
+                                "tok_ui": tok_ui,
+                                "fill_in_raw": result.fill_in.as_ref().map(|a| a.raw),
+                                "fill_out_raw": result.fill_out.as_ref().map(|a| a.raw)
+                            }),
+                            "H-C",
+                        );
+                        // #endregion
                         self.open_position(OpenPositionParams {
                             mint: &pending.mint,
                             pool: &pending.pool,
@@ -5616,12 +5645,25 @@ async fn main() -> Result<()> {
                                                 let sol_ui = sol_reserve as f64 / 1_000_000_000.0;
                                                 if sol_ui > 0.0 {
                                                     let tokens_per_sol = token_ui / sol_ui;
-                                                    ctx.update_position_price_from_pool(
-                                                        &token_mint,
-                                                        &update.pool_address,
-                                                        tokens_per_sol,
-                                                        None,
+                                                    // #region agent log
+                                                    dbg_log(
+                                                        "momentum_bot.rs:PoolCache_price_update",
+                                                        "PoolCacheUpdate updating position price",
+                                                        serde_json::json!({
+                                                            "mint": token_mint,
+                                                            "pool": update.pool_address,
+                                                            "dex": update.dex,
+                                                            "base_reserve": update.base_reserve,
+                                                            "quote_reserve": update.quote_reserve,
+                                                            "base_mint": update.base_mint,
+                                                            "token_ui": token_ui,
+                                                            "sol_ui": sol_ui,
+                                                            "tokens_per_sol": tokens_per_sol
+                                                        }),
+                                                        "H-E",
                                                     );
+                                                    // #endregion
+                                                    ctx.update_position_price(&token_mint, tokens_per_sol, None);
                                                 }
                                             }
                                             msg_count += 1;
@@ -7412,12 +7454,28 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
 
             // Update open position price estimate (tokens_UI per SOL_UI) based on trade ratio.
             // CRITICAL: Use UI-normalized amounts (raw / 10^decimals) to match entry_price units.
-            // FIX-43: Only update from SAME pool — trades on other pools have different prices.
             if sol_lamports > 0 && token_raw > 0 {
                 let token_decimals = ctx.mint_infos.read().get(mint).map(|m| m.decimals).unwrap_or(6);
                 let tok_ui = token_raw as f64 / 10f64.powi(token_decimals as i32);
                 let sol_ui = sol_lamports as f64 / 1_000_000_000.0;
                 let tokens_per_sol = tok_ui / sol_ui;
+                // #region agent log
+                dbg_log(
+                    "momentum_bot.rs:Trade_price_update",
+                    "Trade event updating position price",
+                    serde_json::json!({
+                        "mint": mint,
+                        "is_buy": is_buy,
+                        "sol_lamports": sol_lamports,
+                        "token_raw": token_raw,
+                        "token_decimals": token_decimals,
+                        "tok_ui": tok_ui,
+                        "sol_ui": sol_ui,
+                        "tokens_per_sol": tokens_per_sol
+                    }),
+                    "H-A_H-B",
+                );
+                // #endregion
                 let trade = TradeEvent {
                     timestamp: Instant::now(),
                     trader: trader.to_string(),
@@ -7426,7 +7484,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     token_amount: token_raw,
                     signature: sig.clone(),
                 };
-                ctx.update_position_price_from_pool(mint, pool_address, tokens_per_sol, Some(trade));
+                ctx.update_position_price(mint, tokens_per_sol, Some(trade));
             }
 
             if is_dev {

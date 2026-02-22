@@ -4,17 +4,17 @@
 
 Der **Momentum-Bot** glaubt, er habe +173 % Gewinn und triggert TAKE_PROFIT — tatsächlich ergibt der Verkauf on-chain einen Verlust. Stop-Loss hätte greifen müssen. Das Problem liegt **nicht** im Dashboard (trades_server), sondern in der **internen PnL-Berechnung des Momentum-Bots**.
 
-## Root Cause: Preis-Updates von falschem Pool (FIX-43)
+## Root Cause: Noch ungeklärt
 
-Der Bot aktualisiert `current_price` aus **beliebigen** Pools, die den Token enthalten. Wir kaufen z.B. auf PumpFun-Bonding-Curve, aber PoolCacheUpdates und Trade-Events kommen auch von Meteora, PumpSwap-AMM etc. Diese Pools haben **andere Preise** (andere Liquidität, andere Ratio). Ein Meteora-Pool mit niedrigerem `tokens_per_sol` (Token teurer) führt zu einem künstlich hohen „Gewinn“ und triggert TAKE_PROFIT — der reale Verkauf auf unserem Pool ergibt dann Verlust.
+**Hinweis:** Die Annahme „Preis von falschem Pool“ (FIX-43) war falsch:
+- Token auf Bonding Curve: Es gibt **keinen** anderen Pool.
+- Migrierte Token: Multi-Pool nutzt den besten verfügbaren Pool.
 
-## Fix (FIX-43)
-
-`update_position_price_from_pool(mint, pool, new_price)` — Preis nur aktualisieren, wenn `pos.pool == update.pool`. PoolCacheUpdate- und Trade-Handler nutzen jetzt diese gefilterte Variante.
+Die eigentliche Ursache für „+173 % gain“ bei realem Verlust muss weiter analysiert werden (entry_price vs. current_price, Bonding-Curve-spezifische Formel, Trade-Event-Konvention, etc.).
 
 ---
 
-## Zusätzlich: Asymmetrische Datenquellen im Dashboard (FIX-42)
+## Dashboard: Asymmetrische Datenquellen (FIX-42)
 
 **FIX-39** hatte nur die **SELL**-Seite angepasst:
 

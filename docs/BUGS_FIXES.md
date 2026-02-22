@@ -1051,22 +1051,21 @@ SELL `proceeds_sol` nutzt jetzt **value_sol (fill_out)** als primäre Quelle —
 
 ---
 
-## FIX-43: Momentum falscher TAKE_PROFIT — current_price von falschem Pool
+## FIX-43: (REVERTED) Momentum falscher TAKE_PROFIT — Pool-Filter
 
-**Status:** ✅ FIXED  
+**Status:** ❌ REVERTED (falsche Ursachenannahme)  
 **Datum:** 2026-02-23
 
 ### Problem
-Der Momentum-Bot triggert TAKE_PROFIT mit „+173 % gain“, aber der tatsächliche Verkauf on-chain ergibt Verlust. Der Bot nutzt die falsche Preisquelle für `current_price`.
+Der Momentum-Bot triggert TAKE_PROFIT mit „+173 % gain“, aber der tatsächliche Verkauf on-chain ergibt Verlust.
 
-### Root Cause
-`current_price` wurde aus **allen** Pools aktualisiert, die den Token enthalten: PoolCacheUpdates und Trade-Events von Meteora, PumpSwap, etc. Wir kaufen auf PumpFun-Bonding-Curve — ein anderer Pool mit abweichendem Preis liefert fälschlich hohe „Gewinne“ und triggert TAKE_PROFIT.
+### Ursprüngliche Annahme (falsch)
+`current_price` von „falschem Pool“ (Meteora/PumpSwap statt Bonding Curve).
 
-### Fix
-`update_position_price_from_pool(mint, pool, new_price)` — Preis nur updaten, wenn `pos.pool == pool`. PoolCacheUpdate- und Trade-Handler nutzen diese gefilterte Variante.
-
-### Dateien
-- `src/bin/momentum_bot.rs`: `update_position_price_from_pool()`, PoolCacheUpdate- und Trade-Handler
+### Korrektur
+- Token auf Bonding Curve: Es gibt **keinen** anderen Pool — nur die Bonding Curve.
+- Migrierte Token: Multi-Pool wählt den besten verfügbaren Pool.
+- Der Pool-Filter war daher nicht die richtige Lösung; die eigentliche Ursache des falschen PnL ist weiterhin ungeklärt.
 
 ---
 
