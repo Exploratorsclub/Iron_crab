@@ -406,48 +406,33 @@ impl Orca {
     }
 
     /// Lazy-load reserves from vaults with Geyser-first strategy.
-    /// Returns (reserve_base, reserve_quote) or falls back to pool's static reserves.
-    /// Priority: (0) LivePoolCache/Geyser (1) SQLite persistent cache (2) In-memory cache (3) RPC fetch
+    /// LivePoolCache = einzige Quelle (wenn gesetzt). Cache-Miss → statische Reserves (kein RPC).
+    /// RPC nur im Cold Path (live_pool_cache.is_none(), z.B. sell_all_keyless).
     async fn load_reserves_if_needed(&self, pool_id: &Pubkey, pool: &OrcaPool) -> (u128, u128) {
-        const CACHE_TTL_SECS: u64 = 300; // 5 minutes
-
-        // 0) LivePoolCache (Geyser real-time) — HIGHEST PRIORITY
+        // 0) LivePoolCache (Geyser) — einzige Reserve-Quelle im Hot Path
         if let Some(ref lpc) = self.live_pool_cache {
             if let Some(CachedPoolState::Orca(state)) = lpc.get(pool_id) {
                 if let (Some(va), Some(vb)) = (state.vault_a_balance, state.vault_b_balance) {
-                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    return (va as u128, vb as u128);
-                }
-            }
-        }
-
-        // 1) Try persistent SQLite cache (survives restarts)
-        if let Some(ref db_cache) = self.reserve_cache {
-            if let Ok(Some(entry)) = db_cache.get(pool_id) {
-                self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                // Log removed - too spammy
-                return (entry.reserve_base, entry.reserve_quote);
-            }
-        }
-
-        // Check if we have fresh in-memory cached reserves
-        if let Some((cached_base, cached_quote)) = pool.cached_reserves {
-            if let Some(fetch_time) = pool.last_reserve_fetch {
-                if let Ok(elapsed) = fetch_time.elapsed() {
-                    if elapsed.as_secs() < CACHE_TTL_SECS {
+                    if va > 0 && vb > 0 {
                         self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                        // Log removed - too spammy (hundreds per second)
-                        return (cached_base, cached_quote);
+                        return (va as u128, vb as u128);
                     }
                 }
             }
+            // Cache miss: kein RPC, statische Reserves (meist 0,0 → quote_exact_in returns Ok(None))
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                pool = %pool_id,
+                "orca: LivePoolCache miss, using static reserves (no RPC)"
+            );
+            return (pool.reserve_base, pool.reserve_quote);
         }
 
-        // Cache miss: Fetch fresh reserves from RPC (ARCHITECTURE VIOLATION: should come from Geyser)
+        // Cold Path: live_pool_cache.is_none() — RPC erlaubt
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             pool = %pool_id,
-            "orca: RPC fallback for vault reserves (LivePoolCache miss)"
+            "orca: RPC fallback for vault reserves (Cold Path, no LivePoolCache)"
         );
         match self
             .rpc
@@ -467,7 +452,7 @@ impl Orca {
                         reserves.1 = Self::parse_token_amount(&v2.data) as u128;
                     }
                 }
-                // Store in persistent cache
+                // Store in persistent cache (Cold Path only)
                 if let Some(ref db_cache) = self.reserve_cache {
                     let entry = ReserveEntry {
                         pool_address: *pool_id,
@@ -481,7 +466,7 @@ impl Orca {
                     pool = %pool_id,
                     vault_a = reserves.0,
                     vault_b = reserves.1,
-                    "orca: fresh reserves fetched via RPC"
+                    "orca: fresh reserves fetched via RPC (Cold Path)"
                 );
                 reserves
             }

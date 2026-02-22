@@ -905,10 +905,10 @@ Diese Bugs sind im Detail in `docs/ARCHITECTURE_AUDIT_2026-02-07.md` dokumentier
 |----|---------|-------------|--------|
 | Audit-A | Killswitch-Liquidation überspringt Tokens | ⚠️ TEILWEISE BEHOBEN | FIX-02, FIX-12, FIX-13 |
 | Audit-B | `load_pool_from_geyser()` macht 20 RPC-Retries | ✅ FIXED (FIX-29) | Serum-Caching, RPC-Elimination Hot Path |
-| Audit-C | PumpFunAmmDex eigene RPC-Infrastruktur | ❌ OFFEN | Priorität 3 |
-| Audit-D | Token-Decimals immer per RPC | ❌ OFFEN | Priorität 3 |
-| Audit-E | `cleanup_wallet_after_liquidation()` per RPC | ❌ OFFEN | Priorität 3 |
-| Audit-F | Orca Reserve-Fetching 5min TTL + RPC | ❌ OFFEN | Priorität 3 |
+| Audit-C | PumpFunAmmDex eigene RPC-Infrastruktur | ✅ BEHOBEN | Hot Path: Cache-Miss→None; Cold Path: SolanaRpc statt reqwest |
+| Audit-D | Token-Decimals immer per RPC | ✅ BEHOBEN | token_utils nur Cold Path; Hot Path nutzt mint_infos/TokenMintInfo; LivePoolCache für execution_engine; RPC in sell_all/wallet akzeptabel |
+| Audit-E | `cleanup_wallet_after_liquidation()` per RPC | ✅ AKZEPTIERT | Cold Path; RPC für autoritativen Zustand nötig – alle leeren ATAs müssen zuverlässig geschlossen werden |
+| Audit-F | Orca Reserve-Fetching 5min TTL + RPC | ✅ BEHOBEN | LivePoolCache einzige Quelle; Cache-Miss→statische Reserves (kein RPC); RPC nur Cold Path (`live_pool_cache.is_none()`) |
 | Audit-G | Stale JetStream Wallet-Snapshots | ✅ BEHOBEN | FIX-14 |
 | Audit-H | Hardcoded quote_mint in DEX-Parsern | ✅ BEHOBEN | FIX-15 |
 | Audit-I | PumpFun SELL stale Quote für migrierte Tokens | ✅ BEHOBEN | Guard in pumpfun.rs (Z.888-902). Restprobleme → BUG-A/FIX-20 |

@@ -3,24 +3,22 @@ use crate::solana::dex::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD as BASE64_STD;
-use base64::Engine;
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
-use reqwest::Client;
-use reqwest::StatusCode;
 use serde_json::{json, Value};
+use solana_account_decoder::UiAccountEncoding;
+use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcTransactionConfig};
+use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
 use solana_sdk::hash::hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
+use solana_transaction_status::UiTransactionEncoding;
 use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 use tokio::sync::Mutex;
-use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
@@ -52,29 +50,6 @@ const PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET: usize = 11;
 // Observed on-chain: buy_exact_quote_in fee fields sum to 125 bps (lp 2 + protocol 93 + creator 30).
 // We use that as a conservative default for quoting.
 const DEFAULT_TOTAL_FEE_BPS: u32 = 125;
-
-// Helius can aggressively rate limit across the entire API key. Keep JSON-RPC calls serialized
-// and spaced out process-wide (not per `PumpFunAmmDex` instance).
-static HELIUS_THROTTLES: Lazy<DashMap<String, Arc<HeliusThrottle>>> = Lazy::new(DashMap::new);
-
-#[derive(Debug)]
-struct HeliusThrottle {
-    permits: Arc<Semaphore>,
-    last_request: Arc<Mutex<Option<Instant>>>,
-}
-
-impl HeliusThrottle {
-    fn new() -> Self {
-        Self {
-            permits: Arc::new(Semaphore::new(1)),
-            last_request: Arc::new(Mutex::new(None)),
-        }
-    }
-}
-
-fn normalize_rpc_url(u: &str) -> String {
-    u.trim().trim_end_matches('/').to_string()
-}
 
 fn anchor_disc(ix_name: &str) -> [u8; 8] {
     let out = hash(format!("global:{ix_name}").as_bytes());
@@ -126,13 +101,7 @@ struct ProgramOwnedAccountMeta {
 #[derive(Clone)]
 pub struct PumpFunAmmDex {
     rpc: Arc<SolanaRpc>,
-    rpc_url: String,
-    helius_rpc_url: Option<String>,
-    http: Client,
     user_authority: Option<Pubkey>,
-
-    // Optional, process-wide throttle for the configured Helius endpoint.
-    helius_throttle: Option<Arc<HeliusThrottle>>,
 
     // Prevent concurrent pool discovery storms (e.g. parallel exits) from hammering RPC.
     discovery_lock: Arc<Mutex<()>>,
@@ -153,22 +122,10 @@ pub struct PumpFunAmmDex {
 }
 
 impl PumpFunAmmDex {
-    pub fn new(rpc: Arc<SolanaRpc>, rpc_url: String, helius_rpc_url: Option<String>) -> Self {
-        let helius_throttle = helius_rpc_url.as_deref().map(|u| {
-            let key = normalize_rpc_url(u);
-            HELIUS_THROTTLES
-                .entry(key)
-                .or_insert_with(|| Arc::new(HeliusThrottle::new()))
-                .clone()
-        });
-
+    pub fn new(rpc: Arc<SolanaRpc>) -> Self {
         Self {
             rpc,
-            rpc_url,
-            helius_rpc_url,
-            http: Client::new(),
             user_authority: None,
-            helius_throttle,
             discovery_lock: Arc::new(Mutex::new(())),
             pools_by_base: DashMap::new(),
             pools_by_market: DashMap::new(),
@@ -180,67 +137,31 @@ impl PumpFunAmmDex {
 
     /// Create a new PumpFunAmmDex with a LivePoolCache reference for Geyser-first quoting.
     /// When the cache is provided, quote_exact_in() reads reserves from cache instead of RPC.
-    pub fn new_with_cache(
-        rpc: Arc<SolanaRpc>,
-        rpc_url: String,
-        helius_rpc_url: Option<String>,
-        live_pool_cache: Arc<LivePoolCache>,
-    ) -> Self {
-        let mut dex = Self::new(rpc, rpc_url, helius_rpc_url);
+    pub fn new_with_cache(rpc: Arc<SolanaRpc>, live_pool_cache: Arc<LivePoolCache>) -> Self {
+        let mut dex = Self::new(rpc);
         dex.live_pool_cache = Some(live_pool_cache);
         dex
     }
 
-    fn is_helius_endpoint(&self, endpoint: &str) -> bool {
-        let Some(h) = self.helius_rpc_url.as_deref() else {
-            return false;
-        };
-        normalize_rpc_url(h) == normalize_rpc_url(endpoint)
-    }
-
-    async fn helius_throttle_guard(
-        &self,
-        endpoint: &str,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        if !self.is_helius_endpoint(endpoint) {
-            return None;
-        }
-
-        let throttle = self.helius_throttle.as_ref()?.clone();
-
-        // Serialize Helius calls.
-        let permit = throttle.permits.clone().acquire_owned().await.ok()?;
-
-        // Space out calls to reduce 429/-32429.
-        // Keep this conservative; kill-switch correctness > speed.
-        const MIN_GAP_MS: u64 = 600;
-        let min_gap = Duration::from_millis(MIN_GAP_MS);
-
-        let mut last = throttle.last_request.lock().await;
-        if let Some(prev) = *last {
-            let since = prev.elapsed();
-            if since < min_gap {
-                sleep(min_gap - since).await;
-            }
-        }
-        *last = Some(Instant::now());
-
-        Some(permit)
-    }
-
-    fn parse_retry_after_ms(resp: &reqwest::Response) -> Option<u64> {
-        // Retry-After can be seconds or an HTTP date. We only handle seconds.
-        let v = resp
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)?
-            .to_str()
-            .ok()?;
-        let secs: u64 = v.trim().parse().ok()?;
-        Some(secs.saturating_mul(1000))
-    }
-
     pub fn set_user_authority(&mut self, user: Pubkey) {
         self.user_authority = Some(user);
+    }
+
+    /// Fetch transaction via SolanaRpc and return as Value for legacy JSON parsers.
+    async fn fetch_tx_as_value(&self, sig: &str) -> Result<Value> {
+        let sig_parsed = sig.parse::<Signature>().context("invalid signature")?;
+        let cfg = RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::JsonParsed),
+            max_supported_transaction_version: Some(0),
+            commitment: None,
+        };
+        let tx = self
+            .rpc
+            .get_transaction_with_config_retry(&sig_parsed, cfg)
+            .await
+            .map_err(|e| anyhow!("getTransaction failed: {e}"))?;
+        let tx_val = serde_json::to_value(&tx).context("serialize transaction")?;
+        Ok(json!({"result": tx_val}))
     }
 
     /// Return the deterministic v1 pool-accounts list for a Pump.fun AMM pool.
@@ -272,9 +193,12 @@ impl PumpFunAmmDex {
                     return Ok(Some(accounts));
                 }
             }
+            // Hot Path: Cache miss with LivePoolCache set — no RPC fallback (architecture rule).
+            debug!(base_mint = %base_mint, "pump_amm: pool_accounts cache miss, returning None (no RPC)");
+            return Ok(None);
         }
 
-        // RPC FALLBACK: Cache miss — discover pool via RPC heuristics.
+        // RPC FALLBACK (Cold Path only): No LivePoolCache — discover pool via RPC heuristics.
         let pool = match self.discover_pool_static(base_mint).await? {
             Some(p) => p,
             None => return Ok(None),
@@ -320,264 +244,28 @@ impl PumpFunAmmDex {
         Pubkey::find_program_address(&seeds, &program_id).0
     }
 
-    fn discovery_endpoints(&self) -> Vec<&str> {
-        let mut endpoints: Vec<&str> = Vec::with_capacity(2);
-        endpoints.push(self.rpc_url.as_str());
-        if let Some(h) = self.helius_rpc_url.as_deref() {
-            endpoints.push(h);
-        }
-        endpoints.dedup();
-        endpoints
-    }
-
-    fn tx_history_endpoint(&self) -> &str {
-        // Tx-history discovery is the highest RPC load in this module; prefer the full-index
-        // endpoint (Helius) when available. Local validators are often pruned and will return
-        // empty signature pages.
-        self.helius_rpc_url
-            .as_deref()
-            .unwrap_or(self.rpc_url.as_str())
-    }
-
-    async fn rpc_call_tx_history(&self, method: &str, params: Value) -> Result<Value> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params,
-        });
-
-        let endpoint = self.tx_history_endpoint();
-        let mut backoff_ms = 500u64;
-
-        for attempt in 0..8usize {
-            let _helius_guard = self.helius_throttle_guard(endpoint).await;
-            let resp = self
-                .http
-                .post(endpoint)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| {
-                    anyhow!(
-                        "pump_amm tx_history http error endpoint={endpoint} attempt={attempt}: {e}"
-                    )
-                })?;
-
-            let status = resp.status();
-            let retry_after_ms = Self::parse_retry_after_ms(&resp);
-            let text = resp.text().await.map_err(|e| {
-                anyhow!(
-                    "pump_amm tx_history read body error endpoint={endpoint} attempt={attempt}: {e}"
-                )
-            })?;
-            let v: Value = serde_json::from_str(&text).map_err(|e| {
-                anyhow!(
-                    "pump_amm tx_history json decode error endpoint={endpoint} attempt={attempt}: {e} body={text}"
-                )
-            })?;
-
-            let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS
-                || v.get("error")
-                    .and_then(|e| e.get("code"))
-                    .and_then(|c| c.as_i64())
-                    == Some(-32429)
-                || v.get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                    .map(|m| m.to_ascii_lowercase().contains("rate"))
-                    .unwrap_or(false);
-
-            if is_rate_limited {
-                let wait_ms = retry_after_ms.unwrap_or(backoff_ms);
-                sleep(Duration::from_millis(wait_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(8000);
-                continue;
-            }
-
-            if !status.is_success() {
-                return Err(anyhow!(
-                    "pump_amm tx_history http status {status} endpoint={endpoint}: {v}"
-                ));
-            }
-            if v.get("error").is_some() {
-                return Err(anyhow!(
-                    "pump_amm tx_history rpc error endpoint={endpoint}: {v}"
-                ));
-            }
-            return Ok(v);
-        }
-
-        Err(anyhow!(
-            "pump_amm tx_history rate-limited endpoint={endpoint} method={method}"
-        ))
-    }
-
-    async fn rpc_call(&self, method: &str, params: Value) -> Result<Value> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params,
-        });
-
-        let mut last_err: Option<anyhow::Error> = None;
-        for endpoint in self.discovery_endpoints() {
-            // Retry on rate-limits; fall back to the next endpoint if still blocked.
-            let mut backoff_ms = 250u64;
-            let max_attempts = if self.is_helius_endpoint(endpoint) {
-                10usize
-            } else {
-                2usize
-            };
-            for attempt in 0..max_attempts {
-                let _helius_guard = self.helius_throttle_guard(endpoint).await;
-                let resp = match self.http.post(endpoint).json(&body).send().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        last_err = Some(anyhow!(
-                            "pump_amm rpc http error endpoint={endpoint} attempt={attempt}: {e}"
-                        ));
-                        break;
-                    }
-                };
-
-                let status = resp.status();
-                let retry_after_ms = Self::parse_retry_after_ms(&resp);
-                let text = match resp.text().await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        last_err = Some(anyhow!(
-                            "pump_amm rpc read body error endpoint={endpoint} attempt={attempt}: {e}"
-                        ));
-                        break;
-                    }
-                };
-                let v: Value = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        last_err = Some(anyhow!(
-                            "pump_amm rpc json decode error endpoint={endpoint} attempt={attempt}: {e} body={text}"
-                        ));
-                        break;
-                    }
-                };
-
-                let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS
-                    || v.get("error")
-                        .and_then(|e| e.get("code"))
-                        .and_then(|c| c.as_i64())
-                        == Some(-32429)
-                    || v.get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .map(|m| m.to_ascii_lowercase().contains("rate"))
-                        .unwrap_or(false);
-
-                if is_rate_limited {
-                    last_err = Some(anyhow!(
-                        "pump_amm rpc http status {status} endpoint={endpoint}: {v}"
-                    ));
-                    let wait_ms = retry_after_ms.unwrap_or(backoff_ms);
-                    sleep(Duration::from_millis(wait_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(10_000);
-                    continue;
-                }
-
-                if !status.is_success() {
-                    last_err = Some(anyhow!(
-                        "pump_amm rpc http status {status} endpoint={endpoint}: {v}"
-                    ));
-                    break;
-                }
-                if v.get("error").is_some() {
-                    last_err = Some(anyhow!("pump_amm rpc error endpoint={endpoint}: {v}"));
-                    break;
-                }
-                return Ok(v);
-            }
-        }
-
-        Err(last_err
-            .unwrap_or_else(|| anyhow!("pump_amm rpc call failed method={method} (no endpoints)")))
-    }
-
     async fn rpc_get_account_owner_and_executable(
         &self,
         address: Pubkey,
     ) -> Result<Option<(Pubkey, bool)>> {
-        let v = self
-            .rpc_call(
-                "getAccountInfo",
-                json!([
-                    address.to_string(),
-                    {"encoding": "base64", "commitment": "confirmed"}
-                ]),
-            )
-            .await?;
-
-        let value = match v.get("result").and_then(|r| r.get("value")) {
-            Some(v) => v,
-            None => return Ok(None),
+        let acc = match self.rpc.get_account_opt_retry(&address).await {
+            Ok(Some(a)) => a,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(anyhow!("get_account failed: {e}")),
         };
-        if value.is_null() {
-            return Ok(None);
-        }
-
-        let owner = value
-            .get("owner")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("getAccountInfo missing owner"))?;
-        let executable = value
-            .get("executable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        Ok(Some((Pubkey::from_str(owner)?, executable)))
+        Ok(Some((acc.owner, acc.executable)))
     }
 
     async fn rpc_get_account_owner_executable_and_data(
         &self,
         address: Pubkey,
     ) -> Result<Option<(Pubkey, bool, Vec<u8>)>> {
-        let v = self
-            .rpc_call(
-                "getAccountInfo",
-                json!([
-                    address.to_string(),
-                    {"encoding": "base64", "commitment": "confirmed"}
-                ]),
-            )
-            .await?;
-
-        let value = match v.get("result").and_then(|r| r.get("value")) {
-            Some(v) => v,
-            None => return Ok(None),
+        let acc = match self.rpc.get_account_opt_retry(&address).await {
+            Ok(Some(a)) => a,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(anyhow!("get_account failed: {e}")),
         };
-        if value.is_null() {
-            return Ok(None);
-        }
-
-        let owner = value
-            .get("owner")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("getAccountInfo missing owner"))?;
-        let executable = value
-            .get("executable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let data_b64 = value
-            .get("data")
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.first())
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("getAccountInfo missing data"))?;
-
-        let data = BASE64_STD
-            .decode(data_b64)
-            .map_err(|e| anyhow!("base64 decode getAccountInfo data: {e}"))?;
-
-        Ok(Some((Pubkey::from_str(owner)?, executable, data)))
+        Ok(Some((acc.owner, acc.executable, acc.data)))
     }
 
     fn parse_spl_token_account_mint_and_owner(data: &[u8]) -> Option<(Pubkey, Pubkey)> {
@@ -614,87 +302,19 @@ impl PumpFunAmmDex {
         token_owner: Pubkey,
         mint: Pubkey,
     ) -> Result<Option<Pubkey>> {
-        // Fallback for cases where the recipient token account is not an ATA.
-        // Avoid `getProgramAccounts` over the token program (can be huge / Helius may reject).
-        // Prefer `getTokenAccountsByOwner` with a mint filter.
+        // Query by program and filter client-side by mint (covers SPL Token and Token-2022).
+        let accounts = self
+            .rpc
+            .get_token_accounts_by_owner_with_filter(&token_owner, &token_program)
+            .await
+            .map_err(|e| anyhow!("get_token_accounts_by_owner failed: {e}"))?;
 
-        let params_mint_filtered = json!([
-            token_owner.to_string(),
-            {"mint": mint.to_string()},
+        for (pk, acc) in accounts {
+            if let Some((acc_mint, acc_owner)) =
+                Self::parse_spl_token_account_mint_and_owner(&acc.data)
             {
-                "encoding": "base64",
-                "commitment": "confirmed",
-                "dataSlice": {"offset": 0, "length": 0}
-            }
-        ]);
-
-        let v = self
-            .rpc_call("getTokenAccountsByOwner", params_mint_filtered)
-            .await?;
-
-        if let Some(arr) = v
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_array())
-        {
-            for item in arr {
-                if let Some(pk) = item.get("pubkey").and_then(|p| p.as_str()) {
-                    if let Ok(parsed) = Pubkey::from_str(pk) {
-                        return Ok(Some(parsed));
-                    }
-                }
-            }
-        }
-
-        // Some RPCs may not return Token-2022 accounts for the mint-filtered variant.
-        // As a fallback, query by programId and filter client-side using a small dataSlice.
-        let params_programid_filtered = json!([
-            token_owner.to_string(),
-            {"programId": token_program.to_string()},
-            {
-                "encoding": "base64",
-                "commitment": "confirmed",
-                "dataSlice": {"offset": 0, "length": 72}
-            }
-        ]);
-
-        let v = self
-            .rpc_call("getTokenAccountsByOwner", params_programid_filtered)
-            .await?;
-
-        let Some(arr) = v
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(|v| v.as_array())
-        else {
-            return Ok(None);
-        };
-
-        for item in arr {
-            let Some(pk) = item.get("pubkey").and_then(|p| p.as_str()) else {
-                continue;
-            };
-            let Some(data_arr) = item
-                .get("account")
-                .and_then(|a| a.get("data"))
-                .and_then(|d| d.as_array())
-            else {
-                continue;
-            };
-            let Some(b64) = data_arr.first().and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Ok(acc_data) = BASE64_STD.decode(b64) else {
-                continue;
-            };
-            let Some((acc_mint, acc_owner)) =
-                Self::parse_spl_token_account_mint_and_owner(&acc_data)
-            else {
-                continue;
-            };
-            if acc_mint == mint && acc_owner == token_owner {
-                if let Ok(parsed) = Pubkey::from_str(pk) {
-                    return Ok(Some(parsed));
+                if acc_mint == mint && acc_owner == token_owner {
+                    return Ok(Some(pk));
                 }
             }
         }
@@ -1384,48 +1004,38 @@ impl PumpFunAmmDex {
         &self,
         base_mint: Pubkey,
     ) -> Result<Vec<Pubkey>> {
+        use solana_commitment_config::CommitmentConfig;
+
         let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
 
-        let params = json!([
-            program_id.to_string(),
-            {
-                "encoding": "base64",
-                "commitment": "confirmed",
-                "dataSlice": {"offset": 0, "length": 0},
-                "filters": [
-                    {"memcmp": {"offset": PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET, "bytes": base_mint.to_string()}},
-                    {"memcmp": {"offset": PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET, "bytes": WSOL_MINT}},
-                ]
-            }
-        ]);
+        let filters = vec![
+            RpcFilterType::Memcmp(Memcmp::new(
+                PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET as usize,
+                MemcmpEncodedBytes::Base58(base_mint.to_string()),
+            )),
+            RpcFilterType::Memcmp(Memcmp::new(
+                PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET as usize,
+                MemcmpEncodedBytes::Base58(WSOL_MINT.to_string()),
+            )),
+        ];
 
-        // NOTE: On our local validator RPC, getProgramAccounts can be disabled for large programs
-        // ("excluded from account secondary indexes"). When Helius is configured, always use it
-        // for program-account discovery.
-        let v = if self.helius_rpc_url.is_some() {
-            self.rpc_call_tx_history("getProgramAccounts", params)
-                .await?
-        } else {
-            self.rpc_call("getProgramAccounts", params).await?
+        let config = RpcProgramAccountsConfig {
+            filters: Some(filters),
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(UiAccountEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                ..Default::default()
+            },
+            ..Default::default()
         };
 
-        let arr = match v.get("result").and_then(|r| r.as_array()) {
-            Some(v) => v,
-            None => return Ok(Vec::new()),
-        };
+        let accounts = self
+            .rpc
+            .get_program_accounts_with_config_retry(&program_id, config)
+            .await
+            .map_err(|e| anyhow!("getProgramAccounts failed: {e}"))?;
 
-        // Some mints can have multiple matching market accounts (re-created markets,
-        // migrations, etc). We return all matches and let tx-history scanning pick
-        // the first one that yields a valid swap account set.
-        let mut out = Vec::with_capacity(arr.len());
-        for item in arr {
-            let Some(pk) = item.get("pubkey").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if let Ok(p) = Pubkey::from_str(pk) {
-                out.push(p);
-            }
-        }
+        let mut out: Vec<Pubkey> = accounts.into_iter().map(|(pk, _)| pk).collect();
         out.sort();
         out.dedup();
         Ok(out)
@@ -1441,48 +1051,16 @@ impl PumpFunAmmDex {
         // build a full swap ix. In that case, scan only the market's txs to find a successful
         // swap and extract the canonical account set from the on-chain transaction.
 
-        let addr = pool_market.to_string();
-
         info!(
             "pump_amm TX-history: starting getSignaturesForAddress for market={} base_mint={} limit=200",
             pool_market, base_mint
         );
 
-        let sigs_v = self
-            .rpc_call_tx_history("getSignaturesForAddress", json!([addr, {"limit": 200}]))
-            .await?;
-
-        info!(
-            "pump_amm TX-history: received getSignaturesForAddress response for market={}",
-            pool_market
-        );
-
-        // Check for RPC errors - returnOk(None) triggers generic error message upstream
-        if let Some(err) = sigs_v.get("error") {
-            // RPC error (e.g., method not found) - return as anyhow error with details
-            return Err(anyhow!(
-                "pump_amm tx_history RPC error market={} error={}",
-                pool_market,
-                serde_json::to_string(err).unwrap_or_else(|_| "unknown".to_string())
-            ));
-        }
-
-        let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
-            Some(v) => v,
-            None => {
-                // Unexpected response structure
-                warn!(
-                    "pump_amm TX-history: unexpected response from getSignaturesForAddress market={} response={}",
-                    pool_market,
-                    serde_json::to_string(&sigs_v).unwrap_or_else(|_| "unknown".to_string())
-                );
-                return Err(anyhow!(
-                    "pump_amm tx_history unexpected response market={} response={}",
-                    pool_market,
-                    serde_json::to_string(&sigs_v).unwrap_or_else(|_| "unknown".to_string())
-                ));
-            }
-        };
+        let sigs = self
+            .rpc
+            .get_signatures_for_address(&pool_market, Some(200))
+            .await
+            .map_err(|e| anyhow!("getSignaturesForAddress failed: {e}"))?;
 
         info!(
             "pump_amm TX-history: found {} signatures for market={} base_mint={}, starting transaction scan...",
@@ -1490,7 +1068,6 @@ impl PumpFunAmmDex {
         );
 
         if sigs.is_empty() {
-            // No transactions found - this is expected for brand-new pools, return None
             info!(
                 "pump_amm TX-history: no signatures found for market={}, returning None",
                 pool_market
@@ -1498,38 +1075,20 @@ impl PumpFunAmmDex {
             return Ok(None);
         }
 
-        // Cap transaction fetches (sequential scan is more reliable than sampling for thin history).
-        // Increased from 60 to 200 to handle markets with sparse/old swap history.
         const MAX_TX_FETCHES: usize = 200;
-
         let mut fetched = 0usize;
         let mut scanned_tx_count = 0usize;
         const DEBUG_REF_TX: &str = "3nj499thZ6JrdrC2WGGGRKoSC5Ydrat9gxP3XEnW5JK5ZWnXPzHE2QuAX8y7gvfsjRaLxCy3qkn6BYc1sxtfYiiY";
 
-        // Log first few signatures for debugging
-        info!(
-            "pump_amm TX-history: first 10 signatures: {:?}",
-            sigs.iter()
-                .take(10)
-                .filter_map(|s| s.get("signature").and_then(|v| v.as_str()))
-                .collect::<Vec<_>>()
-        );
-
-        for s in sigs.iter() {
+        for s in &sigs {
             if fetched >= MAX_TX_FETCHES {
                 break;
             }
-            if let Some(err) = s.get("err") {
-                if !err.is_null() {
-                    continue;
-                }
+            if s.err.is_some() {
+                continue;
             }
-            let sig = match s.get("signature").and_then(|v| v.as_str()) {
-                Some(v) => v,
-                None => continue,
-            };
+            let sig = s.signature.to_string();
 
-            // Debug: Check if reference TX is in signature list
             if sig == DEBUG_REF_TX {
                 info!(
                     "pump_amm TX-history: FOUND reference TX in signature list! sig={}",
@@ -1539,22 +1098,14 @@ impl PumpFunAmmDex {
 
             fetched += 1;
 
-            // Log progress every 20 transactions
             if fetched % 20 == 0 {
                 info!(
                     "pump_amm TX-history: scanned {}/{} transactions for market={}...",
-                    fetched,
-                    sigs.len(),
-                    pool_market
+                    fetched, sigs.len(), pool_market
                 );
             }
 
-            let tx_v = self
-                .rpc_call_tx_history(
-                    "getTransaction",
-                    json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}]),
-                )
-                .await?;
+            let tx_v = self.fetch_tx_as_value(&sig).await?;
 
             let msg = match tx_v
                 .get("result")
@@ -1916,45 +1467,41 @@ impl PumpFunAmmDex {
             // liquidation attempts (which we intentionally skip), and the first successful
             // PumpSwap trades can be older than the initial page on busy pools.
             // IMPORTANT: tx-history calls are expensive; cap requests to avoid rate-limits.
-            const SIG_PAGE_SIZE: u32 = 200;
+            const SIG_PAGE_SIZE: usize = 200;
             const SIG_MAX_PAGES: usize = 100; // up to ~20k signatures
             const SIG_TX_PER_PAGE: usize = 40; // cap getTransaction calls per page
-            let mut before: Option<String> = None;
+            let addr_pk = match Pubkey::from_str(&addr) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let mut before: Option<Signature> = None;
 
             for _page in 0..SIG_MAX_PAGES {
-                let mut cfg = json!({"limit": SIG_PAGE_SIZE});
-                if let Some(b) = &before {
-                    cfg["before"] = json!(b);
-                }
-
-                let sigs_v = match self
-                    .rpc_call_tx_history("getSignaturesForAddress", json!([addr, cfg]))
+                let sigs = match self
+                    .rpc
+                    .get_signatures_for_address_with_config(
+                        &addr_pk,
+                        Some(SIG_PAGE_SIZE),
+                        before.as_ref(),
+                        None,
+                    )
                     .await
                 {
                     Ok(v) => v,
                     Err(e) => {
-                        discovery_err = Some(e);
+                        discovery_err = Some(anyhow!("{e}"));
                         break;
                     }
-                };
-
-                let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
-                    Some(v) => v,
-                    None => break,
                 };
                 if sigs.is_empty() {
                     break;
                 }
 
-                // Update pagination cursor (last signature in the page)
+                // Update pagination cursor
                 before = sigs
                     .last()
-                    .and_then(|v| v.get("signature"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                    .and_then(|s| s.signature.parse().ok());
 
-                // Sample across the whole page (not just the newest N), so we don't miss the
-                // relevant swap when the address is busy.
                 let page_len = sigs.len();
                 let take_n = SIG_TX_PER_PAGE.min(page_len);
                 let step = if take_n <= 1 {
@@ -1966,28 +1513,15 @@ impl PumpFunAmmDex {
                 for i in 0..take_n {
                     let idx = (i * step).min(page_len.saturating_sub(1));
                     let s = &sigs[idx];
-                    // Avoid poisoning discovery with failed transactions (e.g., our own earlier
-                    // liquidation attempts that used wrong accounts and therefore failed).
-                    if let Some(err) = s.get("err") {
-                        if !err.is_null() {
-                            continue;
-                        }
+                    if s.err.is_some() {
+                        continue;
                     }
-                    let sig = match s.get("signature").and_then(|v| v.as_str()) {
-                        Some(v) => v,
-                        None => continue,
-                    };
+                    let sig = s.signature.to_string();
 
-                    let tx_v = match self
-                        .rpc_call_tx_history(
-                            "getTransaction",
-                            json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}]),
-                        )
-                        .await
-                    {
+                    let tx_v = match self.fetch_tx_as_value(&sig).await {
                         Ok(v) => v,
                         Err(e) => {
-                            discovery_err = Some(e);
+                            discovery_err = Some(anyhow!("{e}"));
                             break;
                         }
                     };
@@ -2147,36 +1681,19 @@ impl PumpFunAmmDex {
 
         // Scan transactions of the user for a Pump.fun AMM ix on this pool.
         // Scan deeper because recent txs may be unrelated (or failed).
-        let sigs_v = self
-            .rpc_call(
-                "getSignaturesForAddress",
-                json!([user.to_string(), {"limit": 500}]),
-            )
-            .await?;
-        let sigs = match sigs_v.get("result").and_then(|v| v.as_array()) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
+        let sigs = self
+            .rpc
+            .get_signatures_for_address(&user, Some(500))
+            .await
+            .map_err(|e| anyhow!("getSignaturesForAddress failed: {e}"))?;
 
-        for s in sigs.iter() {
-            // Prefer successful transactions; failed ones can contain partial/invalid account sets.
-            if let Some(err) = s.get("err") {
-                if !err.is_null() {
-                    continue;
-                }
+        for s in &sigs {
+            if s.err.is_some() {
+                continue;
             }
-            let sig = match s.get("signature").and_then(|v| v.as_str()) {
-                Some(v) => v,
-                None => continue,
-            };
+            let sig = s.signature.to_string();
 
-            let tx_v = match self
-                .rpc_call(
-                    "getTransaction",
-                    json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}]),
-                )
-                .await
-            {
+            let tx_v = match self.fetch_tx_as_value(&sig).await {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -2321,17 +1838,14 @@ impl PumpFunAmmDex {
     }
 
     async fn get_vault_amount(&self, ta: Pubkey) -> Result<u64> {
-        let bal = self
+        let acc = self
             .rpc
-            .rpc
-            .get_token_account_balance(&ta)
+            .get_account_opt_retry(&ta)
             .await
-            .map_err(|e| anyhow!("get_token_account_balance failed: {e}"))?;
-        let amount_str = bal
-            .amount
-            .parse::<u64>()
-            .map_err(|e| anyhow!("invalid token balance amount: {e}"))?;
-        Ok(amount_str)
+            .map_err(|e| anyhow!("get_account failed: {e}"))?
+            .ok_or_else(|| anyhow!("token account {ta} not found"))?;
+        Self::parse_spl_token_account_amount(&acc.data)
+            .ok_or_else(|| anyhow!("invalid token account data for {ta}"))
     }
 
     fn quote_cp(
@@ -2711,14 +2225,15 @@ impl Dex for PumpFunAmmDex {
                     tick_spacing: None,
                 }));
             }
+            // Hot Path: Cache miss with LivePoolCache set — no RPC fallback (architecture rule).
+            debug!(base_mint = %base_mint_str, "pump_amm: quote cache miss, returning None (no RPC)");
+            return Ok(None);
         }
 
-        // RPC FALLBACK: Cache miss — discover pool and fetch vault reserves via RPC.
-        // This should only happen for pools that Geyser hasn't indexed yet or after restart
-        // before PoolCacheUpdate events arrive.
+        // RPC FALLBACK (Cold Path only): No LivePoolCache — discover pool and fetch vault reserves via RPC.
         warn!(
             base_mint = %base_mint_str,
-            "pump_amm: LivePoolCache miss, falling back to RPC for quote"
+            "pump_amm: no LivePoolCache, using RPC fallback for quote"
         );
 
         let pool = match self.discover_pool_static(base_mint).await? {

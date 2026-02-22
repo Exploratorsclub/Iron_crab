@@ -731,6 +731,21 @@ impl SolanaRpc {
         Vec<solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature>,
         ClientError,
     > {
+        self.get_signatures_for_address_with_config(address, limit, None, None)
+            .await
+    }
+
+    /// Get signatures for an address with pagination (before/until)
+    pub async fn get_signatures_for_address_with_config(
+        &self,
+        address: &Pubkey,
+        limit: Option<usize>,
+        before: Option<&Signature>,
+        until: Option<&Signature>,
+    ) -> Result<
+        Vec<solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature>,
+        ClientError,
+    > {
         use solana_commitment_config::CommitmentConfig;
         use solana_rpc_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 
@@ -738,8 +753,8 @@ impl SolanaRpc {
 
         let config = GetConfirmedSignaturesForAddress2Config {
             limit,
-            before: None,
-            until: None,
+            before: before.cloned(),
+            until: until.cloned(),
             commitment: Some(CommitmentConfig::confirmed()),
         };
 
@@ -754,6 +769,69 @@ impl SolanaRpc {
 
         self.limiter.on_success();
         Ok(sigs)
+    }
+
+    /// Get account with retry; returns None if account does not exist
+    pub async fn get_account_opt_retry(
+        &self,
+        key: &Pubkey,
+    ) -> Result<Option<solana_sdk::account::Account>, ClientError> {
+        match self.get_account_retry(key).await {
+            Ok(acc) => Ok(Some(acc)),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("could not find")
+                    || msg.contains("AccountNotFound")
+                    || msg.contains("account not found")
+                {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Get token accounts by owner with optional mint filter (for pumpfun_amm compatibility)
+    pub async fn get_token_accounts_by_owner_with_filter(
+        &self,
+        owner: &Pubkey,
+        program_id: &Pubkey,
+    ) -> Result<Vec<(Pubkey, solana_sdk::account::Account)>, ClientError> {
+        use solana_account_decoder::UiAccountEncoding;
+        use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
+        use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
+
+        let _permit = self.limiter.acquire().await;
+
+        let filters = vec![
+            RpcFilterType::DataSize(165),
+            RpcFilterType::Memcmp(Memcmp::new(
+                32,
+                MemcmpEncodedBytes::Base58(owner.to_string()),
+            )),
+        ];
+
+        let config = RpcProgramAccountsConfig {
+            filters: Some(filters),
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(UiAccountEncoding::Base64),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let accounts = self
+            .rpc
+            .get_program_accounts_with_config(program_id, config)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "get_token_accounts_by_owner failed");
+                e
+            })?;
+
+        self.limiter.on_success();
+        Ok(accounts)
     }
 
     /// Send and confirm a transaction

@@ -1661,18 +1661,9 @@ impl ExecutionContext {
         };
         let lpc = ctx.live_pool_cache.as_ref().map(Arc::clone);
         let pump_amm = if let Some(ref cache) = lpc {
-            PumpFunAmmDex::new_with_cache(
-                Arc::clone(&ctx.rpc),
-                ctx.rpc_url.clone(),
-                ctx.helius_rpc_url.clone(),
-                Arc::clone(cache),
-            )
+            PumpFunAmmDex::new_with_cache(Arc::clone(&ctx.rpc), Arc::clone(cache))
         } else {
-            PumpFunAmmDex::new(
-                Arc::clone(&ctx.rpc),
-                ctx.rpc_url.clone(),
-                ctx.helius_rpc_url.clone(),
-            )
+            PumpFunAmmDex::new(Arc::clone(&ctx.rpc))
         };
         let mut meteora = MeteoraDlmm::new_with_live_cache(Arc::clone(&ctx.rpc), lpc.clone());
         meteora.set_user_authority(owner);

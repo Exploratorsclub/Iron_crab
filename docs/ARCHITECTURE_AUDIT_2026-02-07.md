@@ -374,19 +374,19 @@ Emergency-Tools – hier sind RPC-Calls akzeptabel, da dies keine Hot-Path-Binar
 
 **`token_utils.rs`** wird an vielen Stellen aufgerufen. Jeder Call macht 1-2 RPC-Requests.
 
-**Status**: ❌ UNVERÄNDERT
+**Status**: ✅ BEHOBEN — token_utils wird ausschließlich im Cold Path aufgerufen (execution_engine Manual Burn, sell_all, sell_all_keyless, wallet). Hot Path (momentum_bot, arb_strategy, dex_parser) nutzt mint_infos/TokenMintInfo bzw. post_token_balances aus Geyser — keine RPC-Calls für Decimals. execution_engine Manual Burn nutzt LivePoolCache. RPC in sell_all/wallet ist laut Architektur-Regeln für Cold Path akzeptabel.
 
 ### BUG E: `cleanup_wallet_after_liquidation()` macht RPC statt Geyser
 
 **Zeile ~2071-2088**: Inkonsistenz — Liquidation = JetStream/RPC-basiert, Cleanup = RPC-basiert.
 
-**Status**: ❌ UNVERÄNDERT
+**Status**: ✅ AKZEPTIERT (by design) — Cleanup nach Liquidation ist Cold Path. RPC ist per Architektur erlaubt. Für das zuverlässige Schließen aller leeren ATAs ist der autoritative on-chain-Zustand (getTokenAccountsByOwner) erforderlich; Geyser/JetStream könnte Stale-Daten liefern und ATAs übersehen.
 
 ### BUG F: Orca Reserve-Fetching hat 5min TTL mit RPC-Fallback
 
 **`load_reserves_if_needed()`**: 5-Minuten-Cache, dann RPC-Fallback. Bei 50+ Pools = 50+ RPC-Calls.
 
-**Status**: ❌ UNVERÄNDERT
+**Status**: ✅ BEHOBEN — Architekturbereinigung (siehe `AUDIT_F_ORCA_RESERVES_IMPLEMENTATION_PLAN.md`): LivePoolCache ist einzige Reserve-Quelle im Hot Path. SQLite- und In-Memory-TTL-Schritte entfernt. Bei Cache-Miss: statische Reserves (pool.reserve_base/quote), kein RPC. RPC nur im Cold Path (live_pool_cache.is_none(), z.B. sell_all_keyless).
 
 ### BUG G (NEU): Stale JetStream Wallet-Snapshots → Ghost Open Positions
 
