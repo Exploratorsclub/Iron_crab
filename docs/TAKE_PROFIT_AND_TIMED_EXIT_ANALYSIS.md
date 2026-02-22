@@ -77,7 +77,7 @@ STOP_LOSS hat Vorrang. Wenn trotzdem TIME_EXIT im Dashboard steht, wurde der Ver
 
 ### Für TAKE_PROFIT / PnL-Anzeige
 
-- **trades_server**: Prüfen, ob Cost-Basis und `wallet_sol_delta` für Probe+Scale korrekt sind.
+- **trades_server**: FIX-39 — SELL proceeds nutzt jetzt value_sol (fill_out) statt wallet_sol_delta; für PumpSwap-SELL ist Output WSOL, wallet_delta enthält nur Rent/Fees.
 - **Exit-Logik**: Konservativeres TAKE_PROFIT (z.B. höheres Ziel oder Slippage-Puffer), um Abstand zwischen Quote und Execution zu verringern.
 - **Tracking**: Sicherstellen, dass bei PumpSwap-SELL die Proceeds (WSOL/native SOL) korrekt erfasst werden.
 

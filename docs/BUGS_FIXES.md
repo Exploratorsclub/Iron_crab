@@ -994,6 +994,24 @@ Bei Erkennung: Simulation als "passed" markieren mit Bypass-Reason, TX direkt se
 
 ---
 
+## FIX-39: TAKE_PROFIT Dashboard PnL invertiert (SELL proceeds falsch)
+
+**Status:** ✅ FIXED
+
+### Problem
+TAKE_PROFIT-Trades zeigten im Dashboard fälschlich Verlust (negative PnL), obwohl der Detail-Text "+176.3% gain" anzeigte. Die PnL-Spalten (SOL, %) waren invertiert.
+
+### Root Cause
+Für SELL-Trades nutzte `trades_server.py` **wallet_sol_delta** als primäre Quelle für `proceeds_sol`. Bei PumpSwap/PumpFun-SELL ist der Swap-Output **WSOL** (Token), nicht native SOL. `wallet_sol_delta` misst nur native SOL (Rent-Rückerstattung ~0.002 SOL minus Fees) — **nicht** die tatsächlichen Swap-Erlöse. Dadurch wurde z.B. 0.002 SOL als proceeds verwendet statt 0.015 SOL → pnl_sol = 0.002 - 0.01 = -0.008 (fälschlicher Verlust).
+
+### Fix
+SELL `proceeds_sol` nutzt jetzt **value_sol (fill_out)** als primäre Quelle — das sind die tatsächlichen Swap-Erlöse (WSOL/SOL). `wallet_delta` nur als Fallback wenn `value_sol` fehlt.
+
+### Dateien
+- `scripts/trades_server.py`: SELL proceeds = value_sol (fill_out) statt wallet_delta in allen 3 PnL-Berechnungsblöcken
+
+---
+
 ## 5. VERLORENE ÄNDERUNGEN DURCH REVERT (Cherry-Pick Status)
 
 | Priorität | Beschreibung | Status |

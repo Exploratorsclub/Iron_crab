@@ -94,16 +94,16 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 print(f"Error reading {jsonl_path}: {e}")
         
-        # Compute running PnL using wallet_sol_delta (real wallet impact).
+        # Compute running PnL.
         #
-        # We use wallet_delta for BOTH BUY cost and SELL proceeds because:
-        # - ATA rent paid on BUY (~0.00204 SOL) is refunded on SELL when ATA is closed
-        # - These cancel out, leaving: realized_gain_or_loss - total_fees
-        # - This shows the REAL change in SOL balance per trade pair
+        # BUY cost: abs(wallet_delta) — total SOL leaving (swap + fees + ATA rent)
         #
-        # For BUY:  cost = abs(wallet_delta) — total SOL leaving wallet (swap + fees + ATA rent)
-        # For SELL: proceeds = wallet_delta — total SOL entering wallet (swap + ATA rent refund - fees)
-        # PnL = proceeds - proportional_cost (reflects real wallet impact including all fees)
+        # SELL proceeds: PREFER value_sol (fill_out) over wallet_delta!
+        # For PumpSwap/PumpFun SELL: output is WSOL (token), NOT native SOL. wallet_delta
+        # only shows rent refund - fees (~0.002), NOT the actual swap proceeds. Using
+        # wallet_delta as proceeds would show false losses for TAKE_PROFIT trades.
+        # value_sol = fill_out = actual SOL/WSOL received from swap.
+        # PnL = proceeds - proportional_cost
         trades.sort(key=lambda t: t.get('timestamp_ms', 0))
         positions = {}
         for trade in trades:
@@ -128,12 +128,11 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 trade["pnl_sol"] = 0.0
                 trade["pnl_pct"] = None
             elif action == "SELL":
-                # Proceeds: wallet_delta (total SOL received including ATA rent refund)
-                # This is consistent with BUY cost using wallet_delta — ATA rent cancels out.
-                proceeds_sol = wallet_delta if (wallet_delta is not None and wallet_delta > 0) else 0
+                # Proceeds: PREFER value_sol (fill_out = swap output) — for PumpSwap SELL,
+                # output is WSOL, wallet_delta only has rent/fees, NOT the swap proceeds.
+                proceeds_sol = value_sol if (value_sol is not None and value_sol > 0) else 0
                 if proceeds_sol == 0:
-                    # Fallback: try value_sol (from fill_out)
-                    proceeds_sol = value_sol if (value_sol is not None and value_sol > 0) else 0
+                    proceeds_sol = wallet_delta if (wallet_delta is not None and wallet_delta > 0) else 0
                 pos = positions.get(mint_full)
                 if pos and pos["tokens"] > 0:
                     avg_cost = pos["cost_sol"] / pos["tokens"]
@@ -233,10 +232,11 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 trade["pnl_sol"] = 0.0
                 trade["pnl_pct"] = None
             elif action == "SELL":
-                # Proceeds: wallet_delta (consistent with BUY cost — ATA rent cancels out)
-                proceeds_sol = wallet_delta if (wallet_delta is not None and wallet_delta > 0) else 0
+                # Proceeds: PREFER value_sol (fill_out) — wallet_delta doesn't include
+                # WSOL swap output for PumpSwap SELL.
+                proceeds_sol = value_sol if (value_sol is not None and value_sol > 0) else 0
                 if proceeds_sol == 0:
-                    proceeds_sol = value_sol if (value_sol is not None and value_sol > 0) else 0
+                    proceeds_sol = wallet_delta if (wallet_delta is not None and wallet_delta > 0) else 0
                 pos = positions.get(mint_full)
                 if pos and pos["tokens"] > 0:
                     avg_cost = pos["cost_sol"] / pos["tokens"]
@@ -336,10 +336,11 @@ class TradesHandler(http.server.BaseHTTPRequestHandler):
                 pos["cost_sol"] += cost_sol
                 positions[mint_full] = pos
             elif action == "SELL":
-                # Proceeds: wallet_delta (consistent with BUY cost — ATA rent cancels out)
-                proceeds_sol = wallet_delta if (wallet_delta is not None and wallet_delta > 0) else 0
+                # Proceeds: PREFER value_sol (fill_out) — wallet_delta doesn't include
+                # WSOL swap output for PumpSwap SELL.
+                proceeds_sol = value_sol if (value_sol is not None and value_sol > 0) else 0
                 if proceeds_sol == 0:
-                    proceeds_sol = value_sol if (value_sol is not None and value_sol > 0) else 0
+                    proceeds_sol = wallet_delta if (wallet_delta is not None and wallet_delta > 0) else 0
                 pos = positions.get(mint_full)
                 if pos and pos["tokens"] > 0:
                     avg_cost = pos["cost_sol"] / pos["tokens"]

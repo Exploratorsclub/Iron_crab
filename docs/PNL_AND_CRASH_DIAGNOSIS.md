@@ -21,13 +21,13 @@ proceeds_sol = wallet_delta (wenn > 0) ODER value_sol (fill_out)
 
 1. **Falsche Formel**: Wenn irgendwo `pnl_sol = sold_cost - proceeds_sol` steht → Inversion.
 2. **Proceeds vs Cost vertauscht**: Falls für SELL fälschlich `sold_cost` als Ertrag und `proceeds` als Aufwand verwendet wird.
-3. **wallet_sol_delta Vorzeichen**: Für PumpSwap-SELLs ist output WSOL (nicht native SOL). `wallet_sol_delta` = native SOL-Änderung kann **negativ** sein (nur Fees). Dann Fallback `value_sol` = fill_out (korrekt). Wenn `value_sol` für SELL falsch befüllt wird (z.B. fill_in statt fill_out), wäre proceeds verkehrt.
+3. **wallet_sol_delta vs value_sol**: Für PumpSwap-SELLs ist output WSOL (nicht native SOL). `wallet_sol_delta` = native SOL nur Rent/Fees, **nicht** Swap-Erlöse. FIX-39: SELL proceeds nutzt jetzt **value_sol (fill_out)** primär, wallet_delta nur als Fallback.
 4. **Cost-Basis-Verwechslung**: Bei Probe+Scale könnten BUYs in falscher Reihenfolge oder mit falschen Beträgen zur Position addiert werden → `avg_cost` und `sold_cost` falsch.
 
 ### Zu prüfen
-- [ ] `trades_server.py` Zeile 141: `pnl_sol = proceeds_sol - sold_cost` (korrekt)
-- [ ] Execution-Engine: Für SELL ist `fill_out` = SOL/WSOL empfangen, `fill_in` = Tokens verkauft
-- [ ] Bei DEX-Wechsel (PumpFun BC → PumpSwap): Unterschiedliches Handling von native SOL vs WSOL
+- [x] `trades_server.py`: `pnl_sol = proceeds_sol - sold_cost` (korrekt) — FIX-39: proceeds = value_sol (fill_out) für SELL
+- [x] Execution-Engine: Für SELL ist `fill_out` = SOL/WSOL empfangen, `fill_in` = Tokens verkauft
+- [x] PumpSwap-SELL: value_sol (fill_out) als proceeds, wallet_delta nur Fallback
 
 ---
 
