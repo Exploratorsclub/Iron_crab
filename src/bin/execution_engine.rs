@@ -3744,8 +3744,10 @@ async fn bootstrap_open_positions_from_wallet_snapshot(
             } = &event.kind
             {
                 observed += 1;
-                // FIX-36: Skip SOL/WSOL — they're the quote currency, not tradeable positions
+                // FIX-36: Skip SOL/WSOL — they're the quote currency, not tradeable positions.
+                // Belt-and-suspenders: SOL_MINT == WSOL_MINT, but WSOL_MINT explicit for clarity.
                 if mint == SOL_MINT
+                    || mint == WSOL_MINT
                     || mint == "NATIVE_SOL"
                     || mint == "11111111111111111111111111111111"
                 {
