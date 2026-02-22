@@ -3092,6 +3092,44 @@ impl MomentumContext {
         candidates
     }
 
+    /// Check for exit signals and publish intents. Call on every price-updating event
+    /// (PoolCacheUpdate, Trade) for sub-500ms reaction; strategy_interval is fallback.
+    async fn process_exit_signals(self: &Arc<Self>) {
+        let exits = self.check_for_exits();
+        for (mint, pool, dex, exit_type, reason, token_amount) in exits {
+            info!(
+                mint = %mint,
+                pool = %pool,
+                exit_type = %exit_type,
+                reason = %reason,
+                token_amount = token_amount,
+                "🚨 EXIT SIGNAL DETECTED"
+            );
+
+            if let Err(e) = generate_and_publish_exit_intent(
+                self,
+                &mint,
+                &pool,
+                &dex,
+                &exit_type,
+                &reason,
+                token_amount,
+            )
+            .await
+            {
+                error!(
+                    error = %e,
+                    mint = %mint,
+                    "Failed to generate/publish sell intent - will retry on next event"
+                );
+            } else {
+                self.mark_exit_generated(&mint);
+                self.exits_generated
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     async fn reconcile_timed_exits(self: &Arc<Self>) {
         let now = Instant::now();
         let candidates = self.collect_timed_exit_reconcile_candidates(now);
@@ -5267,7 +5305,8 @@ async fn main() -> Result<()> {
 
     // Heartbeat and stats tracking
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(60));
-    let mut strategy_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    // 500ms fallback when no price updates; primary path is event-driven (PoolCacheUpdate, Trade)
+    let mut strategy_interval = tokio::time::interval(std::time::Duration::from_millis(500));
     let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     let mut reconcile_interval = tokio::time::interval(std::time::Duration::from_secs(15));
     let mut events_received: u64 = 0;
@@ -5312,6 +5351,9 @@ async fn main() -> Result<()> {
                             // Process the event
                             if let Err(e) = process_market_event(&ctx, &event).await {
                                 warn!(error = %e, event_id = %event.event_id, "Failed to process market event");
+                            } else if matches!(event.kind, MarketEventKind::Trade { .. }) {
+                                // Event-driven: Trade updates position price → check exits immediately (<500ms)
+                                ctx.process_exit_signals().await;
                             }
                         }
                         Err(e) => {
@@ -5565,6 +5607,8 @@ async fn main() -> Result<()> {
                             }
                             if msg_count > 0 {
                                 trace!(updates = msg_count, "SLAVE CACHE: processed PoolCacheUpdates");
+                                // Event-driven: check exits immediately after price update (<500ms reaction)
+                                ctx.process_exit_signals().await;
                             }
                         }
                         Err(e) => {
@@ -5601,27 +5645,8 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // === Check for EXIT signals ===
-                let exits = ctx.check_for_exits();
-                for (mint, pool, dex, exit_type, reason, token_amount) in exits {
-                    info!(
-                        mint = %mint,
-                        pool = %pool,
-                        exit_type = %exit_type,
-                        reason = %reason,
-                        token_amount = token_amount,
-                        "🚨 EXIT SIGNAL DETECTED"
-                    );
-
-                    if let Err(e) = generate_and_publish_exit_intent(&ctx, &mint, &pool, &dex, &exit_type, &reason, token_amount).await {
-                        error!(error = %e, mint = %mint, "Failed to generate/publish sell intent - will retry on next tick");
-                        // Do NOT mark exit_generated - allow retry on next strategy tick
-                    } else {
-                        // Only mark exit_generated AFTER successful publish
-                        ctx.mark_exit_generated(&mint);
-                        ctx.exits_generated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
+                // === Check for EXIT signals (fallback; primary = event-driven on PoolCacheUpdate/Trade) ===
+                ctx.process_exit_signals().await;
             }
 
             // Timed-exit reconciliation (retry exits that were generated but never confirmed)
