@@ -1,5 +1,9 @@
 # IronCrab Architektur-Audit – 2026-02-07 (aktualisiert 2026-02-11)
 
+> **⚠️ DEPRECATED:** Dieses Dokument wurde in `ARCHITECTURE_AUDIT.md` (konsolidierte Fassung 2026-02-23) zusammengeführt. Bitte `docs/ARCHITECTURE_AUDIT.md` verwenden.
+
+---
+
 ## Kontext
 
 Systematisches Audit aller RPC-Calls im Codebase mit Fokus auf:
