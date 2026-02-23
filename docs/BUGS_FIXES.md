@@ -895,6 +895,21 @@ Alle drei Pfade erstellen WSOL-ATA bei SELLs (für empfangene SOL).
 
 **Dateien**: `src/bin/market_data.rs`
 
+### FIX-38: Wrong-Pool Price Pollution → falsche TAKE_PROFIT (realer Verlust)
+
+**Datum**: 2026-02-21  
+**Schweregrad**: CRITICAL — TAKE_PROFIT feuert bei +200% laut Bot, tatsächlicher PnL negativ  
+**Symptom**: Trades mit "Take profit hit: +205% gain" im Detail, aber PnL (SOL) und PnL % negativ. Oft ~1 Sekunde nach Probe-Buy.
+
+**Root Cause**: `update_position_price()` akzeptierte Preis-Updates von **beliebigen** Pools. Bei Multi-Pool-Tokens (Bonding Curve + AMM) wurde `current_price` mit Daten eines anderen Pools überschrieben → falsches `pnl_pct()` → TAKE_PROFIT trotz realem Verlust.
+
+**Fix**:
+1. **Pool-Matching**: Trade- und PoolCacheUpdate-Updates nur anwenden, wenn `source_pool == position.pool`
+2. **take_profit_min_hold_secs** (Default 5): TAKE_PROFIT erst nach Mindest-Haltedauer möglich
+
+**Dateien**: `src/bin/momentum_bot.rs`, `src/config.rs`  
+**Details**: `docs/TAKE_PROFIT_FALSE_GAIN_FIX_20260221.md`
+
 ---
 
 ## 4. BEKANNTE ARCHITEKTUR-PROBLEME (aus Architecture Audit)

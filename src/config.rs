@@ -637,6 +637,9 @@ pub struct MomentumCfg {
     /// Take profit percentage (e.g., 100 = +100% = 2x). Default: 100%
     #[serde(default = "default_take_profit")]
     pub take_profit_pct: f64,
+    /// Min hold (secs) before TAKE_PROFIT can fire. Prevents false TP from wrong-pool price.
+    #[serde(default = "default_take_profit_min_hold_secs")]
+    pub take_profit_min_hold_secs: u64,
     /// Max hold time in seconds before forced exit. Default: 300s (5 min)
     #[serde(default = "default_max_hold_time")]
     pub max_hold_time_secs: u64,
@@ -804,6 +807,9 @@ fn default_trailing_activation() -> f64 {
 fn default_take_profit() -> f64 {
     100.0
 }
+fn default_take_profit_min_hold_secs() -> u64 {
+    5
+}
 fn default_max_hold_time() -> u64 {
     300
 }
@@ -897,6 +903,7 @@ impl Default for MomentumCfg {
             trailing_stop_pct: default_trailing_stop(),
             trailing_activation_pct: default_trailing_activation(),
             take_profit_pct: default_take_profit(),
+            take_profit_min_hold_secs: default_take_profit_min_hold_secs(),
             max_hold_time_secs: default_max_hold_time(),
             momentum_exit_buy_ratio: default_momentum_exit_ratio(),
             momentum_exit_window_secs: default_momentum_exit_window(),

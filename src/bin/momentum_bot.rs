@@ -220,6 +220,9 @@ struct MomentumConfig {
     trailing_activation_pct: f64,
     /// Take profit percentage (e.g., 100 = +100% = 2x). Default: 100%
     take_profit_pct: f64,
+    /// Minimum hold time (secs) before TAKE_PROFIT can trigger. Prevents false TP from
+    /// wrong-pool price updates immediately after probe. Default: 5
+    take_profit_min_hold_secs: u64,
     /// Max hold time in seconds before forced exit. Default: 300s (5 min)
     max_hold_time_secs: u64,
     /// Momentum exit: min buy ratio to stay in (e.g., 0.4 = 40% buys). Default: 0.4
@@ -302,6 +305,7 @@ impl Default for MomentumConfig {
             trailing_stop_pct: 20.0,       // -20% from ATH
             trailing_activation_pct: 10.0, // Activate trailing after +10%
             take_profit_pct: 100.0,        // Take profit at +100% (2x)
+            take_profit_min_hold_secs: 5,  // No TP in first 5s (avoids wrong-pool price spike)
             max_hold_time_secs: 300,       // Max 5 minutes hold
             momentum_exit_buy_ratio: 0.4,  // Exit if buy ratio < 40%
             momentum_exit_window_secs: 30, // Check last 30s of trades
@@ -357,6 +361,7 @@ impl MomentumConfig {
             trailing_stop_pct: cfg.trailing_stop_pct,
             trailing_activation_pct: cfg.trailing_activation_pct,
             take_profit_pct: cfg.take_profit_pct,
+            take_profit_min_hold_secs: cfg.take_profit_min_hold_secs,
             max_hold_time_secs: cfg.max_hold_time_secs,
             momentum_exit_buy_ratio: cfg.momentum_exit_buy_ratio,
             momentum_exit_window_secs: cfg.momentum_exit_window_secs,
@@ -694,8 +699,8 @@ impl PositionTracker {
             ));
         }
 
-        // 2. Take Profit - lock in gains
-        if pnl >= config.take_profit_pct {
+        // 2. Take Profit - lock in gains (only after min hold to avoid wrong-pool price spike)
+        if hold_secs >= config.take_profit_min_hold_secs && pnl >= config.take_profit_pct {
             // #region agent log
             dbg_log(
                 "momentum_bot.rs:should_exit_TAKE_PROFIT",
@@ -2782,9 +2787,29 @@ impl MomentumContext {
     }
 
     /// Update position price from market trade or pool reserves.
-    fn update_position_price(&self, mint: &str, new_price: f64, trade: Option<TradeEvent>) {
+    /// If `source_pool` is Some, only update when position.pool matches (prevents wrong-pool
+    /// price pollution for multi-pool tokens, e.g. bonding curve + AMM).
+    fn update_position_price(
+        &self,
+        mint: &str,
+        new_price: f64,
+        trade: Option<TradeEvent>,
+        source_pool: Option<&str>,
+    ) {
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(mint) {
+            if let Some(pool) = source_pool {
+                if !pos.pool.is_empty() && pos.pool != pool {
+                    // Price from different pool – skip to avoid false TAKE_PROFIT
+                    trace!(
+                        mint = %mint,
+                        position_pool = %pos.pool,
+                        source_pool = %pool,
+                        "Skipping price update: source pool != position pool"
+                    );
+                    return;
+                }
+            }
             pos.update_price(new_price);
             if let Some(t) = trade {
                 pos.record_trade(t);
@@ -5663,7 +5688,12 @@ async fn main() -> Result<()> {
                                                         "H-E",
                                                     );
                                                     // #endregion
-                                                    ctx.update_position_price(&token_mint, tokens_per_sol, None);
+                                                    ctx.update_position_price(
+                                                        &token_mint,
+                                                        tokens_per_sol,
+                                                        None,
+                                                        Some(&update.pool_address),
+                                                    );
                                                 }
                                             }
                                             msg_count += 1;
@@ -7484,7 +7514,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     token_amount: token_raw,
                     signature: sig.clone(),
                 };
-                ctx.update_position_price(mint, tokens_per_sol, Some(trade));
+                ctx.update_position_price(mint, tokens_per_sol, Some(trade), Some(&pool_address));
             }
 
             if is_dev {

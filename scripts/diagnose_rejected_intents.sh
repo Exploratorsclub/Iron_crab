@@ -44,3 +44,13 @@ echo "=== 4. Letzte Rejects im Detail (falls vorhanden) ==="
 if [ -f "$DECISION_FILE" ]; then
   jq -c 'select(.primary_reject_reason != null) | {intent_id, primary_reject_reason, source, outcome}' "$DECISION_FILE" 2>/dev/null | tail -5
 fi
+
+echo ""
+echo "=== 5. SimFailed/QuoteUnavailable Details (letzte 3) ==="
+if [ -f "$DECISION_FILE" ]; then
+  jq -c 'select(.primary_reject_reason == "SIM_FAILED" or .primary_reject_reason == "QuoteUnavailable") | {intent_id, primary_reject_reason, simulate: .simulate.error_code}' "$DECISION_FILE" 2>/dev/null | tail -3
+fi
+
+echo ""
+echo "=== 6. Service-Status ==="
+sudo systemctl is-active momentum-bot execution-engine market-data 2>/dev/null | paste - - - - 2>/dev/null || echo "systemctl nicht verfügbar"
