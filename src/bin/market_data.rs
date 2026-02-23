@@ -2425,6 +2425,54 @@ async fn run_geyser_loop(
                                     }
                                 }
                             }
+                            // A.1 Phase 2.1: Register PumpAmm vaults for Geyser subscription (base/quote reserve updates)
+                            {
+                                let dex_str = "pump_amm".to_string();
+                                let mut vaults_changed = false;
+                                {
+                                    let mut vaults = ctx.tracked_vaults.write();
+                                    vaults
+                                        .entry(s.pool_base_token_account)
+                                        .or_insert_with(|| {
+                                            vaults_changed = true;
+                                            VaultInfo {
+                                                pool_address: account_update.pubkey,
+                                                dex: dex_str.clone(),
+                                                base_mint: s.base_mint,
+                                                quote_mint: s.quote_mint,
+                                                is_base_vault: true,
+                                                last_balance: std::sync::atomic::AtomicU64::new(0),
+                                                active_id: None,
+                                                bin_step: None,
+                                            }
+                                        });
+                                    vaults
+                                        .entry(s.pool_quote_token_account)
+                                        .or_insert_with(|| {
+                                            vaults_changed = true;
+                                            VaultInfo {
+                                                pool_address: account_update.pubkey,
+                                                dex: dex_str,
+                                                base_mint: s.base_mint,
+                                                quote_mint: s.quote_mint,
+                                                is_base_vault: false,
+                                                last_balance: std::sync::atomic::AtomicU64::new(0),
+                                                active_id: None,
+                                                bin_step: None,
+                                            }
+                                        });
+                                }
+                                if vaults_changed {
+                                    let vault_list: Vec<Pubkey> = ctx.tracked_vaults.read().keys().copied().collect();
+                                    let _ = ctx.tracked_vaults_tx.send(vault_list);
+                                    debug!(
+                                        pool = %account_update.pubkey,
+                                        base_vault = %s.pool_base_token_account,
+                                        quote_vault = %s.pool_quote_token_account,
+                                        "A.1: Registered PumpAmm vaults for Geyser reserve subscription"
+                                    );
+                                }
+                            }
                             (s.base_mint, s.quote_mint, s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
                         }
                         CachedPoolState::PumpFun(s) => {

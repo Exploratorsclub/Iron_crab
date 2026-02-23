@@ -203,7 +203,8 @@ impl CrossDexHandler {
         info!("Initialized Raydium DEX connector (for IX building only)");
 
         // Initialize PumpFun (Bonding Curve) - for build_swap_ix() only
-        let mut pumpfun = PumpFunDex::new(Arc::clone(&self.rpc), None)?;
+        // A.1 Phase 4: Pass pool_cache for Arb-Pfad (creator lookup from cache, avoids RPC)
+        let mut pumpfun = PumpFunDex::new(Arc::clone(&self.rpc), self.pool_cache.clone())?;
         if let Some(pk) = self.wallet_pubkey {
             pumpfun.set_user_authority(pk);
         }
