@@ -4,7 +4,8 @@ alwaysApply: true
 ---
 
 # IronCrab Core Rules
-- Follow `docs/TARGET_ARCHITECTURE.md` and `docs/DEFINITION_OF_DONE.md` as source of truth; also respect `docs/STORAGE_CONVENTIONS.md` and `docs/ROLE_SEPARATION.md`.
+- Follow `docs/TARGET_ARCHITECTURE.md` and `docs/DEFINITION_OF_DONE.md` as source of truth; also respect `docs/STORAGE_CONVENTIONS.md`, `docs/ROLE_SEPARATION.md`, and `docs/ORDER_LIFECYCLE.md` for state flows.
+- Before changes: read `docs/INVARIANTS.md` (never violate) and `docs/KNOWN_BUG_PATTERNS.md` (check for similar patterns).
 - Propose a plan before coding.
 - Do not change architecture without explicit approval.
 - Prefer small, isolated changes.
@@ -22,3 +23,9 @@ alwaysApply: true
 - COLD PATH (liquidation, manual actions, bootstrap): RPC calls ARE acceptable. Safety and correctness have priority over speed. Use getTokenAccountsByOwner, getMultipleAccounts etc. for authoritative on-chain state.
 - NEVER remove RPC from cold paths to "optimize" — this breaks safety-critical flows. NEVER add RPC to hot paths without explicit approval — this breaks latency requirements.
 - When refactoring RPC usage, always verify which path (hot vs cold) is affected. Changes that touch both paths require explicit approval.
+
+## Feature-Scoped Prompts
+When the user scopes a task (e.g. "fix X in momentum-bot", "add Y to execution-engine"):
+- **Allowed files**: Restrict edits to the explicitly mentioned component/module. If unclear, ask: "Soll ich nur [component] ändern oder auch [other]?"
+- **Forbidden files**: Do NOT change Hot Path execution logic, RPC usage, or key-loading without explicit user approval. Avoid cross-component edits that could cause side effects.
+- **Scope check**: Before editing a file, confirm it is within the task scope. If the fix logically requires changes elsewhere, propose the plan first and get approval.
