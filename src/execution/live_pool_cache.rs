@@ -1398,6 +1398,250 @@ mod tests {
         assert!(cache.mint_programs.is_empty());
     }
 
+    // ========================================================================
+    // Phase 1.1: PumpAmm-spezifische API (A.1 Geyser-First)
+    // ========================================================================
+
+    fn make_pump_amm_state(
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        base_reserve: Option<u64>,
+        quote_reserve: Option<u64>,
+        pool_accounts: Vec<Pubkey>,
+    ) -> CachedPoolState {
+        CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint,
+            quote_mint,
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve,
+            quote_reserve,
+            pool_accounts,
+            creator: None,
+        })
+    }
+
+    #[test]
+    fn test_get_pump_amm_reserves_by_base_mint_hit() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                vec![],
+            ),
+            100,
+        );
+
+        let result = cache.get_pump_amm_reserves_by_base_mint(&base_mint);
+        assert_eq!(result, Some((1_000_000_000, 50_000_000_000, pool_market)));
+    }
+
+    #[test]
+    fn test_get_pump_amm_reserves_by_base_mint_miss() {
+        let cache = LivePoolCache::new();
+        let unknown_base_mint = Pubkey::new_unique();
+
+        let result = cache.get_pump_amm_reserves_by_base_mint(&unknown_base_mint);
+        assert_eq!(result, None);
+
+        // Also verify: cache with other DEX type returns None for unknown mint
+        let pool = Pubkey::new_unique();
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: Pubkey::new_unique(),
+                token_1_mint: Pubkey::new_unique(),
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            100,
+        );
+        let result = cache.get_pump_amm_reserves_by_base_mint(&unknown_base_mint);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_pump_amm_reserves_by_base_mint_missing_reserves() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(base_mint, quote_mint, None, None, vec![]),
+            100,
+        );
+
+        let result = cache.get_pump_amm_reserves_by_base_mint(&base_mint);
+        assert_eq!(result, None);
+
+        // Only base_reserve set
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                None,
+                vec![],
+            ),
+            101,
+        );
+        let result = cache.get_pump_amm_reserves_by_base_mint(&base_mint);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_pump_amm_pool_accounts_by_base_mint_hit() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1),
+                Some(1),
+                pool_accounts.clone(),
+            ),
+            100,
+        );
+
+        let result = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint);
+        assert!(result.is_some());
+        let accounts = result.unwrap();
+        assert_eq!(accounts.len(), 14);
+        assert_eq!(accounts, pool_accounts);
+    }
+
+    #[test]
+    fn test_get_pump_amm_pool_accounts_by_base_mint_empty() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                vec![],
+            ),
+            100,
+        );
+
+        let result = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_set_pump_amm_pool_accounts() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let accounts_to_set: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(base_mint, quote_mint, Some(1), Some(1), vec![]),
+            100,
+        );
+
+        cache.set_pump_amm_pool_accounts(&pool_market, accounts_to_set.clone());
+
+        let result = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), accounts_to_set);
+
+        let by_pool = cache.get_pump_amm_pool_accounts(&pool_market);
+        assert!(by_pool.is_some());
+        assert_eq!(by_pool.unwrap(), accounts_to_set);
+    }
+
+    #[test]
+    fn test_mark_pumpfun_complete_for_mint() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint,
+                bonding_curve: Pubkey::new_unique(),
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_000_000_000_000_000,
+                real_sol_reserves: 0,
+                real_token_reserves: 793_100_000_000_000,
+                complete: false,
+                creator: Pubkey::new_unique(),
+            }),
+            100,
+        );
+
+        let result = cache.mark_pumpfun_complete_for_mint(&token_mint);
+        assert!(result);
+
+        if let Some(CachedPoolState::PumpFun(s)) = cache.get(&pool) {
+            assert!(s.complete);
+        } else {
+            panic!("Expected PumpFun state");
+        }
+    }
+
+    #[test]
+    fn test_mark_pumpfun_complete_wrong_mint() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token_mint_a = Pubkey::new_unique();
+        let wrong_mint = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: token_mint_a,
+                bonding_curve: Pubkey::new_unique(),
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_000_000_000_000_000,
+                real_sol_reserves: 0,
+                real_token_reserves: 793_100_000_000_000,
+                complete: false,
+                creator: Pubkey::new_unique(),
+            }),
+            100,
+        );
+
+        let result = cache.mark_pumpfun_complete_for_mint(&wrong_mint);
+        assert!(!result);
+
+        if let Some(CachedPoolState::PumpFun(s)) = cache.get(&pool) {
+            assert!(!s.complete);
+        } else {
+            panic!("Expected PumpFun state");
+        }
+    }
+
     #[test]
     fn test_cache_entry_age() {
         let state = CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
