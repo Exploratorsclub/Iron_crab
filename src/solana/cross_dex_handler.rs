@@ -1314,9 +1314,9 @@ impl CrossDexHandler {
         }
     }
 
-    /// Get a reference to a DEX connector by name
-    pub fn get_dex(&self, name: &str) -> Option<&Arc<dyn Dex>> {
-        self.dexes.get(name)
+    /// Get a specific DEX connector by name (for tests and debugging).
+    pub fn get_dex(&self, name: &str) -> Option<Arc<dyn Dex>> {
+        self.dexes.get(name).cloned()
     }
 
     /// Get all DEX connectors as a Vec (for Router construction)
@@ -1327,6 +1327,68 @@ impl CrossDexHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::execution::live_pool_cache::{CachedPoolState, LivePoolCache, PumpAmmState};
+    use crate::solana::dex::router::Router;
+    use crate::solana::rpc::SolanaRpc;
+    use solana_sdk::pubkey::Pubkey;
+    use std::str::FromStr;
+
+    fn make_pump_amm_cache_with_reserves(
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+        base_reserve: u64,
+        quote_reserve: u64,
+    ) -> Arc<LivePoolCache> {
+        let cache = LivePoolCache::new();
+        cache.upsert(
+            pool_market,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint: Pubkey::from_str(SOL_MINT).unwrap(),
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(base_reserve),
+                quote_reserve: Some(quote_reserve),
+                pool_accounts: vec![],
+                creator: None,
+            }),
+            100,
+        );
+        Arc::new(cache)
+    }
+
+    #[tokio::test]
+    async fn test_cross_dex_handler_pump_amm_uses_cache() {
+        let base_mint = Pubkey::new_unique();
+        let pool_market = Pubkey::new_unique();
+        let cache = make_pump_amm_cache_with_reserves(
+            pool_market,
+            base_mint,
+            1_000_000_000_000,
+            50_000_000_000,
+        );
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mut handler = CrossDexHandler::new(rpc.clone(), None)
+            .with_rpc_url("http://127.0.0.1:0".to_string())
+            .with_pool_cache(cache);
+        handler.init_dexes().await.expect("init_dexes must succeed");
+
+        let pump_amm = handler.get_dex("pump_amm").expect("pump_amm must exist");
+        let router = Router::new(vec![pump_amm]);
+        let base_mint_str = base_mint.to_string();
+        let quote = router
+            .best_quote_exact_in(SOL_MINT, &base_mint_str, 1_000_000_000)
+            .await;
+
+        assert!(quote.is_ok(), "quote should succeed");
+        let route_quote = quote.unwrap();
+        assert!(
+            route_quote.is_some(),
+            "expected Some(RouteQuote) — cache was used, otherwise RPC would have failed"
+        );
+    }
+
     #[test]
     fn test_is_cross_dex_arb_intent() {
         // Would need mock TradeIntent for proper testing
