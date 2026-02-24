@@ -1655,6 +1655,10 @@ pub struct ExecutionResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
 
+    /// Error code from simulation or on-chain failure (e.g. "Custom(6005)", "Custom(6023)")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+
     /// Duration from intent received to confirmation (ms)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
@@ -1698,9 +1702,16 @@ impl ExecutionResult {
             fees: None,
             pnl: None,
             error_message: None,
+            error_code: None,
             latency_ms: None,
             metadata: std::collections::HashMap::new(),
         }
+    }
+
+    /// Set error code from simulation or on-chain failure
+    pub fn with_error_code(mut self, code: Option<String>) -> Self {
+        self.error_code = code;
+        self
     }
 
     /// Attach metadata from the TradeIntent (exit_type, reason_detail, etc.)

@@ -475,6 +475,32 @@ fn test_execution_result_fill_unavailable_reason_roundtrip() {
     );
 }
 
+#[test]
+fn test_execution_result_error_code_roundtrip() {
+    let mut result = ExecutionResult::new_sent(
+        "execution-engine",
+        "v0.1.0",
+        "run-789",
+        "exe-003".to_string(),
+        "dec-003".to_string(),
+        "intent-003".to_string(),
+        "momentum-bot".to_string(),
+        Some("mint123".to_string()),
+        None,
+        None,
+    )
+    .with_error_code(Some("Custom(6005)".to_string()));
+    result.status = ExecutionStatus::Failed;
+    result.error_message = Some("execution_failed".to_string());
+
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(json.contains("error_code"));
+    assert!(json.contains("Custom(6005)"));
+
+    let parsed: ExecutionResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.error_code, Some("Custom(6005)".to_string()));
+}
+
 /// Test RejectReason serialization and categorization
 #[test]
 fn test_reject_reason_codes() {

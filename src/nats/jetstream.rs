@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use async_nats::jetstream;
 use tracing::{info, warn};
 
-use super::{TOPIC_TRADE_INTENTS, TOPIC_WALLET_SNAPSHOT_PATTERN};
+use super::{TOPIC_EXECUTION_RESULTS, TOPIC_TRADE_INTENTS, TOPIC_WALLET_SNAPSHOT_PATTERN};
 
 /// JetStream stream name for pool cache updates
 pub const STREAM_NAME: &str = "POOL_CACHE";
@@ -35,6 +35,9 @@ pub const WALLET_SNAPSHOT_STREAM_NAME: &str = "WALLET_SNAPSHOT";
 
 /// JetStream stream name for trade intents (persistent, avoids startup race with Core NATS)
 pub const TRADE_INTENTS_STREAM_NAME: &str = "TRADE_INTENTS";
+
+/// JetStream stream name for execution results (persistent, enables replay/audit)
+pub const EXECUTION_RESULTS_STREAM_NAME: &str = "EXECUTION_RESULTS";
 
 /// Subject pattern for pool cache (subject-per-pool for compaction)
 pub const SUBJECT_PATTERN: &str = "ironcrab.pool_cache.*";
@@ -236,6 +239,60 @@ pub async fn ensure_trade_intents_stream(client: &async_nats::Client) -> Result<
             );
             Err(e).context("TRADE_INTENTS stream creation failed")
         }
+    }
+}
+
+/// Create or update the EXECUTION_RESULTS stream
+///
+/// Persists execution results so momentum_bot and market_data can consume them
+/// even after restarts (fixes Core NATS fire-and-forget race). Enables replay and audit.
+pub async fn ensure_execution_results_stream(client: &async_nats::Client) -> Result<()> {
+    let jetstream = jetstream::new(client.clone());
+
+    let stream_config = jetstream::stream::Config {
+        name: EXECUTION_RESULTS_STREAM_NAME.to_string(),
+        subjects: vec![TOPIC_EXECUTION_RESULTS.to_string()],
+        retention: jetstream::stream::RetentionPolicy::Limits,
+        max_age: std::time::Duration::from_secs(7 * 24 * 60 * 60), // 7 days
+        storage: jetstream::stream::StorageType::File,
+        num_replicas: 1,
+        discard: jetstream::stream::DiscardPolicy::Old,
+        ..Default::default()
+    };
+
+    match jetstream.get_or_create_stream(stream_config).await {
+        Ok(mut stream) => {
+            let info = stream.info().await?;
+            info!(
+                stream_name = %EXECUTION_RESULTS_STREAM_NAME,
+                subject = TOPIC_EXECUTION_RESULTS,
+                num_messages = info.state.messages,
+                "JetStream EXECUTION_RESULTS stream ready"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                stream_name = %EXECUTION_RESULTS_STREAM_NAME,
+                error = %e,
+                "Failed to create/update EXECUTION_RESULTS stream"
+            );
+            Err(e).context("EXECUTION_RESULTS stream creation failed")
+        }
+    }
+}
+
+/// Consumer config for execution results (All = includes results published before we subscribed)
+pub fn execution_results_consumer_config(
+    durable_name: &str,
+) -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::All,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        durable_name: Some(durable_name.to_string()),
+        max_ack_pending: 1000,
+        filter_subject: TOPIC_EXECUTION_RESULTS.to_string(),
+        ..Default::default()
     }
 }
 

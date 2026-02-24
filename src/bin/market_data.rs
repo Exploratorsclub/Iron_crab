@@ -40,11 +40,11 @@ use ironcrab::metrics::{
     NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
-    config_consumer_config, config_subject, ensure_pool_cache_stream,
-    ensure_wallet_snapshot_stream, pool_subject, wallet_balance_topic,
-    wallet_snapshot_consumer_config, wallet_snapshot_subject, NatsClient, NatsConfig,
-    CONFIG_STREAM_NAME, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES,
-    WALLET_SNAPSHOT_STREAM_NAME,
+    config_consumer_config, config_subject, ensure_execution_results_stream,
+    ensure_pool_cache_stream, ensure_wallet_snapshot_stream, execution_results_consumer_config,
+    pool_subject, wallet_balance_topic, wallet_snapshot_consumer_config, wallet_snapshot_subject,
+    NatsClient, NatsConfig, CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, TOPIC_EXECUTION_RESULTS,
+    TOPIC_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
@@ -1369,6 +1369,13 @@ async fn main() -> Result<()> {
                 info!("JetStream WALLET_SNAPSHOT stream ready for position reconciliation");
             }
 
+            // Initialize JetStream stream for ExecutionResults (wallet ATA tracking)
+            if let Err(e) = ensure_execution_results_stream(client.client()).await {
+                warn!(error = %e, "Failed to create/update JetStream EXECUTION_RESULTS stream");
+            } else {
+                info!("JetStream EXECUTION_RESULTS stream ready for wallet ATA tracking");
+            }
+
             Some(client)
         }
     };
@@ -1697,25 +1704,38 @@ async fn run_geyser_loop(
     let mut last_heartbeat = std::time::Instant::now();
     let mut activity_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
-    // Subscribe to execution results so we can track newly created ATAs/mints without RPC.
+    // JetStream consumer for execution results (wallet ATA tracking)
     //
     // This is the trigger that makes wallet tracking "just work" after a BUY:
     // execution-engine already knows token_account/token_program/mint_decimals deterministically.
-    let mut execution_results_subscription: Option<ironcrab::nats::NatsSubscription> = if let Some(
-        ref nats,
-    ) =
-        ctx.nats
-    {
-        match nats.subscribe(TOPIC_EXECUTION_RESULTS).await {
-            Ok(sub) => {
-                info!(
-                    topic = TOPIC_EXECUTION_RESULTS,
-                    "Subscribed to ExecutionResults for wallet ATA tracking"
-                );
-                Some(sub)
-            }
+    let execution_js_consumer = if let Some(ref nats) = ctx.nats {
+        use async_nats::jetstream;
+
+        let jetstream = jetstream::new(nats.client().clone());
+        match jetstream.get_stream(EXECUTION_RESULTS_STREAM_NAME).await {
+            Ok(stream) => match stream
+                .create_consumer(execution_results_consumer_config("market-data"))
+                .await
+            {
+                Ok(consumer) => {
+                    info!(
+                        stream = EXECUTION_RESULTS_STREAM_NAME,
+                        topic = TOPIC_EXECUTION_RESULTS,
+                        "Subscribed to ExecutionResults via JetStream for wallet ATA tracking"
+                    );
+                    Some(consumer)
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to create execution results consumer (wallet ATA auto-tracking disabled)");
+                    None
+                }
+            },
             Err(e) => {
-                warn!(error = %e, "Failed to subscribe to ExecutionResults (wallet ATA auto-tracking disabled)");
+                warn!(
+                    error = %e,
+                    stream = EXECUTION_RESULTS_STREAM_NAME,
+                    "Failed to get execution results stream"
+                );
                 None
             }
         }
@@ -1753,243 +1773,270 @@ async fn run_geyser_loop(
                 let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
             }
 
-            // Track wallet ATAs/mints from execution-engine results (no RPC).
-            msg = async {
-                if let Some(ref mut sub) = execution_results_subscription {
-                    sub.next().await
-                } else {
-                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
-                }
-            } => {
-                if let Some(nats_msg) = msg {
-                    let exec: ExecutionResult = match serde_json::from_slice(&nats_msg.payload) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            debug!(error = %e, "Failed to deserialize ExecutionResult");
-                            continue;
-                        }
-                    };
+            // Track wallet ATAs/mints from execution-engine results via JetStream (no RPC).
+            _ = async {
+                use futures::StreamExt;
+                if let Some(ref consumer) = execution_js_consumer {
+                    match consumer
+                        .fetch()
+                        .max_messages(50)
+                        .expires(std::time::Duration::from_millis(100))
+                        .messages()
+                        .await
+                    {
+                        Ok(mut messages) => {
+                            while let Some(msg_result) = messages.next().await {
+                                match msg_result {
+                                    Ok(msg) => {
+                                        let exec: ExecutionResult = match serde_json::from_slice(&msg.payload) {
+                                            Ok(e) => e,
+                                            Err(e) => {
+                                                debug!(error = %e, "Failed to deserialize ExecutionResult");
+                                                let _ = msg.ack().await;
+                                                continue;
+                                            }
+                                        };
 
-                    // Dedup on execution_id (fallback: signature)
-                    let dedup_key = if !exec.execution_id.is_empty() {
+                                        // Dedup on execution_id (fallback: signature)
+                                        let dedup_key = if !exec.execution_id.is_empty() {
                         exec.execution_id.clone()
                     } else {
                         exec.signature.clone().unwrap_or_else(|| exec.decision_id.clone())
                     };
-                    {
-                        let mut deduper = ctx.execution_results_deduper.lock();
-                        if !deduper.should_process(&dedup_key) {
-                            continue;
-                        }
-                    }
+                                        {
+                                            let mut deduper = ctx.execution_results_deduper.lock();
+                                            if !deduper.should_process(&dedup_key) {
+                                                let _ = msg.ack().await;
+                                                continue;
+                                            }
+                                        }
 
-                    let Some(ref tracked_wallet) = ctx.tracked_wallet else {
-                        // No wallet configured → nothing to track.
-                        continue;
-                    };
+                                        let Some(ref tracked_wallet) = ctx.tracked_wallet else {
+                                            let _ = msg.ack().await;
+                                            continue;
+                                        };
 
-                    let mint_str = match exec.token_mint.as_deref() {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    let mint = match Pubkey::from_str(mint_str) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
+                                        let mint_str = match exec.token_mint.as_deref() {
+                                            Some(s) => s,
+                                            None => {
+                                                let _ = msg.ack().await;
+                                                continue;
+                                            }
+                                        };
+                                        let mint = match Pubkey::from_str(mint_str) {
+                                            Ok(m) => m,
+                                            Err(_) => {
+                                                let _ = msg.ack().await;
+                                                continue;
+                                            }
+                                        };
 
-                    let ata_str = match exec.metadata.get("token_account") {
-                        Some(s) => s,
-                        None => {
-                            warn!(
-                                execution_id = %exec.execution_id,
-                                wallet = %tracked_wallet.wallet,
-                                mint = ?exec.token_mint,
-                                intent_id = %exec.intent_id,
-                                side = ?exec.metadata.get("side"),
-                                "ExecutionResult missing metadata.token_account — cannot track ATA"
-                            );
-                            continue;
-                        }
-                    };
-                    let ata = match Pubkey::from_str(ata_str) {
-                        Ok(a) => a,
-                        Err(_) => {
-                            warn!(
-                                execution_id = %exec.execution_id,
-                                wallet = %tracked_wallet.wallet,
-                                ata = %ata_str,
-                                mint = ?exec.token_mint,
-                                intent_id = %exec.intent_id,
-                                "ExecutionResult metadata.token_account is not a valid Pubkey"
-                            );
-                            continue;
-                        }
-                    };
+                                        let ata_str = match exec.metadata.get("token_account") {
+                                            Some(s) => s,
+                                            None => {
+                                                warn!(
+                                                    execution_id = %exec.execution_id,
+                                                    wallet = %tracked_wallet.wallet,
+                                                    mint = ?exec.token_mint,
+                                                    intent_id = %exec.intent_id,
+                                                    side = ?exec.metadata.get("side"),
+                                                    "ExecutionResult missing metadata.token_account — cannot track ATA"
+                                                );
+                                                let _ = msg.ack().await;
+                                                continue;
+                                            }
+                                        };
+                                        let ata = match Pubkey::from_str(ata_str) {
+                                            Ok(a) => a,
+                                            Err(_) => {
+                                                warn!(
+                                                    execution_id = %exec.execution_id,
+                                                    wallet = %tracked_wallet.wallet,
+                                                    ata = %ata_str,
+                                                    mint = ?exec.token_mint,
+                                                    intent_id = %exec.intent_id,
+                                                    "ExecutionResult metadata.token_account is not a valid Pubkey"
+                                                );
+                                                let _ = msg.ack().await;
+                                                continue;
+                                            }
+                                        };
 
-                    let token_program_str = match exec.metadata.get("token_program") {
-                        Some(s) => s,
-                        None => {
-                            warn!(
-                                execution_id = %exec.execution_id,
-                                wallet = %tracked_wallet.wallet,
-                                mint = ?exec.token_mint,
-                                intent_id = %exec.intent_id,
-                                side = ?exec.metadata.get("side"),
-                                "ExecutionResult missing metadata.token_program — cannot track ATA"
-                            );
-                            continue;
-                        }
-                    };
-                    let token_program = match Pubkey::from_str(token_program_str) {
-                        Ok(p) => p,
-                        Err(_) => {
-                            warn!(
-                                execution_id = %exec.execution_id,
-                                wallet = %tracked_wallet.wallet,
-                                token_program = %token_program_str,
-                                mint = ?exec.token_mint,
-                                "ExecutionResult metadata.token_program is not a valid Pubkey"
-                            );
-                            continue;
-                        }
-                    };
-                    // Only support SPL Token + Token-2022 for wallet ATA tracking.
-                    // If metadata is malformed, avoid subscribing junk accounts.
-                    if token_program.to_bytes() != spl_token::ID.to_bytes()
-                        && token_program.to_bytes() != spl_token_2022::ID.to_bytes()
-                    {
-                        continue;
-                    }
+                                        let token_program_str = match exec.metadata.get("token_program") {
+                                            Some(s) => s,
+                                            None => {
+                                                warn!(
+                                                    execution_id = %exec.execution_id,
+                                                    wallet = %tracked_wallet.wallet,
+                                                    mint = ?exec.token_mint,
+                                                    intent_id = %exec.intent_id,
+                                                    side = ?exec.metadata.get("side"),
+                                                    "ExecutionResult missing metadata.token_program — cannot track ATA"
+                                                );
+                                                let _ = msg.ack().await;
+                                                continue;
+                                            }
+                                        };
+                                        let token_program = match Pubkey::from_str(token_program_str) {
+                                            Ok(p) => p,
+                                            Err(_) => {
+                                                warn!(
+                                                    execution_id = %exec.execution_id,
+                                                    wallet = %tracked_wallet.wallet,
+                                                    token_program = %token_program_str,
+                                                    mint = ?exec.token_mint,
+                                                    "ExecutionResult metadata.token_program is not a valid Pubkey"
+                                                );
+                                                let _ = msg.ack().await;
+                                                continue;
+                                            }
+                                        };
+                                        // Only support SPL Token + Token-2022 for wallet ATA tracking.
+                                        if token_program.to_bytes() != spl_token::ID.to_bytes()
+                                            && token_program.to_bytes() != spl_token_2022::ID.to_bytes()
+                                        {
+                                            let _ = msg.ack().await;
+                                            continue;
+                                        }
 
-                    let mint_decimals: Option<u8> = exec
-                        .metadata
-                        .get("mint_decimals")
-                        .and_then(|s| s.parse::<u8>().ok());
+                                                        let mint_decimals: Option<u8> = exec
+                                            .metadata
+                                            .get("mint_decimals")
+                                            .and_then(|s| s.parse::<u8>().ok());
 
-                    // 1) Track ATA for wallet updates (Geyser subscription list)
-                    let mut added_ata = false;
-                    {
-                        let mut set = ctx.tracked_wallet_token_accounts.write();
-                        if set.insert(ata) {
-                            added_ata = true;
-                        }
-                    }
+                                        // 1) Track ATA for wallet updates (Geyser subscription list)
+                                        let mut added_ata = false;
+                                        {
+                                            let mut set = ctx.tracked_wallet_token_accounts.write();
+                                            if set.insert(ata) {
+                                                added_ata = true;
+                                            }
+                                        }
 
-                    // 2) Cache decimals if provided (fast path; Geyser mint info is authoritative later)
-                    if let Some(d) = mint_decimals {
-                        ctx.tracked_wallet_mint_decimals.write().insert(mint, d);
-                        // PR1: Also populate MASTER LivePoolCache (consistent with Geyser path)
-                        ctx.live_pool_cache.set_mint_decimals(mint, d);
-                    }
+                                        // 2) Cache decimals if provided
+                                        if let Some(d) = mint_decimals {
+                                            ctx.tracked_wallet_mint_decimals.write().insert(mint, d);
+                                            ctx.live_pool_cache.set_mint_decimals(mint, d);
+                                        }
 
-                    // 3) Track mint so Geyser will deliver the mint account → TokenMintInfo
-                    let mut added_mint = false;
-                    {
-                        let mut tracked = ctx.tracked_mints.write();
-                        if tracked.insert(mint) {
-                            added_mint = true;
-                            let updated: Vec<Pubkey> = tracked.iter().copied().collect();
-                            let _ = ctx.tracked_mints_tx.send(updated);
-                        }
-                    }
+                                        // 3) Track mint so Geyser will deliver the mint account
+                                        let mut added_mint = false;
+                                        {
+                                            let mut tracked = ctx.tracked_mints.write();
+                                            if tracked.insert(mint) {
+                                                added_mint = true;
+                                                let updated: Vec<Pubkey> = tracked.iter().copied().collect();
+                                                let _ = ctx.tracked_mints_tx.send(updated);
+                                            }
+                                        }
 
-                    // 4) Recompute tracked wallet accounts and notify listener (resubscribe)
-                    if added_ata {
-                        let mut accounts: Vec<Pubkey> = Vec::new();
-                        accounts.push(tracked_wallet.wallet);
-                        accounts.push(tracked_wallet.wsol_ata);
-                        accounts.extend(ctx.tracked_wallet_token_accounts.read().iter().copied());
-                        accounts.sort();
-                        accounts.dedup();
-                        let _ = ctx.tracked_wallet_tx.send(accounts);
-                    }
+                                        // 4) Recompute tracked wallet accounts and notify listener
+                                        if added_ata {
+                                            let mut accounts: Vec<Pubkey> = Vec::new();
+                                            accounts.push(tracked_wallet.wallet);
+                                            accounts.push(tracked_wallet.wsol_ata);
+                                            accounts.extend(ctx.tracked_wallet_token_accounts.read().iter().copied());
+                                            accounts.sort();
+                                            accounts.dedup();
+                                            let _ = ctx.tracked_wallet_tx.send(accounts);
+                                        }
 
-                    let is_confirmed_sell = exec.status == ExecutionStatus::Confirmed
-                        && exec.metadata.get("side").map(|s| s.as_str()) == Some("SELL");
+                                        let is_confirmed_sell = exec.status == ExecutionStatus::Confirmed
+                                            && exec.metadata.get("side").map(|s| s.as_str()) == Some("SELL");
 
-                    info!(
-                        execution_id = %exec.execution_id,
-                        mint = %mint,
-                        ata = %ata,
-                        token_program = %token_program,
-                        mint_decimals = ?mint_decimals,
-                        added_ata,
-                        added_mint,
-                        is_confirmed_sell,
-                        "ExecutionResult: tracked wallet ATA/mint"
-                    );
+                                        info!(
+                                            execution_id = %exec.execution_id,
+                                            mint = %mint,
+                                            ata = %ata,
+                                            token_program = %token_program,
+                                            mint_decimals = ?mint_decimals,
+                                            added_ata,
+                                            added_mint,
+                                            is_confirmed_sell,
+                                            "ExecutionResult: tracked wallet ATA/mint"
+                                        );
 
-                    // 5) For confirmed SELLs: write zero-balance snapshot to JetStream
-                    //    and untrack ATA. Geyser does NOT send updates for closed/deleted
-                    //    token accounts, so without this, stale non-zero balances persist
-                    //    in JetStream and cause ghost positions after restart.
-                    if is_confirmed_sell {
-                        let wallet_str = tracked_wallet.wallet.to_string();
-                        let snapshot = MarketEvent::new(
-                            "market-data",
-                            BUILD_VERSION,
-                            &ctx.run_id,
-                            format!("wallet_snapshot_sell_{}", exec.execution_id),
-                            "execution_result_sell",
-                            None,
-                            MarketEventKind::WalletBalanceSnapshot {
-                                mint: mint_str.to_string(),
-                                balance_raw: 0,
-                                decimals: mint_decimals.unwrap_or(9),
-                                token_program: token_program_str.clone(),
-                            },
-                        );
-                        if let Some(ref nats) = ctx.nats {
-                            let subject = wallet_snapshot_subject(&wallet_str, mint_str);
-                            if let Err(e) = nats.jetstream_publish(&subject, &snapshot).await {
-                                warn!(error = %e, mint = %mint_str, "Failed to publish zero-balance snapshot to JetStream after SELL");
-                            }
-                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &snapshot).await {
-                                warn!(error = %e, mint = %mint_str, "Failed to publish zero-balance snapshot to Core NATS after SELL");
-                            }
+                                        // 5) For confirmed SELLs: write zero-balance snapshot and untrack ATA
+                                        if is_confirmed_sell {
+                                            let wallet_str = tracked_wallet.wallet.to_string();
+                                            let snapshot = MarketEvent::new(
+                                                "market-data",
+                                                BUILD_VERSION,
+                                                &ctx.run_id,
+                                                format!("wallet_snapshot_sell_{}", exec.execution_id),
+                                                "execution_result_sell",
+                                                None,
+                                                MarketEventKind::WalletBalanceSnapshot {
+                                                    mint: mint_str.to_string(),
+                                                    balance_raw: 0,
+                                                    decimals: mint_decimals.unwrap_or(9),
+                                                    token_program: token_program_str.clone(),
+                                                },
+                                            );
+                                            if let Some(ref nats) = ctx.nats {
+                                                let subject = wallet_snapshot_subject(&wallet_str, mint_str);
+                                                if let Err(e) = nats.jetstream_publish(&subject, &snapshot).await {
+                                                    warn!(error = %e, mint = %mint_str, "Failed to publish zero-balance snapshot to JetStream after SELL");
+                                                }
+                                                if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &snapshot).await {
+                                                    warn!(error = %e, mint = %mint_str, "Failed to publish zero-balance snapshot to Core NATS after SELL");
+                                                }
 
-                            // When WSOL ATA was closed, notify WsolManager/LockManager immediately
-                            // so they know WSOL=0 and can wrap. Geyser does NOT send updates for
-                            // closed accounts.
-                            if mint_str == WSOL_MINT {
-                                tracked_wallet.last_wsol_balance.store(0, Ordering::Relaxed);
-                                let sol = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
-                                let wsol_update = WalletBalanceUpdate {
-                                    header: RecordHeader::new("market-data", BUILD_VERSION, run_id),
-                                    wallet: wallet_str.clone(),
-                                    sol_lamports: sol,
-                                    wsol_lamports: Some(0),
-                                    slot: 0,
-                                };
-                                let topic = wallet_balance_topic(&wallet_str);
-                                if let Err(e) = nats.publish(&topic, &wsol_update).await {
-                                    warn!(error = %e, "Failed to publish WalletBalanceUpdate(WSOL=0) after SELL");
-                                } else {
-                                    info!(sol, "WalletBalanceUpdate(WSOL=0) published after SELL (ATA closed)");
+                                                if mint_str == WSOL_MINT {
+                                                    tracked_wallet.last_wsol_balance.store(0, Ordering::Relaxed);
+                                                    let sol = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
+                                                    let wsol_update = WalletBalanceUpdate {
+                                                        header: RecordHeader::new("market-data", BUILD_VERSION, run_id),
+                                                        wallet: wallet_str.clone(),
+                                                        sol_lamports: sol,
+                                                        wsol_lamports: Some(0),
+                                                        slot: 0,
+                                                    };
+                                                    let topic = wallet_balance_topic(&wallet_str);
+                                                    if let Err(e) = nats.publish(&topic, &wsol_update).await {
+                                                        warn!(error = %e, "Failed to publish WalletBalanceUpdate(WSOL=0) after SELL");
+                                                    } else {
+                                                        info!(sol, "WalletBalanceUpdate(WSOL=0) published after SELL (ATA closed)");
+                                                    }
+                                                }
+                                            }
+
+                                            let mut set = ctx.tracked_wallet_token_accounts.write();
+                                            if set.remove(&ata) {
+                                                let mut accounts: Vec<Pubkey> = Vec::new();
+                                                accounts.push(tracked_wallet.wallet);
+                                                accounts.push(tracked_wallet.wsol_ata);
+                                                accounts.extend(set.iter().copied());
+                                                accounts.sort();
+                                                accounts.dedup();
+                                                let _ = ctx.tracked_wallet_tx.send(accounts);
+                                                info!(
+                                                    mint = %mint_str,
+                                                    ata = %ata,
+                                                    remaining_tracked = set.len(),
+                                                    "Untracked ATA after confirmed SELL"
+                                                );
+                                            }
+                                        }
+
+                                        if let Err(e) = msg.ack().await {
+                                            warn!(error = %e, "Failed to ack ExecutionResult");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "ExecutionResult fetch error");
+                                    }
                                 }
                             }
                         }
-
-                        // Untrack ATA from Geyser subscription (account is closed)
-                        let mut set = ctx.tracked_wallet_token_accounts.write();
-                        if set.remove(&ata) {
-                            let mut accounts: Vec<Pubkey> = Vec::new();
-                            accounts.push(tracked_wallet.wallet);
-                            accounts.push(tracked_wallet.wsol_ata);
-                            accounts.extend(set.iter().copied());
-                            accounts.sort();
-                            accounts.dedup();
-                            let _ = ctx.tracked_wallet_tx.send(accounts);
-                            info!(
-                                mint = %mint_str,
-                                ata = %ata,
-                                remaining_tracked = set.len(),
-                                "Untracked ATA after confirmed SELL"
-                            );
+                        Err(e) => {
+                            debug!(error = %e, "ExecutionResult stream fetch failed (may be empty)");
                         }
                     }
+                } else {
+                    std::future::pending::<()>().await
                 }
-            }
+            } => {}
 
             // Account updates (pool state changes)
             Ok(account_update) = account_rx.recv() => {

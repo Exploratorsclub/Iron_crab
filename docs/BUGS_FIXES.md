@@ -226,6 +226,14 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Schweregrad**: MITTEL — Führt zu Ad-hoc-Workarounds, potentiellen Routing-Fehlern und unnötigen Creator-Lookups
 **Status**: ✅ BEHOBEN — FIX-25
 
+### ISSUE-3: Fehlende automatische Retention für trade_logs (market_events)
+**Schweregrad**: HOCH — Produktionsvorfall 2026-02-21: Root-Partition 100% voll, Deploy fehlgeschlagen
+**Symptom**: `market_events-YYYYMMDD.jsonl` wachsen ungebremst (~85–110 GB/Tag). Ohne Rotation füllt sich die Disk.
+**Root Cause**: STORAGE_CONVENTIONS definiert 7–30 Tage Retention, aber es existiert **kein Janitor/Cron** für automatische Löschung. Rotation läuft nicht asynchron.
+**Status**: ⏳ OFFEN — Manuelle Bereinigung durchgeführt (48 alte Dateien gelöscht, ~2,8 TB freigegeben). Automatische Retention noch einzuführen.
+**Fix**: Cron/Janitor implementieren: JSONL-Dateien in `trade_logs/market_events/`, `trade_logs/intents/`, etc. älter als 7–14 Tage löschen. Asynchron, außerhalb Hot Path.
+**Referenz**: STORAGE_CONVENTIONS.md §5 Retention
+
 ---
 
 #### Analyse

@@ -81,11 +81,11 @@ use ironcrab::metrics::{
     TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
 };
 use ironcrab::nats::{
-    config_consumer_config, config_subject, ensure_trade_intents_stream,
-    wallet_snapshot_consumer_config, NatsClient, NatsConfig, CONFIG_STREAM_NAME, STREAM_NAME,
-    TOPIC_CONTROL_REQUESTS, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
-    TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, TRADE_INTENTS_STREAM_NAME,
-    WALLET_SNAPSHOT_STREAM_NAME,
+    config_consumer_config, config_subject, ensure_execution_results_stream,
+    ensure_trade_intents_stream, wallet_snapshot_consumer_config, NatsClient, NatsConfig,
+    CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_DECISION_RECORDS,
+    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS,
+    TRADE_INTENTS_STREAM_NAME, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
@@ -4869,6 +4869,9 @@ async fn main() -> Result<()> {
         if let Err(e) = ensure_trade_intents_stream(nats.client()).await {
             warn!(error = %e, "Failed to ensure TRADE_INTENTS stream; intents may be lost");
         }
+        if let Err(e) = ensure_execution_results_stream(nats.client()).await {
+            warn!(error = %e, "Failed to ensure EXECUTION_RESULTS stream; results may be lost");
+        }
     }
 
     // JetStream consumer for TradeIntents (persistent, survives startup race)
@@ -7499,11 +7502,15 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             exec.status = status;
             if matches!(exec.status, ExecutionStatus::Failed) {
                 exec.error_message = Some("execution_failed".to_string());
+                exec.error_code = decision
+                    .simulate
+                    .as_ref()
+                    .and_then(|s| s.error_code.clone());
             }
 
             ctx.execution_writer.write(&exec)?;
             if let Some(ref nats) = ctx.nats {
-                nats.publish(TOPIC_EXECUTION_RESULTS, &exec).await?;
+                nats.jetstream_publish(TOPIC_EXECUTION_RESULTS, &exec).await?;
             }
         }
     }
@@ -7815,9 +7822,50 @@ async fn emit_sim_failed_decision(
         nats.publish(TOPIC_DECISION_RECORDS, &decision).await?;
     }
 
+    // Emit ExecutionResult so momentum_bot receives SimFailed and can act on 6005/6023
+    let token_mint = match intent.side {
+        TradeSide::Buy => Some(intent.resources.output_mint.clone()),
+        TradeSide::Sell => Some(intent.resources.input_mint.clone()),
+    };
+    let mut exec = ExecutionResult::new_sent(
+        "execution-engine",
+        BUILD_VERSION,
+        &ctx.run_id,
+        ctx.next_execution_id(),
+        decision_id.clone(),
+        intent.intent_id.clone(),
+        intent.source.clone(),
+        token_mint,
+        None,
+        None,
+    )
+    .with_metadata(intent.metadata.clone())
+    .with_error_code(Some(sim_error_str.clone()));
+    exec.metadata.insert(
+        "side".to_string(),
+        match intent.side {
+            TradeSide::Buy => "BUY".to_string(),
+            TradeSide::Sell => "SELL".to_string(),
+        },
+    );
+    exec.status = ExecutionStatus::Failed;
+    exec.error_message = Some("execution_failed".to_string());
+
+    if ctx.execution_writer.write(&exec).is_err() {
+        warn!(intent_id = %intent.intent_id, "Failed to write SimFailed ExecutionResult to JSONL");
+    }
+    if let Some(ref nats) = ctx.nats {
+        if let Err(e) = nats.jetstream_publish(TOPIC_EXECUTION_RESULTS, &exec).await {
+            warn!(error = %e, intent_id = %intent.intent_id, "Failed to publish SimFailed ExecutionResult");
+        }
+    }
+
     // Enhanced simulation failure logging (Fix 2: diagnostic info for debugging)
-    // sim_error_str and sim_logs_str were cloned before sim_result was moved into DecisionRecord
-    let logs_truncated = if sim_logs_str.len() > 500 { &sim_logs_str[..500] } else { &sim_logs_str };
+    let logs_truncated = if sim_logs_str.len() > 500 {
+        &sim_logs_str[..500]
+    } else {
+        &sim_logs_str
+    };
 
     warn!(
         intent_id = %intent.intent_id,
@@ -7830,7 +7878,6 @@ async fn emit_sim_failed_decision(
     );
 
     // Return Err so callers (e.g. liquidation 6005-retry) can detect and act on sim failures.
-    // Decision record is already persisted above; this Err propagates the failure signal.
     Err(anyhow::anyhow!("Simulation failed: {}", sim_error_str))
 }
 
