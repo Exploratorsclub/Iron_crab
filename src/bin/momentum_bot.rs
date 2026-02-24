@@ -237,6 +237,10 @@ struct MomentumConfig {
     /// Bonding curve exit: threshold in percent (e.g. 98.0 = exit when 98% complete).
     /// Set to 0.0 to disable. Default: 98.0
     bonding_curve_exit_pct: f64,
+    /// Bonding curve exit: enable (default: false). When true, use bonding_curve_exit_threshold_bps.
+    bonding_curve_exit_enabled: bool,
+    /// Bonding curve exit: threshold in BPS (0–10000). Default: 9800 (98%).
+    bonding_curve_exit_threshold_bps: u32,
 }
 
 impl Default for MomentumConfig {
@@ -312,6 +316,8 @@ impl Default for MomentumConfig {
             momentum_exit_min_trades: 5,   // Need 5+ trades to evaluate
             exit_max_slippage_bps: 9500,   // 95% - sell at any price rather than hold
             bonding_curve_exit_pct: 98.0,  // Exit when bonding curve is 98% complete
+            bonding_curve_exit_enabled: false,
+            bonding_curve_exit_threshold_bps: 9800, // 98%
         }
     }
 }
@@ -368,6 +374,8 @@ impl MomentumConfig {
             momentum_exit_min_trades: cfg.momentum_exit_min_trades,
             exit_max_slippage_bps: cfg.exit_max_slippage_bps,
             bonding_curve_exit_pct: cfg.bonding_curve_exit_pct.unwrap_or(98.0),
+            bonding_curve_exit_enabled: cfg.bonding_curve_exit_enabled,
+            bonding_curve_exit_threshold_bps: cfg.bonding_curve_exit_threshold_bps,
         }
     }
 }
@@ -436,6 +444,8 @@ struct PositionTracker {
     token_program: Option<String>,
     /// Current bonding curve progress (basis points, 0-10000). None if not PumpFun.
     bonding_curve_progress_bps: Option<u32>,
+    /// PumpFun creator (for BC-SELL; only when dex == pumpfun)
+    creator: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -491,6 +501,9 @@ struct PersistedPosition {
     /// Bonding curve progress (basis points, 0-10000). None if not PumpFun.
     #[serde(default)]
     bonding_curve_progress_bps: Option<u32>,
+    /// PumpFun creator (for BC-SELL; only when dex == pumpfun)
+    #[serde(default)]
+    creator: Option<String>,
     /// Schema version for forward compatibility
     schema_version: u8,
 }
@@ -529,6 +542,7 @@ impl PersistedPosition {
             entry_source: tracker.entry_source,
             token_program: tracker.token_program.clone(),
             bonding_curve_progress_bps: tracker.bonding_curve_progress_bps,
+            creator: tracker.creator.clone(),
             schema_version: Self::CURRENT_SCHEMA_VERSION,
         }
     }
@@ -571,6 +585,7 @@ impl PersistedPosition {
             entry_source: self.entry_source,
             token_program: self.token_program.clone(),
             bonding_curve_progress_bps: self.bonding_curve_progress_bps,
+            creator: self.creator.clone(),
         }
     }
 }
@@ -606,7 +621,13 @@ impl PositionTracker {
             entry_source: PositionEntrySource::Live,
             token_program: None,
             bonding_curve_progress_bps: None,
+            creator: None,
         }
+    }
+
+    /// Set PumpFun creator (for BC-SELL; only when dex == pumpfun)
+    fn set_creator(&mut self, creator: &str) {
+        self.creator = Some(creator.to_string());
     }
 
     /// Update price and track ATH (best price for holder).
@@ -735,16 +756,21 @@ impl PositionTracker {
         }
 
         // 2b. Bonding Curve Exit - curve nearing completion, sell before migration
-        if config.bonding_curve_exit_pct > 0.0 {
+        // A.2 Phase 7: Skip when bonding_curve_exit_enabled=false; else use _threshold_bps or legacy _pct
+        if config.bonding_curve_exit_enabled || config.bonding_curve_exit_pct > 0.0 {
             if let Some(progress_bps) = self.bonding_curve_progress_bps {
-                let threshold_bps = (config.bonding_curve_exit_pct * 100.0) as u32;
+                let threshold_bps = if config.bonding_curve_exit_enabled {
+                    config.bonding_curve_exit_threshold_bps
+                } else {
+                    (config.bonding_curve_exit_pct * 100.0) as u32
+                };
                 if progress_bps >= threshold_bps {
                     return Some((
                         "BONDING_CURVE_EXIT".to_string(),
                         format!(
                             "Bonding curve {:.1}% complete (threshold: {:.1}%), P&L: {:.1}%",
                             progress_bps as f64 / 100.0,
-                            config.bonding_curve_exit_pct,
+                            threshold_bps as f64 / 100.0,
                             pnl
                         ),
                     ));
@@ -1709,6 +1735,8 @@ struct OpenPositionParams<'a> {
     token_amount: u64,
     sol_invested: u64,
     token_program: Option<String>,
+    /// PumpFun creator (for BC-SELL when dex == pumpfun)
+    creator: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1816,6 +1844,15 @@ impl MomentumContext {
         format!("int-{}-{:06}", &self.run_id[..8], n)
     }
 
+    /// A.2: Normalize DEX names for execution-engine compatibility (pumpswap/PumpFunAmm → pump_amm)
+    fn normalize_dex_for_execution_engine(dex: &str) -> String {
+        match dex {
+            "pumpswap" | "PumpFunAmm" | "PumpFun AMM" => "pump_amm".to_string(),
+            "pumpfun" | "PumpFun" => "pumpfun".to_string(),
+            _ => dex.to_string(),
+        }
+    }
+
     /// Record first-seen slot for a pool
     fn record_pool_seen(&self, pool_address: &str, slot: u64) {
         let mut pools = self.pool_first_seen.write();
@@ -1842,6 +1879,7 @@ impl MomentumContext {
     /// Register or update a pool in the multi-pool registry.
     /// Also checks orphaned_mints for lazy reconciliation.
     fn register_pool(&self, mint: &str, pool_address: &str, dex: &str, slot: u64) {
+        let dex = Self::normalize_dex_for_execution_engine(dex);
         {
             let mut pools = self.mint_pools.write();
             let pool_list = pools.entry(mint.to_string()).or_default();
@@ -1857,7 +1895,7 @@ impl MomentumContext {
             } else {
                 pool_list.push(PoolInfo::new(
                     pool_address.to_string(),
-                    dex.to_string(),
+                    dex.clone(),
                     slot,
                 ));
                 debug!(
@@ -1902,6 +1940,7 @@ impl MomentumContext {
         token_amount: u64,
         slot: u64,
     ) {
+        let dex = Self::normalize_dex_for_execution_engine(dex);
         let mut is_new_pool = false;
         {
             let mut pools = self.mint_pools.write();
@@ -1916,7 +1955,7 @@ impl MomentumContext {
                 is_new_pool = true;
                 pool_list.push(PoolInfo::new(
                     pool_address.to_string(),
-                    dex.to_string(),
+                    dex.clone(),
                     slot,
                 ));
                 debug!(
@@ -2019,6 +2058,17 @@ impl MomentumContext {
             .get(mint)
             .map(|m| m.token_program.clone())
             .filter(|tp| !tp.is_empty());
+        // A.2: Resolve creator for pumpfun (BC-SELL after wallet reconciliation)
+        if dex == "pumpfun" {
+            let tracker_creator = self
+                .token_trackers
+                .read()
+                .get(mint)
+                .and_then(|t| t.dev_wallet.clone());
+            if let Some(creator) = self.resolve_authoritative_creator(mint, tracker_creator) {
+                tracker.set_creator(&creator);
+            }
+        }
 
         let config = self.config.read();
         if config.max_hold_time_secs > 0 {
@@ -2104,24 +2154,27 @@ impl MomentumContext {
             .ok_or_else(|| anyhow::anyhow!("No pools known for mint {}", mint))?;
 
         let now = std::time::Instant::now();
-        let max_age = std::time::Duration::from_secs(300); // Only use pools with trades in last 5min
 
         // FIX-20 constants
         let fail_cooldown = std::time::Duration::from_secs(120);
         const MAX_FAIL_COUNT: u32 = 3;
 
-        // Phase 1: Basic validity filter (must have accounts AND recent trade data)
+        // Phase 1: Basic validity filter.
+        // A.2: 5min-Freshness removed — stale pools are valid for exit.
+        // A.2: For pumpfun, dex_pool_accounts can be None (EE derives from mint+creator).
+        // Other DEXes need dex_pool_accounts. Need accounts OR (pumpfun + last_trade_ratio for quote).
         let valid: Vec<_> = candidates
             .iter()
             .filter(|p| {
-                p.dex_pool_accounts.is_some()
-                    && p.last_trade_ratio.is_some()
-                    && now.duration_since(p.last_updated) < max_age
+                let has_accounts = p.dex_pool_accounts.is_some();
+                let has_ratio = p.last_trade_ratio.is_some();
+                let is_pumpfun = p.dex == "pumpfun";
+                has_accounts || (is_pumpfun && has_ratio)
             })
             .collect();
 
         if valid.is_empty() {
-            anyhow::bail!("No pools with recent trade data and accounts available");
+            anyhow::bail!("No pools with valid data (accounts or pumpfun+ratio)");
         }
 
         // Phase 2 (FIX-20): Exclude migrated PumpFun pools + pools with repeated failures
@@ -2187,8 +2240,12 @@ impl MomentumContext {
                 }
             });
 
+            // A.2: PumpFun allows empty pool_accounts (EE derives from mint+creator)
+            let accounts = p.dex_pool_accounts.clone().unwrap_or_default();
+            let can_use = !accounts.is_empty() || p.dex == "pumpfun";
+
             if let Some(expected_sol) = cache_quote {
-                if let Some(accounts) = p.dex_pool_accounts.clone() {
+                if can_use {
                     quotes.push((
                         p.pool_address.clone(),
                         p.dex.clone(),
@@ -2196,12 +2253,10 @@ impl MomentumContext {
                         expected_sol,
                         "cache",
                     ));
-                } else {
-                    warn!(pool = %p.pool_address, "find_best_sell_pool: skipping pool (dex_pool_accounts None, filter mismatch)");
                 }
             } else if let Some(ratio) = p.last_trade_ratio {
                 // Fallback: approximate from last observed trade ratio
-                if let Some(accounts) = p.dex_pool_accounts.clone() {
+                if can_use {
                     let expected_sol = (token_amount as f64) * ratio;
                     quotes.push((
                         p.pool_address.clone(),
@@ -2210,8 +2265,6 @@ impl MomentumContext {
                         expected_sol,
                         "ratio",
                     ));
-                } else {
-                    warn!(pool = %p.pool_address, "find_best_sell_pool: skipping pool (dex_pool_accounts None, filter mismatch)");
                 }
             }
         }
@@ -2419,6 +2472,7 @@ impl MomentumContext {
         quote_mint: &str,
         accounts: &[String],
     ) {
+        let dex = Self::normalize_dex_for_execution_engine(dex);
         let is_pump_amm = dex == "pump_amm";
 
         // PumpSwap always requires exactly 14 accounts; all other DEXes need at least 3
@@ -2470,7 +2524,7 @@ impl MomentumContext {
             let mut pending = self.pending_pool_accounts.write();
             pending.insert(
                 token_mint.to_string(),
-                (dex.to_string(), pool_address.to_string(), accounts.to_vec()),
+                (dex.clone(), pool_address.to_string(), accounts.to_vec()),
             );
         }
 
@@ -2486,6 +2540,7 @@ impl MomentumContext {
                 );
                 return;
             }
+            tracker.dex = dex.clone(); // A.2: Ensure normalized DEX
             tracker.dex_pool_accounts = Some(accounts.to_vec());
             debug!(
                 mint = %token_mint,
@@ -2584,6 +2639,16 @@ impl MomentumContext {
             if was_not_rejected && tracker.is_rejected() {
                 self.tokens_blacklisted
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // A.2: Also update position creator when dex is pumpfun (for BC-SELL after restart)
+        {
+            let mut positions = self.positions.write();
+            if let Some(pos) = positions.get_mut(mint) {
+                if pos.dex == "pumpfun" && pos.creator.is_none() {
+                    pos.set_creator(dev_wallet);
+                    debug!(mint = %mint, creator = %dev_wallet, "A.2: Set creator on position from record_dev_info");
+                }
             }
         }
     }
@@ -2716,12 +2781,17 @@ impl MomentumContext {
         signals
     }
 
-    /// Clean up old trackers (older than 5 minutes)
+    /// Clean up old trackers (older than 5 minutes).
+    /// A.2 Phase 6: Never remove trackers for mints with open positions.
     fn cleanup_old_trackers(&self) {
+        let open_mints: std::collections::HashSet<_> =
+            self.positions.read().keys().cloned().collect();
         let mut trackers = self.token_trackers.write();
         let cutoff = Duration::from_secs(300); // 5 minutes
-        trackers.retain(|_, tracker| {
-            tracker.first_seen.elapsed() < cutoff || !tracker.state.is_terminal()
+        trackers.retain(|mint, tracker| {
+            open_mints.contains(mint)
+                || tracker.first_seen.elapsed() < cutoff
+                || !tracker.state.is_terminal()
         });
     }
 
@@ -2746,6 +2816,10 @@ impl MomentumContext {
                 if pos.token_program.is_none() && p.token_program.is_some() {
                     pos.token_program = p.token_program.clone();
                 }
+                // A.2: Upgrade creator if not yet known (for pumpfun BC-SELL)
+                if pos.creator.is_none() && p.creator.is_some() && pos.dex == "pumpfun" {
+                    pos.creator = p.creator.clone();
+                }
                 info!(
                     mint = %p.mint,
                     additional_sol = p.sol_invested,
@@ -2767,6 +2841,11 @@ impl MomentumContext {
                     p.sol_invested,
                 );
                 new_tracker.token_program = p.token_program.clone();
+                if p.dex == "pumpfun" {
+                    if let Some(ref c) = p.creator {
+                        new_tracker.set_creator(c);
+                    }
+                }
                 positions.insert(p.mint.to_string(), new_tracker.clone());
                 info!(
                     mint = %p.mint,
@@ -3389,13 +3468,20 @@ impl MomentumContext {
                         // Position may already exist (e.g., scale-in recovered on restart)
                         let already_has_position = self.positions.read().contains_key(mint);
                         if !already_has_position {
-                            // Reconstruct pool/dex from TokenTracker (still alive in memory)
-                            let tracker_info: Option<(String, String)> = {
+                            // Reconstruct pool/dex/creator from TokenTracker (still alive in memory)
+                            let tracker_info: Option<(String, String, Option<String>)> = {
                                 let trackers = self.token_trackers.read();
-                                trackers.get(mint).map(|tr| (tr.pool.clone(), tr.dex.clone()))
+                                trackers.get(mint).map(|tr| {
+                                    let creator = if tr.dex == "pumpfun" {
+                                        tr.dev_wallet.clone()
+                                    } else {
+                                        None
+                                    };
+                                    (tr.pool.clone(), tr.dex.clone(), creator)
+                                })
                             };
 
-                            if let Some((pool, dex)) = tracker_info {
+                            if let Some((pool, dex, creator)) = tracker_info {
                                 let sol_invested = result
                                     .wallet_sol_delta_lamports
                                     .map(|d| d.unsigned_abs() as u64)
@@ -3451,6 +3537,7 @@ impl MomentumContext {
                                     token_amount: fill_out.raw,
                                     sol_invested,
                                     token_program,
+                                    creator,
                                 });
                             } else {
                                 warn!(
@@ -3659,6 +3746,15 @@ impl MomentumContext {
                             "H-C",
                         );
                         // #endregion
+                        // A.2: Resolve creator for pumpfun BC-SELL (Position → TokenTracker)
+                        let creator = if pending.dex == "pumpfun" {
+                            self.token_trackers
+                                .read()
+                                .get(&pending.mint)
+                                .and_then(|t| t.dev_wallet.clone())
+                        } else {
+                            None
+                        };
                         self.open_position(OpenPositionParams {
                             mint: &pending.mint,
                             pool: &pending.pool,
@@ -3668,6 +3764,7 @@ impl MomentumContext {
                             token_amount,
                             sol_invested,
                             token_program: resolved_token_program,
+                            creator,
                         });
                     }
                     TradeSide::Sell => {
@@ -4465,6 +4562,41 @@ impl MomentumContext {
                         }
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected f64".to_string()));
+                    }
+                }
+                "bonding_curve_exit_enabled" => {
+                    if let Some(v) = value.as_bool() {
+                        config.bonding_curve_exit_enabled = v;
+                        applied.push(key.clone());
+                        info!(key = %key, new_value = %v, "Config updated");
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
+                    }
+                }
+                "bonding_curve_exit_threshold_bps" => {
+                    if let Some(v) = value.as_u64() {
+                        if v <= 10_000 {
+                            config.bonding_curve_exit_threshold_bps = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 0-10000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "exit_max_slippage_bps" => {
+                    if let Some(v) = value.as_u64() {
+                        if v <= 10_000 {
+                            config.exit_max_slippage_bps = v as u32;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected.push((key.clone(), "Must be 0-10000".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
                     }
                 }
 
@@ -6999,14 +7131,16 @@ async fn generate_and_publish_exit_intent(
 
     let intent_id = ctx.next_intent_id();
 
-    // FIX-22: Cross-check creator with LivePoolCache (authoritative)
+    // FIX-22 / A.2: Creator resolution order — Position → TokenTracker → LivePoolCache
     let (creator_opt, last_trade_ratio_opt) = {
+        let position_creator = ctx.positions.read().get(mint).and_then(|p| p.creator.clone());
         let trackers = ctx.token_trackers.read();
         let tracker = trackers.get(mint);
         let tracker_creator = tracker.and_then(|t| t.dev_wallet.clone());
         let ratio = tracker.and_then(|t| t.last_trade_ratio());
         drop(trackers);
-        let resolved_creator = ctx.resolve_authoritative_creator(mint, tracker_creator);
+        let base_creator = position_creator.or(tracker_creator);
+        let resolved_creator = ctx.resolve_authoritative_creator(mint, base_creator);
         (resolved_creator, ratio)
     };
 
@@ -7252,10 +7386,11 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             initial_liquidity_sol,
         } => {
             let slot = event.slot.unwrap_or(0);
+            let dex = MomentumContext::normalize_dex_for_execution_engine(dex);
             ctx.record_pool_seen(pool_address, slot);
 
             // Register pool in multi-pool registry
-            ctx.register_pool(base_mint, pool_address, dex, slot);
+            ctx.register_pool(base_mint, pool_address, &dex, slot);
 
             let liq_sol = initial_liquidity_sol
                 .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
@@ -7279,7 +7414,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 let slot = event.slot.unwrap_or(0);
                 let liq_lamports = (liq_sol * 1_000_000_000.0) as u64;
                 let created =
-                    ctx.get_or_create_tracker(base_mint, pool_address, dex, slot, liq_lamports);
+                    ctx.get_or_create_tracker(base_mint, pool_address, &dex, slot, liq_lamports);
 
                 if created {
                     info!(
@@ -7335,13 +7470,14 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             if !tracker_exists && *is_buy && *sol_amount > 0 {
                 // Use DEX from event if available, otherwise infer from pool_address pattern
                 let slot = event.slot.unwrap_or(0);
-                let dex = if !event_dex.is_empty() && event_dex != "unknown" {
+                let dex_raw = if !event_dex.is_empty() && event_dex != "unknown" {
                     event_dex.as_str()
                 } else if pool_address.starts_with("pump") || pool_address.starts_with("pAMM") {
                     "pump_amm"
                 } else {
                     "pumpfun" // Default assumption for Bonding Curve
                 };
+                let dex = MomentumContext::normalize_dex_for_execution_engine(dex_raw);
 
                 debug!(
                     mint = %mint,
@@ -7361,9 +7497,11 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                 };
 
                 let created =
-                    ctx.get_or_create_tracker(mint, pool_address, dex, slot, initial_liq_lamports);
+                    ctx.get_or_create_tracker(mint, pool_address, &dex, slot, initial_liq_lamports);
 
                 if created {
+                    // A.2 Phase 5: Explicitly register pool when discovered via trade
+                    ctx.register_pool(mint, pool_address, &dex, slot);
                     info!(
                         mint = %mint,
                         pool = %pool_address,
@@ -7467,6 +7605,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
 
             // P1: If Trade event carries creator (from market-data cache), set it on tracker.
             // This enables intent building without waiting for separate DevWalletIdentified event.
+            // A.2: Also set on position for pumpfun BC-SELL (persisted for restart).
             if let Some(ref creator) = trade_creator {
                 let config = ctx.config.read().clone();
                 let mut trackers = ctx.token_trackers.write();
@@ -7478,6 +7617,15 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                             creator = %creator,
                             "Set dev_wallet from Trade event (creator_cache)"
                         );
+                    }
+                }
+                drop(trackers);
+                // A.2: Propagate creator to position for pumpfun (BC exit after restart)
+                let mut positions = ctx.positions.write();
+                if let Some(pos) = positions.get_mut(mint) {
+                    if pos.dex == "pumpfun" && pos.creator.is_none() {
+                        pos.set_creator(creator);
+                        debug!(mint = %mint, creator = %creator, "A.2: Set creator on position from Trade event");
                     }
                 }
             }

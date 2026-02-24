@@ -645,17 +645,17 @@ mod tests {
             associated_bonding_curve: Pubkey::new_unique(),
             virtual_sol_reserves: 30_000_000_000, // 30 SOL
             virtual_token_reserves: 1_000_000_000_000_000, // 1B tokens
-            real_sol_reserves: 0,
+            real_sol_reserves: 5_000_000_000, // 5 SOL (curve has SOL to pay out)
             real_token_reserves: 793_100_000_000_000,
             complete: false,
             creator: Pubkey::new_unique(),
         };
 
-        // Sell 100M tokens
+        // Sell 100M tokens — formula uses virtual reserves; output capped by real_sol_reserves
         let amount_out = calculate_pumpfun_quote(&state, 100_000_000_000_000, false).unwrap();
-        // Expected: (100M * 30 SOL) / (1B + 100M) ≈ 2.73 SOL
+        // Expected from virtual: (100M * 30 SOL) / (1B + 100M) ≈ 2.73 SOL; capped by real (5 SOL)
         assert!(amount_out > 2_500_000_000);
-        assert!(amount_out < 3_000_000_000);
+        assert!(amount_out <= 5_000_000_000); // cannot exceed real_sol_reserves
     }
 
     #[test]

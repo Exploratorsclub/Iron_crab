@@ -659,6 +659,12 @@ pub struct MomentumCfg {
     /// Bonding curve exit: threshold in percent (e.g. 98.0 = exit when 98% complete).
     /// Set to 0.0 to disable. Default: 98.0
     pub bonding_curve_exit_pct: Option<f64>,
+    /// Bonding curve exit: enable (default: false). When true, use bonding_curve_exit_threshold_bps.
+    #[serde(default)]
+    pub bonding_curve_exit_enabled: bool,
+    /// Bonding curve exit: threshold in BPS (0–10000). Default: 9800 (98%).
+    #[serde(default = "default_bonding_curve_exit_threshold_bps")]
+    pub bonding_curve_exit_threshold_bps: u32,
 
     // === Buyer Quality (anti-bot / concentration) ===
     /// Cap for top-1 buyer share (0.0..=1.0) within the buyer window.
@@ -826,6 +832,10 @@ fn default_exit_max_slippage_bps() -> u32 {
     9500 // 95% - sell at any price rather than hold
 }
 
+fn default_bonding_curve_exit_threshold_bps() -> u32 {
+    9800 // 98% - exit when bonding curve is 98% complete
+}
+
 fn default_top1_buyer_share_cap() -> f64 {
     0.35
 }
@@ -910,6 +920,8 @@ impl Default for MomentumCfg {
             momentum_exit_min_trades: default_momentum_exit_min_trades(),
             exit_max_slippage_bps: default_exit_max_slippage_bps(),
             bonding_curve_exit_pct: Some(98.0),
+            bonding_curve_exit_enabled: false,
+            bonding_curve_exit_threshold_bps: default_bonding_curve_exit_threshold_bps(),
             top1_buyer_share_cap: default_top1_buyer_share_cap(),
             top3_buyer_share_cap: default_top3_buyer_share_cap(),
             repeat_buyer_min_ratio: default_repeat_buyer_min_ratio(),
