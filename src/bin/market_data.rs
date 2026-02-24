@@ -678,6 +678,8 @@ async fn publish_wallet_snapshot(
         use solana_client::rpc_request::TokenAccountsFilter;
 
         let mut discovered_from_owner_scan: Vec<(Pubkey, u64, Pubkey)> = Vec::new(); // (mint, balance, token_program)
+        let mut spl_non_zero_count: usize = 0;
+        let mut t22_non_zero_count: usize = 0;
 
         // SPL Token accounts
         match rpc.rpc.get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(token_program)).await {
@@ -700,6 +702,7 @@ async fn publish_wallet_snapshot(
                                     // Capture WSOL balance for initial WalletBalanceUpdate
                                     bootstrap_wsol_balance = Some(balance);
                                 } else if balance > 0 {
+                                    spl_non_zero_count += 1;
                                     discovered_from_owner_scan.push((mint_pk, balance, token_program));
                                     // Also cache decimals for later
                                     cached_mint_meta.entry(mint_pk).or_insert((decimals_val, token_program, 0));
@@ -710,7 +713,7 @@ async fn publish_wallet_snapshot(
                 }
             }
             Err(e) => {
-                warn!(error = %e, "Wallet snapshot bootstrap: getTokenAccountsByOwner (SPL Token) failed");
+                warn!(program = "spl_token", error = %e, "Wallet snapshot bootstrap: getTokenAccountsByOwner failed");
             }
         }
 
@@ -732,6 +735,7 @@ async fn publish_wallet_snapshot(
                             if let Ok(mint_pk) = Pubkey::from_str(mint_str) {
                                 let balance: u64 = balance_str.parse().unwrap_or(0);
                                 if balance > 0 && mint_str != WSOL_MINT {
+                                    t22_non_zero_count += 1;
                                     discovered_from_owner_scan.push((mint_pk, balance, token_2022_program));
                                     cached_mint_meta.entry(mint_pk).or_insert((decimals_val, token_2022_program, 0));
                                 }
@@ -741,9 +745,20 @@ async fn publish_wallet_snapshot(
                 }
             }
             Err(e) => {
-                warn!(error = %e, "Wallet snapshot bootstrap: getTokenAccountsByOwner (Token-2022) failed");
+                warn!(program = "token_2022", error = %e, "Wallet snapshot bootstrap: getTokenAccountsByOwner failed");
             }
         }
+
+        // A.3: Bootstrap owner-scan diagnostics (non-zero counts)
+        info!(
+            wallet = %wallet_str,
+            spl_non_zero = spl_non_zero_count,
+            t22_non_zero = t22_non_zero_count,
+            total_discovered = discovered_from_owner_scan.len(),
+            known_mints = known_mints.len(),
+            cap = MAX_BOOTSTRAP_MINTS,
+            "Bootstrap owner-scan: token counts"
+        );
 
         // FIX-37: Owner-scan mints with real balance ALWAYS take priority over stale
         // JetStream entries. Previously, MAX_BOOTSTRAP_MINTS could be filled entirely
@@ -1785,14 +1800,28 @@ async fn run_geyser_loop(
                     let ata_str = match exec.metadata.get("token_account") {
                         Some(s) => s,
                         None => {
-                            warn!(execution_id = %exec.execution_id, "ExecutionResult missing metadata.token_account — cannot track ATA");
+                            warn!(
+                                execution_id = %exec.execution_id,
+                                wallet = %tracked_wallet.wallet,
+                                mint = ?exec.token_mint,
+                                intent_id = %exec.intent_id,
+                                side = ?exec.metadata.get("side"),
+                                "ExecutionResult missing metadata.token_account — cannot track ATA"
+                            );
                             continue;
                         }
                     };
                     let ata = match Pubkey::from_str(ata_str) {
                         Ok(a) => a,
                         Err(_) => {
-                            warn!(execution_id = %exec.execution_id, ata = %ata_str, "ExecutionResult metadata.token_account is not a valid Pubkey");
+                            warn!(
+                                execution_id = %exec.execution_id,
+                                wallet = %tracked_wallet.wallet,
+                                ata = %ata_str,
+                                mint = ?exec.token_mint,
+                                intent_id = %exec.intent_id,
+                                "ExecutionResult metadata.token_account is not a valid Pubkey"
+                            );
                             continue;
                         }
                     };
@@ -1800,13 +1829,29 @@ async fn run_geyser_loop(
                     let token_program_str = match exec.metadata.get("token_program") {
                         Some(s) => s,
                         None => {
-                            warn!(execution_id = %exec.execution_id, "ExecutionResult missing metadata.token_program — cannot track ATA");
+                            warn!(
+                                execution_id = %exec.execution_id,
+                                wallet = %tracked_wallet.wallet,
+                                mint = ?exec.token_mint,
+                                intent_id = %exec.intent_id,
+                                side = ?exec.metadata.get("side"),
+                                "ExecutionResult missing metadata.token_program — cannot track ATA"
+                            );
                             continue;
                         }
                     };
                     let token_program = match Pubkey::from_str(token_program_str) {
                         Ok(p) => p,
-                        Err(_) => continue,
+                        Err(_) => {
+                            warn!(
+                                execution_id = %exec.execution_id,
+                                wallet = %tracked_wallet.wallet,
+                                token_program = %token_program_str,
+                                mint = ?exec.token_mint,
+                                "ExecutionResult metadata.token_program is not a valid Pubkey"
+                            );
+                            continue;
+                        }
                     };
                     // Only support SPL Token + Token-2022 for wallet ATA tracking.
                     // If metadata is malformed, avoid subscribing junk accounts.
