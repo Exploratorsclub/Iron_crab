@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::{json, Value};
 use solana_account_decoder::UiAccountEncoding;
-use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcTransactionConfig};
+use solana_client::rpc_config::{
+    RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcTransactionConfig,
+};
 use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType};
 use solana_sdk::hash::hash;
 use solana_sdk::instruction::{AccountMeta, Instruction};
@@ -1101,7 +1103,9 @@ impl PumpFunAmmDex {
             if fetched % 20 == 0 {
                 info!(
                     "pump_amm TX-history: scanned {}/{} transactions for market={}...",
-                    fetched, sigs.len(), pool_market
+                    fetched,
+                    sigs.len(),
+                    pool_market
                 );
             }
 
@@ -1329,20 +1333,20 @@ impl PumpFunAmmDex {
             if let Some(accounts) = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint) {
                 if accounts.len() >= 14 {
                     let pool = PumpAmmPoolStatic {
-                        pool_market:                  accounts[0],
-                        global_config:                accounts[1],
-                        base_mint:                    accounts[2],
-                        quote_mint:                   accounts[3],
-                        pool_base_vault:              accounts[4],
-                        pool_quote_vault:             accounts[5],
-                        protocol_fee_recipient:       accounts[6],
-                        protocol_fee_recipient_ta:    accounts[7],
-                        event_authority:              accounts[8],
-                        coin_creator_vault_ata:       accounts[9],
-                        coin_creator_vault_authority:  accounts[10],
-                        global_volume_accumulator:    accounts[11],
-                        fee_config:                   accounts[12],
-                        fee_program:                  accounts[13],
+                        pool_market: accounts[0],
+                        global_config: accounts[1],
+                        base_mint: accounts[2],
+                        quote_mint: accounts[3],
+                        pool_base_vault: accounts[4],
+                        pool_quote_vault: accounts[5],
+                        protocol_fee_recipient: accounts[6],
+                        protocol_fee_recipient_ta: accounts[7],
+                        event_authority: accounts[8],
+                        coin_creator_vault_ata: accounts[9],
+                        coin_creator_vault_authority: accounts[10],
+                        global_volume_accumulator: accounts[11],
+                        fee_config: accounts[12],
+                        fee_program: accounts[13],
                     };
                     // Cache internally for build_swap_ix() (sync path)
                     self.pools_by_base.insert(base_mint, pool.clone());
@@ -1498,9 +1502,7 @@ impl PumpFunAmmDex {
                 }
 
                 // Update pagination cursor
-                before = sigs
-                    .last()
-                    .and_then(|s| s.signature.parse().ok());
+                before = sigs.last().and_then(|s| s.signature.parse().ok());
 
                 let page_len = sigs.len();
                 let take_n = SIG_TX_PER_PAGE.min(page_len);
@@ -2042,11 +2044,14 @@ impl Dex for PumpFunAmmDex {
                     }
                     Ok(None) => Err(anyhow!(
                         "pump_amm pool {} parse failed: {} (TX-history also None)",
-                        pool_address, e
+                        pool_address,
+                        e
                     )),
                     Err(e2) => Err(anyhow!(
                         "pump_amm pool {} parse failed: {} (TX-history also failed: {})",
-                        pool_address, e, e2
+                        pool_address,
+                        e,
+                        e2
                     )),
                 }
             }
@@ -2727,7 +2732,8 @@ mod tests {
         ];
         assert_eq!(pool_accounts.len(), 14);
 
-        let cache = make_pump_amm_cache_with_pool_accounts(pool_market, base_mint, pool_accounts.clone());
+        let cache =
+            make_pump_amm_cache_with_pool_accounts(pool_market, base_mint, pool_accounts.clone());
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
         let dex = PumpFunAmmDex::new_with_cache(rpc, cache);
 

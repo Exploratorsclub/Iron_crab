@@ -142,7 +142,10 @@ impl Raydium {
     }
 
     /// Create Raydium instance with optional LivePoolCache for Geyser-first vault balances.
-    pub fn new_with_live_cache(rpc: Arc<SolanaRpc>, live_pool_cache: Option<SharedLivePoolCache>) -> Self {
+    pub fn new_with_live_cache(
+        rpc: Arc<SolanaRpc>,
+        live_pool_cache: Option<SharedLivePoolCache>,
+    ) -> Self {
         Self {
             rpc,
             pools: Arc::new(DashMap::new()),
@@ -365,10 +368,7 @@ impl Raydium {
     }
 
     /// Get Serum/OpenBook accounts for a cached pool (if populated).
-    pub fn get_serum_accounts(
-        &self,
-        pool_address: &Pubkey,
-    ) -> Option<(Pubkey, Pubkey, Pubkey)> {
+    pub fn get_serum_accounts(&self, pool_address: &Pubkey) -> Option<(Pubkey, Pubkey, Pubkey)> {
         let pool = self.pools.get(pool_address)?;
         match (pool.serum_bids, pool.serum_asks, pool.serum_event_queue) {
             (Some(b), Some(a), Some(eq)) => Some((b, a, eq)),

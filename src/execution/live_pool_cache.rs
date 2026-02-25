@@ -1489,13 +1489,7 @@ mod tests {
         // Only base_reserve set
         cache.upsert(
             pool_market,
-            make_pump_amm_state(
-                base_mint,
-                quote_mint,
-                Some(1_000_000_000),
-                None,
-                vec![],
-            ),
+            make_pump_amm_state(base_mint, quote_mint, Some(1_000_000_000), None, vec![]),
             101,
         );
         let result = cache.get_pump_amm_reserves_by_base_mint(&base_mint);

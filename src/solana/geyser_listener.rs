@@ -219,10 +219,7 @@ impl GeyserListener {
 
         // Additional explicit account subscriptions, chunked.
         if !tracked_accounts.is_empty() {
-            for (chunk_idx, chunk) in tracked_accounts
-                .chunks(TRACKED_ACCOUNTS_CHUNK)
-                .enumerate()
-            {
+            for (chunk_idx, chunk) in tracked_accounts.chunks(TRACKED_ACCOUNTS_CHUNK).enumerate() {
                 accounts_filter.insert(
                     format!("tracked_accounts_{}", chunk_idx),
                     SubscribeRequestFilterAccounts {
@@ -236,10 +233,8 @@ impl GeyserListener {
         }
 
         // Subscribe to blocks_meta for confirmed blockhash streaming
-        let blocks_meta_filter = HashMap::from([(
-            "blockhash".to_string(),
-            SubscribeRequestFilterBlocksMeta {},
-        )]);
+        let blocks_meta_filter =
+            HashMap::from([("blockhash".to_string(), SubscribeRequestFilterBlocksMeta {})]);
 
         SubscribeRequest {
             accounts: accounts_filter,
@@ -284,10 +279,8 @@ impl GeyserListener {
         let mut last_log = std::time::Instant::now();
 
         loop {
-            let request = Self::build_subscribe_request(
-                &self.program_ids,
-                &tracked_accounts_current,
-            );
+            let request =
+                Self::build_subscribe_request(&self.program_ids, &tracked_accounts_current);
 
             // Subscribe with bidirectional channel: Sink for updates, Stream for data
             let (mut subscribe_tx, mut stream) = client

@@ -308,13 +308,13 @@ pub async fn build_tx_plan(
     // the more conservative (lower) value. This prevents Error 6002 when the
     // bonding curve shifts between intent creation and TX build.
     let intent_min_out = min_out_raw_from_intent(intent);
-    let cache_min_out = cache.and_then(|c| {
-        match super::quote_calculator::calculate_fresh_min_out(c, intent) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(error = %e, "tx_plan: cache min_out calculation failed");
-                None
-            }
+    let cache_min_out = cache.and_then(|c| match super::quote_calculator::calculate_fresh_min_out(
+        c, intent,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "tx_plan: cache min_out calculation failed");
+            None
         }
     });
 
@@ -326,7 +326,8 @@ pub async fn build_tx_plan(
                     intent_min_out = from_intent,
                     cache_min_out = from_cache,
                     capped,
-                    delta_pct = format_args!("{:.1}", (1.0 - capped as f64 / from_intent as f64) * 100.0),
+                    delta_pct =
+                        format_args!("{:.1}", (1.0 - capped as f64 / from_intent as f64) * 100.0),
                     "tx_plan: capped intent min_out with fresh cache quote"
                 );
             } else {
@@ -339,7 +340,10 @@ pub async fn build_tx_plan(
             capped
         }
         (Some(v), None) => {
-            tracing::debug!(min_out = v, "tx_plan: using min_out from intent (no cache quote)");
+            tracing::debug!(
+                min_out = v,
+                "tx_plan: using min_out from intent (no cache quote)"
+            );
             v
         }
         (None, Some(v)) => {
@@ -360,7 +364,9 @@ pub async fn build_tx_plan(
             } else {
                 return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                     reason: RejectReason::UnsupportedIntent,
-                    details: "missing execution.min_out and no cache available for fresh calculation".to_string(),
+                    details:
+                        "missing execution.min_out and no cache available for fresh calculation"
+                            .to_string(),
                 });
             }
         }
@@ -461,9 +467,7 @@ pub async fn build_tx_plan(
             };
             let ata_spl =
                 spl_associated_token_account::get_associated_token_address_with_program_id(
-                    &owner_spl,
-                    &mint_spl,
-                    &tp,
+                    &owner_spl, &mint_spl, &tp,
                 );
             let ata_sdk = Pubkey::new_from_array(ata_spl.to_bytes());
             orca.set_user_token_account(mint_sdk, ata_sdk);
@@ -522,7 +526,9 @@ pub async fn build_tx_plan(
             final_ixs.insert(0, ata_ix);
         }
 
-        return TxPlanOutcome::Planned(TxPlan { instructions: final_ixs });
+        return TxPlanOutcome::Planned(TxPlan {
+            instructions: final_ixs,
+        });
     }
 
     if dex_hint == DexHint::Raydium {
@@ -661,7 +667,9 @@ pub async fn build_tx_plan(
             final_ixs.insert(0, ata_ix);
         }
 
-        return TxPlanOutcome::Planned(TxPlan { instructions: final_ixs });
+        return TxPlanOutcome::Planned(TxPlan {
+            instructions: final_ixs,
+        });
     }
 
     if dex_hint == DexHint::PumpAmm {
@@ -966,8 +974,7 @@ pub async fn build_tx_plan(
                 .unwrap_or(false);
 
             if close_ata && full_sell_verified {
-                let token_mint =
-                    Pubkey::from_str(&intent.resources.input_mint).unwrap_or_default();
+                let token_mint = Pubkey::from_str(&intent.resources.input_mint).unwrap_or_default();
                 let token_mint_spl = SplProgramPubkey::new_from_array(token_mint.to_bytes());
 
                 let sell_token_program_spl = intent

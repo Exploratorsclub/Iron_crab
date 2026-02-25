@@ -34,22 +34,13 @@ fn extract_reserves(state: &CachedPoolState) -> (u64, u64) {
             s.vault_a_balance.unwrap_or(0),
             s.vault_b_balance.unwrap_or(0),
         ),
-        CachedPoolState::RaydiumAmm(s) => (
-            s.coin_reserve.unwrap_or(0),
-            s.pc_reserve.unwrap_or(0),
-        ),
-        CachedPoolState::RaydiumCpmm(s) => (
-            s.reserve_0.unwrap_or(0),
-            s.reserve_1.unwrap_or(0),
-        ),
+        CachedPoolState::RaydiumAmm(s) => (s.coin_reserve.unwrap_or(0), s.pc_reserve.unwrap_or(0)),
+        CachedPoolState::RaydiumCpmm(s) => (s.reserve_0.unwrap_or(0), s.reserve_1.unwrap_or(0)),
         CachedPoolState::Meteora(s) => (
             s.reserve_x_balance.unwrap_or(0),
             s.reserve_y_balance.unwrap_or(0),
         ),
-        CachedPoolState::PumpAmm(s) => (
-            s.base_reserve.unwrap_or(0),
-            s.quote_reserve.unwrap_or(0),
-        ),
+        CachedPoolState::PumpAmm(s) => (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0)),
         CachedPoolState::PumpFun(s) => (s.virtual_token_reserves, s.virtual_sol_reserves),
         CachedPoolState::MeteoraCpmm(_) => (0, 0),
     }
@@ -251,10 +242,7 @@ fn build_minimal_pool_state_with_reserves(
 /// for the other reserve to avoid "out=0" quote failures (e.g. meteora: missing reserves).
 ///
 /// Returns true if the cache was modified.
-pub fn apply_pool_cache_update(
-    cache: &LivePoolCache,
-    update: &PoolCacheUpdate,
-) -> bool {
+pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) -> bool {
     match update.update_type {
         PoolCacheUpdateType::PoolDiscovered => {
             if let Some((pool_addr, minimal_state)) = build_minimal_pool_state(update) {
@@ -312,7 +300,9 @@ pub async fn bootstrap_pool_cache_from_jetstream(
     live_pool_cache: &LivePoolCache,
 ) -> anyhow::Result<(
     usize,
-    Option<async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>>,
+    Option<
+        async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>,
+    >,
 )> {
     use async_nats::jetstream;
     use futures::StreamExt;
@@ -339,11 +329,7 @@ pub async fn bootstrap_pool_cache_from_jetstream(
 
     // Fetch all available messages in batches until exhausted
     loop {
-        let mut messages = consumer
-            .fetch()
-            .max_messages(batch_size)
-            .messages()
-            .await?;
+        let mut messages = consumer.fetch().max_messages(batch_size).messages().await?;
         let mut batch_count = 0;
 
         while let Some(msg) = messages.next().await {

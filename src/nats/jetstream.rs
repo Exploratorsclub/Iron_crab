@@ -283,9 +283,7 @@ pub async fn ensure_execution_results_stream(client: &async_nats::Client) -> Res
 }
 
 /// Consumer config for execution results (All = includes results published before we subscribed)
-pub fn execution_results_consumer_config(
-    durable_name: &str,
-) -> jetstream::consumer::pull::Config {
+pub fn execution_results_consumer_config(durable_name: &str) -> jetstream::consumer::pull::Config {
     jetstream::consumer::pull::Config {
         deliver_policy: jetstream::consumer::DeliverPolicy::All,
         ack_policy: jetstream::consumer::AckPolicy::Explicit,

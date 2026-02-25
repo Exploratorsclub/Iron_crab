@@ -27,14 +27,17 @@ use anyhow::Result;
 use clap::Parser;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use ironcrab::config::MomentumCfg;
+use ironcrab::execution::live_pool_cache::LivePoolCache;
+use ironcrab::execution::pool_cache_sync;
+use ironcrab::execution::quote_calculator;
 use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult, ExecutionStatus,
     ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind,
@@ -47,10 +50,6 @@ use ironcrab::metrics::{
     MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
     NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
-use ironcrab::execution::live_pool_cache::LivePoolCache;
-use ironcrab::execution::pool_cache_sync;
-use ironcrab::execution::quote_calculator;
-use ironcrab::solana::dex_parser::SOL_MINT_PUBKEY;
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_trade_intents_stream, execution_results_consumer_config,
@@ -58,6 +57,7 @@ use ironcrab::nats::{
     EXECUTION_RESULTS_STREAM_NAME, STREAM_NAME, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
     TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
 };
+use ironcrab::solana::dex_parser::SOL_MINT_PUBKEY;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 
 /// NATS topic for config reload (P1: Runtime Configuration via UI)
@@ -76,7 +76,10 @@ const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 // #region agent log
 fn dbg_log(location: &str, message: &str, data: serde_json::Value, hypothesis_id: &str) {
     if let Ok(path) = std::env::current_dir().map(|p| p.join("debug-79f8ff.log")) {
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
         let payload = serde_json::json!({
             "sessionId": "79f8ff",
             "id": format!("log_{}_x", ts),
@@ -86,7 +89,11 @@ fn dbg_log(location: &str, message: &str, data: serde_json::Value, hypothesis_id
             "data": data,
             "hypothesisId": hypothesis_id
         });
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             use std::io::Write;
             let _ = writeln!(f, "{}", payload);
         }
@@ -832,7 +839,11 @@ impl PositionTracker {
         if recent.len() >= config.momentum_exit_min_trades as usize {
             let buy_count = recent.iter().filter(|t| t.is_buy).count();
             let total = recent.len();
-            let buy_vol: u64 = recent.iter().filter(|t| t.is_buy).map(|t| t.sol_amount).sum();
+            let buy_vol: u64 = recent
+                .iter()
+                .filter(|t| t.is_buy)
+                .map(|t| t.sol_amount)
+                .sum();
             let total_vol: u64 = recent.iter().map(|t| t.sol_amount).sum();
 
             let buy_ratio = if total_vol > 0 {
@@ -1907,11 +1918,7 @@ impl MomentumContext {
                     existing.last_updated = std::time::Instant::now();
                 }
             } else {
-                pool_list.push(PoolInfo::new(
-                    pool_address.to_string(),
-                    dex.clone(),
-                    slot,
-                ));
+                pool_list.push(PoolInfo::new(pool_address.to_string(), dex.clone(), slot));
                 debug!(
                     mint = %mint,
                     pool = %pool_address,
@@ -1967,11 +1974,7 @@ impl MomentumContext {
                 existing
             } else {
                 is_new_pool = true;
-                pool_list.push(PoolInfo::new(
-                    pool_address.to_string(),
-                    dex.clone(),
-                    slot,
-                ));
+                pool_list.push(PoolInfo::new(pool_address.to_string(), dex.clone(), slot));
                 debug!(
                     mint = %mint,
                     pool = %pool_address,
@@ -2000,7 +2003,9 @@ impl MomentumContext {
         if is_new_pool {
             let orphan_data = self.orphaned_mints.write().remove(mint);
             if let Some((balance_raw, decimals)) = orphan_data {
-                if let Some(reconciled) = self.build_reconciled_position(mint, balance_raw, decimals) {
+                if let Some(reconciled) =
+                    self.build_reconciled_position(mint, balance_raw, decimals)
+                {
                     self.positions
                         .write()
                         .insert(mint.to_string(), reconciled.clone());
@@ -2099,12 +2104,18 @@ impl MomentumContext {
     /// and is authoritative. TokenTracker creator may come from instruction_accounts[7]
     /// which can be wrong for CPI/bundler-created tokens.
     /// Returns the best available creator, preferring LivePoolCache when available.
-    fn resolve_authoritative_creator(&self, mint: &str, tracker_creator: Option<String>) -> Option<String> {
+    fn resolve_authoritative_creator(
+        &self,
+        mint: &str,
+        tracker_creator: Option<String>,
+    ) -> Option<String> {
         // Try LivePoolCache (authoritative: from Geyser bonding curve account data)
         let cache_creator = {
             if let Ok(mint_pk) = solana_sdk::pubkey::Pubkey::from_str(mint) {
                 let (bonding_curve, _) =
-                    ironcrab::solana::dex::pumpfun::PumpFunDex::derive_bonding_curve_static(&mint_pk);
+                    ironcrab::solana::dex::pumpfun::PumpFunDex::derive_bonding_curve_static(
+                        &mint_pk,
+                    );
                 self.live_pool_cache
                     .get_pumpfun_creator(&bonding_curve)
                     .map(|pk| pk.to_string())
@@ -2192,7 +2203,9 @@ impl MomentumContext {
         }
 
         // Phase 2 (FIX-20): Exclude migrated PumpFun pools + pools with repeated failures
-        let preferred: Vec<_> = valid.iter().copied()
+        let preferred: Vec<_> = valid
+            .iter()
+            .copied()
             .filter(|p| {
                 // Skip: PumpFun pool with confirmed migration (would fail with 6023)
                 if p.bonding_curve_complete == Some(true) {
@@ -3176,7 +3189,8 @@ impl MomentumContext {
             let exit_mints: std::collections::HashSet<&str> =
                 exits.iter().map(|(m, ..)| m.as_str()).collect();
             let mut pending = self.pending_intents.write();
-            pending.retain(|_, p| !(exit_mints.contains(p.mint.as_str()) && p.side == TradeSide::Buy));
+            pending
+                .retain(|_, p| !(exit_mints.contains(p.mint.as_str()) && p.side == TradeSide::Buy));
         }
 
         exits
@@ -3318,7 +3332,9 @@ impl MomentumContext {
                                     "Timed exit reconcile: hold={}s, last_exit_age={}s",
                                     candidate.hold_secs, age
                                 ),
-                                None => format!("Timed exit reconcile: hold={}s", candidate.hold_secs),
+                                None => {
+                                    format!("Timed exit reconcile: hold={}s", candidate.hold_secs)
+                                }
                             },
                         )
                     })
@@ -3603,7 +3619,8 @@ impl MomentumContext {
                             .map(|c| c.contains("6002"))
                             .unwrap_or(false)
                         {
-                            pos.sell_slippage_fail_count = pos.sell_slippage_fail_count.saturating_add(1);
+                            pos.sell_slippage_fail_count =
+                                pos.sell_slippage_fail_count.saturating_add(1);
                         }
                         warn!(
                             intent_id = %result.intent_id,
@@ -3623,7 +3640,10 @@ impl MomentumContext {
                         .unwrap_or(false)
                     {
                         if let Ok(mint_pk) = solana_sdk::pubkey::Pubkey::from_str(mint) {
-                            if self.live_pool_cache.mark_pumpfun_complete_for_mint(&mint_pk) {
+                            if self
+                                .live_pool_cache
+                                .mark_pumpfun_complete_for_mint(&mint_pk)
+                            {
                                 warn!(mint = %mint, "6005 (orphaned): Marked PumpFun bonding curve complete");
                             }
                         }
@@ -3639,13 +3659,17 @@ impl MomentumContext {
 
                     // FIX-20: Track pool failure for orphaned sell path too.
                     // Extract pool from execution result metadata or position tracker.
-                    let pool_addr = result.metadata.get("pool")
+                    let pool_addr = result
+                        .metadata
+                        .get("pool")
                         .or_else(|| result.metadata.get("pools"))
                         .cloned();
                     if let Some(ref pool) = pool_addr {
                         let mut pools = self.mint_pools.write();
                         if let Some(pool_list) = pools.get_mut(mint.as_str()) {
-                            if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == *pool) {
+                            if let Some(pool_info) =
+                                pool_list.iter_mut().find(|p| p.pool_address == *pool)
+                            {
                                 pool_info.sell_fail_count += 1;
                                 pool_info.last_sell_fail_at = Some(Instant::now());
                                 warn!(
@@ -3658,8 +3682,7 @@ impl MomentumContext {
                         }
                     }
                 }
-            }
-            else {
+            } else {
                 debug!(intent_id = %result.intent_id, "No pending intent found for execution result");
             }
             return;
@@ -3717,7 +3740,7 @@ impl MomentumContext {
                         // Fall back to fill_in (swap amount) or intended SOL spend.
                         let sol_invested_raw = result
                             .wallet_sol_delta_lamports
-                            .map(|d| d.unsigned_abs() as u64)  // BUY delta is negative → abs
+                            .map(|d| d.unsigned_abs() as u64) // BUY delta is negative → abs
                             .or_else(|| result.fill_in.as_ref().map(|a| a.raw))
                             .unwrap_or(pending.sol_amount);
 
@@ -3738,7 +3761,11 @@ impl MomentumContext {
                             .unwrap_or(sol_invested_raw as f64 / 1_000_000_000.0)
                             .max(0.0);
                         let tok_ui = fill_out.as_f64().max(0.0);
-                        let entry_price = if sol_ui_for_price > 0.0 { tok_ui / sol_ui_for_price } else { 1.0 };
+                        let entry_price = if sol_ui_for_price > 0.0 {
+                            tok_ui / sol_ui_for_price
+                        } else {
+                            1.0
+                        };
 
                         let sol_invested = sol_invested_raw;
                         let token_amount = fill_out.raw;
@@ -3831,7 +3858,10 @@ impl MomentumContext {
                         {
                             let mut pools = self.mint_pools.write();
                             if let Some(pool_list) = pools.get_mut(&pending.mint) {
-                                if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pending.pool) {
+                                if let Some(pool_info) = pool_list
+                                    .iter_mut()
+                                    .find(|p| p.pool_address == pending.pool)
+                                {
                                     if pool_info.sell_fail_count > 0 {
                                         info!(
                                             mint = %pending.mint,
@@ -3896,9 +3926,8 @@ impl MomentumContext {
                         } else {
                             // Full sell — close position entirely.
                             // Calculate realized PnL from wallet SOL delta.
-                            let sell_proceeds_lamports = result
-                                .wallet_sol_delta_lamports
-                                .unwrap_or(0);
+                            let sell_proceeds_lamports =
+                                result.wallet_sol_delta_lamports.unwrap_or(0);
                             let cost_basis_lamports = {
                                 self.positions
                                     .read()
@@ -3961,7 +3990,8 @@ impl MomentumContext {
                             .map(|c| c.contains("6002"))
                             .unwrap_or(false)
                         {
-                            pos.sell_slippage_fail_count = pos.sell_slippage_fail_count.saturating_add(1);
+                            pos.sell_slippage_fail_count =
+                                pos.sell_slippage_fail_count.saturating_add(1);
                         }
                         warn!(
                             mint = %pending.mint,
@@ -3981,7 +4011,10 @@ impl MomentumContext {
                         .unwrap_or(false)
                     {
                         if let Ok(mint_pk) = solana_sdk::pubkey::Pubkey::from_str(&pending.mint) {
-                            if self.live_pool_cache.mark_pumpfun_complete_for_mint(&mint_pk) {
+                            if self
+                                .live_pool_cache
+                                .mark_pumpfun_complete_for_mint(&mint_pk)
+                            {
                                 warn!(mint = %pending.mint, "6005: Marked PumpFun bonding curve complete — retry will use PumpSwap AMM");
                             }
                         }
@@ -3998,7 +4031,10 @@ impl MomentumContext {
                     // FIX-20: Track pool failure so find_best_sell_pool() prefers alternatives.
                     let mut pools = self.mint_pools.write();
                     if let Some(pool_list) = pools.get_mut(&pending.mint) {
-                        if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pending.pool) {
+                        if let Some(pool_info) = pool_list
+                            .iter_mut()
+                            .find(|p| p.pool_address == pending.pool)
+                        {
                             pool_info.sell_fail_count += 1;
                             pool_info.last_sell_fail_at = Some(Instant::now());
                             warn!(
@@ -4041,7 +4077,8 @@ impl MomentumContext {
                             .map(|c| c.contains("6002"))
                             .unwrap_or(false)
                         {
-                            pos.sell_slippage_fail_count = pos.sell_slippage_fail_count.saturating_add(1);
+                            pos.sell_slippage_fail_count =
+                                pos.sell_slippage_fail_count.saturating_add(1);
                         }
                         warn!(
                             mint = %pending.mint,
@@ -4060,7 +4097,10 @@ impl MomentumContext {
                         .unwrap_or(false)
                     {
                         if let Ok(mint_pk) = solana_sdk::pubkey::Pubkey::from_str(&pending.mint) {
-                            if self.live_pool_cache.mark_pumpfun_complete_for_mint(&mint_pk) {
+                            if self
+                                .live_pool_cache
+                                .mark_pumpfun_complete_for_mint(&mint_pk)
+                            {
                                 warn!(mint = %pending.mint, "6005: Marked PumpFun bonding curve complete — retry will use PumpSwap AMM");
                             }
                         }
@@ -4077,7 +4117,10 @@ impl MomentumContext {
                     // FIX-20: Track pool failure so find_best_sell_pool() prefers alternatives.
                     let mut pools = self.mint_pools.write();
                     if let Some(pool_list) = pools.get_mut(&pending.mint) {
-                        if let Some(pool_info) = pool_list.iter_mut().find(|p| p.pool_address == pending.pool) {
+                        if let Some(pool_info) = pool_list
+                            .iter_mut()
+                            .find(|p| p.pool_address == pending.pool)
+                        {
                             pool_info.sell_fail_count += 1;
                             pool_info.last_sell_fail_at = Some(Instant::now());
                             warn!(
@@ -5006,14 +5049,12 @@ async fn recover_positions_from_jsonl(
             tracker.current_price = entry_price; // Will update from market events
 
             // Resolve token_program from execution metadata (best source for recovery)
-            tracker.token_program = execs
-                .iter()
-                .find_map(|exec| {
-                    exec.metadata
-                        .get("token_program")
-                        .cloned()
-                        .filter(|tp| !tp.is_empty())
-                });
+            tracker.token_program = execs.iter().find_map(|exec| {
+                exec.metadata
+                    .get("token_program")
+                    .cloned()
+                    .filter(|tp| !tp.is_empty())
+            });
 
             info!(
                 mint = %mint,
@@ -5307,7 +5348,10 @@ async fn main() -> Result<()> {
         match recover_positions_from_jsonl(&log_dir).await {
             Ok(positions) => {
                 if !positions.is_empty() {
-                    info!(count = positions.len(), "Loaded positions from JSONL (execution records)");
+                    info!(
+                        count = positions.len(),
+                        "Loaded positions from JSONL (execution records)"
+                    );
                     jsonl_positions = positions;
                 }
             }
@@ -5339,12 +5383,13 @@ async fn main() -> Result<()> {
             positions.insert(mint.clone(), tracker);
         }
         for (mint, kv_tracker) in kv_positions {
-            if !positions.contains_key(&mint) {
-                positions.insert(mint, kv_tracker);
-            }
+            positions.entry(mint).or_insert(kv_tracker);
         }
         if merged_count > 0 {
-            info!(merged = merged_count, "Corrected probe-only KV positions using JSONL");
+            info!(
+                merged = merged_count,
+                "Corrected probe-only KV positions using JSONL"
+            );
         }
 
         // Persist merged state to KV for future restarts
@@ -5408,7 +5453,11 @@ async fn main() -> Result<()> {
     // until bootstrap completes, find_best_*_pool() falls back to last_trade_ratio.
     let bootstrap_consumer_rx = {
         let (tx, rx) = tokio::sync::oneshot::channel::<
-            Option<async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>>,
+            Option<
+                async_nats::jetstream::consumer::Consumer<
+                    async_nats::jetstream::consumer::pull::Config,
+                >,
+            >,
         >();
 
         if ctx.nats.is_some() {
@@ -5422,9 +5471,17 @@ async fn main() -> Result<()> {
                         return;
                     }
                 };
-                match pool_cache_sync::bootstrap_pool_cache_from_jetstream(nats, &ctx_clone.live_pool_cache).await {
+                match pool_cache_sync::bootstrap_pool_cache_from_jetstream(
+                    nats,
+                    &ctx_clone.live_pool_cache,
+                )
+                .await
+                {
                     Ok((recovered, consumer)) => {
-                        info!(pools_recovered = recovered, "MOMENTUM SLAVE CACHE: bootstrap complete (async)");
+                        info!(
+                            pools_recovered = recovered,
+                            "MOMENTUM SLAVE CACHE: bootstrap complete (async)"
+                        );
                         let _ = tx.send(consumer);
                     }
                     Err(e) => {
@@ -6399,9 +6456,7 @@ async fn generate_and_publish_buy_intent(
 
     if effective_dex == "pumpfun" {
         let creator = creator_opt.ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot generate pumpfun intent: missing dev_wallet/creator"
-            )
+            anyhow::anyhow!("cannot generate pumpfun intent: missing dev_wallet/creator")
         })?;
         intent.metadata.insert("creator".to_string(), creator);
     } else if let Some(creator) = creator_opt {
@@ -6449,7 +6504,10 @@ async fn generate_and_publish_buy_intent(
             }
             Ok(false) => {
                 NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                anyhow::bail!("JetStream publish dropped/failed topic={}", TOPIC_TRADE_INTENTS);
+                anyhow::bail!(
+                    "JetStream publish dropped/failed topic={}",
+                    TOPIC_TRADE_INTENTS
+                );
             }
             Err(e) => {
                 NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -6624,13 +6682,12 @@ mod tests {
 
         {
             let mut pools = ctx.mint_pools.write();
-            pools.insert(
-                mint.to_string(),
-                vec![migrated, active],
-            );
+            pools.insert(mint.to_string(), vec![migrated, active]);
         }
 
-        let (pool, _, _, _, _) = ctx.find_best_sell_pool(mint, 1_000_000, "pool_migrated").unwrap();
+        let (pool, _, _, _, _) = ctx
+            .find_best_sell_pool(mint, 1_000_000, "pool_migrated")
+            .unwrap();
         assert_eq!(pool, "pool_active", "Should select non-migrated pool");
     }
 
@@ -6679,8 +6736,13 @@ mod tests {
             pools.insert(mint.to_string(), vec![failed, ok_pool]);
         }
 
-        let (pool, _, _, _, _) = ctx.find_best_sell_pool(mint, 1_000_000, "pool_failed").unwrap();
-        assert_eq!(pool, "pool_ok", "Should prefer pool without failures in cooldown");
+        let (pool, _, _, _, _) = ctx
+            .find_best_sell_pool(mint, 1_000_000, "pool_failed")
+            .unwrap();
+        assert_eq!(
+            pool, "pool_ok",
+            "Should prefer pool without failures in cooldown"
+        );
     }
 
     #[test]
@@ -7338,29 +7400,28 @@ async fn generate_and_publish_exit_intent(
     let sol_mint = "So11111111111111111111111111111111111111112";
 
     // === MULTI-POOL ROUTING: Find best pool for exit ===
-    let (pool, dex, pool_accounts, expected_sol, alternatives_checked, sell_routing) = match ctx
-        .find_best_sell_pool(mint, token_amount, original_pool)
-    {
-        Ok((pool, dex, accounts, expected, alts)) => (
-            pool,
-            dex,
-            accounts,
-            expected,
-            alts,
-            "multi_pool".to_string(),
-        ),
-        Err(e) => {
-            // Fallback to original pool if multi-pool routing fails
-            warn!(
-                mint = %mint,
-                original_pool = %original_pool,
-                error = %e,
-                "⚠️  Multi-pool routing failed, using original pool"
-            );
+    let (pool, dex, pool_accounts, expected_sol, alternatives_checked, sell_routing) =
+        match ctx.find_best_sell_pool(mint, token_amount, original_pool) {
+            Ok((pool, dex, accounts, expected, alts)) => (
+                pool,
+                dex,
+                accounts,
+                expected,
+                alts,
+                "multi_pool".to_string(),
+            ),
+            Err(e) => {
+                // Fallback to original pool if multi-pool routing fails
+                warn!(
+                    mint = %mint,
+                    original_pool = %original_pool,
+                    error = %e,
+                    "⚠️  Multi-pool routing failed, using original pool"
+                );
 
-            // Get accounts: try mint_pools for the specific pool first,
-            // then try_get_dex_pool_accounts_for_mint, then empty fallback
-            let accounts = {
+                // Get accounts: try mint_pools for the specific pool first,
+                // then try_get_dex_pool_accounts_for_mint, then empty fallback
+                let accounts = {
                 let pools = ctx.mint_pools.read();
                 pools
                     .get(mint)
@@ -7378,22 +7439,22 @@ async fn generate_and_publish_exit_intent(
                 Vec::new()
             });
 
-            let routing = if original_dex == "pump_amm" {
-                "pumpswap_fallback"
-            } else {
-                "primary"
-            };
+                let routing = if original_dex == "pump_amm" {
+                    "pumpswap_fallback"
+                } else {
+                    "primary"
+                };
 
-            (
-                original_pool.to_string(),
-                original_dex.to_string(),
-                accounts,
-                0.0,     // Unknown expected
-                0_usize, // No alternatives checked
-                routing.to_string(),
-            )
-        }
-    };
+                (
+                    original_pool.to_string(),
+                    original_dex.to_string(),
+                    accounts,
+                    0.0,     // Unknown expected
+                    0_usize, // No alternatives checked
+                    routing.to_string(),
+                )
+            }
+        };
 
     // Decimals depend on the token. Prefer decimals from the open position (which was seeded
     // from MarketEventKind::TokenMintInfo), fall back to mint_infos cache, then fallback to 6.
@@ -7421,7 +7482,11 @@ async fn generate_and_publish_exit_intent(
 
     // FIX-22 / A.2: Creator resolution order — Position → TokenTracker → LivePoolCache
     let (creator_opt, last_trade_ratio_opt) = {
-        let position_creator = ctx.positions.read().get(mint).and_then(|p| p.creator.clone());
+        let position_creator = ctx
+            .positions
+            .read()
+            .get(mint)
+            .and_then(|p| p.creator.clone());
         let trackers = ctx.token_trackers.read();
         let tracker = trackers.get(mint);
         let tracker_creator = tracker.and_then(|t| t.dev_wallet.clone());
@@ -7663,7 +7728,10 @@ async fn generate_and_publish_exit_intent(
             }
             Ok(false) => {
                 NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                anyhow::bail!("JetStream publish dropped/failed topic={}", TOPIC_TRADE_INTENTS);
+                anyhow::bail!(
+                    "JetStream publish dropped/failed topic={}",
+                    TOPIC_TRADE_INTENTS
+                );
             }
             Err(e) => {
                 NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -7962,7 +8030,7 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
                     token_amount: token_raw,
                     signature: sig.clone(),
                 };
-                ctx.update_position_price(mint, tokens_per_sol, Some(trade), Some(&pool_address));
+                ctx.update_position_price(mint, tokens_per_sol, Some(trade), Some(pool_address));
             }
 
             if is_dev {

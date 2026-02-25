@@ -195,7 +195,8 @@ impl CrossDexHandler {
     /// Pool data comes from arb-strategy via Intent metadata.
     pub async fn init_dexes(&mut self) -> Result<()> {
         // Initialize Raydium - for build_swap_ix() only
-        let mut raydium = Raydium::new_with_live_cache(Arc::clone(&self.rpc), self.pool_cache.clone());
+        let mut raydium =
+            Raydium::new_with_live_cache(Arc::clone(&self.rpc), self.pool_cache.clone());
         if let Some(pk) = self.wallet_pubkey {
             raydium.set_user_authority(pk);
         }
@@ -229,7 +230,8 @@ impl CrossDexHandler {
         }
 
         // Initialize Meteora DLMM - for build_swap_ix() only
-        let mut meteora = MeteoraDlmm::new_with_live_cache(Arc::clone(&self.rpc), self.pool_cache.clone());
+        let mut meteora =
+            MeteoraDlmm::new_with_live_cache(Arc::clone(&self.rpc), self.pool_cache.clone());
         if let Some(pk) = self.wallet_pubkey {
             meteora.set_user_authority(pk);
         }

@@ -34,7 +34,9 @@ mod tests {
 
     #[test]
     fn detects_instruction_error_custom_6005() {
-        assert!(is_6005_bonding_curve_complete(&"InstructionError(1, Custom(6005))"));
+        assert!(is_6005_bonding_curve_complete(
+            &"InstructionError(1, Custom(6005))"
+        ));
     }
 
     #[test]

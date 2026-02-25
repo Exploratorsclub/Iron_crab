@@ -43,8 +43,9 @@ use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_pool_cache_stream, ensure_wallet_snapshot_stream, execution_results_consumer_config,
     pool_subject, wallet_balance_topic, wallet_snapshot_consumer_config, wallet_snapshot_subject,
-    NatsClient, NatsConfig, CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, TOPIC_EXECUTION_RESULTS,
-    TOPIC_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES, WALLET_SNAPSHOT_STREAM_NAME,
+    NatsClient, NatsConfig, CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME,
+    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES,
+    WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
@@ -244,7 +245,8 @@ struct MarketDataContext {
 
     /// Throttling for BondingCurveProgress events: last emitted progress_bps per bonding curve.
     /// Only emit when progress changes by >= 50 bps or complete flag changes.
-    last_emitted_curve_progress: parking_lot::RwLock<std::collections::HashMap<Pubkey, (u32, bool)>>,
+    last_emitted_curve_progress:
+        parking_lot::RwLock<std::collections::HashMap<Pubkey, (u32, bool)>>,
 }
 
 #[derive(Debug, Default)]
@@ -682,17 +684,24 @@ async fn publish_wallet_snapshot(
         let mut t22_non_zero_count: usize = 0;
 
         // SPL Token accounts
-        match rpc.rpc.get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(token_program)).await {
+        match rpc
+            .rpc
+            .get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(token_program))
+            .await
+        {
             Ok(accounts) => {
                 for keyed in &accounts {
-                    if let solana_account_decoder::UiAccountData::Json(parsed) = &keyed.account.data {
+                    if let solana_account_decoder::UiAccountData::Json(parsed) = &keyed.account.data
+                    {
                         if let Some(info) = parsed.parsed.get("info") {
                             let mint_str = info.get("mint").and_then(|v| v.as_str()).unwrap_or("");
-                            let balance_str = info.get("tokenAmount")
+                            let balance_str = info
+                                .get("tokenAmount")
                                 .and_then(|v| v.get("amount"))
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("0");
-                            let decimals_val = info.get("tokenAmount")
+                            let decimals_val = info
+                                .get("tokenAmount")
                                 .and_then(|v| v.get("decimals"))
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(6) as u8;
@@ -703,9 +712,17 @@ async fn publish_wallet_snapshot(
                                     bootstrap_wsol_balance = Some(balance);
                                 } else if balance > 0 {
                                     spl_non_zero_count += 1;
-                                    discovered_from_owner_scan.push((mint_pk, balance, token_program));
+                                    discovered_from_owner_scan.push((
+                                        mint_pk,
+                                        balance,
+                                        token_program,
+                                    ));
                                     // Also cache decimals for later
-                                    cached_mint_meta.entry(mint_pk).or_insert((decimals_val, token_program, 0));
+                                    cached_mint_meta.entry(mint_pk).or_insert((
+                                        decimals_val,
+                                        token_program,
+                                        0,
+                                    ));
                                 }
                             }
                         }
@@ -718,17 +735,24 @@ async fn publish_wallet_snapshot(
         }
 
         // Token-2022 accounts
-        match rpc.rpc.get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(token_2022_program)).await {
+        match rpc
+            .rpc
+            .get_token_accounts_by_owner(wallet, TokenAccountsFilter::ProgramId(token_2022_program))
+            .await
+        {
             Ok(accounts) => {
                 for keyed in &accounts {
-                    if let solana_account_decoder::UiAccountData::Json(parsed) = &keyed.account.data {
+                    if let solana_account_decoder::UiAccountData::Json(parsed) = &keyed.account.data
+                    {
                         if let Some(info) = parsed.parsed.get("info") {
                             let mint_str = info.get("mint").and_then(|v| v.as_str()).unwrap_or("");
-                            let balance_str = info.get("tokenAmount")
+                            let balance_str = info
+                                .get("tokenAmount")
                                 .and_then(|v| v.get("amount"))
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("0");
-                            let decimals_val = info.get("tokenAmount")
+                            let decimals_val = info
+                                .get("tokenAmount")
                                 .and_then(|v| v.get("decimals"))
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(6) as u8;
@@ -736,8 +760,16 @@ async fn publish_wallet_snapshot(
                                 let balance: u64 = balance_str.parse().unwrap_or(0);
                                 if balance > 0 && mint_str != WSOL_MINT {
                                     t22_non_zero_count += 1;
-                                    discovered_from_owner_scan.push((mint_pk, balance, token_2022_program));
-                                    cached_mint_meta.entry(mint_pk).or_insert((decimals_val, token_2022_program, 0));
+                                    discovered_from_owner_scan.push((
+                                        mint_pk,
+                                        balance,
+                                        token_2022_program,
+                                    ));
+                                    cached_mint_meta.entry(mint_pk).or_insert((
+                                        decimals_val,
+                                        token_2022_program,
+                                        0,
+                                    ));
                                 }
                             }
                         }
@@ -875,7 +907,9 @@ async fn publish_wallet_snapshot(
                 if acc.owner.to_bytes() == spl_token_2022::ID.to_bytes() {
                     // Token-2022 accounts may have extensions (data > 165 bytes).
                     // Use StateWithExtensions instead of Pack::unpack to handle this.
-                    if let Ok(state) = StateWithExtensions::<spl_token_2022::state::Account>::unpack(&acc.data) {
+                    if let Ok(state) =
+                        StateWithExtensions::<spl_token_2022::state::Account>::unpack(&acc.data)
+                    {
                         let ta = &state.base;
                         let mint_pk = Pubkey::new_from_array(ta.mint.to_bytes());
                         let owner_pk = Pubkey::new_from_array(ta.owner.to_bytes());
@@ -983,18 +1017,14 @@ async fn publish_wallet_snapshot(
                             let mut total_checked = 0usize;
 
                             loop {
-                                let mut messages = match consumer
-                                    .fetch()
-                                    .max_messages(500)
-                                    .messages()
-                                    .await
-                                {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        warn!(error = %e, "Stale cleanup: fetch failed");
-                                        break;
-                                    }
-                                };
+                                let mut messages =
+                                    match consumer.fetch().max_messages(500).messages().await {
+                                        Ok(m) => m,
+                                        Err(e) => {
+                                            warn!(error = %e, "Stale cleanup: fetch failed");
+                                            break;
+                                        }
+                                    };
 
                                 let mut batch_count = 0usize;
 
@@ -1035,10 +1065,7 @@ async fn publish_wallet_snapshot(
                                                 "market-data",
                                                 BUILD_VERSION,
                                                 &ctx.run_id,
-                                                format!(
-                                                    "wallet_snapshot_stale_cleanup_{}",
-                                                    mint
-                                                ),
+                                                format!("wallet_snapshot_stale_cleanup_{}", mint),
                                                 "wallet_bootstrap_stale_cleanup",
                                                 None,
                                                 MarketEventKind::WalletBalanceSnapshot {
@@ -1165,7 +1192,8 @@ async fn publish_wallet_snapshot(
                     Ok(sol_lamports) => {
                         // Always send explicit WSOL: Some(0) when no ATA exists, so WsolManager
                         // knows to wrap and JetStream doesn't retain stale WSOL from previous runs.
-                        let wsol_lamports = Some(bootstrap_wsol_balance.unwrap_or(0));
+                        let wsol_balance = bootstrap_wsol_balance.unwrap_or(0);
+                        let wsol_lamports = Some(wsol_balance);
 
                         // Seed TrackedWallet so subsequent Geyser events correctly detect changes
                         tracked_wallet
@@ -1224,13 +1252,15 @@ async fn publish_wallet_snapshot(
                                 },
                             );
                             let sol_subject = wallet_snapshot_subject(&wallet_str, "NATIVE_SOL");
-                            if let Err(e) = nats.jetstream_publish(&sol_subject, &sol_snapshot).await {
+                            if let Err(e) =
+                                nats.jetstream_publish(&sol_subject, &sol_snapshot).await
+                            {
                                 warn!(error = %e, "Failed to publish native SOL WalletBalanceSnapshot to JetStream");
                             }
 
                             // Always publish WSOL (including 0) so JetStream has authoritative
                             // state; otherwise LastPerSubject returns stale WSOL from previous runs.
-                            let wsol_bal = wsol_lamports.unwrap_or(0);
+                            let wsol_bal = wsol_balance;
                             let wsol_snapshot = MarketEvent::new(
                                 "market-data",
                                 BUILD_VERSION,
@@ -1242,11 +1272,14 @@ async fn publish_wallet_snapshot(
                                     mint: WSOL_MINT.to_string(),
                                     balance_raw: wsol_bal,
                                     decimals: 9,
-                                    token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+                                    token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                                        .to_string(),
                                 },
                             );
                             let wsol_subject = wallet_snapshot_subject(&wallet_str, WSOL_MINT);
-                            if let Err(e) = nats.jetstream_publish(&wsol_subject, &wsol_snapshot).await {
+                            if let Err(e) =
+                                nats.jetstream_publish(&wsol_subject, &wsol_snapshot).await
+                            {
                                 warn!(error = %e, "Failed to publish WSOL WalletBalanceSnapshot to JetStream");
                             }
 

@@ -63,19 +63,18 @@ use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
     DecisionRecord, ExecutionResult, ExecutionStatus, ExplicitAmount, FairnessPolicy, FeePolicy,
     FillStatus, FillUnavailableReason, IntentOrigin, IntentTier, KillSwitchContext, MarketEvent,
-    MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles, RecordHeader,
-    RejectReason, SimulationResult, TradeExecutionConstraints, TradeIntent, TradeResources,
-    TradeSide, TradingRegime,
+    MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles, RecordHeader, RejectReason,
+    SimulationResult, TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide,
+    TradingRegime,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind};
 use ironcrab::metrics::{
     record_recent_trade, serve_metrics, RecentTrade, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS,
-    KILL_SWITCH_ACTIVE,
-    AVAILABLE_SOL_LAMPORTS, INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
-    JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL,
-    JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
-    CONCURRENT_INTENTS_GAUGE, OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE,
-    REJECT_RESOURCE_LOCK,
+    AVAILABLE_SOL_LAMPORTS, CONCURRENT_INTENTS_GAUGE, INTENTS_EXECUTED_TOTAL,
+    INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL, JITO_BUNDLES_LANDED_TOTAL,
+    JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL, JITO_BUNDLES_TIMEOUT_TOTAL,
+    JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE, NATS_MESSAGES_RECEIVED_TOTAL,
+    OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK,
     REJECT_SEND_FAILED, REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL,
     TX_CONFIRM_GEYSER_TOTAL, TX_CONFIRM_LATENCY_MS, TX_CONFIRM_RPC_FALLBACK_TOTAL,
     TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL,
@@ -268,7 +267,12 @@ fn compute_wallet_lamport_delta_best_effort(
         }
     }
 
-    Some((delta, meta.fee, has_account_lifecycle_noise, rent_adjustment))
+    Some((
+        delta,
+        meta.fee,
+        has_account_lifecycle_noise,
+        rent_adjustment,
+    ))
 }
 
 /// Extract SOL swap amounts from parsed inner instructions.
@@ -324,32 +328,23 @@ fn extract_swap_sol_from_inner_instructions(
             let parsed_obj = ix
                 .get("parsed")
                 // Also handle the case where the SDK wraps in { "Parsed": { "parsed": ... } }
-                .or_else(|| {
-                    ix.get("Parsed")
-                        .and_then(|p| p.get("parsed"))
-                });
+                .or_else(|| ix.get("Parsed").and_then(|p| p.get("parsed")));
 
-            let program = ix
-                .get("program")
-                .and_then(|p| p.as_str())
-                .or_else(|| {
-                    ix.get("Parsed")
-                        .and_then(|p| p.get("program"))
-                        .and_then(|p| p.as_str())
-                });
+            let program = ix.get("program").and_then(|p| p.as_str()).or_else(|| {
+                ix.get("Parsed")
+                    .and_then(|p| p.get("program"))
+                    .and_then(|p| p.as_str())
+            });
 
-            let program_id = ix
-                .get("programId")
-                .and_then(|p| p.as_str())
-                .or_else(|| {
-                    ix.get("Parsed")
-                        .and_then(|p| p.get("programId"))
-                        .and_then(|p| p.as_str())
-                });
+            let program_id = ix.get("programId").and_then(|p| p.as_str()).or_else(|| {
+                ix.get("Parsed")
+                    .and_then(|p| p.get("programId"))
+                    .and_then(|p| p.as_str())
+            });
 
             // Must be System program
-            let is_system = program == Some("system")
-                || program_id == Some("11111111111111111111111111111111");
+            let is_system =
+                program == Some("system") || program_id == Some("11111111111111111111111111111111");
             if !is_system {
                 continue;
             }
@@ -595,8 +590,8 @@ async fn compute_intent_fills_best_effort(
         } else {
             // Rent-adjusted fallback: |delta| - rent_paid - fee ≈ swap + program-level fees
             // rent_adjustment is positive when wallet paid rent (ATA created), so subtract it.
-            let adjusted = ((-payer_delta_lamports) - rent_adjustment)
-                .saturating_sub(fee_lamports as i128);
+            let adjusted =
+                ((-payer_delta_lamports) - rent_adjustment).saturating_sub(fee_lamports as i128);
             if adjusted > 0 {
                 debug!(
                     adjusted = adjusted,
@@ -648,8 +643,8 @@ async fn compute_intent_fills_best_effort(
             Some(ExplicitAmount::new(ix_sol_in, 9))
         } else {
             // Rent-adjusted: raw_delta - rent_refund + fee ≈ swap proceeds
-            let adjusted = (payer_delta_lamports + rent_adjustment)
-                .saturating_add(fee_lamports as i128);
+            let adjusted =
+                (payer_delta_lamports + rent_adjustment).saturating_add(fee_lamports as i128);
             if adjusted > 0 {
                 debug!(
                     adjusted = adjusted,
@@ -1304,6 +1299,7 @@ const MAX_BLOCKHASH_AGE_SECS: u64 = 30;
 struct ExecutionContext {
     run_id: String,
     rpc_url: String,
+    #[allow(dead_code)]
     helius_rpc_url: Option<String>,
     wallet_pubkey: Option<Pubkey>,
     /// The ONLY signer (Single-Signer rule). None means keyless mode.
@@ -1718,19 +1714,15 @@ impl ExecutionContext {
         // This bypasses JetStream snapshot staleness and ATA derivation issues.
         let token_program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
             .expect("valid token program");
-        let token_2022_program_id =
-            Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
-                .expect("valid token-2022 program");
+        let token_2022_program_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+            .expect("valid token-2022 program");
 
         info!(wallet = %owner, "Liquidation: fetching wallet inventory via RPC (getTokenAccountsByOwner)");
 
         let mut rpc_token_accounts = ctx
             .rpc
             .rpc
-            .get_token_accounts_by_owner(
-                &owner,
-                TokenAccountsFilter::ProgramId(token_program_id),
-            )
+            .get_token_accounts_by_owner(&owner, TokenAccountsFilter::ProgramId(token_program_id))
             .await
             .unwrap_or_default();
 
@@ -1782,11 +1774,14 @@ impl ExecutionContext {
             let token_prog_str = ta.account.owner.clone();
             let ta_pubkey_str = ta.pubkey.clone();
 
-            if balance_raw > 0
-                && mint_str != SOL_MINT
-                && mint_str != WSOL_MINT
-            {
-                inventory.push((mint_str, balance_raw, decimals, token_prog_str, ta_pubkey_str));
+            if balance_raw > 0 && mint_str != SOL_MINT && mint_str != WSOL_MINT {
+                inventory.push((
+                    mint_str,
+                    balance_raw,
+                    decimals,
+                    token_prog_str,
+                    ta_pubkey_str,
+                ));
             }
         }
 
@@ -1815,14 +1810,14 @@ impl ExecutionContext {
             #[cfg(unix)]
             maybe_ping_watchdog();
 
-            let mint = match Pubkey::from_str(&mint_str) {
+            let mint = match Pubkey::from_str(mint_str) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
             if mint == sol_mint {
                 continue;
             }
-            let token_program = match Pubkey::from_str(&token_program_str) {
+            let token_program = match Pubkey::from_str(token_program_str) {
                 Ok(p) => p,
                 Err(_) => {
                     Self::token_program_for_mint_cached(ctx.live_pool_cache.as_deref(), &mint, None)
@@ -1831,7 +1826,7 @@ impl ExecutionContext {
             #[cfg(unix)]
             maybe_ping_watchdog();
             // Use the actual token account pubkey from RPC (not derived ATA)
-            let ta_pubkey = match Pubkey::from_str(&ta_pubkey_str) {
+            let ta_pubkey = match Pubkey::from_str(ta_pubkey_str) {
                 Ok(p) => p,
                 Err(_) => Self::ata_for_owner_mint(&owner, &mint, &token_program),
             };
@@ -1852,7 +1847,10 @@ impl ExecutionContext {
                 metadata.insert("kill_reason".to_string(), r.clone());
                 metadata.insert("exit_reason".to_string(), format!("Kill switch: {}", r));
             } else {
-                metadata.insert("exit_reason".to_string(), "Kill switch liquidation".to_string());
+                metadata.insert(
+                    "exit_reason".to_string(),
+                    "Kill switch liquidation".to_string(),
+                );
             }
 
             let mut resources = TradeResources {
@@ -1894,10 +1892,17 @@ impl ExecutionContext {
                 // For LIQUIDATION: always try PumpSwap AMM regardless of bonding_curve_known_complete.
                 // The LivePoolCache may not know the curve is complete, but PumpSwap AMM
                 // might still have a pool. The RPC-based discovery in quote_exact_in handles this.
-                let pump_amm_quote = Some(tokio::time::timeout(
-                    Duration::from_secs(10),
-                    pump_amm.quote_exact_in(&mint.to_string(), &sol_mint.to_string(), amount_in),
-                ).await);
+                let pump_amm_quote = Some(
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        pump_amm.quote_exact_in(
+                            &mint.to_string(),
+                            &sol_mint.to_string(),
+                            amount_in,
+                        ),
+                    )
+                    .await,
+                );
                 match pump_amm_quote {
                     None => {} // Already logged above
                     Some(Err(_timeout)) => {
@@ -1914,7 +1919,10 @@ impl ExecutionContext {
                                         // and future liquidations (avoids repeated RPC discovery).
                                         if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
                                             if let Some(ref cache) = ctx.live_pool_cache {
-                                                cache.set_pump_amm_pool_accounts(&pool_pk, accounts.clone());
+                                                cache.set_pump_amm_pool_accounts(
+                                                    &pool_pk,
+                                                    accounts.clone(),
+                                                );
                                             }
                                         }
                                         let acct_strings: Vec<String> =
@@ -2308,10 +2316,12 @@ impl ExecutionContext {
                                         match ctx.rpc.get_account(&bc).await {
                                             Ok(account) => {
                                                 if account.data.len() >= 81 {
-                                                    let creator_bytes: [u8; 32] = account.data[49..81]
+                                                    let creator_bytes: [u8; 32] = account.data
+                                                        [49..81]
                                                         .try_into()
                                                         .expect("slice is exactly 32 bytes");
-                                                    let creator = Pubkey::new_from_array(creator_bytes);
+                                                    let creator =
+                                                        Pubkey::new_from_array(creator_bytes);
                                                     if creator != Pubkey::default() {
                                                         metadata.insert(
                                                             "creator".to_string(),
@@ -2341,7 +2351,10 @@ impl ExecutionContext {
                             maybe_ping_watchdog();
 
                             if metadata.contains_key("creator") && resources.pools.len() == 1 {
-                                metadata.insert("sell_routing".to_string(), "pumpfun_fallback".to_string());
+                                metadata.insert(
+                                    "sell_routing".to_string(),
+                                    "pumpfun_fallback".to_string(),
+                                );
                                 metadata.insert("dex".to_string(), "pumpfun".to_string());
                                 min_out_sol = Some(Self::apply_slippage_min_out(
                                     q.amount_out,
@@ -2484,7 +2497,8 @@ impl ExecutionContext {
                 Ok(()) => {}
                 Err(e) => {
                     let is_6005 = is_6005_bonding_curve_complete(&e);
-                    let dex_pumpfun = intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun");
+                    let dex_pumpfun =
+                        intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun");
 
                     if is_6005 && dex_pumpfun {
                         // 6005-Retry: BondingCurveComplete → curve migrated to PumpSwap AMM
@@ -2535,10 +2549,13 @@ impl ExecutionContext {
                                             max_slippage_bps,
                                         );
                                         let mut retry = intent;
-                                        retry.metadata.insert("dex".to_string(), "pump_amm".to_string());
                                         retry
                                             .metadata
-                                            .insert("sell_routing".to_string(), "multi_pool".to_string());
+                                            .insert("dex".to_string(), "pump_amm".to_string());
+                                        retry.metadata.insert(
+                                            "sell_routing".to_string(),
+                                            "multi_pool".to_string(),
+                                        );
                                         retry
                                             .metadata
                                             .insert("6005_retry".to_string(), "true".to_string());
@@ -2958,7 +2975,12 @@ impl ExecutionContext {
             }
 
             // Re-validate: if a supported sell route exists, refuse to burn.
-            let decimals = get_token_decimals_or_default(ctx.rpc.as_ref(), &mint, ctx.live_pool_cache.as_deref()).await;
+            let decimals = get_token_decimals_or_default(
+                ctx.rpc.as_ref(),
+                &mint,
+                ctx.live_pool_cache.as_deref(),
+            )
+            .await;
             let unit_u64 = 10u128
                 .checked_pow(decimals as u32)
                 .and_then(|v| u64::try_from(v).ok())
@@ -3982,7 +4004,11 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
         let sol = bootstrap_sol.unwrap_or_else(|| lock_manager.total_native_sol());
         // If we have SOL but no WSOL in JetStream (e.g. market-data not run yet), assume 0
         // rather than leaving available_wsol uninitialized (which would show wrong metrics).
-        let wsol = bootstrap_wsol.or(if bootstrap_sol.is_some() { Some(0) } else { None });
+        let wsol = bootstrap_wsol.or(if bootstrap_sol.is_some() {
+            Some(0)
+        } else {
+            None
+        });
         lock_manager.update_wallet_balances(sol, wsol);
         info!(
             wallet = %wallet_str,
@@ -4432,8 +4458,7 @@ async fn main() -> Result<()> {
                 if reconciled != initial_positions {
                     info!(
                         previous = initial_positions,
-                        reconciled,
-                        "Open positions reconciled from wallet snapshot"
+                        reconciled, "Open positions reconciled from wallet snapshot"
                     );
                 }
                 initial_positions = reconciled;
@@ -4492,7 +4517,9 @@ async fn main() -> Result<()> {
     // Bootstrap LivePoolCache from JetStream (state recovery after restart)
     // The consumer is returned so it can be reused in the main loop,
     // avoiding a second LastPerSubject replay of ~579k messages.
-    let bootstrap_consumer = if let (Some(ref nats_client), Some(ref cache)) = (&nats, &live_pool_cache) {
+    let bootstrap_consumer = if let (Some(ref nats_client), Some(ref cache)) =
+        (&nats, &live_pool_cache)
+    {
         match bootstrap_pool_cache_from_jetstream(nats_client, cache).await {
             Ok((pools_recovered, consumer)) => {
                 info!(
@@ -4517,12 +4544,17 @@ async fn main() -> Result<()> {
             .and_then(|c| c.solana.geyser_grpc_url.as_ref());
         if exec_config.geyser_confirm_enabled {
             if let (Some(url), Some(ref wpk)) = (geyser_url, &wallet_pubkey) {
-                info!("FIX-32: Initializing Geyser-based TX confirmation (wallet={})", wpk);
-                Arc::new(ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::with_geyser(
-                    exec_config.confirmation_timeout_ms / 1000,
-                    url.clone(),
-                    *wpk,
-                ))
+                info!(
+                    "FIX-32: Initializing Geyser-based TX confirmation (wallet={})",
+                    wpk
+                );
+                Arc::new(
+                    ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::with_geyser(
+                        exec_config.confirmation_timeout_ms / 1000,
+                        url.clone(),
+                        *wpk,
+                    ),
+                )
             } else {
                 info!("FIX-32: Geyser TX confirm disabled (no geyser URL or wallet)");
                 Arc::new(ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::new(
@@ -5325,8 +5357,9 @@ async fn main() -> Result<()> {
                     topic = TOPIC_MARKET_EVENTS,
                     "Subscribed to MarketEvents for TokenMintInfo → SLAVE LivePoolCache decimals"
                 );
-                let cache_for_mint_info: Option<Arc<ironcrab::execution::live_pool_cache::LivePoolCache>> =
-                    ctx.live_pool_cache.as_ref().map(Arc::clone);
+                let cache_for_mint_info: Option<
+                    Arc<ironcrab::execution::live_pool_cache::LivePoolCache>,
+                > = ctx.live_pool_cache.as_ref().map(Arc::clone);
                 let ctx_for_blockhash = Arc::clone(&ctx);
                 tokio::spawn(async move {
                     let mut mint_info_count: u64 = 0;
@@ -5403,25 +5436,24 @@ async fn main() -> Result<()> {
                                 blockhash,
                                 slot,
                                 block_height,
-                            } => {
-                                match solana_sdk::hash::Hash::from_str(blockhash) {
-                                    Ok(hash) => {
-                                        *ctx_for_blockhash.cached_blockhash.write() = Some(CachedBlockhash {
+                            } => match solana_sdk::hash::Hash::from_str(blockhash) {
+                                Ok(hash) => {
+                                    *ctx_for_blockhash.cached_blockhash.write() =
+                                        Some(CachedBlockhash {
                                             hash,
                                             slot: *slot,
                                             block_height: *block_height,
                                             received_at: std::time::Instant::now(),
                                         });
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            blockhash,
-                                            error = %e,
-                                            "Failed to parse LatestBlockhash from NATS"
-                                        );
-                                    }
                                 }
-                            }
+                                Err(e) => {
+                                    warn!(
+                                        blockhash,
+                                        error = %e,
+                                        "Failed to parse LatestBlockhash from NATS"
+                                    );
+                                }
+                            },
                             _ => {
                                 // Other MarketEvent types are handled by momentum-bot/arb-strategy
                             }
@@ -6858,8 +6890,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         // On-chain validators have the latest state, so the TX will succeed there.
         let sim_error = sim_result.error_code.as_deref().unwrap_or("");
 
-        let is_ata_create_failure_on_buy = intent.side == TradeSide::Buy
-            && sim_error.contains("InstructionError(0, Custom(2))");
+        let is_ata_create_failure_on_buy =
+            intent.side == TradeSide::Buy && sim_error.contains("InstructionError(0, Custom(2))");
 
         let is_pumpfun_sell_balance_lag = intent.side == TradeSide::Sell
             && sim_error.contains("Custom(6023)")
@@ -7569,7 +7601,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         if !exec.metadata.contains_key("mint_decimals") {
                             if let Some(ref cache) = ctx.live_pool_cache {
                                 if let Some(d) = cache.get_mint_decimals(&output_mint_pk) {
-                                    exec.metadata.insert("mint_decimals".to_string(), d.to_string());
+                                    exec.metadata
+                                        .insert("mint_decimals".to_string(), d.to_string());
                                 }
                             }
                         }
@@ -7622,7 +7655,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
             ctx.execution_writer.write(&exec)?;
             if let Some(ref nats) = ctx.nats {
-                nats.jetstream_publish(TOPIC_EXECUTION_RESULTS, &exec).await?;
+                nats.jetstream_publish(TOPIC_EXECUTION_RESULTS, &exec)
+                    .await?;
             }
         }
     }
@@ -7884,8 +7918,14 @@ async fn emit_sim_failed_decision(
     REJECT_SIMULATION_FAIL.fetch_add(1, Ordering::Relaxed);
 
     // Extract diagnostic info before sim_result is moved into DecisionRecord
-    let sim_error_str = sim_result.error_code.clone().unwrap_or_else(|| "unknown".to_string());
-    let sim_logs_str = sim_result.logs_preview.clone().unwrap_or_else(|| "no logs".to_string());
+    let sim_error_str = sim_result
+        .error_code
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let sim_logs_str = sim_result
+        .logs_preview
+        .clone()
+        .unwrap_or_else(|| "no logs".to_string());
 
     let mut decision = DecisionRecord::new_sim_failed(
         "execution-engine",
@@ -8347,7 +8387,15 @@ async fn confirm_signature_status(
         let interval_ms = config.rebroadcast_interval_ms;
         let max_rebroadcasts = config.max_rebroadcasts;
         Some(tokio::spawn(async move {
-            spawn_rebroadcast_loop(rpc, &sig_str, tx_clone, deadline, interval_ms, max_rebroadcasts).await;
+            spawn_rebroadcast_loop(
+                rpc,
+                &sig_str,
+                tx_clone,
+                deadline,
+                interval_ms,
+                max_rebroadcasts,
+            )
+            .await;
         }))
     } else {
         None
@@ -8374,7 +8422,9 @@ async fn confirm_via_geyser(
     deadline: Duration,
     start: std::time::Instant,
 ) -> std::result::Result<ConfirmOutcome, String> {
-    let rx = ctx.tx_confirm.register_tx(signature_base58.to_string(), None);
+    let rx = ctx
+        .tx_confirm
+        .register_tx(signature_base58.to_string(), None);
     let remaining = deadline.saturating_sub(start.elapsed());
 
     tokio::select! {

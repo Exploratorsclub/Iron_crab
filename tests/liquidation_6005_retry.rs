@@ -34,7 +34,9 @@ fn make_intent(dex: &str) -> TradeIntent {
         TradingRegime::NotApplicable,
     );
     intent.metadata.insert("dex".to_string(), dex.to_string());
-    intent.metadata.insert("purpose".to_string(), "liquidation".to_string());
+    intent
+        .metadata
+        .insert("purpose".to_string(), "liquidation".to_string());
     intent
 }
 

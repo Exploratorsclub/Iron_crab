@@ -222,7 +222,9 @@ impl PumpFunDex {
 
     /// Get creator from LivePoolCache (GEYSER-FIRST, no RPC).
     fn get_creator_from_cache(&self, bonding_curve: &Pubkey) -> Option<Pubkey> {
-        self.live_pool_cache.as_ref()?.get_pumpfun_creator(bonding_curve)
+        self.live_pool_cache
+            .as_ref()?
+            .get_pumpfun_creator(bonding_curve)
     }
 
     /// Derive bonding curve PDA for a token mint
@@ -645,7 +647,8 @@ impl PumpFunDex {
         // SELL: Validate against real_token_reserves (same logic as quote_exact_in).
         // If real_reserves=0 but virtual_reserves populated, cache may be stale — proceed.
         if !buy_token {
-            let real_reserves_populated = state.real_token_reserves > 0 || state.real_sol_reserves > 0;
+            let real_reserves_populated =
+                state.real_token_reserves > 0 || state.real_sol_reserves > 0;
             if real_reserves_populated {
                 if amount_in > state.real_token_reserves {
                     info!(
@@ -864,7 +867,8 @@ impl Dex for PumpFunDex {
         // the cache may be stale (PoolCacheUpdate from older market-data without real_reserves).
         // In that case, proceed with the quote and let simulation catch any on-chain failures.
         if !buy_token {
-            let real_reserves_populated = state.real_token_reserves > 0 || state.real_sol_reserves > 0;
+            let real_reserves_populated =
+                state.real_token_reserves > 0 || state.real_sol_reserves > 0;
             if real_reserves_populated {
                 if amount_in > state.real_token_reserves {
                     info!(

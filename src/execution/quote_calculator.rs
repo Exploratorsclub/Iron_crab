@@ -147,9 +147,15 @@ pub fn quote_output_amount(
         CachedPoolState::PumpAmm(s) => {
             let base_to_quote = *input_mint == s.base_mint;
             let (reserve_in, reserve_out) = if base_to_quote {
-                (s.base_reserve.unwrap_or(0) as u128, s.quote_reserve.unwrap_or(0) as u128)
+                (
+                    s.base_reserve.unwrap_or(0) as u128,
+                    s.quote_reserve.unwrap_or(0) as u128,
+                )
             } else {
-                (s.quote_reserve.unwrap_or(0) as u128, s.base_reserve.unwrap_or(0) as u128)
+                (
+                    s.quote_reserve.unwrap_or(0) as u128,
+                    s.base_reserve.unwrap_or(0) as u128,
+                )
             };
             if reserve_in == 0 || reserve_out == 0 {
                 return Err(anyhow!("pump_amm: missing reserves"));
@@ -163,11 +169,19 @@ pub fn quote_output_amount(
         CachedPoolState::Orca(s) => {
             let a_to_b = *input_mint == s.token_mint_a;
             let (ri, ro) = if a_to_b {
-                (s.vault_a_balance.unwrap_or(0) as u128, s.vault_b_balance.unwrap_or(0) as u128)
+                (
+                    s.vault_a_balance.unwrap_or(0) as u128,
+                    s.vault_b_balance.unwrap_or(0) as u128,
+                )
             } else {
-                (s.vault_b_balance.unwrap_or(0) as u128, s.vault_a_balance.unwrap_or(0) as u128)
+                (
+                    s.vault_b_balance.unwrap_or(0) as u128,
+                    s.vault_a_balance.unwrap_or(0) as u128,
+                )
             };
-            if ri == 0 || ro == 0 { return Err(anyhow!("orca: missing vault balances")); }
+            if ri == 0 || ro == 0 {
+                return Err(anyhow!("orca: missing vault balances"));
+            }
             let fee_bps = s.fee_rate as u128 / 100;
             let a = amount_in as u128;
             let after_fee = a * (10000 - fee_bps) / 10000;
@@ -176,11 +190,19 @@ pub fn quote_output_amount(
         CachedPoolState::RaydiumAmm(s) => {
             let base_to_quote = *input_mint == s.base_mint;
             let (ri, ro) = if base_to_quote {
-                (s.coin_reserve.unwrap_or(0) as u128, s.pc_reserve.unwrap_or(0) as u128)
+                (
+                    s.coin_reserve.unwrap_or(0) as u128,
+                    s.pc_reserve.unwrap_or(0) as u128,
+                )
             } else {
-                (s.pc_reserve.unwrap_or(0) as u128, s.coin_reserve.unwrap_or(0) as u128)
+                (
+                    s.pc_reserve.unwrap_or(0) as u128,
+                    s.coin_reserve.unwrap_or(0) as u128,
+                )
             };
-            if ri == 0 || ro == 0 { return Err(anyhow!("raydium_amm: missing reserves")); }
+            if ri == 0 || ro == 0 {
+                return Err(anyhow!("raydium_amm: missing reserves"));
+            }
             const FEE: u128 = 25;
             let a = amount_in as u128;
             let after_fee = a * (10000 - FEE) / 10000;
@@ -191,11 +213,19 @@ pub fn quote_output_amount(
         CachedPoolState::RaydiumCpmm(s) => {
             let zero_to_one = *input_mint == s.token_0_mint;
             let (ri, ro) = if zero_to_one {
-                (s.reserve_0.unwrap_or(0) as u128, s.reserve_1.unwrap_or(0) as u128)
+                (
+                    s.reserve_0.unwrap_or(0) as u128,
+                    s.reserve_1.unwrap_or(0) as u128,
+                )
             } else {
-                (s.reserve_1.unwrap_or(0) as u128, s.reserve_0.unwrap_or(0) as u128)
+                (
+                    s.reserve_1.unwrap_or(0) as u128,
+                    s.reserve_0.unwrap_or(0) as u128,
+                )
             };
-            if ri == 0 || ro == 0 { return Err(anyhow!("raydium_cpmm: missing reserves")); }
+            if ri == 0 || ro == 0 {
+                return Err(anyhow!("raydium_cpmm: missing reserves"));
+            }
             const FEE: u128 = 25;
             let a = amount_in as u128;
             let after_fee = a * (10000 - FEE) / 10000;
@@ -206,11 +236,19 @@ pub fn quote_output_amount(
         CachedPoolState::Meteora(s) => {
             let x_to_y = *input_mint == s.token_x_mint;
             let (ri, ro) = if x_to_y {
-                (s.reserve_x_balance.unwrap_or(0) as u128, s.reserve_y_balance.unwrap_or(0) as u128)
+                (
+                    s.reserve_x_balance.unwrap_or(0) as u128,
+                    s.reserve_y_balance.unwrap_or(0) as u128,
+                )
             } else {
-                (s.reserve_y_balance.unwrap_or(0) as u128, s.reserve_x_balance.unwrap_or(0) as u128)
+                (
+                    s.reserve_y_balance.unwrap_or(0) as u128,
+                    s.reserve_x_balance.unwrap_or(0) as u128,
+                )
             };
-            if ri == 0 || ro == 0 { return Err(anyhow!("meteora: missing reserves")); }
+            if ri == 0 || ro == 0 {
+                return Err(anyhow!("meteora: missing reserves"));
+            }
             let fee_bps = (s.bin_step as u128).min(100);
             let a = amount_in as u128;
             let after_fee = a * (10000 - fee_bps) / 10000;
@@ -223,13 +261,17 @@ pub fn quote_output_amount(
             } else {
                 (s.reserve_1 as u128, s.reserve_0 as u128)
             };
-            if ri == 0 || ro == 0 { return Err(anyhow!("meteora_cpmm: missing reserves")); }
+            if ri == 0 || ro == 0 {
+                return Err(anyhow!("meteora_cpmm: missing reserves"));
+            }
             let fee: u128 = 25;
             let a = amount_in as u128;
             let fm = 10000 - fee;
             let num = ro * a * fm;
             let den = ri * 10000 + a * fm;
-            if den == 0 { return Err(anyhow!("meteora_cpmm: denominator zero")); }
+            if den == 0 {
+                return Err(anyhow!("meteora_cpmm: denominator zero"));
+            }
             Ok((num / den) as u64)
         }
     }
@@ -645,7 +687,7 @@ mod tests {
             associated_bonding_curve: Pubkey::new_unique(),
             virtual_sol_reserves: 30_000_000_000, // 30 SOL
             virtual_token_reserves: 1_000_000_000_000_000, // 1B tokens
-            real_sol_reserves: 5_000_000_000, // 5 SOL (curve has SOL to pay out)
+            real_sol_reserves: 5_000_000_000,     // 5 SOL (curve has SOL to pay out)
             real_token_reserves: 793_100_000_000_000,
             complete: false,
             creator: Pubkey::new_unique(),

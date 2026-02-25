@@ -152,9 +152,7 @@ async fn contract_pump_amm_zero_input() {
     let dex = PumpFunAmmDex::new_with_cache(rpc, cache);
 
     let base_mint_str = base_mint.to_string();
-    let result = dex
-        .quote_exact_in(WSOL_MINT, &base_mint_str, 0)
-        .await;
+    let result = dex.quote_exact_in(WSOL_MINT, &base_mint_str, 0).await;
 
     assert!(result.is_ok());
     let quote_opt = result.unwrap();

@@ -1,0 +1,10 @@
+# Security audit config - see docs/KNOWN_BUG_PATTERNS.md
+# Transitive deps from Solana/SPL/async-nats; cannot be replaced without upgrading entire Solana stack.
+
+[advisories]
+# bincode unmaintained (Solana/spl-token-2022), rustls-pemfile (async-nats)
+ignore = ["RUSTSEC-2025-0141", "RUSTSEC-2025-0134"]
+
+# Disable yanked warnings - js-sys, wasm-bindgen come from web-time/rustls-pki-types via async-nats
+[yanked]
+enabled = false

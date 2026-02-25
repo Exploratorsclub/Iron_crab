@@ -297,7 +297,7 @@ mod tests {
         // Add samples with varying fees
         for i in 1..=20 {
             let fee = 5000 + (i * 1000); // 6000, 7000, ..., 25000
-            tracker.add_sample(i as u64, fee, Some(100_000));
+            tracker.add_sample(i, fee, Some(100_000));
         }
 
         let percentiles = tracker.get_percentiles();
@@ -309,9 +309,11 @@ mod tests {
 
     #[test]
     fn test_fee_clamping() {
-        let mut config = PriorityFeeConfig::default();
-        config.min_priority_fee_micro_lamports = 50_000;
-        config.max_priority_fee_micro_lamports = 500_000;
+        let config = PriorityFeeConfig {
+            min_priority_fee_micro_lamports: 50_000,
+            max_priority_fee_micro_lamports: 500_000,
+            ..PriorityFeeConfig::default()
+        };
 
         let tracker = PriorityFeeTracker::with_config(config);
 

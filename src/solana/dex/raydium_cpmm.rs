@@ -172,7 +172,10 @@ impl RaydiumCpmm {
     }
 
     /// Create RaydiumCpmm instance with optional LivePoolCache for Geyser-first vault balances.
-    pub fn new_with_live_cache(rpc: Arc<SolanaRpc>, live_pool_cache: Option<SharedLivePoolCache>) -> Self {
+    pub fn new_with_live_cache(
+        rpc: Arc<SolanaRpc>,
+        live_pool_cache: Option<SharedLivePoolCache>,
+    ) -> Self {
         Self {
             rpc,
             pools: Arc::new(DashMap::new()),
