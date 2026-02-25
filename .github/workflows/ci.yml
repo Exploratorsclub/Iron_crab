@@ -95,7 +95,7 @@ jobs:
 
       - name: Eval tests
         run: |
-          cd Iron_crab-eval
+          cd ../Iron_crab-eval
           cargo test --quiet
 
   python-backend:
