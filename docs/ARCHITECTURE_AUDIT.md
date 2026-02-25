@@ -97,9 +97,9 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 - `register_pool()` bei Trade-Events (findet Pools die `PoolCreated` verpasst haben)
 - `cleanup_old_trackers()` bewahrt Trackers für offene Positionen (Lock-Order-Fix)
 
-**Status**: ❌ FEHLT — Bonding-Curve Exit ist nicht aktiv, Creator-Handling und DEX-Normalisierung fehlen
+**Status (2026-02-21)**: ✅ BEHOBEN — Config `bonding_curve_exit_*`, Creator auf PositionTracker, `normalize_dex_for_execution_engine`, `resolve_authoritative_creator` und Hot-Reload sind implementiert.
 
-**Bewertung**: Priorität 2 für Cherry-Pick.
+**Bewertung**: War Priorität 2 für Cherry-Pick; jetzt implementiert.
 
 ### A.3 — Market-Data: Wallet-Tracking & JetStream Verbesserungen (MITTEL – sollte zurück)
 
@@ -130,15 +130,15 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 - ✅ Liquidation-Routing: Multi-Pool first, PumpFun last
 - ✅ `side` in ExecutionResult Metadata
 - ✅ Liquidation-Sells bypassen `sell_token_balance` Preflight
+- ✅ `PumpFunAmmDex::new_with_cache()` Verwendung in Liquidation (2026-02-21)
+- ✅ `emit_sim_failed_decision()` gibt `Err` zurück für Retry-Detection
 
 **Was noch fehlt**:
 - ❌ 6005-Retry-Mechanismus (bei BondingCurveComplete → automatisch multi-pool retry)
-- ❌ `PumpFunAmmDex::new_with_cache()` Verwendung in Liquidation (nutzt aktuell `new()`)
-- ❌ SELL → token_account + token_program in ExecutionResult Metadata für market-data ATA-Tracking
-- ❌ `emit_sim_failed_decision()` gibt `Err` zurück (statt `Ok`) für Retry-Detection
+- ❌ SELL → token_account + token_program in ExecutionResult Metadata für market-data ATA-Tracking (Momentum-Sells)
 - ❌ `AVAILABLE_TRADING_CAPITAL_LAMPORTS` Metrik
 
-**Status**: ⚠️ TEILWEISE — Kern-Liquidation funktioniert, 6005-Retry und Cache-Nutzung fehlen
+**Status**: ⚠️ TEILWEISE — Kern-Liquidation funktioniert; 6005-Retry fehlt noch
 
 ### A.5 — Pump.fun Bonding Curve: SELL bei migrierten Tokens (SINNVOLL – sollte zurück)
 
@@ -161,9 +161,9 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 - Bei Pump.fun BUY: `min_out` wird mit frischem Cache-Quote gekappt
 - Vermeidet Error 6002 ("Too much SOL required") wenn sich die Bonding Curve zwischen Intent-Publish und TX-Build verschoben hat
 
-**Status**: ❌ FEHLT — BUY-Transaktionen können mit 6002 scheitern bei schnellen Kursbewegungen
+**Status (2026-02-21)**: ✅ BEHOBEN — FIX-28 in tx_builder.rs: min_out wird aus Cache berechnet und mit Intent-Wert gekappt.
 
-**Bewertung**: Priorität 2 für Cherry-Pick.
+**Bewertung**: War Priorität 2 für Cherry-Pick; jetzt implementiert.
 
 ### A.7 — Metrics: `available_trading_capital_lamports` (NICE-TO-HAVE)
 
