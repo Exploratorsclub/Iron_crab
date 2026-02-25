@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ solana3x_clean, main ]
+    branches: ['*']  # Alle Branches
   pull_request:
-    branches: [ solana3x_clean, main ]
+    branches: ['*']  # Alle Branches
 
 jobs:
   build-test:
