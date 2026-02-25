@@ -68,6 +68,36 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+  eval:
+    name: Eval (Level 5)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone ironcrab-eval (Sibling für path = "../Iron_crab")
+        run: |
+          cd ..
+          git clone https://github.com/${{ github.repository_owner }}/Iron_crab-eval.git Iron_crab-eval
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Eval tests
+        run: |
+          cd Iron_crab-eval
+          cargo test --quiet
+
   python-backend:
     name: Python backend (pyo3)
     runs-on: ubuntu-latest

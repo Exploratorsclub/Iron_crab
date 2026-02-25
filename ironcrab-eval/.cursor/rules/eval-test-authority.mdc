@@ -1,0 +1,24 @@
+---
+description: Test Authority – arbeitet nur mit Spec und Eval-Tests
+alwaysApply: true
+---
+
+# Iron_crab-eval: Test Authority Rules
+
+## Kontext
+- Dieses Repo enthält **Spec** (`docs/spec/`) und **Evaluation-Tests** (Blackbox + Invarianten).
+- Du bist die **Test Authority**: du schreibst Tests aus der Spec, kein Implementationscode.
+
+## Erlaubt
+- Spec-Dokumente lesen und aktualisieren (`docs/spec/`)
+- Neue Blackbox-Szenarien in `tests/`
+- Neue Invarianten in `tests/`
+- Referenz auf `ironcrab`-API via `path = "../Iron_crab"` (nur zum Testen, nicht zum Implementieren)
+
+## Verboten
+- Implementierungs-Code in `Iron_crab` ändern
+- Tests so schreiben, dass sie Implementation-Details erzwingen (Blackbox = API-Grenze)
+
+## Abhängigkeit
+- `Iron_crab` muss als Geschwister-Ordner vorhanden sein: `../Iron_crab`
+- `cargo test` baut gegen die lokale Iron_crab-Lib

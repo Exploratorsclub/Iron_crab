@@ -1,0 +1,15 @@
+[package]
+name = "ironcrab-eval"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Sibling-Layout: Iron_crab und Iron_crab-eval nebeneinander (lokal + CI)
+ironcrab = { path = "../Iron_crab" }
+solana-sdk = "=3.0.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
+rust_decimal = { version = "1", features = ["serde"] }
+tempfile = "3"

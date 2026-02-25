@@ -275,8 +275,5 @@ Siehe `.github/copilot-instructions.md` für Details.
 
 ## Siehe auch
 
-- [TARGET_ARCHITECTURE.md](TARGET_ARCHITECTURE.md) — Architektur-Dokumentation
-- [ROLE_SEPARATION.md](ROLE_SEPARATION.md) — Keyless vs. Single-Signer
-- [DEFINITION_OF_DONE.md](DEFINITION_OF_DONE.md) — P0 Requirements
+- [Iron_crab-eval/docs/spec/](https://github.com/Exploratorsclub/Iron_crab-eval) — Spezifikation (TARGET_ARCHITECTURE, ROLE_SEPARATION, DEFINITION_OF_DONE, STORAGE_CONVENTIONS)
 - [VALIDATOR_SETUP.md](VALIDATOR_SETUP.md) — Validator + Geyser Konfiguration
-- [STORAGE_CONVENTIONS.md](STORAGE_CONVENTIONS.md) — JSONL Storage Details

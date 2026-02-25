@@ -4,7 +4,7 @@ alwaysApply: true
 ---
 
 # IronCrab Core Rules
-- Follow `docs/TARGET_ARCHITECTURE.md` and `docs/DEFINITION_OF_DONE.md` as source of truth; also respect `docs/STORAGE_CONVENTIONS.md`, `docs/ROLE_SEPARATION.md`, and `docs/ORDER_LIFECYCLE.md` for state flows.
+- Vollständige Spec: [Iron_crab-eval/docs/spec/](https://github.com/Exploratorsclub/Iron_crab-eval). Kern-Regeln siehe unten (Single-Signer, Hot Path, Cold Path).
 - Before changes: read `docs/INVARIANTS.md` (never violate) and `docs/KNOWN_BUG_PATTERNS.md` (check for similar patterns).
 - Propose a plan before coding.
 - Do not change architecture without explicit approval.
@@ -23,6 +23,13 @@ alwaysApply: true
 - COLD PATH (liquidation, manual actions, bootstrap): RPC calls ARE acceptable. Safety and correctness have priority over speed. Use getTokenAccountsByOwner, getMultipleAccounts etc. for authoritative on-chain state.
 - NEVER remove RPC from cold paths to "optimize" — this breaks safety-critical flows. NEVER add RPC to hot paths without explicit approval — this breaks latency requirements.
 - When refactoring RPC usage, always verify which path (hot vs cold) is affected. Changes that touch both paths require explicit approval.
+
+## Eval-Tests (Level 5)
+Nach Implementations-Änderungen die Eval-Tests selbst ausführen, bevor der Task als erledigt gilt:
+- **Befehl:** `cd ..\ironcrab-eval; cargo test` (oder `cd ../ironcrab-eval && cargo test` unter Unix)
+- **Pfad:** ironcrab-eval liegt als Sibling neben Iron_crab unter `Trading_bot/`.
+- **Bei Fail:** Ausgabe lesen, Code korrigieren, erneut `cargo test` ausführen. Erst bei Pass abschließen.
+- **Alternative:** Push → CI führt Eval-Tests aus; bei CI-Fail Fehlermeldung in den Chat übernehmen und beheben.
 
 ## Feature-Scoped Prompts
 When the user scopes a task (e.g. "fix X in momentum-bot", "add Y to execution-engine"):
