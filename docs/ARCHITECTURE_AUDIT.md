@@ -132,13 +132,13 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 - ✅ Liquidation-Sells bypassen `sell_token_balance` Preflight
 - ✅ `PumpFunAmmDex::new_with_cache()` Verwendung in Liquidation (2026-02-21)
 - ✅ `emit_sim_failed_decision()` gibt `Err` zurück für Retry-Detection
+- ✅ 6005-Retry-Mechanismus (2026-02-25): Bei BondingCurveComplete auf pumpfun → automatisch Retry mit PumpSwap AMM
 
 **Was noch fehlt**:
-- ❌ 6005-Retry-Mechanismus (bei BondingCurveComplete → automatisch multi-pool retry)
 - ❌ SELL → token_account + token_program in ExecutionResult Metadata für market-data ATA-Tracking (Momentum-Sells)
 - ❌ `AVAILABLE_TRADING_CAPITAL_LAMPORTS` Metrik
 
-**Status**: ⚠️ TEILWEISE — Kern-Liquidation funktioniert; 6005-Retry fehlt noch
+**Status**: ⚠️ TEILWEISE — Kern-Liquidation funktioniert; 6005-Retry implementiert
 
 ### A.5 — Pump.fun Bonding Curve: SELL bei migrierten Tokens (SINNVOLL – sollte zurück)
 

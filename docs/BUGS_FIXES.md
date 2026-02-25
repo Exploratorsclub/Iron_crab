@@ -16,6 +16,11 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Problem**: Bei `BondingCurveComplete` (Error 6005) wurde nur ein DEX versucht. Zweiter Token wurde nicht über PumpSwap AMM probiert.
 **Fix**: Liquidation versucht jetzt Multi-Pool zuerst, PumpFun als Fallback. Alle DEXes werden durchprobiert.
 
+### FIX-44: 6005-Retry-Mechanismus in Liquidation (ARCHITECTURE_AUDIT A.4)
+**Datum**: 2026-02-25
+**Problem**: Wenn eine Liquidation-Sell-Route über PumpFun Bonding Curve gewählt wurde und die Simulation mit 6005 (BondingCurveComplete) fehlschlägt, wurde der Intent verworfen statt mit PumpSwap AMM zu retrien.
+**Fix**: Automatischer Retry: Bei Sim-Fail mit 6005 und dex=pumpfun wird `mark_pumpfun_complete_for_mint` gesetzt, eine frische PumpSwap-Quote geholt und ein neuer Intent mit pump_amm erstellt und verarbeitet. Library-Funktion `ironcrab::execution::error_detection::is_6005_bonding_curve_complete` für Fehlererkennung.
+
 ### FIX-03: Grafana Liquidation als "buy" angezeigt
 **Datum**: 2026-02-09
 **Problem**: Liquidation-Sells wurden im Dashboard als "buy" klassifiziert.

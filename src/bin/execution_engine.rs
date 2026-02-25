@@ -52,6 +52,7 @@ use uuid::Uuid;
 
 use ironcrab::config::Config as AppConfig;
 // cache_geyser removed - execution-engine now subscribes to PoolCacheUpdates from market-data via NATS
+use ironcrab::execution::error_detection::is_6005_bonding_curve_complete;
 use ironcrab::execution::live_pool_cache::{
     create_shared_cache, CachedPoolState, SharedLivePoolCache,
 };
@@ -2479,8 +2480,119 @@ impl ExecutionContext {
             #[cfg(unix)]
             maybe_ping_watchdog();
 
-            if let Err(e) = process_intent(&ctx, intent).await {
-                warn!(error = %e, "Liquidation intent processing failed");
+            match process_intent(&ctx, intent.clone()).await {
+                Ok(()) => {}
+                Err(e) => {
+                    let is_6005 = is_6005_bonding_curve_complete(&e);
+                    let dex_pumpfun = intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun");
+
+                    if is_6005 && dex_pumpfun {
+                        // 6005-Retry: BondingCurveComplete → curve migrated to PumpSwap AMM
+                        let mint_str = intent.resources.input_mint.clone();
+                        let sol_mint_str = intent.resources.output_mint.clone();
+                        let amount_in = intent.required_capital.raw;
+                        let mint = match Pubkey::from_str(&mint_str) {
+                            Ok(m) => m,
+                            Err(_) => {
+                                warn!(mint = %mint_str, "6005-retry: invalid mint; skipping");
+                                continue;
+                            }
+                        };
+
+                        // Mark curve complete so future attempts skip pumpfun for this mint
+                        if let Some(ref cache) = ctx.live_pool_cache {
+                            cache.mark_pumpfun_complete_for_mint(&mint);
+                        }
+
+                        info!(
+                            mint = %mint_str,
+                            amount_in,
+                            "6005-retry: BondingCurveComplete detected; retrying with PumpSwap AMM"
+                        );
+
+                        // Get fresh pump_amm quote
+                        let pump_amm_result = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            pump_amm.quote_exact_in(&mint_str, &sol_mint_str, amount_in),
+                        )
+                        .await;
+
+                        let retry_intent = match pump_amm_result {
+                            Ok(Ok(Some(ref q))) => {
+                                let pool_id = match q.route.first() {
+                                    Some(id) => id.clone(),
+                                    None => {
+                                        warn!(mint = %mint_str, "6005-retry: no pool in pump_amm route");
+                                        continue;
+                                    }
+                                };
+                                match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
+                                    Ok(Some(accounts)) => {
+                                        let acct_strings: Vec<String> =
+                                            accounts.iter().map(|p| p.to_string()).collect();
+                                        let min_out = Self::apply_slippage_min_out(
+                                            q.amount_out,
+                                            max_slippage_bps,
+                                        );
+                                        let mut retry = intent;
+                                        retry.metadata.insert("dex".to_string(), "pump_amm".to_string());
+                                        retry
+                                            .metadata
+                                            .insert("sell_routing".to_string(), "multi_pool".to_string());
+                                        retry
+                                            .metadata
+                                            .insert("6005_retry".to_string(), "true".to_string());
+                                        retry.resources.pools = vec![pool_id];
+                                        retry.resources.accounts = acct_strings;
+                                        retry.execution = Some(TradeExecutionConstraints {
+                                            min_out: Some(ExplicitAmount::new(min_out, 9)),
+                                        });
+                                        Some(retry)
+                                    }
+                                    Ok(None) => {
+                                        warn!(
+                                            mint = %mint_str,
+                                            "6005-retry: pump_amm quote ok but pool accounts not found"
+                                        );
+                                        None
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            mint = %mint_str,
+                                            error = %e,
+                                            "6005-retry: pump_amm pool account discovery failed"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            Ok(Ok(None)) => {
+                                warn!(mint = %mint_str, "6005-retry: pump_amm returned no quote");
+                                None
+                            }
+                            Ok(Err(e)) => {
+                                warn!(mint = %mint_str, error = %e, "6005-retry: pump_amm quote error");
+                                None
+                            }
+                            Err(_) => {
+                                warn!(mint = %mint_str, "6005-retry: pump_amm quote timeout");
+                                None
+                            }
+                        };
+
+                        if let Some(retry) = retry_intent {
+                            if let Err(retry_e) = process_intent(&ctx, retry).await {
+                                warn!(
+                                    mint = %mint_str,
+                                    error = %retry_e,
+                                    "6005-retry: PumpSwap AMM attempt also failed"
+                                );
+                            }
+                        }
+                    } else {
+                        warn!(error = %e, "Liquidation intent processing failed");
+                    }
+                }
             }
         }
 
