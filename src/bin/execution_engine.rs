@@ -1377,6 +1377,10 @@ struct ExecutionContext {
     /// Semaphore limiting how many intents run concurrently (sized from config at startup)
     intent_semaphore: Arc<tokio::sync::Semaphore>,
 
+    /// Channel to send SOL/WSOL balance updates to WsolManager (from JetStream consumer).
+    /// When Some, WalletBalanceSnapshot for NATIVE_SOL/WSOL are forwarded here.
+    wsol_balance_tx: Option<tokio::sync::mpsc::Sender<(u64, Option<u64>)>>,
+
     // === FIX-32: Geyser TX Confirmation ===
     /// Geyser-based TX confirmation tracker (Geyser-first, RPC-polling fallback)
     tx_confirm: Arc<ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm>,
@@ -4615,6 +4619,8 @@ async fn main() -> Result<()> {
         live_pool_cache: live_pool_cache.clone(),
         // FIX-32: Geyser-based TX confirmation
         tx_confirm,
+        // WsolManager balance updates (from JetStream); set when WsolManager enabled
+        wsol_balance_tx: None,
         // Metrics
         intents_received: std::sync::atomic::AtomicU64::new(0),
         intents_rejected: std::sync::atomic::AtomicU64::new(0),
@@ -4693,6 +4699,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Create WsolManager balance channel when treasury exists (JetStream → WsolManager)
+    let wsol_balance_rx = if ctx.treasury.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        ctx.wsol_balance_tx = Some(tx);
+        Some(rx)
+    } else {
+        None
+    };
+
     let ctx = Arc::new(ctx);
 
     // LivePoolCache is now synced via NATS from market-data (Single Source of Truth)
@@ -4727,8 +4742,6 @@ async fn main() -> Result<()> {
             });
 
         if wsol_config.enabled {
-            // Create separate NATS connection for WsolManager
-            let nats_url = args.nats_url.clone();
             let ctx_for_kill_switch = Arc::clone(&ctx);
             let wsol_manager = WsolManager::with_jsonl_writer(
                 wsol_config.clone(),
@@ -4741,23 +4754,11 @@ async fn main() -> Result<()> {
             .with_kill_switch(move || ctx_for_kill_switch.is_kill_switch_active());
             let shutdown_rx_wsol = shutdown_rx.clone();
 
+            let balance_rx = wsol_balance_rx
+                .expect("wsol_balance_rx set when treasury exists");
             tokio::spawn(async move {
-                // Create separate NATS client for WsolManager
-                let nats_config = NatsConfig::new(&nats_url, "wsol-manager");
-                let mut nats_client = NatsClient::new(nats_config);
-                match nats_client.connect().await {
-                    Ok(()) => {
-                        info!("WsolManager NATS connected");
-                        if let Err(e) = wsol_manager
-                            .run(Arc::new(nats_client), shutdown_rx_wsol)
-                            .await
-                        {
-                            error!(error = %e, "WsolManager task failed");
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = %e, "WsolManager failed to connect to NATS, cannot run without events");
-                    }
+                if let Err(e) = wsol_manager.run(balance_rx, shutdown_rx_wsol).await {
+                    error!(error = %e, "WsolManager task failed");
                 }
             });
 
@@ -4766,36 +4767,23 @@ async fn main() -> Result<()> {
                 target_wsol = wsol_config.target_wsol_sol,
                 max_wsol = wsol_config.max_wsol_sol,
                 dry_run = wsol_config.dry_run,
-                "WsolManager background task started"
+                "WsolManager background task started (balance updates via JetStream)"
             );
 
-            // Seed WsolManager with bootstrap balances so it can wrap immediately.
-            // Without this, WsolManager may never receive WalletBalanceUpdate (ephemeral NATS)
-            // if market-data bootstrapped before execution-engine started.
-            if let Some(ref nats) = ctx.nats {
-                use ironcrab::execution::wsol_manager::WalletBalanceUpdate;
-                use ironcrab::nats::wallet_balance_topic;
+            // Seed WsolManager with bootstrap balances from LockManager (JetStream bootstrap).
+            if let Some(ref tx) = ctx.wsol_balance_tx {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let wallet_str = treasury.pubkey().to_string();
                 let sol = ctx.lock_manager.total_native_sol();
                 let wsol = ctx.lock_manager.available_wsol();
-                let update = WalletBalanceUpdate {
-                    header: RecordHeader::new("execution-engine", BUILD_VERSION, &run_id),
-                    wallet: wallet_str.clone(),
-                    sol_lamports: sol,
-                    wsol_lamports: Some(wsol),
-                    slot: 0,
-                };
-                let topic = wallet_balance_topic(&wallet_str);
-                if let Err(e) = nats.publish(&topic, &update).await {
-                    warn!(error = %e, "Failed to publish bootstrap WalletBalanceUpdate for WsolManager");
+                if let Err(e) = tx.send((sol, Some(wsol))).await {
+                    warn!(error = %e, "Failed to send bootstrap balance to WsolManager");
                 } else {
                     info!(
                         sol = sol,
                         wsol = wsol,
                         sol_sol = sol as f64 / 1e9,
                         wsol_sol = wsol as f64 / 1e9,
-                        "Bootstrapped WsolManager with WalletBalanceUpdate from JetStream"
+                        "Bootstrapped WsolManager with balance from JetStream"
                     );
                 }
             }
@@ -4806,83 +4794,8 @@ async fn main() -> Result<()> {
         debug!("WsolManager not started (no Treasury)");
     }
 
-    // === WalletBalanceUpdate Listener: Keep LockManager in sync with wallet balances ===
-    // This ensures the dashboard shows correct "Available SOL" (actually WSOL) after wraps
-    if let Some(ref treasury) = ctx.treasury {
-        use ironcrab::nats::wallet_balance_topic;
-
-        let wallet_pubkey = treasury.pubkey();
-        let topic = wallet_balance_topic(&wallet_pubkey.to_string());
-        let ctx_for_balance = Arc::clone(&ctx);
-        let nats_url = args.nats_url.clone();
-        let shutdown_rx_balance = shutdown_rx.clone();
-
-        tokio::spawn(async move {
-            use ironcrab::execution::wsol_manager::WalletBalanceUpdate;
-            // Create dedicated NATS client for balance updates
-            let nats_config = NatsConfig::new(&nats_url, "balance-updater");
-            let mut nats_client = NatsClient::new(nats_config);
-
-            if let Err(e) = nats_client.connect().await {
-                warn!(error = %e, "Balance updater failed to connect to NATS");
-                return;
-            }
-
-            let mut subscription = match nats_client.subscribe(&topic).await {
-                Ok(sub) => sub,
-                Err(e) => {
-                    warn!(error = %e, topic = %topic, "Failed to subscribe to wallet balance updates");
-                    return;
-                }
-            };
-
-            info!(topic = %topic, "LockManager balance updater subscribed to wallet balance events");
-
-            let mut shutdown = shutdown_rx_balance;
-            loop {
-                tokio::select! {
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
-                            info!("Balance updater shutting down");
-                            break;
-                        }
-                    }
-                    msg = subscription.next() => {
-                        if let Some(msg) = msg {
-                            match serde_json::from_slice::<WalletBalanceUpdate>(&msg.payload) {
-                                Ok(update) => {
-                                    // Update LockManager with new balances
-                                    ctx_for_balance.lock_manager.update_wallet_balances(
-                                        update.sol_lamports,
-                                        update.wsol_lamports,
-                                    );
-                                    info!(
-                                        sol = update.sol_lamports,
-                                        wsol = ?update.wsol_lamports,
-                                        slot = update.slot,
-                                        "LockManager updated from WalletBalanceUpdate"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to parse WalletBalanceUpdate");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        info!(
-            wallet = %treasury.pubkey(),
-            "LockManager balance updater background task started"
-        );
-
-        // NOTE: Redundant background JetStream token-balance-sync task was removed.
-        // Token balance sync is now handled exclusively in the main select! loop
-        // (wallet_snapshot_consumer_opt), which also updates open_positions on
-        // balance transitions (non-zero→0 = position closed, 0→non-zero = new position).
-    }
+    // NOTE: LockManager balance updates now come from JetStream WalletBalanceSnapshot
+    // in the main loop (wallet_snapshot_consumer_opt). No separate balance-updater task.
 
     // === AccountJanitor: Background cleanup of empty ATAs and dust ===
     if let Some(ref treasury) = ctx.treasury {
@@ -5673,33 +5586,17 @@ async fn main() -> Result<()> {
                                 warn!(error = %e, "Failed to persist state after kill switch reset");
                             }
 
-                            // Publish WalletBalanceUpdate so WsolManager runs check_and_act immediately.
-                            // Without this, WsolManager only reacts on the next Geyser-driven update (after a trade).
-                            if let (Some(ref nats), Some(ref treasury)) = (&ctx.nats, &ctx.treasury) {
-                                use ironcrab::execution::wsol_manager::WalletBalanceUpdate;
-                                use ironcrab::nats::wallet_balance_topic;
-                                let wallet_str = treasury.pubkey().to_string();
+                            // Trigger WsolManager so it runs check_and_act immediately (can wrap now).
+                            if let Some(ref tx) = ctx.wsol_balance_tx {
                                 let sol = ctx.lock_manager.total_native_sol();
                                 let wsol = ctx.lock_manager.available_wsol();
-                                let update = WalletBalanceUpdate {
-                                    header: RecordHeader::new(
-                                        "execution-engine",
-                                        BUILD_VERSION,
-                                        &ctx.run_id,
-                                    ),
-                                    wallet: wallet_str.clone(),
-                                    sol_lamports: sol,
-                                    wsol_lamports: Some(wsol),
-                                    slot: 0,
-                                };
-                                let topic = wallet_balance_topic(&wallet_str);
-                                if let Err(e) = nats.publish(&topic, &update).await {
-                                    warn!(error = %e, "Failed to publish WalletBalanceUpdate after kill switch reset");
+                                if let Err(e) = tx.try_send((sol, Some(wsol))) {
+                                    warn!(error = %e, "Failed to send balance to WsolManager after kill switch reset");
                                 } else {
                                     info!(
                                         sol = sol as f64 / 1e9,
                                         wsol = wsol as f64 / 1e9,
-                                        "Published WalletBalanceUpdate after kill switch reset (WsolManager can wrap now)"
+                                        "Triggered WsolManager after kill switch reset (can wrap now)"
                                     );
                                 }
                             }
@@ -5807,10 +5704,17 @@ async fn main() -> Result<()> {
                                                         let wsol = ctx.lock_manager.wsol_balance();
                                                         let wsol_opt = if wsol > 0 { Some(wsol) } else { None };
                                                         ctx.lock_manager.update_wallet_balances(*balance_raw, wsol_opt);
+                                                        if let Some(ref tx) = ctx.wsol_balance_tx {
+                                                            let wsol = ctx.lock_manager.wsol_balance();
+                                                            let _ = tx.try_send((*balance_raw, Some(wsol)));
+                                                        }
                                                     } else if mint == WSOL_MINT || mint == SOL_MINT {
                                                         // WSOL balance update: update LockManager wallet balance
                                                         let sol = ctx.lock_manager.total_native_sol();
                                                         ctx.lock_manager.update_wallet_balances(sol, Some(*balance_raw));
+                                                        if let Some(ref tx) = ctx.wsol_balance_tx {
+                                                            let _ = tx.try_send((sol, Some(*balance_raw)));
+                                                        }
                                                     } else {
                                                         // Regular token: update balance + track open_positions
                                                         let old = ctx.lock_manager.available_token_balance(mint);

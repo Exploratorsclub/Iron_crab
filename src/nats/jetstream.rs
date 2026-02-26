@@ -363,6 +363,19 @@ pub fn wallet_snapshot_consumer_config() -> jetstream::consumer::pull::Config {
     }
 }
 
+/// Consumer config for live WalletBalanceSnapshot updates (New only, no replay).
+/// Used by momentum-bot for real-time position reconciliation.
+pub fn wallet_snapshot_live_consumer_config() -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::New,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        durable_name: Some("momentum-bot-wallet-snapshot".to_string()),
+        max_ack_pending: 1000,
+        filter_subject: "ironcrab.wallet_snapshot.>".to_string(),
+        ..Default::default()
+    }
+}
+
 /// Consumer config for trade intents (All = includes intents published before we subscribed)
 pub fn trade_intents_consumer_config() -> jetstream::consumer::pull::Config {
     jetstream::consumer::pull::Config {

@@ -29,11 +29,10 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ironcrab::config::WalletTrackerCfg;
-use ironcrab::execution::wsol_manager::WalletBalanceUpdate;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult,
     ExecutionStatus, IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate,
-    PriorityFeePercentiles, RecordHeader,
+    PriorityFeePercentiles,
 };
 use ironcrab::metrics::{
     serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
@@ -42,7 +41,7 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_pool_cache_stream, ensure_wallet_snapshot_stream, execution_results_consumer_config,
-    pool_subject, wallet_balance_topic, wallet_snapshot_consumer_config, wallet_snapshot_subject,
+    pool_subject, wallet_snapshot_consumer_config, wallet_snapshot_subject,
     NatsClient, NatsConfig, CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME,
     TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES,
     WALLET_SNAPSHOT_STREAM_NAME,
@@ -673,7 +672,7 @@ async fn publish_wallet_snapshot(
     // mints, and ensures the startup snapshot reflects the true on-chain wallet state.
     // This is a legitimate startup-only RPC call (2 calls: SPL Token + Token-2022).
     // It runs at every startup but NOT for periodic refreshes.
-    // Capture WSOL balance from owner-scan for initial WalletBalanceUpdate (set inside if !is_periodic)
+    // Capture WSOL balance from owner-scan for JetStream bootstrap (set inside if !is_periodic)
     let mut bootstrap_wsol_balance: Option<u64> = None;
 
     if !is_periodic {
@@ -708,7 +707,7 @@ async fn publish_wallet_snapshot(
                             if let Ok(mint_pk) = Pubkey::from_str(mint_str) {
                                 let balance: u64 = balance_str.parse().unwrap_or(0);
                                 if mint_str == WSOL_MINT {
-                                    // Capture WSOL balance for initial WalletBalanceUpdate
+                                    // Capture WSOL balance for JetStream bootstrap
                                     bootstrap_wsol_balance = Some(balance);
                                 } else if balance > 0 {
                                     spl_non_zero_count += 1;
@@ -977,11 +976,8 @@ async fn publish_wallet_snapshot(
             },
         );
 
-        // Publish to NATS + persist to JetStream subject-per-wallet+mint
+        // Publish to JetStream only (SSOT for bot state)
         if let Some(ref nats) = ctx.nats {
-            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
-                warn!(error = %e, mint = %mint_str, "Failed to publish WalletBalanceSnapshot (bootstrap)");
-            }
             let subject = wallet_snapshot_subject(&wallet_str, &mint_str);
             if let Err(e) = nats.jetstream_publish(&subject, &event).await {
                 warn!(error = %e, mint = %mint_str, "Failed to publish WalletBalanceSnapshot to JetStream (bootstrap)");
@@ -1084,14 +1080,6 @@ async fn publish_wallet_snapshot(
                                             {
                                                 warn!(error = %e, mint = %mint, "Stale cleanup: failed to publish zero-balance override to JetStream");
                                             }
-                                            // Also publish to Core NATS so momentum-bot can
-                                            // close ghost positions immediately.
-                                            if let Err(e) = nats
-                                                .publish(TOPIC_MARKET_EVENTS, &override_event)
-                                                .await
-                                            {
-                                                warn!(error = %e, mint = %mint, "Stale cleanup: failed to publish zero-balance override to Core NATS");
-                                            }
 
                                             stale_cleaned += 1;
                                             info!(
@@ -1180,10 +1168,8 @@ async fn publish_wallet_snapshot(
         warn!(error = %e, "Failed to write WalletSnapshotComplete (bootstrap) to JSONL");
     }
 
-    // 5) Publish initial WalletBalanceUpdate so execution-engine/WsolManager get correct
-    //    SOL + WSOL balances immediately at startup (before any Geyser event arrives).
-    //    Without this, execution-engine stays at the default 1.0 SOL until the first on-chain
-    //    wallet transaction triggers a Geyser update.
+    // 5) Publish SOL + WSOL as WalletBalanceSnapshot to JetStream (SSOT for bot state).
+    //    execution-engine/WsolManager bootstrap from JetStream on startup.
     if !is_periodic {
         if let Some(ref tracked_wallet) = ctx.tracked_wallet {
             if let Some(ref nats) = ctx.nats {
@@ -1193,46 +1179,17 @@ async fn publish_wallet_snapshot(
                         // Always send explicit WSOL: Some(0) when no ATA exists, so WsolManager
                         // knows to wrap and JetStream doesn't retain stale WSOL from previous runs.
                         let wsol_balance = bootstrap_wsol_balance.unwrap_or(0);
-                        let wsol_lamports = Some(wsol_balance);
 
                         // Seed TrackedWallet so subsequent Geyser events correctly detect changes
                         tracked_wallet
                             .last_sol_balance
                             .store(sol_lamports, Ordering::Relaxed);
-                        if let Some(wsol) = wsol_lamports {
-                            tracked_wallet
-                                .last_wsol_balance
-                                .store(wsol, Ordering::Relaxed);
-                            tracked_wallet.wsol_seen.store(true, Ordering::Relaxed);
-                        }
+                        tracked_wallet
+                            .last_wsol_balance
+                            .store(wsol_balance, Ordering::Relaxed);
+                        tracked_wallet.wsol_seen.store(true, Ordering::Relaxed);
 
-                        let update = WalletBalanceUpdate {
-                            header: RecordHeader::new("market-data", BUILD_VERSION, &ctx.run_id),
-                            wallet: wallet_str.clone(),
-                            sol_lamports,
-                            wsol_lamports,
-                            slot: 0, // Bootstrap, no specific slot
-                        };
-
-                        let topic = wallet_balance_topic(&wallet_str);
-                        if let Err(e) = nats.publish(&topic, &update).await {
-                            warn!(error = %e, "Failed to publish initial WalletBalanceUpdate");
-                        } else {
-                            info!(
-                                wallet = %wallet_str,
-                                sol_lamports,
-                                wsol_lamports = ?wsol_lamports,
-                                sol = sol_lamports as f64 / 1e9,
-                                wsol = wsol_lamports.map(|w| w as f64 / 1e9),
-                                "✅ Initial WalletBalanceUpdate published (bootstrap)"
-                            );
-                        }
-
-                        // Also publish SOL + WSOL as WalletBalanceSnapshot to JetStream
-                        // so execution-engine can bootstrap wallet balances from JetStream
-                        // (persistent) instead of relying on the core NATS WalletBalanceUpdate
-                        // above which is fire-and-forget and may be missed.
-                        //
+                        // Publish SOL + WSOL as WalletBalanceSnapshot to JetStream (SSOT).
                         // NOTE: Native SOL uses sentinel "NATIVE_SOL" as mint key because
                         // SOL_MINT == WSOL_MINT (same address). Without this, a single
                         // JetStream subject would be shared and one would overwrite the other.
@@ -1286,15 +1243,15 @@ async fn publish_wallet_snapshot(
                             info!(
                                 wallet = %wallet_str,
                                 sol_lamports,
-                                wsol_lamports = ?wsol_lamports,
-                                "SOL/WSOL WalletBalanceSnapshot published to JetStream (persistent bootstrap)"
+                                wsol_balance,
+                                "SOL/WSOL WalletBalanceSnapshot published to JetStream (bootstrap)"
                             );
                         }
                     }
                     Err(e) => {
                         warn!(
                             error = %e,
-                            "Failed to fetch SOL balance for initial WalletBalanceUpdate (will rely on Geyser events)"
+                            "Failed to fetch SOL balance for bootstrap (will rely on Geyser events)"
                         );
                     }
                 }
@@ -2011,27 +1968,10 @@ async fn run_geyser_loop(
                                                 if let Err(e) = nats.jetstream_publish(&subject, &snapshot).await {
                                                     warn!(error = %e, mint = %mint_str, "Failed to publish zero-balance snapshot to JetStream after SELL");
                                                 }
-                                                if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &snapshot).await {
-                                                    warn!(error = %e, mint = %mint_str, "Failed to publish zero-balance snapshot to Core NATS after SELL");
-                                                }
+                                            }
 
-                                                if mint_str == WSOL_MINT {
-                                                    tracked_wallet.last_wsol_balance.store(0, Ordering::Relaxed);
-                                                    let sol = tracked_wallet.last_sol_balance.load(Ordering::Relaxed);
-                                                    let wsol_update = WalletBalanceUpdate {
-                                                        header: RecordHeader::new("market-data", BUILD_VERSION, run_id),
-                                                        wallet: wallet_str.clone(),
-                                                        sol_lamports: sol,
-                                                        wsol_lamports: Some(0),
-                                                        slot: 0,
-                                                    };
-                                                    let topic = wallet_balance_topic(&wallet_str);
-                                                    if let Err(e) = nats.publish(&topic, &wsol_update).await {
-                                                        warn!(error = %e, "Failed to publish WalletBalanceUpdate(WSOL=0) after SELL");
-                                                    } else {
-                                                        info!(sol, "WalletBalanceUpdate(WSOL=0) published after SELL (ATA closed)");
-                                                    }
-                                                }
+                                            if mint_str == WSOL_MINT {
+                                                tracked_wallet.last_wsol_balance.store(0, Ordering::Relaxed);
                                             }
 
                                             let mut set = ctx.tracked_wallet_token_accounts.write();
@@ -2110,31 +2050,62 @@ async fn run_geyser_loop(
 
                         if balance_changed {
                             let wallet_str = tracked_wallet.wallet.to_string();
-                            let update = WalletBalanceUpdate {
-                                header: RecordHeader::new("market-data", BUILD_VERSION, run_id),
-                                wallet: wallet_str.clone(),
-                                sol_lamports: new_sol,
-                                wsol_lamports: new_wsol,
-                                slot: account_update.slot,
-                            };
 
-                            info!(
-                                wallet = %wallet_str,
-                                sol_lamports = new_sol,
-                                wsol_lamports = ?new_wsol,
-                                slot = account_update.slot,
-                                "WalletBalanceUpdate: publishing to NATS"
-                            );
-
-                            // Publish to NATS on wallet-specific topic
+                            // Publish SOL + WSOL as WalletBalanceSnapshot to JetStream (SSOT)
                             if let Some(ref nats) = ctx.nats {
-                                let topic = wallet_balance_topic(&wallet_str);
-                                if let Err(e) = nats.publish(&topic, &update).await {
-                                    warn!(error = %e, "Failed to publish WalletBalanceUpdate to NATS");
+                                let sol_snapshot = MarketEvent::new(
+                                    "market-data",
+                                    BUILD_VERSION,
+                                    run_id,
+                                    format!("geyser_wallet_sol_{}", account_update.slot),
+                                    "geyser_wallet_update",
+                                    Some(account_update.slot),
+                                    MarketEventKind::WalletBalanceSnapshot {
+                                        mint: "NATIVE_SOL".to_string(),
+                                        balance_raw: new_sol,
+                                        decimals: 9,
+                                        token_program: "system".to_string(),
+                                    },
+                                );
+                                let sol_subject = wallet_snapshot_subject(&wallet_str, "NATIVE_SOL");
+                                if let Err(e) = nats.jetstream_publish(&sol_subject, &sol_snapshot).await {
+                                    warn!(error = %e, "Failed to publish native SOL WalletBalanceSnapshot to JetStream");
                                     NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                                 } else {
                                     NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                                 }
+
+                                if let Some(wsol) = new_wsol {
+                                    let wsol_snapshot = MarketEvent::new(
+                                        "market-data",
+                                        BUILD_VERSION,
+                                        run_id,
+                                        format!("geyser_wallet_wsol_{}", account_update.slot),
+                                        "geyser_wallet_update",
+                                        Some(account_update.slot),
+                                        MarketEventKind::WalletBalanceSnapshot {
+                                            mint: WSOL_MINT.to_string(),
+                                            balance_raw: wsol,
+                                            decimals: 9,
+                                            token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+                                        },
+                                    );
+                                    let wsol_subject = wallet_snapshot_subject(&wallet_str, WSOL_MINT);
+                                    if let Err(e) = nats.jetstream_publish(&wsol_subject, &wsol_snapshot).await {
+                                        warn!(error = %e, "Failed to publish WSOL WalletBalanceSnapshot to JetStream");
+                                        NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+
+                                info!(
+                                    wallet = %wallet_str,
+                                    sol_lamports = new_sol,
+                                    wsol_lamports = ?new_wsol,
+                                    slot = account_update.slot,
+                                    "WalletBalanceSnapshot (SOL/WSOL) published to JetStream"
+                                );
                             }
                         }
                     } else if is_token_ata
@@ -2191,13 +2162,6 @@ async fn run_geyser_loop(
                         );
 
                         if let Some(ref nats) = ctx.nats {
-                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &event).await {
-                                warn!(error = %e, mint = %mint_str, "Failed to publish WalletBalanceSnapshot");
-                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            }
                             let subject = wallet_snapshot_subject(
                                 &tracked_wallet.wallet.to_string(),
                                 &mint_str,
@@ -2209,6 +2173,9 @@ async fn run_geyser_loop(
                                     "Failed to publish WalletBalanceSnapshot to JetStream"
                                 );
                                 NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                             }
                         }
 

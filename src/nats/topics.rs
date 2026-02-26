@@ -34,11 +34,14 @@ pub const TOPIC_PRIORITY_FEE_SAMPLES: &str = "ironcrab.v1.priority_fee_samples";
 /// NOTE: For JetStream persistence, use subject-per-pool pattern from jetstream.rs
 pub const TOPIC_POOL_CACHE_UPDATES: &str = "ironcrab.v1.pool_cache_updates";
 
-/// Wallet balance updates from market-data (for WsolManager in execution-engine)
+/// Wallet balance updates — DEPRECATED: JetStream is now SSOT for bot state.
+/// WalletBalanceSnapshot in ironcrab.wallet_snapshot.{wallet}.{mint} replaced this.
 /// Subject per wallet: ironcrab.v1.wallet_balance.{wallet_address}
+#[deprecated(note = "JetStream wallet_snapshot is SSOT; use wallet_snapshot_subject instead")]
 pub const TOPIC_WALLET_BALANCE_PREFIX: &str = "ironcrab.v1.wallet_balance";
 
-/// Helper function to build wallet balance topic for a specific wallet
+/// Helper function to build wallet balance topic — DEPRECATED.
+#[deprecated(note = "JetStream wallet_snapshot is SSOT; use wallet_snapshot_subject instead")]
 pub fn wallet_balance_topic(wallet: &str) -> String {
     format!("{}.{}", TOPIC_WALLET_BALANCE_PREFIX, wallet)
 }

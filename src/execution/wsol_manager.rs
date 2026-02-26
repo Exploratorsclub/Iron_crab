@@ -13,7 +13,7 @@
 //! # Architecture
 //!
 //! ```text
-//! market-data (Geyser) → WalletBalanceUpdate (NATS) → WsolManager → wrap/unwrap TX
+//! market-data (Geyser) → WalletBalanceSnapshot (JetStream) → execution-engine → WsolManager (channel) → wrap/unwrap TX
 //! ```
 //!
 //! # Configuration
@@ -35,7 +35,6 @@ use solana_sdk::transaction::Transaction;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
@@ -44,7 +43,6 @@ use crate::metrics::{
     WSOL_BALANCE_LAMPORTS, WSOL_UNWRAP_LAMPORTS_TOTAL, WSOL_UNWRAP_TOTAL, WSOL_WRAP_LAMPORTS_TOTAL,
     WSOL_WRAP_TOTAL,
 };
-use crate::nats::NatsClient;
 use crate::solana::rpc::SolanaRpc;
 use crate::storage::JsonlWriter;
 use crate::wallet::Treasury;
@@ -316,10 +314,11 @@ impl WsolManager {
 
     /// Run the WSOL manager main loop
     ///
-    /// Subscribes to wallet balance updates via NATS and maintains WSOL balance.
+    /// Receives SOL/WSOL balance updates from execution-engine (JetStream consumer)
+    /// via channel. No NATS subscription — JetStream is the SSOT for bot state.
     pub async fn run(
         &self,
-        nats: Arc<NatsClient>,
+        mut balance_rx: tokio::sync::mpsc::Receiver<(u64, Option<u64>)>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         if !self.config.enabled {
@@ -333,31 +332,8 @@ impl WsolManager {
             target_wsol = self.config.target_wsol_sol,
             max_wsol = self.config.max_wsol_sol,
             dry_run = self.config.dry_run,
-            "WsolManager starting"
+            "WsolManager starting (balance updates via JetStream channel)"
         );
-
-        // No startup RPC — WsolManager starts with balance 0 and waits for
-        // the first Geyser-driven WalletBalanceUpdate via NATS (typically <3 s).
-        // With sol_balance=0 no wrap can be triggered, so this is safe.
-
-        // Subscribe to wallet balance updates
-        use crate::nats::wallet_balance_topic;
-        let topic = wallet_balance_topic(&self.wallet_pubkey.to_string());
-        let subscription = match nats.subscribe(&topic).await {
-            Ok(sub) => sub,
-            Err(e) => {
-                // Fallback: subscribe to wildcard and filter
-                use crate::nats::TOPIC_WALLET_BALANCE_PREFIX;
-                warn!(error = %e, topic = %topic, "Failed to subscribe to wallet-specific topic, using wildcard");
-                nats.subscribe(&format!("{}.*", TOPIC_WALLET_BALANCE_PREFIX))
-                    .await?
-            }
-        };
-
-        info!(topic = %topic, "Subscribed to wallet balance updates");
-
-        // Need mutable subscription for next()
-        let mut subscription = subscription;
 
         loop {
             tokio::select! {
@@ -369,19 +345,10 @@ impl WsolManager {
                     }
                 }
 
-                // Process NATS messages (sole source of balance data)
-                msg = subscription.next() => {
-                    match msg {
-                        Some(nats_msg) => {
-                            if let Err(e) = self.handle_balance_update(&nats_msg.payload).await {
-                                debug!(error = %e, "Failed to handle balance update");
-                            }
-                        }
-                        None => {
-                            warn!("NATS subscription ended");
-                            // Small delay before retry
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
+                // Process balance updates from JetStream consumer
+                Some((sol, wsol_opt)) = balance_rx.recv() => {
+                    if let Err(e) = self.apply_balance_update(sol, wsol_opt).await {
+                        debug!(error = %e, "Balance update/check_and_act failed (transient RPC etc), continuing loop");
                     }
                 }
             }
@@ -390,37 +357,21 @@ impl WsolManager {
         Ok(())
     }
 
-    /// Handle incoming wallet balance update from NATS
-    async fn handle_balance_update(&self, data: &[u8]) -> Result<()> {
-        let update: WalletBalanceUpdate = serde_json::from_slice(data)?;
-
-        // Verify this is for our wallet
-        if update.wallet != self.wallet_pubkey.to_string() {
-            return Ok(());
-        }
-
-        // Update cached balances
-        self.sol_balance
-            .store(update.sol_lamports, Ordering::Relaxed);
-        if let Some(wsol) = update.wsol_lamports {
+    /// Apply SOL/WSOL balance update (from JetStream WalletBalanceSnapshot)
+    async fn apply_balance_update(&self, sol: u64, wsol_opt: Option<u64>) -> Result<()> {
+        self.sol_balance.store(sol, Ordering::Relaxed);
+        if let Some(wsol) = wsol_opt {
             self.wsol_balance.store(wsol, Ordering::Relaxed);
             self.wsol_initialized.store(true, Ordering::Relaxed);
-            // Update Prometheus gauge
             WSOL_BALANCE_LAMPORTS.store(wsol, Ordering::Relaxed);
         }
-        // If update has no WSOL data, we simply wait for the next event that does.
-        // No RPC fallback — Geyser-first architecture.
 
         debug!(
-            sol = update.sol_lamports as f64 / LAMPORTS_PER_SOL as f64,
-            wsol = update
-                .wsol_lamports
-                .map(|w| w as f64 / LAMPORTS_PER_SOL as f64),
-            slot = update.slot,
-            "Balance update received"
+            sol = sol as f64 / LAMPORTS_PER_SOL as f64,
+            wsol = wsol_opt.map(|w| w as f64 / LAMPORTS_PER_SOL as f64),
+            "Balance update received from JetStream"
         );
 
-        // Check if action needed
         self.check_and_act().await
     }
 

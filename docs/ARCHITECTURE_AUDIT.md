@@ -105,19 +105,19 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 **Datei**: `market_data.rs` (+331 Zeilen)
 
-**Was verloren ging**:
+**Was verloren ging** (jetzt umgesetzt):
 - Besseres Logging für Bootstrap Owner-Scan (non-zero counts, diagnostics)
 - WSOL-Seeding in `TrackedWallet` beim Bootstrap (für korrekte WSOL-Anzeige in Grafana)
 - Initiales `WalletBalanceUpdate` nach Bootstrap (statt erst beim nächsten Geyser-Event)
 - PumpAmm `pool_accounts` werden IMMER im PoolCacheUpdate propagiert (nicht nur bei Creator)
-- `pool_accounts` Fallback aus MASTER LivePoolCache wenn Geyser-Parse noch keine hat
+- `pool_accounts` Fallback: *interner* Fallback innerhalb von market-data (Geyser-Parse leer → eigener LivePoolCache)
 - SELL → JetStream `WalletBalanceSnapshot(0)` schreiben + ATA untracking
 - Bessere Fehler-Logs bei fehlendem `token_account`/`token_program` in ExecutionResult
-- `TrackedWallet` als `Arc<TrackedWallet>` für delayed re-publish task
+- `TrackedWallet` als `Arc<TrackedWallet>` für delayed re-publish task: **obsolet** — war Workaround für Core-NATS-Race; JetStream ersetzt dies vollständig
 
-**Status**: ❌ FEHLT — Wallet-Tracking ist weniger robust, WSOL-Anzeige in Grafana ggf. inkorrekt
+**Status (2026-02-21)**: ✅ IMPLEMENTIERT — Alle Punkte umgesetzt (außer obsoletem Arc/delayed re-publish).
 
-**Bewertung**: Priorität 2 für Cherry-Pick.
+**Bewertung**: Priorität 2 für Cherry-Pick; jetzt implementiert.
 
 ### A.4 — Execution-Engine: Liquidation-Robustheit (TEILWEISE ZURÜCK)
 

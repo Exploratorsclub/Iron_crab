@@ -76,6 +76,8 @@
 |----|------------|--------------|
 | I-23 | Keine neuen ad-hoc NATS Topics. An versioned Topics halten oder klar dokumentieren. | Topic-Chaos |
 | I-24 | Topics: ironcrab.v1.market_events, ironcrab.v1.trade_intents, ironcrab.v1.execution_results, ironcrab.v1.decision_records (siehe src/nats/topics.rs). | — |
+| I-24a | **JetStream = SSOT für Bot-Zustand**: Wallet-Balances, Positionen, Pool-Cache, Config gehören in JetStream (persistent). Konsumenten bootstrappen und holen Live-Updates von dort. | Zustands-Drift |
+| I-24b | **Core NATS = Market Events**: Chain-Daten (Trades, Blocks, Preise) als Echtzeit-Events. Kein Bot-Zustand über Core NATS — Datenflut zu hoch, keine Persistenz. | — |
 
 ---
 

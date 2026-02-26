@@ -53,9 +53,9 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_trade_intents_stream, execution_results_consumer_config,
-    wallet_snapshot_consumer_config, NatsClient, NatsConfig, CONFIG_STREAM_NAME,
-    EXECUTION_RESULTS_STREAM_NAME, STREAM_NAME, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
-    TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
+    wallet_snapshot_consumer_config, wallet_snapshot_live_consumer_config, NatsClient, NatsConfig,
+    CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, STREAM_NAME, TOPIC_EXECUTION_RESULTS,
+    TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::dex_parser::SOL_MINT_PUBKEY;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
@@ -5688,6 +5688,42 @@ async fn main() -> Result<()> {
         None
     };
 
+    // JetStream consumer for live WalletBalanceSnapshot (position reconciliation).
+    // market-data publishes only to JetStream (SSOT); no longer to TOPIC_MARKET_EVENTS.
+    let mut wallet_snapshot_consumer_opt = if let Some(ref nats) = ctx.nats {
+        use async_nats::jetstream;
+
+        let jetstream = jetstream::new(nats.client().clone());
+        match jetstream.get_stream(WALLET_SNAPSHOT_STREAM_NAME).await {
+            Ok(stream) => match stream
+                .create_consumer(wallet_snapshot_live_consumer_config())
+                .await
+            {
+                Ok(consumer) => {
+                    info!(
+                        stream = WALLET_SNAPSHOT_STREAM_NAME,
+                        "Subscribed to JetStream WalletBalanceSnapshot (live updates)"
+                    );
+                    Some(consumer)
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to create JetStream wallet snapshot consumer");
+                    None
+                }
+            },
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    stream = WALLET_SNAPSHOT_STREAM_NAME,
+                    "Wallet snapshot stream not found"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Subscribe to Control Commands (manual position cleanup, etc.)
     let mut control_subscription = if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_CONTROL_COMMANDS).await {
@@ -5962,6 +5998,52 @@ async fn main() -> Result<()> {
                         Err(e) => {
                             debug!(error = %e, "ExecutionResult stream fetch failed (may be empty)");
                         }
+                    }
+                } else {
+                    std::future::pending::<()>().await
+                }
+            } => {}
+
+            // Process live WalletBalanceSnapshot from JetStream (SSOT for bot state)
+            _ = async {
+                use futures::StreamExt;
+                if let Some(ref mut consumer) = wallet_snapshot_consumer_opt {
+                    match consumer
+                        .fetch()
+                        .max_messages(100)
+                        .expires(std::time::Duration::from_millis(100))
+                        .messages()
+                        .await
+                    {
+                        Ok(mut messages) => {
+                            while let Some(msg_result) = messages.next().await {
+                                match msg_result {
+                                    Ok(msg) => {
+                                        ironcrab::metrics::record_activity();
+                                        NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                        match serde_json::from_slice::<MarketEvent>(&msg.payload) {
+                                            Ok(event) => {
+                                                if let MarketEventKind::WalletBalanceSnapshot { .. } = &event.kind {
+                                                    if let Err(e) = process_market_event(&ctx, &event).await {
+                                                        warn!(error = %e, "Failed to process WalletBalanceSnapshot from JetStream");
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(error = %e, "Failed to deserialize WalletBalanceSnapshot");
+                                            }
+                                        }
+                                        if let Err(e) = msg.ack().await {
+                                            warn!(error = %e, "Failed to ack wallet snapshot message");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!(error = %e, "Wallet snapshot fetch error");
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {}
                     }
                 } else {
                     std::future::pending::<()>().await
