@@ -79,9 +79,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Clone ironcrab-eval (Sibling für path = "../Iron_crab")
+        env:
+          # GITHUB_TOKEN: für öffentliche Repos optional, für private same-org Repos erforderlich
+          EVAL_CLONE_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository_owner }}/Iron_crab-eval.git
         run: |
           cd ..
-          git clone https://github.com/${{ github.repository_owner }}/Iron_crab-eval.git Iron_crab-eval
+          git clone "$EVAL_CLONE_URL" Iron_crab-eval
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master

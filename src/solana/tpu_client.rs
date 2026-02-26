@@ -126,7 +126,6 @@ impl TpuSubmitter {
 
         let tpu_config = TpuClientConfig {
             fanout_slots: config.fanout_slots,
-            ..TpuClientConfig::default()
         };
 
         // Create QUIC connection manager (Solana 3.0 API)
@@ -271,7 +270,6 @@ impl TpuSubmitter {
 
         let tpu_config = TpuClientConfig {
             fanout_slots: self.config.fanout_slots,
-            ..TpuClientConfig::default()
         };
 
         // Create QUIC connection manager (Solana 3.0 API)

@@ -237,9 +237,8 @@ async fn run_cache_subscription(
 
                     match message {
                         Ok(msg) => {
-                            if let Some(update) = msg.update_oneof {
-                                if let UpdateOneof::Account(account_update) = update {
-                                    if let Some(account_info) = account_update.account {
+                            if let Some(UpdateOneof::Account(account_update)) = msg.update_oneof {
+                                if let Some(account_info) = account_update.account {
                                         // Parse pubkey and owner
                                         let pubkey = match account_info.pubkey.as_slice().try_into() {
                                             Ok(bytes) => Pubkey::new_from_array(bytes),
@@ -303,7 +302,6 @@ async fn run_cache_subscription(
                                             }
                                         }
                                     }
-                                }
                             }
                         }
                         Err(e) => {

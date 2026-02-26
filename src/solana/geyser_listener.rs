@@ -524,7 +524,7 @@ impl GeyserListener {
                                             for inner_ix in &inner_ix_group.instructions {
                                                 inner_instructions.push(InnerInstruction {
                                                     program_id_index: inner_ix.program_id_index as u8,
-                                                    accounts: inner_ix.accounts.iter().map(|&a| a as u8).collect(),
+                                                    accounts: inner_ix.accounts.iter().map(|&a| a).collect(),
                                                     data: inner_ix.data.clone(),
                                                 });
                                             }
