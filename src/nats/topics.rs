@@ -41,6 +41,7 @@ pub const TOPIC_POOL_CACHE_UPDATES: &str = "ironcrab.v1.pool_cache_updates";
 pub const TOPIC_WALLET_BALANCE_PREFIX: &str = "ironcrab.v1.wallet_balance";
 
 /// Helper function to build wallet balance topic — DEPRECATED.
+#[allow(deprecated)]
 #[deprecated(note = "JetStream wallet_snapshot is SSOT; use wallet_snapshot_subject instead")]
 pub fn wallet_balance_topic(wallet: &str) -> String {
     format!("{}.{}", TOPIC_WALLET_BALANCE_PREFIX, wallet)

@@ -4754,8 +4754,7 @@ async fn main() -> Result<()> {
             .with_kill_switch(move || ctx_for_kill_switch.is_kill_switch_active());
             let shutdown_rx_wsol = shutdown_rx.clone();
 
-            let balance_rx = wsol_balance_rx
-                .expect("wsol_balance_rx set when treasury exists");
+            let balance_rx = wsol_balance_rx.expect("wsol_balance_rx set when treasury exists");
             tokio::spawn(async move {
                 if let Err(e) = wsol_manager.run(balance_rx, shutdown_rx_wsol).await {
                     error!(error = %e, "WsolManager task failed");

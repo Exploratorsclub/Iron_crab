@@ -24,6 +24,12 @@ alwaysApply: true
 - NEVER remove RPC from cold paths to "optimize" — this breaks safety-critical flows. NEVER add RPC to hot paths without explicit approval — this breaks latency requirements.
 - When refactoring RPC usage, always verify which path (hot vs cold) is affected. Changes that touch both paths require explicit approval.
 
+## Format & Clippy (vor Abschluss)
+Nach jeder Implementierung **vor** dem Abschluss als fertig:
+- **Format:** `cargo fmt --check` ausführen; bei Fehlern `cargo fmt` und erneut prüfen.
+- **Clippy:** `cargo clippy -- -D warnings` ausführen; gefundene Warnungen/Fehler beheben.
+- Erst wenn beide durchlaufen, darf die Implementierung als fertig gemeldet werden. CI-Failures durch fmt/clippy sind vermeidbar und dürfen nicht ignoriert werden.
+
 ## Eval-Tests (Level 5)
 Nach Implementations-Änderungen die Eval-Tests selbst ausführen, bevor der Task als erledigt gilt:
 - **Befehl:** `cd ..\ironcrab-eval; cargo test` (oder `cd ../ironcrab-eval && cargo test` unter Unix)

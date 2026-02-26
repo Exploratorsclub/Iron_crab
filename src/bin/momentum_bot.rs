@@ -6008,6 +6008,7 @@ async fn main() -> Result<()> {
             _ = async {
                 use futures::StreamExt;
                 if let Some(ref mut consumer) = wallet_snapshot_consumer_opt {
+                    #[allow(clippy::single_match)]
                     match consumer
                         .fetch()
                         .max_messages(100)
