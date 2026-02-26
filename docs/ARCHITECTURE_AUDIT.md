@@ -315,12 +315,13 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 | tx_sender 459 | `send_transaction_with_config()` | AKZEPTABEL – RPC-Fallback in TPU → Jito → RPC Chain |
 | tpu_client 151, 211 | `get_slot()` | AKZEPTABEL – Slot-Query für Leader-Schedule |
 
-#### Arbitrage – `execution.rs` (arbitrage) / `arbitrage.rs`
+#### Arbitrage
 
-| Zeile | Call | Bewertung |
+**Status:** `solana::execution::ExecutionEngine` (Monolith-Artefakt mit `get_balance_retry`) wurde entfernt. Produktiver Arb-Flow nutzt CrossDexHandler + LockManager (kein RPC für Balance-Check).
+
+| Modul | Call | Bewertung |
 |-------|------|-----------|
-| execution.rs 129 | `get_balance_retry(&wallet.pubkey())` | **VERSTOSS** – Balance-Check per RPC vor Arb-Execution | LockManager/Geyser-Wallet-Snapshot |
-| arbitrage.rs 315, 328 | `get_latest_blockhash()`, `simulate_transaction()` | AKZEPTABEL – Simulation |
+| arbitrage.rs 315, 328 | `get_latest_blockhash()`, `simulate_transaction()` | AKZEPTABEL – Simulation (nur in Tests/Discovery) |
 
 ---
 
@@ -478,8 +479,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 | meteora_dlmm.rs | 3 | KRITISCH |
 | tx_builder.rs | 4 | KRITISCH (Fallbacks) |
 | cross_dex_handler.rs | 0 | — (PumpFun aus Arb entfernt) |
-| execution.rs (arb) | 1 | VERSTOSS |
-| **TOTAL** | **26+** | |
+| **TOTAL** | **25+** | — (execution.rs entfernt, Monolith-Dead-Code) |
 
 ### Geschätzte Latenz-Auswirkung
 
@@ -508,7 +508,7 @@ Typischer **Momentum-Buy**:
 | PumpFun SELL migriert | A.5 fehlt | ✅ Guard implementiert (real_reserves) |
 | Raydium RPC-Retries | 20 × 500ms | 3 × 300ms (korrigiert) |
 | PumpSwap quote_mint hardcode | BUG H | Bestätigt, PumpSwap typischerweise SOL |
-| Arbitrage get_balance | VERSTOSS | Bestätigt, LockManager-Alternative fehlt |
+| Arbitrage get_balance | VERSTOSS | ✅ Erledigt – solana::execution entfernt (Dead-Code) |
 
 ---
 
@@ -519,7 +519,7 @@ Typischer **Momentum-Buy**:
 | # | Problem | Fix | Risiko |
 |---|---------|-----|--------|
 | ~~1~~ | ~~CrossDexHandler: PumpFun~~ | ✅ Erledigt – PumpFun aus Arb entfernt (keine Arb-Möglichkeit auf BC) | — |
-| 2 | Arbitrage get_balance_retry | LockManager/available_sol vor RPC prüfen; RPC nur als Fallback | Niedrig |
+| ~~2~~ | ~~Arbitrage get_balance_retry~~ | ✅ Erledigt – solana::execution (Monolith-Dead-Code) entfernt | — |
 
 ### Priorität 2 — Bald (Robustheit)
 

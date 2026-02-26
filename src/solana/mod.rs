@@ -6,7 +6,6 @@ pub mod compute_budget_helper;
 pub mod cross_dex_handler;
 pub mod dex;
 pub mod dex_parser;
-pub mod execution;
 pub mod geyser_listener;
 pub mod geyser_pool_discovery;
 #[cfg(not(windows))]
