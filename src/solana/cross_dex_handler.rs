@@ -32,7 +32,6 @@ use crate::execution::live_pool_cache::{CachedPoolState, LivePoolCache};
 use crate::ipc::TradeIntent;
 use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::orca::Orca;
-use crate::solana::dex::pumpfun::PumpFunDex;
 use crate::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use crate::solana::dex::raydium::Raydium;
 use crate::solana::dex::{Dex, Quote};
@@ -109,7 +108,7 @@ fn get_token_program_for_mint_cached(
     }
 
     if let Some(dex) = dex_hint {
-        if dex == "pumpfun" || dex == "pump_amm" {
+        if dex == "pump_amm" {
             return spl_token::id();
         }
     }
@@ -203,14 +202,8 @@ impl CrossDexHandler {
         self.dexes.insert("raydium".to_string(), Arc::new(raydium));
         info!("Initialized Raydium DEX connector (for IX building only)");
 
-        // Initialize PumpFun (Bonding Curve) - for build_swap_ix() only
-        // A.1 Phase 4: Pass pool_cache for Arb-Pfad (creator lookup from cache, avoids RPC)
-        let mut pumpfun = PumpFunDex::new(Arc::clone(&self.rpc), self.pool_cache.clone())?;
-        if let Some(pk) = self.wallet_pubkey {
-            pumpfun.set_user_authority(pk);
-        }
-        self.dexes.insert("pumpfun".to_string(), Arc::new(pumpfun));
-        info!("Initialized PumpFun DEX connector (for IX building only)");
+        // PumpFun Bonding Curve: EXCLUDED from arb (arb-strategy rejects it).
+        // Tokens on BC have no other pools → no arb opportunity. See arb_strategy.rs.
 
         // Initialize PumpSwap AMM (pump_amm) - for build_swap_ix() only
         if self.rpc_url.is_some() {
@@ -426,23 +419,7 @@ impl CrossDexHandler {
                     return true;
                 }
             }
-            ("pumpfun", CachedPoolState::PumpFun(pf_state)) => {
-                // PumpFun bonding curve - cache the creator in the DEX connector
-                // The connector needs the creator to build swap instructions without RPC
-                if pf_state.creator != Pubkey::default() {
-                    // Try to downcast and cache the creator
-                    // Note: We can't directly access PumpFunDex through Arc<dyn Dex>
-                    // So we store the creator in a side map that we'll use later
-                    info!(
-                        pool = %pool_pk,
-                        dex = %dex,
-                        creator = %pf_state.creator,
-                        token_mint = %pf_state.token_mint,
-                        "PumpFun pool in cache with creator"
-                    );
-                    return true;
-                }
-            }
+            // pumpfun (BC) excluded from arb - see init_dexes
             _ => {
                 debug!(
                     pool = %pool_pk,
@@ -453,12 +430,6 @@ impl CrossDexHandler {
         }
 
         false
-    }
-
-    /// Get PumpFun creator from LivePoolCache for a bonding curve
-    /// Returns None if not found or not a PumpFun pool
-    fn get_pumpfun_creator_from_cache(&self, bonding_curve: &Pubkey) -> Option<Pubkey> {
-        self.pool_cache.as_ref()?.get_pumpfun_creator(bonding_curve)
     }
 
     /// Validate a cross-DEX arbitrage opportunity - OPTION B (SIMULATION-BASED)
@@ -1151,24 +1122,7 @@ impl CrossDexHandler {
             &token_program_sdk.to_string(),
         );
 
-        // For PumpFun bonding curve: derive bonding_curve and get creator from cache
-        if buy_dex == "pumpfun" {
-            let (bonding_curve, _) =
-                crate::solana::dex::pumpfun::PumpFunDex::derive_bonding_curve_static(
-                    &token_mint_pk,
-                );
-            if let Some(creator) = self.get_pumpfun_creator_from_cache(&bonding_curve) {
-                buy_connector
-                    .cache_extra_data(&format!("creator:{}", token_mint), &creator.to_string());
-                debug!(
-                    token_mint = %token_mint,
-                    creator = %creator,
-                    "Injected PumpFun creator from LivePoolCache for buy (GEYSER-FIRST)"
-                );
-            }
-        }
-
-        // Use async build to support DEXes that need it (PumpFun, etc.)
+        // Use async build to support DEXes that need it
         let buy_instructions = buy_connector
             .build_swap_ix_async(SOL_MINT, token_mint, buy_amount_in, buy_min_out)
             .await?;
@@ -1211,25 +1165,6 @@ impl CrossDexHandler {
                     sell_pool,
                     sell_dex
                 ));
-            }
-        }
-
-        // ====================================================================
-        // GEYSER-FIRST: Inject cached creators for PumpFun SELL before building IX
-        // ====================================================================
-        if sell_dex == "pumpfun" {
-            let (bonding_curve, _) =
-                crate::solana::dex::pumpfun::PumpFunDex::derive_bonding_curve_static(
-                    &token_mint_pk,
-                );
-            if let Some(creator) = self.get_pumpfun_creator_from_cache(&bonding_curve) {
-                sell_connector
-                    .cache_extra_data(&format!("creator:{}", token_mint), &creator.to_string());
-                debug!(
-                    token_mint = %token_mint,
-                    creator = %creator,
-                    "Injected PumpFun creator from LivePoolCache for sell (GEYSER-FIRST)"
-                );
             }
         }
 
@@ -1308,8 +1243,9 @@ impl CrossDexHandler {
             // Likely Raydium
             Ok(("raydium".to_string(), pool_address.to_string()))
         } else if pool_address.len() == 44 {
-            // Could be PumpFun bonding curve
-            Ok(("pumpfun".to_string(), pool_address.to_string()))
+            Err(anyhow!(
+                "pumpfun bonding curve excluded from arb (no other pools to arb against)"
+            ))
         } else {
             // Default to Raydium
             warn!(pool = %pool_address, "Could not identify DEX, defaulting to Raydium");

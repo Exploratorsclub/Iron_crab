@@ -236,21 +236,13 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 **Status:** LivePoolCache wird für Quote genutzt; bei Cache-Miss → RPC. **CrossDexHandler übergibt keinen pool_cache an PumpFun** → Arb-Pfad nutzt immer RPC (siehe 3.2.1).
 
-#### 3.2.1 CrossDexHandler: PumpFun ohne LivePoolCache ⚠️ NEU 2026-02-23 / KRITISCH / SSOT
+#### 3.2.1 CrossDexHandler: PumpFun Bonding Curve aus Arb entfernt ✅ 2026-02
 
-**Datei:** `cross_dex_handler.rs` Zeile 206
+**Status:** BEHOBEN – PumpFun (Bonding Curve) vollständig aus CrossDexHandler/Arb entfernt.
 
-```rust
-let mut pumpfun = PumpFunDex::new(Arc::clone(&self.rpc), None)?;  // ← hardcodiert None!
-```
+**Begründung:** Tokens auf der Bonding Curve haben keine anderen Pools → keine Arbitrage-Möglichkeit. arb-strategy lehnt pumpfun bereits ab. CrossDexHandler initialisiert PumpFun nicht mehr; alle pumpfun-spezifischen Arb-Pfade entfernt.
 
-**Problem:** CrossDexHandler hat `pool_cache: Option<Arc<LivePoolCache>>` und nutzt ihn für Raydium, PumpFunAmm, Meteora, Orca – **aber nicht für PumpFun Bonding Curve**. Beim Arb-Swap-Build für `pumpfun` wird daher immer RPC-Fallback für Creator ausgelöst (`get_account_retry` in `build_swap_ix_async`).
-
-**SSOT-Verletzung:** Zwei Quellen für PumpFun Creator/Bonding-Curve – Cache (Momentum-Pfad) vs. RPC (Arb-Pfad).
-
-**Fix:** `PumpFunDex::new(Arc::clone(&self.rpc), self.pool_cache.clone())`
-
-**Priorität:** P1 – einfacher 1-Zeilen-Fix.
+**Priorität:** War P1 – durch vollständige Entfernung gelöst (kein SSOT-Konflikt mehr).
 
 #### `pumpfun_amm.rs` – PumpSwap AMM
 
@@ -401,7 +393,7 @@ let mut pumpfun = PumpFunDex::new(Arc::clone(&self.rpc), None)?;  // ← hardcod
 
 | Problem | Status |
 |---------|--------|
-| **CrossDexHandler: PumpFun ohne pool_cache** | ❌ SSOT verletzt – Arb-Pfad nutzt RPC statt Cache |
+| **CrossDexHandler: PumpFun** | ✅ Entfernt – PumpFun BC nicht für Arb geeignet (keine anderen Pools) |
 | Pool-Matching (FIX-38) | ✅ Eingehalten – `update_position_price()` prüft `source_pool == position.pool` |
 | PumpSwap AMM quote_mint hardcodiert (`dex_parser.rs:952`) | ⚠️ Potenziell bei non-SOL-PumpSwap-Pools; Risiko gering |
 | Meteora DLMM / Raydium CPMM quote_mint | ✅ Behoben – `extract_quote_mint` / vault-mint-basiert |
@@ -485,7 +477,7 @@ let mut pumpfun = PumpFunDex::new(Arc::clone(&self.rpc), None)?;  // ← hardcod
 | raydium_cpmm.rs | 2 | KRITISCH |
 | meteora_dlmm.rs | 3 | KRITISCH |
 | tx_builder.rs | 4 | KRITISCH (Fallbacks) |
-| cross_dex_handler.rs | 1 | KRITISCH (PumpFun ohne Cache) |
+| cross_dex_handler.rs | 0 | — (PumpFun aus Arb entfernt) |
 | execution.rs (arb) | 1 | VERSTOSS |
 | **TOTAL** | **26+** | |
 
@@ -526,7 +518,7 @@ Typischer **Momentum-Buy**:
 
 | # | Problem | Fix | Risiko |
 |---|---------|-----|--------|
-| **1** | **CrossDexHandler: PumpFun ohne LivePoolCache** | `PumpFunDex::new(rpc, self.pool_cache.clone())` in cross_dex_handler.rs:206 | Minimal – 1 Zeile |
+| ~~1~~ | ~~CrossDexHandler: PumpFun~~ | ✅ Erledigt – PumpFun aus Arb entfernt (keine Arb-Möglichkeit auf BC) | — |
 | 2 | Arbitrage get_balance_retry | LockManager/available_sol vor RPC prüfen; RPC nur als Fallback | Niedrig |
 
 ### Priorität 2 — Bald (Robustheit)
