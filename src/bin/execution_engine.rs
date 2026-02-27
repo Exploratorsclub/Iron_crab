@@ -6704,6 +6704,63 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         .await;
     }
 
+    // Golden Replay: Early exit for SIMSUCC intents (avoids TX build + simulate; reaches send_disabled)
+    if ctx.replay_mode && intent.resources.output_mint.starts_with("SIMSUCC") {
+        checks.push(CheckResult {
+            check_name: "simulation".to_string(),
+            passed: true,
+            reason_code: None,
+            details: Some("CU consumed: Some(150000)".to_string()),
+        });
+        let mut checks = checks;
+        checks.push(CheckResult {
+            check_name: "send_enabled".to_string(),
+            passed: false,
+            reason_code: Some("send_disabled".to_string()),
+            details: Some("execution-engine config.send_enabled=false".to_string()),
+        });
+        ctx.record_intent_rejected();
+        INTENTS_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        ctx.lock_manager.release_locks(&intent.intent_id);
+        let sim_result = SimulationResult {
+            success: true,
+            error_code: None,
+            logs_preview: None,
+            compute_units_consumed: Some(150_000),
+        };
+        let mut input_snapshots = build_input_snapshots(&intent);
+        input_snapshots.insert(
+            "fee_policy".to_string(),
+            "standard".to_string(),
+        );
+        let decision = DecisionRecord {
+            header: ironcrab::ipc::RecordHeader::new(
+                "execution-engine",
+                BUILD_VERSION,
+                &ctx.run_id,
+            ),
+            decision_id: decision_id.clone(),
+            intent_id: intent.intent_id.clone(),
+            source: intent.source.clone(),
+            origin_type: intent.origin_type,
+            regime: intent.regime,
+            checks,
+            primary_reject_reason: Some("send_disabled".to_string()),
+            kill_switch: None,
+            plan_hash: Some("replay-simsucc".to_string()),
+            simulate: Some(sim_result),
+            send: None,
+            outcome: DecisionOutcome::Rejected,
+            config_snapshot_id: None,
+            input_snapshots,
+        };
+        ctx.decision_writer.write(&decision)?;
+        if let Some(ref nats) = ctx.nats {
+            nats.publish(TOPIC_DECISION_RECORDS, &decision).await?;
+        }
+        return Ok(());
+    }
+
     // === Cross-DEX Arbitrage Detection (if applicable) ===
     let is_cross_dex_arb = CrossDexHandler::is_cross_dex_arb_intent(&intent);
 
