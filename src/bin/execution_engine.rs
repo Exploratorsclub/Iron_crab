@@ -42,6 +42,7 @@ use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding, UiTransactionTokenBalance,
 };
 use std::collections::{HashMap, HashSet};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -961,6 +962,18 @@ struct Args {
     /// Initial SOL balance for lock manager (lamports)
     #[arg(long, default_value = "1000000000")]
     initial_sol_lamports: u64,
+
+    /// Golden Replay Mode: Liest Intents aus JSONL, schreibt Decisions in JSONL, kein NATS/RPC.
+    #[arg(long)]
+    replay: bool,
+
+    /// Pfad zur Intents-JSONL (nur bei --replay)
+    #[arg(long, requires = "replay")]
+    replay_intents: Option<PathBuf>,
+
+    /// Pfad zur Output-Decisions-JSONL (nur bei --replay)
+    #[arg(long, requires = "replay")]
+    replay_output: Option<PathBuf>,
 }
 
 /// Execution engine configuration
@@ -1394,6 +1407,9 @@ struct ExecutionContext {
     arb_validated: std::sync::atomic::AtomicU64,
     #[allow(dead_code)]
     arb_executed: std::sync::atomic::AtomicU64,
+
+    /// Golden Replay Mode: true = no RPC/TX send, early-exit for SIMFAIL intents.
+    replay_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4049,6 +4065,17 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let run_id = Uuid::new_v4().to_string();
 
+    // Golden Replay Mode: read intents from JSONL, write decisions to JSONL, no NATS/RPC.
+    if args.replay {
+        if let (Some(intents_path), Some(output_path)) = (&args.replay_intents, &args.replay_output)
+        {
+            run_golden_replay(intents_path, output_path).await;
+            return Ok(());
+        }
+        error!("--replay requires --replay-intents and --replay-output");
+        std::process::exit(1);
+    }
+
     // Optional app config: used for non-hot-path settings (e.g. Helius fallback endpoints).
     let helius_rpc_url = match AppConfig::load(&args.config) {
         Ok(c) => c.solana.helius_rpc_url,
@@ -4628,6 +4655,7 @@ async fn main() -> Result<()> {
         tx_sent: std::sync::atomic::AtomicU64::new(0),
         arb_validated: std::sync::atomic::AtomicU64::new(0),
         arb_executed: std::sync::atomic::AtomicU64::new(0),
+        replay_mode: false,
     };
 
     // Sync kill switch to global metric so control plane /status can display correct state after restarts
@@ -5899,6 +5927,140 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Load TradeIntents from a JSONL file (for Golden Replay)
+fn load_intents_from_jsonl(path: &Path) -> Vec<TradeIntent> {
+    let f = std::fs::File::open(path).expect("open intents file");
+    let reader = std::io::BufReader::new(f);
+    reader
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(&l).expect("parse intent"))
+        .collect()
+}
+
+/// Build minimal ExecutionContext for Golden Replay (no NATS, no RPC, no TX send)
+async fn build_replay_context(output_path: &Path) -> Result<ExecutionContext> {
+    let run_id = Uuid::new_v4().to_string();
+    let exec_config = ExecutionConfig {
+        send_enabled: false,
+        max_position_size_lamports: 500_000_000,
+        daily_loss_limit_lamports: 5_000_000_000,
+        max_open_positions: 5,
+        max_slippage_bps: 500,
+        ..ExecutionConfig::default()
+    };
+    let config_snapshot_id = exec_config.snapshot_id();
+
+    let log_dir = output_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let prefix = output_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("golden_decisions")
+        .to_string();
+
+    let decision_config = JsonlWriterConfig::new(&prefix)
+        .with_log_dir(&log_dir)
+        .with_flush_each_write(true);
+    let decision_writer = JsonlWriter::new(decision_config)?;
+
+    let execution_config =
+        JsonlWriterConfig::new("replay_exec").with_log_dir(log_dir.join("executions"));
+    let execution_writer = JsonlWriter::new(execution_config)?;
+
+    let burn_config = JsonlWriterConfig::new("replay_burn").with_log_dir(log_dir.join("burns"));
+    let burn_writer = JsonlWriter::new(burn_config)?;
+
+    // Dummy RPC (never called for Phase 1: rejected_trade + sim_failed)
+    let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+
+    let lock_manager = LockManager::new(1_000_000_000); // 1 SOL for replay
+
+    let ctx = ExecutionContext {
+        run_id: run_id.clone(),
+        rpc_url: "replay".to_string(),
+        helius_rpc_url: None,
+        wallet_pubkey: Some(Pubkey::new_from_array([1u8; 32])), // Dummy for replay
+        treasury: None,
+        config: parking_lot::RwLock::new(exec_config),
+        config_snapshot_id: parking_lot::RwLock::new(config_snapshot_id),
+        nats: None,
+        decision_writer,
+        execution_writer,
+        burn_writer,
+        lock_manager,
+        log_base: log_dir,
+        decision_counter: std::sync::atomic::AtomicU64::new(0),
+        execution_counter: std::sync::atomic::AtomicU64::new(0),
+        current_day: parking_lot::RwLock::new(chrono::Utc::now().date_naive()),
+        daily_loss_lamports: std::sync::atomic::AtomicI64::new(0),
+        open_positions: std::sync::atomic::AtomicUsize::new(0),
+        kill_switch_active: AtomicBool::new(false),
+        liquidation_in_progress: AtomicBool::new(false),
+        kill_switch_context: parking_lot::RwLock::new(None),
+        burn_in_progress: AtomicBool::new(false),
+        jito_client: None,
+        bundles_submitted: std::sync::atomic::AtomicU64::new(0),
+        bundles_confirmed: std::sync::atomic::AtomicU64::new(0),
+        cross_dex_handler: None,
+        rpc,
+        address_lookup_table: None,
+        tx_sender: None,
+        dynamic_fee_percentiles: parking_lot::RwLock::new(None),
+        cached_blockhash: parking_lot::RwLock::new(None),
+        live_pool_cache: None,
+        intent_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        wsol_balance_tx: None,
+        tx_confirm: Arc::new(ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::new(
+            15,
+        )),
+        intents_received: std::sync::atomic::AtomicU64::new(0),
+        intents_rejected: std::sync::atomic::AtomicU64::new(0),
+        sim_failures: std::sync::atomic::AtomicU64::new(0),
+        tx_sent: std::sync::atomic::AtomicU64::new(0),
+        arb_validated: std::sync::atomic::AtomicU64::new(0),
+        arb_executed: std::sync::atomic::AtomicU64::new(0),
+        replay_mode: true,
+    };
+
+    Ok(ctx)
+}
+
+/// Run Golden Replay: process intents from JSONL, write decisions to JSONL
+async fn run_golden_replay(intents_path: &Path, output_path: &Path) {
+    let intents = load_intents_from_jsonl(intents_path);
+    info!(
+        intents_count = intents.len(),
+        intents_path = %intents_path.display(),
+        output_path = %output_path.display(),
+        "Golden Replay: starting"
+    );
+
+    let ctx = match build_replay_context(output_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "Failed to build replay context");
+            std::process::exit(1);
+        }
+    };
+
+    let mut decision_counter: u64 = 0;
+    for intent in intents {
+        decision_counter += 1;
+        if let Err(e) = process_intent(&ctx, intent).await {
+            warn!(error = %e, "Replay process_intent failed");
+        }
+    }
+
+    info!(
+        decisions_processed = decision_counter,
+        "Golden Replay: finished"
+    );
+}
+
 /// Create a test intent for MVP demonstration
 fn create_test_intent(run_id: &str) -> TradeIntent {
     use ironcrab::ipc::{ExplicitAmount, IntentTier, TradeResources, TradeSide};
@@ -6502,6 +6664,32 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             ctx.lock_manager.release_locks(&intent.intent_id);
             return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
         }
+    }
+
+    // Golden Replay: Early exit for SIMFAIL intents (avoids TX build + simulate)
+    if ctx.replay_mode && intent.resources.output_mint.starts_with("SIMFAIL") {
+        let sim_result = SimulationResult {
+            success: false,
+            error_code: Some("Custom program error: 0x1".into()),
+            logs_preview: None,
+            compute_units_consumed: None,
+        };
+        checks.push(CheckResult {
+            check_name: "simulation".to_string(),
+            passed: false,
+            reason_code: Some(RejectReason::SimFailed.to_string()),
+            details: sim_result.error_code.clone(),
+        });
+        ctx.lock_manager.release_locks(&intent.intent_id);
+        return emit_sim_failed_decision(
+            ctx,
+            decision_id,
+            &intent,
+            checks,
+            "replay-simfail".to_string(),
+            sim_result,
+        )
+        .await;
     }
 
     // === Cross-DEX Arbitrage Detection (if applicable) ===

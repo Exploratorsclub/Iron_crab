@@ -78,11 +78,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Clone ironcrab-eval (Sibling für path = "../Iron_crab")
+      - name: Clone ironcrab-eval (inside workspace for correct cache key hashing)
         env:
           EVAL_CLONE_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository_owner }}/Iron_crab-eval.git
         run: |
-          git clone "$EVAL_CLONE_URL" "${{ github.workspace }}/../ironcrab-eval"
+          git clone "$EVAL_CLONE_URL" "${{ github.workspace }}/ironcrab-eval"
+          # Path dep: eval expects sibling layout (../Iron_crab); inside workspace use ..
+          sed -i 's|path = "../Iron_crab"|path = ".."|g' "${{ github.workspace }}/ironcrab-eval/Cargo.toml"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -100,12 +102,12 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ${{ github.workspace }}/../ironcrab-eval/target
-          key: ${{ runner.os }}-cargo-eval-${{ hashFiles('**/Cargo.lock') }}
+            ironcrab-eval/target
+          key: ${{ runner.os }}-cargo-eval-${{ hashFiles('ironcrab-eval/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-eval-
 
       - name: Eval tests
-        working-directory: ${{ github.workspace }}/../ironcrab-eval
+        working-directory: ironcrab-eval
         run: cargo test --quiet
 
   python-backend:
