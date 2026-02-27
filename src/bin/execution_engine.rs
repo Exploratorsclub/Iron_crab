@@ -7518,6 +7518,54 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         );
                     }
                 }
+            } else if intent.side == TradeSide::Sell {
+                // For SELL: derive ATA from wallet + input_mint + token_program (PDA, no RPC).
+                // market-data needs token_account/token_program to untrack the ATA after a sell.
+                if let Some(wallet) = ctx.wallet_pubkey {
+                    let input_mint_str = &intent.resources.input_mint;
+                    if let Ok(input_mint_pk) = Pubkey::from_str(input_mint_str) {
+                        use spl_token::solana_program::pubkey::Pubkey as SplPubkey;
+
+                        let token_program_spl = intent
+                            .resources
+                            .token_program
+                            .as_ref()
+                            .and_then(|tp| Pubkey::from_str(tp).ok())
+                            .map(|pk| SplPubkey::new_from_array(pk.to_bytes()))
+                            .unwrap_or_else(spl_token::id);
+
+                        let wallet_spl = SplPubkey::new_from_array(wallet.to_bytes());
+                        let mint_spl = SplPubkey::new_from_array(input_mint_pk.to_bytes());
+                        let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
+                            &wallet_spl, &mint_spl, &token_program_spl,
+                        );
+                        let ata_pk = Pubkey::new_from_array(ata_spl.to_bytes());
+                        let token_program_pk = Pubkey::new_from_array(token_program_spl.to_bytes());
+
+                        exec.metadata
+                            .entry("token_account".to_string())
+                            .or_insert_with(|| ata_pk.to_string());
+                        exec.metadata
+                            .entry("token_program".to_string())
+                            .or_insert_with(|| token_program_pk.to_string());
+
+                        if !exec.metadata.contains_key("mint_decimals") {
+                            if let Some(ref cache) = ctx.live_pool_cache {
+                                if let Some(d) = cache.get_mint_decimals(&input_mint_pk) {
+                                    exec.metadata
+                                        .insert("mint_decimals".to_string(), d.to_string());
+                                }
+                            }
+                        }
+
+                        info!(
+                            intent_id = %intent.intent_id,
+                            token_account = %ata_pk,
+                            token_program = %token_program_pk,
+                            "ExecutionResult: enriched metadata for market-data ATA untracking (SELL)"
+                        );
+                    }
+                }
             }
 
             // Best-effort fill accounting: attach fills only when we have a signature and wallet.
