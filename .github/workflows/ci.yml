@@ -80,11 +80,9 @@ jobs:
 
       - name: Clone ironcrab-eval (Sibling für path = "../Iron_crab")
         env:
-          # GITHUB_TOKEN: für öffentliche Repos optional, für private same-org Repos erforderlich
           EVAL_CLONE_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository_owner }}/Iron_crab-eval.git
         run: |
-          cd ..
-          git clone "$EVAL_CLONE_URL" ironcrab-eval
+          git clone "$EVAL_CLONE_URL" "${{ github.workspace }}/../ironcrab-eval"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -102,14 +100,13 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ../ironcrab-eval/target
+            ${{ github.workspace }}/../ironcrab-eval/target
           key: ${{ runner.os }}-cargo-eval-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-eval-
 
       - name: Eval tests
-        run: |
-          cd ../ironcrab-eval
-          cargo test --quiet
+        working-directory: ${{ github.workspace }}/../ironcrab-eval
+        run: cargo test --quiet
 
   python-backend:
     name: Python backend (pyo3)

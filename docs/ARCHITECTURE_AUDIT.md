@@ -529,7 +529,7 @@ Typischer **Momentum-Buy**:
 | ~~4~~ | ~~momentum_bot.rs~~ | ✅ A.2 Creator-Handling, DEX-Normalisierung – implementiert | — |
 | ~~5~~ | ~~market_data.rs~~ | ✅ A.3 WSOL-Seeding, PumpAmm pool_accounts – implementiert | — |
 | ~~6~~ | ~~Raydium~~ | ✅ BUG B behoben – Umbenennung + Hot-Path RPC-Eliminierung | — |
-| 7 | PumpFun Creator | LivePoolCache immer liefern (market-data) | Mittel |
+| ~~7~~ | ~~PumpFun Creator~~ | ✅ Erledigt – Creator zuverlässig aus LivePoolCache (token_mint-Anreicherung, BondingCurveUpdate-Fallback) | — |
 | ~~8~~ | ~~metrics.rs~~ | A.7 available_trading_capital_lamports – entfällt (Dashboard ok) | — |
 
 ### Priorität 3 — Langfristig (Architektur)

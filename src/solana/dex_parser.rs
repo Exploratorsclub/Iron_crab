@@ -109,6 +109,8 @@ pub enum ParsedDexEvent {
         creator: Pubkey,
         virtual_token_reserves: u64,
         virtual_sol_reserves: u64,
+        real_token_reserves: u64,
+        real_sol_reserves: u64,
         complete: bool,
         slot: u64,
     },
@@ -689,6 +691,8 @@ fn parse_pumpfun_account(update: &GeyserAccountUpdate) -> Option<ParsedDexEvent>
         creator: state.creator,
         virtual_token_reserves: state.virtual_token_reserves,
         virtual_sol_reserves: state.virtual_sol_reserves,
+        real_token_reserves: state.real_token_reserves,
+        real_sol_reserves: state.real_sol_reserves,
         complete: state.complete,
         slot: update.slot,
     })

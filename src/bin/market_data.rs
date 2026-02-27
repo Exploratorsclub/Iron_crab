@@ -32,7 +32,7 @@ use ironcrab::config::WalletTrackerCfg;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult,
     ExecutionStatus, IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate,
-    PriorityFeePercentiles,
+    PriorityFeePercentiles, NATIVE_SOL_MINT,
 };
 use ironcrab::metrics::{
     serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
@@ -71,7 +71,9 @@ use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 const EXECUTION_RESULT_DEDUP_CAPACITY: usize = 4096;
 
 // LivePoolCache - MASTER Cache (Single Source of Truth)
-use ironcrab::execution::live_pool_cache::{parse_pool_account, CachedPoolState, LivePoolCache};
+use ironcrab::execution::live_pool_cache::{
+    parse_pool_account, CachedPoolState, LivePoolCache, PumpFunState,
+};
 
 // P1 Crash Isolation: Systemd Watchdog support
 #[cfg(unix)]
@@ -2428,7 +2430,24 @@ async fn run_geyser_loop(
                 }
 
                 // MASTER CACHE: Try to parse as DEX pool state and upsert into LivePoolCache
-                if let Some(cached_state) = parse_pool_account(&account_update.owner, &account_update.data) {
+                if let Some(mut cached_state) = parse_pool_account(&account_update.owner, &account_update.data) {
+                    // P2#7: Enrich PumpFun token_mint from pool_mint_map when parse returns default
+                    if let CachedPoolState::PumpFun(ref mut s) = &mut cached_state {
+                        if s.token_mint == Pubkey::default() {
+                            let pool_str = account_update.pubkey.to_string();
+                            if let Some(mint_str) = ctx.pool_mint_map.read().get(&pool_str).cloned() {
+                                if let Ok(mint_pk) = Pubkey::from_str(&mint_str) {
+                                    s.token_mint = mint_pk;
+                                    debug!(
+                                        pool = %pool_str,
+                                        mint = %mint_str,
+                                        "P2#7: Enriched PumpFun token_mint from pool_mint_map"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     // Update MASTER LivePoolCache (Single Source of Truth)
                     ctx.live_pool_cache.upsert(account_update.pubkey, cached_state.clone(), account_update.slot);
 
@@ -2714,6 +2733,11 @@ async fn run_geyser_loop(
                 if let Some(ParsedDexEvent::BondingCurveUpdate {
                     pool_address,
                     creator,
+                    virtual_token_reserves,
+                    virtual_sol_reserves,
+                    real_token_reserves,
+                    real_sol_reserves,
+                    complete,
                     slot,
                     ..
                 }) = &parsed {
@@ -2790,6 +2814,70 @@ async fn run_geyser_loop(
                                     NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                                     MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                                 }
+                            }
+                        }
+                    }
+
+                    // P2#7: BondingCurveUpdate fallback when parse_pool_account failed.
+                    // Ensure LivePoolCache/SLAVE receives creator so Liquidation/PumpFunDex skip RPC.
+                    let needs_fallback = ctx
+                        .live_pool_cache
+                        .get(pool_address)
+                        .is_none_or(|s| !matches!(s, CachedPoolState::PumpFun(_)));
+                    if needs_fallback {
+                        let base_mint_pk = ctx
+                            .pool_mint_map
+                            .read()
+                            .get(&pool_str)
+                            .and_then(|m| Pubkey::from_str(m).ok())
+                            .unwrap_or_default();
+                        let base_mint = base_mint_pk.to_string();
+                        let minimal_state = CachedPoolState::PumpFun(PumpFunState {
+                            token_mint: base_mint_pk,
+                            bonding_curve: *pool_address,
+                            associated_bonding_curve: Pubkey::default(),
+                            virtual_token_reserves: *virtual_token_reserves,
+                            virtual_sol_reserves: *virtual_sol_reserves,
+                            real_token_reserves: *real_token_reserves,
+                            real_sol_reserves: *real_sol_reserves,
+                            complete: *complete,
+                            creator: *creator,
+                        });
+                        ctx.live_pool_cache
+                            .upsert(*pool_address, minimal_state, *slot);
+
+                        let mut pool_update = PoolCacheUpdate::new_pool_discovered(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            pool_str.clone(),
+                            "pumpfun".to_string(),
+                            base_mint.clone(),
+                            NATIVE_SOL_MINT.to_string(),
+                            *virtual_token_reserves,
+                            *virtual_sol_reserves,
+                            Some(0),
+                            *slot,
+                        );
+                        let mut meta = std::collections::HashMap::new();
+                        meta.insert("creator".to_string(), creator_str.clone());
+                        meta.insert("complete".to_string(), complete.to_string());
+                        meta.insert("real_token_reserves".to_string(), real_token_reserves.to_string());
+                        meta.insert("real_sol_reserves".to_string(), real_sol_reserves.to_string());
+                        pool_update.metadata = Some(meta);
+
+                        if let Some(ref nats) = ctx.nats {
+                            let subject = pool_subject(&pool_str);
+                            if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
+                                warn!(error = %e, pool = %pool_str, "P2#7: Failed to publish BondingCurveUpdate fallback PoolCacheUpdate");
+                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                debug!(
+                                    pool = %pool_str,
+                                    creator = %creator_str,
+                                    "P2#7: Published BondingCurveUpdate fallback PoolCacheUpdate"
+                                );
                             }
                         }
                     }
