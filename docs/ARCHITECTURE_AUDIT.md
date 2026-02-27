@@ -1,6 +1,6 @@
 # IronCrab Architektur-Audit – Konsolidierte Fassung
 
-**Stand:** 2026-02-23 | **Quellen:** main (ARCHITECTURE_AUDIT_2026-02-07) + arch-audit-tsw (ARCHITECTURE_AUDIT_2026-02-23)
+**Stand:** 2026-02-21 | **Quellen:** main (ARCHITECTURE_AUDIT_2026-02-07) + arch-audit-tsw (ARCHITECTURE_AUDIT_2026-02-23)
 
 > Dieses Dokument ist die einzige aktuelle Architektur-Audit-Quelle. Enthält die **vollständige** Revert-Analyse, alle RPC-Matrix-Tabellen, DEX-Details, BUG-Beschreibungen, **CrossDexHandler PumpFun-Befund** (tsw) sowie SSOT- und Cherry-Pick-Empfehlungen.
 
@@ -133,12 +133,12 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 - ✅ `PumpFunAmmDex::new_with_cache()` Verwendung in Liquidation (2026-02-21)
 - ✅ `emit_sim_failed_decision()` gibt `Err` zurück für Retry-Detection
 - ✅ 6005-Retry-Mechanismus (2026-02-25): Bei BondingCurveComplete auf pumpfun → automatisch Retry mit PumpSwap AMM
+- ✅ SELL → token_account + token_program in ExecutionResult Metadata für market-data ATA-Tracking (Momentum-Sells, 2026-02-21)
 
-**Was noch fehlt**:
-- ❌ SELL → token_account + token_program in ExecutionResult Metadata für market-data ATA-Tracking (Momentum-Sells)
-- ❌ `AVAILABLE_TRADING_CAPITAL_LAMPORTS` Metrik
+**Entfällt** (bewusst nicht umgesetzt):
+- `AVAILABLE_TRADING_CAPITAL_LAMPORTS` — SOL-Fallback-Anzeige im WSOL-Panel bereits behoben; Dashboard zeigt korrekt.
 
-**Status**: ⚠️ TEILWEISE — Kern-Liquidation funktioniert; 6005-Retry implementiert
+**Status**: ✅ IMPLEMENTIERT — Kern-Liquidation, 6005-Retry, SELL-Metadata für market-data ATA-untracking.
 
 ### A.5 — Pump.fun Bonding Curve: SELL bei migrierten Tokens (SINNVOLL – sollte zurück)
 
@@ -171,7 +171,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 **Was verloren ging**: Neue Prometheus-Metrik `available_trading_capital_lamports` mit klarerem Namen für Grafana
 
-**Status**: ❌ FEHLT — Grafana nutzt `available_sol_lamports` (funktioniert, aber Name ist verwirrend)
+**Status**: ⛔ ENTFÄLLT — SOL-Fallback-Anzeige im WSOL-Panel wurde behoben; Dashboard zeigt WSOL und Wallet-Gesamtbalance korrekt. Keine weitere Metrik erforderlich.
 
 ### A.8 — Dokumentation & Scripts (TEILWEISE RELEVANT)
 
@@ -416,7 +416,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 **Problem:** Bei `run_liquidation_job()` gibt es mehrere Pfade wo Token übersprungen werden: `min_out_sol.is_none()`, Creator fehlt im Cache, `pool_accounts_v1_for_base_mint()` gibt `None`.
 
-**Status:** ✅ TEILWEISE BEHOBEN — Liquidation versucht Multi-Pool zuerst, PumpFun als Fallback. 6005-Auto-Retry fehlt noch.
+**Status:** ✅ TEILWEISE BEHOBEN — Liquidation versucht Multi-Pool zuerst, PumpFun als Fallback. 6005-Retry bei BondingCurveComplete implementiert (2026-02-25).
 
 ### BUG B: `load_pool_from_geyser()` in `raydium.rs` macht RPC
 
@@ -525,12 +525,12 @@ Typischer **Momentum-Buy**:
 
 | # | Quelle | Beschreibung | Risiko |
 |---|--------|-------------|--------|
-| 3 | tx_builder.rs | Cache-capped min_out für PumpFun BUY (A.6) | Niedrig |
-| 4 | momentum_bot.rs, config.rs | Creator-Handling, DEX-Normalisierung, Pool-Registry (A.2) | Mittel |
-| 5 | market_data.rs | WSOL-Seeding, PumpAmm pool_accounts, SELL→JetStream(0) (A.3) | Mittel |
-| 6 | Raydium | load_pool_from_geyser umbenennen | Minimal |
+| ~~3~~ | ~~tx_builder.rs~~ | ✅ A.6 Cache-capped min_out – implementiert | — |
+| ~~4~~ | ~~momentum_bot.rs~~ | ✅ A.2 Creator-Handling, DEX-Normalisierung – implementiert | — |
+| ~~5~~ | ~~market_data.rs~~ | ✅ A.3 WSOL-Seeding, PumpAmm pool_accounts – implementiert | — |
+| 6 | Raydium | load_pool_from_geyser umbenennen in load_pool_from_rpc_fallback | Minimal |
 | 7 | PumpFun Creator | LivePoolCache immer liefern (market-data) | Mittel |
-| 8 | metrics.rs | available_trading_capital_lamports (A.7) | Minimal |
+| ~~8~~ | ~~metrics.rs~~ | A.7 available_trading_capital_lamports – entfällt (Dashboard ok) | — |
 
 ### Priorität 3 — Langfristig (Architektur)
 
@@ -571,12 +571,12 @@ Dokumentiert in `.cursor/rules/ironcrab-core.mdc`:
 | Kategorie | Status |
 |-----------|--------|
 | A.1 PumpSwap Geyser-First | ⚠️ new_with_cache vorhanden, RPC bei Miss |
-| A.2 Bonding-Curve Exit | ❌ Fehlt |
-| A.3 Market-Data Wallet-Tracking | ❌ Fehlt |
-| A.4 Liquidation 6005-Retry | ❌ Fehlt |
+| A.2 Bonding-Curve Exit | ✅ Implementiert |
+| A.3 Market-Data Wallet-Tracking | ✅ Implementiert |
+| A.4 Liquidation (6005-Retry, SELL-Metadata) | ✅ Implementiert |
 | A.5 PumpFun SELL migriert | ✅ Behoben |
-| A.6 Cache-capped min_out | ❌ Fehlt |
-| A.7 available_trading_capital_lamports | ❌ Fehlt |
+| A.6 Cache-capped min_out | ✅ Behoben |
+| A.7 available_trading_capital_lamports | ⛔ Entfällt (Dashboard ok) |
 
 ---
 
