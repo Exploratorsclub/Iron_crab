@@ -55,17 +55,20 @@ pub struct MeteoraDlmm {
     extra_data: Arc<DashMap<String, String>>,
     /// Geyser-sourced LivePoolCache for real-time vault balances (GEYSER-FIRST)
     live_pool_cache: Option<SharedLivePoolCache>,
+    /// If false: reject on cache miss (Hot Path). If true: allow RPC fallback (Cold Path)
+    allow_rpc_on_miss: bool,
 }
 
 impl MeteoraDlmm {
     pub fn new(rpc: Arc<SolanaRpc>) -> Self {
-        Self::new_with_live_cache(rpc, None)
+        Self::new_with_live_cache(rpc, None, true)
     }
 
     /// Create MeteoraDlmm instance with optional LivePoolCache for Geyser-first vault balances.
     pub fn new_with_live_cache(
         rpc: Arc<SolanaRpc>,
         live_pool_cache: Option<SharedLivePoolCache>,
+        allow_rpc_on_miss: bool,
     ) -> Self {
         Self {
             rpc,
@@ -74,6 +77,7 @@ impl MeteoraDlmm {
             user_authority: parking_lot::RwLock::new(None),
             extra_data: Arc::new(DashMap::new()),
             live_pool_cache,
+            allow_rpc_on_miss,
         }
     }
 
@@ -223,7 +227,14 @@ impl MeteoraDlmm {
             }
         }
 
-        // 2) RPC fallback
+        // 2) RPC fallback (Cold Path only when allow_rpc_on_miss)
+        if !self.allow_rpc_on_miss {
+            return Err(anyhow!(
+                "meteora_dlmm: vault reserves not in LivePoolCache (GEYSER-ONLY hot path, pool={})",
+                pool_addr
+            ));
+        }
+
         let pool = self
             .pools
             .get(pool_addr)
@@ -942,6 +953,39 @@ impl Dex for MeteoraDlmm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_update_reserve_balances_rejects_on_cache_miss_when_geyser_only() {
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let meteora = MeteoraDlmm::new_with_live_cache(rpc, None, false);
+        let pool_addr = Pubkey::new_unique();
+        let token_x = Pubkey::new_unique();
+        let token_y = Pubkey::new_unique();
+        let reserve_x = Pubkey::new_unique();
+        let reserve_y = Pubkey::new_unique();
+        meteora
+            .set_pool_from_accounts(
+                &pool_addr.to_string(),
+                &[
+                    pool_addr.to_string(),
+                    token_x.to_string(),
+                    token_y.to_string(),
+                    reserve_x.to_string(),
+                    reserve_y.to_string(),
+                ],
+            )
+            .expect("set_pool_from_accounts");
+        let result = meteora
+            .quote_exact_in(&token_x.to_string(), &token_y.to_string(), 1_000_000)
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("GEYSER-ONLY"),
+            "expected GEYSER-ONLY in error, got: {}",
+            err_msg
+        );
+    }
 
     #[test]
     fn test_constant_product_quote() {

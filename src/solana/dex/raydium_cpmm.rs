@@ -164,23 +164,27 @@ pub struct RaydiumCpmm {
     mint_index: Arc<DashMap<Pubkey, Vec<Pubkey>>>, // mint -> pool addresses
     /// Geyser-sourced LivePoolCache for real-time vault balances (GEYSER-FIRST)
     live_pool_cache: Option<SharedLivePoolCache>,
+    /// If false: reject on cache miss (Hot Path). If true: allow RPC fallback (Cold Path)
+    allow_rpc_on_miss: bool,
 }
 
 impl RaydiumCpmm {
     pub fn new(rpc: Arc<SolanaRpc>) -> Self {
-        Self::new_with_live_cache(rpc, None)
+        Self::new_with_live_cache(rpc, None, true)
     }
 
     /// Create RaydiumCpmm instance with optional LivePoolCache for Geyser-first vault balances.
     pub fn new_with_live_cache(
         rpc: Arc<SolanaRpc>,
         live_pool_cache: Option<SharedLivePoolCache>,
+        allow_rpc_on_miss: bool,
     ) -> Self {
         Self {
             rpc,
             pools: Arc::new(DashMap::new()),
             mint_index: Arc::new(DashMap::new()),
             live_pool_cache,
+            allow_rpc_on_miss,
         }
     }
 
@@ -221,7 +225,14 @@ impl RaydiumCpmm {
             }
         }
 
-        // 2) RPC fallback
+        // 2) RPC fallback (Cold Path only when allow_rpc_on_miss)
+        if !self.allow_rpc_on_miss {
+            return Err(anyhow!(
+                "raydium_cpmm: vault reserves not in LivePoolCache (GEYSER-ONLY hot path, pool={})",
+                pool_addr
+            ));
+        }
+
         let pool = self
             .pools
             .get(pool_addr)
@@ -685,5 +696,38 @@ mod tests {
         assert_eq!(pool.token_1_vault, vault_1);
         assert_eq!(pool.lp_mint, lp_mint);
         assert_eq!(pool.fee_rate, 2500);
+    }
+
+    #[tokio::test]
+    async fn test_update_reserve_balances_rejects_on_cache_miss_when_geyser_only() {
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let cpmm = RaydiumCpmm::new_with_live_cache(rpc, None, false);
+        let pool_addr = Pubkey::new_unique();
+        let token_0 = Pubkey::new_unique();
+        let token_1 = Pubkey::new_unique();
+        let vault_0 = Pubkey::new_unique();
+        let vault_1 = Pubkey::new_unique();
+        cpmm
+            .set_pool_from_accounts(
+                &pool_addr.to_string(),
+                &[
+                    pool_addr.to_string(),
+                    token_0.to_string(),
+                    token_1.to_string(),
+                    vault_0.to_string(),
+                    vault_1.to_string(),
+                ],
+            )
+            .expect("set_pool_from_accounts");
+        let result = cpmm
+            .quote_exact_in(&token_0.to_string(), &token_1.to_string(), 1_000_000)
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("GEYSER-ONLY"),
+            "expected GEYSER-ONLY in error, got: {}",
+            err_msg
+        );
     }
 }

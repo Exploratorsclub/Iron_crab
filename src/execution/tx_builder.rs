@@ -548,7 +548,11 @@ pub async fn build_tx_plan(
             }
         };
 
-        let mut raydium = Raydium::new_with_live_cache(Arc::clone(&rpc), cache.map(Arc::clone));
+        let mut raydium = Raydium::new_with_live_cache(
+            Arc::clone(&rpc),
+            cache.map(Arc::clone),
+            allow_rpc_fallback,
+        );
         raydium.set_user_authority(wallet_pubkey);
 
         // Try cache first for pool state, fallback to RPC
@@ -862,7 +866,11 @@ pub async fn build_tx_plan(
             }
         };
 
-        let mut meteora = MeteoraDlmm::new_with_live_cache(Arc::clone(&rpc), cache.map(Arc::clone));
+        let mut meteora = MeteoraDlmm::new_with_live_cache(
+            Arc::clone(&rpc),
+            cache.map(Arc::clone),
+            allow_rpc_fallback,
+        );
         meteora.set_user_authority(wallet_pubkey);
 
         // Meteora DLMM: If DexPoolAccounts missing, fallback to cache/RPC.
@@ -1489,7 +1497,11 @@ async fn build_hop_raydium(
     rpc: &Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
-    let mut raydium = Raydium::new_with_live_cache(Arc::clone(rpc), cache.map(Arc::clone));
+    let mut raydium = Raydium::new_with_live_cache(
+        Arc::clone(rpc),
+        cache.map(Arc::clone),
+        false, // Multi-hop is Hot Path (arb) — no RPC on vault reserve miss
+    );
 
     // Try to inject pool state from cache
     let mut used_cache = false;
@@ -1649,7 +1661,11 @@ async fn build_hop_meteora_dlmm(
     rpc: &Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
-    let mut meteora = MeteoraDlmm::new_with_live_cache(Arc::clone(rpc), cache.map(Arc::clone));
+    let mut meteora = MeteoraDlmm::new_with_live_cache(
+        Arc::clone(rpc),
+        cache.map(Arc::clone),
+        false, // Multi-hop is Hot Path (arb) — no RPC on vault reserve miss
+    );
     meteora.set_user_authority(wallet_pubkey);
 
     // Try to inject state from cache

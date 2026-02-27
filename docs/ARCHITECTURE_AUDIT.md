@@ -1,6 +1,6 @@
 # IronCrab Architektur-Audit – Konsolidierte Fassung
 
-**Stand:** 2026-02-21 | **Quellen:** main (ARCHITECTURE_AUDIT_2026-02-07) + arch-audit-tsw (ARCHITECTURE_AUDIT_2026-02-23) | **Korrekturen 2026-02-21:** PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt
+**Stand:** 2026-02-27 | **Quellen:** main (ARCHITECTURE_AUDIT_2026-02-07) + arch-audit-tsw (ARCHITECTURE_AUDIT_2026-02-23) | **Korrekturen 2026-02-21:** PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt | **2026-02-27:** P3 #11 Vault-Balances – allow_rpc_on_miss, Hot Path RPC-frei
 
 > Dieses Dokument ist die einzige aktuelle Architektur-Audit-Quelle. Enthält die **vollständige** Revert-Analyse, alle RPC-Matrix-Tabellen, DEX-Details, BUG-Beschreibungen, **CrossDexHandler PumpFun-Befund** (tsw) sowie SSOT- und Cherry-Pick-Empfehlungen.
 
@@ -275,27 +275,27 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 |-------|------|-----------|---------------------|
 | 194 | `get_account_retry(pool_address)` in `load_pool_from_rpc_fallback()` | AKZEPTABEL (Cold Path) | ERLEDIGT – nur Liquidation; Hot Path lehnt ab |
 | 1264 / 1276 | `get_account_retry(&market_id)` in `fetch_and_populate_serum_accounts` | **KRITISCH** – Serum-Market im Hot Path | Cache oder Bootstrap |
-| 1324-1325 / 1336-1337 | `get_token_account_balance()` in `fetch_and_update_reserves()` | **KRITISCH** – Vault-Balances per RPC | Geyser-Vault-Updates → LivePoolCache |
+| 1324-1325 / 1336-1337 | `get_token_account_balance()` in `fetch_and_update_reserves()` | **ERLEDIGT P3#11** | Geyser-Vault-Updates → LivePoolCache |
 
-**Status:** Umbenennung load_pool_from_geyser → load_pool_from_rpc_fallback (2026-02-21). Hot Path: build_tx_plan mit allow_rpc_fallback=false lehnt bei Cache-Miss ab – kein RPC. Cold Path (Liquidation): RPC erlaubt. Raydium RPC-Retries: 20×500ms → 3×300ms (korrigiert).
+**Status:** Umbenennung load_pool_from_geyser → load_pool_from_rpc_fallback (2026-02-21). Vault-Balances (2026-02-27): `allow_rpc_on_miss` – Hot Path (tx_builder, cross_dex_handler) mit `false` → Cache-Miss = Err, kein RPC. Cold Path (Liquidation, Burn): `true` → RPC-Fallback. Raydium RPC-Retries: 20×500ms → 3×300ms (korrigiert).
 
 #### `meteora_dlmm.rs` – Meteora DLMM
 
 | Zeile | Call | Problem | Geyser-Alternative |
 |-------|------|---------|---------------------|
-| 240 | `get_account(pool_addr)` in `update_reserve_balances()` | VERSTOSS – Pool-Fetch für Vault-Adressen | LivePoolCache hat Meteora-State |
-| 269-270 | `get_account_retry(&reserve_x/y)` | **KRITISCH** – Vault-Balances per RPC | Geyser trackt diese Accounts |
+| 240 | `get_account(pool_addr)` in `update_reserve_balances()` | **ERLEDIGT P3#11** – Pool-Fetch nur Cold Path | LivePoolCache hat Meteora-State |
+| 269-270 | `get_account_retry(&reserve_x/y)` | **ERLEDIGT P3#11** – Vault-Balances nur Cold Path | Geyser trackt diese Accounts |
 | 480 | `get_account_retry(pool_address)` | Pool-Fetch im Build-Pfad | LivePoolCache |
 
-**Status:** LivePoolCache-First; RPC bei Miss.
+**Status:** `allow_rpc_on_miss` (2026-02-27). Hot Path: Cache-Miss = Err. Cold Path: RPC-Fallback erlaubt.
 
 #### `raydium_cpmm.rs` – Raydium CPMM
 
 | Zeile | Call | Problem | Geyser-Alternative |
 |-------|------|---------|---------------------|
-| 237-238 | `get_account_retry(&vault_0/1)` | **KRITISCH** – Vault-Balances per RPC | Geyser → LivePoolCache |
+| 237-238 | `get_account_retry(&vault_0/1)` | **ERLEDIGT P3#11** – Vault-Balances nur Cold Path | Geyser → LivePoolCache |
 
-**Status:** LivePoolCache-First; RPC-Fallback bei Miss.
+**Status:** `allow_rpc_on_miss` (2026-02-27). Hot Path: Cache-Miss = Err. Cold Path (account_janitor): RPC-Fallback erlaubt.
 
 ---
 
@@ -406,7 +406,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 ### 4.3 Invarianten-Checkliste (INVARIANTS.md)
 
-- [ ] Kein RPC im Hot Path? → ⚠️ Noch RPC-Fallbacks
+- [ ] Kein RPC im Hot Path? → ⚠️ Vault-Balances P3#11 erledigt; Rest: PumpSwap, Tick-Arrays, Serum
 - [x] Pool-Matching bei Preis-Updates? → ✅ Ja
 - [x] tokens_per_sol-Konvention? → ✅ Ja
 - [x] Simulation vor jedem Send? → ✅ Ja
@@ -478,13 +478,13 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 |-------|-----------------|-------------|
 | pumpfun.rs | 0 | — (nur Cold Path: Liquidation, Manual Burn, sell_all) |
 | pumpfun_amm.rs | 6+ | KRITISCH |
-| orca.rs | 2 | KRITISCH (Fallback) |
-| raydium.rs | 2 | KRITISCH (load_pool_from_rpc_fallback nur Cold Path – erledigt) |
-| raydium_cpmm.rs | 2 | KRITISCH |
-| meteora_dlmm.rs | 3 | KRITISCH |
+| orca.rs | 2 | KRITISCH (Vaults ok; Tick-Arrays offen) |
+| raydium.rs | 1 | KRITISCH (Vaults erledigt P3#11; Serum-Market offen) |
+| raydium_cpmm.rs | 0 | — (Vaults erledigt P3#11) |
+| meteora_dlmm.rs | 1 | KRITISCH (Vaults erledigt P3#11; Pool-Fetch offen) |
 | tx_builder.rs | 4 | KRITISCH (Fallbacks) |
 | cross_dex_handler.rs | 0 | — (PumpFun aus Arb entfernt) |
-| **TOTAL** | **20+** | — (pumpfun + raydium load_pool nur Cold Path – erledigt) |
+| **TOTAL** | **14+** | — (Vault-Balances Raydium/CPMM/Meteora P3#11 erledigt) |
 
 ### Geschätzte Latenz-Auswirkung
 
@@ -512,6 +512,7 @@ Typischer **Momentum-Buy** (PumpFun BC):
 | CrossDexHandler PumpFun Cache | Nicht erwähnt | **NEU:** PumpFun erhält keinen pool_cache |
 | **PumpFun RPC Hot vs. Cold** | Als KRITISCH/Hot Path markiert | **KORRIGIERT 2026-02-21:** Caller-Analyse: nur Cold Path. Keine Änderung. |
 | **Raydium load_pool_from_rpc_fallback** | Priorität 3 #10 als offen | **ERLEDIGT 2026-02-21:** Hot Path lehnt bei Cache-Miss ab (allow_rpc_fallback=false). RPC nur bei Liquidation – architekturgerecht. |
+| **Raydium/RaydiumCpmm/Meteora Vault-Balances** | Priorität 3 #11 als offen | **ERLEDIGT 2026-02-27:** `allow_rpc_on_miss` – Hot Path lehnt bei Cache-Miss ab; Cold Path RPC-Fallback. |
 | Pool-Matching (FIX-38) | Dokumentiert | Bestätigt eingehalten |
 | Meteora/Raydium CPMM quote_mint | BUG H offen | Implementiert (extract_quote_mint) |
 | PumpFun SELL migriert | A.5 fehlt | ✅ Guard implementiert (real_reserves) |
@@ -547,7 +548,7 @@ Typischer **Momentum-Buy** (PumpFun BC):
 |---|---------|-----|
 | ~~9~~ | ~~PumpFun BC-Fetch per RPC~~ | **N/A** – Nur Cold Path (Liquidation, Manual Burn, sell_all). Keine Änderung – RPC architekturgerecht. Entfernen würde Liquidation brechen. |
 | ~~10~~ | ~~Raydium `load_pool_from_rpc_fallback()`~~ | ✅ ERLEDIGT – Kein RPC im Hot Path. Hot Path lehnt bei Cache-Miss ab. RPC nur im Cold Path (Liquidation) – erlaubt. |
-| 11 | Orca/Raydium/Meteora Vault-Balances | Geyser-Vault-Subscription → LivePoolCache |
+| ~~11~~ | ~~Orca/Raydium/Meteora Vault-Balances~~ | ✅ ERLEDIGT (2026-02-27) – `allow_rpc_on_miss` in Raydium, RaydiumCpmm, MeteoraDlmm. Hot Path: Cache-Miss = Err. Cold Path: RPC-Fallback. Orca Vaults bereits frei; Tick-Arrays separat. |
 | 12 | pumpfun_amm eigene RPC-Infrastruktur | Komplett auf LivePoolCache umstellen |
 | 13 | Token-Decimals (token_utils) | Globalen Decimals-Cache aus Geyser-Mint-Info |
 | 14 | A.2, A.3 | Creator-Handling, WSOL-Seeding zurückholen |
@@ -598,4 +599,4 @@ Dokumentiert in `.cursor/rules/ironcrab-core.mdc`:
 
 ---
 
-*Konsolidiert: 2026-02-23. Korrekturen 2026-02-21: PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt.*
+*Konsolidiert: 2026-02-23. Korrekturen 2026-02-21: PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt. 2026-02-27: P3 #11 Vault-Balances – allow_rpc_on_miss implementiert.*

@@ -1682,9 +1682,17 @@ impl ExecutionContext {
         } else {
             PumpFunAmmDex::new(Arc::clone(&ctx.rpc))
         };
-        let mut meteora = MeteoraDlmm::new_with_live_cache(Arc::clone(&ctx.rpc), lpc.clone());
+        let mut meteora = MeteoraDlmm::new_with_live_cache(
+            Arc::clone(&ctx.rpc),
+            lpc.clone(),
+            true, // Liquidation = Cold Path — RPC fallback allowed
+        );
         meteora.set_user_authority(owner);
-        let raydium = Raydium::new_with_live_cache(Arc::clone(&ctx.rpc), lpc.clone());
+        let raydium = Raydium::new_with_live_cache(
+            Arc::clone(&ctx.rpc),
+            lpc.clone(),
+            true, // Liquidation = Cold Path — RPC fallback allowed
+        );
         let orca = Orca::new_with_cache(Arc::clone(&ctx.rpc), None, lpc);
         orca.set_user_authority(owner);
 
@@ -2910,7 +2918,11 @@ impl ExecutionContext {
 
         // Initialize DEX connectors for route validation.
         let burn_lpc = ctx.live_pool_cache.as_ref().map(Arc::clone);
-        let raydium = Raydium::new_with_live_cache(Arc::clone(&ctx.rpc), burn_lpc.clone());
+        let raydium = Raydium::new_with_live_cache(
+            Arc::clone(&ctx.rpc),
+            burn_lpc.clone(),
+            true, // Burn job = Cold Path — RPC fallback allowed
+        );
         let burn_pumpfun_cache = burn_lpc;
         let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc), burn_pumpfun_cache) {
             Ok(p) => Some(p),

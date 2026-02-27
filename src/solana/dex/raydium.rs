@@ -66,6 +66,8 @@ pub struct Raydium {
     user_authority: Option<Pubkey>,
     /// Geyser-sourced LivePoolCache for real-time vault balances (GEYSER-FIRST)
     live_pool_cache: Option<SharedLivePoolCache>,
+    /// When false (Hot Path): reject on vault reserve cache miss, no RPC
+    allow_rpc_on_miss: bool,
 }
 
 /// Planned swap including the constructed instruction list plus metadata for future TX assembly.
@@ -138,13 +140,15 @@ struct SimplePool {
 
 impl Raydium {
     pub fn new(rpc: Arc<SolanaRpc>) -> Self {
-        Self::new_with_live_cache(rpc, None)
+        Self::new_with_live_cache(rpc, None, true)
     }
 
     /// Create Raydium instance with optional LivePoolCache for Geyser-first vault balances.
+    /// `allow_rpc_on_miss`: When false (Hot Path), reject on vault reserve cache miss instead of RPC.
     pub fn new_with_live_cache(
         rpc: Arc<SolanaRpc>,
         live_pool_cache: Option<SharedLivePoolCache>,
+        allow_rpc_on_miss: bool,
     ) -> Self {
         Self {
             rpc,
@@ -152,6 +156,7 @@ impl Raydium {
             mint_index: Arc::new(DashMap::new()),
             user_authority: None,
             live_pool_cache,
+            allow_rpc_on_miss,
         }
     }
 
@@ -1317,7 +1322,14 @@ impl Raydium {
             }
         }
 
-        // 2) RPC fallback (WARN: should come from Geyser)
+        // 2) RPC fallback (Cold Path only when allow_rpc_on_miss)
+        if !self.allow_rpc_on_miss {
+            return Err(anyhow!(
+                "raydium: vault reserves not in LivePoolCache (GEYSER-ONLY hot path, pool={})",
+                pool_address
+            ));
+        }
+
         let (base_vault, quote_vault) = {
             let pool = self
                 .pools
@@ -1807,5 +1819,43 @@ pub mod reader {
             out.push(d);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_fetch_and_update_reserves_rejects_on_cache_miss_when_geyser_only() {
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let raydium = Raydium::new_with_live_cache(rpc, None, false);
+        let pool_addr = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let market_id = Pubkey::new_unique();
+        raydium.inject_cached_amm_state(
+            pool_addr,
+            base_mint,
+            quote_mint,
+            base_vault,
+            quote_vault,
+            9,
+            6,
+            market_id,
+            None,
+            None,
+            None,
+        );
+        let result = raydium.fetch_and_update_reserves(&pool_addr).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("GEYSER-ONLY"),
+            "expected GEYSER-ONLY in error, got: {}",
+            err_msg
+        );
     }
 }
