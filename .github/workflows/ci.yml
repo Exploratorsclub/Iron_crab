@@ -75,20 +75,16 @@ jobs:
       CARGO_INCREMENTAL: 0
       RUSTFLAGS: -C debuginfo=0
     steps:
-      - name: Checkout
+      - name: Checkout Iron_crab
         uses: actions/checkout@v4
+        with:
+          path: Iron_crab
 
-      - name: Clone ironcrab-eval (inside workspace for correct cache key hashing)
+      - name: Clone ironcrab-eval (Sibling für path = "../Iron_crab")
         env:
           EVAL_CLONE_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository_owner }}/Iron_crab-eval.git
         run: |
-          # Iron_crab repo may contain ironcrab-eval/ (partial); remove before cloning full eval repo
-          rm -rf "${{ github.workspace }}/ironcrab-eval"
           git clone "$EVAL_CLONE_URL" "${{ github.workspace }}/ironcrab-eval"
-          # Path dep: eval expects sibling layout (../Iron_crab); inside workspace use ..
-          sed -i 's|path = "../Iron_crab"|path = ".."|g' "${{ github.workspace }}/ironcrab-eval/Cargo.toml"
-          grep -q 'path = "\.\."' "${{ github.workspace }}/ironcrab-eval/Cargo.toml" || \
-            (echo "::error::ironcrab-eval Cargo.toml: expected path = \"../Iron_crab\" not found; path dep may be incorrect"; exit 1)
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
