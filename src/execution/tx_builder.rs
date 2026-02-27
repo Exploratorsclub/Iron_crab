@@ -236,12 +236,16 @@ async fn fetch_orca_from_rpc(
 
 /// Optional hint for SELL: (available_balance_raw, required_amount_raw).
 /// When provided and available != required, CloseAccount is NOT added (partial sell safety).
+///
+/// `allow_rpc_fallback`: When true (Cold Path, e.g. Liquidation ExecutionMevB), Raydium may use
+/// RPC on cache miss. When false (Hot Path), reject on cache miss (GEYSER-ONLY).
 pub async fn build_tx_plan(
     intent: &TradeIntent,
     wallet_pubkey: Pubkey,
     rpc: Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
     sell_balance_hint: Option<(u64, u64)>,
+    allow_rpc_fallback: bool,
 ) -> TxPlanOutcome {
     // === Multi-hop detection (takes priority over single-hop) ===
     // Multi-hop intents have swap_path with multiple hops for atomic arbitrage
@@ -586,12 +590,18 @@ pub async fn build_tx_plan(
             }
         }
 
-        // If cache didn't provide state, load from RPC
+        // If cache didn't provide state: Cold Path may use RPC, Hot Path rejects
         if !used_cache {
-            if let Err(e) = raydium.load_pool_from_geyser(&pool_id).await {
+            if !allow_rpc_fallback {
                 return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                     reason: RejectReason::UnsupportedIntent,
-                    details: format!("raydium load_pool_from_geyser failed: {e}"),
+                    details: "raydium pool not in LivePoolCache (GEYSER-ONLY hot path)".to_string(),
+                });
+            }
+            if let Err(e) = raydium.load_pool_from_rpc_fallback(&pool_id).await {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: format!("raydium load_pool_from_rpc_fallback failed: {e}"),
                 });
             }
         }
@@ -1509,14 +1519,15 @@ async fn build_hop_raydium(
         }
     }
 
-    // If cache didn't provide state, load from RPC
+    // Multi-hop is Hot Path only (arb) — reject on cache miss, no RPC
     if !used_cache {
-        if let Err(e) = raydium.load_pool_from_geyser(pool_address).await {
-            return Err(UnsupportedTxPlan {
-                reason: RejectReason::UnsupportedIntent,
-                details: format!("raydium load_pool failed: {}", e),
-            });
-        }
+        return Err(UnsupportedTxPlan {
+            reason: RejectReason::UnsupportedIntent,
+            details: format!(
+                "raydium pool {} not in LivePoolCache (multi-hop GEYSER-ONLY)",
+                pool_address
+            ),
+        });
     }
 
     raydium.set_user_authority(wallet_pubkey);

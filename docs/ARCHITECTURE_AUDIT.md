@@ -270,7 +270,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 | Zeile | Call | Problem | Geyser-Alternative |
 |-------|------|---------|---------------------|
-| 194 | `get_account_retry(pool_address)` in `load_pool_from_geyser()` | **VERSTOSS** – Funktion heißt „from_geyser“, macht aber RPC (3×300ms; 2026-02-07: 20×500ms) | Geyser-Account-Update direkt parsen |
+| 194 | `get_account_retry(pool_address)` in `load_pool_from_rpc_fallback()` | **COLD PATH** – Hot Path lehnt ab (2026-02-21) „from_geyser“, | Geyser-Account-Update direkt parsen |
 | 1264 / 1276 | `get_account_retry(&market_id)` in `fetch_and_populate_serum_accounts` | **KRITISCH** – Serum-Market im Hot Path | Cache oder Bootstrap |
 | 1324-1325 / 1336-1337 | `get_token_account_balance()` in `fetch_and_update_reserves()` | **KRITISCH** – Vault-Balances per RPC | Geyser-Vault-Updates → LivePoolCache |
 
@@ -303,7 +303,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 | Zeile | Call | Problem | Geyser-Alternative |
 |-------|------|---------|---------------------|
 | 218 | `get_account(pool_id)` in `fetch_orca_from_rpc()` | **KRITISCH** – Orca-Whirlpool-Fallback im TX-Build-Pfad | LivePoolCache (`CachedPoolState::Orca`) |
-| 523, 1370/1378 | `load_pool_from_geyser()` Raydium Fallback | **KRITISCH** – Bis zu 3×300ms (früher 20×500ms) RPC Retries | Geyser-Update direkt nutzen |
+| 523 | `load_pool_from_rpc_fallback()` Raydium | **COLD PATH** – Nur bei ExecutionMevB (Liquidation); Hot Path lehnt ab | Geyser-Update direkt nutzen |
 | 1518 | `load_pool_by_address()` Multi-hop Meteora | **KRITISCH** – Pool-Fetch per RPC | LivePoolCache |
 
 **Revert-Impact:** Cache-capped `min_out` für Pump.fun BUY fehlt (A.6) – Error 6002 Risiko.
@@ -420,9 +420,9 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 ### BUG B: `load_pool_from_geyser()` in `raydium.rs` macht RPC
 
-**Zeile ~194:** Funktion heißt „from_geyser“, macht aber RPC (3×300ms; früher 20×500ms).
+**Zeile ~194:** Funktion hieß „from_geyser“, machte aber RPC. Umbenannt in `load_pool_from_rpc_fallback()`.
 
-**Status:** ❌ Irreführender Name — Empfehlung: umbenennen in `load_pool_from_rpc_fallback()`.
+**Status:** ✅ BEHOBEN (2026-02-21) — Umbenannt zu `load_pool_from_rpc_fallback()`; Hot-Path-RPC-Eliminierung: `build_tx_plan` lehnt bei Cache-Miss ab (außer Liquidation/ExecutionMevB). Multi-Hop-Raydium lehnt immer ab.
 
 ### BUG C: PumpFunAmmDex hat eigene RPC-Infrastruktur
 
@@ -460,7 +460,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 | Thema | Beschreibung |
 |-------|--------------|
-| load_pool_from_geyser() Name | Irreführend — Umbenennen empfohlen |
+| load_pool_from_geyser() Name | ✅ BEHOBEN — Umbenannt zu load_pool_from_rpc_fallback; Hot Path RPC eliminiert |
 | Arbitrage get_balance_retry | Zusätzliche Latenz; LockManager-Alternative fehlt |
 
 ---
@@ -528,7 +528,7 @@ Typischer **Momentum-Buy**:
 | ~~3~~ | ~~tx_builder.rs~~ | ✅ A.6 Cache-capped min_out – implementiert | — |
 | ~~4~~ | ~~momentum_bot.rs~~ | ✅ A.2 Creator-Handling, DEX-Normalisierung – implementiert | — |
 | ~~5~~ | ~~market_data.rs~~ | ✅ A.3 WSOL-Seeding, PumpAmm pool_accounts – implementiert | — |
-| 6 | Raydium | load_pool_from_geyser umbenennen in load_pool_from_rpc_fallback | Minimal |
+| ~~6~~ | ~~Raydium~~ | ✅ BUG B behoben – Umbenennung + Hot-Path RPC-Eliminierung | — |
 | 7 | PumpFun Creator | LivePoolCache immer liefern (market-data) | Mittel |
 | ~~8~~ | ~~metrics.rs~~ | A.7 available_trading_capital_lamports – entfällt (Dashboard ok) | — |
 
@@ -537,7 +537,7 @@ Typischer **Momentum-Buy**:
 | # | Problem | Fix |
 |---|---------|-----|
 | 9 | PumpFun BC-Fetch per RPC | Quote aus `CachedPoolState::PumpFun` berechnen |
-| 10 | Raydium `load_pool_from_geyser()` | Geyser-Account-Update direkt parsen |
+| 10 | Raydium `load_pool_from_rpc_fallback()` | Geyser-Account-Update direkt parsen (Cold Path nutzt weiter RPC) |
 | 11 | Orca/Raydium/Meteora Vault-Balances | Geyser-Vault-Subscription → LivePoolCache |
 | 12 | pumpfun_amm eigene RPC-Infrastruktur | Komplett auf LivePoolCache umstellen |
 | 13 | Token-Decimals (token_utils) | Globalen Decimals-Cache aus Geyser-Mint-Info |

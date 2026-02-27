@@ -112,7 +112,8 @@ async fn test_tx_builder_supports_pumpfun_sell_pure_derivation() {
         .metadata
         .insert("min_out_raw".to_string(), "1".to_string()); // 1 lamport min SOL out
 
-    let plan = match tx_builder::build_tx_plan(&intent, wallet, Arc::clone(&rpc), None, None).await
+    let plan = match tx_builder::build_tx_plan(&intent, wallet, Arc::clone(&rpc), None, None, false)
+        .await
     {
         tx_builder::TxPlanOutcome::Planned(p) => p,
         tx_builder::TxPlanOutcome::Unsupported(u) => {

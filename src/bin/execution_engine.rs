@@ -6654,6 +6654,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 Arc::clone(&ctx.rpc),
                 ctx.live_pool_cache.as_ref(),
                 sell_balance_hint,
+                intent.origin_type == IntentOrigin::ExecutionMevB,
             )
             .await
             {

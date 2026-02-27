@@ -233,7 +233,7 @@ async fn burn_and_close_account(
     if let Some(pid) = pool_id {
         if pid != Pubkey::default() {
             info!("Found Raydium pool {} for {}", pid, mint);
-            if let Err(e) = raydium.load_pool_from_geyser(&pid).await {
+            if let Err(e) = raydium.load_pool_from_rpc_fallback(&pid).await {
                 warn!("Failed to load pool {}: {}", pid, e);
             }
         }

@@ -181,9 +181,9 @@ impl Raydium {
         total_sol
     }
 
-    /// Load a pool from Geyser discovery event into the cache.
-    /// This allows the bot to trade on newly detected pools immediately.
-    pub async fn load_pool_from_geyser(&self, pool_address: &Pubkey) -> Result<()> {
+    /// Load a pool via RPC fallback (get_account_retry) when not in LivePoolCache.
+    /// COLD PATH ONLY – used by liquidation. Hot path rejects on cache miss.
+    pub async fn load_pool_from_rpc_fallback(&self, pool_address: &Pubkey) -> Result<()> {
         // FIX-29: Reduced from 20x500ms (10s) to 3x300ms (0.9s).
         // LivePoolCache should have the pool in 99% of cases — this is a rare fallback.
         const MAX_RETRIES: usize = 3;
@@ -285,7 +285,7 @@ impl Raydium {
             pool=%pool_address,
             base=%pool.base_mint,
             quote=%pool.quote_mint,
-            "loaded raydium pool from geyser into cache"
+            "loaded raydium pool via RPC fallback into cache"
         );
 
         Ok(())
@@ -310,7 +310,7 @@ impl Raydium {
         serum_asks: Option<Pubkey>,
         serum_event_queue: Option<Pubkey>,
     ) {
-        // Derive PDAs (same as load_pool_from_geyser)
+        // Derive PDAs (same as load_pool_from_rpc_fallback)
         let (amm_auth, _) = Self::derive_amm_authority();
 
         // Try to derive serum vault signer (market_program_id not in cache, use OpenBook default)
@@ -1163,8 +1163,8 @@ impl Dex for Raydium {
             return Ok(());
         }
 
-        // Use existing load_pool_from_geyser which fetches via single getAccount
-        self.load_pool_from_geyser(pool_address).await
+        // RPC fallback when pool not in cache
+        self.load_pool_from_rpc_fallback(pool_address).await
     }
 }
 
