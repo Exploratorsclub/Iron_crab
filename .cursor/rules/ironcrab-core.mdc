@@ -14,12 +14,11 @@ alwaysApply: true
 - Simulation-gated: if simulation fails, never send (esp. arbitrage).
 - Decision Records required for every decision (inputs, checks, outcome).
 - Amounts must be explicit (units/decimals); no implicit conventions.
-- Prefer Geyser over RPC/WS; use RPC/WS only as fallback.
+- Prefer Geyser over RPC/WS; use RPC/WS only as fallback in cold path.
 - No new ad-hoc NATS topics; align with versioned topics or document clearly.
 - Avoid expanding legacy monolith; align new work to target multi-process architecture and MVP vertical slice.
-- SSH/Server commands only when the user explicitly requests or approves.
 - never add rpc calls to hot path without explizit approval and report all calls in hotpath as architecture violation
-- HOT PATH (normal operations: discovery, buy, sell, monitoring): GEYSER-ONLY. No blocking RPC calls. Latency target < 1s between discovery and TX on-chain. Data from Geyser/LivePoolCache is authoritative.
+- HOT PATH (normal operations: discovery, buy, sell, monitoring): GEYSER-ONLY. No blocking RPC calls. Latency target < 250ms between discovery and TX on-chain. Data from Geyser/LivePoolCache is authoritative.
 - COLD PATH (liquidation, manual actions, bootstrap): RPC calls ARE acceptable. Safety and correctness have priority over speed. Use getTokenAccountsByOwner, getMultipleAccounts etc. for authoritative on-chain state.
 - NEVER remove RPC from cold paths to "optimize" — this breaks safety-critical flows. NEVER add RPC to hot paths without explicit approval — this breaks latency requirements.
 - When refactoring RPC usage, always verify which path (hot vs cold) is affected. Changes that touch both paths require explicit approval.

@@ -6729,10 +6729,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             compute_units_consumed: Some(150_000),
         };
         let mut input_snapshots = build_input_snapshots(&intent);
-        input_snapshots.insert(
-            "fee_policy".to_string(),
-            "standard".to_string(),
-        );
+        input_snapshots.insert("fee_policy".to_string(), "standard".to_string());
         let decision = DecisionRecord {
             header: ironcrab::ipc::RecordHeader::new(
                 "execution-engine",

@@ -707,18 +707,17 @@ mod tests {
         let token_1 = Pubkey::new_unique();
         let vault_0 = Pubkey::new_unique();
         let vault_1 = Pubkey::new_unique();
-        cpmm
-            .set_pool_from_accounts(
-                &pool_addr.to_string(),
-                &[
-                    pool_addr.to_string(),
-                    token_0.to_string(),
-                    token_1.to_string(),
-                    vault_0.to_string(),
-                    vault_1.to_string(),
-                ],
-            )
-            .expect("set_pool_from_accounts");
+        cpmm.set_pool_from_accounts(
+            &pool_addr.to_string(),
+            &[
+                pool_addr.to_string(),
+                token_0.to_string(),
+                token_1.to_string(),
+                vault_0.to_string(),
+                vault_1.to_string(),
+            ],
+        )
+        .expect("set_pool_from_accounts");
         let result = cpmm
             .quote_exact_in(&token_0.to_string(), &token_1.to_string(), 1_000_000)
             .await;
