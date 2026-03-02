@@ -2894,7 +2894,7 @@ impl MomentumContext {
 
     /// Update position price from market trade or pool reserves.
     /// If `source_pool` is Some, only update when position.pool matches (prevents wrong-pool
-    /// price pollution for multi-pool tokens, e.g. bonding curve + AMM).
+    /// price pollution for multi-pool tokens, e.g. bonding curve + AMM). INVARIANTS.md I-13.
     fn update_position_price(
         &self,
         mint: &str,
@@ -2904,17 +2904,17 @@ impl MomentumContext {
     ) {
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(mint) {
-            if let Some(pool) = source_pool {
-                if !pos.pool.is_empty() && pos.pool != pool {
-                    // Price from different pool – skip to avoid false TAKE_PROFIT
-                    trace!(
-                        mint = %mint,
-                        position_pool = %pos.pool,
-                        source_pool = %pool,
-                        "Skipping price update: source pool != position pool"
-                    );
-                    return;
-                }
+            if !ironcrab::execution::position_utils::should_apply_position_price_update(
+                &pos.pool,
+                source_pool,
+            ) {
+                trace!(
+                    mint = %mint,
+                    position_pool = %pos.pool,
+                    source_pool = ?source_pool,
+                    "Skipping price update: source pool != position pool"
+                );
+                return;
             }
             pos.update_price(new_price);
             if let Some(t) = trade {
