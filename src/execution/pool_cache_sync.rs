@@ -255,8 +255,9 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 Ok(p) => p,
                 Err(_) => return false,
             };
-            let (base_reserve, quote_reserve) = if let Some(existing) = cache.get(&pool_addr) {
-                let (eb, eq) = extract_reserves(&existing);
+            let existing = cache.get(&pool_addr);
+            let (base_reserve, quote_reserve) = if let Some(ref ex) = existing {
+                let (eb, eq) = extract_reserves(ex);
                 let base = if update.base_reserve > 0 {
                     update.base_reserve
                 } else {
@@ -271,9 +272,28 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
             } else {
                 (update.base_reserve, update.quote_reserve)
             };
-            if let Some((addr, minimal_state)) =
+            if let Some((addr, mut minimal_state)) =
                 build_minimal_pool_state_with_reserves(update, base_reserve, quote_reserve)
             {
+                // P3 #12: Preserve pool_accounts and creator for pump_amm when BalanceUpdated
+                // has no metadata (BalanceUpdated never includes metadata). Otherwise we'd
+                // overwrite good data from PoolDiscovered and force RPC fallback in Liquidation.
+                if update.dex == "pump_amm" {
+                    if let (
+                        Some(CachedPoolState::PumpAmm(ref existing_pump)),
+                        CachedPoolState::PumpAmm(ref mut new_pump),
+                    ) = (existing.as_ref(), &mut minimal_state)
+                    {
+                        if new_pump.pool_accounts.is_empty()
+                            && !existing_pump.pool_accounts.is_empty()
+                        {
+                            new_pump.pool_accounts = existing_pump.pool_accounts.clone();
+                        }
+                        if new_pump.creator.is_none() && existing_pump.creator.is_some() {
+                            new_pump.creator = existing_pump.creator;
+                        }
+                    }
+                }
                 cache.upsert(addr, minimal_state, update.geyser_slot);
                 return true;
             }

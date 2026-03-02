@@ -3177,6 +3177,87 @@ async fn run_geyser_loop(
                     }
                 }
 
+                // P12 Option A: PumpSwap create_pool - pool_accounts available at creation time.
+                // Emit PoolCreated + DexPoolAccounts immediately (no need to wait for first trade).
+                if let Some(ParsedDexEvent::PoolCreated {
+                    pool_address,
+                    base_mint: base_mint_pk,
+                    quote_mint: quote_mint_pk,
+                    dex: DexType::PumpFunAmm,
+                    pool_accounts: Some(pool_accounts),
+                    ..
+                }) = parsed_event.as_ref()
+                {
+                    let is_new_pool = ctx.known_pump_amm_pools.write().insert(*pool_address);
+                    if is_new_pool {
+                        let base_mint = base_mint_pk.to_string();
+                        let quote_mint = quote_mint_pk.to_string();
+                        info!(
+                            pool = %pool_address,
+                            base_mint = %base_mint_pk,
+                            "pump_amm pool discovered via create_pool - emitting PoolCreated + DexPoolAccounts"
+                        );
+                        let pool_created_event = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            ctx.next_event_id(),
+                            "geyser_create_pool",
+                            Some(tx_update.slot),
+                            MarketEventKind::PoolCreated {
+                                pool_address: pool_address.to_string(),
+                                base_mint: base_mint.clone(),
+                                quote_mint: quote_mint.clone(),
+                                dex: DexType::PumpFunAmm.to_string(),
+                                initial_liquidity_sol: None,
+                            },
+                        );
+                        if let Err(e) = ctx.jsonl_writer.write(&pool_created_event) {
+                            error!(error = %e, "Failed to write pump_amm PoolCreated (create_pool) to JSONL");
+                        }
+                        if let Some(ref nats) = ctx.nats {
+                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &pool_created_event).await {
+                                warn!(error = %e, "Failed to publish pump_amm PoolCreated (create_pool) to NATS");
+                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        let accounts_event = MarketEvent::new(
+                            "market-data",
+                            BUILD_VERSION,
+                            run_id,
+                            ctx.next_event_id(),
+                            "geyser_create_pool",
+                            Some(tx_update.slot),
+                            MarketEventKind::DexPoolAccounts {
+                                dex: DexType::PumpFunAmm.to_string(),
+                                pool_address: pool_address.to_string(),
+                                base_mint: base_mint.clone(),
+                                quote_mint: quote_mint.clone(),
+                                accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
+                            },
+                        );
+                        if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
+                            error!(error = %e, "Failed to write DexPoolAccounts (create_pool) to JSONL");
+                        }
+                        if let Some(ref nats) = ctx.nats {
+                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &accounts_event).await {
+                                warn!(error = %e, "Failed to publish DexPoolAccounts (create_pool) to NATS");
+                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        if pool_accounts.len() >= 14 {
+                            ctx.live_pool_cache.set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
+                        }
+                        ctx.pool_mint_map.write().insert(pool_address.to_string(), base_mint.clone());
+                    }
+                }
+
                 // Pump.fun AMM: emit static pool account metadata for intent-driven execution.
                 // IMPORTANT: We emit PoolCreated + DexPoolAccounts TOGETHER on first trade.
                 // This ensures arb-strategy has all required accounts before seeing the pool.

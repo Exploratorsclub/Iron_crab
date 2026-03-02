@@ -1,6 +1,8 @@
 use base64::Engine;
 use clap::Parser;
 use ironcrab::config::Config;
+use ironcrab::execution::live_pool_cache::LivePoolCache;
+use ironcrab::execution::pool_cache_sync::bootstrap_pool_cache_from_jetstream;
 use ironcrab::ipc::{
     DecisionOutcome, DecisionRecord, ExplicitAmount, IntentOrigin, IntentTier,
     TradeExecutionConstraints, TradeIntent, TradeResources, TradingRegime,
@@ -258,10 +260,20 @@ async fn main() -> anyhow::Result<()> {
     nats.connect().await?;
     info!(nats_url = %nats_url, "Connected to NATS");
 
+    // P12 Option 3: LivePoolCache from JetStream for pump_amm (Cold Path, RPC fallback allowed)
+    let live_pool_cache = Arc::new(LivePoolCache::new());
+    match bootstrap_pool_cache_from_jetstream(&nats, live_pool_cache.as_ref()).await {
+        Ok((pools, _)) => info!(
+            pools_recovered = pools,
+            "Bootstrapped pool cache from JetStream"
+        ),
+        Err(e) => warn!(error = %e, "JetStream bootstrap failed (will use RPC fallback)"),
+    }
+
     // Initialize DEX connectors (keyless) for route discovery only
     let raydium = Raydium::new(Arc::clone(&rpc));
     let pumpfun = PumpFunDex::new(Arc::clone(&rpc), None)?;
-    let pump_amm = PumpFunAmmDex::new(Arc::clone(&rpc));
+    let pump_amm = PumpFunAmmDex::new_with_cache(Arc::clone(&rpc), live_pool_cache, true);
 
     info!("Refreshing Raydium pools (for route discovery)...");
     raydium.refresh_pools().await?;

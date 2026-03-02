@@ -70,6 +70,7 @@ jobs:
 
   eval:
     name: Eval (Level 5)
+    needs: [build-test]
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: 0

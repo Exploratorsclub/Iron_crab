@@ -11,8 +11,13 @@ use crate::solana::geyser_listener::{GeyserAccountUpdate, GeyserTransactionUpdat
 use rust_decimal::Decimal;
 use solana_sdk::hash::hash;
 use solana_sdk::pubkey::Pubkey;
+use spl_token::solana_program::pubkey::Pubkey as SplPubkey;
 use std::str::FromStr;
 use tracing::{debug, info, trace};
+
+fn to_spl_pubkey(p: &Pubkey) -> SplPubkey {
+    SplPubkey::new_from_array(p.to_bytes())
+}
 
 // ============================================================================
 // Program IDs
@@ -154,6 +159,9 @@ fn anchor_disc(ix_name: &str) -> [u8; 8] {
 const PUMPFUN_CREATE: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
 const PUMPFUN_BUY: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
 const PUMPFUN_SELL: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
+
+// PumpSwap create_pool discriminator (Anchor IDL: create_pool)
+const PUMPFUN_AMM_CREATE_POOL: [u8; 8] = [233, 146, 209, 142, 207, 104, 64, 188];
 
 // Raydium AMM V4 discriminators
 const RAYDIUM_SWAP_BASE_IN: u8 = 9;
@@ -921,7 +929,158 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
 // Pump.fun AMM (PumpSwap) Parsing
 // ============================================================================
 
+/// Build 14 swap pool_accounts from create_pool instruction accounts.
+/// IDL order: pool[0], global_config[1], creator[2], base_mint[3], quote_mint[4],
+/// lp_mint[5], user_base[6], user_quote[7], user_pool[8], pool_base_vault[9],
+/// pool_quote_vault[10], system[11], token_2022[12], base_tp[13], quote_tp[14],
+/// ata_program[15], event_authority[16], program[17].
+fn build_pool_accounts_from_create_pool(accounts: &[Pubkey]) -> Option<Vec<Pubkey>> {
+    if accounts.len() < 18 {
+        return None;
+    }
+    // Resolve accounts: for top-level, accounts IS the list. For inner, accounts are indices.
+    // We receive already-resolved Pubkeys in accounts from the caller.
+    let get = |i: usize| accounts.get(i).copied();
+
+    let pool = get(0)?;
+    let global_config = get(1)?;
+    let creator = get(2)?;
+    let base_mint = get(3)?;
+    let quote_mint = get(4)?;
+    let pool_base_vault = get(9)?;
+    let pool_quote_vault = get(10)?;
+    let base_token_program = get(13)?;
+    let quote_token_program = get(14)?;
+    let event_authority = get(16)?;
+
+    let fee_config = Pubkey::from_str("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx").ok()?;
+    let fee_program = Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ").ok()?;
+    let protocol_fee_recipient =
+        Pubkey::from_str("JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU").ok()?;
+
+    let protocol_fee_recipient_ta =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &to_spl_pubkey(&protocol_fee_recipient),
+            &to_spl_pubkey(&quote_mint),
+            &to_spl_pubkey(&quote_token_program),
+        );
+    let protocol_fee_recipient_ta = Pubkey::new_from_array(protocol_fee_recipient_ta.to_bytes());
+    let coin_creator_vault_ata =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &to_spl_pubkey(&creator),
+            &to_spl_pubkey(&base_mint),
+            &to_spl_pubkey(&base_token_program),
+        );
+    let coin_creator_vault_ata = Pubkey::new_from_array(coin_creator_vault_ata.to_bytes());
+
+    let pool_accounts = vec![
+        pool,
+        global_config,
+        base_mint,
+        quote_mint,
+        pool_base_vault,
+        pool_quote_vault,
+        protocol_fee_recipient,
+        protocol_fee_recipient_ta,
+        event_authority,
+        coin_creator_vault_ata,
+        creator,           // coin_creator_vault_authority
+        Pubkey::default(), // global_volume_accumulator (not in create)
+        fee_config,
+        fee_program,
+    ];
+    Some(pool_accounts)
+}
+
+/// Try to parse create_pool from top-level or inner instructions.
+fn try_parse_pumpfun_amm_create_pool(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
+    let pumpfun_amm = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).ok()?;
+
+    // 1. Check top-level instruction
+    if update.instruction_data.len() >= 8
+        && update.instruction_data[0..8] == PUMPFUN_AMM_CREATE_POOL
+        && update.instruction_accounts.len() >= 18
+    {
+        if let Some(pool_accounts) =
+            build_pool_accounts_from_create_pool(&update.instruction_accounts)
+        {
+            let pool = update.instruction_accounts[0];
+            let base_mint = update.instruction_accounts[3];
+            let quote_mint = update.instruction_accounts[4];
+            let creator = update.instruction_accounts[2];
+            info!(
+                pool = %pool,
+                base_mint = %base_mint,
+                "PumpSwap create_pool detected (top-level) - pool_accounts available"
+            );
+            return Some(ParsedDexEvent::PoolCreated {
+                pool_address: pool,
+                base_mint,
+                quote_mint,
+                dex: DexType::PumpFunAmm,
+                initial_liquidity_lamports: 0,
+                slot: update.slot,
+                creator: Some(creator),
+                pool_accounts: Some(pool_accounts),
+            });
+        }
+    }
+
+    // 2. Check inner instructions (e.g. migrate CPI)
+    for inner in &update.inner_instructions {
+        if inner.data.len() < 8 {
+            continue;
+        }
+        if inner.data[0..8] != PUMPFUN_AMM_CREATE_POOL {
+            continue;
+        }
+        let program_id = update
+            .account_keys
+            .get(inner.program_id_index as usize)
+            .copied()?;
+        if program_id != pumpfun_amm {
+            continue;
+        }
+        let accounts: Vec<Pubkey> = inner
+            .accounts
+            .iter()
+            .filter_map(|&idx| update.account_keys.get(idx as usize).copied())
+            .collect();
+        if accounts.len() < 18 {
+            continue;
+        }
+        if let Some(pool_accounts) = build_pool_accounts_from_create_pool(&accounts) {
+            let pool = accounts[0];
+            let base_mint = accounts[3];
+            let quote_mint = accounts[4];
+            let creator = accounts[2];
+            info!(
+                pool = %pool,
+                base_mint = %base_mint,
+                "PumpSwap create_pool detected (inner/CPI) - pool_accounts available"
+            );
+            return Some(ParsedDexEvent::PoolCreated {
+                pool_address: pool,
+                base_mint,
+                quote_mint,
+                dex: DexType::PumpFunAmm,
+                initial_liquidity_lamports: 0,
+                slot: update.slot,
+                creator: Some(creator),
+                pool_accounts: Some(pool_accounts),
+            });
+        }
+    }
+
+    None
+}
+
 fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
+    // P12 Option A: Try create_pool first (pool_accounts from Create-IX)
+    if let Some(created) = try_parse_pumpfun_amm_create_pool(update) {
+        return Some(created);
+    }
+
     if update.instruction_data.len() < 24 {
         return None;
     }
@@ -1537,6 +1696,7 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solana::geyser_listener::GeyserTransactionUpdate;
 
     #[test]
     fn test_dex_type_display() {
@@ -1544,5 +1704,68 @@ mod tests {
         assert_eq!(DexType::OrcaWhirlpool.to_string(), "orca");
         assert_eq!(DexType::PumpFun.to_string(), "pumpfun");
         assert_eq!(DexType::PumpFunAmm.to_string(), "pump_amm");
+    }
+
+    #[test]
+    fn test_pumpfun_amm_create_pool_parsing() {
+        // Create minimal create_pool TX: discriminator + 18 accounts
+        let pool = Pubkey::new_unique();
+        let global_config = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let mut instruction_accounts = vec![pool, global_config, creator, base_mint, quote_mint];
+        for _ in 0..13 {
+            instruction_accounts.push(Pubkey::new_unique());
+        }
+        let mut instruction_data = PUMPFUN_AMM_CREATE_POOL.to_vec();
+        instruction_data.extend_from_slice(&[0u8; 24]); // index(2) + base_in(8) + quote_in(8)
+
+        let pumpfun_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).unwrap();
+        let mut account_keys = instruction_accounts.clone();
+        account_keys.push(pumpfun_amm_program); // Required for parse to dispatch to PumpFunAmm
+
+        let update = GeyserTransactionUpdate {
+            signature: "test_sig".to_string(),
+            slot: 100,
+            account_keys,
+            instruction_accounts,
+            instruction_data,
+            inner_instructions: vec![],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+            pre_balances: vec![],
+            post_balances: vec![],
+            fee_lamports: 5000,
+            compute_units_consumed: None,
+        };
+
+        let parsed = parse_transaction_update(&update);
+        assert!(parsed.is_some());
+        let event = parsed.unwrap();
+        match &event {
+            ParsedDexEvent::PoolCreated {
+                pool_address: p,
+                base_mint: b,
+                quote_mint: q,
+                dex,
+                pool_accounts,
+                creator: c,
+                ..
+            } => {
+                assert_eq!(p, &pool);
+                assert_eq!(b, &base_mint);
+                assert_eq!(q, &quote_mint);
+                assert_eq!(dex, &DexType::PumpFunAmm);
+                assert_eq!(c, &Some(creator));
+                let accounts = pool_accounts.as_ref().expect("pool_accounts");
+                assert_eq!(accounts.len(), 14);
+                assert_eq!(accounts[0], pool);
+                assert_eq!(accounts[1], global_config);
+                assert_eq!(accounts[2], base_mint);
+                assert_eq!(accounts[3], quote_mint);
+            }
+            _ => panic!("expected PoolCreated, got {:?}", event),
+        }
     }
 }

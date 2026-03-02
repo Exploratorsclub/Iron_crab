@@ -387,6 +387,8 @@ impl PumpFunAmmDex {
     /// Parse PumpSwap AMM pool structure from on-chain market account.
     /// If `prefetched_data` is Some, use it instead of re-fetching via RPC.
     /// This avoids transient RPC inconsistencies when the account was already fetched.
+    ///
+    /// COLD PATH ONLY. Uses RPC (getAccountInfo). Never call from hot path.
     async fn try_parse_pool_static_from_market_account_inner(
         &self,
         pool_market: Pubkey,
@@ -1015,6 +1017,9 @@ impl PumpFunAmmDex {
         }))
     }
 
+    /// Discover PumpSwap pool market addresses by base_mint via getProgramAccounts RPC.
+    ///
+    /// COLD PATH ONLY. Uses RPC (getProgramAccounts). Never call from hot path.
     async fn discover_pool_markets_via_program_accounts(
         &self,
         base_mint: Pubkey,
@@ -1912,9 +1917,8 @@ impl Dex for PumpFunAmmDex {
 
     /// Load a single pool by its market address (pool_address) via getAccount RPC.
     ///
-    /// **ARCHITECTURE COMPLIANCE (TARGET_ARCHITECTURE.md Section 4.2):**
-    /// This is a single getAccount call (acceptable) to pre-load a pool
-    /// that arb-strategy discovered and passed via Intent metadata.
+    /// COLD PATH ONLY. For PumpFunAmm, the primary path uses LivePoolCache (Geyser);
+    /// this RPC-based load is for Multi-Hop / fallback when cache misses.
     /// NOT getProgramAccounts - no scanning.
     async fn load_pool_by_address(&self, pool_address: &Pubkey) -> Result<()> {
         // Check if already cached via market index
