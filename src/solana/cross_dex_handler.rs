@@ -211,7 +211,8 @@ impl CrossDexHandler {
         // Initialize PumpSwap AMM (pump_amm) - for build_swap_ix() only
         if self.rpc_url.is_some() {
             let mut pump_amm = if let Some(ref cache) = self.pool_cache {
-                PumpFunAmmDex::new_with_cache(Arc::clone(&self.rpc), Arc::clone(cache))
+                PumpFunAmmDex::new_with_cache(Arc::clone(&self.rpc), Arc::clone(cache), false)
+                // Arb = Hot Path — no RPC on cache miss. P3 #12.
             } else {
                 PumpFunAmmDex::new(Arc::clone(&self.rpc))
             };

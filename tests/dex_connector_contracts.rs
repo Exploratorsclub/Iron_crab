@@ -57,7 +57,7 @@ async fn contract_pump_amm_quote_monotonic() {
         50_000_000_000,
     );
     let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
-    let dex = PumpFunAmmDex::new_with_cache(rpc, cache);
+    let dex = PumpFunAmmDex::new_with_cache(rpc, cache, false);
 
     let base_mint_str = base_mint.to_string();
 
@@ -95,7 +95,7 @@ async fn contract_pump_amm_price_impact_non_decreasing() {
         50_000_000_000,
     );
     let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
-    let dex = PumpFunAmmDex::new_with_cache(rpc, cache);
+    let dex = PumpFunAmmDex::new_with_cache(rpc, cache, false);
 
     let base_mint_str = base_mint.to_string();
 
@@ -127,7 +127,7 @@ async fn contract_pump_amm_unknown_pair_returns_none() {
     let base_mint = Pubkey::new_unique();
     let cache = make_empty_cache();
     let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
-    let dex = PumpFunAmmDex::new_with_cache(rpc, cache);
+    let dex = PumpFunAmmDex::new_with_cache(rpc, cache, false);
 
     let base_mint_str = base_mint.to_string();
     let result = dex
@@ -149,7 +149,7 @@ async fn contract_pump_amm_zero_input() {
         50_000_000_000,
     );
     let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
-    let dex = PumpFunAmmDex::new_with_cache(rpc, cache);
+    let dex = PumpFunAmmDex::new_with_cache(rpc, cache, false);
 
     let base_mint_str = base_mint.to_string();
     let result = dex.quote_exact_in(WSOL_MINT, &base_mint_str, 0).await;

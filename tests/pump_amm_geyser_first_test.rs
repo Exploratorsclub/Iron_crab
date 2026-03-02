@@ -72,7 +72,7 @@ async fn test_quote_from_cache_no_rpc() {
         50_000_000_000,
     );
     let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
-    let dex = PumpFunAmmDex::new_with_cache(rpc, cache);
+    let dex = PumpFunAmmDex::new_with_cache(rpc, cache, false);
 
     let base_mint_str = base_mint.to_string();
     let result = dex
@@ -117,7 +117,7 @@ async fn test_pool_accounts_from_cache_no_rpc() {
     let cache =
         make_pump_amm_cache_with_pool_accounts(pool_market, base_mint, pool_accounts.clone());
     let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
-    let dex = PumpFunAmmDex::new_with_cache(rpc, cache);
+    let dex = PumpFunAmmDex::new_with_cache(rpc, cache, false);
 
     let result = dex.pool_accounts_v1_for_base_mint(base_mint).await;
 

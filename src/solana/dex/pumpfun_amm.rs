@@ -121,6 +121,10 @@ pub struct PumpFunAmmDex {
     /// and discover_pool_static() checks for cached pool_accounts first.
     /// This is the primary mechanism for eliminating RPC calls from the hot path.
     live_pool_cache: Option<Arc<LivePoolCache>>,
+
+    /// When LivePoolCache is set and cache miss: if false, return None (Hot Path, no RPC).
+    /// If true, fall back to RPC discovery (Cold Path, e.g. Liquidation). P3 #12.
+    allow_rpc_on_miss: bool,
 }
 
 impl PumpFunAmmDex {
@@ -134,14 +138,21 @@ impl PumpFunAmmDex {
             user_accounts: DashMap::new(),
             cached_data: DashMap::new(),
             live_pool_cache: None,
+            allow_rpc_on_miss: true, // No cache: always RPC (Cold Path only)
         }
     }
 
     /// Create a new PumpFunAmmDex with a LivePoolCache reference for Geyser-first quoting.
     /// When the cache is provided, quote_exact_in() reads reserves from cache instead of RPC.
-    pub fn new_with_cache(rpc: Arc<SolanaRpc>, live_pool_cache: Arc<LivePoolCache>) -> Self {
+    /// `allow_rpc_on_miss`: false = Hot Path (Cache miss → None), true = Cold Path (Cache miss → RPC fallback). P3 #12.
+    pub fn new_with_cache(
+        rpc: Arc<SolanaRpc>,
+        live_pool_cache: Arc<LivePoolCache>,
+        allow_rpc_on_miss: bool,
+    ) -> Self {
         let mut dex = Self::new(rpc);
         dex.live_pool_cache = Some(live_pool_cache);
+        dex.allow_rpc_on_miss = allow_rpc_on_miss;
         dex
     }
 
@@ -195,12 +206,14 @@ impl PumpFunAmmDex {
                     return Ok(Some(accounts));
                 }
             }
-            // Hot Path: Cache miss with LivePoolCache set — no RPC fallback (architecture rule).
-            debug!(base_mint = %base_mint, "pump_amm: pool_accounts cache miss, returning None (no RPC)");
-            return Ok(None);
+            // Cache miss: Hot Path (allow_rpc_on_miss=false) → None. Cold Path (true) → RPC fallback. P3 #12.
+            if !self.allow_rpc_on_miss {
+                debug!(base_mint = %base_mint, "pump_amm: pool_accounts cache miss, returning None (no RPC)");
+                return Ok(None);
+            }
         }
 
-        // RPC FALLBACK (Cold Path only): No LivePoolCache — discover pool via RPC heuristics.
+        // RPC FALLBACK (Cold Path only): No LivePoolCache or allow_rpc_on_miss — discover pool via RPC heuristics.
         let pool = match self.discover_pool_static(base_mint).await? {
             Some(p) => p,
             None => return Ok(None),
@@ -1320,6 +1333,7 @@ impl PumpFunAmmDex {
         Ok(None)
     }
 
+    /// COLD PATH ONLY — RPC fallback when LivePoolCache misses. Never called in Hot Path. P3 #12.
     async fn discover_pool_static(&self, base_mint: Pubkey) -> Result<Option<PumpAmmPoolStatic>> {
         if let Some(v) = self.pools_by_base.get(&base_mint) {
             return Ok(Some(v.clone()));
@@ -2230,12 +2244,14 @@ impl Dex for PumpFunAmmDex {
                     tick_spacing: None,
                 }));
             }
-            // Hot Path: Cache miss with LivePoolCache set — no RPC fallback (architecture rule).
-            debug!(base_mint = %base_mint_str, "pump_amm: quote cache miss, returning None (no RPC)");
-            return Ok(None);
+            // Cache miss: Hot Path (allow_rpc_on_miss=false) → None. Cold Path (true) → RPC fallback. P3 #12.
+            if !self.allow_rpc_on_miss {
+                debug!(base_mint = %base_mint_str, "pump_amm: quote cache miss, returning None (no RPC)");
+                return Ok(None);
+            }
         }
 
-        // RPC FALLBACK (Cold Path only): No LivePoolCache — discover pool and fetch vault reserves via RPC.
+        // RPC FALLBACK (Cold Path only): No LivePoolCache or allow_rpc_on_miss — discover pool and fetch vault reserves via RPC.
         warn!(
             base_mint = %base_mint_str,
             "pump_amm: no LivePoolCache, using RPC fallback for quote"
@@ -2678,7 +2694,7 @@ mod tests {
             50_000_000_000,
         );
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
-        let dex = PumpFunAmmDex::new_with_cache(rpc, cache);
+        let dex = PumpFunAmmDex::new_with_cache(rpc, cache, false);
 
         let base_mint_str = base_mint.to_string();
         let result = dex
@@ -2698,7 +2714,7 @@ mod tests {
         let base_mint = Pubkey::new_unique();
         let cache = make_empty_cache();
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
-        let dex = PumpFunAmmDex::new_with_cache(rpc, cache);
+        let dex = PumpFunAmmDex::new_with_cache(rpc, cache, false);
 
         let base_mint_str = base_mint.to_string();
         let result = dex
@@ -2735,7 +2751,7 @@ mod tests {
         let cache =
             make_pump_amm_cache_with_pool_accounts(pool_market, base_mint, pool_accounts.clone());
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
-        let dex = PumpFunAmmDex::new_with_cache(rpc, cache);
+        let dex = PumpFunAmmDex::new_with_cache(rpc, cache, false);
 
         let result = dex.pool_accounts_v1_for_base_mint(base_mint).await;
 
@@ -2752,7 +2768,7 @@ mod tests {
         let base_mint = Pubkey::new_unique();
         let cache = make_empty_cache();
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
-        let dex = PumpFunAmmDex::new_with_cache(rpc, cache);
+        let dex = PumpFunAmmDex::new_with_cache(rpc, cache, false);
 
         let result = dex.pool_accounts_v1_for_base_mint(base_mint).await;
 

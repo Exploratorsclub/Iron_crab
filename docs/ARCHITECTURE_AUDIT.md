@@ -406,7 +406,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 ### 4.3 Invarianten-Checkliste (INVARIANTS.md)
 
-- [ ] Kein RPC im Hot Path? → ⚠️ Vault-Balances P3#11 erledigt; Rest: PumpSwap, Tick-Arrays, Serum
+- [ ] Kein RPC im Hot Path? → ⚠️ PumpSwap P3#12 erledigt (allow_rpc_on_miss); Rest: Tick-Arrays, Serum
 - [x] Pool-Matching bei Preis-Updates? → ✅ Ja
 - [x] tokens_per_sol-Konvention? → ✅ Ja
 - [x] Simulation vor jedem Send? → ✅ Ja
@@ -433,7 +433,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 **Zeilen 378-465:** Eigener `rpc_call()` HTTP-Client.
 
-**Status:** new_with_cache existiert; RPC bei Cache-Miss. Komplett auf LivePoolCache umstellen = Priorität 3.
+**Status:** ✅ ERLEDIGT (2026-02-28, P3 #12) — allow_rpc_on_miss: Hot Path (CrossDexHandler) false, Cold Path (Liquidation) true. RPC-Code als Cold Path only dokumentiert.
 
 ### BUG D: Token-Decimals per RPC
 
@@ -549,7 +549,7 @@ Typischer **Momentum-Buy** (PumpFun BC):
 | ~~9~~ | ~~PumpFun BC-Fetch per RPC~~ | **N/A** – Nur Cold Path (Liquidation, Manual Burn, sell_all). Keine Änderung – RPC architekturgerecht. Entfernen würde Liquidation brechen. |
 | ~~10~~ | ~~Raydium `load_pool_from_rpc_fallback()`~~ | ✅ ERLEDIGT – Kein RPC im Hot Path. Hot Path lehnt bei Cache-Miss ab. RPC nur im Cold Path (Liquidation) – erlaubt. |
 | ~~11~~ | ~~Orca/Raydium/Meteora Vault-Balances~~ | ✅ ERLEDIGT (2026-02-27) – `allow_rpc_on_miss` in Raydium, RaydiumCpmm, MeteoraDlmm. Hot Path: Cache-Miss = Err. Cold Path: RPC-Fallback. Orca Vaults bereits frei; Tick-Arrays separat. |
-| 12 | pumpfun_amm eigene RPC-Infrastruktur | Komplett auf LivePoolCache umstellen |
+| ~~12~~ | ~~pumpfun_amm eigene RPC-Infrastruktur~~ | ✅ ERLEDIGT (2026-02-28): allow_rpc_on_miss, Cold Path dokumentiert |
 | 13 | Token-Decimals (token_utils) | Globalen Decimals-Cache aus Geyser-Mint-Info |
 | 14 | A.2, A.3 | Creator-Handling, WSOL-Seeding zurückholen |
 
@@ -599,4 +599,4 @@ Dokumentiert in `.cursor/rules/ironcrab-core.mdc`:
 
 ---
 
-*Konsolidiert: 2026-02-23. Korrekturen 2026-02-21: PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt. 2026-02-27: P3 #11 Vault-Balances – allow_rpc_on_miss implementiert.*
+*Konsolidiert: 2026-02-23. Korrekturen 2026-02-21: PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt. 2026-02-27: P3 #11 Vault-Balances – allow_rpc_on_miss implementiert. 2026-02-28: P3 #12 PumpSwap allow_rpc_on_miss, Cold Path dokumentiert.*
