@@ -55,7 +55,7 @@ use ironcrab::config::Config as AppConfig;
 // cache_geyser removed - execution-engine now subscribes to PoolCacheUpdates from market-data via NATS
 use ironcrab::execution::error_detection::is_6005_bonding_curve_complete;
 use ironcrab::execution::live_pool_cache::{
-    create_shared_cache, CachedPoolState, SharedLivePoolCache,
+    create_shared_cache, CachedPoolState, LivePoolCache, PumpAmmState, SharedLivePoolCache,
 };
 use ironcrab::execution::quote_calculator;
 use ironcrab::execution::tx_builder;
@@ -1615,6 +1615,93 @@ impl ExecutionContext {
         ((quoted_out as u128) * (keep_bps as u128) / 10_000u128) as u64
     }
 
+    /// 6005-Retry: Bei BondingCurveComplete (PumpFun) Retry mit PumpSwap AMM.
+    /// Wird von run_liquidation_job und run_golden_replay genutzt.
+    async fn try_6005_pumpfun_retry(
+        &self,
+        intent: &TradeIntent,
+        pump_amm: &PumpFunAmmDex,
+        max_slippage_bps: u32,
+    ) -> Option<TradeIntent> {
+        let mint_str = intent.resources.input_mint.clone();
+        let sol_mint_str = if intent.resources.output_mint == "SIMFAIL6005" {
+            "So11111111111111111111111111111111111111112".to_string()
+        } else {
+            intent.resources.output_mint.clone()
+        };
+        let amount_in = intent.required_capital.raw;
+        let mint = match Pubkey::from_str(&mint_str) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(mint = %mint_str, error = %e, "6005-retry: invalid base_mint");
+                return None;
+            }
+        };
+
+        if let Some(ref cache) = self.live_pool_cache {
+            cache.mark_pumpfun_complete_for_mint(&mint);
+        }
+
+        let pump_amm_result = tokio::time::timeout(
+            Duration::from_secs(10),
+            pump_amm.quote_exact_in(&mint_str, &sol_mint_str, amount_in),
+        )
+        .await;
+
+        match pump_amm_result {
+            Ok(Ok(Some(ref q))) => {
+                let pool_id = match q.route.first() {
+                    Some(id) => id.clone(),
+                    None => {
+                        warn!(mint = %mint_str, "6005-retry: quote route empty");
+                        return None;
+                    }
+                };
+                let accounts = match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
+                    Ok(Some(a)) => a,
+                    Ok(None) => {
+                        warn!(mint = %mint_str, "6005-retry: pool_accounts cache miss");
+                        return None;
+                    }
+                    Err(e) => {
+                        warn!(mint = %mint_str, error = %e, "6005-retry: pool_accounts failed");
+                        return None;
+                    }
+                };
+                let acct_strings: Vec<String> = accounts.iter().map(|p| p.to_string()).collect();
+                let min_out = Self::apply_slippage_min_out(q.amount_out, max_slippage_bps);
+                let mut retry = intent.clone();
+                retry
+                    .metadata
+                    .insert("dex".to_string(), "pump_amm".to_string());
+                retry
+                    .metadata
+                    .insert("sell_routing".to_string(), "multi_pool".to_string());
+                retry
+                    .metadata
+                    .insert("6005_retry".to_string(), "true".to_string());
+                retry.resources.pools = vec![pool_id];
+                retry.resources.accounts = acct_strings;
+                retry.execution = Some(TradeExecutionConstraints {
+                    min_out: Some(ExplicitAmount::new(min_out, 9)),
+                });
+                Some(retry)
+            }
+            Ok(Ok(None)) => {
+                warn!(mint = %mint_str, "6005-retry: quote_exact_in returned None (cache miss or reserves)");
+                None
+            }
+            Ok(Err(e)) => {
+                warn!(mint = %mint_str, error = %e, "6005-retry: quote_exact_in failed");
+                None
+            }
+            Err(_) => {
+                warn!(mint = %mint_str, "6005-retry: quote_exact_in timeout");
+                None
+            }
+        }
+    }
+
     async fn run_liquidation_job(
         ctx: Arc<ExecutionContext>,
         max_slippage_bps: u32,
@@ -2525,108 +2612,20 @@ impl ExecutionContext {
             match process_intent(&ctx, intent.clone()).await {
                 Ok(()) => {}
                 Err(e) => {
+                    let mint_str = intent.resources.input_mint.clone();
                     let is_6005 = is_6005_bonding_curve_complete(&e);
                     let dex_pumpfun =
                         intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun");
 
                     if is_6005 && dex_pumpfun {
-                        // 6005-Retry: BondingCurveComplete → curve migrated to PumpSwap AMM
-                        let mint_str = intent.resources.input_mint.clone();
-                        let sol_mint_str = intent.resources.output_mint.clone();
-                        let amount_in = intent.required_capital.raw;
-                        let mint = match Pubkey::from_str(&mint_str) {
-                            Ok(m) => m,
-                            Err(_) => {
-                                warn!(mint = %mint_str, "6005-retry: invalid mint; skipping");
-                                continue;
-                            }
-                        };
-
-                        // Mark curve complete so future attempts skip pumpfun for this mint
-                        if let Some(ref cache) = ctx.live_pool_cache {
-                            cache.mark_pumpfun_complete_for_mint(&mint);
-                        }
-
                         info!(
                             mint = %mint_str,
-                            amount_in,
                             "6005-retry: BondingCurveComplete detected; retrying with PumpSwap AMM"
                         );
-
-                        // Get fresh pump_amm quote
-                        let pump_amm_result = tokio::time::timeout(
-                            Duration::from_secs(10),
-                            pump_amm.quote_exact_in(&mint_str, &sol_mint_str, amount_in),
-                        )
-                        .await;
-
-                        let retry_intent = match pump_amm_result {
-                            Ok(Ok(Some(ref q))) => {
-                                let pool_id = match q.route.first() {
-                                    Some(id) => id.clone(),
-                                    None => {
-                                        warn!(mint = %mint_str, "6005-retry: no pool in pump_amm route");
-                                        continue;
-                                    }
-                                };
-                                match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
-                                    Ok(Some(accounts)) => {
-                                        let acct_strings: Vec<String> =
-                                            accounts.iter().map(|p| p.to_string()).collect();
-                                        let min_out = Self::apply_slippage_min_out(
-                                            q.amount_out,
-                                            max_slippage_bps,
-                                        );
-                                        let mut retry = intent;
-                                        retry
-                                            .metadata
-                                            .insert("dex".to_string(), "pump_amm".to_string());
-                                        retry.metadata.insert(
-                                            "sell_routing".to_string(),
-                                            "multi_pool".to_string(),
-                                        );
-                                        retry
-                                            .metadata
-                                            .insert("6005_retry".to_string(), "true".to_string());
-                                        retry.resources.pools = vec![pool_id];
-                                        retry.resources.accounts = acct_strings;
-                                        retry.execution = Some(TradeExecutionConstraints {
-                                            min_out: Some(ExplicitAmount::new(min_out, 9)),
-                                        });
-                                        Some(retry)
-                                    }
-                                    Ok(None) => {
-                                        warn!(
-                                            mint = %mint_str,
-                                            "6005-retry: pump_amm quote ok but pool accounts not found"
-                                        );
-                                        None
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            mint = %mint_str,
-                                            error = %e,
-                                            "6005-retry: pump_amm pool account discovery failed"
-                                        );
-                                        None
-                                    }
-                                }
-                            }
-                            Ok(Ok(None)) => {
-                                warn!(mint = %mint_str, "6005-retry: pump_amm returned no quote");
-                                None
-                            }
-                            Ok(Err(e)) => {
-                                warn!(mint = %mint_str, error = %e, "6005-retry: pump_amm quote error");
-                                None
-                            }
-                            Err(_) => {
-                                warn!(mint = %mint_str, "6005-retry: pump_amm quote timeout");
-                                None
-                            }
-                        };
-
-                        if let Some(retry) = retry_intent {
+                        if let Some(retry) = ctx
+                            .try_6005_pumpfun_retry(&intent, &pump_amm, max_slippage_bps)
+                            .await
+                        {
                             if let Err(retry_e) = process_intent(&ctx, retry).await {
                                 warn!(
                                     mint = %mint_str,
@@ -5952,8 +5951,25 @@ fn load_intents_from_jsonl(path: &Path) -> Vec<TradeIntent> {
         .collect()
 }
 
-/// Build minimal ExecutionContext for Golden Replay (no NATS, no RPC, no TX send)
-async fn build_replay_context(output_path: &Path) -> Result<ExecutionContext> {
+/// Fixture-Daten für 6005-Retry Replay
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Liquidation6005Fixture {
+    base_mint: String,
+    pool_market: String,
+    quote_mint: String,
+    pool_accounts: Vec<String>,
+    /// Token-Balance (raw) für base_mint, damit sell_token_balance-Check besteht.
+    /// Muss >= required_capital.raw des Intent sein.
+    #[serde(default)]
+    initial_token_balance: Option<u64>,
+}
+
+/// Build minimal ExecutionContext for Golden Replay (no NATS, no RPC, no TX send).
+/// Wenn `fixture` gesetzt: LivePoolCache mit PumpAmmState vorbelegen (6005-Retry-Test).
+async fn build_replay_context(
+    output_path: &Path,
+    fixture: Option<Liquidation6005Fixture>,
+) -> Result<ExecutionContext> {
     let run_id = Uuid::new_v4().to_string();
     let exec_config = ExecutionConfig {
         send_enabled: false,
@@ -5992,6 +6008,40 @@ async fn build_replay_context(output_path: &Path) -> Result<ExecutionContext> {
 
     let lock_manager = LockManager::new(1_000_000_000); // 1 SOL for replay
 
+    let live_pool_cache = if let Some(ref f) = fixture {
+        let base_mint = Pubkey::from_str(&f.base_mint).unwrap_or_else(|_| Pubkey::new_unique());
+        let quote_mint = Pubkey::from_str(&f.quote_mint).unwrap_or_else(|_| Pubkey::new_unique());
+        let pool_market = Pubkey::from_str(&f.pool_market).unwrap_or_else(|_| Pubkey::new_unique());
+        let pool_accounts: Vec<Pubkey> = f
+            .pool_accounts
+            .iter()
+            .filter_map(|s| Pubkey::from_str(s).ok())
+            .collect();
+        let (pool_base_token_account, pool_quote_token_account) = if pool_accounts.len() >= 6 {
+            (pool_accounts[4], pool_accounts[5])
+        } else {
+            (Pubkey::new_unique(), Pubkey::new_unique())
+        };
+        let state = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint,
+            quote_mint,
+            pool_base_token_account,
+            pool_quote_token_account,
+            base_reserve: Some(1_000_000_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: pool_accounts.clone(),
+            creator: None,
+        });
+        let cache = LivePoolCache::new();
+        cache.upsert(pool_market, state, 0);
+        if let Some(balance) = f.initial_token_balance {
+            lock_manager.set_available_token_balance(f.base_mint.clone(), balance);
+        }
+        Some(Arc::new(cache))
+    } else {
+        None
+    };
+
     let ctx = ExecutionContext {
         run_id: run_id.clone(),
         rpc_url: "replay".to_string(),
@@ -6024,7 +6074,7 @@ async fn build_replay_context(output_path: &Path) -> Result<ExecutionContext> {
         tx_sender: None,
         dynamic_fee_percentiles: parking_lot::RwLock::new(None),
         cached_blockhash: parking_lot::RwLock::new(None),
-        live_pool_cache: None,
+        live_pool_cache,
         intent_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         wsol_balance_tx: None,
         tx_confirm: Arc::new(ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::new(
@@ -6042,6 +6092,14 @@ async fn build_replay_context(output_path: &Path) -> Result<ExecutionContext> {
     Ok(ctx)
 }
 
+/// Prüft ob Intents den 6005-Retry-Flow benötigen (SIMFAIL6005 + dex=pumpfun)
+fn needs_6005_fixture(intents: &[TradeIntent]) -> bool {
+    intents.iter().any(|i| {
+        i.resources.output_mint == "SIMFAIL6005"
+            && i.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun")
+    })
+}
+
 /// Run Golden Replay: process intents from JSONL, write decisions to JSONL
 async fn run_golden_replay(intents_path: &Path, output_path: &Path) {
     let intents = load_intents_from_jsonl(intents_path);
@@ -6052,7 +6110,37 @@ async fn run_golden_replay(intents_path: &Path, output_path: &Path) {
         "Golden Replay: starting"
     );
 
-    let ctx = match build_replay_context(output_path).await {
+    let fixture = if needs_6005_fixture(&intents) {
+        let fixture_path = intents_path
+            .to_string_lossy()
+            .replace("_intents.jsonl", "_fixture.json");
+        let fixture_path = Path::new(&fixture_path);
+        if fixture_path.exists() {
+            match std::fs::read_to_string(fixture_path) {
+                Ok(s) => match serde_json::from_str::<Liquidation6005Fixture>(&s) {
+                    Ok(f) => {
+                        info!(path = %fixture_path.display(), "Loaded 6005 fixture");
+                        Some(f)
+                    }
+                    Err(e) => {
+                        warn!(path = %fixture_path.display(), error = %e, "Failed to parse 6005 fixture");
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!(path = %fixture_path.display(), error = %e, "Failed to read 6005 fixture");
+                    None
+                }
+            }
+        } else {
+            warn!(path = %fixture_path.display(), "6005 fixture file not found");
+            None
+        }
+    } else {
+        None
+    };
+
+    let ctx = match build_replay_context(output_path, fixture).await {
         Ok(c) => c,
         Err(e) => {
             error!(error = %e, "Failed to build replay context");
@@ -6060,11 +6148,39 @@ async fn run_golden_replay(intents_path: &Path, output_path: &Path) {
         }
     };
 
+    let max_slippage_bps = 500u32;
     let mut decision_counter: u64 = 0;
     for intent in intents {
         decision_counter += 1;
-        if let Err(e) = process_intent(&ctx, intent).await {
-            warn!(error = %e, "Replay process_intent failed");
+        let result = process_intent(&ctx, intent.clone()).await;
+        if let Err(e) = result {
+            let is_6005 = is_6005_bonding_curve_complete(&e);
+            let dex_pumpfun = intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun");
+            if is_6005 && dex_pumpfun {
+                if let Some(ref cache) = ctx.live_pool_cache {
+                    let pump_amm = PumpFunAmmDex::new_with_cache(
+                        Arc::clone(&ctx.rpc),
+                        Arc::clone(cache),
+                        true,
+                    );
+                    if let Some(retry) = ctx
+                        .try_6005_pumpfun_retry(&intent, &pump_amm, max_slippage_bps)
+                        .await
+                    {
+                        if let Err(retry_e) = process_intent(&ctx, retry).await {
+                            warn!(
+                                mint = %intent.resources.input_mint,
+                                error = %retry_e,
+                                "6005-retry: PumpSwap AMM attempt also failed"
+                            );
+                        }
+                    }
+                } else {
+                    warn!(error = %e, "6005-retry: no live_pool_cache (fixture missing?)");
+                }
+            } else {
+                warn!(error = %e, "Replay process_intent failed");
+            }
         }
     }
 
@@ -6677,6 +6793,39 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             ctx.lock_manager.release_locks(&intent.intent_id);
             return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
         }
+    }
+
+    // Golden Replay: 6005 (BondingCurveComplete) simulieren → löst Err aus,
+    // damit Aufrufer Retry-Logik ausführen kann.
+    // Wichtig: SimFailed-Decision VOR return Err schreiben, damit find_replay_output_file
+    // mindestens eine Decision-Datei findet (auch wenn Retry scheitert).
+    if ctx.replay_mode
+        && intent.resources.output_mint == "SIMFAIL6005"
+        && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun")
+    {
+        checks.push(CheckResult {
+            check_name: "simulation".to_string(),
+            passed: false,
+            reason_code: Some(RejectReason::SimFailed.to_string()),
+            details: Some("Simulation failed: Custom(6005)".to_string()),
+        });
+        let sim_result = SimulationResult {
+            success: false,
+            error_code: Some("Simulation failed: Custom(6005)".into()),
+            logs_preview: None,
+            compute_units_consumed: None,
+        };
+        let _ = emit_sim_failed_decision(
+            ctx,
+            decision_id,
+            &intent,
+            checks,
+            "replay-simfail-6005".to_string(),
+            sim_result,
+        )
+        .await;
+        ctx.lock_manager.release_locks(&intent.intent_id);
+        return Err(anyhow::anyhow!("Simulation failed: Custom(6005)"));
     }
 
     // Golden Replay: Early exit for SIMFAIL intents (avoids TX build + simulate)
