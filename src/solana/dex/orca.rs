@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::orca_reserve_cache::{OrcaReserveCache, ReserveEntry};
@@ -68,6 +68,8 @@ pub struct Orca {
     live_pool_cache: Option<SharedLivePoolCache>,
     cache_hits: Arc<AtomicU64>,
     cache_misses: Arc<AtomicU64>,
+    /// When true (Hot Path): skip get_multiple_accounts tick validation to avoid RPC
+    skip_tick_array_rpc_validation: Arc<AtomicBool>,
 }
 
 impl Orca {
@@ -96,12 +98,20 @@ impl Orca {
             live_pool_cache,
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
+            skip_tick_array_rpc_validation: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Set the global user authority (signer) used for swaps.
     pub fn set_user_authority(&self, auth: Pubkey) {
         *self.user_authority.write().unwrap() = Some(auth);
+    }
+
+    /// When true (Hot Path): skip tick array RPC validation to avoid get_multiple_accounts.
+    /// Cold Path (Liquidation) keeps validation for safety.
+    pub fn set_skip_tick_array_rpc_validation(&self, skip: bool) {
+        self.skip_tick_array_rpc_validation
+            .store(skip, Ordering::Relaxed);
     }
 
     /// Inject cached Orca Whirlpool state from LivePoolCache.
@@ -1366,33 +1376,36 @@ impl Dex for Orca {
         );
 
         // Validate tick arrays exist to avoid InvalidTickArraySequence (6023)
-        match self
-            .rpc
-            .rpc
-            .get_multiple_accounts(&[tick_array_0, tick_array_1, tick_array_2])
-            .await
-        {
-            Ok(accounts) => {
-                let missing: Vec<usize> = accounts
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, acct)| if acct.is_none() { Some(idx) } else { None })
-                    .collect();
-                if !missing.is_empty() {
+        // Hot Path: skip RPC to avoid get_multiple_accounts (I-4, I-7)
+        if !self.skip_tick_array_rpc_validation.load(Ordering::Relaxed) {
+            match self
+                .rpc
+                .rpc
+                .get_multiple_accounts(&[tick_array_0, tick_array_1, tick_array_2])
+                .await
+            {
+                Ok(accounts) => {
+                    let missing: Vec<usize> = accounts
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, acct)| if acct.is_none() { Some(idx) } else { None })
+                        .collect();
+                    if !missing.is_empty() {
+                        tracing::warn!(
+                            pool = %pool_id,
+                            missing = ?missing,
+                            "orca: missing tick array accounts (swap may fail)"
+                        );
+                        return Err(anyhow!("orca tick array accounts missing"));
+                    }
+                }
+                Err(e) => {
                     tracing::warn!(
                         pool = %pool_id,
-                        missing = ?missing,
-                        "orca: missing tick array accounts (swap may fail)"
+                        error = %e,
+                        "orca: failed to validate tick arrays (continuing)"
                     );
-                    return Err(anyhow!("orca tick array accounts missing"));
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    pool = %pool_id,
-                    error = %e,
-                    "orca: failed to validate tick arrays (continuing)"
-                );
             }
         }
 

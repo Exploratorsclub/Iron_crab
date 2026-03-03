@@ -256,7 +256,15 @@ pub async fn build_tx_plan(
                 hops = swap_path.len(),
                 "Building multi-hop tx plan"
             );
-            return build_multi_hop_tx_plan(intent, wallet_pubkey, rpc, cache, swap_path).await;
+            return build_multi_hop_tx_plan(
+                intent,
+                wallet_pubkey,
+                rpc,
+                cache,
+                swap_path,
+                allow_rpc_fallback,
+            )
+            .await;
         }
     }
 
@@ -415,6 +423,13 @@ pub async fn build_tx_plan(
                         }
                     }
                     _ => {
+                        if !allow_rpc_fallback {
+                            return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                                reason: RejectReason::UnsupportedIntent,
+                                details: "orca pool not in LivePoolCache (GEYSER-ONLY hot path)"
+                                    .to_string(),
+                            });
+                        }
                         warn!(pool = %pool_id, "orca: cache hit but wrong DEX type, falling back to RPC");
                         match fetch_orca_from_rpc(&rpc, &pool_id).await {
                             Ok(p) => p,
@@ -423,6 +438,13 @@ pub async fn build_tx_plan(
                     }
                 }
             } else {
+                if !allow_rpc_fallback {
+                    return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                        reason: RejectReason::UnsupportedIntent,
+                        details: "orca pool not in LivePoolCache (GEYSER-ONLY hot path)"
+                            .to_string(),
+                    });
+                }
                 warn!(pool = %pool_id, "orca: cache miss, falling back to RPC");
                 match fetch_orca_from_rpc(&rpc, &pool_id).await {
                     Ok(p) => p,
@@ -430,6 +452,12 @@ pub async fn build_tx_plan(
                 }
             }
         } else {
+            if !allow_rpc_fallback {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: "orca pool not in LivePoolCache (GEYSER-ONLY hot path)".to_string(),
+                });
+            }
             // No cache provided, use RPC directly
             match fetch_orca_from_rpc(&rpc, &pool_id).await {
                 Ok(p) => p,
@@ -439,6 +467,7 @@ pub async fn build_tx_plan(
 
         let orca = Orca::new_with_cache(Arc::clone(&rpc), None, cache.map(Arc::clone));
         orca.set_user_authority(wallet_pubkey);
+        orca.set_skip_tick_array_rpc_validation(!allow_rpc_fallback);
 
         // Register ATAs for both mints (Orca build_swap_ix requires these mappings).
         // Use token_program from intent for Token-2022 support.
@@ -612,6 +641,13 @@ pub async fn build_tx_plan(
 
         // FIX-29: Serum accounts are static — skip RPC if already in cache
         if !has_serum_from_cache {
+            if !allow_rpc_fallback {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: "raydium serum accounts not in LivePoolCache (GEYSER-ONLY hot path)"
+                        .to_string(),
+                });
+            }
             if let Err(e) = raydium.fetch_and_populate_serum_accounts(&pool_id).await {
                 return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                     reason: RejectReason::UnsupportedIntent,
@@ -903,6 +939,13 @@ pub async fn build_tx_plan(
             }
 
             if !used_cache {
+                if !allow_rpc_fallback {
+                    return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                        reason: RejectReason::UnsupportedIntent,
+                        details: "meteora pool not in LivePoolCache (GEYSER-ONLY hot path)"
+                            .to_string(),
+                    });
+                }
                 if let Err(e) = meteora.load_pool_by_address(&_pool_id).await {
                     return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
                         reason: RejectReason::UnsupportedIntent,
@@ -1213,6 +1256,7 @@ async fn build_multi_hop_tx_plan(
     rpc: Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
     swap_path: &[SwapHop],
+    allow_rpc_fallback: bool,
 ) -> TxPlanOutcome {
     // Validate: must start and end with SOL for arbitrage
     if swap_path.is_empty() {
@@ -1267,16 +1311,24 @@ async fn build_multi_hop_tx_plan(
             "Building hop instruction"
         );
 
-        let hop_ixs =
-            match build_hop_instructions(wallet_pubkey, hop, current_amount, &rpc, cache).await {
-                Ok(ixs) => ixs,
-                Err(e) => {
-                    return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
-                        reason: e.reason,
-                        details: format!("multi-hop: hop {} failed: {}", hop_idx, e.details),
-                    });
-                }
-            };
+        let hop_ixs = match build_hop_instructions(
+            wallet_pubkey,
+            hop,
+            current_amount,
+            &rpc,
+            cache,
+            allow_rpc_fallback,
+        )
+        .await
+        {
+            Ok(ixs) => ixs,
+            Err(e) => {
+                return TxPlanOutcome::Unsupported(UnsupportedTxPlan {
+                    reason: e.reason,
+                    details: format!("multi-hop: hop {} failed: {}", hop_idx, e.details),
+                });
+            }
+        };
 
         all_instructions.extend(hop_ixs);
 
@@ -1310,6 +1362,7 @@ async fn build_hop_instructions(
     amount_in: u64,
     rpc: &Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
+    allow_rpc_fallback: bool,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
     let dex = hop.dex.to_lowercase();
     let pool_address = match Pubkey::from_str(&hop.pool_address) {
@@ -1348,6 +1401,7 @@ async fn build_hop_instructions(
                 min_out,
                 rpc,
                 cache,
+                allow_rpc_fallback,
             )
             .await
         }
@@ -1370,6 +1424,7 @@ async fn build_hop_instructions(
                 min_out,
                 rpc,
                 cache,
+                allow_rpc_fallback,
             )
             .await
         }
@@ -1382,6 +1437,7 @@ async fn build_hop_instructions(
                 min_out,
                 rpc,
                 cache,
+                allow_rpc_fallback,
             )
             .await
         }
@@ -1488,6 +1544,7 @@ async fn build_hop_pump_amm(
     Ok(ixs)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_hop_raydium(
     wallet_pubkey: Pubkey,
     hop: &SwapHop,
@@ -1496,6 +1553,7 @@ async fn build_hop_raydium(
     min_out: u64,
     rpc: &Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
+    allow_rpc_fallback: bool,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
     let mut raydium = Raydium::new_with_live_cache(
         Arc::clone(rpc),
@@ -1546,6 +1604,15 @@ async fn build_hop_raydium(
 
     // FIX-29: Serum accounts are static — skip RPC if already in cache
     if !has_serum_from_cache {
+        if !allow_rpc_fallback {
+            return Err(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: format!(
+                    "raydium serum accounts for {} not in LivePoolCache (multi-hop GEYSER-ONLY)",
+                    pool_address
+                ),
+            });
+        }
         if let Err(e) = raydium
             .fetch_and_populate_serum_accounts(pool_address)
             .await
@@ -1574,6 +1641,7 @@ async fn build_hop_raydium(
     Ok(ixs)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_hop_orca(
     wallet_pubkey: Pubkey,
     hop: &SwapHop,
@@ -1582,42 +1650,47 @@ async fn build_hop_orca(
     min_out: u64,
     rpc: &Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
+    allow_rpc_fallback: bool,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
     let orca = Orca::new_with_cache(Arc::clone(rpc), None, cache.map(Arc::clone));
     orca.set_user_authority(wallet_pubkey);
 
     // Get pool state from cache or RPC
     let parsed = if let Some(cache) = cache {
-        if let Some(state) = cache.get(pool_address) {
-            match state {
-                CachedPoolState::Orca(orca_state) => {
-                    tracing::debug!(
-                        pool = %pool_address,
-                        "multi-hop orca: using cached pool state"
-                    );
-                    orca_whirlpool_layout::WhirlpoolParsed {
-                        token_mint_a: orca_state.token_mint_a,
-                        token_mint_b: orca_state.token_mint_b,
-                        token_vault_a: orca_state.token_vault_a,
-                        token_vault_b: orca_state.token_vault_b,
-                        tick_current_index: orca_state.tick_current_index,
-                        sqrt_price: orca_state.sqrt_price,
-                        liquidity: orca_state.liquidity,
-                        fee_rate: orca_state.fee_rate,
-                        protocol_fee_rate: orca_state.protocol_fee_rate,
-                        tick_spacing: orca_state.tick_spacing,
-                    }
-                }
-                _ => {
-                    // Cache hit but wrong type - fallback to RPC
-                    fetch_orca_from_rpc(rpc, pool_address).await?
-                }
+        if let Some(CachedPoolState::Orca(orca_state)) = cache.get(pool_address) {
+            tracing::debug!(
+                pool = %pool_address,
+                "multi-hop orca: using cached pool state"
+            );
+            orca_whirlpool_layout::WhirlpoolParsed {
+                token_mint_a: orca_state.token_mint_a,
+                token_mint_b: orca_state.token_mint_b,
+                token_vault_a: orca_state.token_vault_a,
+                token_vault_b: orca_state.token_vault_b,
+                tick_current_index: orca_state.tick_current_index,
+                sqrt_price: orca_state.sqrt_price,
+                liquidity: orca_state.liquidity,
+                fee_rate: orca_state.fee_rate,
+                protocol_fee_rate: orca_state.protocol_fee_rate,
+                tick_spacing: orca_state.tick_spacing,
             }
         } else {
-            // Cache miss - fallback to RPC
+            // Cache miss or wrong DEX type — fallback to RPC when allowed
+            if !allow_rpc_fallback {
+                return Err(UnsupportedTxPlan {
+                    reason: RejectReason::UnsupportedIntent,
+                    details: "orca pool not in LivePoolCache (multi-hop GEYSER-ONLY)".to_string(),
+                });
+            }
             fetch_orca_from_rpc(rpc, pool_address).await?
         }
     } else {
+        if !allow_rpc_fallback {
+            return Err(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: "orca pool not in LivePoolCache (multi-hop GEYSER-ONLY)".to_string(),
+            });
+        }
         fetch_orca_from_rpc(rpc, pool_address).await?
     };
 
@@ -1652,6 +1725,7 @@ async fn build_hop_orca(
     Ok(ixs)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_hop_meteora_dlmm(
     wallet_pubkey: Pubkey,
     hop: &SwapHop,
@@ -1660,11 +1734,12 @@ async fn build_hop_meteora_dlmm(
     min_out: u64,
     rpc: &Arc<SolanaRpc>,
     cache: Option<&SharedLivePoolCache>,
+    allow_rpc_fallback: bool,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
     let mut meteora = MeteoraDlmm::new_with_live_cache(
         Arc::clone(rpc),
         cache.map(Arc::clone),
-        false, // Multi-hop is Hot Path (arb) — no RPC on vault reserve miss
+        allow_rpc_fallback,
     );
     meteora.set_user_authority(wallet_pubkey);
 
@@ -1693,7 +1768,12 @@ async fn build_hop_meteora_dlmm(
 
     // If cache didn't help, load from RPC
     if !used_cache {
-        // Try to load pool state via single RPC getAccount call
+        if !allow_rpc_fallback {
+            return Err(UnsupportedTxPlan {
+                reason: RejectReason::UnsupportedIntent,
+                details: "meteora pool not in LivePoolCache (multi-hop GEYSER-ONLY)".to_string(),
+            });
+        }
         if let Err(e) = meteora.load_pool_by_address(pool_address).await {
             return Err(UnsupportedTxPlan {
                 reason: RejectReason::UnsupportedIntent,
