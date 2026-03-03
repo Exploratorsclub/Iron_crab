@@ -273,7 +273,8 @@ async fn main() -> anyhow::Result<()> {
     // Initialize DEX connectors (keyless) for route discovery only
     let raydium = Raydium::new(Arc::clone(&rpc));
     let pumpfun = PumpFunDex::new(Arc::clone(&rpc), None)?;
-    let pump_amm = PumpFunAmmDex::new_with_cache(Arc::clone(&rpc), live_pool_cache, true);
+    let pump_amm =
+        PumpFunAmmDex::new_with_cache(Arc::clone(&rpc), Arc::clone(&live_pool_cache), true);
 
     info!("Refreshing Raydium pools (for route discovery)...");
     raydium.refresh_pools().await?;
@@ -340,7 +341,9 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        let decimals = get_token_decimals_or_default(rpc.as_ref(), &mint, None).await;
+        let decimals =
+            get_token_decimals_or_default(rpc.as_ref(), &mint, Some(live_pool_cache.as_ref()))
+                .await;
 
         info!(mint = %mint, amount_raw = amount, decimals, ata = %ata, "Queuing liquidation");
         tasks.push(SellTask {

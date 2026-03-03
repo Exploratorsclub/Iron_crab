@@ -235,6 +235,27 @@ fn build_minimal_pool_state_with_reserves(
     Some((pool_addr, state))
 }
 
+/// P3 #13: Apply base_decimals and quote_decimals from PoolCacheUpdate metadata to LivePoolCache.
+fn apply_decimals_from_metadata(cache: &LivePoolCache, update: &PoolCacheUpdate) {
+    let meta = match update.metadata.as_ref() {
+        Some(m) if !m.is_empty() => m,
+        _ => return,
+    };
+    if let (Ok(base_mint), Some(d)) = (
+        Pubkey::from_str(&update.base_mint),
+        meta.get("base_decimals").and_then(|s| s.parse::<u8>().ok()),
+    ) {
+        cache.set_mint_decimals(base_mint, d);
+    }
+    if let (Ok(quote_mint), Some(d)) = (
+        Pubkey::from_str(&update.quote_mint),
+        meta.get("quote_decimals")
+            .and_then(|s| s.parse::<u8>().ok()),
+    ) {
+        cache.set_mint_decimals(quote_mint, d);
+    }
+}
+
 /// Apply a single PoolCacheUpdate to a LivePoolCache.
 ///
 /// For BalanceUpdated: merges partial updates (one vault at a time) with existing cache state.
@@ -247,6 +268,8 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
         PoolCacheUpdateType::PoolDiscovered => {
             if let Some((pool_addr, minimal_state)) = build_minimal_pool_state(update) {
                 cache.upsert(pool_addr, minimal_state, update.geyser_slot);
+                // P3 #13: Propagate base_decimals and quote_decimals to SLAVE cache
+                apply_decimals_from_metadata(cache, update);
                 return true;
             }
         }
@@ -295,6 +318,8 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                     }
                 }
                 cache.upsert(addr, minimal_state, update.geyser_slot);
+                // P3 #13: Apply decimals from metadata when present (e.g. BalanceUpdated with metadata)
+                apply_decimals_from_metadata(cache, update);
                 return true;
             }
         }

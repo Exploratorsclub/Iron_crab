@@ -1,6 +1,6 @@
 # IronCrab Architektur-Audit – Konsolidierte Fassung
 
-**Stand:** 2026-02-27 | **Quellen:** main (ARCHITECTURE_AUDIT_2026-02-07) + arch-audit-tsw (ARCHITECTURE_AUDIT_2026-02-23) | **Korrekturen 2026-02-21:** PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt | **2026-02-27:** P3 #11 Vault-Balances – allow_rpc_on_miss, Hot Path RPC-frei
+**Stand:** 2026-03-03 | **Quellen:** main (ARCHITECTURE_AUDIT_2026-02-07) + arch-audit-tsw (ARCHITECTURE_AUDIT_2026-02-23) | **Korrekturen 2026-02-21:** PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt | **2026-02-27:** P3 #11 Vault-Balances – allow_rpc_on_miss, Hot Path RPC-frei | **2026-03-03:** A.1 PumpSwap Geyser-First vollständig; RPC aus Hot Path (Orca/Raydium/Meteora/tx_builder) erledigt; Cherry-Pick-Liste abgeschlossen
 
 > Dieses Dokument ist die einzige aktuelle Architektur-Audit-Quelle. Enthält die **vollständige** Revert-Analyse, alle RPC-Matrix-Tabellen, DEX-Details, BUG-Beschreibungen, **CrossDexHandler PumpFun-Befund** (tsw) sowie SSOT- und Cherry-Pick-Empfehlungen.
 
@@ -76,9 +76,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 - Besseres Logging (`eprintln!` → `warn!()` mit structured fields)
 - `CrossDexHandler` nutzt `new_with_cache()` statt `new()`
 
-**Status (2026-02-23)**: ⚠️ `new_with_cache()` existiert wieder; CrossDexHandler und execution-engine nutzen es für pump_amm. Bei Cache-Miss erfolgt RPC-Fallback.
-
-**Bewertung**: Priorität 1 für vollständige Cherry-Pick (noch Rest-RPC bei Miss).
+**Status (2026-03-03)**: ✅ IMPLEMENTIERT — `new_with_cache(allow_rpc_on_miss)` vollständig. CrossDexHandler nutzt `false` (Hot Path: Cache-Miss → None, kein RPC). Liquidation/sell_all_keyless nutzen `true` (Cold Path: RPC-Fallback). LivePoolCache: get_pump_amm_reserves_by_base_mint, get_pump_amm_pool_accounts_by_base_mint, mark_pumpfun_complete_for_mint. Cherry-Pick abgeschlossen.
 
 ### A.2 — Momentum-Bot: Bonding-Curve Exit Config (MITTEL – sollte zurück)
 
@@ -406,7 +404,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 ### 4.3 Invarianten-Checkliste (INVARIANTS.md)
 
-- [ ] Kein RPC im Hot Path? → ⚠️ PumpSwap P3#12 erledigt (allow_rpc_on_miss); Rest: Tick-Arrays, Serum
+- [x] Kein RPC im Hot Path? → ✅ Erledigt (P3 #11, #12; RPC aus Hot Path Plan: Orca/Raydium/Meteora/tx_builder Guards, Orca skip_tick_array_rpc_validation)
 - [x] Pool-Matching bei Preis-Updates? → ✅ Ja
 - [x] tokens_per_sol-Konvention? → ✅ Ja
 - [x] Simulation vor jedem Send? → ✅ Ja
@@ -477,20 +475,20 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 | Modul | Anzahl Hot Path | Schweregrad |
 |-------|-----------------|-------------|
 | pumpfun.rs | 0 | — (nur Cold Path: Liquidation, Manual Burn, sell_all) |
-| pumpfun_amm.rs | 6+ | KRITISCH |
-| orca.rs | 2 | KRITISCH (Vaults ok; Tick-Arrays offen) |
-| raydium.rs | 1 | KRITISCH (Vaults erledigt P3#11; Serum-Market offen) |
+| pumpfun_amm.rs | 0 | — (P3 #12: allow_rpc_on_miss=false im Hot Path; Cache-Miss → None) |
+| orca.rs | 0 | — (skip_tick_array_rpc_validation; allow_rpc_fallback-Guards in tx_builder) |
+| raydium.rs | 0 | — (P3 #11 Vaults; allow_rpc_fallback-Guards für Serum in tx_builder) |
 | raydium_cpmm.rs | 0 | — (Vaults erledigt P3#11) |
-| meteora_dlmm.rs | 1 | KRITISCH (Vaults erledigt P3#11; Pool-Fetch offen) |
-| tx_builder.rs | 4 | KRITISCH (Fallbacks) |
-| cross_dex_handler.rs | 0 | — (PumpFun aus Arb entfernt) |
-| **TOTAL** | **14+** | — (Vault-Balances Raydium/CPMM/Meteora P3#11 erledigt) |
+| meteora_dlmm.rs | 0 | — (P3 #11; allow_rpc_fallback-Guards in tx_builder) |
+| tx_builder.rs | 0 | — (allow_rpc_fallback durchgereicht; Orca/Meteora/Raydium/Multi-Hop Guards) |
+| cross_dex_handler.rs | 0 | — (PumpFun aus Arb entfernt; PumpAmm allow_rpc_on_miss=false) |
+| **TOTAL** | **0** | — (Hot Path RPC-frei; Cold Path RPC-Fallback erhalten) |
 
 ### Geschätzte Latenz-Auswirkung
 
 Typischer **Momentum-Buy** (PumpFun BC):
 1. Quote → `quote_calculator` aus LivePoolCache (kein RPC im Hot Path)
-2. PumpSwap AMM Quote = +500–3000ms RPC bei Cache-Miss (sollte: 0ms mit LivePoolCache)
+2. PumpSwap AMM Quote → LivePoolCache (allow_rpc_on_miss=false); Cache-Miss = None (kein RPC)
 3. TX-Build → Creator aus Intent-Metadata (tx_builder verlangt ihn); kein PumpFun-RPC
 4. Simulation = +100–500ms (unvermeidlich)
 5. TX-Send = +50–400ms (unvermeidlich)
@@ -499,9 +497,9 @@ Typischer **Momentum-Buy** (PumpFun BC):
 
 | Metrik | Wert |
 |--------|------|
-| **Aktuelle Gesamtlatenz** | ~1500–8000ms |
+| **Aktuelle Gesamtlatenz** | ~200–900ms (Hot Path RPC-frei) |
 | **Optimierte Latenz (nur Sim+Send)** | ~200–900ms |
-| **Potenzial** | 3–8× schneller |
+| **Status** | Hot Path RPC-Eliminierung abgeschlossen |
 
 ---
 
@@ -519,6 +517,8 @@ Typischer **Momentum-Buy** (PumpFun BC):
 | Raydium RPC-Retries | 20 × 500ms | 3 × 300ms (korrigiert) |
 | PumpSwap quote_mint hardcode | BUG H | Bestätigt, PumpSwap typischerweise SOL |
 | Arbitrage get_balance | VERSTOSS | ✅ Erledigt – solana::execution entfernt (Dead-Code) |
+| **PumpSwap AMM Geyser-First** | A.1 RPC bei Miss | **ERLEDIGT 2026-03-03:** allow_rpc_on_miss; Hot Path Cache-Miss → None |
+| **Orca/Raydium/Meteora/tx_builder** | Tick-Arrays, Serum, Fallbacks | **ERLEDIGT 2026-03-03:** allow_rpc_fallback-Guards, Orca skip_tick_array_rpc_validation |
 
 ---
 
@@ -550,16 +550,16 @@ Typischer **Momentum-Buy** (PumpFun BC):
 | ~~10~~ | ~~Raydium `load_pool_from_rpc_fallback()`~~ | ✅ ERLEDIGT – Kein RPC im Hot Path. Hot Path lehnt bei Cache-Miss ab. RPC nur im Cold Path (Liquidation) – erlaubt. |
 | ~~11~~ | ~~Orca/Raydium/Meteora Vault-Balances~~ | ✅ ERLEDIGT (2026-02-27) – `allow_rpc_on_miss` in Raydium, RaydiumCpmm, MeteoraDlmm. Hot Path: Cache-Miss = Err. Cold Path: RPC-Fallback. Orca Vaults bereits frei; Tick-Arrays separat. |
 | ~~12~~ | ~~pumpfun_amm eigene RPC-Infrastruktur~~ | ✅ ERLEDIGT (2026-02-28): allow_rpc_on_miss, Cold Path dokumentiert |
-| 13 | Token-Decimals (token_utils) | Globalen Decimals-Cache aus Geyser-Mint-Info |
-| 14 | A.2, A.3 | Creator-Handling, WSOL-Seeding zurückholen |
+| ~~13~~ | ~~Token-Decimals (token_utils)~~ | ✅ ERLEDIGT (2026-03-03): base_decimals und quote_decimals über PoolCacheUpdate; Cold Path RPC nur bei Cache-Miss; Arbitrage future-proof für non-SOL-Pools |
+| ~~14~~ | ~~A.2, A.3~~ | ✅ Bereits implementiert (A.2 Bonding-Curve Exit, A.3 Market-Data) |
 
 ### Cherry-Pick aus Revert (Priorität 1–2)
 
 | # | Quelle | Beschreibung | Risiko |
 |---|--------|-------------|--------|
-| 1 | pumpfun_amm.rs, live_pool_cache.rs, cross_dex_handler.rs | PumpSwap AMM Geyser-First (vollständig) | Niedrig |
-| 2 | pumpfun.rs | SELL migriert – bereits implementiert | — |
-| 3 | execution_engine.rs | emit_sim_failed_decision() → Err für 6005-Retry | Niedrig |
+| ~~1~~ | ~~pumpfun_amm.rs, live_pool_cache.rs, cross_dex_handler.rs~~ | ✅ PumpSwap AMM Geyser-First (allow_rpc_on_miss, Cache-First) – erledigt | — |
+| ~~2~~ | ~~pumpfun.rs~~ | ✅ SELL migriert – bereits implementiert | — |
+| ~~3~~ | ~~execution_engine.rs~~ | ✅ 6005-Retry: SimFailed-Decision + return Err für Retry-Logik – erledigt | — |
 
 ---
 
@@ -580,7 +580,7 @@ Dokumentiert in `.cursor/rules/ironcrab-core.mdc`:
 
 | Kategorie | Status |
 |-----------|--------|
-| A.1 PumpSwap Geyser-First | ⚠️ new_with_cache vorhanden, RPC bei Miss |
+| A.1 PumpSwap Geyser-First | ✅ Implementiert (allow_rpc_on_miss, Cache-First; Hot Path RPC-frei) |
 | A.2 Bonding-Curve Exit | ✅ Implementiert |
 | A.3 Market-Data Wallet-Tracking | ✅ Implementiert |
 | A.4 Liquidation (6005-Retry, SELL-Metadata) | ✅ Implementiert |
@@ -599,4 +599,4 @@ Dokumentiert in `.cursor/rules/ironcrab-core.mdc`:
 
 ---
 
-*Konsolidiert: 2026-02-23. Korrekturen 2026-02-21: PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt. 2026-02-27: P3 #11 Vault-Balances – allow_rpc_on_miss implementiert. 2026-02-28: P3 #12 PumpSwap allow_rpc_on_miss, Cold Path dokumentiert.*
+*Konsolidiert: 2026-02-23. Korrekturen 2026-02-21: PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt. 2026-02-27: P3 #11 Vault-Balances – allow_rpc_on_miss implementiert. 2026-02-28: P3 #12 PumpSwap allow_rpc_on_miss, Cold Path dokumentiert. 2026-03-03: A.1 PumpSwap Geyser-First vollständig; RPC aus Hot Path (Orca/Raydium/Meteora/tx_builder) erledigt; Cherry-Pick-Liste abgeschlossen; P3 #13 Token-Decimals über PoolCacheUpdate (base_decimals, quote_decimals).*

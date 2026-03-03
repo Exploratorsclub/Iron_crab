@@ -2716,6 +2716,29 @@ async fn run_geyser_loop(
                             }
                             _ => {}
                         }
+                        // P3 #13: Propagate base_decimals and quote_decimals to SLAVE caches (all DEX types)
+                        {
+                            let mut meta = pool_update.metadata.as_ref().cloned().unwrap_or_default();
+                            if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&base_mint) {
+                                meta.insert("base_decimals".to_string(), d.to_string());
+                            }
+                            // For quote: use quote_mint, or when default (PumpFun) use SOL
+                            let quote_for_decimals = if quote_mint == Pubkey::default() {
+                                Pubkey::from_str(NATIVE_SOL_MINT).ok()
+                            } else {
+                                Some(quote_mint)
+                            };
+                            if let Some(q) = quote_for_decimals {
+                                if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&q) {
+                                    meta.insert("quote_decimals".to_string(), d.to_string());
+                                } else if q == Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default() {
+                                    meta.insert("quote_decimals".to_string(), "9".to_string());
+                                }
+                            }
+                            if !meta.is_empty() {
+                                pool_update.metadata = Some(meta);
+                            }
+                        }
                         let subject = pool_subject(&account_update.pubkey.to_string());
                         if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
                             warn!(error = %e, "Failed to publish PoolCacheUpdate to JetStream");
@@ -2864,6 +2887,17 @@ async fn run_geyser_loop(
                         meta.insert("complete".to_string(), complete.to_string());
                         meta.insert("real_token_reserves".to_string(), real_token_reserves.to_string());
                         meta.insert("real_sol_reserves".to_string(), real_sol_reserves.to_string());
+                        // P3 #13: base_decimals and quote_decimals (PumpFun quote = SOL)
+                        if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&base_mint_pk) {
+                            meta.insert("base_decimals".to_string(), d.to_string());
+                        }
+                        if let Ok(sol_pk) = Pubkey::from_str(NATIVE_SOL_MINT) {
+                            if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&sol_pk) {
+                                meta.insert("quote_decimals".to_string(), d.to_string());
+                            } else {
+                                meta.insert("quote_decimals".to_string(), "9".to_string());
+                            }
+                        }
                         pool_update.metadata = Some(meta);
 
                         if let Some(ref nats) = ctx.nats {
