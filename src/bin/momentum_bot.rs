@@ -38,6 +38,7 @@ use ironcrab::config::MomentumCfg;
 use ironcrab::execution::live_pool_cache::LivePoolCache;
 use ironcrab::execution::pool_cache_sync;
 use ironcrab::execution::quote_calculator;
+use ironcrab::execution::tokens_per_sol;
 use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExecutionResult, ExecutionStatus,
     ExplicitAmount, IntentOrigin, IntentTier, MarketEvent, MarketEventKind,
@@ -656,9 +657,7 @@ impl PositionTracker {
     /// So ATH (highest_price) tracks the LOWEST tps seen (best SOL value per token).
     fn update_price(&mut self, new_price: f64) {
         self.current_price = new_price;
-        if new_price < self.highest_price {
-            self.highest_price = new_price;
-        }
+        self.highest_price = tokens_per_sol::updated_highest_price(self.highest_price, new_price);
     }
 
     fn add_investment(&mut self, additional_sol: u64) {
@@ -677,7 +676,8 @@ impl PositionTracker {
         self.sol_invested = self.sol_invested.saturating_add(additional_sol);
         self.entry_price = new_entry;
         // ATH = lowest tps (best price for holder)
-        self.highest_price = self.highest_price.min(self.current_price);
+        self.highest_price =
+            tokens_per_sol::updated_highest_price(self.highest_price, self.current_price);
     }
 
     /// Record a trade for momentum tracking
@@ -696,10 +696,7 @@ impl PositionTracker {
     ///   - Token gets cheaper (current_tps UP): negative PnL (loss)
     ///   - Token gets more expensive (current_tps DOWN): positive PnL (gain)
     fn pnl_pct(&self) -> f64 {
-        if self.entry_price <= 0.0 || self.current_price <= 0.0 {
-            return 0.0;
-        }
-        ((self.entry_price / self.current_price) - 1.0) * 100.0
+        tokens_per_sol::pnl_pct(self.entry_price, self.current_price)
     }
 
     /// Calculate drawdown from ATH (best price) percentage.
@@ -707,11 +704,7 @@ impl PositionTracker {
     /// Drawdown = how much worse current price is vs ATH.
     /// Positive = loss from ATH, zero = at ATH.
     fn drawdown_from_ath_pct(&self) -> f64 {
-        if self.highest_price <= 0.0 || self.current_price <= 0.0 {
-            return 0.0;
-        }
-        // current_tps > highest_tps means token got cheaper (worse) → positive drawdown
-        ((self.current_price / self.highest_price) - 1.0) * 100.0
+        tokens_per_sol::drawdown_from_ath_pct(self.highest_price, self.current_price)
     }
 
     /// Check if we should exit this position

@@ -5,5 +5,6 @@ pub mod live_pool_cache;
 pub mod pool_cache_sync;
 pub mod position_utils;
 pub mod quote_calculator;
+pub mod tokens_per_sol;
 pub mod tx_builder;
 pub mod wsol_manager;
