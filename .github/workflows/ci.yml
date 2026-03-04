@@ -71,6 +71,9 @@ jobs:
   eval:
     name: Eval (Level 5)
     needs: [build-test]
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release'))) ||
+      (github.event_name == 'pull_request' && github.base_ref == 'main' && github.repository == github.event.pull_request.head.repo.full_name)
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: 0
@@ -103,12 +106,12 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            Iron_crab-eval/target
-          key: ${{ runner.os }}-cargo-eval-${{ hashFiles('**/Iron_crab-eval/Cargo.lock') }}
+            ${{ github.workspace }}/Iron_crab-eval/target
+          key: ${{ runner.os }}-cargo-eval-${{ hashFiles('Iron_crab-eval/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-eval-
 
       - name: Eval tests
-        working-directory: Iron_crab-eval
+        working-directory: ${{ github.workspace }}/Iron_crab-eval
         run: cargo test --quiet
 
   python-backend:
