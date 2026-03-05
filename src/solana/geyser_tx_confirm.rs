@@ -122,7 +122,15 @@ impl GeyserTxConfirm {
     /// Spawns two background tasks:
     /// 1. ATA watcher: subscribes to specific ATA account updates
     /// 2. TX watcher: subscribes to `transactions_status` filtered by `wallet_pubkey`
-    pub fn with_geyser(timeout_secs: u64, geyser_url: String, wallet_pubkey: Pubkey) -> Self {
+    ///
+    /// `confirm_commitment`: "finalized" (INVARIANTS D.2, safe) or "confirmed" (faster, reorg risk).
+    /// Geyser uses startup value; hot-reload does not affect subscription.
+    pub fn with_geyser(
+        timeout_secs: u64,
+        geyser_url: String,
+        wallet_pubkey: Pubkey,
+        confirm_commitment: &str,
+    ) -> Self {
         let (watcher_tx, watcher_rx) = mpsc::channel(100);
         let (tx_watcher_tx, tx_watcher_rx) = mpsc::channel(256);
 
@@ -135,12 +143,14 @@ impl GeyserTxConfirm {
         let watched_atas_clone = watched_atas.clone();
         let geyser_url_clone = geyser_url.clone();
 
+        let confirm_commitment = confirm_commitment.to_string();
         tokio::spawn(async move {
             Self::run_ata_watcher(
                 geyser_url_clone,
                 watcher_rx,
                 pending_atas_clone,
                 watched_atas_clone,
+                &confirm_commitment,
             )
             .await;
         });
@@ -149,12 +159,14 @@ impl GeyserTxConfirm {
         let pending_txs_clone = pending_txs.clone();
         let geyser_url_clone2 = geyser_url.clone();
 
+        let confirm_commitment = confirm_commitment.to_string();
         tokio::spawn(async move {
             Self::run_tx_watcher(
                 geyser_url_clone2,
                 tx_watcher_rx,
                 pending_txs_clone,
                 wallet_pubkey,
+                &confirm_commitment,
             )
             .await;
         });
@@ -181,6 +193,7 @@ impl GeyserTxConfirm {
         mut cmd_rx: mpsc::Receiver<WatcherCommand>,
         pending_atas: Arc<RwLock<HashMap<Pubkey, PendingAtaBalance>>>,
         watched_atas: Arc<RwLock<HashSet<Pubkey>>>,
+        confirm_commitment: &str,
     ) {
         info!("geyser_tx_confirm: ATA watcher starting");
 
@@ -219,6 +232,7 @@ impl GeyserTxConfirm {
                 &mut cmd_rx,
                 &pending_atas,
                 &watched_atas,
+                confirm_commitment,
             )
             .await;
 
@@ -229,9 +243,21 @@ impl GeyserTxConfirm {
         }
     }
 
+    /// Map confirm_commitment string to Geyser CommitmentLevel.
+    fn commitment_from_str(s: &str) -> i32 {
+        if s.eq_ignore_ascii_case("finalized") {
+            CommitmentLevel::Finalized as i32
+        } else {
+            CommitmentLevel::Confirmed as i32
+        }
+    }
+
     /// Build a SubscribeRequest for TX status confirmation.
     /// Filters by wallet pubkey so we only receive our own transactions.
-    fn build_tx_status_subscribe_request(wallet_pubkey: &Pubkey) -> SubscribeRequest {
+    fn build_tx_status_subscribe_request(
+        wallet_pubkey: &Pubkey,
+        confirm_commitment: &str,
+    ) -> SubscribeRequest {
         let mut tx_status_filter = HashMap::new();
         tx_status_filter.insert(
             "tx_confirm".to_string(),
@@ -253,7 +279,7 @@ impl GeyserTxConfirm {
             blocks: HashMap::new(),
             blocks_meta: HashMap::new(),
             entry: HashMap::new(),
-            commitment: Some(CommitmentLevel::Confirmed as i32),
+            commitment: Some(Self::commitment_from_str(confirm_commitment)),
             accounts_data_slice: vec![],
             ping: None,
             from_slot: None,
@@ -267,6 +293,7 @@ impl GeyserTxConfirm {
         mut cmd_rx: mpsc::Receiver<WatcherCommand>,
         pending_txs: Arc<RwLock<HashMap<String, PendingTx>>>,
         wallet_pubkey: Pubkey,
+        confirm_commitment: &str,
     ) {
         info!(wallet=%wallet_pubkey, "geyser_tx_confirm: TX watcher starting");
         let timeout = std::time::Duration::from_secs(30);
@@ -291,7 +318,8 @@ impl GeyserTxConfirm {
                 }
             };
 
-            let request = Self::build_tx_status_subscribe_request(&wallet_pubkey);
+            let request =
+                Self::build_tx_status_subscribe_request(&wallet_pubkey, confirm_commitment);
 
             let (_, mut stream) = match client.subscribe_with_request(Some(request)).await {
                 Ok(pair) => pair,
@@ -436,7 +464,7 @@ impl GeyserTxConfirm {
 
     /// Build a SubscribeRequest for the given ATA list.
     /// Extracted so it can be reused for initial subscription and incremental updates.
-    fn build_ata_subscribe_request(atas: &[Pubkey]) -> SubscribeRequest {
+    fn build_ata_subscribe_request(atas: &[Pubkey], confirm_commitment: &str) -> SubscribeRequest {
         let mut accounts_filter = HashMap::new();
         accounts_filter.insert(
             "ata_watch".to_string(),
@@ -456,7 +484,7 @@ impl GeyserTxConfirm {
             blocks: HashMap::new(),
             blocks_meta: HashMap::new(),
             entry: HashMap::new(),
-            commitment: Some(CommitmentLevel::Confirmed as i32),
+            commitment: Some(Self::commitment_from_str(confirm_commitment)),
             accounts_data_slice: vec![],
             ping: None,
             from_slot: None,
@@ -470,6 +498,7 @@ impl GeyserTxConfirm {
         cmd_rx: &mut mpsc::Receiver<WatcherCommand>,
         pending_atas: &Arc<RwLock<HashMap<Pubkey, PendingAtaBalance>>>,
         watched_atas: &Arc<RwLock<HashSet<Pubkey>>>,
+        confirm_commitment: &str,
     ) -> anyhow::Result<()> {
         // Connect to Geyser
         let mut client = GeyserGrpcClient::build_from_shared(geyser_url.to_string())
@@ -478,7 +507,7 @@ impl GeyserTxConfirm {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to Geyser: {}", e))?;
 
-        let request = Self::build_ata_subscribe_request(atas);
+        let request = Self::build_ata_subscribe_request(atas, confirm_commitment);
 
         // Subscribe with bidirectional channel: Sink for updates, Stream for data
         let (mut subscribe_tx, mut stream) = client
@@ -501,7 +530,8 @@ impl GeyserTxConfirm {
                             watched_atas.write().insert(ata);
                             // Send updated subscription via Sink (NO reconnect!)
                             let current_atas: Vec<Pubkey> = watched_atas.read().iter().copied().collect();
-                            let updated_request = Self::build_ata_subscribe_request(&current_atas);
+                            let updated_request =
+                                Self::build_ata_subscribe_request(&current_atas, confirm_commitment);
                             if let Err(e) = subscribe_tx.send(updated_request).await {
                                 warn!("geyser_tx_confirm: failed to send subscription update: {e}, reconnecting");
                                 return Ok(()); // Fallback: reconnect
@@ -515,7 +545,8 @@ impl GeyserTxConfirm {
                             watched_atas.write().remove(&ata);
                             // Send updated subscription via Sink
                             let current_atas: Vec<Pubkey> = watched_atas.read().iter().copied().collect();
-                            let updated_request = Self::build_ata_subscribe_request(&current_atas);
+                            let updated_request =
+                                Self::build_ata_subscribe_request(&current_atas, confirm_commitment);
                             if let Err(e) = subscribe_tx.send(updated_request).await {
                                 warn!("geyser_tx_confirm: failed to send subscription update on unwatch: {e}, reconnecting");
                                 return Ok(());

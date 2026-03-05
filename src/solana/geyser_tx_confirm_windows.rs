@@ -45,7 +45,12 @@ impl GeyserTxConfirm {
     /// Create new tracker with Geyser support.
     ///
     /// On Windows this is a stub and behaves like `new()`.
-    pub fn with_geyser(timeout_secs: u64, _geyser_url: String, _wallet_pubkey: Pubkey) -> Self {
+    pub fn with_geyser(
+        timeout_secs: u64,
+        _geyser_url: String,
+        _wallet_pubkey: Pubkey,
+        _confirm_commitment: &str,
+    ) -> Self {
         Self::new(timeout_secs)
     }
 

@@ -107,7 +107,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ${{ github.workspace }}/Iron_crab-eval/target
-          key: ${{ runner.os }}-cargo-eval-${{ hashFiles('Iron_crab-eval/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-eval-${{ hashFiles('Iron_crab/Cargo.lock', 'Iron_crab-eval/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-eval-
 
       - name: Eval tests

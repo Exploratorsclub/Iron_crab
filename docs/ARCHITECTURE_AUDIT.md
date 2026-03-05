@@ -1,6 +1,6 @@
 # IronCrab Architektur-Audit – Konsolidierte Fassung
 
-**Stand:** 2026-03-03 | **Quellen:** main (ARCHITECTURE_AUDIT_2026-02-07) + arch-audit-tsw (ARCHITECTURE_AUDIT_2026-02-23) | **Korrekturen 2026-02-21:** PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt | **2026-02-27:** P3 #11 Vault-Balances – allow_rpc_on_miss, Hot Path RPC-frei | **2026-03-03:** A.1 PumpSwap Geyser-First vollständig; RPC aus Hot Path (Orca/Raydium/Meteora/tx_builder) erledigt; Cherry-Pick-Liste abgeschlossen
+**Stand:** 2026-03-04 | **Quellen:** main (ARCHITECTURE_AUDIT_2026-02-07) + arch-audit-tsw (ARCHITECTURE_AUDIT_2026-02-23) | **Korrekturen 2026-02-21:** PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt | **2026-02-27:** P3 #11 Vault-Balances – allow_rpc_on_miss, Hot Path RPC-frei | **2026-03-03:** A.1 PumpSwap Geyser-First vollständig; RPC aus Hot Path (Orca/Raydium/Meteora/tx_builder) erledigt; Cherry-Pick-Liste abgeschlossen | **2026-03-04:** PumpSwap quote_mint dynamisch (instruction_accounts[4]); wallet.rs + WsolManager als Cold Path AKZEPTIERT; BUG A defensive Logging; Arbitrage get_balance_retry ERLEDIGT (Dead Code); Widersprüche bereinigt
 
 > Dieses Dokument ist die einzige aktuelle Architektur-Audit-Quelle. Enthält die **vollständige** Revert-Analyse, alle RPC-Matrix-Tabellen, DEX-Details, BUG-Beschreibungen, **CrossDexHandler PumpFun-Befund** (tsw) sowie SSOT- und Cherry-Pick-Empfehlungen.
 
@@ -307,7 +307,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 | 523 | `load_pool_from_rpc_fallback()` Raydium | **AKZEPTABEL** – Nur bei ExecutionMevB (Liquidation). Hot Path lehnt bei Cache-Miss ab → kein RPC. | ✅ ERLEDIGT |
 | 1518 | `load_pool_by_address()` Multi-hop Meteora | **KRITISCH** – Pool-Fetch per RPC | LivePoolCache |
 
-**Revert-Impact:** Cache-capped `min_out` für Pump.fun BUY fehlt (A.6) – Error 6002 Risiko.
+**Status:** A.6 Cache-capped min_out implementiert (FIX-28). allow_rpc_fallback-Guards verhindern RPC im Hot Path.
 
 #### `tx_sender.rs`, `tpu_client.rs`
 
@@ -318,7 +318,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 #### Arbitrage
 
-**Status:** `solana::execution::ExecutionEngine` (Monolith-Artefakt mit `get_balance_retry`) wurde entfernt. Produktiver Arb-Flow nutzt CrossDexHandler + LockManager (kein RPC für Balance-Check).
+**Status:** Arbitrage nutzt CrossDexHandler + LockManager (kein RPC für Balance-Check). Der frühere Caller `solana::execution::ExecutionEngine` mit `get_balance_retry` wurde entfernt; `get_balance_retry` in rpc.rs ist seither Dead Code.
 
 | Modul | Call | Bewertung |
 |-------|------|-----------|
@@ -342,19 +342,23 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 | Zeile | Call | Problem | Geyser-Alternative |
 |-------|------|---------|---------------------|
-| 211 | `get_balance()` | VERSTOSS im Hot-Path / AKZEPTABEL für Utility | Geyser-Balance-Tracking |
-| 220 | `get_account(mint)` für Token-Programm-Erkennung | VERSTOSS | Geyser-Mint-Info |
-| 268 | `get_account(&ata)` für ATA-Existenz-Check | VERSTOSS wenn im Hot-Path | Geyser-Account-Subscription |
+| 211 | `get_balance()` | ✅ AKZEPTIERT (Cold Path) | Geyser-Balance-Tracking |
+| 220 | `get_account(mint)` für Token-Programm-Erkennung | ✅ AKZEPTIERT (Cold Path) | Geyser-Mint-Info |
+| 268 | `get_account(&ata)` für ATA-Existenz-Check | ✅ AKZEPTIERT (Cold Path) | Geyser-Account-Subscription |
 | 325, 364, 449, 567 | `get_latest_blockhash()` + `send_and_confirm_transaction()` | AKZEPTABEL – TX-Sending |
-| 385 | `get_account(&to_ata)` | VERSTOSS | Geyser-Account-Subscription |
+| 385 | `get_account(&to_ata)` | ✅ AKZEPTIERT (Cold Path) | Geyser-Account-Subscription |
+
+**Status (2026-03-04):** ✅ AKZEPTIERT — `wallet.rs` (`Treasury`) wird **ausschließlich** im Cold Path aufgerufen: Key-Loading beim Bootstrap (`Treasury::load_from_env()`, I-1 Single-Signer), TX-Signing/Sending (AKZEPTABEL), und von `wsol_manager.rs` / `account_janitor.rs` (beide Cold Path Background-Tasks). **Kein Hot-Path-Aufruf.** RPC-Calls in wallet.rs sind utility-Funktionen für Cold Path Operationen.
 
 #### `wsol_manager.rs`
 
 | Zeile | Call | Problem | Geyser-Alternative |
 |-------|------|---------|---------------------|
-| 501 | `get_balance()` | VERSTOSS – SOL-Balance per RPC | Geyser-Wallet-Tracking |
-| 530 | `get_token_account_balance()` | VERSTOSS – WSOL-Balance per RPC | Geyser-Wallet-Tracking |
+| 501 | `get_balance()` | ✅ AKZEPTIERT (Cold Path) | Geyser-Wallet-Tracking |
+| 530 | `get_token_account_balance()` | ✅ AKZEPTIERT (Cold Path) | Geyser-Wallet-Tracking |
 | 846, 895 | `get_latest_blockhash()` + `send_and_confirm_transaction()` | AKZEPTABEL – Wrap/Unwrap TX-Sending |
+
+**Status (2026-03-04):** ✅ AKZEPTIERT — `WsolManager` läuft als Background-Task in execution-engine. Empfängt Balance-Updates via JetStream-Channel (kein eigenes NATS-Subscribe). RPC-Calls nur für: (1) Balance-Check vor Wrap/Unwrap-Entscheidung, (2) TX-Sending (wrap/unwrap SOL). **Kein Hot-Path-Aufruf** — wird nie im Discovery/Buy/Sell/Monitoring-Flow aufgerufen. KillSwitch-Guard: bei aktivem Kill Switch werden alle Aktionen übersprungen.
 
 #### `account_janitor.rs`
 
@@ -399,7 +403,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 |---------|--------|
 | **CrossDexHandler: PumpFun** | ✅ Entfernt – PumpFun BC nicht für Arb geeignet (keine anderen Pools) |
 | Pool-Matching (FIX-38) | ✅ Eingehalten – `update_position_price()` prüft `source_pool == position.pool` |
-| PumpSwap AMM quote_mint hardcodiert (`dex_parser.rs:952`) | ⚠️ Potenziell bei non-SOL-PumpSwap-Pools; Risiko gering |
+| PumpSwap AMM quote_mint hardcodiert (`dex_parser.rs` ~1115) | ✅ BEHOBEN (2026-03-04) — quote_mint aus instruction_accounts[4] gelesen, Fallback SOL_MINT_PUBKEY |
 | Meteora DLMM / Raydium CPMM quote_mint | ✅ Behoben – `extract_quote_mint` / vault-mint-basiert |
 
 ### 4.3 Invarianten-Checkliste (INVARIANTS.md)
@@ -419,7 +423,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 **Problem:** Bei `run_liquidation_job()` gibt es mehrere Pfade wo Token übersprungen werden: `min_out_sol.is_none()`, Creator fehlt im Cache, `pool_accounts_v1_for_base_mint()` gibt `None`.
 
-**Status:** ✅ TEILWEISE BEHOBEN — Liquidation versucht Multi-Pool zuerst, PumpFun als Fallback. 6005-Retry bei BondingCurveComplete implementiert (2026-02-25).
+**Status:** ✅ TEILWEISE BEHOBEN — Liquidation versucht Multi-Pool zuerst, PumpFun als Fallback. 6005-Retry bei BondingCurveComplete implementiert (2026-02-25). Defensive Logging (2026-03-04): Alle Token-Skip-Pfade loggen jetzt `warn!` mit mint, Grund und balance_raw — inkl. ungültige Mint-Pubkeys und QuoteUnavailable-DecisionRecord.
 
 ### BUG B: `load_pool_from_geyser()` in `raydium.rs` macht RPC
 
@@ -451,7 +455,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 
 ### BUG H: Meteora DLMM / Raydium CPMM hardcoded SOL quote_mint
 
-**Status:** ✅ BEHOBEN (2026-02-23) — `extract_quote_mint` bzw. vault-mint-basierte Ableitung. PumpSwap AMM: quote_mint weiterhin hardcodiert (typischerweise SOL-Paare).
+**Status:** ✅ BEHOBEN (2026-02-23, 2026-03-04) — `extract_quote_mint` bzw. vault-mint-basierte Ableitung. PumpSwap AMM: quote_mint jetzt dynamisch aus instruction_accounts[4], Fallback SOL_MINT_PUBKEY.
 
 ### BUG I (vormals G): PumpFun SELL migriert
 
@@ -464,7 +468,7 @@ Am 2026-02-09 wurde der Branch auf `e341c04b` zurückgesetzt (Hard-Reset), weil 
 | Thema | Beschreibung |
 |-------|--------------|
 | load_pool_from_geyser() / Raydium | ✅ BEHOBEN — Umbenannt zu load_pool_from_rpc_fallback; Hot Path lehnt ab; keine RPC-Calls im Hot Path |
-| Arbitrage get_balance_retry | Zusätzliche Latenz; LockManager-Alternative fehlt |
+| Arbitrage get_balance_retry | ✅ ERLEDIGT — Arbitrage-Caller (solana::execution) entfernt. `get_balance_retry` in rpc.rs ist Dead Code (keine Aufrufer); optional bei Cleanup entfernen. |
 
 ---
 
@@ -515,7 +519,7 @@ Typischer **Momentum-Buy** (PumpFun BC):
 | Meteora/Raydium CPMM quote_mint | BUG H offen | Implementiert (extract_quote_mint) |
 | PumpFun SELL migriert | A.5 fehlt | ✅ Guard implementiert (real_reserves) |
 | Raydium RPC-Retries | 20 × 500ms | 3 × 300ms (korrigiert) |
-| PumpSwap quote_mint hardcode | BUG H | Bestätigt, PumpSwap typischerweise SOL |
+| PumpSwap quote_mint hardcode | BUG H | ✅ BEHOBEN (2026-03-04) — dynamisch aus instruction_accounts[4] |
 | Arbitrage get_balance | VERSTOSS | ✅ Erledigt – solana::execution entfernt (Dead-Code) |
 | **PumpSwap AMM Geyser-First** | A.1 RPC bei Miss | **ERLEDIGT 2026-03-03:** allow_rpc_on_miss; Hot Path Cache-Miss → None |
 | **Orca/Raydium/Meteora/tx_builder** | Tick-Arrays, Serum, Fallbacks | **ERLEDIGT 2026-03-03:** allow_rpc_fallback-Guards, Orca skip_tick_array_rpc_validation |
@@ -599,4 +603,4 @@ Dokumentiert in `.cursor/rules/ironcrab-core.mdc`:
 
 ---
 
-*Konsolidiert: 2026-02-23. Korrekturen 2026-02-21: PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt. 2026-02-27: P3 #11 Vault-Balances – allow_rpc_on_miss implementiert. 2026-02-28: P3 #12 PumpSwap allow_rpc_on_miss, Cold Path dokumentiert. 2026-03-03: A.1 PumpSwap Geyser-First vollständig; RPC aus Hot Path (Orca/Raydium/Meteora/tx_builder) erledigt; Cherry-Pick-Liste abgeschlossen; P3 #13 Token-Decimals über PoolCacheUpdate (base_decimals, quote_decimals).*
+*Konsolidiert: 2026-02-23. Korrekturen 2026-02-21: PumpFun + Raydium load_pool_from_rpc_fallback – nur Cold Path, Hot Path erledigt. 2026-02-27: P3 #11 Vault-Balances – allow_rpc_on_miss implementiert. 2026-02-28: P3 #12 PumpSwap allow_rpc_on_miss, Cold Path dokumentiert. 2026-03-03: A.1 PumpSwap Geyser-First vollständig; RPC aus Hot Path (Orca/Raydium/Meteora/tx_builder) erledigt; Cherry-Pick-Liste abgeschlossen; P3 #13 Token-Decimals über PoolCacheUpdate (base_decimals, quote_decimals). 2026-03-04: PumpSwap quote_mint dynamisch aus instruction_accounts[4]; wallet.rs + WsolManager als Cold Path AKZEPTIERT dokumentiert; BUG A defensive Logging für Token-Skips; Arbitrage get_balance_retry als ERLEDIGT dokumentiert (Dead Code).*

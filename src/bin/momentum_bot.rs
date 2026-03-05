@@ -1852,6 +1852,9 @@ struct MomentumContext {
     tokens_blacklisted: std::sync::atomic::AtomicU64,
     intents_generated: std::sync::atomic::AtomicU64,
     exits_generated: std::sync::atomic::AtomicU64,
+    /// K Phase 1: Last event slot/ts for Slot-to-Send Latency propagation
+    last_event_slot: std::sync::atomic::AtomicU64,
+    last_event_ts_ms: std::sync::atomic::AtomicU64,
 }
 
 impl MomentumContext {
@@ -5430,6 +5433,8 @@ async fn main() -> Result<()> {
         tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
         intents_generated: std::sync::atomic::AtomicU64::new(0),
         exits_generated: std::sync::atomic::AtomicU64::new(0),
+        last_event_slot: std::sync::atomic::AtomicU64::new(0),
+        last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
     });
 
     // === P0: Wallet snapshot recovery from JetStream ===
@@ -6547,6 +6552,22 @@ async fn generate_and_publish_buy_intent(
         current_open_positions.to_string(),
     );
 
+    // K Phase 1: Slot-to-Send Latency - propagate slot from last event
+    let slot = ctx
+        .last_event_slot
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let ts_ms = ctx
+        .last_event_ts_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if slot > 0 {
+        intent.metadata.insert("slot".to_string(), slot.to_string());
+    }
+    if ts_ms > 0 {
+        intent
+            .metadata
+            .insert("slot_seen_at_ms".to_string(), ts_ms.to_string());
+    }
+
     // Register pending intent BEFORE publishing
     ctx.register_buy_intent(
         &intent_id,
@@ -6744,6 +6765,8 @@ mod tests {
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         };
 
         let mint = "So11111111111111111111111111111111111111112";
@@ -6794,6 +6817,8 @@ mod tests {
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         };
 
         let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -6869,6 +6894,8 @@ mod tests {
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Insert a fresh tracker.
@@ -7118,6 +7145,8 @@ mod tests {
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Seed tracker with a last_trade_ratio so intent generation can compute min_out.
@@ -7218,6 +7247,8 @@ mod tests {
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Open a position.
@@ -7286,6 +7317,8 @@ mod tests {
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Open a position.
@@ -7342,6 +7375,8 @@ mod tests {
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         };
 
         let now = Instant::now();
@@ -7410,6 +7445,8 @@ mod tests {
             tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
             intents_generated: std::sync::atomic::AtomicU64::new(0),
             exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Seed pool registry so reconciliation can pick a pool.
@@ -7779,6 +7816,22 @@ async fn generate_and_publish_exit_intent(
         current_open_positions.to_string(),
     );
 
+    // K Phase 1: Slot-to-Send Latency - propagate slot from last event
+    let slot = ctx
+        .last_event_slot
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let ts_ms = ctx
+        .last_event_ts_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if slot > 0 {
+        intent.metadata.insert("slot".to_string(), slot.to_string());
+    }
+    if ts_ms > 0 {
+        intent
+            .metadata
+            .insert("slot_seen_at_ms".to_string(), ts_ms.to_string());
+    }
+
     // Register pending intent BEFORE publishing
     ctx.register_sell_intent(&intent_id, mint, &pool, &dex, token_amount);
 
@@ -7821,6 +7874,16 @@ async fn generate_and_publish_exit_intent(
 
 /// Process a MarketEvent and update token trackers
 async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Result<()> {
+    // K Phase 1: Slot-to-Send Latency - store for intent metadata propagation
+    if let Some(slot) = event.slot {
+        ctx.last_event_slot
+            .store(slot, std::sync::atomic::Ordering::Relaxed);
+    }
+    ctx.last_event_ts_ms.store(
+        event.header.ts_unix_ms,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     match &event.kind {
         MarketEventKind::PoolCreated {
             pool_address,

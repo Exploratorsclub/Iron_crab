@@ -128,6 +128,10 @@ pub struct ExecutionEngineCfg {
     /// Fee Policy Configuration (priority fees, compute limits)
     #[serde(default)]
     pub fee_policy: Option<FeePolicyCfg>,
+    /// Commitment level for TX confirmation: "finalized" (default, safe) or "confirmed" (faster, reorg risk).
+    /// INVARIANTS D.2: Position only from finalized executions when set to "finalized".
+    #[serde(default)]
+    pub confirm_commitment: Option<String>,
 }
 
 /// Fee Policy Configuration

@@ -2442,7 +2442,15 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
                 );
 
                 // Publish any multi-hop intents found
-                for intent in multi_hop_intents {
+                for mut intent in multi_hop_intents {
+                    // K Phase 1: Slot-to-Send Latency - propagate slot from event
+                    if let Some(slot) = event.slot {
+                        intent.metadata.insert("slot".to_string(), slot.to_string());
+                    }
+                    intent.metadata.insert(
+                        "slot_seen_at_ms".to_string(),
+                        event.header.ts_unix_ms.to_string(),
+                    );
                     if let Err(e) = ctx.jsonl_writer.write(&intent) {
                         error!(error = %e, "Failed to write multi-hop intent to JSONL");
                     }
@@ -2486,7 +2494,17 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
                     "🔥 Arbitrage opportunity detected!"
                 );
                 // create_arb_intent returns None if pump_amm is used but DexPoolAccounts are missing
-                create_arb_intent(ctx, &opp)
+                create_arb_intent(ctx, &opp).map(|mut intent| {
+                    // K Phase 1: Slot-to-Send Latency - propagate slot from event
+                    if let Some(slot) = event.slot {
+                        intent.metadata.insert("slot".to_string(), slot.to_string());
+                    }
+                    intent.metadata.insert(
+                        "slot_seen_at_ms".to_string(),
+                        event.header.ts_unix_ms.to_string(),
+                    );
+                    intent
+                })
             } else {
                 None
             }

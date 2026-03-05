@@ -250,6 +250,16 @@ pub static TX_CONFIRM_TIMEOUT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::n
 pub static TX_CONFIRM_GEYSER_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_CONFIRM_RPC_FALLBACK_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TX_CONFIRM_LATENCY_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+// K Phase 1: Slot-to-Send Latency (Geyser event/slot → TX send)
+const TX_SLOT_TO_SEND_MS_BUCKETS: &[u64] = &[10, 25, 50, 100, 200, 500, 1000, 2000];
+pub static TX_SLOT_TO_SEND_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    TX_SLOT_TO_SEND_MS_BUCKETS
+        .iter()
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+pub static TX_SLOT_TO_SEND_MS_SUM_MS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static TX_SLOT_TO_SEND_MS_COUNT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TPU_RECONNECT_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static TPU_CACHE_STALE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static GEYSER_TX_WATCHER_CONNECTED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
@@ -716,6 +726,20 @@ pub fn record_swap_latency_duration(duration: std::time::Duration) {
     record_swap_latency(duration.as_nanos() as u64);
 }
 
+/// Record slot-to-send latency (ms): time from Geyser event/slot observation to TX send.
+/// Call after successful TX send when intent has slot_seen_at_ms in metadata.
+/// If slot not available, do not call (no metric emitted).
+pub fn record_tx_slot_to_send_ms(ms: u64) {
+    TX_SLOT_TO_SEND_MS_SUM_MS.fetch_add(ms, Ordering::Relaxed);
+    TX_SLOT_TO_SEND_MS_COUNT.fetch_add(1, Ordering::Relaxed);
+    for (i, bucket) in TX_SLOT_TO_SEND_MS_BUCKETS.iter().enumerate() {
+        if ms <= *bucket {
+            TX_SLOT_TO_SEND_MS_BUCKET_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+    }
+}
+
 /// Record price impact measurement (basis points)
 pub fn record_price_impact(_price_impact_bps: f64) {
     // For now, we'll just track in the trade success metrics
@@ -879,6 +903,22 @@ async fn metrics_response() -> Response<Body> {
         "tx_confirm_latency_ms",
         TX_CONFIRM_LATENCY_MS.load(Ordering::Relaxed)
     );
+    // K Phase 1: Slot-to-Send Latency histogram
+    let sts_count = TX_SLOT_TO_SEND_MS_COUNT.load(Ordering::Relaxed);
+    let sts_sum = TX_SLOT_TO_SEND_MS_SUM_MS.load(Ordering::Relaxed);
+    for (i, b) in TX_SLOT_TO_SEND_MS_BUCKETS.iter().enumerate() {
+        let cum = TX_SLOT_TO_SEND_MS_BUCKET_COUNTS[i].load(Ordering::Relaxed);
+        out.push_str(&format!(
+            "tx_slot_to_send_ms_bucket{{le=\"{}\"}} {}\n",
+            b, cum
+        ));
+    }
+    out.push_str(&format!(
+        "tx_slot_to_send_ms_bucket{{le=\"+Inf\"}} {}\n",
+        sts_count
+    ));
+    out.push_str(&format!("tx_slot_to_send_ms_sum {}\n", sts_sum));
+    out.push_str(&format!("tx_slot_to_send_ms_count {}\n", sts_count));
     line!(
         "tpu_reconnect_total",
         TPU_RECONNECT_TOTAL.load(Ordering::Relaxed)

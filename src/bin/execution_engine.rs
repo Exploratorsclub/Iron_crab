@@ -70,16 +70,17 @@ use ironcrab::ipc::{
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind};
 use ironcrab::metrics::{
-    record_recent_trade, serve_metrics, RecentTrade, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS,
-    AVAILABLE_SOL_LAMPORTS, CONCURRENT_INTENTS_GAUGE, INTENTS_EXECUTED_TOTAL,
-    INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL, JITO_BUNDLES_LANDED_TOTAL,
-    JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL, JITO_BUNDLES_TIMEOUT_TOTAL,
-    JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE, NATS_MESSAGES_RECEIVED_TOTAL,
-    OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK,
-    REJECT_SEND_FAILED, REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL,
-    TX_CONFIRM_GEYSER_TOTAL, TX_CONFIRM_LATENCY_MS, TX_CONFIRM_RPC_FALLBACK_TOTAL,
-    TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL,
-    TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
+    record_recent_trade, record_tx_slot_to_send_ms, serve_metrics, RecentTrade,
+    ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS, CONCURRENT_INTENTS_GAUGE,
+    INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
+    JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL,
+    JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE,
+    NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE,
+    REJECT_RESOURCE_LOCK, REJECT_SEND_FAILED, REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL,
+    TX_CONFIRMED_TOTAL, TX_CONFIRM_GEYSER_TOTAL, TX_CONFIRM_LATENCY_MS,
+    TX_CONFIRM_RPC_FALLBACK_TOTAL, TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL,
+    TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL, TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL,
+    WALLET_TOTAL_SOL_LAMPORTS,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -1057,6 +1058,8 @@ struct ExecutionConfig {
     // === FIX-32: Geyser TX Confirmation ===
     /// Use Geyser for TX confirmation instead of RPC polling (requires geyser_grpc_url)
     geyser_confirm_enabled: bool,
+    /// Commitment for TX confirmation: "finalized" (default, INVARIANTS D.2) or "confirmed"
+    confirm_commitment: String,
     /// Rebroadcast interval during confirmation wait (ms)
     rebroadcast_interval_ms: u64,
     /// Max rebroadcasts per TX during confirmation
@@ -1114,8 +1117,9 @@ impl Default for ExecutionConfig {
             wsol_dry_run: false,
             // FIX-31: Parallel intent processing
             max_concurrent_intents: 4,
-            // FIX-32: Geyser TX confirmation defaults
+            // FIX-32: Geyser TX confirmation defaults (INVARIANTS D.2: finalized)
             geyser_confirm_enabled: true,
+            confirm_commitment: "finalized".to_string(),
             rebroadcast_interval_ms: 2_000,
             max_rebroadcasts: 5,
             // Account Janitor defaults
@@ -1928,7 +1932,15 @@ impl ExecutionContext {
 
             let mint = match Pubkey::from_str(mint_str) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!(
+                        mint = %mint_str,
+                        error = %e,
+                        balance_raw,
+                        "LIQUIDATION SKIP: invalid mint pubkey, cannot parse"
+                    );
+                    continue;
+                }
             };
             if mint == sol_mint {
                 continue;
@@ -3393,6 +3405,28 @@ impl ExecutionContext {
                         rejected.push((key.clone(), "Invalid type, expected bool".to_string()));
                     }
                 }
+                "confirm_commitment" => {
+                    if let Some(v) = value.as_str() {
+                        let v_lc = v.to_lowercase();
+                        match v_lc.as_str() {
+                            "finalized" | "confirmed" => {
+                                config.confirm_commitment = v_lc;
+                                applied.push(key.clone());
+                                info!(
+                                    key = %key,
+                                    new_value = %v,
+                                    "Config updated (RPC polling uses new value; Geyser uses startup value)"
+                                );
+                            }
+                            _ => rejected.push((
+                                key.clone(),
+                                "Must be one of: finalized, confirmed".to_string(),
+                            )),
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected string".to_string()));
+                    }
+                }
                 "rebroadcast_interval_ms" => {
                     if let Some(v) = value.as_u64() {
                         if (500..=30_000).contains(&v) {
@@ -4257,6 +4291,10 @@ async fn main() -> Result<()> {
             .and_then(|fp| fp.liquidation_max_priority_fee_micro_lamports),
         liquidation_max_tx_cost_lamports: fee_policy_cfg
             .and_then(|fp| fp.liquidation_max_tx_cost_lamports),
+        // INVARIANTS D.2: confirm_commitment (default finalized)
+        confirm_commitment: exec_eng_cfg
+            .and_then(|e| e.confirm_commitment.clone())
+            .unwrap_or_else(|| "finalized".to_string()),
         ..Default::default()
     };
 
@@ -4596,6 +4634,7 @@ async fn main() -> Result<()> {
                         exec_config.confirmation_timeout_ms / 1000,
                         url.clone(),
                         *wpk,
+                        &exec_config.confirm_commitment,
                     ),
                 )
             } else {
@@ -7462,6 +7501,18 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     TX_SEND_JITO_TOTAL.fetch_add(1, Ordering::Relaxed);
                     sent_anything = true;
                     bundle_id = Some(bid.clone());
+                    // K Phase 1: Slot-to-Send Latency
+                    if let Some(seen) = intent
+                        .metadata
+                        .get("slot_seen_at_ms")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        record_tx_slot_to_send_ms(now_ms.saturating_sub(seen));
+                    }
                     checks.push(CheckResult {
                         check_name: "send".to_string(),
                         passed: true,
@@ -7504,6 +7555,18 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         _ => TX_SEND_RPC_TOTAL.fetch_add(1, Ordering::Relaxed),
                     };
                     sent_anything = true;
+                    // K Phase 1: Slot-to-Send Latency
+                    if let Some(seen) = intent
+                        .metadata
+                        .get("slot_seen_at_ms")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        record_tx_slot_to_send_ms(now_ms.saturating_sub(seen));
+                    }
                     send_signature = Some(result.signature.clone());
                     send_method_used = Some(result.method.clone());
                     sent_tx = Some(result.tx);
@@ -8841,6 +8904,7 @@ async fn confirm_via_geyser(
 }
 
 /// RPC-polling fallback: exponential backoff polling of `get_signature_statuses()`.
+/// INVARIANTS D.2: When confirm_commitment == "finalized", only Finalized status is accepted.
 async fn confirm_via_rpc_polling(
     ctx: &ExecutionContext,
     signature_base58: &str,
@@ -8885,11 +8949,17 @@ async fn confirm_via_rpc_polling(
                 });
             }
 
+            let config = ctx.config.read();
+            let require_finalized = config.confirm_commitment.eq_ignore_ascii_case("finalized");
+            drop(config);
+
             let is_confirmed = match st.confirmation_status {
-                Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed)
-                | Some(solana_transaction_status::TransactionConfirmationStatus::Finalized) => true,
+                Some(solana_transaction_status::TransactionConfirmationStatus::Finalized) => true,
+                Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed) => {
+                    !require_finalized
+                }
                 Some(solana_transaction_status::TransactionConfirmationStatus::Processed) => false,
-                None => st.confirmations.is_none(),
+                None => false, // No definitive status, keep polling
             };
 
             if is_confirmed {

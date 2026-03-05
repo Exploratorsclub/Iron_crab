@@ -1109,10 +1109,13 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     let trader = update.account_keys.first().copied().unwrap_or(user);
     let global_config = update.instruction_accounts[2];
     let base_mint = update.instruction_accounts[3];
-    // instruction_accounts[4] = quote_mint (WSOL)
     // instruction_accounts[5] = user_base_ta
     // instruction_accounts[6] = user_quote_ta
-    let quote_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+    let quote_mint = update
+        .instruction_accounts
+        .get(4)
+        .copied()
+        .unwrap_or(*SOL_MINT_PUBKEY);
     let pool_base_vault = update.instruction_accounts[7];
     let pool_quote_vault = update.instruction_accounts[8];
     let protocol_fee_recipient = update.instruction_accounts[9];

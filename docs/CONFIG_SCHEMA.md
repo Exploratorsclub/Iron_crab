@@ -55,6 +55,7 @@ Component name: `execution-engine`
 |-----|------|---------|-------|-------------|
 | `simulation_timeout_ms` | u64 | 2000 | 100-30000 | Simulation timeout (ms) |
 | `confirmation_timeout_ms` | u64 | 30000 | 500-300000 | Confirmation timeout after send (ms) |
+| `confirm_commitment` | string | "finalized" | finalized, confirmed | Commitment level for TX confirmation. "finalized" (INVARIANTS D.2): Position only from finalized executions. "confirmed": faster but reorg risk. Geyser uses startup value; RPC polling uses hot-reload value. |
 | `send_enabled` | bool | false | true/false | If true, engine signs and submits transactions |
 
 ### Validation Rules
@@ -62,6 +63,7 @@ Component name: `execution-engine`
 - All `_lamports` values must be positive integers
 - `send_enabled=true` is rejected if wallet keys are not configured
 - `confirm_timeout_ms` must be between 500 and 300000
+- `confirm_commitment` must be one of: finalized, confirmed
 - `preflight_commitment` must be one of: processed, confirmed, finalized (or null)
 
 ---
