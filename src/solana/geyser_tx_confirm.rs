@@ -144,6 +144,7 @@ impl GeyserTxConfirm {
         let geyser_url_clone = geyser_url.clone();
 
         let confirm_commitment = confirm_commitment.to_string();
+        let confirm_commitment_tx = confirm_commitment.clone();
         tokio::spawn(async move {
             Self::run_ata_watcher(
                 geyser_url_clone,
@@ -159,14 +160,13 @@ impl GeyserTxConfirm {
         let pending_txs_clone = pending_txs.clone();
         let geyser_url_clone2 = geyser_url.clone();
 
-        let confirm_commitment = confirm_commitment.to_string();
         tokio::spawn(async move {
             Self::run_tx_watcher(
                 geyser_url_clone2,
                 tx_watcher_rx,
                 pending_txs_clone,
                 wallet_pubkey,
-                &confirm_commitment,
+                &confirm_commitment_tx,
             )
             .await;
         });
