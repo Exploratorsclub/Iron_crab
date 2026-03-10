@@ -680,6 +680,80 @@
           "labels": { "severity": "warning", "component": "infrastructure", "type": "cpu" }
         },
         {
+          "uid": "ironcrab-network-link-down",
+          "title": "Network Link Down (eno2)",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": { "from": 120, "to": 0 },
+              "datasourceUid": "bf5zln2g4x5vka",
+              "model": {
+                "expr": "node_network_carrier{device=\"eno2\",job=\"node-exporter\"}",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": { "expression": "A", "reducer": "last", "refId": "B", "type": "reduce" }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [{ "evaluator": { "params": [1], "type": "lt" } }],
+                "expression": "B", "refId": "C", "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Alerting",
+          "for": "1m",
+          "annotations": {
+            "summary": "Netzwerk-Link eno2 ist down",
+            "description": "Interface eno2 hat keinen Carrier/Link mehr. Server ist offline. Netzwerkkabel und Switch pruefen."
+          },
+          "labels": { "severity": "critical", "component": "infrastructure", "type": "network" }
+        },
+        {
+          "uid": "ironcrab-network-throughput-low",
+          "title": "Network Throughput Very Low (eno2)",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": { "from": 600, "to": 0 },
+              "datasourceUid": "bf5zln2g4x5vka",
+              "model": {
+                "expr": "rate(node_network_receive_bytes_total{device=\"eno2\",job=\"node-exporter\"}[5m])",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": { "expression": "A", "reducer": "mean", "refId": "B", "type": "reduce" }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [{ "evaluator": { "params": [1024], "type": "lt" } }],
+                "expression": "B", "refId": "C", "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "OK",
+          "for": "5m",
+          "annotations": {
+            "summary": "Netzwerk-Durchsatz auf eno2 extrem niedrig",
+            "description": "RX-Durchsatz auf eno2 liegt unter 1 KB/s seit 5 Minuten. Moegliche Netzwerkprobleme oder Verbindungsstoerung."
+          },
+          "labels": { "severity": "warning", "component": "infrastructure", "type": "network" }
+        },
+        {
           "uid": "ironcrab-kill-switch-active",
           "title": "Kill Switch Activated",
           "condition": "C",

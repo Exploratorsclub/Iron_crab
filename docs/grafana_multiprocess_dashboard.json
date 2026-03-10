@@ -35,7 +35,8 @@
       "description": "Verbleibender freier Speicher auf NVMe 1 (Validator-Partition)",
       "targets": [{"expr": "node_filesystem_avail_bytes{mountpoint=~\"/var/solana.*\",job=\"node-exporter\"}", "refId": "A"}],
       "gridPos": {"h":3,"w":4,"x":8,"y":1},
-      "fieldConfig": {"defaults": {"unit": "bytes", "decimals": 1, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 107374182400}, {"color": "yellow", "value": 214748364800}, {"color": "green", "value": 536870912000}]}}}
+      "options": {"graphMode": "none"},
+      "fieldConfig": {"defaults": {"unit": "decbytes", "decimals": 1, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 107374182400}, {"color": "yellow", "value": 214748364800}, {"color": "green", "value": 536870912000}]}}}
     },
     {
       "type": "stat",
@@ -43,7 +44,8 @@
       "description": "Verbleibender freier Speicher auf NVMe 0 (Bot-Partition)",
       "targets": [{"expr": "node_filesystem_avail_bytes{mountpoint=\"/\",job=\"node-exporter\"}", "refId": "A"}],
       "gridPos": {"h":3,"w":4,"x":8,"y":4},
-      "fieldConfig": {"defaults": {"unit": "bytes", "decimals": 1, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 53687091200}, {"color": "green", "value": 214748364800}]}}}
+      "options": {"graphMode": "none"},
+      "fieldConfig": {"defaults": {"unit": "decbytes", "decimals": 1, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 53687091200}, {"color": "green", "value": 214748364800}]}}}
     },
     {
       "type": "timeseries",
@@ -70,19 +72,28 @@
       "fieldConfig": {"defaults": {"unit": "percent", "decimals": 1, "min": 0, "max": 100, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 70}, {"color": "orange", "value": 85}, {"color": "red", "value": 95}]}}}
     },
     {
-      "type": "stat",
-      "title": "RAM Free",
-      "description": "Verfuegbarer Arbeitsspeicher",
-      "targets": [{"expr": "node_memory_MemAvailable_bytes{job=\"node-exporter\"}", "refId": "A"}],
+      "type": "timeseries",
+      "title": "Network Traffic",
+      "description": "Netzwerk-Durchsatz eno2 (Receive / Transmit)",
+      "targets": [
+        {"expr": "rate(node_network_receive_bytes_total{device=\"eno2\",job=\"node-exporter\"}[5m])", "refId": "A", "legendFormat": "RX"},
+        {"expr": "rate(node_network_transmit_bytes_total{device=\"eno2\",job=\"node-exporter\"}[5m]) * -1", "refId": "B", "legendFormat": "TX"}
+      ],
       "gridPos": {"h":4,"w":4,"x":8,"y":7},
-      "fieldConfig": {"defaults": {"unit": "bytes", "decimals": 1, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 8589934592}, {"color": "yellow", "value": 34359738368}, {"color": "green", "value": 68719476736}]}}}
+      "fieldConfig": {
+        "defaults": {"unit": "Bps", "decimals": 1, "custom": {"fillOpacity": 15, "lineWidth": 1}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "RX"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "TX"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]}
+        ]
+      }
     },
     {
       "type": "timeseries",
       "title": "CPU & RAM Over Time",
       "description": "CPU- und RAM-Auslastung ueber Zeit",
       "targets": [
-        {"expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[1m])) * 100)", "refId": "A", "legendFormat": "CPU %"},
+        {"expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[5m])) * 100)", "refId": "A", "legendFormat": "CPU %"},
         {"expr": "(1 - node_memory_MemAvailable_bytes{job=\"node-exporter\"} / node_memory_MemTotal_bytes{job=\"node-exporter\"}) * 100", "refId": "B", "legendFormat": "RAM %"}
       ],
       "gridPos": {"h":4,"w":12,"x":12,"y":7},
