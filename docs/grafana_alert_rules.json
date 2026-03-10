@@ -739,7 +739,7 @@
               "refId": "C",
               "datasourceUid": "__expr__",
               "model": {
-                "conditions": [{ "evaluator": { "params": [1024], "type": "lt" } }],
+                "conditions": [{ "evaluator": { "params": [10000000], "type": "lt" } }],
                 "expression": "B", "refId": "C", "type": "threshold"
               }
             }
@@ -748,8 +748,8 @@
           "execErrState": "OK",
           "for": "5m",
           "annotations": {
-            "summary": "Netzwerk-Durchsatz auf eno2 extrem niedrig",
-            "description": "RX-Durchsatz auf eno2 liegt unter 1 KB/s seit 5 Minuten. Moegliche Netzwerkprobleme oder Verbindungsstoerung."
+            "summary": "Netzwerk-Durchsatz auf eno2 extrem niedrig (<10 MB/s)",
+            "description": "RX-Durchsatz auf eno2 liegt unter 10 MB/s seit 5 Minuten. Validator kann bei diesem Durchsatz nicht mit dem Cluster mithalten. Netzwerk, Switch und Kabel pruefen."
           },
           "labels": { "severity": "warning", "component": "infrastructure", "type": "network" }
         },
