@@ -2,642 +2,324 @@
   "title": "IronCrab Multi-Process Architecture",
   "description": "Dashboard for the Debuggable-First Multi-Process Architecture",
   "schemaVersion": 39,
-  "version": 3,
+  "version": 5,
   "time": { "from": "now-1h", "to": "now" },
   "refresh": "5s",
   "tags": ["ironcrab", "multi-process", "trading"],
   "panels": [
     {
       "type": "row",
-      "title": "🔄 Pipeline Health",
+      "title": "Server Infrastructure",
       "gridPos": {"h":1,"w":24,"x":0,"y":0},
       "collapsed": false
     },
     {
-      "type": "stat",
-      "title": "market-data",
-      "description": "Geyser event ingest service",
-      "targets": [{ "expr": "up{job=\"ironcrab-market-data\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":0,"y":1},
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            { "type": "value", "options": { "1": { "text": "UP", "color": "green" } } },
-            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" } } }
-          ]
-        }
-      }
+      "type": "gauge",
+      "title": "Disk: /var/solana (Validator)",
+      "description": "NVMe 1 - Agave Validator: Ledger, Accounts, Logs",
+      "targets": [{"expr": "100 - (node_filesystem_avail_bytes{mountpoint=~\"/var/solana.*\",job=\"node-exporter\"} / node_filesystem_size_bytes{mountpoint=~\"/var/solana.*\",job=\"node-exporter\"} * 100)", "refId": "A", "legendFormat": "{{mountpoint}}"}],
+      "gridPos": {"h":6,"w":4,"x":0,"y":1},
+      "fieldConfig": {"defaults": {"unit": "percent", "decimals": 1, "min": 0, "max": 100, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 70}, {"color": "orange", "value": 85}, {"color": "red", "value": 95}]}}}
+    },
+    {
+      "type": "gauge",
+      "title": "Disk: / (IronCrab Bot)",
+      "description": "NVMe 0 - Root-Partition mit IronCrab Bot, NATS, Prometheus etc.",
+      "targets": [{"expr": "100 - (node_filesystem_avail_bytes{mountpoint=\"/\",job=\"node-exporter\"} / node_filesystem_size_bytes{mountpoint=\"/\",job=\"node-exporter\"} * 100)", "refId": "A"}],
+      "gridPos": {"h":6,"w":4,"x":4,"y":1},
+      "fieldConfig": {"defaults": {"unit": "percent", "decimals": 1, "min": 0, "max": 100, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 70}, {"color": "orange", "value": 85}, {"color": "red", "value": 95}]}}}
     },
     {
       "type": "stat",
-      "title": "momentum-bot",
-      "description": "Strategy plane - 4-Filter policy",
-      "targets": [{ "expr": "up{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":4,"y":1},
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            { "type": "value", "options": { "1": { "text": "UP", "color": "green" } } },
-            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" } } }
-          ]
-        }
-      }
-    },
-    {
-      "type": "stat",
-      "title": "arb-strategy",
-      "description": "Typ A market-driven arbitrage strategy",
-      "targets": [{ "expr": "up{job=\"ironcrab-arb-strategy\"}", "refId": "A" }],
+      "title": "Free: /var/solana",
+      "description": "Verbleibender freier Speicher auf NVMe 1 (Validator-Partition)",
+      "targets": [{"expr": "node_filesystem_avail_bytes{mountpoint=~\"/var/solana.*\",job=\"node-exporter\"}", "refId": "A"}],
       "gridPos": {"h":3,"w":4,"x":8,"y":1},
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            { "type": "value", "options": { "1": { "text": "UP", "color": "green" } } },
-            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" } } }
-          ]
-        }
-      }
+      "fieldConfig": {"defaults": {"unit": "bytes", "decimals": 1, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 107374182400}, {"color": "yellow", "value": 214748364800}, {"color": "green", "value": 536870912000}]}}}
     },
     {
       "type": "stat",
-      "title": "execution-engine",
-      "description": "Single-signer execution service",
-      "targets": [{ "expr": "up{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":12,"y":1},
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            { "type": "value", "options": { "1": { "text": "UP", "color": "green" } } },
-            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" } } }
-          ]
-        }
-      }
-    },
-    {
-      "type": "stat",
-      "title": "Events Published",
-      "description": "Total market events published",
-      "targets": [{ "expr": "market_events_published_total{job=\"ironcrab-market-data\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":16,"y":1},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } } }
-    },
-    {
-      "type": "stat",
-      "title": "Events Consumed",
-      "description": "Market events consumed by momentum-bot",
-      "targets": [{ "expr": "market_events_consumed_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":20,"y":1},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "purple" } } }
-    },
-    {
-      "type": "stat",
-      "title": "NATS Messages",
-      "description": "Total NATS messages published",
-      "targets": [{ "expr": "nats_messages_published_total{job=\"ironcrab-market-data\"}", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":0,"y":4},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } }
-    },
-    {
-      "type": "row",
-      "title": "📊 Market Data Service (Port 9801)",
-      "gridPos": {"h":1,"w":24,"x":0,"y":7},
-      "collapsed": false
+      "title": "Free: / (Bot)",
+      "description": "Verbleibender freier Speicher auf NVMe 0 (Bot-Partition)",
+      "targets": [{"expr": "node_filesystem_avail_bytes{mountpoint=\"/\",job=\"node-exporter\"}", "refId": "A"}],
+      "gridPos": {"h":3,"w":4,"x":8,"y":4},
+      "fieldConfig": {"defaults": {"unit": "bytes", "decimals": 1, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 53687091200}, {"color": "green", "value": 214748364800}]}}}
     },
     {
       "type": "timeseries",
-      "title": "Event Publish Rate",
-      "description": "Market events published by market-data service",
-      "targets": [{ "expr": "rate(market_events_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "events/s" }],
-      "gridPos": {"h":6,"w":12,"x":0,"y":8},
-      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "unit": "ops" } }
+      "title": "Disk Usage Over Time",
+      "description": "Disk-Auslastung aller relevanten Partitionen ueber Zeit",
+      "targets": [{"expr": "100 - (node_filesystem_avail_bytes{mountpoint=~\"/|/var/solana.*\",job=\"node-exporter\"} / node_filesystem_size_bytes{mountpoint=~\"/|/var/solana.*\",job=\"node-exporter\"} * 100)", "refId": "A", "legendFormat": "{{mountpoint}}"}],
+      "gridPos": {"h":6,"w":12,"x":12,"y":1},
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "decimals": 1, "custom": {"fillOpacity": 10, "lineWidth": 2}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 70}, {"color": "orange", "value": 85}, {"color": "red", "value": 95}]}}}
+    },
+    {
+      "type": "gauge",
+      "title": "CPU Usage",
+      "description": "Aktuelle CPU-Auslastung (alle Kerne)",
+      "targets": [{"expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[1m])) * 100)", "refId": "A"}],
+      "gridPos": {"h":4,"w":4,"x":0,"y":7},
+      "fieldConfig": {"defaults": {"unit": "percent", "decimals": 1, "min": 0, "max": 100, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 60}, {"color": "orange", "value": 80}, {"color": "red", "value": 95}]}}}
+    },
+    {
+      "type": "gauge",
+      "title": "RAM Usage",
+      "description": "Aktuelle RAM-Auslastung",
+      "targets": [{"expr": "(1 - node_memory_MemAvailable_bytes{job=\"node-exporter\"} / node_memory_MemTotal_bytes{job=\"node-exporter\"}) * 100", "refId": "A"}],
+      "gridPos": {"h":4,"w":4,"x":4,"y":7},
+      "fieldConfig": {"defaults": {"unit": "percent", "decimals": 1, "min": 0, "max": 100, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 70}, {"color": "orange", "value": 85}, {"color": "red", "value": 95}]}}}
+    },
+    {
+      "type": "stat",
+      "title": "RAM Free",
+      "description": "Verfuegbarer Arbeitsspeicher",
+      "targets": [{"expr": "node_memory_MemAvailable_bytes{job=\"node-exporter\"}", "refId": "A"}],
+      "gridPos": {"h":4,"w":4,"x":8,"y":7},
+      "fieldConfig": {"defaults": {"unit": "bytes", "decimals": 1, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 8589934592}, {"color": "yellow", "value": 34359738368}, {"color": "green", "value": 68719476736}]}}}
     },
     {
       "type": "timeseries",
-      "title": "NATS Message Rate",
-      "description": "NATS messages published by market-data",
-      "targets": [{ "expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "msgs/s" }],
-      "gridPos": {"h":6,"w":12,"x":12,"y":8},
-      "fieldConfig": { "defaults": { "unit": "ops" } }
-    },
-    {
-      "type": "row",
-      "title": "🎯 Momentum Bot (Port 9802) - 4-Filter Policy",
-      "gridPos": {"h":1,"w":24,"x":0,"y":14},
-      "collapsed": false
-    },
-    {
-      "type": "stat",
-      "title": "Tokens Tracked",
-      "description": "Tokens currently being observed by momentum-bot",
-      "targets": [{ "expr": "tokens_tracked_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":0,"y":15},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "orange" } } }
-    },
-    {
-      "type": "stat",
-      "title": "Pools Tracked",
-      "description": "Pools currently being observed by momentum-bot",
-      "targets": [{ "expr": "pools_tracked_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":4,"y":15},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "purple" } } }
-    },
-    {
-      "type": "stat",
-      "title": "Total Intents",
-      "description": "All TradeIntents published (BUY + SELL)",
-      "targets": [{ "expr": "intents_generated_total{job=\"ironcrab-momentum-bot\"} + exits_generated_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":2,"x":8,"y":15},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } } }
-    },
-    {
-      "type": "stat",
-      "title": "BUY Intents",
-      "description": "Entry/BUY intents generated",
-      "targets": [{ "expr": "intents_generated_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":2,"x":10,"y":15},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } }
-    },
-    {
-      "type": "stat",
-      "title": "SELL Intents",
-      "description": "Exit/SELL intents generated",
-      "targets": [{ "expr": "exits_generated_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":2,"x":12,"y":15},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "orange" } } }
-    },
-    {
-      "type": "stat",
-      "title": "4-Filter Passed",
-      "targets": [{ "expr": "filter_passed_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":2,"x":14,"y":15},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } }
-    },
-    {
-      "type": "stat",
-      "title": "4-Filter Rejected",
-      "targets": [{ "expr": "filter_rejected_total{job=\"ironcrab-momentum-bot\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":2,"x":16,"y":15},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "red" } } }
-    },
-    {
-      "type": "piechart",
-      "title": "Filter Rejection Reasons",
-      "description": "Why tokens were rejected by 4-Filter policy",
-      "targets": [{ "expr": "filter_rejection_by_reason{job=\"ironcrab-momentum-bot\"}", "refId": "A", "legendFormat": "{{reason}}" }],
-      "gridPos": {"h":8,"w":6,"x":18,"y":15},
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
-    },
-    {
-      "type": "timeseries",
-      "title": "Intent Generation Rate",
-      "description": "Rate of TradeIntents generated per minute (BUY + SELL)",
+      "title": "CPU & RAM Over Time",
+      "description": "CPU- und RAM-Auslastung ueber Zeit",
       "targets": [
-        { "expr": "rate(intents_generated_total{job=\"ironcrab-momentum-bot\"}[5m]) * 60", "refId": "A", "legendFormat": "BUY/min" },
-        { "expr": "rate(exits_generated_total{job=\"ironcrab-momentum-bot\"}[5m]) * 60", "refId": "B", "legendFormat": "SELL/min" }
+        {"expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[1m])) * 100)", "refId": "A", "legendFormat": "CPU %"},
+        {"expr": "(1 - node_memory_MemAvailable_bytes{job=\"node-exporter\"} / node_memory_MemTotal_bytes{job=\"node-exporter\"}) * 100", "refId": "B", "legendFormat": "RAM %"}
       ],
-      "gridPos": {"h":4,"w":18,"x":0,"y":19},
-      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "palette-classic" } } }
-    },
-    {
-      "type": "row",
-      "title": "🧮 Arb Strategy (Port 9803)",
-      "gridPos": {"h":1,"w":24,"x":0,"y":23},
-      "collapsed": false
-    },
-    {
-      "type": "stat",
-      "title": "Market Events Consumed",
-      "targets": [{ "expr": "market_events_consumed_total{job=\"ironcrab-arb-strategy\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":6,"x":0,"y":24},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "purple" } } }
-    },
-    {
-      "type": "stat",
-      "title": "Arb Intents Published",
-      "targets": [{ "expr": "intents_generated_total{job=\"ironcrab-arb-strategy\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":6,"x":6,"y":24},
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "yellow", "value": null }, { "color": "green", "value": 1 }] } } }
-    },
-    {
-      "type": "stat",
-      "title": "Opportunities Detected",
-      "targets": [{ "expr": "arb_triangle_opportunities_total{job=\"ironcrab-arb-strategy\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":6,"x":12,"y":24},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } } }
-    },
-    {
-      "type": "timeseries",
-      "title": "Arb NATS Message Rate",
-      "description": "NATS messages received and published by market-data",
-      "targets": [
-        { "expr": "rate(nats_messages_received_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "recv/s" },
-        { "expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "B", "legendFormat": "pub/s" }
-      ],
-      "gridPos": {"h":6,"w":12,"x":12,"y":8},
-      "fieldConfig": { "defaults": { "unit": "ops" } }
-    },
-    {
-      "type": "row",
-      "title": "⚡ Execution Engine (Port 9804)",
-      "gridPos": {"h":1,"w":24,"x":0,"y":28},
-      "collapsed": false
-    },
-    {
-      "type": "stat",
-      "title": "Intents Received",
-      "targets": [{ "expr": "intents_received_total{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":0,"y":29},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } } }
-    },
-    {
-      "type": "stat",
-      "title": "Intents Executed",
-      "targets": [{ "expr": "intents_executed_total{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":4,"y":29},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } }
-    },
-    {
-      "type": "stat",
-      "title": "Intents Rejected",
-      "targets": [{ "expr": "intents_rejected_total{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":8,"y":29},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "orange" } } }
-    },
-    {
-      "type": "stat",
-      "title": "Simulation Failures",
-      "targets": [{ "expr": "simulation_failures_total{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":12,"y":29},
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "red" } } }
-    },
-    {
-      "type": "stat",
-      "title": "Available WSOL",
-      "targets": [{ "expr": "available_sol_lamports{job=\"ironcrab-execution-engine\"} / 1e9", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":16,"y":29},
-      "fieldConfig": { "defaults": { "unit": "short", "decimals": 2 } }
-    },
-    {
-      "type": "stat",
-      "title": "Active Locks",
-      "targets": [{ "expr": "active_capital_locks{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":20,"y":29}
-    },
-    {
-      "type": "stat",
-      "title": "Open Positions",
-      "targets": [{ "expr": "open_positions{job=\"ironcrab-execution-engine\"}", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":0,"y":33},
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } } }
-    },
-    {
-      "type": "stat",
-      "title": "Wallet SOL+WSOL",
-      "description": "Combined native SOL + WSOL balance",
-      "targets": [{ "expr": "wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} / 1e9", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":4,"y":33},
-      "fieldConfig": { "defaults": { "unit": "short", "decimals": 4 } }
-    },
-    {
-      "type": "stat",
-      "title": "24h Wallet Delta",
-      "description": "Wallet value change (SOL+WSOL) over last 24 hours. Requires 24h continuous uptime for accuracy — shows incorrect values after restarts until 24h of data accumulates.",
-      "targets": [{ "expr": "(wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} - wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} offset 24h) / 1e9", "refId": "A" }],
-      "gridPos": {"h":4,"w":4,"x":8,"y":33},
+      "gridPos": {"h":4,"w":12,"x":12,"y":7},
       "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "decimals": 4,
-          "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 0 }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "type": "stat",
-      "title": "24h Realized PnL",
-      "description": "Sum of realized PnL from all SELL trades in the last 24 hours",
-      "datasource": {
-        "type": "yesoreyeram-infinity-datasource",
-        "uid": "bf7ze18vokflsf"
-      },
-      "targets": [{
-        "refId": "A",
-        "type": "json",
-        "source": "url",
-        "format": "table",
-        "url": "/pnl_24h",
-        "url_options": { "method": "GET", "data": "" },
-        "columns": [
-          { "selector": "realized_pnl_sol", "text": "PnL", "type": "number" }
-        ]
-      }],
-      "gridPos": {"h":4,"w":4,"x":12,"y":33},
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "decimals": 4,
-          "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 0 }
-            ]
-          }
-        }
-      },
-      "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] }
-      }
-    },
-    {
-      "type": "stat",
-      "title": "24h Wins / Losses",
-      "description": "Win/Loss count from realized trades in last 24h",
-      "datasource": {
-        "type": "yesoreyeram-infinity-datasource",
-        "uid": "bf7ze18vokflsf"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "type": "json",
-          "source": "url",
-          "format": "table",
-          "url": "/pnl_24h",
-          "url_options": { "method": "GET", "data": "" },
-          "columns": [
-            { "selector": "wins", "text": "Wins", "type": "number" },
-            { "selector": "losses", "text": "Losses", "type": "number" },
-            { "selector": "trade_count", "text": "Total", "type": "number" }
-          ]
-        }
-      ],
-      "gridPos": {"h":4,"w":4,"x":16,"y":33},
-      "fieldConfig": { "defaults": { "unit": "short" } }
-    },
-    {
-      "type": "piechart",
-      "title": "Intent Rejection Reasons",
-      "targets": [{ "expr": "intent_rejection_by_reason{job=\"ironcrab-execution-engine\"}", "refId": "A", "legendFormat": "{{reason}}" }],
-      "gridPos": {"h":6,"w":8,"x":0,"y":37},
-      "options": { "legend": { "displayMode": "table", "placement": "right" } }
-    },
-    {
-      "type": "timeseries",
-      "title": "Execution Rate",
-      "targets": [
-        { "expr": "rate(intents_executed_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "A", "legendFormat": "executed/min" },
-        { "expr": "rate(intents_rejected_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "B", "legendFormat": "rejected/min" }
-      ],
-      "gridPos": {"h":6,"w":8,"x":8,"y":37},
-      "fieldConfig": { "defaults": { "unit": "short" } }
-    },
-    {
-      "type": "timeseries",
-      "title": "TX Send Methods",
-      "targets": [
-        { "expr": "rate(tx_send_tpu_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "A", "legendFormat": "TPU Direct" },
-        { "expr": "rate(tx_send_jito_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "B", "legendFormat": "Jito Bundle" },
-        { "expr": "rate(tx_send_rpc_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "C", "legendFormat": "RPC Fallback" }
-      ],
-      "gridPos": {"h":6,"w":8,"x":16,"y":37},
-      "fieldConfig": {
-        "defaults": { "unit": "short" },
+        "defaults": {"unit": "percent", "min": 0, "max": 100, "decimals": 1, "custom": {"fillOpacity": 10, "lineWidth": 2}},
         "overrides": [
-          { "matcher": { "id": "byName", "options": "TPU Direct" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }] },
-          { "matcher": { "id": "byName", "options": "Jito Bundle" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }] },
-          { "matcher": { "id": "byName", "options": "RPC Fallback" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }] }
+          {"matcher": {"id": "byName", "options": "CPU %"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]},
+          {"matcher": {"id": "byName", "options": "RAM %"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]}
         ]
       }
     },
     {
-      "type": "timeseries",
-      "title": "Simulation Failure Rate",
-      "targets": [{ "expr": "rate(simulation_failures_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "A", "legendFormat": "sim failures/min" }],
-      "gridPos": {"h":6,"w":8,"x":0,"y":43},
-      "fieldConfig": { "defaults": { "unit": "short" } }
+      "type": "row",
+      "title": "Pipeline Health",
+      "gridPos": {"h":1,"w":24,"x":0,"y":11},
+      "collapsed": false
     },
     {
-      "type": "table",
-      "title": "📋 Recent Trades (Current Run)",
-      "gridPos": {"h":12,"w":24,"x":0,"y":43},
-      "datasource": {
-        "type": "yesoreyeram-infinity-datasource",
-        "uid": "bf7ze18vokflsf"
-      },
-      "targets": [{
-        "refId": "A",
-        "type": "json",
-        "source": "url",
-        "format": "table",
-        "url": "/trades?mode=run",
-        "url_options": {
-          "method": "GET",
-          "data": ""
-        },
-        "root_selector": "",
-        "columns": [
-          { "selector": "timestamp_ms", "text": "Time", "type": "timestamp_epoch" },
-          { "selector": "action", "text": "Action", "type": "string" },
-          { "selector": "mint", "text": "Token (Mint)", "type": "string" },
-          { "selector": "tx_hash", "text": "TX Hash", "type": "string" },
-          { "selector": "amount_tokens", "text": "Amount", "type": "number" },
-          { "selector": "value_sol", "text": "Value (SOL)", "type": "number" },
-          { "selector": "pnl_sol", "text": "PnL (SOL)", "type": "number" },
-          { "selector": "pnl_pct", "text": "PnL %", "type": "number" },
-          { "selector": "reason", "text": "Reason", "type": "string" },
-          { "selector": "reason_detail", "text": "Detail", "type": "string" }
+      "type": "stat", "title": "market-data", "description": "Geyser event ingest service",
+      "targets": [{"expr": "up{job=\"ironcrab-market-data\"}", "refId": "A"}],
+      "gridPos": {"h":3,"w":4,"x":0,"y":12},
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"1": {"text": "UP", "color": "green"}}}, {"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}}}]}}
+    },
+    {
+      "type": "stat", "title": "momentum-bot", "description": "Strategy plane - 4-Filter policy",
+      "targets": [{"expr": "up{job=\"ironcrab-momentum-bot\"}", "refId": "A"}],
+      "gridPos": {"h":3,"w":4,"x":4,"y":12},
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"1": {"text": "UP", "color": "green"}}}, {"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}}}]}}
+    },
+    {
+      "type": "stat", "title": "arb-strategy", "description": "Typ A market-driven arbitrage strategy",
+      "targets": [{"expr": "up{job=\"ironcrab-arb-strategy\"}", "refId": "A"}],
+      "gridPos": {"h":3,"w":4,"x":8,"y":12},
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"1": {"text": "UP", "color": "green"}}}, {"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}}}]}}
+    },
+    {
+      "type": "stat", "title": "execution-engine", "description": "Single-signer execution service",
+      "targets": [{"expr": "up{job=\"ironcrab-execution-engine\"}", "refId": "A"}],
+      "gridPos": {"h":3,"w":4,"x":12,"y":12},
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"1": {"text": "UP", "color": "green"}}}, {"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}}}]}}
+    },
+    {
+      "type": "stat", "title": "Events Published", "description": "Total market events published",
+      "targets": [{"expr": "market_events_published_total{job=\"ironcrab-market-data\"}", "refId": "A"}],
+      "gridPos": {"h":3,"w":4,"x":16,"y":12},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "blue"}}}
+    },
+    {
+      "type": "stat", "title": "Events Consumed", "description": "Market events consumed by momentum-bot",
+      "targets": [{"expr": "market_events_consumed_total{job=\"ironcrab-momentum-bot\"}", "refId": "A"}],
+      "gridPos": {"h":3,"w":4,"x":20,"y":12},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "purple"}}}
+    },
+    {
+      "type": "stat", "title": "NATS Messages", "description": "Total NATS messages published",
+      "targets": [{"expr": "nats_messages_published_total{job=\"ironcrab-market-data\"}", "refId": "A"}],
+      "gridPos": {"h":3,"w":4,"x":0,"y":15},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "green"}}}
+    },
+    {
+      "type": "row", "title": "Market Data Service (Port 9801)",
+      "gridPos": {"h":1,"w":24,"x":0,"y":18}, "collapsed": false
+    },
+    {
+      "type": "timeseries", "title": "Event Publish Rate", "description": "Market events published by market-data service",
+      "targets": [{"expr": "rate(market_events_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "events/s"}],
+      "gridPos": {"h":6,"w":12,"x":0,"y":19},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "ops"}}
+    },
+    {
+      "type": "timeseries", "title": "NATS Message Rate", "description": "NATS messages published by market-data",
+      "targets": [{"expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "msgs/s"}],
+      "gridPos": {"h":6,"w":12,"x":12,"y":19},
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "type": "row", "title": "Momentum Bot (Port 9802) - 4-Filter Policy",
+      "gridPos": {"h":1,"w":24,"x":0,"y":25}, "collapsed": false
+    },
+    {
+      "type": "stat", "title": "Tokens Tracked", "description": "Tokens currently being observed by momentum-bot",
+      "targets": [{"expr": "tokens_tracked_total{job=\"ironcrab-momentum-bot\"}", "refId": "A"}],
+      "gridPos": {"h":4,"w":4,"x":0,"y":26},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "orange"}}}
+    },
+    {
+      "type": "stat", "title": "Pools Tracked", "description": "Pools currently being observed by momentum-bot",
+      "targets": [{"expr": "pools_tracked_total{job=\"ironcrab-momentum-bot\"}", "refId": "A"}],
+      "gridPos": {"h":4,"w":4,"x":4,"y":26},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "purple"}}}
+    },
+    {"type": "stat", "title": "Total Intents", "targets": [{"expr": "intents_generated_total{job=\"ironcrab-momentum-bot\"} + exits_generated_total{job=\"ironcrab-momentum-bot\"}", "refId": "A"}], "gridPos": {"h":4,"w":2,"x":8,"y":26}, "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "blue"}}}},
+    {"type": "stat", "title": "BUY Intents", "targets": [{"expr": "intents_generated_total{job=\"ironcrab-momentum-bot\"}", "refId": "A"}], "gridPos": {"h":4,"w":2,"x":10,"y":26}, "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "green"}}}},
+    {"type": "stat", "title": "SELL Intents", "targets": [{"expr": "exits_generated_total{job=\"ironcrab-momentum-bot\"}", "refId": "A"}], "gridPos": {"h":4,"w":2,"x":12,"y":26}, "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "orange"}}}},
+    {"type": "stat", "title": "4-Filter Passed", "targets": [{"expr": "filter_passed_total{job=\"ironcrab-momentum-bot\"}", "refId": "A"}], "gridPos": {"h":4,"w":2,"x":14,"y":26}, "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "green"}}}},
+    {"type": "stat", "title": "4-Filter Rejected", "targets": [{"expr": "filter_rejected_total{job=\"ironcrab-momentum-bot\"}", "refId": "A"}], "gridPos": {"h":4,"w":2,"x":16,"y":26}, "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "red"}}}},
+    {
+      "type": "piechart", "title": "Filter Rejection Reasons",
+      "targets": [{"expr": "filter_rejection_by_reason{job=\"ironcrab-momentum-bot\"}", "refId": "A", "legendFormat": "{{reason}}"}],
+      "gridPos": {"h":8,"w":6,"x":18,"y":26},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}}
+    },
+    {
+      "type": "timeseries", "title": "Intent Generation Rate",
+      "targets": [
+        {"expr": "rate(intents_generated_total{job=\"ironcrab-momentum-bot\"}[5m]) * 60", "refId": "A", "legendFormat": "BUY/min"},
+        {"expr": "rate(exits_generated_total{job=\"ironcrab-momentum-bot\"}[5m]) * 60", "refId": "B", "legendFormat": "SELL/min"}
+      ],
+      "gridPos": {"h":4,"w":18,"x":0,"y":30},
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "palette-classic"}}}
+    },
+    {
+      "type": "row", "title": "Arb Strategy (Port 9803)",
+      "gridPos": {"h":1,"w":24,"x":0,"y":34}, "collapsed": false
+    },
+    {"type": "stat", "title": "Market Events Consumed", "targets": [{"expr": "market_events_consumed_total{job=\"ironcrab-arb-strategy\"}", "refId": "A"}], "gridPos": {"h":4,"w":6,"x":0,"y":35}, "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "purple"}}}},
+    {"type": "stat", "title": "Arb Intents Published", "targets": [{"expr": "intents_generated_total{job=\"ironcrab-arb-strategy\"}", "refId": "A"}], "gridPos": {"h":4,"w":6,"x":6,"y":35}, "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "yellow", "value": null}, {"color": "green", "value": 1}]}}}},
+    {"type": "stat", "title": "Opportunities Detected", "targets": [{"expr": "arb_triangle_opportunities_total{job=\"ironcrab-arb-strategy\"}", "refId": "A"}], "gridPos": {"h":4,"w":6,"x":12,"y":35}, "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "blue"}}}},
+    {
+      "type": "timeseries", "title": "Arb NATS Message Rate",
+      "targets": [
+        {"expr": "rate(nats_messages_received_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "recv/s"},
+        {"expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "B", "legendFormat": "pub/s"}
+      ],
+      "gridPos": {"h":6,"w":12,"x":12,"y":19},
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "type": "row", "title": "Execution Engine (Port 9804)",
+      "gridPos": {"h":1,"w":24,"x":0,"y":39}, "collapsed": false
+    },
+    {"type": "stat", "title": "Intents Received", "targets": [{"expr": "intents_received_total{job=\"ironcrab-execution-engine\"}", "refId": "A"}], "gridPos": {"h":4,"w":4,"x":0,"y":40}, "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "blue"}}}},
+    {"type": "stat", "title": "Intents Executed", "targets": [{"expr": "intents_executed_total{job=\"ironcrab-execution-engine\"}", "refId": "A"}], "gridPos": {"h":4,"w":4,"x":4,"y":40}, "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "green"}}}},
+    {"type": "stat", "title": "Intents Rejected", "targets": [{"expr": "intents_rejected_total{job=\"ironcrab-execution-engine\"}", "refId": "A"}], "gridPos": {"h":4,"w":4,"x":8,"y":40}, "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "orange"}}}},
+    {"type": "stat", "title": "Simulation Failures", "targets": [{"expr": "simulation_failures_total{job=\"ironcrab-execution-engine\"}", "refId": "A"}], "gridPos": {"h":4,"w":4,"x":12,"y":40}, "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "red"}}}},
+    {"type": "stat", "title": "Available WSOL", "targets": [{"expr": "available_sol_lamports{job=\"ironcrab-execution-engine\"} / 1e9", "refId": "A"}], "gridPos": {"h":4,"w":4,"x":16,"y":40}, "fieldConfig": {"defaults": {"unit": "short", "decimals": 2}}},
+    {"type": "stat", "title": "Active Locks", "targets": [{"expr": "active_capital_locks{job=\"ironcrab-execution-engine\"}", "refId": "A"}], "gridPos": {"h":4,"w":4,"x":20,"y":40}},
+    {"type": "stat", "title": "Open Positions", "targets": [{"expr": "open_positions{job=\"ironcrab-execution-engine\"}", "refId": "A"}], "gridPos": {"h":4,"w":4,"x":0,"y":44}, "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 5}]}}}},
+    {"type": "stat", "title": "Wallet SOL+WSOL", "description": "Combined native SOL + WSOL balance", "targets": [{"expr": "wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} / 1e9", "refId": "A"}], "gridPos": {"h":4,"w":4,"x":4,"y":44}, "fieldConfig": {"defaults": {"unit": "short", "decimals": 4}}},
+    {
+      "type": "stat", "title": "24h Wallet Delta",
+      "description": "Wallet value change (SOL+WSOL) over last 24 hours",
+      "targets": [{"expr": "(wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} - wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} offset 24h) / 1e9", "refId": "A"}],
+      "gridPos": {"h":4,"w":4,"x":8,"y":44},
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 4, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 0}]}}}
+    },
+    {
+      "type": "stat", "title": "24h Realized PnL",
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "bf7ze18vokflsf"},
+      "targets": [{"refId": "A", "type": "json", "source": "url", "format": "table", "url": "/pnl_24h", "url_options": {"method": "GET", "data": ""}, "columns": [{"selector": "realized_pnl_sol", "text": "PnL", "type": "number"}]}],
+      "gridPos": {"h":4,"w":4,"x":12,"y":44},
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 4, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 0}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "type": "stat", "title": "24h Wins / Losses",
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "bf7ze18vokflsf"},
+      "targets": [{"refId": "A", "type": "json", "source": "url", "format": "table", "url": "/pnl_24h", "url_options": {"method": "GET", "data": ""}, "columns": [{"selector": "wins", "text": "Wins", "type": "number"}, {"selector": "losses", "text": "Losses", "type": "number"}, {"selector": "trade_count", "text": "Total", "type": "number"}]}],
+      "gridPos": {"h":4,"w":4,"x":16,"y":44},
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "type": "piechart", "title": "Intent Rejection Reasons",
+      "targets": [{"expr": "intent_rejection_by_reason{job=\"ironcrab-execution-engine\"}", "refId": "A", "legendFormat": "{{reason}}"}],
+      "gridPos": {"h":6,"w":8,"x":0,"y":48},
+      "options": {"legend": {"displayMode": "table", "placement": "right"}}
+    },
+    {
+      "type": "timeseries", "title": "Execution Rate",
+      "targets": [
+        {"expr": "rate(intents_executed_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "A", "legendFormat": "executed/min"},
+        {"expr": "rate(intents_rejected_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "B", "legendFormat": "rejected/min"}
+      ],
+      "gridPos": {"h":6,"w":8,"x":8,"y":48},
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "type": "timeseries", "title": "TX Send Methods",
+      "targets": [
+        {"expr": "rate(tx_send_tpu_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "A", "legendFormat": "TPU Direct"},
+        {"expr": "rate(tx_send_jito_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "B", "legendFormat": "Jito Bundle"},
+        {"expr": "rate(tx_send_rpc_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "C", "legendFormat": "RPC Fallback"}
+      ],
+      "gridPos": {"h":6,"w":8,"x":16,"y":48},
+      "fieldConfig": {
+        "defaults": {"unit": "short"},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "TPU Direct"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "Jito Bundle"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+          {"matcher": {"id": "byName", "options": "RPC Fallback"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
         ]
-      }],
+      }
+    },
+    {
+      "type": "timeseries", "title": "Simulation Failure Rate",
+      "targets": [{"expr": "rate(simulation_failures_total{job=\"ironcrab-execution-engine\"}[5m]) * 60", "refId": "A", "legendFormat": "sim failures/min"}],
+      "gridPos": {"h":6,"w":8,"x":0,"y":54},
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "type": "table", "title": "Recent Trades (Current Run)",
+      "gridPos": {"h":12,"w":24,"x":0,"y":54},
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "bf7ze18vokflsf"},
+      "targets": [{"refId": "A", "type": "json", "source": "url", "format": "table", "url": "/trades?mode=run", "url_options": {"method": "GET", "data": ""}, "root_selector": "", "columns": [{"selector": "timestamp_ms", "text": "Time", "type": "timestamp_epoch"}, {"selector": "action", "text": "Action", "type": "string"}, {"selector": "mint", "text": "Token (Mint)", "type": "string"}, {"selector": "tx_hash", "text": "TX Hash", "type": "string"}, {"selector": "amount_tokens", "text": "Amount", "type": "number"}, {"selector": "value_sol", "text": "Value (SOL)", "type": "number"}, {"selector": "pnl_sol", "text": "PnL (SOL)", "type": "number"}, {"selector": "pnl_pct", "text": "PnL %", "type": "number"}, {"selector": "reason", "text": "Reason", "type": "string"}, {"selector": "reason_detail", "text": "Detail", "type": "string"}]}],
       "fieldConfig": {
         "defaults": {},
         "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "Time" },
-            "properties": [{ "id": "unit", "value": "dateTimeFromNow" }]
-          },
-          {
-            "matcher": { "id": "byName", "options": "Action" },
-            "properties": [
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-text"
-                }
-              },
-              {
-                "id": "mappings",
-                "value": [
-                  { "type": "value", "options": { "BUY": { "color": "green", "text": "🟢 BUY" } } },
-                  { "type": "value", "options": { "SELL": { "color": "orange", "text": "🟠 SELL" } } }
-                ]
-              }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "Token (Mint)" },
-            "properties": [
-              { "id": "custom.width", "value": 120 },
-              {
-                "id": "links",
-                "value": [
-                  {
-                    "title": "View on Solscan",
-                    "url": "https://solscan.io/token/${__value.text}",
-                    "targetBlank": true
-                  }
-                ]
-              }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "TX Hash" },
-            "properties": [
-              { "id": "custom.width", "value": 100 },
-              {
-                "id": "links",
-                "value": [
-                  {
-                    "title": "View TX on Solscan",
-                    "url": "https://solscan.io/tx/${__value.text}",
-                    "targetBlank": true
-                  }
-                ]
-              }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "Value (SOL)" },
-            "properties": [{ "id": "decimals", "value": 12 }]
-          },
-          {
-            "matcher": { "id": "byName", "options": "PnL (SOL)" },
-            "properties": [
-              { "id": "decimals", "value": 6 },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    { "color": "red", "value": null },
-                    { "color": "green", "value": 0 }
-                  ]
-                }
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": { "type": "color-text" }
-              }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "PnL %" },
-            "properties": [
-              { "id": "unit", "value": "percent" },
-              { "id": "decimals", "value": 2 },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    { "color": "red", "value": null },
-                    { "color": "green", "value": 0 }
-                  ]
-                }
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": { "type": "color-text" }
-              }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "Reason" },
-            "properties": [
-              { "id": "custom.width", "value": 200 },
-              {
-                "id": "custom.cellOptions",
-                "value": { "type": "color-text" }
-              },
-              {
-                "id": "mappings",
-                "value": [
-                  { "type": "value", "options": { "Enter_probe": { "color": "blue", "text": "🔵 ENTER_PROBE" } } },
-                  { "type": "value", "options": { "Enter_scale_in": { "color": "purple", "text": "🟣 ENTER_SCALE_IN" } } },
-                  { "type": "value", "options": { "LIQUIDATION": { "color": "red", "text": "🔴 LIQUIDATION" } } },
-                  { "type": "value", "options": { "KILL_SWITCH": { "color": "red", "text": "🔴 KILL_SWITCH" } } },
-                  { "type": "value", "options": { "DEV_SELL": { "color": "red", "text": "🔴 DEV_SELL" } } },
-                  { "type": "value", "options": { "STOP_LOSS": { "color": "orange", "text": "🟠 STOP_LOSS" } } },
-                  { "type": "value", "options": { "TAKE_PROFIT": { "color": "green", "text": "🟢 TAKE_PROFIT" } } },
-                  { "type": "value", "options": { "LP_REMOVAL": { "color": "purple", "text": "🟣 LP_REMOVAL" } } },
-                  { "type": "value", "options": { "TIME_EXIT": { "color": "blue", "text": "🔵 TIMED_EXIT" } } },
-                  { "type": "value", "options": { "TRAILING_STOP": { "color": "yellow", "text": "🟡 TRAILING_STOP" } } },
-                  { "type": "value", "options": { "MOMENTUM_EXIT": { "color": "purple", "text": "🟣 MOMENTUM_EXIT" } } },
-                  { "type": "value", "options": { "BONDING_CURVE_EXIT": { "color": "yellow", "text": "🟡 BONDING_CURVE_EXIT" } } },
-                  { "type": "value", "options": { "ENTER_PROBE": { "color": "blue", "text": "🔵 ENTER_PROBE" } } },
-                  { "type": "value", "options": { "ENTER_SCALE_IN": { "color": "purple", "text": "🟣 ENTER_SCALE_IN" } } }
-                ]
-              }
-            ]
-          },
-          {
-            "matcher": { "id": "byName", "options": "Detail" },
-            "properties": [
-              { "id": "custom.width", "value": 300 }
-            ]
-          }
+          {"matcher": {"id": "byName", "options": "Time"}, "properties": [{"id": "unit", "value": "dateTimeFromNow"}]},
+          {"matcher": {"id": "byName", "options": "Action"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-text"}}, {"id": "mappings", "value": [{"type": "value", "options": {"BUY": {"color": "green", "text": "BUY"}}}, {"type": "value", "options": {"SELL": {"color": "orange", "text": "SELL"}}}]}]},
+          {"matcher": {"id": "byName", "options": "Token (Mint)"}, "properties": [{"id": "custom.width", "value": 120}, {"id": "links", "value": [{"title": "View on Solscan", "url": "https://solscan.io/token/${__value.text}", "targetBlank": true}]}]},
+          {"matcher": {"id": "byName", "options": "TX Hash"}, "properties": [{"id": "custom.width", "value": 100}, {"id": "links", "value": [{"title": "View TX on Solscan", "url": "https://solscan.io/tx/${__value.text}", "targetBlank": true}]}]},
+          {"matcher": {"id": "byName", "options": "Value (SOL)"}, "properties": [{"id": "decimals", "value": 12}]},
+          {"matcher": {"id": "byName", "options": "PnL (SOL)"}, "properties": [{"id": "decimals", "value": 6}, {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 0}]}}, {"id": "custom.cellOptions", "value": {"type": "color-text"}}]},
+          {"matcher": {"id": "byName", "options": "PnL %"}, "properties": [{"id": "unit", "value": "percent"}, {"id": "decimals", "value": 2}, {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 0}]}}, {"id": "custom.cellOptions", "value": {"type": "color-text"}}]},
+          {"matcher": {"id": "byName", "options": "Reason"}, "properties": [{"id": "custom.width", "value": 200}, {"id": "custom.cellOptions", "value": {"type": "color-text"}}, {"id": "mappings", "value": [{"type": "value", "options": {"Enter_probe": {"color": "blue", "text": "ENTER_PROBE"}}}, {"type": "value", "options": {"LIQUIDATION": {"color": "red", "text": "LIQUIDATION"}}}, {"type": "value", "options": {"KILL_SWITCH": {"color": "red", "text": "KILL_SWITCH"}}}, {"type": "value", "options": {"DEV_SELL": {"color": "red", "text": "DEV_SELL"}}}, {"type": "value", "options": {"STOP_LOSS": {"color": "orange", "text": "STOP_LOSS"}}}, {"type": "value", "options": {"TAKE_PROFIT": {"color": "green", "text": "TAKE_PROFIT"}}}, {"type": "value", "options": {"LP_REMOVAL": {"color": "purple", "text": "LP_REMOVAL"}}}, {"type": "value", "options": {"TIME_EXIT": {"color": "blue", "text": "TIMED_EXIT"}}}, {"type": "value", "options": {"TRAILING_STOP": {"color": "yellow", "text": "TRAILING_STOP"}}}, {"type": "value", "options": {"MOMENTUM_EXIT": {"color": "purple", "text": "MOMENTUM_EXIT"}}}, {"type": "value", "options": {"BONDING_CURVE_EXIT": {"color": "yellow", "text": "BONDING_CURVE_EXIT"}}}, {"type": "value", "options": {"ENTER_PROBE": {"color": "blue", "text": "ENTER_PROBE"}}}, {"type": "value", "options": {"ENTER_SCALE_IN": {"color": "purple", "text": "ENTER_SCALE_IN"}}}]}]},
+          {"matcher": {"id": "byName", "options": "Detail"}, "properties": [{"id": "custom.width", "value": 300}]}
         ]
       },
-      "options": {
-        "showHeader": true,
-        "sortBy": [{ "displayName": "Time", "desc": true }]
-      }
+      "options": {"showHeader": true, "sortBy": [{"displayName": "Time", "desc": true}]}
     },
     {
-      "type": "row",
-      "title": "🔗 NATS Message Flow",
-      "gridPos": {"h":1,"w":24,"x":0,"y":55},
-      "collapsed": false
+      "type": "row", "title": "NATS Message Flow",
+      "gridPos": {"h":1,"w":24,"x":0,"y":66}, "collapsed": false
     },
     {
-      "type": "timeseries",
-      "title": "NATS Message Rates",
+      "type": "timeseries", "title": "NATS Message Rates",
       "targets": [
-        { "expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "market-data pub" },
-        { "expr": "rate(nats_messages_published_total{job=\"ironcrab-momentum-bot\"}[1m])", "refId": "B", "legendFormat": "momentum-bot pub" },
-        { "expr": "rate(nats_messages_published_total{job=\"ironcrab-arb-strategy\"}[1m])", "refId": "D", "legendFormat": "arb-strategy pub" },
-        { "expr": "rate(nats_messages_received_total{job=\"ironcrab-execution-engine\"}[1m])", "refId": "C", "legendFormat": "exec-engine recv" }
+        {"expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])", "refId": "A", "legendFormat": "market-data pub"},
+        {"expr": "rate(nats_messages_published_total{job=\"ironcrab-momentum-bot\"}[1m])", "refId": "B", "legendFormat": "momentum-bot pub"},
+        {"expr": "rate(nats_messages_published_total{job=\"ironcrab-arb-strategy\"}[1m])", "refId": "D", "legendFormat": "arb-strategy pub"},
+        {"expr": "rate(nats_messages_received_total{job=\"ironcrab-execution-engine\"}[1m])", "refId": "C", "legendFormat": "exec-engine recv"}
       ],
-      "gridPos": {"h":6,"w":12,"x":0,"y":56},
-      "fieldConfig": { "defaults": { "unit": "ops" } }
+      "gridPos": {"h":6,"w":12,"x":0,"y":67},
+      "fieldConfig": {"defaults": {"unit": "ops"}}
     },
-    {
-      "type": "stat",
-      "title": "NATS Reconnects",
-      "targets": [{ "expr": "sum(nats_reconnects_total)", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":12,"y":56},
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } } }
-    },
-    {
-      "type": "stat",
-      "title": "NATS Errors",
-      "targets": [{ "expr": "sum(nats_errors_total)", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":16,"y":56},
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } } }
-    },
-    {
-      "type": "stat",
-      "title": "Total Published",
-      "targets": [{ "expr": "sum(nats_messages_published_total)", "refId": "A" }],
-      "gridPos": {"h":3,"w":4,"x":20,"y":56}
-    }
+    {"type": "stat", "title": "NATS Reconnects", "targets": [{"expr": "sum(nats_reconnects_total)", "refId": "A"}], "gridPos": {"h":3,"w":4,"x":12,"y":67}, "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 5}]}}}},
+    {"type": "stat", "title": "NATS Errors", "targets": [{"expr": "sum(nats_errors_total)", "refId": "A"}], "gridPos": {"h":3,"w":4,"x":16,"y":67}, "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}}},
+    {"type": "stat", "title": "Total Published", "targets": [{"expr": "sum(nats_messages_published_total)", "refId": "A"}], "gridPos": {"h":3,"w":4,"x":20,"y":67}}
   ]
 }

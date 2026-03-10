@@ -42,8 +42,8 @@ scrape_configs:
       - targets: ['localhost:7777']
     metrics_path: /metrics
 
-  # Legacy Monolith (if still running)
-  - job_name: 'ironcrab-monolith'
+  # Node Exporter (Server Infrastructure: CPU, Disk, Memory, Network)
+  - job_name: 'node-exporter'
     static_configs:
-      - targets: ['localhost:9898']
+      - targets: ['localhost:9100']
     metrics_path: /metrics
