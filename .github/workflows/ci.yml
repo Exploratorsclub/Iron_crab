@@ -72,8 +72,8 @@ jobs:
     name: Eval (Level 5)
     needs: [build-test]
     if: |
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release'))) ||
-      (github.event_name == 'pull_request' && github.base_ref == 'main' && github.repository == github.event.pull_request.head.repo.full_name)
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/architecture-rebuild' || startsWith(github.ref, 'refs/heads/release'))) ||
+      (github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'architecture-rebuild') && github.repository == github.event.pull_request.head.repo.full_name)
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: 0
