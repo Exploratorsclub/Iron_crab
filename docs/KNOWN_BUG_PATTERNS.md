@@ -226,6 +226,16 @@
 
 ---
 
+## 23. Non-Atomic SOL/WSOL Wallet Updates — Falsche wallet_total_sol_lamports Metrik
+
+| Symptom | 24h Wallet Delta zeigt grossen positiven Wert obwohl alle TX fehlgeschlagen. WSOL Wrap/Unwrap veraendert das scheinbare Delta. |
+|---------|--------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Event-Handler fuer NATIVE_SOL und WSOL riefen beide `update_wallet_balances()` auf und ueberschrieben dabei den jeweils anderen Wert mit einem veralteten Snapshot. WSOL-Handler las zudem `total_native_sol()` (inkl. Capital-Locks) und schrieb es als `available_sol` zurueck — Doppelzaehlung bei aktiven Locks. |
+| **Fix** | Neue Methoden `update_native_sol_only()` und `update_wsol_only()` in LockManager. Jeder Event-Handler aktualisiert nur seinen eigenen Wert. Grafana-Query nutzt `avg_over_time([5m])` statt Einzelpunkt. |
+| **Pruefen bei** | WalletBalanceSnapshot Handler, LockManager Balance-Updates, Grafana Wallet-Metriken |
+
+---
+
 ## Quick-Check: Bei neuem Bug
 
 1. Sieht das wie eines der Muster oben?

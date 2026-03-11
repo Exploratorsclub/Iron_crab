@@ -5779,18 +5779,16 @@ async fn main() -> Result<()> {
                                                 if let MarketEventKind::WalletBalanceSnapshot { mint, balance_raw, decimals, .. } = &event.kind {
                                                     if mint == "NATIVE_SOL" {
                                                         // Native SOL sentinel: update LockManager wallet balance
-                                                        let wsol = ctx.lock_manager.wsol_balance();
-                                                        let wsol_opt = if wsol > 0 { Some(wsol) } else { None };
-                                                        ctx.lock_manager.update_wallet_balances(*balance_raw, wsol_opt);
+                                                        ctx.lock_manager.update_native_sol_only(*balance_raw);
                                                         if let Some(ref tx) = ctx.wsol_balance_tx {
                                                             let wsol = ctx.lock_manager.wsol_balance();
                                                             let _ = tx.try_send((*balance_raw, Some(wsol)));
                                                         }
                                                     } else if mint == WSOL_MINT || mint == SOL_MINT {
                                                         // WSOL balance update: update LockManager wallet balance
-                                                        let sol = ctx.lock_manager.total_native_sol();
-                                                        ctx.lock_manager.update_wallet_balances(sol, Some(*balance_raw));
+                                                        ctx.lock_manager.update_wsol_only(*balance_raw);
                                                         if let Some(ref tx) = ctx.wsol_balance_tx {
+                                                            let sol = ctx.lock_manager.total_native_sol();
                                                             let _ = tx.try_send((sol, Some(*balance_raw)));
                                                         }
                                                     } else {

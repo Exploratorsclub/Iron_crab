@@ -433,6 +433,20 @@ impl LockManager {
         );
     }
 
+    /// Update only native SOL balance (from Geyser NATIVE_SOL event).
+    /// Does NOT touch WSOL — each event handler only updates its own value.
+    pub fn update_native_sol_only(&self, sol_lamports: u64) {
+        *self.available_sol.write() = sol_lamports;
+    }
+
+    /// Update only WSOL balance (from Geyser WSOL event).
+    /// Does NOT touch native SOL — each event handler only updates its own value.
+    pub fn update_wsol_only(&self, wsol_lamports: u64) {
+        *self.available_wsol.write() = wsol_lamports;
+        self.wsol_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Get current available WSOL (for trades/dashboard)
     pub fn available_wsol(&self) -> u64 {
         *self.available_wsol.read()

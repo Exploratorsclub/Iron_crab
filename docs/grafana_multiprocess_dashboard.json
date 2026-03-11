@@ -1591,7 +1591,7 @@
       "description": "Wallet value change (SOL+WSOL) over last 24 hours",
       "targets": [
         {
-          "expr": "(wallet_total_sol_lamports{job=\"execution-engine\"} - wallet_total_sol_lamports{job=\"execution-engine\"} offset 24h) / 1e9",
+          "expr": "(avg_over_time(wallet_total_sol_lamports{job=\"execution-engine\"}[5m]) - avg_over_time(wallet_total_sol_lamports{job=\"execution-engine\"}[5m] offset 24h)) / 1e9",
           "refId": "A"
         }
       ],
