@@ -728,7 +728,7 @@
       "description": "Geyser event ingest service",
       "targets": [
         {
-          "expr": "up{job=\"ironcrab-market-data\"}",
+          "expr": "up{job=\"market-data\"}",
           "refId": "A"
         }
       ],
@@ -769,7 +769,7 @@
       "description": "Strategy plane - 4-Filter policy",
       "targets": [
         {
-          "expr": "up{job=\"ironcrab-momentum-bot\"}",
+          "expr": "up{job=\"momentum-bot\"}",
           "refId": "A"
         }
       ],
@@ -810,7 +810,7 @@
       "description": "Typ A market-driven arbitrage strategy",
       "targets": [
         {
-          "expr": "up{job=\"ironcrab-arb-strategy\"}",
+          "expr": "up{job=\"arb-strategy\"}",
           "refId": "A"
         }
       ],
@@ -851,7 +851,7 @@
       "description": "Single-signer execution service",
       "targets": [
         {
-          "expr": "up{job=\"ironcrab-execution-engine\"}",
+          "expr": "up{job=\"execution-engine\"}",
           "refId": "A"
         }
       ],
@@ -892,7 +892,7 @@
       "description": "Total market events published",
       "targets": [
         {
-          "expr": "market_events_published_total{job=\"ironcrab-market-data\"}",
+          "expr": "market_events_published_total{job=\"market-data\"}",
           "refId": "A"
         }
       ],
@@ -917,7 +917,7 @@
       "description": "Market events consumed by momentum-bot",
       "targets": [
         {
-          "expr": "market_events_consumed_total{job=\"ironcrab-momentum-bot\"}",
+          "expr": "market_events_consumed_total{job=\"momentum-bot\"}",
           "refId": "A"
         }
       ],
@@ -942,7 +942,7 @@
       "description": "Total NATS messages published",
       "targets": [
         {
-          "expr": "nats_messages_published_total{job=\"ironcrab-market-data\"}",
+          "expr": "nats_messages_published_total{job=\"market-data\"}",
           "refId": "A"
         }
       ],
@@ -978,7 +978,7 @@
       "description": "Market events published by market-data service",
       "targets": [
         {
-          "expr": "rate(market_events_published_total{job=\"ironcrab-market-data\"}[1m])",
+          "expr": "rate(market_events_published_total{job=\"market-data\"}[1m])",
           "refId": "A",
           "legendFormat": "events/s"
         }
@@ -1004,7 +1004,7 @@
       "description": "NATS messages published by market-data",
       "targets": [
         {
-          "expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])",
+          "expr": "rate(nats_messages_published_total{job=\"market-data\"}[1m])",
           "refId": "A",
           "legendFormat": "msgs/s"
         }
@@ -1038,7 +1038,7 @@
       "description": "Tokens currently being observed by momentum-bot",
       "targets": [
         {
-          "expr": "tokens_tracked_total{job=\"ironcrab-momentum-bot\"}",
+          "expr": "tokens_tracked_total{job=\"momentum-bot\"}",
           "refId": "A"
         }
       ],
@@ -1063,7 +1063,7 @@
       "description": "Pools currently being observed by momentum-bot",
       "targets": [
         {
-          "expr": "pools_tracked_total{job=\"ironcrab-momentum-bot\"}",
+          "expr": "pools_tracked_total{job=\"momentum-bot\"}",
           "refId": "A"
         }
       ],
@@ -1087,7 +1087,7 @@
       "title": "Total Intents",
       "targets": [
         {
-          "expr": "intents_generated_total{job=\"ironcrab-momentum-bot\"} + exits_generated_total{job=\"ironcrab-momentum-bot\"}",
+          "expr": "intents_generated_total{job=\"momentum-bot\"} + exits_generated_total{job=\"momentum-bot\"}",
           "refId": "A"
         }
       ],
@@ -1111,7 +1111,7 @@
       "title": "BUY Intents",
       "targets": [
         {
-          "expr": "intents_generated_total{job=\"ironcrab-momentum-bot\"}",
+          "expr": "intents_generated_total{job=\"momentum-bot\"}",
           "refId": "A"
         }
       ],
@@ -1135,7 +1135,7 @@
       "title": "SELL Intents",
       "targets": [
         {
-          "expr": "exits_generated_total{job=\"ironcrab-momentum-bot\"}",
+          "expr": "exits_generated_total{job=\"momentum-bot\"}",
           "refId": "A"
         }
       ],
@@ -1159,7 +1159,7 @@
       "title": "4-Filter Passed",
       "targets": [
         {
-          "expr": "filter_passed_total{job=\"ironcrab-momentum-bot\"}",
+          "expr": "filter_passed_total{job=\"momentum-bot\"}",
           "refId": "A"
         }
       ],
@@ -1183,7 +1183,7 @@
       "title": "4-Filter Rejected",
       "targets": [
         {
-          "expr": "filter_rejected_total{job=\"ironcrab-momentum-bot\"}",
+          "expr": "filter_rejected_total{job=\"momentum-bot\"}",
           "refId": "A"
         }
       ],
@@ -1207,7 +1207,7 @@
       "title": "Filter Rejection Reasons",
       "targets": [
         {
-          "expr": "filter_rejection_by_reason{job=\"ironcrab-momentum-bot\"}",
+          "expr": "filter_rejection_by_reason{job=\"momentum-bot\"}",
           "refId": "A",
           "legendFormat": "{{reason}}"
         }
@@ -1230,12 +1230,12 @@
       "title": "Intent Generation Rate",
       "targets": [
         {
-          "expr": "rate(intents_generated_total{job=\"ironcrab-momentum-bot\"}[5m]) * 60",
+          "expr": "rate(intents_generated_total{job=\"momentum-bot\"}[5m]) * 60",
           "refId": "A",
           "legendFormat": "BUY/min"
         },
         {
-          "expr": "rate(exits_generated_total{job=\"ironcrab-momentum-bot\"}[5m]) * 60",
+          "expr": "rate(exits_generated_total{job=\"momentum-bot\"}[5m]) * 60",
           "refId": "B",
           "legendFormat": "SELL/min"
         }
@@ -1271,7 +1271,7 @@
       "title": "Market Events Consumed",
       "targets": [
         {
-          "expr": "market_events_consumed_total{job=\"ironcrab-arb-strategy\"}",
+          "expr": "market_events_consumed_total{job=\"arb-strategy\"}",
           "refId": "A"
         }
       ],
@@ -1295,7 +1295,7 @@
       "title": "Arb Intents Published",
       "targets": [
         {
-          "expr": "intents_generated_total{job=\"ironcrab-arb-strategy\"}",
+          "expr": "intents_generated_total{job=\"arb-strategy\"}",
           "refId": "A"
         }
       ],
@@ -1331,7 +1331,7 @@
       "title": "Opportunities Detected",
       "targets": [
         {
-          "expr": "arb_triangle_opportunities_total{job=\"ironcrab-arb-strategy\"}",
+          "expr": "arb_triangle_opportunities_total{job=\"arb-strategy\"}",
           "refId": "A"
         }
       ],
@@ -1355,12 +1355,12 @@
       "title": "Arb NATS Message Rate",
       "targets": [
         {
-          "expr": "rate(nats_messages_received_total{job=\"ironcrab-market-data\"}[1m])",
+          "expr": "rate(nats_messages_received_total{job=\"market-data\"}[1m])",
           "refId": "A",
           "legendFormat": "recv/s"
         },
         {
-          "expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])",
+          "expr": "rate(nats_messages_published_total{job=\"market-data\"}[1m])",
           "refId": "B",
           "legendFormat": "pub/s"
         }
@@ -1393,7 +1393,7 @@
       "title": "Intents Received",
       "targets": [
         {
-          "expr": "intents_received_total{job=\"ironcrab-execution-engine\"}",
+          "expr": "intents_received_total{job=\"execution-engine\"}",
           "refId": "A"
         }
       ],
@@ -1417,7 +1417,7 @@
       "title": "Intents Executed",
       "targets": [
         {
-          "expr": "intents_executed_total{job=\"ironcrab-execution-engine\"}",
+          "expr": "intents_executed_total{job=\"execution-engine\"}",
           "refId": "A"
         }
       ],
@@ -1441,7 +1441,7 @@
       "title": "Intents Rejected",
       "targets": [
         {
-          "expr": "intents_rejected_total{job=\"ironcrab-execution-engine\"}",
+          "expr": "intents_rejected_total{job=\"execution-engine\"}",
           "refId": "A"
         }
       ],
@@ -1465,7 +1465,7 @@
       "title": "Simulation Failures",
       "targets": [
         {
-          "expr": "simulation_failures_total{job=\"ironcrab-execution-engine\"}",
+          "expr": "simulation_failures_total{job=\"execution-engine\"}",
           "refId": "A"
         }
       ],
@@ -1489,7 +1489,7 @@
       "title": "Available WSOL",
       "targets": [
         {
-          "expr": "available_sol_lamports{job=\"ironcrab-execution-engine\"} / 1e9",
+          "expr": "available_sol_lamports{job=\"execution-engine\"} / 1e9",
           "refId": "A"
         }
       ],
@@ -1511,7 +1511,7 @@
       "title": "Active Locks",
       "targets": [
         {
-          "expr": "active_capital_locks{job=\"ironcrab-execution-engine\"}",
+          "expr": "active_capital_locks{job=\"execution-engine\"}",
           "refId": "A"
         }
       ],
@@ -1527,7 +1527,7 @@
       "title": "Open Positions",
       "targets": [
         {
-          "expr": "open_positions{job=\"ironcrab-execution-engine\"}",
+          "expr": "open_positions{job=\"execution-engine\"}",
           "refId": "A"
         }
       ],
@@ -1568,7 +1568,7 @@
       "description": "Combined native SOL + WSOL balance",
       "targets": [
         {
-          "expr": "wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} / 1e9",
+          "expr": "wallet_total_sol_lamports{job=\"execution-engine\"} / 1e9",
           "refId": "A"
         }
       ],
@@ -1591,7 +1591,7 @@
       "description": "Wallet value change (SOL+WSOL) over last 24 hours",
       "targets": [
         {
-          "expr": "(wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} - wallet_total_sol_lamports{job=\"ironcrab-execution-engine\"} offset 24h) / 1e9",
+          "expr": "(wallet_total_sol_lamports{job=\"execution-engine\"} - wallet_total_sol_lamports{job=\"execution-engine\"} offset 24h) / 1e9",
           "refId": "A"
         }
       ],
@@ -1741,7 +1741,7 @@
       "title": "Intent Rejection Reasons",
       "targets": [
         {
-          "expr": "intent_rejection_by_reason{job=\"ironcrab-execution-engine\"}",
+          "expr": "intent_rejection_by_reason{job=\"execution-engine\"}",
           "refId": "A",
           "legendFormat": "{{reason}}"
         }
@@ -1764,12 +1764,12 @@
       "title": "Execution Rate",
       "targets": [
         {
-          "expr": "rate(intents_executed_total{job=\"ironcrab-execution-engine\"}[5m]) * 60",
+          "expr": "rate(intents_executed_total{job=\"execution-engine\"}[5m]) * 60",
           "refId": "A",
           "legendFormat": "executed/min"
         },
         {
-          "expr": "rate(intents_rejected_total{job=\"ironcrab-execution-engine\"}[5m]) * 60",
+          "expr": "rate(intents_rejected_total{job=\"execution-engine\"}[5m]) * 60",
           "refId": "B",
           "legendFormat": "rejected/min"
         }
@@ -1791,17 +1791,17 @@
       "title": "TX Send Methods",
       "targets": [
         {
-          "expr": "rate(tx_send_tpu_total{job=\"ironcrab-execution-engine\"}[5m]) * 60",
+          "expr": "rate(tx_send_tpu_total{job=\"execution-engine\"}[5m]) * 60",
           "refId": "A",
           "legendFormat": "TPU Direct"
         },
         {
-          "expr": "rate(tx_send_jito_total{job=\"ironcrab-execution-engine\"}[5m]) * 60",
+          "expr": "rate(tx_send_jito_total{job=\"execution-engine\"}[5m]) * 60",
           "refId": "B",
           "legendFormat": "Jito Bundle"
         },
         {
-          "expr": "rate(tx_send_rpc_total{job=\"ironcrab-execution-engine\"}[5m]) * 60",
+          "expr": "rate(tx_send_rpc_total{job=\"execution-engine\"}[5m]) * 60",
           "refId": "C",
           "legendFormat": "RPC Fallback"
         }
@@ -1870,7 +1870,7 @@
       "title": "Simulation Failure Rate",
       "targets": [
         {
-          "expr": "rate(simulation_failures_total{job=\"ironcrab-execution-engine\"}[5m]) * 60",
+          "expr": "rate(simulation_failures_total{job=\"execution-engine\"}[5m]) * 60",
           "refId": "A",
           "legendFormat": "sim failures/min"
         }
@@ -2326,22 +2326,22 @@
       "title": "NATS Message Rates",
       "targets": [
         {
-          "expr": "rate(nats_messages_published_total{job=\"ironcrab-market-data\"}[1m])",
+          "expr": "rate(nats_messages_published_total{job=\"market-data\"}[1m])",
           "refId": "A",
           "legendFormat": "market-data pub"
         },
         {
-          "expr": "rate(nats_messages_published_total{job=\"ironcrab-momentum-bot\"}[1m])",
+          "expr": "rate(nats_messages_published_total{job=\"momentum-bot\"}[1m])",
           "refId": "B",
           "legendFormat": "momentum-bot pub"
         },
         {
-          "expr": "rate(nats_messages_published_total{job=\"ironcrab-arb-strategy\"}[1m])",
+          "expr": "rate(nats_messages_published_total{job=\"arb-strategy\"}[1m])",
           "refId": "D",
           "legendFormat": "arb-strategy pub"
         },
         {
-          "expr": "rate(nats_messages_received_total{job=\"ironcrab-execution-engine\"}[1m])",
+          "expr": "rate(nats_messages_received_total{job=\"execution-engine\"}[1m])",
           "refId": "C",
           "legendFormat": "exec-engine recv"
         }

@@ -140,9 +140,9 @@
 
 | Symptom | Panic, Wrong Instruction, Error 6002. „12 vs 14 accounts", „21 vs 23 accounts". |
 |---------|--------------------------------------------------------------------------------|
-| **Root Cause** | Verschiedene Formate: BUY vs SELL, Bonding Curve vs AMM. `pool_accounts_v1_for_base_mint` ≥14. PumpSwap BUY braucht 23 (mit global_volume_accumulator), SELL weniger. |
-| **Fix** | FIX-23, 839cb9d2: 12 oder 14 je nach Format. Immer DEX-IDL und Mainnet-TX prüfen. Bounds-Check ≥14 (nicht ≥12). |
-| **Prüfen bei** | pumpfun_amm, tx_builder, neue PumpFun/PumpSwap-Änderungen |
+| **Root Cause** | Verschiedene Formate: BUY vs SELL, Bonding Curve vs AMM. `pool_accounts_v1_for_base_mint` ≥14. PumpSwap BUY braucht 23 (mit global_volume_accumulator), SELL 21. |
+| **Fix** | FIX-23, 839cb9d2: 12 oder 14 je nach Format. **Guard-Check:** In `parse_pumpfun_amm_transaction()` NICHT `!= 23` prüfen — das blockiert alle SELL-TXs (21 Accounts). Stattdessen: `if instruction_accounts.len() < 21 { return None; }`. Referenz: ee4c938f (Einführung), 049290d8 (teilweiser Fix). |
+| **Prüfen bei** | pumpfun_amm, tx_builder, dex_parser, neue PumpFun/PumpSwap-Änderungen |
 
 ---
 

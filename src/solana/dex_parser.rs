@@ -200,11 +200,31 @@ pub fn parse_transaction_update(update: &GeyserTransactionUpdate) -> Option<Pars
 
 /// Parse a transaction update into a DEX event (pool creation, swap) with optional pool lookup.
 /// The pool lookup is used to resolve Orca pool mints deterministically.
+///
+/// Tries top-level instruction first. If that returns None and inner_instructions exist,
+/// falls back to parsing CPI calls (e.g. Jupiter/aggregator-routed PumpSwap trades).
 pub fn parse_transaction_update_with_pool_lookup(
     update: &GeyserTransactionUpdate,
     pool_lookup: PoolLookupFn<'_>,
 ) -> Option<ParsedDexEvent> {
-    // Identify DEX by checking account keys
+    // 1. Try top-level instruction first
+    if let Some(event) = try_parse_top_level(update, pool_lookup) {
+        return Some(event);
+    }
+
+    // 2. Fallback: inner instructions (CPI from aggregators like Jupiter)
+    if !update.inner_instructions.is_empty() {
+        return try_parse_inner_instructions(update, pool_lookup);
+    }
+
+    None
+}
+
+/// Parse top-level instruction only (original logic).
+fn try_parse_top_level(
+    update: &GeyserTransactionUpdate,
+    pool_lookup: PoolLookupFn<'_>,
+) -> Option<ParsedDexEvent> {
     let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).ok()?;
     let raydium_cpmm = Pubkey::from_str(RAYDIUM_CPMM).ok()?;
     let orca = Pubkey::from_str(ORCA_WHIRLPOOL).ok()?;
@@ -229,6 +249,61 @@ pub fn parse_transaction_update_with_pool_lookup(
     }
     if update.account_keys.contains(&orca) {
         return parse_orca_transaction(update, pool_lookup);
+    }
+
+    None
+}
+
+/// Try to parse DEX trades from inner instructions (CPI calls).
+/// Used when top-level is an aggregator (Jupiter, etc.) and the actual swap is a CPI.
+fn try_parse_inner_instructions(
+    update: &GeyserTransactionUpdate,
+    pool_lookup: PoolLookupFn<'_>,
+) -> Option<ParsedDexEvent> {
+    let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).ok()?;
+    let raydium_cpmm = Pubkey::from_str(RAYDIUM_CPMM).ok()?;
+    let orca = Pubkey::from_str(ORCA_WHIRLPOOL).ok()?;
+    let meteora = Pubkey::from_str(METEORA_DLMM).ok()?;
+    let pumpfun = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
+    let pumpfun_amm = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).ok()?;
+
+    for inner in &update.inner_instructions {
+        if inner.data.len() < 8 {
+            continue;
+        }
+        let Some(program_id) = update
+            .account_keys
+            .get(inner.program_id_index as usize)
+            .copied()
+        else {
+            continue;
+        };
+        let instruction_accounts: Vec<Pubkey> = inner
+            .accounts
+            .iter()
+            .filter_map(|idx| update.account_keys.get(*idx as usize).copied())
+            .collect();
+
+        let synth = GeyserTransactionUpdate {
+            instruction_accounts,
+            instruction_data: inner.data.clone(),
+            inner_instructions: vec![], // avoid recursion; we only parse one level
+            ..update.clone()
+        };
+
+        let result = match program_id {
+            p if p == meteora => parse_meteora_transaction(&synth),
+            p if p == raydium_cpmm => parse_raydium_cpmm_transaction(&synth),
+            p if p == pumpfun_amm => parse_pumpfun_amm_transaction(&synth),
+            p if p == pumpfun => parse_pumpfun_transaction(&synth),
+            p if p == raydium => parse_raydium_transaction(&synth),
+            p if p == orca => parse_orca_transaction(&synth, pool_lookup),
+            _ => continue,
+        };
+
+        if result.is_some() {
+            return result;
+        }
     }
 
     None
@@ -1084,7 +1159,7 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
     if update.instruction_data.len() < 24 {
         return None;
     }
-    if update.instruction_accounts.len() != 23 {
+    if update.instruction_accounts.len() < 21 {
         return None;
     }
 
