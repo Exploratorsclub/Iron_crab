@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ['*']  # Alle Branches
+    branches: [architecture-rebuild, main, 'release/**']
   pull_request:
-    branches: ['*']  # Alle Branches
+    branches: [architecture-rebuild, main, 'release/**']
 
 jobs:
   build-test:

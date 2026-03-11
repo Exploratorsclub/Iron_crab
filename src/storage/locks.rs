@@ -435,8 +435,16 @@ impl LockManager {
 
     /// Update only native SOL balance (from Geyser NATIVE_SOL event).
     /// Does NOT touch WSOL — each event handler only updates its own value.
+    /// Subtracts active capital locks so that total_native_sol() = on-chain value
+    /// (avoids double-counting: on-chain already includes locked amounts).
     pub fn update_native_sol_only(&self, sol_lamports: u64) {
-        *self.available_sol.write() = sol_lamports;
+        let locked: u64 = self
+            .capital_locks
+            .read()
+            .values()
+            .map(|l| l.sol_lamports)
+            .sum();
+        *self.available_sol.write() = sol_lamports.saturating_sub(locked);
     }
 
     /// Update only WSOL balance (from Geyser WSOL event).
