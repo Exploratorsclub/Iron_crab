@@ -85,6 +85,8 @@ pub struct BondingCurveState {
     pub token_total_supply: u64,
     pub complete: bool,
     pub creator: Pubkey,
+    /// Cashback enabled (byte 82 in bonding curve data). Required for SELL account layout since Feb 2026.
+    pub cashback_enabled: bool,
 }
 
 impl BondingCurveState {
@@ -114,6 +116,11 @@ impl BondingCurveState {
             token_total_supply: u64::from_le_bytes(data[40..48].try_into()?),
             complete: data[48] != 0,
             creator: Pubkey::new_from_array(data[49..81].try_into()?),
+            cashback_enabled: if data.len() > 82 {
+                data[82] != 0
+            } else {
+                false
+            },
         })
     }
 
@@ -214,6 +221,7 @@ impl PumpFunDex {
                 token_total_supply: 1_000_000_000_000_000, // PumpFun always 1B * 10^6
                 complete: state.complete,
                 creator: state.creator,
+                cashback_enabled: state.cashback_enabled,
             })
         } else {
             None
@@ -237,6 +245,13 @@ impl PumpFunDex {
     pub fn derive_bonding_curve_static(token_mint: &Pubkey) -> (Pubkey, u8) {
         let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).expect("valid pumpfun program id");
         Pubkey::find_program_address(&[b"bonding-curve", token_mint.as_ref()], &program_id)
+    }
+
+    /// Derive bonding curve v2 PDA (required since Feb 2026 cashback upgrade).
+    /// Must be included as last account in BUY and SELL instructions.
+    pub fn derive_bonding_curve_v2(token_mint: &Pubkey) -> (Pubkey, u8) {
+        let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).expect("valid pumpfun program id");
+        Pubkey::find_program_address(&[b"bonding-curve-v2", token_mint.as_ref()], &program_id)
     }
 
     /// Derive associated bonding curve token account (holds real token reserves).
@@ -340,6 +355,7 @@ impl PumpFunDex {
             token_total_supply: 1_000_000_000_000_000, // 1 billion tokens (6 decimals)
             complete: false,
             creator,
+            cashback_enabled: false, // new tokens start without cashback
         }
     }
 
@@ -369,6 +385,7 @@ impl PumpFunDex {
         let (user_volume_accumulator, uva_bump) = self.derive_user_volume_accumulator(&user);
         let (fee_config, fc_bump) = Self::derive_fee_config();
         let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM)?;
+        let (bonding_curve_v2, _) = Self::derive_bonding_curve_v2(token_mint);
 
         // Log derived PDAs for debugging
         debug!(
@@ -429,6 +446,65 @@ impl PumpFunDex {
                 AccountMeta::new_readonly(fee_config, false),
                 // #16 (15): Fee Program (Pump Fees Program) - required for get_fees CPI
                 AccountMeta::new_readonly(fee_program, false),
+                // #17 (16): Bonding Curve V2 - readonly (required since Feb 2026 cashback upgrade)
+                AccountMeta::new_readonly(bonding_curve_v2, false),
+            ],
+            data,
+        })
+    }
+
+    /// Build buy_exact_sol_in instruction (Market Order: exact SOL in, min tokens out = 1)
+    /// Instruction discriminator: [56, 252, 116, 8, 158, 223, 205, 95] (buy_exact_sol_in)
+    /// Account layout: IDENTICAL to build_buy_ix (17 accounts including bonding_curve_v2)
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_buy_exact_sol_ix(
+        &self,
+        token_mint: &Pubkey,
+        bonding_curve: &Pubkey,
+        associated_bonding_curve: &Pubkey,
+        user_token_account: &Pubkey,
+        creator: &Pubkey,
+        token_program: &Pubkey,
+        sol_amount: u64,
+        min_tokens_out: u64,
+    ) -> Result<Instruction> {
+        let user = self
+            .user_authority
+            .ok_or_else(|| anyhow!("user authority not set"))?;
+
+        let (creator_vault, _) = self.derive_creator_vault(creator);
+        let (global_volume_accumulator, _) = self.derive_global_volume_accumulator();
+        let (user_volume_accumulator, _) = self.derive_user_volume_accumulator(&user);
+        let (fee_config, _) = Self::derive_fee_config();
+        let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM)?;
+        let (bonding_curve_v2, _) = Self::derive_bonding_curve_v2(token_mint);
+
+        // Data: discriminator(8) + sol_amount(8) + min_tokens_out(8)
+        let mut data = Vec::with_capacity(24);
+        data.extend_from_slice(&[56, 252, 116, 8, 158, 223, 205, 95]);
+        data.extend_from_slice(&sol_amount.to_le_bytes());
+        data.extend_from_slice(&min_tokens_out.to_le_bytes());
+
+        Ok(Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(self.global, false),
+                AccountMeta::new(self.fee_recipient, false),
+                AccountMeta::new_readonly(*token_mint, false),
+                AccountMeta::new(*bonding_curve, false),
+                AccountMeta::new(*associated_bonding_curve, false),
+                AccountMeta::new(*user_token_account, false),
+                AccountMeta::new(user, true),
+                AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false),
+                AccountMeta::new_readonly(*token_program, false),
+                AccountMeta::new(creator_vault, false),
+                AccountMeta::new_readonly(self.event_authority, false),
+                AccountMeta::new_readonly(self.program_id, false),
+                AccountMeta::new_readonly(global_volume_accumulator, false),
+                AccountMeta::new(user_volume_accumulator, false),
+                AccountMeta::new_readonly(fee_config, false),
+                AccountMeta::new_readonly(fee_program, false),
+                AccountMeta::new_readonly(bonding_curve_v2, false),
             ],
             data,
         })
@@ -436,6 +512,8 @@ impl PumpFunDex {
 
     /// Build sell instruction (Token → SOL)
     /// Instruction discriminator: 0x33e685a4017f83ad (8 bytes)
+    ///
+    /// Account count: 15 (non-cashback) or 16 (cashback). bonding_curve_v2 is always last.
     #[allow(clippy::too_many_arguments)]
     pub fn build_sell_ix(
         &self,
@@ -447,6 +525,7 @@ impl PumpFunDex {
         token_program: &Pubkey,
         amount_in: u64,      // Token amount
         min_sol_output: u64, // Slippage protection
+        cashback_enabled: bool,
     ) -> Result<Instruction> {
         let user = self
             .user_authority
@@ -456,6 +535,8 @@ impl PumpFunDex {
         let (creator_vault, _) = self.derive_creator_vault(creator);
         let (fee_config, _) = Self::derive_fee_config();
         let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM)?;
+        let (bonding_curve_v2, _) = Self::derive_bonding_curve_v2(token_mint);
+        let (user_volume_accumulator, _) = self.derive_user_volume_accumulator(&user);
 
         // Instruction data: discriminator (8 bytes) + amount (8 bytes) + min_output (8 bytes)
         let mut data = Vec::with_capacity(24);
@@ -464,26 +545,32 @@ impl PumpFunDex {
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_sol_output.to_le_bytes());
 
+        let mut accounts = vec![
+            // Original accounts (indices 0-7)
+            AccountMeta::new_readonly(self.global, false), // 0: global
+            AccountMeta::new(self.fee_recipient, false),   // 1: fee_recipient
+            AccountMeta::new_readonly(*token_mint, false), // 2: mint
+            AccountMeta::new(*bonding_curve, false),       // 3: bonding_curve
+            AccountMeta::new(*associated_bonding_curve, false), // 4: associated_bonding_curve
+            AccountMeta::new(*user_token_account, false),  // 5: associated_user (user's ATA)
+            AccountMeta::new(user, true),                  // 6: user (signer, writable)
+            AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false), // 7: system_program
+            // NEW accounts (indices 8-13) - added in protocol update
+            AccountMeta::new(creator_vault, false), // 8: creator_vault
+            AccountMeta::new_readonly(*token_program, false), // 9: token_program
+            AccountMeta::new_readonly(self.event_authority, false), // 10: event_authority
+            AccountMeta::new_readonly(self.program_id, false), // 11: program
+            AccountMeta::new_readonly(fee_config, false), // 12: fee_config
+            AccountMeta::new_readonly(fee_program, false), // 13: fee_program
+        ];
+        if cashback_enabled {
+            accounts.push(AccountMeta::new(user_volume_accumulator, false)); // 14: user_volume_accumulator
+        }
+        accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false)); // 14 or 15: bonding_curve_v2
+
         Ok(Instruction {
             program_id: self.program_id,
-            accounts: vec![
-                // Original accounts (indices 0-7)
-                AccountMeta::new_readonly(self.global, false), // 0: global
-                AccountMeta::new(self.fee_recipient, false),   // 1: fee_recipient
-                AccountMeta::new_readonly(*token_mint, false), // 2: mint
-                AccountMeta::new(*bonding_curve, false),       // 3: bonding_curve
-                AccountMeta::new(*associated_bonding_curve, false), // 4: associated_bonding_curve
-                AccountMeta::new(*user_token_account, false),  // 5: associated_user (user's ATA)
-                AccountMeta::new(user, true),                  // 6: user (signer, writable)
-                AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM_ID).unwrap(), false), // 7: system_program
-                // NEW accounts (indices 8-13) - added in protocol update
-                AccountMeta::new(creator_vault, false), // 8: creator_vault
-                AccountMeta::new_readonly(*token_program, false), // 9: token_program
-                AccountMeta::new_readonly(self.event_authority, false), // 10: event_authority
-                AccountMeta::new_readonly(self.program_id, false), // 11: program
-                AccountMeta::new_readonly(fee_config, false), // 12: fee_config
-                AccountMeta::new_readonly(fee_program, false), // 13: fee_program
-            ],
+            accounts,
             data,
         })
     }
@@ -1036,7 +1123,8 @@ impl PumpFunDex {
             min_out,
             fallback_creator,
             1500,
-            None, // No token_program override - uses default SPL Token
+            None,  // No token_program override - uses default SPL Token
+            false, // market_order: default limit order
         )
         .await
     }
@@ -1056,6 +1144,7 @@ impl PumpFunDex {
         fallback_creator: Option<Pubkey>,
         slippage_bps: u32,
         token_program_override: Option<Pubkey>,
+        market_order: bool,
     ) -> Result<Vec<Instruction>> {
         let sol_mint = "So11111111111111111111111111111111111111112";
 
@@ -1094,20 +1183,28 @@ impl PumpFunDex {
         // 2. Cached creator (from DashMap, populated from previous lookups)
         // 3. LivePoolCache (GEYSER-FIRST, populated by market-data)
         // 4. RPC fallback (DEPRECATED - should not happen in production)
-        let creator = if let Some(c) = fallback_creator {
+        let (creator, cashback_enabled) = if let Some(c) = fallback_creator {
             debug!(
                 token_mint = %token_mint_str,
                 creator = %c,
                 "pump.fun: using creator from producer"
             );
-            c
+            let cashback = self
+                .get_bonding_curve_from_cache(&bonding_curve)
+                .map(|s| s.cashback_enabled)
+                .unwrap_or(false);
+            (c, cashback)
         } else if let Some(c) = self.get_cached_creator(&token_mint) {
             debug!(
                 token_mint = %token_mint_str,
                 creator = %c,
                 "pump.fun: using creator from DashMap cache"
             );
-            c
+            let cashback = self
+                .get_bonding_curve_from_cache(&bonding_curve)
+                .map(|s| s.cashback_enabled)
+                .unwrap_or(false);
+            (c, cashback)
         } else if let Some(c) = self.get_creator_from_cache(&bonding_curve) {
             debug!(
                 token_mint = %token_mint_str,
@@ -1116,7 +1213,11 @@ impl PumpFunDex {
             );
             // Also cache in DashMap for faster subsequent lookups
             self.cached_creators.insert(token_mint, c);
-            c
+            let cashback = self
+                .get_bonding_curve_from_cache(&bonding_curve)
+                .map(|s| s.cashback_enabled)
+                .unwrap_or(false);
+            (c, cashback)
         } else {
             // RPC FALLBACK - This path should NOT be hit in production!
             // If we're here, it means neither cache had the creator.
@@ -1137,7 +1238,7 @@ impl PumpFunDex {
             }
             // Cache for future use
             self.cached_creators.insert(token_mint, state.creator);
-            state.creator
+            (state.creator, state.cashback_enabled)
         };
 
         let user = self
@@ -1159,36 +1260,55 @@ impl PumpFunDex {
         let user_token_account = Pubkey::new_from_array(user_token_account_spl.to_bytes());
 
         let ix = if buy_token {
-            // For BUY: We want to spend amount_in SOL to get tokens.
-            // Pump.fun BUY expects:
-            //   - amount: token amount we want to receive (min_out)
-            //   - max_sol_cost: maximum SOL we're willing to pay (with slippage buffer!)
-            //
-            // The slippage on BUY should be on max_sol_cost, not on token amount!
-            // If price goes up, we need MORE SOL for the same tokens.
-            // So max_sol_cost = amount_in + slippage
-            let max_sol_cost =
-                ((amount_in as u128) * (10_000 + slippage_bps as u128) / 10_000) as u64;
+            if market_order {
+                info!(
+                    token_mint = %token_mint_str,
+                    sol_amount = amount_in,
+                    min_tokens_out = 1u64,
+                    "pump.fun MARKET ORDER BUY: exact SOL in, min tokens out = 1"
+                );
+                self.build_buy_exact_sol_ix(
+                    &token_mint,
+                    &bonding_curve,
+                    &associated_bonding_curve,
+                    &user_token_account,
+                    &creator,
+                    &token_program_sdk,
+                    amount_in,
+                    1,
+                )?
+            } else {
+                // For BUY: We want to spend amount_in SOL to get tokens.
+                // Pump.fun BUY expects:
+                //   - amount: token amount we want to receive (min_out)
+                //   - max_sol_cost: maximum SOL we're willing to pay (with slippage buffer!)
+                //
+                // The slippage on BUY should be on max_sol_cost, not on token amount!
+                // If price goes up, we need MORE SOL for the same tokens.
+                // So max_sol_cost = amount_in + slippage
+                let max_sol_cost =
+                    ((amount_in as u128) * (10_000 + slippage_bps as u128) / 10_000) as u64;
 
-            info!(
-                token_mint = %token_mint_str,
-                amount_in_sol = amount_in,
-                min_tokens_out = min_out,
-                max_sol_cost,
-                slippage_bps,
-                "pump.fun BUY: amount_in SOL with slippage protection on max_sol_cost"
-            );
+                info!(
+                    token_mint = %token_mint_str,
+                    amount_in_sol = amount_in,
+                    min_tokens_out = min_out,
+                    max_sol_cost,
+                    slippage_bps,
+                    "pump.fun BUY: amount_in SOL with slippage protection on max_sol_cost"
+                );
 
-            self.build_buy_ix(
-                &token_mint,
-                &bonding_curve,
-                &associated_bonding_curve,
-                &user_token_account,
-                &creator,
-                &token_program_sdk,
-                min_out,      // amount (tokens we want)
-                max_sol_cost, // max SOL we're willing to pay (amount_in + slippage!)
-            )?
+                self.build_buy_ix(
+                    &token_mint,
+                    &bonding_curve,
+                    &associated_bonding_curve,
+                    &user_token_account,
+                    &creator,
+                    &token_program_sdk,
+                    min_out,      // amount (tokens we want)
+                    max_sol_cost, // max SOL we're willing to pay (amount_in + slippage!)
+                )?
+            }
         } else {
             self.build_sell_ix(
                 &token_mint,
@@ -1199,6 +1319,7 @@ impl PumpFunDex {
                 &token_program_sdk,
                 amount_in,
                 min_out,
+                cashback_enabled,
             )?
         };
 

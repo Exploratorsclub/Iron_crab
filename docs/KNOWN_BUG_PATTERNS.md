@@ -206,6 +206,26 @@
 
 ---
 
+## 21. PumpFun Custom(6024) Overflow — Fehlendes bonding_curve_v2 Account
+
+| Symptom | Alle PumpFun Bonding Curve Trades schlagen mit `Custom(6024)` (Overflow) fehl. |
+|---------|-------------------------------------------------------------------------------|
+| **Root Cause** | PumpFun Cashback-Upgrade (Feb 2026) führte `bonding_curve_v2` PDA als Pflicht-Account ein. Fehlt in build_buy_ix und build_sell_ix. |
+| **Fix** | bonding_curve_v2 PDA als letztes Account in build_buy_ix (17 total) und build_sell_ix (15/16 total). Ref: plan_pumpfun_6024_cashback_fix.md |
+| **Prüfen bei** | PumpFun BUY/SELL, tx_builder, neue PumpFun-Protokoll-Updates |
+
+---
+
+## 22. FIX-38 Simulation Bypass
+
+| Symptom | Fehlerhafte TX werden on-chain gesendet trotz Simulationsfehler. Custom(2) ATA-Create, Custom(6023) PumpFun SELL. |
+|---------|------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | FIX-38 umging Simulation bei "bekannten" transienten Fehlern (State-Lag). Zu aggressiv — sendet fehlerhafte TX. |
+| **Fix** | FIX-38 entfernt. Simulation nutzt jetzt "processed" Commitment (aligniert mit Geyser). Kein Bypass mehr. |
+| **Prüfen bei** | simulate_transaction, process_intent, Commitment-Konfiguration |
+
+---
+
 ## Quick-Check: Bei neuem Bug
 
 1. Sieht das wie eines der Muster oben?

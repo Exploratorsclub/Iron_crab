@@ -30,8 +30,9 @@ async fn test_pumpfun_build_buy_ix_pure_derivation() {
             1_000_000, // 0.001 SOL
             123_456,   // min_out (raw)
             Some(creator),
-            500,  // 5% slippage
-            None, // token_program_override - use default SPL Token
+            500,   // 5% slippage
+            None,  // token_program_override - use default SPL Token
+            false, // market_order: limit order
         )
         .await
         .expect("build_swap_ix_async_with_slippage");
@@ -65,8 +66,57 @@ async fn test_pumpfun_build_buy_ix_pure_derivation() {
     // Ensure we didn't accidentally construct empty data.
     assert!(!ix.data.is_empty(), "instruction data must not be empty");
 
+    // Post-cashback-upgrade (Feb 2026): BUY requires 17 accounts (bonding_curve_v2 as last).
+    assert_eq!(
+        ix.accounts.len(),
+        17,
+        "BUY ix must have 17 accounts (bonding_curve_v2 required since Feb 2026)"
+    );
+
     // Keep AccountMeta imported to avoid unused import warning changes across Solana versions.
     let _ = AccountMeta::new_readonly(Pubkey::default(), false);
+}
+
+#[tokio::test]
+async fn test_pumpfun_market_order_buy() {
+    // Market order uses buy_exact_sol_in discriminator [56, 252, 116, 8, 158, 223, 205, 95]
+    let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:8899"));
+    let mut dex = PumpFunDex::new(rpc, None).expect("PumpFunDex::new");
+
+    let wallet =
+        Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM").expect("wallet pubkey");
+    dex.set_user_authority(wallet);
+
+    let creator =
+        Pubkey::from_str("2tFqgkJX6kqz8q6o9tFv3oJ9nQx7n1m3fHk2m8f3oKpZ").expect("creator pubkey");
+    let token_mint = "9xQeWvG816bUx9EPfKJb9N9dKz5wW7Yy2hBzXv4mQ4kG";
+
+    let ixs = dex
+        .build_swap_ix_async_with_slippage(
+            "So11111111111111111111111111111111111111112",
+            token_mint,
+            1_000_000,
+            1, // min_out ignored for market order
+            Some(creator),
+            500,
+            None,
+            true, // market_order: exact SOL in, min tokens out = 1
+        )
+        .await
+        .expect("build_swap_ix_async_with_slippage");
+
+    assert_eq!(ixs.len(), 2, "expected ATA creation + pump.fun instruction");
+    let ix = &ixs[1];
+    assert!(
+        ix.data.len() >= 8,
+        "instruction data must have at least 8-byte discriminator"
+    );
+    let discriminator: [u8; 8] = ix.data[0..8].try_into().expect("8 bytes");
+    assert_eq!(
+        discriminator,
+        [56, 252, 116, 8, 158, 223, 205, 95],
+        "market order must use buy_exact_sol_in discriminator"
+    );
 }
 
 #[tokio::test]
@@ -147,4 +197,10 @@ async fn test_tx_builder_supports_pumpfun_sell_pure_derivation() {
     assert!(user_meta.is_writable);
 
     assert!(!ix.data.is_empty(), "instruction data must not be empty");
+
+    // Post-cashback-upgrade (Feb 2026): SELL has 15 (non-cashback) or 16 (cashback) accounts.
+    assert!(
+        ix.accounts.len() >= 15,
+        "SELL ix must have at least 15 accounts (bonding_curve_v2 required since Feb 2026)"
+    );
 }

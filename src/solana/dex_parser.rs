@@ -117,6 +117,7 @@ pub enum ParsedDexEvent {
         real_token_reserves: u64,
         real_sol_reserves: u64,
         complete: bool,
+        cashback_enabled: bool,
         slot: u64,
     },
 }
@@ -777,6 +778,7 @@ fn parse_pumpfun_account(update: &GeyserAccountUpdate) -> Option<ParsedDexEvent>
         real_token_reserves: state.real_token_reserves,
         real_sol_reserves: state.real_sol_reserves,
         complete: state.complete,
+        cashback_enabled: state.cashback_enabled,
         slot: update.slot,
     })
 }

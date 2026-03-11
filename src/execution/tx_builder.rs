@@ -1130,6 +1130,12 @@ pub async fn build_tx_plan(
         .as_ref()
         .and_then(|s| Pubkey::from_str(s).ok());
 
+    let market_order = intent
+        .metadata
+        .get("market_order")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     let ixs = match pumpfun
         .build_swap_ix_async_with_slippage(
             &intent.resources.input_mint,
@@ -1139,6 +1145,7 @@ pub async fn build_tx_plan(
             Some(creator),
             intent.max_slippage_bps,
             token_program_override,
+            market_order,
         )
         .await
     {

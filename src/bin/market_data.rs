@@ -2761,8 +2761,8 @@ async fn run_geyser_loop(
                     real_token_reserves,
                     real_sol_reserves,
                     complete,
+                    cashback_enabled,
                     slot,
-                    ..
                 }) = &parsed {
                     let pool_str = pool_address.to_string();
                     let creator_str = creator.to_string();
@@ -2865,6 +2865,7 @@ async fn run_geyser_loop(
                             real_sol_reserves: *real_sol_reserves,
                             complete: *complete,
                             creator: *creator,
+                            cashback_enabled: *cashback_enabled,
                         });
                         ctx.live_pool_cache
                             .upsert(*pool_address, minimal_state, *slot);

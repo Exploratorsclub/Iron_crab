@@ -32,7 +32,7 @@ use solana_client::rpc_config::{
     RpcSendTransactionConfig, RpcSimulateTransactionConfig, RpcTransactionConfig,
 };
 use solana_client::rpc_request::TokenAccountsFilter;
-use solana_commitment_config::CommitmentLevel;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_message::{v0, AddressLookupTableAccount, VersionedMessage};
 use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
@@ -6400,12 +6400,22 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // Check 3b: Max slippage
     // Skip for ALL sells - strategies like momentum-bot may need high slippage to exit positions
     // (e.g., exit_max_slippage_bps=9500 for emergency exits at any price)
-    if intent.side == TradeSide::Sell {
+    // Skip for market orders - exact SOL in, min tokens out = 1 (Custom(6002) on-chain)
+    let is_market_order = intent
+        .metadata
+        .get("market_order")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if intent.side == TradeSide::Sell || is_market_order {
         checks.push(CheckResult {
             check_name: "max_slippage".to_string(),
             passed: true,
             reason_code: None,
-            details: Some("skipped_for_sell".to_string()),
+            details: Some(if is_market_order {
+                "skipped_for_market_order".to_string()
+            } else {
+                "skipped_for_sell".to_string()
+            }),
         });
     } else {
         if intent.max_slippage_bps > config.max_slippage_bps {
@@ -7226,65 +7236,23 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     let sim_result = simulate_transaction(ctx, wallet_pubkey, &tx_plan_for_sim).await;
 
     if !sim_result.success {
-        // FIX-38: Bypass simulation for known transient failures caused by local node state lag.
-        //
-        // (a) Custom(2) on ix 0 for BUY: Token-2022 ATA creation fails because the mint
-        //     account isn't in the local simulation state yet (GetAccountDataSize → "Invalid Mint").
-        //
-        // (b) Custom(6023) on ix 1 for SELL via PumpFun: "NotEnoughTokensToSell" because the
-        //     recently-bought tokens aren't reflected in the local simulation state yet.
-        //
-        // On-chain validators have the latest state, so the TX will succeed there.
-        let sim_error = sim_result.error_code.as_deref().unwrap_or("");
-
-        let is_ata_create_failure_on_buy =
-            intent.side == TradeSide::Buy && sim_error.contains("InstructionError(0, Custom(2))");
-
-        let is_pumpfun_sell_balance_lag = intent.side == TradeSide::Sell
-            && sim_error.contains("Custom(6023)")
-            && intent.metadata.get("dex").map(|d| d.as_str()) == Some("pumpfun");
-
-        if (is_ata_create_failure_on_buy || is_pumpfun_sell_balance_lag) && config.send_enabled {
-            let bypass_reason = if is_ata_create_failure_on_buy {
-                "sim_bypassed:token2022_ata_state_lag"
-            } else {
-                "sim_bypassed:pumpfun_sell_balance_lag"
-            };
-            warn!(
-                intent_id = %intent.intent_id,
-                side = ?intent.side,
-                error = %sim_error,
-                bypass = %bypass_reason,
-                "FIX-38: Bypassing simulation failure (local node state lag)"
-            );
-            checks.push(CheckResult {
-                check_name: "simulation".to_string(),
-                passed: true,
-                reason_code: None,
-                details: Some(bypass_reason.to_string()),
-            });
-        } else {
-            let reason = RejectReason::SimFailed;
-            checks.push(CheckResult {
-                check_name: "simulation".to_string(),
-                passed: false,
-                reason_code: Some(reason.to_string()),
-                details: sim_result.error_code.clone(),
-            });
-
-            // Release lock on failure
-            ctx.lock_manager.release_locks(&intent.intent_id);
-
-            return emit_sim_failed_decision(
-                ctx,
-                decision_id,
-                &intent,
-                checks,
-                plan_hash_str,
-                sim_result,
-            )
-            .await;
-        }
+        let reason = RejectReason::SimFailed;
+        checks.push(CheckResult {
+            check_name: "simulation".to_string(),
+            passed: false,
+            reason_code: Some(reason.to_string()),
+            details: sim_result.error_code.clone(),
+        });
+        ctx.lock_manager.release_locks(&intent.intent_id);
+        return emit_sim_failed_decision(
+            ctx,
+            decision_id,
+            &intent,
+            checks,
+            plan_hash_str,
+            sim_result,
+        )
+        .await;
     }
 
     if sim_result.success {
@@ -8541,6 +8509,7 @@ async fn simulate_transaction(
     let cfg = RpcSimulateTransactionConfig {
         sig_verify: false,
         replace_recent_blockhash: true,
+        commitment: Some(CommitmentConfig::processed()),
         ..RpcSimulateTransactionConfig::default()
     };
 

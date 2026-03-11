@@ -6511,6 +6511,9 @@ async fn generate_and_publish_buy_intent(
         .insert("dex".to_string(), effective_dex.clone());
     intent
         .metadata
+        .insert("market_order".to_string(), "true".to_string());
+    intent
+        .metadata
         .insert("reason_code".to_string(), reason_code.to_string());
     intent
         .metadata

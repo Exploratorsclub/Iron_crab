@@ -164,6 +164,8 @@ pub struct PumpFunState {
     pub complete: bool,
     /// Creator of the token (parsed from bonding curve account at offset 49-80)
     pub creator: Pubkey,
+    /// Cashback enabled (byte 82 in bonding curve data). Required for SELL account layout since Feb 2026.
+    pub cashback_enabled: bool,
 }
 
 /// PumpFun AMM (PumpSwap) cached state
@@ -1034,6 +1036,13 @@ fn parse_pumpfun_bonding(data: &[u8]) -> Option<CachedPoolState> {
     // Offset 49: creator (Pubkey, 32 bytes) - BEFORE mint in bonding curve layout
     let creator = Pubkey::new_from_array(data[49..81].try_into().ok()?);
 
+    // Offset 82: cashback_enabled (since Feb 2026 cashback upgrade). Older tokens have shorter data.
+    let cashback_enabled = if data.len() > 82 {
+        data[82] != 0
+    } else {
+        false
+    };
+
     // NOTE: token_mint is NOT in bonding curve data - it's derived from the bonding_curve pubkey
     // The caller must set token_mint and bonding_curve after parsing
 
@@ -1049,6 +1058,7 @@ fn parse_pumpfun_bonding(data: &[u8]) -> Option<CachedPoolState> {
         real_token_reserves,
         complete,
         creator,
+        cashback_enabled,
     }))
 }
 
@@ -1174,6 +1184,7 @@ mod tests {
             real_token_reserves: 793_000_000_000_000,
             complete: false,
             creator: Pubkey::new_unique(),
+            cashback_enabled: false,
         });
 
         cache.upsert(pool, state, 12345);
@@ -1589,6 +1600,7 @@ mod tests {
                 real_token_reserves: 793_100_000_000_000,
                 complete: false,
                 creator: Pubkey::new_unique(),
+                cashback_enabled: false,
             }),
             100,
         );
@@ -1622,6 +1634,7 @@ mod tests {
                 real_token_reserves: 793_100_000_000_000,
                 complete: false,
                 creator: Pubkey::new_unique(),
+                cashback_enabled: false,
             }),
             100,
         );

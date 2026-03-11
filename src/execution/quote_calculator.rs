@@ -670,6 +670,7 @@ mod tests {
             real_token_reserves: 793_100_000_000_000,
             complete: false,
             creator: Pubkey::new_unique(),
+            cashback_enabled: false,
         };
 
         // Buy with 1 SOL
@@ -691,6 +692,7 @@ mod tests {
             real_token_reserves: 793_100_000_000_000,
             complete: false,
             creator: Pubkey::new_unique(),
+            cashback_enabled: false,
         };
 
         // Sell 100M tokens — formula uses virtual reserves; output capped by real_sol_reserves
@@ -965,6 +967,7 @@ mod tests {
             real_token_reserves: 793_100_000_000_000,
             complete: true, // Migrated!
             creator: Pubkey::new_unique(),
+            cashback_enabled: false,
         };
 
         let result = super::calculate_pumpfun_quote(&state, 1_000_000_000, true);
