@@ -47,3 +47,9 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9100']
     metrics_path: /metrics
+
+  # Solana Exporter (Validator Sync, Health, Slot-Height)
+  - job_name: 'solana-exporter'
+    static_configs:
+      - targets: ['localhost:9179']
+    scrape_interval: 10s

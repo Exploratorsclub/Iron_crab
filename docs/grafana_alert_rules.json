@@ -811,6 +811,125 @@
           }
         }
       ]
+    },
+    {
+      "orgId": 1,
+      "name": "Validator Health",
+      "folder": "IronCrab Alerts",
+      "interval": "30s",
+      "rules": [
+        {
+          "uid": "solana-validator-unhealthy",
+          "title": "Validator Unhealthy",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": { "from": 120, "to": 0 },
+              "datasourceUid": "bf5zln2g4x5vka",
+              "model": {
+                "expr": "solana_node_is_healthy{job=\"solana-exporter\"}",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": { "expression": "A", "reducer": "last", "refId": "B", "type": "reduce" }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [{ "evaluator": { "params": [1], "type": "lt" } }],
+                "expression": "B", "refId": "C", "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "Alerting",
+          "execErrState": "Alerting",
+          "for": "2m",
+          "annotations": {
+            "summary": "Agave Validator meldet unhealthy",
+            "description": "Der Validator RPC-Endpunkt meldet 'unhealthy'. Der Node ist moeglicherweise nicht synchron oder hat interne Probleme."
+          },
+          "labels": { "severity": "critical", "component": "validator", "type": "health" }
+        },
+        {
+          "uid": "solana-validator-out-of-sync",
+          "title": "Validator Out of Sync (>100 Slots Behind)",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": { "from": 300, "to": 0 },
+              "datasourceUid": "bf5zln2g4x5vka",
+              "model": {
+                "expr": "solana_node_num_slots_behind{job=\"solana-exporter\"}",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": { "expression": "A", "reducer": "last", "refId": "B", "type": "reduce" }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [{ "evaluator": { "params": [100], "type": "gt" } }],
+                "expression": "B", "refId": "C", "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "OK",
+          "for": "5m",
+          "annotations": {
+            "summary": "Validator ist >100 Slots hinter dem Cluster",
+            "description": "Der Node faellt zurueck. RPC-Daten und Geyser-Events sind nicht mehr aktuell. Netzwerk und Disk-I/O pruefen."
+          },
+          "labels": { "severity": "warning", "component": "validator", "type": "sync" }
+        },
+        {
+          "uid": "solana-validator-far-behind",
+          "title": "Validator Far Behind (>1000 Slots)",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": { "from": 300, "to": 0 },
+              "datasourceUid": "bf5zln2g4x5vka",
+              "model": {
+                "expr": "solana_node_num_slots_behind{job=\"solana-exporter\"}",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": { "expression": "A", "reducer": "last", "refId": "B", "type": "reduce" }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [{ "evaluator": { "params": [1000], "type": "gt" } }],
+                "expression": "B", "refId": "C", "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "OK",
+          "for": "3m",
+          "annotations": {
+            "summary": "Validator ist >1000 Slots hinter dem Cluster",
+            "description": "Schwerer Sync-Verlust. Trading-Daten sind stark veraltet. Bot sollte pausiert werden. Moeglicherweise ist ein Neustart mit frischem Snapshot noetig."
+          },
+          "labels": { "severity": "critical", "component": "validator", "type": "sync" }
+        }
+      ]
     }
   ]
 }

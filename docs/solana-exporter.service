@@ -1,0 +1,21 @@
+[Unit]
+Description=Solana Exporter (Prometheus metrics for Agave Validator)
+After=network-online.target agave-validator.service
+Wants=network-online.target
+
+[Service]
+User=sol
+Group=sol
+ExecStart=/usr/local/bin/solana-exporter \
+  -rpc-url http://localhost:8899 \
+  -listen-address :9179
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solana-exporter
+
+[Install]
+WantedBy=multi-user.target
