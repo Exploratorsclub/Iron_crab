@@ -1146,6 +1146,7 @@ pub async fn build_tx_plan(
             intent.max_slippage_bps,
             token_program_override,
             market_order,
+            allow_rpc_fallback,
         )
         .await
     {

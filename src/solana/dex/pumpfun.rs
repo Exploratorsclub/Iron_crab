@@ -1125,6 +1125,7 @@ impl PumpFunDex {
             1500,
             None,  // No token_program override - uses default SPL Token
             false, // market_order: default limit order
+            false, // allow_rpc_fallback: Hot Path default (GEYSER-ONLY)
         )
         .await
     }
@@ -1134,6 +1135,8 @@ impl PumpFunDex {
     /// # Arguments
     /// * `token_program_override` - If set, use this token program instead of defaulting to SPL Token.
     ///   This is critical for Token-2022 mints (newer PumpFun tokens).
+    /// * `allow_rpc_fallback` - When true (Cold Path, e.g. Liquidation), use RPC for cashback_enabled
+    ///   on cache miss. When false (Hot Path), cashback_enabled=false on cache miss (I-7).
     #[allow(clippy::too_many_arguments)]
     pub async fn build_swap_ix_async_with_slippage(
         &self,
@@ -1145,6 +1148,7 @@ impl PumpFunDex {
         slippage_bps: u32,
         token_program_override: Option<Pubkey>,
         market_order: bool,
+        allow_rpc_fallback: bool,
     ) -> Result<Vec<Instruction>> {
         let sol_mint = "So11111111111111111111111111111111111111112";
 
@@ -1189,10 +1193,27 @@ impl PumpFunDex {
                 creator = %c,
                 "pump.fun: using creator from producer"
             );
-            let cashback = self
-                .get_bonding_curve_from_cache(&bonding_curve)
-                .map(|s| s.cashback_enabled)
-                .unwrap_or(false);
+            let cashback = match self.get_bonding_curve_from_cache(&bonding_curve) {
+                Some(state) => state.cashback_enabled,
+                None => {
+                    if allow_rpc_fallback {
+                        match self.fetch_bonding_curve_fast(&bonding_curve).await {
+                            Some(state) => {
+                                warn!(
+                                    bonding_curve = %bonding_curve,
+                                    cashback_enabled = state.cashback_enabled,
+                                    "cashback_enabled resolved via RPC fallback (cache miss)"
+                                );
+                                state.cashback_enabled
+                            }
+                            None => false,
+                        }
+                    } else {
+                        // Hot Path: Cache miss → cashback_enabled=false (I-7, no RPC)
+                        false
+                    }
+                }
+            };
             (c, cashback)
         } else if let Some(c) = self.get_cached_creator(&token_mint) {
             debug!(
@@ -1200,10 +1221,27 @@ impl PumpFunDex {
                 creator = %c,
                 "pump.fun: using creator from DashMap cache"
             );
-            let cashback = self
-                .get_bonding_curve_from_cache(&bonding_curve)
-                .map(|s| s.cashback_enabled)
-                .unwrap_or(false);
+            let cashback = match self.get_bonding_curve_from_cache(&bonding_curve) {
+                Some(state) => state.cashback_enabled,
+                None => {
+                    if allow_rpc_fallback {
+                        match self.fetch_bonding_curve_fast(&bonding_curve).await {
+                            Some(state) => {
+                                warn!(
+                                    bonding_curve = %bonding_curve,
+                                    cashback_enabled = state.cashback_enabled,
+                                    "cashback_enabled resolved via RPC fallback (cache miss)"
+                                );
+                                state.cashback_enabled
+                            }
+                            None => false,
+                        }
+                    } else {
+                        // Hot Path: Cache miss → cashback_enabled=false (I-7, no RPC)
+                        false
+                    }
+                }
+            };
             (c, cashback)
         } else if let Some(c) = self.get_creator_from_cache(&bonding_curve) {
             debug!(
@@ -1213,14 +1251,36 @@ impl PumpFunDex {
             );
             // Also cache in DashMap for faster subsequent lookups
             self.cached_creators.insert(token_mint, c);
-            let cashback = self
-                .get_bonding_curve_from_cache(&bonding_curve)
-                .map(|s| s.cashback_enabled)
-                .unwrap_or(false);
+            let cashback = match self.get_bonding_curve_from_cache(&bonding_curve) {
+                Some(state) => state.cashback_enabled,
+                None => {
+                    if allow_rpc_fallback {
+                        match self.fetch_bonding_curve_fast(&bonding_curve).await {
+                            Some(state) => {
+                                warn!(
+                                    bonding_curve = %bonding_curve,
+                                    cashback_enabled = state.cashback_enabled,
+                                    "cashback_enabled resolved via RPC fallback (cache miss)"
+                                );
+                                state.cashback_enabled
+                            }
+                            None => false,
+                        }
+                    } else {
+                        // Hot Path: Cache miss → cashback_enabled=false (I-7, no RPC)
+                        false
+                    }
+                }
+            };
             (c, cashback)
         } else {
-            // RPC FALLBACK - This path should NOT be hit in production!
-            // If we're here, it means neither cache had the creator.
+            // RPC FALLBACK - Only allowed in Cold Path (Liquidation).
+            // Hot Path: reject when creator not in cache (I-7).
+            if !allow_rpc_fallback {
+                return Err(anyhow!(
+                    "pump.fun: creator not in cache (GEYSER-ONLY hot path, no RPC)"
+                ));
+            }
             warn!(
                 token_mint = %token_mint_str,
                 bonding_curve = %bonding_curve,

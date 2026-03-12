@@ -465,6 +465,17 @@ impl LockManager {
         self.available_tokens.read().get(mint).copied().unwrap_or(0)
     }
 
+    /// Count the number of token mints with non-zero available balance.
+    /// Used as Single Source of Truth for open positions count,
+    /// replacing the error-prone dual-path AtomicUsize counter.
+    pub fn count_non_zero_token_balances(&self) -> usize {
+        self.available_tokens
+            .read()
+            .values()
+            .filter(|&&balance| balance > 0)
+            .count()
+    }
+
     /// Get total available capital for trading (WSOL for trades, SOL as fallback before init)
     ///
     /// Returns WSOL if initialized (even if 0), otherwise falls back to SOL.

@@ -224,7 +224,7 @@ fn build_minimal_pool_state_with_reserves(
                 real_token_reserves,
                 complete,
                 creator,
-                cashback_enabled: false, // JetStream metadata may not have it; safe default
+                cashback_enabled: false, // JetStream metadata may not have it; safe default — resolved at TX build time via RPC
             })
         }
         _ => {

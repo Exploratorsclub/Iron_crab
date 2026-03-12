@@ -1198,9 +1198,7 @@ impl StateSnapshot {
             daily_loss_lamports: ctx
                 .daily_loss_lamports
                 .load(std::sync::atomic::Ordering::Relaxed),
-            open_positions: ctx
-                .open_positions
-                .load(std::sync::atomic::Ordering::Relaxed),
+            open_positions: ctx.get_open_positions(),
             decision_counter: ctx
                 .decision_counter
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1338,9 +1336,6 @@ struct ExecutionContext {
     current_day: parking_lot::RwLock<chrono::NaiveDate>,
     /// Cumulative loss today (lamports, positive = loss)
     daily_loss_lamports: std::sync::atomic::AtomicI64,
-    /// Currently open positions count
-    open_positions: std::sync::atomic::AtomicUsize,
-
     // === Operational Kill Switch ===
     /// When active: reject new BUY intents.
     kill_switch_active: AtomicBool,
@@ -2653,6 +2648,64 @@ impl ExecutionContext {
             }
         }
 
+        // === Retry Phase: Re-scan wallet for tokens still present ===
+        // First pass may have failed for some tokens (stale quotes, RPC issues, sim failures).
+        // Wait for first-pass TXs to confirm, then re-scan and retry failed tokens.
+        info!("Liquidation first pass complete. Waiting before retry scan...");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        #[cfg(unix)]
+        maybe_ping_watchdog();
+
+        let token_program_id = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let retry_rpc_accounts = ctx
+            .rpc
+            .rpc
+            .get_token_accounts_by_owner(&owner, TokenAccountsFilter::ProgramId(token_program_id))
+            .await
+            .unwrap_or_default();
+
+        let mut retry_count = 0u32;
+        for ta in &retry_rpc_accounts {
+            let parsed = match &ta.account.data {
+                UiAccountData::Json(parsed) => parsed,
+                _ => continue,
+            };
+            let info = match parsed.parsed.get("info") {
+                Some(v) => v,
+                None => continue,
+            };
+            let mint_str = info
+                .get("mint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let balance_str = info
+                .get("tokenAmount")
+                .and_then(|v| v.get("amount"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("0");
+            let balance_raw: u64 = balance_str.parse().unwrap_or(0);
+
+            if balance_raw == 0 || mint_str == SOL_MINT || mint_str == WSOL_MINT {
+                continue;
+            }
+
+            retry_count += 1;
+            warn!(
+                mint = %mint_str,
+                balance_raw,
+                "LIQUIDATION RETRY: Token still in wallet after first pass"
+            );
+        }
+
+        if retry_count > 0 {
+            warn!(
+                remaining_tokens = retry_count,
+                "Liquidation: {} tokens still in wallet — full retry would require re-routing (logged for diagnostics)",
+                retry_count
+            );
+        }
+
         // Post-liquidation cleanup:
         // - Unwrap WSOL by closing WSOL ATA
         // - Close empty token accounts to avoid leaving rent-funded accounts open
@@ -3846,8 +3899,7 @@ impl ExecutionContext {
 
     /// Get current open positions count
     fn get_open_positions(&self) -> usize {
-        self.open_positions
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.lock_manager.count_non_zero_token_balances()
     }
 }
 
@@ -3875,6 +3927,9 @@ use ironcrab::execution::pool_cache_sync::{
 ///
 /// Uses last-per-subject WalletBalanceSnapshot events to count non-zero mints.
 /// Returns None if no snapshots were found (do not override persisted state).
+/// NOTE: open_positions is now derived from LockManager.count_non_zero_token_balances();
+/// this function is kept for potential diagnostics/future use.
+#[allow(dead_code)]
 async fn bootstrap_open_positions_from_wallet_snapshot(
     nats_client: &NatsClient,
     wallet: &Pubkey,
@@ -4480,81 +4535,40 @@ async fn main() -> Result<()> {
     // If reconciliation is needed after manual sales/transfers, use market-data's
     // WalletBalanceSnapshot events consumed by momentum-bot (strategy plane).
 
-    let (
-        initial_day,
-        initial_daily_loss,
-        mut initial_positions,
-        initial_decision_counter,
-        initial_execution_counter,
-    ) = if let Some(ref snap) = snapshot {
-        if snap.is_same_day() {
-            // Same day: restore all counters
-            info!(
-                daily_loss = snap.daily_loss_lamports,
-                open_positions = snap.open_positions,
-                decision_counter = snap.decision_counter,
-                "Restored same-day state from snapshot"
-            );
-            let positions = snap.open_positions;
-            (
-                chrono::NaiveDate::parse_from_str(&snap.day, "%Y-%m-%d")
-                    .unwrap_or_else(|_| chrono::Utc::now().date_naive()),
-                snap.daily_loss_lamports,
-                positions,
-                snap.decision_counter,
-                snap.execution_counter,
-            )
-        } else {
-            // New day: reset daily counters but keep counters for ID generation
-            info!(
-                old_day = %snap.day,
-                "New day detected, resetting daily loss but keeping ID counters"
-            );
-            // New day: daily loss resets. Positions should be 0 if all were closed,
-            // or restored from previous snapshot if holdings persist.
-            let positions = 0; // Reset positions on new day (clean slate)
-            (
-                chrono::Utc::now().date_naive(),
-                0, // Reset daily loss
-                positions,
-                snap.decision_counter, // Keep for unique IDs across restarts
-                snap.execution_counter,
-            )
-        }
-    } else {
-        // Fresh start (no snapshot)
-        (
-            chrono::Utc::now().date_naive(),
-            0,
-            0, // No positions on fresh start
-            0,
-            0,
-        )
-    };
-
-    // Reconcile open positions from wallet snapshot (JetStream) if available.
-    if let (Some(ref nats_client), Some(wallet)) = (&nats, wallet_pubkey) {
-        match bootstrap_open_positions_from_wallet_snapshot(nats_client, &wallet).await {
-            Ok(Some(reconciled)) => {
-                if reconciled != initial_positions {
-                    info!(
-                        previous = initial_positions,
-                        reconciled, "Open positions reconciled from wallet snapshot"
-                    );
-                }
-                initial_positions = reconciled;
-            }
-            Ok(None) => {
+    let (initial_day, initial_daily_loss, initial_decision_counter, initial_execution_counter) =
+        if let Some(ref snap) = snapshot {
+            if snap.is_same_day() {
+                // Same day: restore all counters
                 info!(
-                    persisted = initial_positions,
-                    "Wallet snapshot bootstrap: no JetStream data (market-data may start after execution-engine); using persisted open_positions"
+                    daily_loss = snap.daily_loss_lamports,
+                    open_positions = snap.open_positions,
+                    decision_counter = snap.decision_counter,
+                    "Restored same-day state from snapshot"
                 );
+                (
+                    chrono::NaiveDate::parse_from_str(&snap.day, "%Y-%m-%d")
+                        .unwrap_or_else(|_| chrono::Utc::now().date_naive()),
+                    snap.daily_loss_lamports,
+                    snap.decision_counter,
+                    snap.execution_counter,
+                )
+            } else {
+                // New day: reset daily counters but keep counters for ID generation
+                info!(
+                    old_day = %snap.day,
+                    "New day detected, resetting daily loss but keeping ID counters"
+                );
+                (
+                    chrono::Utc::now().date_naive(),
+                    0,                     // Reset daily loss
+                    snap.decision_counter, // Keep for unique IDs across restarts
+                    snap.execution_counter,
+                )
             }
-            Err(e) => {
-                warn!(error = %e, "Wallet snapshot bootstrap failed (keeping persisted open_positions)");
-            }
-        }
-    }
+        } else {
+            // Fresh start (no snapshot)
+            (chrono::Utc::now().date_naive(), 0, 0, 0)
+        };
 
     // Seed token balances AND SOL/WSOL from wallet snapshot stream (JetStream).
     // This also replaces the hardcoded 1 SOL default with the actual on-chain balance
@@ -4673,7 +4687,6 @@ async fn main() -> Result<()> {
         // Risk tracking - restored from snapshot
         current_day: parking_lot::RwLock::new(initial_day),
         daily_loss_lamports: std::sync::atomic::AtomicI64::new(initial_daily_loss),
-        open_positions: std::sync::atomic::AtomicUsize::new(initial_positions),
         kill_switch_active: AtomicBool::new(initial_kill_switch_active),
         liquidation_in_progress: AtomicBool::new(false),
         kill_switch_context: parking_lot::RwLock::new(None),
@@ -5637,19 +5650,21 @@ async fn main() -> Result<()> {
                             }
 
                             if active && liquidate_positions {
-                                // Check if liquidation is already in progress BEFORE spawning
                                 if ctx.liquidation_in_progress.load(Ordering::SeqCst) {
                                     warn!("KillSwitch: Liquidation already in progress, ignoring duplicate request");
                                 } else {
                                     let slippage = max_slippage_bps.unwrap_or(9900);
                                     let ttl = ttl_ms.unwrap_or(60_000);
-                                    ExecutionContext::run_liquidation_job(
-                                        Arc::clone(&ctx),
-                                        slippage,
-                                        ttl,
-                                        reason,
-                                    )
-                                    .await;
+                                    let ctx_spawn = Arc::clone(&ctx);
+                                    tokio::spawn(async move {
+                                        ExecutionContext::run_liquidation_job(
+                                            ctx_spawn,
+                                            slippage,
+                                            ttl,
+                                            reason,
+                                        )
+                                        .await;
+                                    });
                                 }
                             }
                         }
@@ -5792,37 +5807,14 @@ async fn main() -> Result<()> {
                                                             let _ = tx.try_send((sol, Some(*balance_raw)));
                                                         }
                                                     } else {
-                                                        // Regular token: update balance + track open_positions
+                                                        // Regular token: update balance (open_positions derived from LockManager)
                                                         let old = ctx.lock_manager.available_token_balance(mint);
                                                         ctx.lock_manager.set_available_token_balance(
                                                             mint.clone(),
                                                             *balance_raw,
                                                         );
 
-                                                        // Track open_positions on balance transitions
-                                                        if old > 0 && *balance_raw == 0 {
-                                                            let prev = ctx.open_positions.load(Ordering::Relaxed);
-                                                            if prev > 0 {
-                                                                ctx.open_positions.fetch_sub(1, Ordering::Relaxed);
-                                                                OPEN_POSITIONS_GAUGE.store((prev - 1) as u64, Ordering::Relaxed);
-                                                                info!(
-                                                                    mint = %mint,
-                                                                    old_balance = old,
-                                                                    open_positions = prev - 1,
-                                                                    "Token balance sync: position closed (balance → 0), open_positions decremented"
-                                                                );
-                                                            }
-                                                        } else if old == 0 && *balance_raw > 0 {
-                                                            let prev = ctx.open_positions.fetch_add(1, Ordering::Relaxed);
-                                                            OPEN_POSITIONS_GAUGE.store((prev + 1) as u64, Ordering::Relaxed);
-                                                            info!(
-                                                                mint = %mint,
-                                                                new_balance = *balance_raw,
-                                                                open_positions = prev + 1,
-                                                                "Token balance sync: new position detected (balance 0 → {}), open_positions incremented",
-                                                                balance_raw
-                                                            );
-                                                        } else if old != *balance_raw {
+                                                        if old != *balance_raw {
                                                             info!(
                                                                 mint = %mint,
                                                                 old_balance = old,
@@ -6097,7 +6089,6 @@ async fn build_replay_context(
         execution_counter: std::sync::atomic::AtomicU64::new(0),
         current_day: parking_lot::RwLock::new(chrono::Utc::now().date_naive()),
         daily_loss_lamports: std::sync::atomic::AtomicI64::new(0),
-        open_positions: std::sync::atomic::AtomicUsize::new(0),
         kill_switch_active: AtomicBool::new(false),
         liquidation_in_progress: AtomicBool::new(false),
         kill_switch_context: parking_lot::RwLock::new(None),
@@ -8054,16 +8045,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     ) {
         INTENTS_EXECUTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 
-        // Update execution-engine's own open_positions counter.
-        // This counter is reconciled from wallet snapshots at bootstrap and updated
-        // here on confirmed trades. momentum-bot remains the authoritative source
-        // for position tracking, but execution-engine needs an accurate counter
-        // for max_open_positions risk checks and dashboard metrics.
+        // open_positions is derived from LockManager.count_non_zero_token_balances()
+        // (Single Source of Truth). No separate counter — avoids dual-path drift.
         match intent.side {
             TradeSide::Buy => {
-                let prev = ctx.open_positions.fetch_add(1, Ordering::Relaxed);
-                OPEN_POSITIONS_GAUGE.store((prev + 1) as u64, Ordering::Relaxed);
-
                 // Immediately update LockManager with bought token balance so that
                 // subsequent SELL intents don't fail with SIM_INSUFFICIENT_BALANCE.
                 //
@@ -8118,15 +8103,6 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 }
             }
             TradeSide::Sell => {
-                // Prevent underflow: only decrement if > 0
-                let prev = ctx.open_positions.load(Ordering::Relaxed);
-                if prev > 0 {
-                    ctx.open_positions.fetch_sub(1, Ordering::Relaxed);
-                    OPEN_POSITIONS_GAUGE.store((prev - 1) as u64, Ordering::Relaxed);
-                } else {
-                    OPEN_POSITIONS_GAUGE.store(0, Ordering::Relaxed);
-                }
-
                 // Clear token balance from LockManager after successful SELL.
                 // This prevents stale balances that would pass pre-flight checks
                 // for tokens we no longer hold.
@@ -8140,6 +8116,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 );
             }
         }
+        OPEN_POSITIONS_GAUGE.store(ctx.get_open_positions() as u64, Ordering::Relaxed);
 
         // Best-effort recent trade record for Grafana (/trades via Infinity datasource).
         // NOTE: If fill accounting is available, use it; otherwise fall back to placeholders.

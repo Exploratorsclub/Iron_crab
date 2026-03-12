@@ -4,6 +4,43 @@ alwaysApply: true
 ---
 
 # IronCrab Core Rules
+
+**DIESE REGELN SIND VERBINDLICH. SIE SIND KEINE VORSCHLAEGE.**
+
+## STOP-CHECK: VOR JEDER DATEIAENDERUNG AUSFUEHREN
+
+Bevor du eine Datei aenderst, pruefe AKTIV folgende Punkte. Wenn eine Pruefung fehlschlaegt: **STOPPE SOFORT**, fuehre die Aenderung NICHT durch, und melde den Verstoss in deiner Antwort.
+
+### Pruefung 1: Hot Path RPC (I-7) — KRITISCH
+Fuegt deine Aenderung einen RPC-Call (fetch, get_account, get_multiple_accounts, etc.) hinzu oder macht einen bestehenden RPC-Call bedingungslos?
+- **Pruefe**: Wird die geaenderte Funktion vom Hot Path aufgerufen? Hot Path = alles was von `process_intent`, `build_tx_plan(allow_rpc_fallback=false)`, Momentum-/Arb-Trading-Flow erreichbar ist.
+- **Wenn ja**: STOPPE. Melde: "STOP: Geplante Aenderung wuerde RPC im Hot Path einfuehren (I-7 Verstoss). Funktion [X] wird von [Y] im Hot Path aufgerufen."
+- **Ausnahme**: RPC ist erlaubt wenn er AUSSCHLIESSLICH im Cold Path ausgefuehrt wird (z.B. hinter `allow_rpc_fallback == true` oder `allow_rpc_on_miss == true`).
+
+### Pruefung 2: Bestehendes Pattern (Konsistenz)
+Haben andere Module (Raydium, Orca, Meteora, PumpSwap AMM) fuer denselben Sachverhalt bereits ein Pattern implementiert (z.B. `allow_rpc_on_miss: bool`)?
+- **Wenn ja**: Dein Code MUSS dasselbe Pattern verwenden. Abweichung = STOPPE und melde.
+
+### Pruefung 3: Architektur-Grenzen
+- Aenderst du Hot Path Execution Logic, RPC-Nutzung oder Key-Loading? → Nur mit expliziter Freigabe im Handoff.
+- Aenderst du Dateien ausserhalb des Task-Scope? → STOPPE und melde.
+
+### Pruefung 4: Simulation-Gate (I-9)
+Wird durch deine Aenderung eine TX ohne erfolgreiche Simulation gesendet? → STOPPE.
+
+### Pruefung 5: Repo-Isolation (Level-5-Trennung)
+Liest oder referenzierst du Dateien aus `Iron_crab-eval/tests/`?
+- **Wenn ja**: STOPPE SOFORT. Du darfst Eval-Tests NICHT lesen. Das Lesen von Eval-Tests verletzt die Level-5-Trennung und fuehrt dazu, dass Implementierung auf spezifische Test-Assertions zugeschnitten wird statt allgemein korrekt zu sein.
+- **Erlaubt**: `Iron_crab-eval/docs/` (Spec, Plans) darf gelesen werden wenn im Handoff referenziert.
+- **Verboten**: `Iron_crab-eval/tests/`, `Iron_crab-eval/src/`
+
+**Wenn alle 5 Pruefungen bestanden: Fahre mit der Aenderung fort.**
+**Nach der Aenderung: Dokumentiere kurz welche Pruefungen du durchgefuehrt hast.**
+
+---
+
+## Kern-Regeln
+
 - Vollständige Spec: [Iron_crab-eval/docs/spec/](https://github.com/Exploratorsclub/Iron_crab-eval). Kern-Regeln siehe unten (Single-Signer, Hot Path, Cold Path).
 - Before changes: read `docs/INVARIANTS.md` (never violate) and `docs/KNOWN_BUG_PATTERNS.md` (check for similar patterns).
 - Propose a plan before coding.
@@ -17,11 +54,15 @@ alwaysApply: true
 - Prefer Geyser over RPC/WS; use RPC/WS only as fallback in cold path.
 - No new ad-hoc NATS topics; align with versioned topics or document clearly.
 - Avoid expanding legacy monolith; align new work to target multi-process architecture and MVP vertical slice.
-- never add rpc calls to hot path without explizit approval and report all calls in hotpath as architecture violation
-- HOT PATH (normal operations: discovery, buy, sell, monitoring): GEYSER-ONLY. No blocking RPC calls. Latency target < 250ms between discovery and TX on-chain. Data from Geyser/LivePoolCache is authoritative.
-- COLD PATH (liquidation, manual actions, bootstrap): RPC calls ARE acceptable. Safety and correctness have priority over speed. Use getTokenAccountsByOwner, getMultipleAccounts etc. for authoritative on-chain state.
-- NEVER remove RPC from cold paths to "optimize" — this breaks safety-critical flows. NEVER add RPC to hot paths without explicit approval — this breaks latency requirements.
-- When refactoring RPC usage, always verify which path (hot vs cold) is affected. Changes that touch both paths require explicit approval.
+
+## Hot Path vs. Cold Path (KRITISCH — HARD STOP bei Verstoss)
+
+- **HOT PATH** (Discovery, Buy, Sell, Monitoring): **GEYSER-ONLY**. Keine blockierenden RPC-Calls. Latenz-Ziel < 250ms. Geyser/LivePoolCache ist autoritativ.
+- **COLD PATH** (Liquidation, Manual Actions, Bootstrap): RPC erlaubt. Safety vor Speed.
+- **NEVER** RPC aus Cold Paths entfernen — bricht Safety.
+- **NEVER** RPC in Hot Paths ohne explizite Freigabe — bricht Latenz. **→ STOP-CHECK Pruefung 1**
+- Bei Aenderungen die beide Pfade beruehren: explizite Freigabe noetig.
+- Wenn eine Funktion von BEIDEN Pfaden aufgerufen wird: Parameter `allow_rpc_fallback: bool` oder `allow_rpc_on_miss: bool` verwenden um den Pfad zu unterscheiden. **→ STOP-CHECK Pruefung 2**
 
 ## Format & Clippy (vor Abschluss)
 Nach jeder Implementierung **vor** dem Abschluss als fertig:

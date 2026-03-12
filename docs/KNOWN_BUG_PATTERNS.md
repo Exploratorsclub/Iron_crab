@@ -236,6 +236,36 @@
 
 ---
 
+## 24. Open Positions Counter Drift (Ghost Positions / Missing Positions)
+
+| Symptom | Grafana "Open Positions" zeigt weniger (oder mehr) als tatsaechlich in der Wallet. Nach Redeploy korrekt, driftet waehrend Laufzeit. |
+|---------|--------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | `open_positions` war ein separater AtomicUsize Counter, der ueber ZWEI unabhaengige Pfade modifiziert wurde: (1) Execution Result Handler bei bestaetigtem BUY/SELL, (2) Geyser WalletBalanceSnapshot Balance-Transitions (0→positiv, positiv→0). Race Conditions zwischen diesen Pfaden fuehrten zu nicht-deterministischem Drift. |
+| **Fix** | `open_positions` als abgeleiteter Wert aus `LockManager.count_non_zero_token_balances()`. Eliminiert den separaten Counter und alle fetch_add/fetch_sub Aufrufe. Single Source of Truth ist `available_tokens` HashMap im LockManager. |
+| **Pruefen bei** | get_open_positions(), OPEN_POSITIONS_GAUGE, WalletBalanceSnapshot Handler, Execution Result Handler |
+
+---
+
+## 25. Liquidation scheitert — cashback_enabled defaults to false
+
+| Symptom | Kill-Switch Liquidation schliesst nur WSOL ATA, alle PumpFun Token-SELLs scheitern. |
+|---------|--------------------------------------------------------------------------------------|
+| **Root Cause** | `pool_cache_sync.rs` setzte `cashback_enabled: false` als Safe-Default fuer JetStream-bootstrapped Pools. In `build_swap_ix_async_with_slippage` wurde `cashback_enabled` per `unwrap_or(false)` aus dem Cache gelesen. Fuer Token mit aktivem Cashback erzeugte `build_sell_ix` ein falsches Account-Layout (14 statt 15/16 Accounts). |
+| **Fix** | RPC-Fallback via `fetch_bonding_curve_fast()` bei Cache-Miss fuer `cashback_enabled`. Alle drei Creator-Resolution-Pfade aktualisiert. |
+| **Pruefen bei** | build_swap_ix_async_with_slippage, build_sell_ix, pool_cache_sync, Liquidation-Flow |
+
+---
+
+## 26. run_liquidation_job blockiert Main-Loop
+
+| Symptom | Waehrend Liquidation keine Event-Verarbeitung (keine Balance-Updates, Control-Requests, Heartbeat). |
+|---------|------------------------------------------------------------------------------------------------------|
+| **Root Cause** | `run_liquidation_job().await` wurde direkt im `select!`-Macro der Main-Loop aufgerufen. Die Liquidation (RPC-Calls, Simulation, 15s Sleep, Cleanup) blockierte alle anderen Branches. |
+| **Fix** | `tokio::spawn` statt `.await` fuer `run_liquidation_job`. `liquidation_in_progress` AtomicBool Guard verhindert weiterhin parallele Jobs. |
+| **Pruefen bei** | ControlRequestKind::KillSwitch Handler, run_liquidation_job |
+
+---
+
 ## Quick-Check: Bei neuem Bug
 
 1. Sieht das wie eines der Muster oben?

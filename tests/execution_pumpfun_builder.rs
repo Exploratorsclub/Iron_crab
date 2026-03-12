@@ -33,6 +33,7 @@ async fn test_pumpfun_build_buy_ix_pure_derivation() {
             500,   // 5% slippage
             None,  // token_program_override - use default SPL Token
             false, // market_order: limit order
+            false, // allow_rpc_fallback: Hot Path (pure-derivation test)
         )
         .await
         .expect("build_swap_ix_async_with_slippage");
@@ -100,7 +101,8 @@ async fn test_pumpfun_market_order_buy() {
             Some(creator),
             500,
             None,
-            true, // market_order: exact SOL in, min tokens out = 1
+            true,  // market_order: exact SOL in, min tokens out = 1
+            false, // allow_rpc_fallback: Hot Path
         )
         .await
         .expect("build_swap_ix_async_with_slippage");
