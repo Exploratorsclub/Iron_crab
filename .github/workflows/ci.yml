@@ -84,11 +84,19 @@ jobs:
         with:
           path: Iron_crab
 
-      - name: Clone Iron_crab-eval (Sibling für path = "../Iron_crab")
+      - name: Clone Iron_crab-eval
         env:
           EVAL_CLONE_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository_owner }}/Iron_crab-eval.git
         run: |
           git clone "$EVAL_CLONE_URL" "${{ github.workspace }}/Iron_crab-eval"
+
+      - name: Patch eval git-dep to use PR checkout
+        run: |
+          cat >> "${{ github.workspace }}/Iron_crab-eval/Cargo.toml" <<'EOF'
+
+          [patch."https://github.com/Exploratorsclub/Iron_crab.git"]
+          ironcrab = { path = "../Iron_crab" }
+          EOF
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
