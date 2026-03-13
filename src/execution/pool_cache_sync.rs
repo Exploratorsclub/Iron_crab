@@ -224,7 +224,12 @@ fn build_minimal_pool_state_with_reserves(
                 real_token_reserves,
                 complete,
                 creator,
-                cashback_enabled: false, // JetStream metadata may not have it; safe default — resolved at TX build time via RPC
+                cashback_enabled: update
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("cashback_enabled"))
+                    .map(|v| v == "true")
+                    .unwrap_or(false), // Resolved from JetStream metadata (propagated by market-data from Geyser)
             })
         }
         _ => {

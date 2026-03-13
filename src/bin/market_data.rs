@@ -2624,6 +2624,7 @@ async fn run_geyser_loop(
                                 meta.insert("complete".to_string(), s.complete.to_string());
                                 meta.insert("real_token_reserves".to_string(), s.real_token_reserves.to_string());
                                 meta.insert("real_sol_reserves".to_string(), s.real_sol_reserves.to_string());
+                                meta.insert("cashback_enabled".to_string(), s.cashback_enabled.to_string());
                                 pool_update.metadata = Some(meta);
 
                                 // === BondingCurveProgress event for momentum-bot exit signal ===
