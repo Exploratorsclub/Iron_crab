@@ -4654,8 +4654,7 @@ async fn main() -> Result<()> {
                 count = pools_needing_accounts.len(),
                 "Startup: seeding pool_accounts for PumpSwap pools via getAccountInfo"
             );
-            let pump_amm =
-                PumpFunAmmDex::new_with_cache(Arc::clone(&rpc), Arc::clone(cache), true);
+            let pump_amm = PumpFunAmmDex::new_with_cache(Arc::clone(&rpc), Arc::clone(cache), true);
             let mut seeded = 0u32;
             for (pool_addr, base_mint) in &pools_needing_accounts {
                 match pump_amm.pool_accounts_v1_for_base_mint(*base_mint).await {

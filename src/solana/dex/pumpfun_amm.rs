@@ -311,50 +311,6 @@ impl PumpFunAmmDex {
         Pubkey::new_from_array(ata_spl.to_bytes())
     }
 
-    async fn find_token_account_by_owner_and_mint(
-        &self,
-        token_program: Pubkey,
-        token_owner: Pubkey,
-        mint: Pubkey,
-    ) -> Result<Option<Pubkey>> {
-        // Query by program and filter client-side by mint (covers SPL Token and Token-2022).
-        let accounts = self
-            .rpc
-            .get_token_accounts_by_owner_with_filter(&token_owner, &token_program)
-            .await
-            .map_err(|e| anyhow!("get_token_accounts_by_owner failed: {e}"))?;
-
-        for (pk, acc) in accounts {
-            if let Some((acc_mint, acc_owner)) =
-                Self::parse_spl_token_account_mint_and_owner(&acc.data)
-            {
-                if acc_mint == mint && acc_owner == token_owner {
-                    return Ok(Some(pk));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    async fn find_any_token_account_for_owner_and_mint(
-        &self,
-        token_owner: Pubkey,
-        mint: Pubkey,
-        token_program: Pubkey,
-        token_2022_program: Pubkey,
-    ) -> Result<Option<Pubkey>> {
-        // Prefer the legacy SPL Token program first.
-        if let Some(ta) = self
-            .find_token_account_by_owner_and_mint(token_program, token_owner, mint)
-            .await?
-        {
-            return Ok(Some(ta));
-        }
-        self.find_token_account_by_owner_and_mint(token_2022_program, token_owner, mint)
-            .await
-    }
-
     async fn derive_existing_pda(
         &self,
         program_id: Pubkey,
@@ -584,7 +540,10 @@ impl PumpFunAmmDex {
                         derived_ata = %derived_ata,
                         "pump_amm: ATA not on-chain, using derived address (PumpSwap will create via CreateIdempotent)"
                     );
-                    return Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(Some((cand, derived_ata)));
+                    return Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(Some((
+                        cand,
+                        derived_ata,
+                    )));
                 }
             }
             Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(None)
