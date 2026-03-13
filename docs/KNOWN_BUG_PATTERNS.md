@@ -246,13 +246,14 @@
 
 ---
 
-## 25. Liquidation scheitert — cashback_enabled defaults to false
+## 25. Liquidation scheitert — cashback_enabled defaults to false (REGRESSIERT)
 
-| Symptom | Kill-Switch Liquidation schliesst nur WSOL ATA, alle PumpFun Token-SELLs scheitern. |
-|---------|--------------------------------------------------------------------------------------|
-| **Root Cause** | `pool_cache_sync.rs` setzte `cashback_enabled: false` als Safe-Default fuer JetStream-bootstrapped Pools. In `build_swap_ix_async_with_slippage` wurde `cashback_enabled` per `unwrap_or(false)` aus dem Cache gelesen. Fuer Token mit aktivem Cashback erzeugte `build_sell_ix` ein falsches Account-Layout (14 statt 15/16 Accounts). |
-| **Fix** | RPC-Fallback via `fetch_bonding_curve_fast()` bei Cache-Miss fuer `cashback_enabled`. Alle drei Creator-Resolution-Pfade aktualisiert. |
-| **Pruefen bei** | build_swap_ix_async_with_slippage, build_sell_ix, pool_cache_sync, Liquidation-Flow |
+| Symptom | Kill-Switch Liquidation schliesst nur WSOL ATA, alle PumpFun Token-SELLs scheitern mit Custom(6024) Overflow. |
+|---------|---------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Zwei-Ebenen-Problem: (1) `pool_cache_sync.rs` hardcodet `cashback_enabled: false` fuer JetStream-bootstrapped PumpFun-Pools. `market_data.rs` propagiert `cashback_enabled` NICHT in der JetStream PoolCacheUpdate-Metadata. (2) In `build_swap_ix_async_with_slippage` liefert der LivePoolCache einen Cache-HIT mit `cashback_enabled=false` (von JetStream). Dadurch wird der RPC-Fallback NIE getriggert — auch nicht im Cold Path (Liquidation), weil der Fallback nur bei Cache-MISS greift. `build_sell_ix` laesst `user_volume_accumulator` weg. PumpFun interpretiert `bonding_curve_v2` als `user_volume_accumulator` → Overflow(6024). |
+| **Fix** | 3-teilig: (a) `market_data.rs`: `cashback_enabled` in JetStream PoolCacheUpdate-Metadata propagieren. (b) `pool_cache_sync.rs`: `cashback_enabled` aus Metadata lesen statt `false` zu hardcoden. (c) `pumpfun.rs`: Cold Path (allow_rpc_fallback=true) verifiziert `cashback_enabled` IMMER per RPC, auch bei Cache-HIT. |
+| **Pruefen bei** | build_swap_ix_async_with_slippage, build_sell_ix, pool_cache_sync, market_data (JetStream publish), Liquidation-Flow |
+| **Vorheriger Fix war unvollstaendig** | Der erste Fix (RPC-Fallback bei Cache-Miss) loeste das Problem nicht, weil JetStream-Daten einen Cache-HIT erzeugen und der RPC-Fallback-Pfad nie erreicht wird. |
 
 ---
 
