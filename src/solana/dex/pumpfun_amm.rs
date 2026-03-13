@@ -573,17 +573,18 @@ impl PumpFunAmmDex {
                     }
                 }
 
-                // 2) Slow path: find any token account owned by cand for mint (non-ATA).
-                if let Some(ta) = self
-                    .find_any_token_account_for_owner_and_mint(
-                        cand,
-                        mint,
-                        token_program,
-                        token_2022_program,
-                    )
-                    .await?
-                {
-                    return Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(Some((cand, ta)));
+                // FIX-32: ATA not found on-chain — derive and use anyway.
+                // PumpSwap creates it via CreateIdempotent during swap.
+                // No getTokenAccountsByOwner fallback (incompatible with restricted validator secondary indexes).
+                if mint == expected_quote_mint {
+                    let derived_ata = Self::derive_ata_with_program(cand, mint, token_program);
+                    warn!(
+                        candidate = %cand,
+                        mint = %mint,
+                        derived_ata = %derived_ata,
+                        "pump_amm: ATA not on-chain, using derived address (PumpSwap will create via CreateIdempotent)"
+                    );
+                    return Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(Some((cand, derived_ata)));
                 }
             }
             Ok::<Option<(Pubkey, Pubkey)>, anyhow::Error>(None)

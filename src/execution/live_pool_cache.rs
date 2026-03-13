@@ -823,6 +823,20 @@ impl LivePoolCache {
         None
     }
 
+    /// Get all PumpAmm pools that have empty pool_accounts.
+    /// Returns Vec<(pool_address, base_mint)> for pools that need pool_accounts seeding.
+    pub fn get_pump_amm_pools_without_accounts(&self) -> Vec<(Pubkey, Pubkey)> {
+        let mut result = Vec::new();
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
+                if s.pool_accounts.is_empty() {
+                    result.push((*entry.key(), s.base_mint));
+                }
+            }
+        }
+        result
+    }
+
     /// Get PumpAmm pool_accounts for a given base_mint from cache.
     ///
     /// Returns `Some(Vec<Pubkey>)` if the pool_accounts are non-empty in the cache.

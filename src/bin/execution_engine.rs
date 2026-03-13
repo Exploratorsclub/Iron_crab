@@ -1642,7 +1642,7 @@ impl ExecutionContext {
         }
 
         let pump_amm_result = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(45),
             pump_amm.quote_exact_in(&mint_str, &sol_mint_str, amount_in),
         )
         .await;
@@ -2017,7 +2017,7 @@ impl ExecutionContext {
                 // might still have a pool. The RPC-based discovery in quote_exact_in handles this.
                 let pump_amm_quote = Some(
                     tokio::time::timeout(
-                        Duration::from_secs(10),
+                        Duration::from_secs(45),
                         pump_amm.quote_exact_in(
                             &mint.to_string(),
                             &sol_mint.to_string(),
@@ -4644,6 +4644,40 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // FIX-33: Proactively seed pool_accounts for PumpSwap pools
+    // that came from JetStream bootstrap without pool_accounts.
+    if let Some(ref cache) = live_pool_cache {
+        let pools_needing_accounts = cache.get_pump_amm_pools_without_accounts();
+        if !pools_needing_accounts.is_empty() {
+            info!(
+                count = pools_needing_accounts.len(),
+                "Startup: seeding pool_accounts for PumpSwap pools via getAccountInfo"
+            );
+            let pump_amm =
+                PumpFunAmmDex::new_with_cache(Arc::clone(&rpc), Arc::clone(cache), true);
+            let mut seeded = 0u32;
+            for (pool_addr, base_mint) in &pools_needing_accounts {
+                match pump_amm.pool_accounts_v1_for_base_mint(*base_mint).await {
+                    Ok(Some(accounts)) => {
+                        cache.set_pump_amm_pool_accounts(pool_addr, accounts);
+                        seeded += 1;
+                    }
+                    Ok(None) => {
+                        debug!(pool = %pool_addr, "Startup seeding: pool parse returned None (may be non-WSOL pair)");
+                    }
+                    Err(e) => {
+                        warn!(pool = %pool_addr, error = %e, "Startup seeding: pool discovery failed");
+                    }
+                }
+            }
+            info!(
+                seeded = seeded,
+                total = pools_needing_accounts.len(),
+                "Startup: pool_accounts seeding complete"
+            );
+        }
+    }
 
     // FIX-32: Initialize Geyser-based TX confirmation tracker
     let tx_confirm = {

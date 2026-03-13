@@ -3316,6 +3316,34 @@ async fn run_geyser_loop(
                         }
                         if pool_accounts.len() >= 14 {
                             ctx.live_pool_cache.set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
+
+                            // FIX-33: Persist pool_accounts to JetStream so bootstrap recovers them after restart.
+                            if let Some(ref nats) = ctx.nats {
+                                let mut pool_update = PoolCacheUpdate::new_pool_discovered(
+                                    "market-data",
+                                    BUILD_VERSION,
+                                    run_id,
+                                    pool_address.to_string(),
+                                    "pump_amm".to_string(),
+                                    base_mint.clone(),
+                                    quote_mint.clone(),
+                                    0,
+                                    0,
+                                    None,
+                                    tx_update.slot,
+                                );
+                                let mut meta = std::collections::HashMap::new();
+                                let accounts_str: Vec<String> = pool_accounts.iter().map(|p| p.to_string()).collect();
+                                meta.insert("pool_accounts".to_string(), accounts_str.join(","));
+                                pool_update.metadata = Some(meta);
+                                let subject = pool_subject(&pool_address.to_string());
+                                if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
+                                    warn!(error = %e, "FIX-33: Failed to publish pump_amm pool_accounts PoolCacheUpdate to JetStream (create_pool)");
+                                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                         }
                         ctx.pool_mint_map.write().insert(pool_address.to_string(), base_mint.clone());
                     }
@@ -3415,6 +3443,34 @@ async fn run_geyser_loop(
                     // when the parsed Geyser state has empty pool_accounts.
                     if pool_accounts.len() >= 14 {
                         ctx.live_pool_cache.set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
+
+                        // FIX-33: Persist pool_accounts to JetStream so bootstrap recovers them after restart.
+                        if let Some(ref nats) = ctx.nats {
+                            let mut pool_update = PoolCacheUpdate::new_pool_discovered(
+                                "market-data",
+                                BUILD_VERSION,
+                                run_id,
+                                pool_address.to_string(),
+                                "pump_amm".to_string(),
+                                base_mint.clone(),
+                                quote_mint.clone(),
+                                0,
+                                0,
+                                None,
+                                tx_update.slot,
+                            );
+                            let mut meta = std::collections::HashMap::new();
+                            let accounts_str: Vec<String> = pool_accounts.iter().map(|p| p.to_string()).collect();
+                            meta.insert("pool_accounts".to_string(), accounts_str.join(","));
+                            pool_update.metadata = Some(meta);
+                            let subject = pool_subject(&pool_address.to_string());
+                            if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
+                                warn!(error = %e, "FIX-33: Failed to publish pump_amm pool_accounts PoolCacheUpdate to JetStream (trade)");
+                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
 
