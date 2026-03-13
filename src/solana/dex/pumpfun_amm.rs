@@ -2224,29 +2224,38 @@ impl Dex for PumpFunAmmDex {
                 let (amount_out, price_impact_bps) =
                     self.quote_cp(amount_in, in_reserve, out_reserve, DEFAULT_TOTAL_FEE_BPS);
                 if amount_out == 0 {
-                    return Ok(None);
+                    if self.allow_rpc_on_miss {
+                        warn!(
+                            base_mint = %base_mint_str,
+                            base_reserve = base_r,
+                            quote_reserve = quote_r,
+                            "pump_amm: cache reserves degenerate (one side=0), Cold Path falling through to RPC"
+                        );
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    debug!(
+                        base_mint = %base_mint_str,
+                        pool = %pool_market,
+                        base_reserve = base_r,
+                        quote_reserve = quote_r,
+                        amount_out,
+                        "pump_amm: quote from LivePoolCache (ZERO RPC)"
+                    );
+
+                    return Ok(Some(Quote {
+                        amount_out,
+                        price_impact_bps,
+                        route: vec![pool_market.to_string()],
+                        fee_bps: DEFAULT_TOTAL_FEE_BPS,
+                        in_reserve,
+                        out_reserve,
+                        input_mint: input_mint.to_string(),
+                        output_mint: output_mint.to_string(),
+                        tick_spacing: None,
+                    }));
                 }
-
-                debug!(
-                    base_mint = %base_mint_str,
-                    pool = %pool_market,
-                    base_reserve = base_r,
-                    quote_reserve = quote_r,
-                    amount_out,
-                    "pump_amm: quote from LivePoolCache (ZERO RPC)"
-                );
-
-                return Ok(Some(Quote {
-                    amount_out,
-                    price_impact_bps,
-                    route: vec![pool_market.to_string()],
-                    fee_bps: DEFAULT_TOTAL_FEE_BPS,
-                    in_reserve,
-                    out_reserve,
-                    input_mint: input_mint.to_string(),
-                    output_mint: output_mint.to_string(),
-                    tick_spacing: None,
-                }));
             }
             // Cache miss: Hot Path (allow_rpc_on_miss=false) → None. Cold Path (true) → RPC fallback. P3 #12.
             if !self.allow_rpc_on_miss {

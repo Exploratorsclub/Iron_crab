@@ -2583,7 +2583,34 @@ async fn run_geyser_loop(
                                     );
                                 }
                             }
-                            (s.base_mint, s.quote_mint, s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
+                            {
+                                let (base_r, quote_r) = if s.base_reserve.is_none() || s.quote_reserve.is_none() {
+                                    let base_vault = s.pool_base_token_account;
+                                    let quote_vault = s.pool_quote_token_account;
+                                    let base_bal = match rpc.get_account_opt_retry(&base_vault).await {
+                                        Ok(Some(acc)) => try_parse_token_account_balance(&acc.data).unwrap_or(0),
+                                        _ => 0,
+                                    };
+                                    let quote_bal = match rpc.get_account_opt_retry(&quote_vault).await {
+                                        Ok(Some(acc)) => try_parse_token_account_balance(&acc.data).unwrap_or(0),
+                                        _ => 0,
+                                    };
+                                    if base_bal > 0 || quote_bal > 0 {
+                                        info!(
+                                            pool = %account_update.pubkey,
+                                            base_vault = %base_vault,
+                                            quote_vault = %quote_vault,
+                                            base_bal,
+                                            quote_bal,
+                                            "pump_amm: pre-loaded vault balances via RPC (Cold Start Bootstrap)"
+                                        );
+                                    }
+                                    (base_bal, quote_bal)
+                                } else {
+                                    (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
+                                };
+                                (s.base_mint, s.quote_mint, base_r, quote_r)
+                            }
                         }
                         CachedPoolState::PumpFun(s) => {
                             (s.token_mint, Pubkey::default(), s.virtual_token_reserves, s.virtual_sol_reserves)
