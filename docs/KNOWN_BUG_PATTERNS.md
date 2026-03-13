@@ -278,6 +278,38 @@
 
 ---
 
+## 28. PoolDiscovered ueberschreibt pool_accounts im SLAVE LivePoolCache
+
+| Symptom | Kill-Switch Liquidation fuer PumpSwap AMM Token scheitert mit "pump_amm=err_discovery pump_amm pool discovery failed" und "cache=skip pump_amm no_pool_accounts". Pool_accounts waren zwischenzeitlich vorhanden (logs: "pool_accounts populated (was empty)"), aber spaeter verschwunden. |
+|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | In `pool_cache_sync.rs` ruft der `PoolDiscovered` Handler `cache.upsert()` auf, das den kompletten Cache-Eintrag ERSETZT. Wenn ein neues PoolDiscovered JetStream-Event ohne `pool_accounts` Metadata kommt (z.B. Geyser Re-Scan des Pool-Accounts), werden zuvor per DexPoolAccounts gesetzte pool_accounts geloescht. Der `BalanceUpdated` Handler hat bereits Merge-Logik (Zeile 310-324) die pool_accounts erhalt, aber `PoolDiscovered` hat diese NICHT. |
+| **Fix** | `PoolDiscovered` Handler: Vor `cache.upsert()` pruefen ob ein bestehender PumpAmm-Eintrag pool_accounts hat. Wenn ja und der neue Eintrag leere pool_accounts hat, die bestehenden uebernehmen (analog zu BalanceUpdated). |
+| **Pruefen bei** | apply_pool_cache_update (PoolDiscovered branch), LivePoolCache.upsert, Liquidation pool account discovery |
+| **Verwandt** | Bug #27 (degenerate reserves) — selbe Symptom-Familie: SLAVE Cache verliert Daten die fuer Liquidation benoetigt werden |
+
+---
+
+## 29. build_swap_ix hardcodes spl_token::id() fuer Token-2022 PumpSwap Sells
+
+| Symptom | PumpSwap AMM Sell Simulation scheitert mit `Custom(6023)` fuer Token-2022 Tokens. Regulaere Sells (Momentum-Bot) betroffen, nicht die Liquidation (die nutzt `build_swap_ix_from_pool_accounts`). |
+|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | In `pumpfun_amm.rs` `build_swap_ix()` sind Instruction-Accounts 11/12 (base/quote Token Program) hardcoded auf `spl_token::id()` (Zeile 2394-2395), obwohl `base_token_program` bereits korrekt aus `cached_data` aufgeloest wird (Zeile 2346-2350). Fuer Token-2022 Tokens muss Account 11 `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb` sein. `build_swap_ix_from_pool_accounts` (genutzt von tx_builder fuer Liquidation/Intent-Pfad) handhabt dies korrekt via `base_token_program` Parameter. |
+| **Fix** | In `build_swap_ix()`: Account 11 auf die bereits aufgeloeste Variable `base_token_program` aendern statt hardcoded `spl_token::id()`. Account 12 bleibt `spl_token::id()` (WSOL ist immer SPL Token). |
+| **Pruefen bei** | build_swap_ix (pumpfun_amm.rs), Token-2022 PumpSwap sells |
+| **Verwandt** | Bug #25 (cashback_enabled Token-Layout) — selbes Pattern: statische Annahme ueber Account-Layout statt dynamische Aufloesung |
+
+---
+
+## 30. Liquidation Retry Scan ignoriert Token-2022 Accounts
+
+| Symptom | Nach erstem Liquidation-Pass werden Token-2022 Token nicht als "noch im Wallet" erkannt. Retry-Diagnostic-Log zeigt 0 remaining tokens, obwohl Token-2022 Positionen verbleiben. |
+|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Die Retry-Diagnostic-Schleife in `execution_engine.rs` (Zeile 2659-2665) scannt nur `spl_token::id()` per `getTokenAccountsByOwner`. Token-2022 Accounts werden nicht abgefragt. Die initiale Scan-Phase (Zeile 1830-1855) scannt korrekt beide Programme. |
+| **Fix** | Analog zur initialen Phase auch im Retry-Scan `token_2022_program_id` abfragen und Ergebnisse mergen. |
+| **Pruefen bei** | run_liquidation_job retry scan, cleanup_wallet_after_liquidation |
+
+---
+
 ## Quick-Check: Bei neuem Bug
 
 1. Sieht das wie eines der Muster oben?
