@@ -267,6 +267,17 @@
 
 ---
 
+## 27. PumpSwap AMM Liquidation scheitert — degenerate Cache Reserves nach Restart
+
+| Symptom | Kill-Switch Liquidation fuer Token mit completed bonding curve (migriert zu PumpSwap AMM) scheitert mit "LIQUIDATION SKIP: No supported route found". On-chain haben die Pools gueltige Liquiditaet. |
+|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Nach Restart/Deploy werden PumpSwap AMM Pools per Geyser mit `base_reserve=None, quote_reserve=None` geparst (Reserves kommen aus Vault-Accounts, nicht aus dem Pool-Account). Der PoolDiscovered-Event geht mit `(0, 0)` an JetStream. Wenn nur ein Vault-Balance-Update vor der Liquidation ankommt, hat der SLAVE-Cache z.B. `(691T tokens, 0 SOL)`. In `pumpfun_amm.rs` `quote_exact_in()` liefert der Cache `Some((691T, 0))` — ein Cache-HIT. `amount_out` berechnet sich zu 0 → Code gibt `Ok(None)` zurueck und erreicht den RPC-Fallback NICHT, obwohl `allow_rpc_on_miss=true` (Cold Path). |
+| **Fix** | 2-teilig: (a) `pumpfun_amm.rs`: Wenn Cache-Reserves degenerate sind (eine Seite=0) und Cold Path aktiv (`allow_rpc_on_miss=true`), zum RPC-Fallback durchfallen statt None zurueckzugeben. (b) `market_data.rs`: Bei Pool-Discovery Vault-Balances sofort per RPC vorladen, damit PoolDiscovered-Events bereits gueltige Reserves enthalten. |
+| **Pruefen bei** | quote_exact_in (pumpfun_amm.rs), Geyser pool account parse (market_data.rs), PoolCacheUpdate publish, Liquidation-Flow |
+| **Verwandt** | Bug #25 (cashback_enabled) — selbes Pattern: Cache-HIT verhindert RPC-Fallback im Cold Path |
+
+---
+
 ## Quick-Check: Bei neuem Bug
 
 1. Sieht das wie eines der Muster oben?
