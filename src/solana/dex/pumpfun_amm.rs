@@ -1380,6 +1380,49 @@ impl PumpFunAmmDex {
             }
         }
 
+        // FIX-31: FAST PATH — If the LivePoolCache has the pool address (even without
+        // pool_accounts), use a single getAccount call to parse the pool account data.
+        // This avoids the slow getProgramAccounts scan that routinely times out (>10s).
+        if let Some(ref cache) = self.live_pool_cache {
+            if let Some(pool_address) = cache.get_pump_amm_pool_address_by_base_mint(&base_mint) {
+                info!(
+                    base_mint = %base_mint,
+                    pool = %pool_address,
+                    "pump_amm: LivePoolCache has pool address but no pool_accounts, trying direct getAccount"
+                );
+                match self
+                    .try_parse_pool_static_from_market_account(pool_address, base_mint)
+                    .await
+                {
+                    Ok(Some(pool)) => {
+                        self.pools_by_base.insert(base_mint, pool.clone());
+                        self.pools_by_market.insert(pool.pool_market, base_mint);
+                        info!(
+                            base_mint = %base_mint,
+                            pool_market = %pool.pool_market,
+                            "pump_amm: PumpAmmPoolStatic from direct getAccount (fast path)"
+                        );
+                        return Ok(Some(pool));
+                    }
+                    Ok(None) => {
+                        warn!(
+                            base_mint = %base_mint,
+                            pool = %pool_address,
+                            "pump_amm: direct getAccount parse returned None, falling through to getProgramAccounts"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            base_mint = %base_mint,
+                            pool = %pool_address,
+                            error = %e,
+                            "pump_amm: direct getAccount parse failed, falling through to getProgramAccounts"
+                        );
+                    }
+                }
+            }
+        }
+
         // Avoid concurrent discovery attempts for the same base mint.
         // This significantly reduces RPC rate-limits when `parallel_exits` is enabled.
         let _guard = self.discovery_lock.lock().await;

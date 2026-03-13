@@ -809,6 +809,20 @@ impl LivePoolCache {
         None
     }
 
+    /// Get the pool market address for a PumpAmm pool by base_mint, regardless of whether
+    /// pool_accounts or reserves are populated. Used as a fast-path in discover_pool_static
+    /// to do a single getAccount instead of the slow getProgramAccounts scan.
+    pub fn get_pump_amm_pool_address_by_base_mint(&self, base_mint: &Pubkey) -> Option<Pubkey> {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
+                if s.base_mint == *base_mint {
+                    return Some(*entry.key());
+                }
+            }
+        }
+        None
+    }
+
     /// Get PumpAmm pool_accounts for a given base_mint from cache.
     ///
     /// Returns `Some(Vec<Pubkey>)` if the pool_accounts are non-empty in the cache.
