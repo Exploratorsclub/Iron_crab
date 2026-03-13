@@ -3418,8 +3418,8 @@ async fn run_geyser_loop(
                         MarketEventKind::DexPoolAccounts {
                             dex: DexType::PumpFunAmm.to_string(),
                             pool_address: pool_address.to_string(),
-                            base_mint,
-                            quote_mint,
+                            base_mint: base_mint.clone(),
+                            quote_mint: quote_mint.clone(),
                             accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
                         },
                     );
