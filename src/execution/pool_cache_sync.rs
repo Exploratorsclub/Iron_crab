@@ -341,6 +341,24 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         }
                     }
                 }
+                // Bug #25: Preserve cashback_enabled for pumpfun when BalanceUpdated has no metadata
+                // (BalanceUpdated never includes metadata). Otherwise we'd overwrite true with false.
+                if update.dex == "pumpfun" {
+                    let metadata_has_cashback = update
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("cashback_enabled"))
+                        .is_some();
+                    if !metadata_has_cashback {
+                        if let (
+                            Some(CachedPoolState::PumpFun(ref existing_pump)),
+                            CachedPoolState::PumpFun(ref mut new_pump),
+                        ) = (existing.as_ref(), &mut minimal_state)
+                        {
+                            new_pump.cashback_enabled = existing_pump.cashback_enabled;
+                        }
+                    }
+                }
                 cache.upsert(addr, minimal_state, update.geyser_slot);
                 // P3 #13: Apply decimals from metadata when present (e.g. BalanceUpdated with metadata)
                 apply_decimals_from_metadata(cache, update);
@@ -439,4 +457,58 @@ pub async fn bootstrap_pool_cache_from_jetstream(
 
     info!(pools_recovered, "SLAVE CACHE BOOTSTRAP: Complete");
     Ok((pools_recovered, Some(consumer)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A.30 Regression: cashback_enabled must be true when JetStream metadata contains
+    /// cashback_enabled="true". Verifies pool_cache_sync propagates metadata correctly.
+    #[test]
+    fn test_jetstream_metadata_propagates_cashback_enabled_true() {
+        let cache = LivePoolCache::new();
+        let pool_addr = "14Nx7vjtSeMVWugP4zUq5EJkD97ZXKRFUCAPhJJ1pump";
+        let base_mint = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+        let quote_mint = "So11111111111111111111111111111111111111112";
+
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run-123",
+            pool_addr.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1_000_000,
+            100_000_000,
+            Some(0),
+            12345,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "creator".to_string(),
+            "Creato11111111111111111111111111111111111111".to_string(),
+        );
+        meta.insert("complete".to_string(), "false".to_string());
+        meta.insert(
+            "real_token_reserves".to_string(),
+            "793100000000000".to_string(),
+        );
+        meta.insert("real_sol_reserves".to_string(), "0".to_string());
+        meta.insert("cashback_enabled".to_string(), "true".to_string());
+        update.metadata = Some(meta);
+
+        let applied = apply_pool_cache_update(&cache, &update);
+        assert!(applied, "apply_pool_cache_update should succeed");
+
+        let pool_pk = Pubkey::from_str(pool_addr).unwrap();
+        let state = cache.get(&pool_pk).expect("cache should have pool");
+        match state {
+            CachedPoolState::PumpFun(s) => {
+                assert!(s.cashback_enabled, "A.30: cashback_enabled must be true when JetStream metadata contains cashback_enabled=\"true\"");
+            }
+            other => panic!("expected PumpFun state, got {:?}", other),
+        }
+    }
 }

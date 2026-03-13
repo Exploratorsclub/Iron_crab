@@ -2916,6 +2916,7 @@ async fn run_geyser_loop(
                         meta.insert("complete".to_string(), complete.to_string());
                         meta.insert("real_token_reserves".to_string(), real_token_reserves.to_string());
                         meta.insert("real_sol_reserves".to_string(), real_sol_reserves.to_string());
+                        meta.insert("cashback_enabled".to_string(), cashback_enabled.to_string());
                         // P3 #13: base_decimals and quote_decimals (PumpFun quote = SOL)
                         if let Some(d) = ctx.live_pool_cache.get_mint_decimals(&base_mint_pk) {
                             meta.insert("base_decimals".to_string(), d.to_string());
