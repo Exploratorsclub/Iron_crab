@@ -321,6 +321,28 @@
 
 ---
 
+## 32. try_parse_pool_static nutzt getTokenAccountsByOwner — inkompatibel mit Validator Secondary Index Whitelist
+
+| Symptom | Pool Discovery scheitert mit `RPC response error -32010: ... excluded from account secondary indexes` fuer coin_creator/protocol_fee_recipient Wallets die nicht in der Validator Whitelist stehen. Betrifft ALLE PumpSwap Pools deren Creator-ATA nicht on-chain existiert. |
+|---------|----------|
+| **Root Cause** | `try_parse_pool_static_from_market_account_inner` (pumpfun_amm.rs Zeile 550-590) nutzt `getTokenAccountsByOwner` als Fallback wenn die ATA eines Candidates nicht on-chain existiert. Der Validator hat `--account-index-include-key` konfiguriert, und beliebige coin_creator Wallets sind nicht in dieser Whitelist. 6.2M PumpSwap Accounts machen `getProgramAccounts` als letzten Fallback mit ~26s zu langsam. |
+| **Fix** | `getTokenAccountsByOwner`-Fallback entfernen. Stattdessen ATA-Adresse immer per PDA ableiten und verwenden — PumpSwap erstellt die ATA via CreateIdempotent waehrend des Swaps. Fuer WSOL (quote_mint) ist das Token-Program immer SPL Token. |
+| **Pruefen bei** | Pool Discovery fuer PumpSwap Pools mit unbekannten Creator-Wallets |
+| **Verwandt** | Bug #31 (getProgramAccounts Timeout), Validator-Konfiguration mit Secondary Index Whitelist |
+
+---
+
+## 33. JetStream Bootstrap-Luecke — pool_accounts gehen bei Restart verloren
+
+| Symptom | Nach Restart hat der SLAVE LivePoolCache leere pool_accounts fuer PumpSwap Pools, obwohl sie vor dem Restart vorhanden waren. Betrifft Pools die nach dem letzten Trade kein Geyser-Account-Update mehr hatten. |
+|---------|----------|
+| **Root Cause** | `pool_accounts` werden bei Trade-Parsing im MASTER Cache gesetzt und per `DexPoolAccounts` auf NATS pub/sub emittiert (nicht persistent). Ein aktualisiertes `PoolCacheUpdate` auf JetStream wird NUR bei Geyser-Account-Updates publiziert. Wenn kein Balance-Update nach dem Trade kommt → JetStream hat alte Nachricht ohne pool_accounts → Bootstrap nach Restart hat leere pool_accounts. |
+| **Fix** | Bei Trade-Parsing nach `set_pump_amm_pool_accounts()` ein zusaetzliches `PoolCacheUpdate` mit pool_accounts in metadata auf JetStream publizieren. |
+| **Pruefen bei** | Restart des execution-engine, Bootstrap von PumpSwap Pools |
+| **Verwandt** | Bug #28 (PoolDiscovered ueberschreibt pool_accounts), FIX-26 (MASTER Cache Fallback) |
+
+---
+
 ## Quick-Check: Bei neuem Bug
 
 1. Sieht das wie eines der Muster oben?
