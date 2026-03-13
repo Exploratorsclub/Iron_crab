@@ -2657,12 +2657,25 @@ impl ExecutionContext {
         maybe_ping_watchdog();
 
         let token_program_id = Pubkey::new_from_array(spl_token::id().to_bytes());
-        let retry_rpc_accounts = ctx
+        let token_2022_program_id = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+        let mut retry_rpc_accounts = ctx
             .rpc
             .rpc
             .get_token_accounts_by_owner(&owner, TokenAccountsFilter::ProgramId(token_program_id))
             .await
             .unwrap_or_default();
+
+        if let Ok(mut accounts_2022) = ctx
+            .rpc
+            .rpc
+            .get_token_accounts_by_owner(
+                &owner,
+                TokenAccountsFilter::ProgramId(token_2022_program_id),
+            )
+            .await
+        {
+            retry_rpc_accounts.append(&mut accounts_2022);
+        }
 
         let mut retry_count = 0u32;
         for ta in &retry_rpc_accounts {

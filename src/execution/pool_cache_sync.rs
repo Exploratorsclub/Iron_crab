@@ -272,7 +272,25 @@ fn apply_decimals_from_metadata(cache: &LivePoolCache, update: &PoolCacheUpdate)
 pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) -> bool {
     match update.update_type {
         PoolCacheUpdateType::PoolDiscovered => {
-            if let Some((pool_addr, minimal_state)) = build_minimal_pool_state(update) {
+            if let Some((pool_addr, mut minimal_state)) = build_minimal_pool_state(update) {
+                if update.dex == "pump_amm" {
+                    if let Some(existing) = cache.get(&pool_addr) {
+                        if let (
+                            CachedPoolState::PumpAmm(ref existing_pump),
+                            CachedPoolState::PumpAmm(ref mut new_pump),
+                        ) = (&existing, &mut minimal_state)
+                        {
+                            if new_pump.pool_accounts.is_empty()
+                                && !existing_pump.pool_accounts.is_empty()
+                            {
+                                new_pump.pool_accounts = existing_pump.pool_accounts.clone();
+                            }
+                            if new_pump.creator.is_none() && existing_pump.creator.is_some() {
+                                new_pump.creator = existing_pump.creator;
+                            }
+                        }
+                    }
+                }
                 cache.upsert(pool_addr, minimal_state, update.geyser_slot);
                 // P3 #13: Propagate base_decimals and quote_decimals to SLAVE cache
                 apply_decimals_from_metadata(cache, update);

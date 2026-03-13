@@ -2391,7 +2391,7 @@ impl Dex for PumpFunAmmDex {
             AccountMeta::new(pool.pool_quote_vault, false),       // 8
             AccountMeta::new_readonly(pool.protocol_fee_recipient, false), // 9
             AccountMeta::new(pool.protocol_fee_recipient_ta, false), // 10
-            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 11
+            AccountMeta::new_readonly(base_token_program, false), // 11
             AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false), // 12
             AccountMeta::new_readonly(
                 Pubkey::new_from_array(solana_system_program::id().to_bytes()),
