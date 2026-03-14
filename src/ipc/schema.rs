@@ -2067,6 +2067,88 @@ mod tests {
         let parsed: ExecutionResult = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.status, ExecutionStatus::Sent);
     }
+
+    // ========================================================================
+    // Discovery Request/Reply (I-24d EnsurePumpAmmPoolAccounts)
+    // ========================================================================
+
+    #[test]
+    fn test_control_request_ensure_pump_amm_pool_accounts_serde() {
+        let req = ControlRequest::new(
+            "execution-engine",
+            "v0.1.0",
+            "run-123",
+            "req-ensure-001".to_string(),
+            "market-data",
+            ControlRequestKind::EnsurePumpAmmPoolAccounts {
+                base_mint: "TokenMint11111111111111111111111111111111".to_string(),
+            },
+        );
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("ensure_pump_amm_pool_accounts"));
+        assert!(json.contains("TokenMint11111111111111111111111111111111"));
+        assert!(json.contains("market-data"));
+        assert!(json.contains("req-ensure-001"));
+
+        let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.request_id, "req-ensure-001");
+        assert_eq!(parsed.target, "market-data");
+        match &parsed.kind {
+            ControlRequestKind::EnsurePumpAmmPoolAccounts { base_mint } => {
+                assert_eq!(base_mint, "TokenMint11111111111111111111111111111111");
+            }
+            _ => panic!("expected EnsurePumpAmmPoolAccounts"),
+        }
+    }
+
+    #[test]
+    fn test_control_response_serde() {
+        let resp = ControlResponse::new(
+            "market-data",
+            "v0.1.0",
+            "run-123",
+            "req-001".to_string(),
+            "market-data",
+            ControlResponseStatus::Ok,
+        )
+        .with_pool_address("PoolAddr11111111111111111111111111111111".to_string());
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("schema_version"));
+        assert!(json.contains("req-001"));
+        assert!(json.contains("ok"));
+        assert!(json.contains("PoolAddr11111111111111111111111111111111"));
+
+        let parsed: ControlResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.request_id, "req-001");
+        assert_eq!(parsed.status, ControlResponseStatus::Ok);
+        assert_eq!(
+            parsed.pool_address.as_deref(),
+            Some("PoolAddr11111111111111111111111111111111")
+        );
+    }
+
+    #[test]
+    fn test_control_response_status_roundtrip() {
+        for status in [
+            ControlResponseStatus::Ok,
+            ControlResponseStatus::NotFound,
+            ControlResponseStatus::Error,
+        ] {
+            let resp = ControlResponse::new(
+                "market-data",
+                "v0.1.0",
+                "run-123",
+                "req-123".to_string(),
+                "market-data",
+                status,
+            );
+            let json = serde_json::to_string(&resp).unwrap();
+            let parsed: ControlResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.status, status);
+        }
+    }
 }
 
 // ============================================================================

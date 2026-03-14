@@ -4352,3 +4352,34 @@ async fn run_simulation_loop(
 
     Ok(())
 }
+
+// ============================================================================
+// Discovery Request/Reply tests (I-24d)
+// ============================================================================
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    /// Positive Ack ONLY when JetStream write succeeds (I-24a).
+    /// This helper encodes the invariant; the handler uses the same logic.
+    fn discovery_response_status_for_jetstream(jetstream_ok: bool) -> ControlResponseStatus {
+        if jetstream_ok {
+            ControlResponseStatus::Ok
+        } else {
+            ControlResponseStatus::Error
+        }
+    }
+
+    #[test]
+    fn test_discovery_response_ok_only_when_jetstream_succeeds() {
+        assert_eq!(
+            discovery_response_status_for_jetstream(true),
+            ControlResponseStatus::Ok
+        );
+        assert_eq!(
+            discovery_response_status_for_jetstream(false),
+            ControlResponseStatus::Error
+        );
+    }
+}

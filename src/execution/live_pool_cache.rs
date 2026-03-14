@@ -1610,6 +1610,54 @@ mod tests {
         assert_eq!(by_pool.unwrap(), accounts_to_set);
     }
 
+    /// Discovery Request path must NOT degrade existing reserves/creator.
+    /// set_pump_amm_pool_accounts only updates pool_accounts; reserves and creator stay intact.
+    #[test]
+    fn test_set_pump_amm_pool_accounts_preserves_reserves_and_creator() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let base_reserve = 1_000_000_000u64;
+        let quote_reserve = 50_000_000_000u64;
+        let new_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(base_reserve),
+                quote_reserve: Some(quote_reserve),
+                pool_accounts: vec![],
+                creator: Some(creator),
+            }),
+            100,
+        );
+
+        cache.set_pump_amm_pool_accounts(&pool_market, new_accounts.clone());
+
+        let (r_base, r_quote, _) = cache
+            .get_pump_amm_reserves_by_base_mint(&base_mint)
+            .expect("reserves must be preserved");
+        assert_eq!(r_base, base_reserve);
+        assert_eq!(r_quote, quote_reserve);
+
+        let accounts = cache
+            .get_pump_amm_pool_accounts_by_base_mint(&base_mint)
+            .expect("pool_accounts must be set");
+        assert_eq!(accounts, new_accounts);
+
+        if let Some(CachedPoolState::PumpAmm(s)) = cache.get(&pool_market) {
+            assert_eq!(s.creator, Some(creator));
+        } else {
+            panic!("expected PumpAmm state");
+        }
+    }
+
     #[test]
     fn test_mark_pumpfun_complete_for_mint() {
         let cache = LivePoolCache::new();
