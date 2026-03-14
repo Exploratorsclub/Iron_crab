@@ -1314,8 +1314,11 @@ const MAX_BLOCKHASH_AGE_SECS: u64 = 30;
 /// I-24d: Bounded wait timeout for Discovery Request/Reply (market-data).
 const DISCOVERY_REQUEST_TIMEOUT_SECS: u64 = 15;
 
-/// I-24d: Delay after Ok response to allow JetStream PoolCacheUpdate to reach SLAVE cache.
-const DISCOVERY_JETSTREAM_SYNC_DELAY_MS: u64 = 500;
+/// I-24d: Bounded wait for authoritative SLAVE cache state (pool_accounts from JetStream).
+const DISCOVERY_CACHE_WAIT_TIMEOUT_MS: u64 = 10_000;
+
+/// I-24d: Poll interval when waiting for pool_accounts in SLAVE cache.
+const DISCOVERY_CACHE_POLL_INTERVAL_MS: u64 = 100;
 
 /// Outcome of a Discovery Request (I-24d). Used for bounded wait + single retry.
 #[derive(Debug)]
@@ -1324,6 +1327,27 @@ enum DiscoveryRequestOutcome {
     NotFound,
     Error(String),
     Timeout,
+}
+
+/// I-24d: Wait bounded for authoritative pool_accounts in SLAVE cache (from JetStream).
+/// Polls until pool_accounts present or timeout. Returns true if found.
+async fn wait_for_pool_accounts_in_cache(
+    cache: &LivePoolCache,
+    base_mint: &Pubkey,
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        if cache
+            .get_pump_amm_pool_accounts_by_base_mint(base_mint)
+            .is_some()
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+    }
+    false
 }
 
 /// Runtime context for execution-engine
@@ -1679,25 +1703,40 @@ impl ExecutionContext {
                         return None;
                     }
                 };
-                let accounts = match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
-                    Ok(Some(a)) => a,
-                    Ok(None) => {
-                        // I-24d: No local discovery. Request from market-data, bounded wait, single retry.
+                // I-24d: Cache-only — no pump_amm.pool_accounts_v1_for_base_mint (would trigger RPC).
+                let accounts = match self
+                    .live_pool_cache
+                    .as_ref()
+                    .and_then(|c| c.get_pump_amm_pool_accounts_by_base_mint(&mint))
+                {
+                    Some(a) if a.len() >= 14 => a,
+                    _ => {
+                        // I-24d: Request from market-data, wait bounded on authoritative cache state.
                         info!(mint = %mint_str, "6005-retry: pool_accounts cache miss, requesting discovery from market-data");
                         match self.request_discovery_and_wait(&mint_str).await {
                             DiscoveryRequestOutcome::Ok => {
-                                tokio::time::sleep(Duration::from_millis(
-                                    DISCOVERY_JETSTREAM_SYNC_DELAY_MS,
-                                ))
-                                .await;
-                                match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
-                                    Ok(Some(a)) => a,
-                                    Ok(None) => {
-                                        warn!(mint = %mint_str, "6005-retry: pool_accounts still missing after discovery");
+                                let cache = match self.live_pool_cache.as_ref() {
+                                    Some(c) => c,
+                                    None => {
+                                        warn!(mint = %mint_str, "6005-retry: no cache");
                                         return None;
                                     }
-                                    Err(e) => {
-                                        warn!(mint = %mint_str, error = %e, "6005-retry: pool_accounts failed after discovery");
+                                };
+                                if !wait_for_pool_accounts_in_cache(
+                                    cache,
+                                    &mint,
+                                    DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                    DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                                )
+                                .await
+                                {
+                                    warn!(mint = %mint_str, "6005-retry: pool_accounts not in cache after discovery timeout");
+                                    return None;
+                                }
+                                match cache.get_pump_amm_pool_accounts_by_base_mint(&mint) {
+                                    Some(a) if a.len() >= 14 => a,
+                                    _ => {
+                                        warn!(mint = %mint_str, "6005-retry: pool_accounts still missing after discovery");
                                         return None;
                                     }
                                 }
@@ -1715,10 +1754,6 @@ impl ExecutionContext {
                                 return None;
                             }
                         }
-                    }
-                    Err(e) => {
-                        warn!(mint = %mint_str, error = %e, "6005-retry: pool_accounts failed");
-                        return None;
                     }
                 };
                 let acct_strings: Vec<String> = accounts.iter().map(|p| p.to_string()).collect();
@@ -1876,25 +1911,26 @@ impl ExecutionContext {
                 None
             }
         };
-        let lpc = ctx.live_pool_cache.as_ref().map(Arc::clone);
-        let pump_amm = if let Some(ref cache) = lpc {
-            PumpFunAmmDex::new_with_cache(Arc::clone(&ctx.rpc), Arc::clone(cache), true)
-            // Liquidation = Cold Path — RPC fallback allowed on cache miss. P3 #12.
-        } else {
-            PumpFunAmmDex::new(Arc::clone(&ctx.rpc))
-        };
+        let lpc = ctx
+            .live_pool_cache
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(create_shared_cache);
+        // I-24d: allow_rpc_on_miss=false — no local PumpSwap discovery. Discovery only via
+        // Request/Reply to market-data. Cache-only for quote and pool_accounts.
+        let pump_amm = PumpFunAmmDex::new_with_cache(Arc::clone(&ctx.rpc), Arc::clone(&lpc), false);
         let mut meteora = MeteoraDlmm::new_with_live_cache(
             Arc::clone(&ctx.rpc),
-            lpc.clone(),
+            Some(lpc.clone()),
             true, // Liquidation = Cold Path — RPC fallback allowed
         );
         meteora.set_user_authority(owner);
         let raydium = Raydium::new_with_live_cache(
             Arc::clone(&ctx.rpc),
-            lpc.clone(),
+            Some(lpc.clone()),
             true, // Liquidation = Cold Path — RPC fallback allowed
         );
-        let orca = Orca::new_with_cache(Arc::clone(&ctx.rpc), None, lpc);
+        let orca = Orca::new_with_cache(Arc::clone(&ctx.rpc), None, Some(lpc));
         orca.set_user_authority(owner);
 
         if let Err(e) = raydium.refresh_pools().await {
@@ -2150,10 +2186,13 @@ impl ExecutionContext {
                             #[cfg(unix)]
                             maybe_ping_watchdog();
                             if let Some(pool_id) = q.route.first().cloned() {
-                                match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
-                                    Ok(Some(accounts)) => {
-                                        // I-24d: No local set_pump_amm_pool_accounts. Cache is
-                                        // updated by market-data via JetStream.
+                                // I-24d: Cache-only — no pump_amm.pool_accounts_v1_for_base_mint.
+                                let accounts = ctx
+                                    .live_pool_cache
+                                    .as_ref()
+                                    .and_then(|c| c.get_pump_amm_pool_accounts_by_base_mint(&mint));
+                                match accounts {
+                                    Some(accounts) if accounts.len() >= 14 => {
                                         let acct_strings: Vec<String> =
                                             accounts.into_iter().map(|p| p.to_string()).collect();
                                         quote_attempts.push(format!(
@@ -2169,53 +2208,62 @@ impl ExecutionContext {
                                             acct_strings,
                                         );
                                     }
-                                    Ok(None) => {
-                                        // I-24d: Request discovery from market-data, bounded wait, single retry.
+                                    _ => {
+                                        // I-24d: Request discovery, wait bounded on authoritative cache state.
                                         info!(mint = %mint, "pump_amm quote ok but pool_accounts missing; requesting discovery");
                                         match ctx
                                             .request_discovery_and_wait(&mint.to_string())
                                             .await
                                         {
                                             DiscoveryRequestOutcome::Ok => {
-                                                tokio::time::sleep(Duration::from_millis(
-                                                    DISCOVERY_JETSTREAM_SYNC_DELAY_MS,
-                                                ))
-                                                .await;
-                                                match pump_amm
-                                                    .pool_accounts_v1_for_base_mint(mint)
+                                                if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                                                    if wait_for_pool_accounts_in_cache(
+                                                        cache,
+                                                        &mint,
+                                                        DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                                        DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                                                    )
                                                     .await
-                                                {
-                                                    Ok(Some(accounts)) => {
-                                                        let acct_strings: Vec<String> = accounts
-                                                            .into_iter()
-                                                            .map(|p| p.to_string())
-                                                            .collect();
+                                                    {
+                                                        if let Some(accounts) = cache
+                                                            .get_pump_amm_pool_accounts_by_base_mint(&mint)
+                                                        {
+                                                            let acct_strings: Vec<String> = accounts
+                                                                .into_iter()
+                                                                .map(|p| p.to_string())
+                                                                .collect();
+                                                            quote_attempts.push(format!(
+                                                                "pump_amm=ok amount_out={} pool={} accounts_len={} (after discovery)",
+                                                                q.amount_out,
+                                                                pool_id,
+                                                                acct_strings.len()
+                                                            ));
+                                                            record_candidate(
+                                                                "pump_amm",
+                                                                q.amount_out,
+                                                                pool_id,
+                                                                acct_strings,
+                                                            );
+                                                        } else {
+                                                            warn!(mint = %mint, "pump_amm pool_accounts still missing after discovery");
+                                                            quote_attempts.push(format!(
+                                                                "pump_amm=skip no_pool_accounts amount_out={} pool={}",
+                                                                q.amount_out, pool_id
+                                                            ));
+                                                        }
+                                                    } else {
+                                                        warn!(mint = %mint, "pump_amm pool_accounts not in cache after discovery timeout");
                                                         quote_attempts.push(format!(
-                                                            "pump_amm=ok amount_out={} pool={} accounts_len={} (after discovery)",
-                                                            q.amount_out,
-                                                            pool_id,
-                                                            acct_strings.len()
-                                                        ));
-                                                        record_candidate(
-                                                            "pump_amm",
-                                                            q.amount_out,
-                                                            pool_id,
-                                                            acct_strings,
-                                                        );
-                                                    }
-                                                    Ok(None) => {
-                                                        warn!(mint = %mint, "pump_amm pool_accounts still missing after discovery");
-                                                        quote_attempts.push(format!(
-                                                            "pump_amm=skip no_pool_accounts amount_out={} pool={}",
+                                                            "pump_amm=skip timeout amount_out={} pool={}",
                                                             q.amount_out, pool_id
                                                         ));
                                                     }
-                                                    Err(e) => {
-                                                        warn!(mint = %mint, error = %e, "pump_amm pool_accounts failed after discovery");
-                                                        quote_attempts.push(format!(
-                                                            "pump_amm=err_discovery {e}"
-                                                        ));
-                                                    }
+                                                } else {
+                                                    warn!(mint = %mint, "pump_amm: no cache");
+                                                    quote_attempts.push(format!(
+                                                        "pump_amm=skip no_cache amount_out={} pool={}",
+                                                        q.amount_out, pool_id
+                                                    ));
                                                 }
                                             }
                                             DiscoveryRequestOutcome::NotFound => {
@@ -2238,10 +2286,6 @@ impl ExecutionContext {
                                                 ));
                                             }
                                         }
-                                    }
-                                    Err(e) => {
-                                        warn!(mint = %mint, error = %e, "pump_amm pool account discovery failed; skipping pump_amm");
-                                        quote_attempts.push(format!("pump_amm=err_discovery {e}"));
                                     }
                                 }
                             }
@@ -6411,10 +6455,11 @@ async fn run_golden_replay(intents_path: &Path, output_path: &Path) {
             let dex_pumpfun = intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun");
             if is_6005 && dex_pumpfun {
                 if let Some(ref cache) = ctx.live_pool_cache {
+                    // I-24d: allow_rpc_on_miss=false — no local PumpSwap discovery.
                     let pump_amm = PumpFunAmmDex::new_with_cache(
                         Arc::clone(&ctx.rpc),
                         Arc::clone(cache),
-                        true,
+                        false,
                     );
                     if let Some(retry) = ctx
                         .try_6005_pumpfun_retry(&intent, &pump_amm, max_slippage_bps)
