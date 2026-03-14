@@ -68,7 +68,7 @@ use ironcrab::ipc::{
     SimulationResult, TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide,
     TradingRegime,
 };
-use ironcrab::ipc::{ControlRequest, ControlRequestKind};
+use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
     record_recent_trade, record_tx_slot_to_send_ms, serve_metrics, RecentTrade,
     ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS, CONCURRENT_INTENTS_GAUGE,
@@ -85,9 +85,10 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_trade_intents_stream, wallet_snapshot_consumer_config, NatsClient, NatsConfig,
-    CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_DECISION_RECORDS,
-    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS,
-    TRADE_INTENTS_STREAM_NAME, WALLET_SNAPSHOT_STREAM_NAME,
+    CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_CONTROL_RESPONSES,
+    TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
+    TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, TRADE_INTENTS_STREAM_NAME,
+    WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
@@ -1310,6 +1311,21 @@ struct CachedBlockhash {
 /// Solana blockhashes expire after ~150 slots (~60s). We use a conservative 30s.
 const MAX_BLOCKHASH_AGE_SECS: u64 = 30;
 
+/// I-24d: Bounded wait timeout for Discovery Request/Reply (market-data).
+const DISCOVERY_REQUEST_TIMEOUT_SECS: u64 = 15;
+
+/// I-24d: Delay after Ok response to allow JetStream PoolCacheUpdate to reach SLAVE cache.
+const DISCOVERY_JETSTREAM_SYNC_DELAY_MS: u64 = 500;
+
+/// Outcome of a Discovery Request (I-24d). Used for bounded wait + single retry.
+#[derive(Debug)]
+enum DiscoveryRequestOutcome {
+    Ok,
+    NotFound,
+    Error(String),
+    Timeout,
+}
+
 /// Runtime context for execution-engine
 struct ExecutionContext {
     run_id: String,
@@ -1388,6 +1404,13 @@ struct ExecutionContext {
     // === FIX-31: Parallel Intent Processing ===
     /// Semaphore limiting how many intents run concurrently (sized from config at startup)
     intent_semaphore: Arc<tokio::sync::Semaphore>,
+
+    /// I-24d: Pending Discovery Request/Reply correlation (request_id -> oneshot sender).
+    pending_discovery_responses: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<ControlResponse>>,
+        >,
+    >,
 
     /// Channel to send SOL/WSOL balance updates to WsolManager (from JetStream consumer).
     /// When Some, WalletBalanceSnapshot for NATIVE_SOL/WSOL are forwarded here.
@@ -1659,8 +1682,39 @@ impl ExecutionContext {
                 let accounts = match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
                     Ok(Some(a)) => a,
                     Ok(None) => {
-                        warn!(mint = %mint_str, "6005-retry: pool_accounts cache miss");
-                        return None;
+                        // I-24d: No local discovery. Request from market-data, bounded wait, single retry.
+                        info!(mint = %mint_str, "6005-retry: pool_accounts cache miss, requesting discovery from market-data");
+                        match self.request_discovery_and_wait(&mint_str).await {
+                            DiscoveryRequestOutcome::Ok => {
+                                tokio::time::sleep(Duration::from_millis(
+                                    DISCOVERY_JETSTREAM_SYNC_DELAY_MS,
+                                ))
+                                .await;
+                                match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
+                                    Ok(Some(a)) => a,
+                                    Ok(None) => {
+                                        warn!(mint = %mint_str, "6005-retry: pool_accounts still missing after discovery");
+                                        return None;
+                                    }
+                                    Err(e) => {
+                                        warn!(mint = %mint_str, error = %e, "6005-retry: pool_accounts failed after discovery");
+                                        return None;
+                                    }
+                                }
+                            }
+                            DiscoveryRequestOutcome::NotFound => {
+                                warn!(mint = %mint_str, "6005-retry: discovery not_found");
+                                return None;
+                            }
+                            DiscoveryRequestOutcome::Error(e) => {
+                                warn!(mint = %mint_str, error = %e, "6005-retry: discovery error");
+                                return None;
+                            }
+                            DiscoveryRequestOutcome::Timeout => {
+                                warn!(mint = %mint_str, "6005-retry: discovery timeout");
+                                return None;
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!(mint = %mint_str, error = %e, "6005-retry: pool_accounts failed");
@@ -1699,6 +1753,66 @@ impl ExecutionContext {
                 None
             }
         }
+    }
+
+    /// I-24d: Request PumpSwap pool_accounts discovery from market-data (Cold Path only).
+    /// Sends EnsurePumpAmmPoolAccounts, waits bounded for ControlResponse, returns outcome.
+    /// Does NOT write to SLAVE cache — market-data publishes to JetStream, SLAVE consumes.
+    async fn request_discovery_and_wait(&self, base_mint: &str) -> DiscoveryRequestOutcome {
+        let Some(ref nats) = self.nats else {
+            warn!("Discovery request: NATS not connected");
+            return DiscoveryRequestOutcome::Error("NATS not connected".to_string());
+        };
+
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        {
+            let mut pending = self.pending_discovery_responses.lock().await;
+            pending.insert(request_id.clone(), tx);
+        }
+
+        let req = ControlRequest::new(
+            "execution-engine",
+            BUILD_VERSION,
+            &self.run_id,
+            request_id.clone(),
+            "market-data",
+            ControlRequestKind::EnsurePumpAmmPoolAccounts {
+                base_mint: base_mint.to_string(),
+            },
+        );
+
+        if nats.publish(TOPIC_CONTROL_REQUESTS, &req).await.is_err() {
+            let mut pending = self.pending_discovery_responses.lock().await;
+            pending.remove(&request_id);
+            warn!(base_mint = %base_mint, "Discovery request: publish failed");
+            return DiscoveryRequestOutcome::Error("publish failed".to_string());
+        }
+
+        let outcome =
+            match tokio::time::timeout(Duration::from_secs(DISCOVERY_REQUEST_TIMEOUT_SECS), rx)
+                .await
+            {
+                Ok(Ok(resp)) => match resp.status {
+                    ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
+                    ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                    ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
+                        resp.message.unwrap_or_else(|| "unknown error".to_string()),
+                    ),
+                },
+                Ok(Err(_)) => DiscoveryRequestOutcome::Error("channel closed".to_string()),
+                Err(_) => DiscoveryRequestOutcome::Timeout,
+            };
+
+        // Cleanup pending entry (may have been removed by subscription)
+        let _ = self
+            .pending_discovery_responses
+            .lock()
+            .await
+            .remove(&request_id);
+
+        outcome
     }
 
     async fn run_liquidation_job(
@@ -2038,16 +2152,8 @@ impl ExecutionContext {
                             if let Some(pool_id) = q.route.first().cloned() {
                                 match pump_amm.pool_accounts_v1_for_base_mint(mint).await {
                                     Ok(Some(accounts)) => {
-                                        // Cache pool_accounts in LivePoolCache for Phase 3 fallback
-                                        // and future liquidations (avoids repeated RPC discovery).
-                                        if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
-                                            if let Some(ref cache) = ctx.live_pool_cache {
-                                                cache.set_pump_amm_pool_accounts(
-                                                    &pool_pk,
-                                                    accounts.clone(),
-                                                );
-                                            }
-                                        }
+                                        // I-24d: No local set_pump_amm_pool_accounts. Cache is
+                                        // updated by market-data via JetStream.
                                         let acct_strings: Vec<String> =
                                             accounts.into_iter().map(|p| p.to_string()).collect();
                                         quote_attempts.push(format!(
@@ -2064,11 +2170,74 @@ impl ExecutionContext {
                                         );
                                     }
                                     Ok(None) => {
-                                        warn!(mint = %mint, "pump_amm quote returned route, but pool accounts not found; skipping pump_amm");
-                                        quote_attempts.push(format!(
-                                            "pump_amm=skip no_pool_accounts amount_out={} pool={}",
-                                            q.amount_out, pool_id
-                                        ));
+                                        // I-24d: Request discovery from market-data, bounded wait, single retry.
+                                        info!(mint = %mint, "pump_amm quote ok but pool_accounts missing; requesting discovery");
+                                        match ctx
+                                            .request_discovery_and_wait(&mint.to_string())
+                                            .await
+                                        {
+                                            DiscoveryRequestOutcome::Ok => {
+                                                tokio::time::sleep(Duration::from_millis(
+                                                    DISCOVERY_JETSTREAM_SYNC_DELAY_MS,
+                                                ))
+                                                .await;
+                                                match pump_amm
+                                                    .pool_accounts_v1_for_base_mint(mint)
+                                                    .await
+                                                {
+                                                    Ok(Some(accounts)) => {
+                                                        let acct_strings: Vec<String> = accounts
+                                                            .into_iter()
+                                                            .map(|p| p.to_string())
+                                                            .collect();
+                                                        quote_attempts.push(format!(
+                                                            "pump_amm=ok amount_out={} pool={} accounts_len={} (after discovery)",
+                                                            q.amount_out,
+                                                            pool_id,
+                                                            acct_strings.len()
+                                                        ));
+                                                        record_candidate(
+                                                            "pump_amm",
+                                                            q.amount_out,
+                                                            pool_id,
+                                                            acct_strings,
+                                                        );
+                                                    }
+                                                    Ok(None) => {
+                                                        warn!(mint = %mint, "pump_amm pool_accounts still missing after discovery");
+                                                        quote_attempts.push(format!(
+                                                            "pump_amm=skip no_pool_accounts amount_out={} pool={}",
+                                                            q.amount_out, pool_id
+                                                        ));
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(mint = %mint, error = %e, "pump_amm pool_accounts failed after discovery");
+                                                        quote_attempts.push(format!(
+                                                            "pump_amm=err_discovery {e}"
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            DiscoveryRequestOutcome::NotFound => {
+                                                warn!(mint = %mint, "pump_amm discovery not_found");
+                                                quote_attempts.push(format!(
+                                                    "pump_amm=skip not_found amount_out={} pool={}",
+                                                    q.amount_out, pool_id
+                                                ));
+                                            }
+                                            DiscoveryRequestOutcome::Error(e) => {
+                                                warn!(mint = %mint, error = %e, "pump_amm discovery error");
+                                                quote_attempts
+                                                    .push(format!("pump_amm=err_discovery {e}"));
+                                            }
+                                            DiscoveryRequestOutcome::Timeout => {
+                                                warn!(mint = %mint, "pump_amm discovery timeout");
+                                                quote_attempts.push(format!(
+                                                    "pump_amm=skip timeout amount_out={} pool={}",
+                                                    q.amount_out, pool_id
+                                                ));
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         warn!(mint = %mint, error = %e, "pump_amm pool account discovery failed; skipping pump_amm");
@@ -4645,38 +4814,8 @@ async fn main() -> Result<()> {
         None
     };
 
-    // FIX-33: Proactively seed pool_accounts for PumpSwap pools
-    // that came from JetStream bootstrap without pool_accounts.
-    if let Some(ref cache) = live_pool_cache {
-        let pools_needing_accounts = cache.get_pump_amm_pools_without_accounts();
-        if !pools_needing_accounts.is_empty() {
-            info!(
-                count = pools_needing_accounts.len(),
-                "Startup: seeding pool_accounts for PumpSwap pools via getAccountInfo"
-            );
-            let pump_amm = PumpFunAmmDex::new_with_cache(Arc::clone(&rpc), Arc::clone(cache), true);
-            let mut seeded = 0u32;
-            for (pool_addr, base_mint) in &pools_needing_accounts {
-                match pump_amm.pool_accounts_v1_for_base_mint(*base_mint).await {
-                    Ok(Some(accounts)) => {
-                        cache.set_pump_amm_pool_accounts(pool_addr, accounts);
-                        seeded += 1;
-                    }
-                    Ok(None) => {
-                        debug!(pool = %pool_addr, "Startup seeding: pool parse returned None (may be non-WSOL pair)");
-                    }
-                    Err(e) => {
-                        warn!(pool = %pool_addr, error = %e, "Startup seeding: pool discovery failed");
-                    }
-                }
-            }
-            info!(
-                seeded = seeded,
-                total = pools_needing_accounts.len(),
-                "Startup: pool_accounts seeding complete"
-            );
-        }
-    }
+    // I-24d: No global Startup-Seeding/Discovery-Rebuild. market-data is Discovery authority.
+    // Pool_accounts arrive via JetStream PoolCacheUpdate or Discovery Request/Reply on demand.
 
     // FIX-32: Initialize Geyser-based TX confirmation tracker
     let tx_confirm = {
@@ -4720,6 +4859,9 @@ async fn main() -> Result<()> {
         config_snapshot_id: parking_lot::RwLock::new(exec_config.snapshot_id()),
         intent_semaphore: Arc::new(tokio::sync::Semaphore::new(
             exec_config.max_concurrent_intents as usize,
+        )),
+        pending_discovery_responses: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
         )),
         config: parking_lot::RwLock::new(exec_config),
         nats,
@@ -5363,6 +5505,36 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 warn!(error = %e, "Failed to subscribe to ControlRequests");
+            }
+        }
+
+        // I-24d: Subscribe to ControlResponses for Discovery Request/Reply correlation
+        match nats.subscribe(TOPIC_CONTROL_RESPONSES).await {
+            Ok(mut resp_sub) => {
+                info!(
+                    topic = TOPIC_CONTROL_RESPONSES,
+                    "Subscribed to ControlResponses (Discovery Request/Reply)"
+                );
+                let pending = Arc::clone(&ctx.pending_discovery_responses);
+                tokio::spawn(async move {
+                    while let Some(msg) = resp_sub.next().await {
+                        match msg.deserialize::<ControlResponse>() {
+                            Ok(resp) => {
+                                let request_id = resp.request_id.clone();
+                                let mut map = pending.lock().await;
+                                if let Some(tx) = map.remove(&request_id) {
+                                    let _ = tx.send(resp);
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to deserialize ControlResponse");
+                            }
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to subscribe to ControlResponses");
             }
         }
     }
@@ -6154,6 +6326,9 @@ async fn build_replay_context(
         cached_blockhash: parking_lot::RwLock::new(None),
         live_pool_cache,
         intent_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        pending_discovery_responses: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
         wsol_balance_tx: None,
         tx_confirm: Arc::new(ironcrab::solana::geyser_tx_confirm::GeyserTxConfirm::new(
             15,
