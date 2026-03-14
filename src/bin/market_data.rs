@@ -1569,9 +1569,10 @@ async fn main() -> Result<()> {
 ///
 /// Performs RPC-based discovery (Cold Path), updates MASTER cache, publishes
 /// JetStream PoolCacheUpdate (SSOT), and ControlResponse (correlation only).
+/// Uses shared PumpFunAmmDex for dedupe/storm protection.
 async fn handle_ensure_pump_amm_pool_accounts(
     ctx: &MarketDataContext,
-    rpc: &SolanaRpc,
+    dex: &ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex,
     run_id: &str,
     request_id: &str,
     base_mint_str: &str,
@@ -1595,12 +1596,6 @@ async fn handle_ensure_pump_amm_pool_accounts(
         }
     };
 
-    let dex = PumpFunAmmDex::new_with_cache(
-        Arc::new(rpc.clone()),
-        ctx.live_pool_cache.clone(),
-        true, // allow_rpc_on_miss: Cold Path Discovery
-    );
-
     match dex.pool_accounts_v1_for_base_mint(base_mint).await {
         Ok(Some(accounts)) if accounts.len() >= 14 => {
             let pool_address = accounts[0];
@@ -1609,21 +1604,37 @@ async fn handle_ensure_pump_amm_pool_accounts(
             let quote_mint = accounts[3];
             let quote_mint_str = quote_mint.to_string();
 
-            // Update MASTER cache (upsert if not present, then set pool_accounts)
-            let state = CachedPoolState::PumpAmm(PumpAmmState {
-                base_mint,
-                quote_mint,
-                pool_base_token_account: accounts[4],
-                pool_quote_token_account: accounts[5],
-                base_reserve: None,
-                quote_reserve: None,
-                pool_accounts: accounts.clone(),
-                creator: None,
-            });
-            ctx.live_pool_cache.upsert(pool_address, state, 0);
+            // Preserve existing reserves/creator: only set pool_accounts if pool exists,
+            // else upsert minimal state. Never degrade existing good data with 0/0.
+            let existing = ctx.live_pool_cache.get(&pool_address);
+            if let Some(CachedPoolState::PumpAmm(ref _existing_pump)) = existing {
+                ctx.live_pool_cache
+                    .set_pump_amm_pool_accounts(&pool_address, accounts.clone());
+            } else {
+                let state = CachedPoolState::PumpAmm(PumpAmmState {
+                    base_mint,
+                    quote_mint,
+                    pool_base_token_account: accounts[4],
+                    pool_quote_token_account: accounts[5],
+                    base_reserve: None,
+                    quote_reserve: None,
+                    pool_accounts: accounts.clone(),
+                    creator: None,
+                });
+                ctx.live_pool_cache.upsert(pool_address, state, 0);
+            }
 
-            // Publish JetStream PoolCacheUpdate (authoritative SSOT)
-            if let Some(ref nats) = ctx.nats {
+            // Use existing reserves for JetStream publish when available (don't degrade with 0/0).
+            let (base_reserve, quote_reserve) =
+                if let Some(CachedPoolState::PumpAmm(ref s)) = existing {
+                    (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
+                } else {
+                    (0u64, 0u64)
+                };
+
+            // Publish JetStream PoolCacheUpdate (authoritative SSOT).
+            // Reply Ok ONLY when JetStream write succeeds (I-24a).
+            let jetstream_ok = if let Some(ref nats) = ctx.nats {
                 let mut pool_update = PoolCacheUpdate::new_pool_discovered(
                     "market-data",
                     BUILD_VERSION,
@@ -1632,35 +1643,61 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     "pump_amm".to_string(),
                     base_mint_str.clone(),
                     quote_mint_str,
-                    0,
-                    0,
+                    base_reserve,
+                    quote_reserve,
                     None,
                     0,
                 );
                 let mut meta = std::collections::HashMap::new();
                 let accounts_str: Vec<String> = accounts.iter().map(|p| p.to_string()).collect();
                 meta.insert("pool_accounts".to_string(), accounts_str.join(","));
+                if let Some(CachedPoolState::PumpAmm(ref s)) = existing {
+                    if let Some(creator) = s.creator {
+                        meta.insert("creator".to_string(), creator.to_string());
+                    }
+                }
                 pool_update.metadata = Some(meta);
                 let subject = pool_subject(&pool_address_str);
-                if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
-                    warn!(error = %e, "EnsurePumpAmmPoolAccounts: Failed to publish PoolCacheUpdate to JetStream");
-                } else {
-                    info!(
-                        pool = %pool_address_str,
-                        base_mint = %base_mint_str,
-                        "EnsurePumpAmmPoolAccounts: Published PoolCacheUpdate to JetStream"
-                    );
+                match nats.jetstream_publish(&subject, &pool_update).await {
+                    Ok(true) => {
+                        info!(
+                            pool = %pool_address_str,
+                            base_mint = %base_mint_str,
+                            "EnsurePumpAmmPoolAccounts: Published PoolCacheUpdate to JetStream"
+                        );
+                        true
+                    }
+                    Ok(false) => {
+                        warn!(
+                            "EnsurePumpAmmPoolAccounts: JetStream publish failed (timeout or drop)"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "EnsurePumpAmmPoolAccounts: Failed to publish PoolCacheUpdate to JetStream");
+                        false
+                    }
                 }
-            }
+            } else {
+                false
+            };
 
             if let Some(ref nats) = ctx.nats {
+                let (status, message) = if jetstream_ok {
+                    (ControlResponseStatus::Ok, None)
+                } else {
+                    (
+                        ControlResponseStatus::Error,
+                        Some("JetStream publish failed".to_string()),
+                    )
+                };
                 publish_control_response(
                     nats,
                     &ctx.run_id,
                     request_id,
-                    ControlResponseStatus::Ok,
+                    status,
                     Some(pool_address_str),
-                    None,
+                    message,
                 )
                 .await;
             }
@@ -1929,6 +1966,13 @@ async fn run_geyser_loop(
         None
     };
 
+    // Shared PumpFunAmmDex for Discovery (dedupe/storm protection: one instance, internal cache).
+    let pump_amm_dex = Arc::new(PumpFunAmmDex::new_with_cache(
+        rpc.clone(),
+        ctx.live_pool_cache.clone(),
+        true, // allow_rpc_on_miss: Cold Path Discovery
+    ));
+
     loop {
         tokio::select! {
             // I-24d: ControlRequests (EnsurePumpAmmPoolAccounts Discovery)
@@ -1948,11 +1992,11 @@ async fn run_geyser_loop(
                                 let run_id = ctx.run_id.clone();
                                 let request_id = req.request_id.clone();
                                 let ctx_clone = ctx.clone();
-                                let rpc_clone = rpc.clone();
+                                let dex_clone = Arc::clone(&pump_amm_dex);
                                 tokio::spawn(async move {
                                     handle_ensure_pump_amm_pool_accounts(
                                         &ctx_clone,
-                                        &rpc_clone,
+                                        dex_clone.as_ref(),
                                         run_id.as_str(),
                                         &request_id,
                                         &base_mint,

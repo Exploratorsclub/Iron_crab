@@ -1053,6 +1053,7 @@ impl SwapHop {
 /// Versioned control request kind.
 ///
 /// Published on `ironcrab.v1.control_requests`.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlRequestKind {
