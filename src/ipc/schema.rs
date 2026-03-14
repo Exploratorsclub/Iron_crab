@@ -1094,6 +1094,16 @@ pub enum ControlRequestKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+
+    /// Discovery request for missing PumpSwap pool_accounts (I-24d).
+    ///
+    /// Sent by execution-engine (Cold Path) when pool_accounts are needed but missing in SLAVE cache.
+    /// market-data performs discovery, updates MASTER cache, publishes JetStream PoolCacheUpdate,
+    /// and replies with ControlResponse. Truth Source = JetStream, not the reply.
+    EnsurePumpAmmPoolAccounts {
+        /// Base mint address (base58) of the PumpSwap pool to discover.
+        base_mint: String,
+    },
 }
 
 fn default_true() -> bool {
@@ -1131,6 +1141,79 @@ impl ControlRequest {
             target: target.to_string(),
             kind,
         }
+    }
+}
+
+// ============================================================================
+// Control Responses (for request/reply correlation)
+// ============================================================================
+
+/// Status of a control response (correlation only; JetStream is SSOT for state).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlResponseStatus {
+    /// Request completed successfully.
+    Ok,
+    /// Resource not found (e.g. pool does not exist).
+    NotFound,
+    /// Error during processing.
+    Error,
+}
+
+/// Control response for request/reply correlation.
+///
+/// Published on `ironcrab.v1.control_responses`.
+/// This is for correlation only — the authoritative state comes from JetStream (e.g. PoolCacheUpdate).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControlResponse {
+    #[serde(flatten)]
+    pub header: RecordHeader,
+
+    /// Request ID for correlation with ControlRequest.
+    pub request_id: String,
+
+    /// Target component that processed the request (e.g. "market-data").
+    pub target: String,
+
+    /// Status of the response.
+    pub status: ControlResponseStatus,
+
+    /// Pool address (base58) if applicable (e.g. for EnsurePumpAmmPoolAccounts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_address: Option<String>,
+
+    /// Optional message for debugging or error details.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl ControlResponse {
+    pub fn new(
+        component: &str,
+        build: &str,
+        run_id: &str,
+        request_id: String,
+        target: &str,
+        status: ControlResponseStatus,
+    ) -> Self {
+        Self {
+            header: RecordHeader::new(component, build, run_id),
+            request_id,
+            target: target.to_string(),
+            status,
+            pool_address: None,
+            message: None,
+        }
+    }
+
+    pub fn with_pool_address(mut self, pool_address: String) -> Self {
+        self.pool_address = Some(pool_address);
+        self
+    }
+
+    pub fn with_message(mut self, message: String) -> Self {
+        self.message = Some(message);
+        self
     }
 }
 

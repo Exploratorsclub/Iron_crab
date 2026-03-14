@@ -5751,6 +5751,10 @@ async fn main() -> Result<()> {
                             )
                             .await;
                         }
+                        // I-24d: EnsurePumpAmmPoolAccounts is for market-data; execution-engine ignores.
+                        ControlRequestKind::EnsurePumpAmmPoolAccounts { .. } => {
+                            debug!("EnsurePumpAmmPoolAccounts targets market-data, ignoring");
+                        }
                     }
                 }
             }
