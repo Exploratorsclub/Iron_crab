@@ -1776,8 +1776,99 @@ impl ExecutionContext {
                 Some(retry)
             }
             Ok(Ok(None)) => {
-                warn!(mint = %mint_str, "6005-retry: quote_exact_in returned None (cache miss or reserves)");
-                None
+                // I-24d: Cold-Path Recovery — quote cache miss/degenerate, trigger Discovery-Request.
+                info!(
+                    mint = %mint_str,
+                    "6005-retry: quote cache miss, requesting discovery from market-data"
+                );
+                match self.request_discovery_and_wait(&mint_str).await {
+                    DiscoveryRequestOutcome::Ok => {
+                        let cache = match self.live_pool_cache.as_ref() {
+                            Some(c) => c,
+                            None => {
+                                warn!(mint = %mint_str, "6005-retry: no cache");
+                                return None;
+                            }
+                        };
+                        if !wait_for_pool_accounts_in_cache(
+                            cache,
+                            &mint,
+                            DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                            DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                        )
+                        .await
+                        {
+                            warn!(
+                                mint = %mint_str,
+                                "6005-retry: pool_accounts not in cache after discovery timeout"
+                            );
+                            return None;
+                        }
+                        // Retry quote_exact_in (cache may now have reserves + pool_accounts).
+                        let retry_quote = pump_amm
+                            .quote_exact_in(&mint_str, &sol_mint_str, amount_in)
+                            .await;
+                        match retry_quote {
+                            Ok(Some(ref q)) => {
+                                let pool_id = match q.route.first() {
+                                    Some(id) => id.clone(),
+                                    None => {
+                                        warn!(mint = %mint_str, "6005-retry: retry quote route empty");
+                                        return None;
+                                    }
+                                };
+                                let accounts = match cache
+                                    .get_pump_amm_pool_accounts_by_base_mint(&mint)
+                                {
+                                    Some(a) if a.len() >= 14 => a,
+                                    _ => {
+                                        warn!(mint = %mint_str, "6005-retry: pool_accounts missing after retry");
+                                        return None;
+                                    }
+                                };
+                                let acct_strings: Vec<String> =
+                                    accounts.iter().map(|p| p.to_string()).collect();
+                                let min_out =
+                                    Self::apply_slippage_min_out(q.amount_out, max_slippage_bps);
+                                let mut retry = intent.clone();
+                                retry
+                                    .metadata
+                                    .insert("dex".to_string(), "pump_amm".to_string());
+                                retry
+                                    .metadata
+                                    .insert("sell_routing".to_string(), "multi_pool".to_string());
+                                retry
+                                    .metadata
+                                    .insert("6005_retry".to_string(), "true".to_string());
+                                retry.resources.pools = vec![pool_id];
+                                retry.resources.accounts = acct_strings;
+                                retry.execution = Some(TradeExecutionConstraints {
+                                    min_out: Some(ExplicitAmount::new(min_out, 9)),
+                                });
+                                Some(retry)
+                            }
+                            _ => {
+                                warn!(
+                                    mint = %mint_str,
+                                    "6005-retry: quote still None after discovery (reserves may be degenerate)"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    DiscoveryRequestOutcome::NotFound => {
+                        warn!(mint = %mint_str, "6005-retry: discovery not_found");
+                        None
+                    }
+                    DiscoveryRequestOutcome::Error(e) => {
+                        warn!(mint = %mint_str, error = %e, "6005-retry: discovery error");
+                        None
+                    }
+                    DiscoveryRequestOutcome::Timeout => {
+                        warn!(mint = %mint_str, "6005-retry: discovery timeout");
+                        None
+                    }
+                }
             }
             Ok(Err(e)) => {
                 warn!(mint = %mint_str, error = %e, "6005-retry: quote_exact_in failed");
@@ -2291,7 +2382,103 @@ impl ExecutionContext {
                             }
                         }
                         Ok(None) => {
-                            quote_attempts.push("pump_amm=none".to_string());
+                            // I-24d: Cold-Path Recovery — quote cache miss/degenerate, trigger Discovery-Request.
+                            info!(
+                                mint = %mint,
+                                "pump_amm quote cache miss; requesting discovery from market-data"
+                            );
+                            match ctx.request_discovery_and_wait(&mint.to_string()).await {
+                                DiscoveryRequestOutcome::Ok => {
+                                    if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                                        if wait_for_pool_accounts_in_cache(
+                                            cache,
+                                            &mint,
+                                            DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                            DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                                        )
+                                        .await
+                                        {
+                                            // Retry quote_exact_in (cache may now have reserves + pool_accounts).
+                                            let retry_quote = pump_amm
+                                                .quote_exact_in(
+                                                    &mint.to_string(),
+                                                    &sol_mint.to_string(),
+                                                    amount_in,
+                                                )
+                                                .await;
+                                            match retry_quote {
+                                                Ok(Some(q)) => {
+                                                    if let Some(pool_id) = q.route.first().cloned()
+                                                    {
+                                                        let accounts = cache
+                                                            .get_pump_amm_pool_accounts_by_base_mint(&mint);
+                                                        if let Some(accounts) = accounts {
+                                                            if accounts.len() >= 14 {
+                                                                let acct_strings: Vec<String> =
+                                                                    accounts
+                                                                        .into_iter()
+                                                                        .map(|p| p.to_string())
+                                                                        .collect();
+                                                                quote_attempts.push(format!(
+                                                                    "pump_amm=ok amount_out={} pool={} accounts_len={} (after discovery)",
+                                                                    q.amount_out,
+                                                                    pool_id,
+                                                                    acct_strings.len()
+                                                                ));
+                                                                record_candidate(
+                                                                    "pump_amm",
+                                                                    q.amount_out,
+                                                                    pool_id,
+                                                                    acct_strings,
+                                                                );
+                                                            } else {
+                                                                quote_attempts.push(format!(
+                                                                    "pump_amm=skip no_pool_accounts amount_out={} pool={}",
+                                                                    q.amount_out, pool_id
+                                                                ));
+                                                            }
+                                                        } else {
+                                                            quote_attempts.push(format!(
+                                                                "pump_amm=skip no_pool_accounts amount_out={} pool={}",
+                                                                q.amount_out, pool_id
+                                                            ));
+                                                        }
+                                                    } else {
+                                                        quote_attempts.push(
+                                                            "pump_amm=none (after discovery)"
+                                                                .to_string(),
+                                                        );
+                                                    }
+                                                }
+                                                _ => {
+                                                    quote_attempts.push(
+                                                        "pump_amm=none (after discovery, reserves may be degenerate)"
+                                                            .to_string(),
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            quote_attempts.push(
+                                                "pump_amm=skip timeout (cache wait after discovery)"
+                                                    .to_string(),
+                                            );
+                                        }
+                                    } else {
+                                        quote_attempts.push("pump_amm=skip no_cache".to_string());
+                                    }
+                                }
+                                DiscoveryRequestOutcome::NotFound => {
+                                    quote_attempts
+                                        .push("pump_amm=none (discovery not_found)".to_string());
+                                }
+                                DiscoveryRequestOutcome::Error(e) => {
+                                    quote_attempts.push(format!("pump_amm=err_discovery {e}"));
+                                }
+                                DiscoveryRequestOutcome::Timeout => {
+                                    quote_attempts
+                                        .push("pump_amm=none (discovery timeout)".to_string());
+                                }
+                            }
                         }
                         Err(e) => {
                             quote_attempts.push(format!("pump_amm=err {e:#}"));
