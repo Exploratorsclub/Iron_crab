@@ -5751,6 +5751,10 @@ async fn main() -> Result<()> {
                             )
                             .await;
                         }
+                        // #[non_exhaustive]: unknown variants (e.g. EnsurePumpAmmPoolAccounts for market-data)
+                        _ => {
+                            debug!(kind = ?req.kind, "Ignoring ControlRequest for other target");
+                        }
                     }
                 }
             }
