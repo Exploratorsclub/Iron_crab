@@ -4645,38 +4645,9 @@ async fn main() -> Result<()> {
         None
     };
 
-    // FIX-33: Proactively seed pool_accounts for PumpSwap pools
-    // that came from JetStream bootstrap without pool_accounts.
-    if let Some(ref cache) = live_pool_cache {
-        let pools_needing_accounts = cache.get_pump_amm_pools_without_accounts();
-        if !pools_needing_accounts.is_empty() {
-            info!(
-                count = pools_needing_accounts.len(),
-                "Startup: seeding pool_accounts for PumpSwap pools via getAccountInfo"
-            );
-            let pump_amm = PumpFunAmmDex::new_with_cache(Arc::clone(&rpc), Arc::clone(cache), true);
-            let mut seeded = 0u32;
-            for (pool_addr, base_mint) in &pools_needing_accounts {
-                match pump_amm.pool_accounts_v1_for_base_mint(*base_mint).await {
-                    Ok(Some(accounts)) => {
-                        cache.set_pump_amm_pool_accounts(pool_addr, accounts);
-                        seeded += 1;
-                    }
-                    Ok(None) => {
-                        debug!(pool = %pool_addr, "Startup seeding: pool parse returned None (may be non-WSOL pair)");
-                    }
-                    Err(e) => {
-                        warn!(pool = %pool_addr, error = %e, "Startup seeding: pool discovery failed");
-                    }
-                }
-            }
-            info!(
-                seeded = seeded,
-                total = pools_needing_accounts.len(),
-                "Startup: pool_accounts seeding complete"
-            );
-        }
-    }
+    // I-24c: execution-engine is consumer/executor only. No global discovery/seeding rebuild.
+    // Pool state comes from JetStream (bootstrap) + incremental PoolCacheUpdate from market-data.
+    // market-data is the discovery authority and publishes pool_accounts to JetStream.
 
     // FIX-32: Initialize Geyser-based TX confirmation tracker
     let tx_confirm = {
