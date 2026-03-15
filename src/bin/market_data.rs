@@ -4303,9 +4303,26 @@ async fn run_simulation_loop(
                 // Keep /ready fresh even when only simulating.
                 ironcrab::metrics::record_activity();
 
-                // Refresh readiness (simulate: no control_sub, no jetstream)
+                // Refresh readiness from current runtime state (simulate: no control_sub)
                 let nats_connected = ctx.nats.as_ref().is_some_and(|n| n.is_connected());
-                update_readiness_market_data_current(nats_connected, false, false);
+                let jetstream_ready = if nats_connected {
+                    if let Some(ref nats) = ctx.nats {
+                        use async_nats::jetstream;
+                        use ironcrab::nats::STREAM_NAME;
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            jetstream::new(nats.client().clone()).get_stream(STREAM_NAME),
+                        )
+                        .await
+                        .map(|r| r.is_ok())
+                        .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                update_readiness_market_data_current(nats_connected, false, jetstream_ready);
 
                 let event = MarketEvent::new(
                     "market-data",
