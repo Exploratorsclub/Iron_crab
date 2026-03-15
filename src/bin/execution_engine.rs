@@ -5720,6 +5720,20 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Subscription liveness: updated by tasks so /status reflects current contract state
+    let control_sub_last_activity = Arc::new(std::sync::atomic::AtomicU64::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    ));
+    let control_response_last_activity = Arc::new(std::sync::atomic::AtomicU64::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    ));
+
     // Spawn dedicated task for ControlRequests subscription
     if let Some(ref nats) = ctx.nats {
         match nats.subscribe(TOPIC_CONTROL_REQUESTS).await {
@@ -5730,19 +5744,42 @@ async fn main() -> Result<()> {
                 );
                 set_readiness_control_sub_active(true);
                 let tx = control_tx.clone();
+                let last_activity = Arc::clone(&control_sub_last_activity);
                 tokio::spawn(async move {
-                    while let Some(msg) = control_sub.next().await {
-                        info!("Received raw ControlRequest message from NATS");
-                        match msg.deserialize::<ControlRequest>() {
-                            Ok(req) => {
-                                info!(target = %req.target, kind = ?req.kind, "Parsed ControlRequest, forwarding to main loop");
-                                if tx.send(req).await.is_err() {
-                                    warn!("ControlRequest channel closed, stopping subscription");
-                                    break;
+                    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+                    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            Some(msg) = control_sub.next() => {
+                                info!("Received raw ControlRequest message from NATS");
+                                match msg.deserialize::<ControlRequest>() {
+                                    Ok(req) => {
+                                        info!(target = %req.target, kind = ?req.kind, "Parsed ControlRequest, forwarding to main loop");
+                                        if tx.send(req).await.is_err() {
+                                            warn!("ControlRequest channel closed, stopping subscription");
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "Failed to deserialize ControlRequest");
+                                    }
                                 }
+                                last_activity.store(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                    Ordering::Relaxed,
+                                );
                             }
-                            Err(e) => {
-                                warn!(error = %e, "Failed to deserialize ControlRequest");
+                            _ = heartbeat.tick() => {
+                                last_activity.store(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                    Ordering::Relaxed,
+                                );
                             }
                         }
                     }
@@ -5762,18 +5799,41 @@ async fn main() -> Result<()> {
                 );
                 set_readiness_control_response_sub_active(true);
                 let pending = Arc::clone(&ctx.pending_discovery_responses);
+                let last_activity = Arc::clone(&control_response_last_activity);
                 tokio::spawn(async move {
-                    while let Some(msg) = resp_sub.next().await {
-                        match msg.deserialize::<ControlResponse>() {
-                            Ok(resp) => {
-                                let request_id = resp.request_id.clone();
-                                let mut map = pending.lock().await;
-                                if let Some(tx) = map.remove(&request_id) {
-                                    let _ = tx.send(resp);
+                    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+                    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            Some(msg) = resp_sub.next() => {
+                                match msg.deserialize::<ControlResponse>() {
+                                    Ok(resp) => {
+                                        let request_id = resp.request_id.clone();
+                                        let mut map = pending.lock().await;
+                                        if let Some(tx) = map.remove(&request_id) {
+                                            let _ = tx.send(resp);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "Failed to deserialize ControlResponse");
+                                    }
                                 }
+                                last_activity.store(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                    Ordering::Relaxed,
+                                );
                             }
-                            Err(e) => {
-                                warn!(error = %e, "Failed to deserialize ControlResponse");
+                            _ = heartbeat.tick() => {
+                                last_activity.store(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                    Ordering::Relaxed,
+                                );
                             }
                         }
                     }
@@ -6193,9 +6253,15 @@ async fn main() -> Result<()> {
                 // Keep /ready fresh even when no intents flow.
                 ironcrab::metrics::record_activity();
 
-                // Refresh readiness from current state (not startup-latch)
+                // Refresh readiness from current runtime state (subscription heartbeats)
                 let nats_connected = ctx.nats.as_ref().is_some_and(|n| n.is_connected());
-                update_readiness_execution_engine_current(nats_connected);
+                let control_sub_secs = control_sub_last_activity.load(Ordering::Relaxed);
+                let control_response_secs = control_response_last_activity.load(Ordering::Relaxed);
+                update_readiness_execution_engine_current(
+                    nats_connected,
+                    control_sub_secs,
+                    control_response_secs,
+                );
 
                 // Process any available PoolCacheUpdates from JetStream Consumer
                 if let Some(ref mut consumer) = pool_cache_consumer_opt {

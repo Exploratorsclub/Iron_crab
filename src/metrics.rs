@@ -362,14 +362,33 @@ pub fn update_readiness_market_data_current(
     READINESS_JETSTREAM_INITIALIZED.store(jetstream_ready, Ordering::Relaxed);
 }
 
+/// Stale threshold for subscription liveness (seconds): if no heartbeat in this time, consider dead.
+const SUBSCRIPTION_STALE_THRESHOLD_SECS: u64 = 15;
+
 /// Refresh readiness from current runtime state (not startup-latch).
-/// When NATS disconnects, control subs are cleared (they are tied to the connection).
-pub fn update_readiness_execution_engine_current(nats_connected: bool) {
+/// Control subs are active only when NATS connected AND subscription task has sent heartbeat recently.
+pub fn update_readiness_execution_engine_current(
+    nats_connected: bool,
+    control_sub_last_activity_secs: u64,
+    control_response_last_activity_secs: u64,
+) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     READINESS_NATS_CONNECTED.store(nats_connected, Ordering::Relaxed);
-    if !nats_connected {
-        READINESS_CONTROL_SUB_ACTIVE.store(false, Ordering::Relaxed);
-        READINESS_CONTROL_RESPONSE_SUB_ACTIVE.store(false, Ordering::Relaxed);
-    }
+    READINESS_CONTROL_SUB_ACTIVE.store(
+        nats_connected
+            && now.saturating_sub(control_sub_last_activity_secs)
+                <= SUBSCRIPTION_STALE_THRESHOLD_SECS,
+        Ordering::Relaxed,
+    );
+    READINESS_CONTROL_RESPONSE_SUB_ACTIVE.store(
+        nats_connected
+            && now.saturating_sub(control_response_last_activity_secs)
+                <= SUBSCRIPTION_STALE_THRESHOLD_SECS,
+        Ordering::Relaxed,
+    );
 }
 
 // --- WsolManager metrics ---
