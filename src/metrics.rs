@@ -350,6 +350,28 @@ pub fn set_readiness_mode(mode: u8) {
     READINESS_MODE.store(mode as u64, Ordering::Relaxed);
 }
 
+/// Refresh readiness from current runtime state (not startup-latch).
+/// Call periodically from main loop so /status reflects actual communication health.
+pub fn update_readiness_market_data_current(
+    nats_connected: bool,
+    control_sub_active: bool,
+    jetstream_ready: bool,
+) {
+    READINESS_NATS_CONNECTED.store(nats_connected, Ordering::Relaxed);
+    READINESS_CONTROL_SUB_ACTIVE.store(control_sub_active, Ordering::Relaxed);
+    READINESS_JETSTREAM_INITIALIZED.store(jetstream_ready, Ordering::Relaxed);
+}
+
+/// Refresh readiness from current runtime state (not startup-latch).
+/// When NATS disconnects, control subs are cleared (they are tied to the connection).
+pub fn update_readiness_execution_engine_current(nats_connected: bool) {
+    READINESS_NATS_CONNECTED.store(nats_connected, Ordering::Relaxed);
+    if !nats_connected {
+        READINESS_CONTROL_SUB_ACTIVE.store(false, Ordering::Relaxed);
+        READINESS_CONTROL_RESPONSE_SUB_ACTIVE.store(false, Ordering::Relaxed);
+    }
+}
+
 // --- WsolManager metrics ---
 pub static WSOL_BALANCE_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static WSOL_WRAP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -1584,20 +1606,36 @@ fn status_response(component: MetricsComponent) -> String {
 
     let (component_name, ready, missing_checks): (&str, bool, Vec<String>) = match component {
         MetricsComponent::MarketData => {
-            let mut missing = Vec::new();
-            if !nats {
-                missing.push("nats_connected".to_string());
+            // Mode-sensitive: dry_run/simulate intentionally disable parts – don't count as missing
+            if mode_u64 == 1 {
+                // dry_run: no NATS, no ControlRequests, no JetStream – ready if HTTP serving
+                ("market-data", true, vec![])
+            } else if mode_u64 == 2 {
+                // simulate: fake Geyser, may have NATS for publish; no ControlRequests sub – require only nats
+                let mut missing = Vec::new();
+                if !nats {
+                    missing.push("nats_connected".to_string());
+                }
+                let ready = nats;
+                ("market-data", ready, missing)
+            } else {
+                let mut missing = Vec::new();
+                if !nats {
+                    missing.push("nats_connected".to_string());
+                }
+                if !control_sub {
+                    missing.push("control_request_sub_active".to_string());
+                }
+                if !jetstream {
+                    missing.push("jetstream_initialized".to_string());
+                }
+                let ready = nats && control_sub && jetstream;
+                ("market-data", ready, missing)
             }
-            if !control_sub {
-                missing.push("control_request_sub_active".to_string());
-            }
-            if !jetstream {
-                missing.push("jetstream_initialized".to_string());
-            }
-            let ready = nats && control_sub && jetstream;
-            ("market-data", ready, missing)
         }
         MetricsComponent::ExecutionEngine => {
+            // Mode-sensitive: dry_run/simulate_only don't disable NATS (still consume intents)
+            // Only live-mode semantics; no intentionally disabled parts to skip
             let mut missing = Vec::new();
             if !nats {
                 missing.push("nats_connected".to_string());

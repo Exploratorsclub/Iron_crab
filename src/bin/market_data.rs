@@ -37,9 +37,9 @@ use ironcrab::ipc::{
 };
 use ironcrab::metrics::{
     serve_metrics, set_readiness_control_sub_active, set_readiness_jetstream_initialized,
-    set_readiness_mode, set_readiness_nats_connected, MetricsComponent,
-    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
-    NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
+    set_readiness_mode, set_readiness_nats_connected, update_readiness_market_data_current,
+    MetricsComponent, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL,
+    NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -1344,15 +1344,15 @@ async fn main() -> Result<()> {
     info!(log_dir = %log_dir.display(), "JSONL writer initialized");
 
     // Setup NATS (optional in dry-run mode)
-    let nats = if args.dry_run {
+    let (nats, jetstream_initialized_at_startup) = if args.dry_run {
         info!("Dry-run mode: NATS publishing disabled");
-        None
+        (None, false)
     } else {
         let config = NatsConfig::new(&args.nats_url, "market-data");
         let mut client = NatsClient::new(config);
         if let Err(e) = client.connect().await {
             warn!(error = %e, "Failed to connect to NATS (continuing without)");
-            None
+            (None, false)
         } else {
             info!(url = %args.nats_url, "Connected to NATS");
             set_readiness_nats_connected(true);
@@ -1385,7 +1385,8 @@ async fn main() -> Result<()> {
                 }
             };
 
-            set_readiness_jetstream_initialized(pool_cache_ok && wallet_snapshot_ok);
+            let js_ok = pool_cache_ok && wallet_snapshot_ok;
+            set_readiness_jetstream_initialized(js_ok);
 
             // Initialize JetStream stream for ExecutionResults (wallet ATA tracking)
             if let Err(e) = ensure_execution_results_stream(client.client()).await {
@@ -1394,7 +1395,7 @@ async fn main() -> Result<()> {
                 info!("JetStream EXECUTION_RESULTS stream ready for wallet ATA tracking");
             }
 
-            Some(client)
+            (Some(client), js_ok)
         }
     };
 
@@ -1578,6 +1579,7 @@ async fn main() -> Result<()> {
             tracked_bin_arrays_rx,
             tracked_wallet_rx,
             args.wallet_snapshot_only,
+            jetstream_initialized_at_startup,
         )
         .await?;
     }
@@ -1810,6 +1812,7 @@ async fn run_geyser_loop(
     tracked_bin_arrays_rx: watch::Receiver<Vec<Pubkey>>,
     tracked_wallet_rx: watch::Receiver<Vec<Pubkey>>,
     wallet_snapshot_only: bool,
+    jetstream_initialized_at_startup: bool,
 ) -> Result<()> {
     // Initialize RPC client for fallback/metadata (prefer local RPC, fallback to Helius)
     let rpc_url =
@@ -2060,6 +2063,12 @@ async fn run_geyser_loop(
             // Keep /ready fresh even if Geyser/NATS are quiet.
             _ = activity_interval.tick() => {
                 ironcrab::metrics::record_activity();
+
+                // Refresh readiness from current state (not startup-latch)
+                let nats_connected = ctx.nats.as_ref().is_some_and(|n| n.is_connected());
+                let control_sub_active = nats_connected && control_subscription.is_some();
+                let jetstream_ready = nats_connected && jetstream_initialized_at_startup;
+                update_readiness_market_data_current(nats_connected, control_sub_active, jetstream_ready);
 
                 // P1 Crash Isolation: Ping systemd watchdog frequently enough.
                 #[cfg(unix)]
@@ -4292,6 +4301,10 @@ async fn run_simulation_loop(
 
                 // Keep /ready fresh even when only simulating.
                 ironcrab::metrics::record_activity();
+
+                // Refresh readiness (simulate: no control_sub, no jetstream)
+                let nats_connected = ctx.nats.as_ref().is_some_and(|n| n.is_connected());
+                update_readiness_market_data_current(nats_connected, false, false);
 
                 let event = MarketEvent::new(
                     "market-data",

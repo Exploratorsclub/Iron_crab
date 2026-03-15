@@ -73,16 +73,17 @@ use ironcrab::metrics::{
     record_recent_trade, record_tx_slot_to_send_ms, serve_metrics,
     set_readiness_control_response_sub_active, set_readiness_control_sub_active,
     set_readiness_mode, set_readiness_nats_connected, set_readiness_state_paths_initialized,
-    MetricsComponent, RecentTrade, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS,
-    AVAILABLE_SOL_LAMPORTS, CONCURRENT_INTENTS_GAUGE, INTENTS_EXECUTED_TOTAL,
-    INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL, JITO_BUNDLES_LANDED_TOTAL,
-    JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL, JITO_BUNDLES_TIMEOUT_TOTAL,
-    JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE, NATS_MESSAGES_RECEIVED_TOTAL,
-    OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK,
-    REJECT_SEND_FAILED, REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL,
-    TX_CONFIRM_GEYSER_TOTAL, TX_CONFIRM_LATENCY_MS, TX_CONFIRM_RPC_FALLBACK_TOTAL,
-    TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL,
-    TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
+    update_readiness_execution_engine_current, MetricsComponent, RecentTrade, ACTIVE_CAPITAL_LOCKS,
+    ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS, CONCURRENT_INTENTS_GAUGE,
+    INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
+    JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL,
+    JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE,
+    NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE,
+    REJECT_RESOURCE_LOCK, REJECT_SEND_FAILED, REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL,
+    TX_CONFIRMED_TOTAL, TX_CONFIRM_GEYSER_TOTAL, TX_CONFIRM_LATENCY_MS,
+    TX_CONFIRM_RPC_FALLBACK_TOTAL, TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL,
+    TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL, TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL,
+    WALLET_TOTAL_SOL_LAMPORTS,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -6191,6 +6192,10 @@ async fn main() -> Result<()> {
 
                 // Keep /ready fresh even when no intents flow.
                 ironcrab::metrics::record_activity();
+
+                // Refresh readiness from current state (not startup-latch)
+                let nats_connected = ctx.nats.as_ref().is_some_and(|n| n.is_connected());
+                update_readiness_execution_engine_current(nats_connected);
 
                 // Process any available PoolCacheUpdates from JetStream Consumer
                 if let Some(ref mut consumer) = pool_cache_consumer_opt {
