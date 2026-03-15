@@ -34,9 +34,10 @@ use ironcrab::ipc::{
     TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    serve_metrics, ARB_REJECTED_MISSING_ACCOUNTS, ARB_TRIANGLE_OPPORTUNITIES,
-    INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    serve_metrics, set_readiness_nats_connected, MetricsComponent, ARB_REJECTED_MISSING_ACCOUNTS,
+    ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
+    TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, slave_consumer_config, CONFIG_STREAM_NAME, STREAM_NAME,
@@ -1912,7 +1913,7 @@ async fn main() -> Result<()> {
     // Start metrics server
     let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
     tokio::spawn(async move {
-        if let Err(e) = serve_metrics(metrics_addr).await {
+        if let Err(e) = serve_metrics(metrics_addr, MetricsComponent::ArbStrategy).await {
             error!(error = %e, "Metrics server failed");
         }
     });
@@ -1951,6 +1952,7 @@ async fn main() -> Result<()> {
             return Err(e);
         }
         info!(url = %args.nats_url, "Connected to NATS");
+        set_readiness_nats_connected(true);
         Some(client)
     };
 

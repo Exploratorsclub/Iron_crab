@@ -45,11 +45,12 @@ use ironcrab::ipc::{
     TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
-    serve_metrics, EXITS_GENERATED_TOTAL, FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY,
-    FILTER_REJECTED_DEV_BEHAVIOR, FILTER_REJECTED_INFLOW, FILTER_REJECTED_LIQUIDITY,
-    FILTER_REJECTED_TOTAL, FILTER_REJECTED_VELOCITY, INTENTS_GENERATED_TOTAL,
-    MARKET_EVENTS_CONSUMED_TOTAL, NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    serve_metrics, set_readiness_nats_connected, MetricsComponent, EXITS_GENERATED_TOTAL,
+    FILTER_PASSED_TOTAL, FILTER_REJECTED_BUYER_QUALITY, FILTER_REJECTED_DEV_BEHAVIOR,
+    FILTER_REJECTED_INFLOW, FILTER_REJECTED_LIQUIDITY, FILTER_REJECTED_TOTAL,
+    FILTER_REJECTED_VELOCITY, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
+    NATS_ERRORS_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL,
+    POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -5204,7 +5205,7 @@ async fn main() -> Result<()> {
     // Start metrics server
     let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
     tokio::spawn(async move {
-        if let Err(e) = serve_metrics(metrics_addr).await {
+        if let Err(e) = serve_metrics(metrics_addr, MetricsComponent::MomentumBot).await {
             error!(error = %e, "Metrics server failed");
         }
     });
@@ -5297,6 +5298,7 @@ async fn main() -> Result<()> {
             None
         } else {
             info!(url = %args.nats_url, "Connected to NATS");
+            set_readiness_nats_connected(true);
             // Ensure TRADE_INTENTS JetStream stream exists (avoids Core NATS startup race)
             if let Err(e) = ensure_trade_intents_stream(client.client()).await {
                 warn!(error = %e, "Failed to ensure TRADE_INTENTS stream (intents may be lost)");

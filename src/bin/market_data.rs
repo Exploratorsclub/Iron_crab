@@ -36,7 +36,9 @@ use ironcrab::ipc::{
     NATIVE_SOL_MINT,
 };
 use ironcrab::metrics::{
-    serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
+    serve_metrics, set_readiness_control_sub_active, set_readiness_mode,
+    set_readiness_nats_connected, update_readiness_market_data_current, MetricsComponent,
+    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
     NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
@@ -1299,10 +1301,19 @@ async fn main() -> Result<()> {
         "Starting market-data service"
     );
 
+    // Set readiness mode for /status (E2E blackbox)
+    set_readiness_mode(if args.dry_run {
+        1
+    } else if args.simulate {
+        2
+    } else {
+        0
+    });
+
     // Start metrics server
     let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
     tokio::spawn(async move {
-        if let Err(e) = serve_metrics(metrics_addr).await {
+        if let Err(e) = serve_metrics(metrics_addr, MetricsComponent::MarketData).await {
             error!(error = %e, "Metrics server failed");
         }
     });
@@ -1344,6 +1355,7 @@ async fn main() -> Result<()> {
             None
         } else {
             info!(url = %args.nats_url, "Connected to NATS");
+            set_readiness_nats_connected(true);
 
             // Initialize JetStream stream for PoolCacheUpdates (persistent state)
             if let Err(e) = ensure_pool_cache_stream(client.client()).await {
@@ -1955,6 +1967,7 @@ async fn run_geyser_loop(
                     topic = TOPIC_CONTROL_REQUESTS,
                     "Subscribed to ControlRequests (Discovery)"
                 );
+                set_readiness_control_sub_active(true);
                 Some(sub)
             }
             Err(e) => {
@@ -2035,6 +2048,28 @@ async fn run_geyser_loop(
             // Keep /ready fresh even if Geyser/NATS are quiet.
             _ = activity_interval.tick() => {
                 ironcrab::metrics::record_activity();
+
+                // Refresh readiness from current runtime state (not startup-latch)
+                let nats_connected = ctx.nats.as_ref().is_some_and(|n| n.is_connected());
+                let control_sub_active = nats_connected && control_subscription.is_some();
+                let jetstream_ready = if nats_connected {
+                    if let Some(ref nats) = ctx.nats {
+                        use async_nats::jetstream;
+                        use ironcrab::nats::STREAM_NAME;
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            jetstream::new(nats.client().clone()).get_stream(STREAM_NAME),
+                        )
+                        .await
+                        .map(|r| r.is_ok())
+                        .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                update_readiness_market_data_current(nats_connected, control_sub_active, jetstream_ready);
 
                 // P1 Crash Isolation: Ping systemd watchdog frequently enough.
                 #[cfg(unix)]
@@ -4267,6 +4302,27 @@ async fn run_simulation_loop(
 
                 // Keep /ready fresh even when only simulating.
                 ironcrab::metrics::record_activity();
+
+                // Refresh readiness from current runtime state (simulate: no control_sub)
+                let nats_connected = ctx.nats.as_ref().is_some_and(|n| n.is_connected());
+                let jetstream_ready = if nats_connected {
+                    if let Some(ref nats) = ctx.nats {
+                        use async_nats::jetstream;
+                        use ironcrab::nats::STREAM_NAME;
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            jetstream::new(nats.client().clone()).get_stream(STREAM_NAME),
+                        )
+                        .await
+                        .map(|r| r.is_ok())
+                        .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                update_readiness_market_data_current(nats_connected, false, jetstream_ready);
 
                 let event = MarketEvent::new(
                     "market-data",
