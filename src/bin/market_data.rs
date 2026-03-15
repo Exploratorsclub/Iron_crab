@@ -36,7 +36,9 @@ use ironcrab::ipc::{
     NATIVE_SOL_MINT,
 };
 use ironcrab::metrics::{
-    serve_metrics, MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
+    serve_metrics, set_readiness_control_sub_active, set_readiness_jetstream_initialized,
+    set_readiness_mode, set_readiness_nats_connected, MetricsComponent,
+    MARKET_EVENTS_PUBLISHED_TOTAL, MARKET_EVENTS_RECEIVED_TOTAL, NATS_ERRORS_TOTAL,
     NATS_MESSAGES_PUBLISHED_TOTAL, POOLS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
@@ -1299,10 +1301,19 @@ async fn main() -> Result<()> {
         "Starting market-data service"
     );
 
+    // Set readiness mode for /status (E2E blackbox)
+    set_readiness_mode(if args.dry_run {
+        1
+    } else if args.simulate {
+        2
+    } else {
+        0
+    });
+
     // Start metrics server
     let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
     tokio::spawn(async move {
-        if let Err(e) = serve_metrics(metrics_addr).await {
+        if let Err(e) = serve_metrics(metrics_addr, MetricsComponent::MarketData).await {
             error!(error = %e, "Metrics server failed");
         }
     });
@@ -1344,24 +1355,37 @@ async fn main() -> Result<()> {
             None
         } else {
             info!(url = %args.nats_url, "Connected to NATS");
+            set_readiness_nats_connected(true);
 
             // Initialize JetStream stream for PoolCacheUpdates (persistent state)
-            if let Err(e) = ensure_pool_cache_stream(client.client()).await {
-                error!(error = %e, "Failed to create/update JetStream POOL_CACHE stream");
-                error!("PoolCacheUpdates will not persist across restarts!");
-                error!("Check that nats-server is running with -js flag");
-            } else {
-                info!("JetStream POOL_CACHE stream ready for persistent state recovery");
-            }
+            let pool_cache_ok = match ensure_pool_cache_stream(client.client()).await {
+                Ok(()) => {
+                    info!("JetStream POOL_CACHE stream ready for persistent state recovery");
+                    true
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to create/update JetStream POOL_CACHE stream");
+                    error!("PoolCacheUpdates will not persist across restarts!");
+                    error!("Check that nats-server is running with -js flag");
+                    false
+                }
+            };
 
             // Initialize JetStream stream for WalletBalanceSnapshot (position reconciliation)
-            if let Err(e) = ensure_wallet_snapshot_stream(client.client()).await {
-                error!(error = %e, "Failed to create/update JetStream WALLET_SNAPSHOT stream");
-                error!("WalletBalanceSnapshot persistence disabled!");
-                error!("Check that nats-server is running with -js flag");
-            } else {
-                info!("JetStream WALLET_SNAPSHOT stream ready for position reconciliation");
-            }
+            let wallet_snapshot_ok = match ensure_wallet_snapshot_stream(client.client()).await {
+                Ok(()) => {
+                    info!("JetStream WALLET_SNAPSHOT stream ready for position reconciliation");
+                    true
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to create/update JetStream WALLET_SNAPSHOT stream");
+                    error!("WalletBalanceSnapshot persistence disabled!");
+                    error!("Check that nats-server is running with -js flag");
+                    false
+                }
+            };
+
+            set_readiness_jetstream_initialized(pool_cache_ok && wallet_snapshot_ok);
 
             // Initialize JetStream stream for ExecutionResults (wallet ATA tracking)
             if let Err(e) = ensure_execution_results_stream(client.client()).await {
@@ -1955,6 +1979,7 @@ async fn run_geyser_loop(
                     topic = TOPIC_CONTROL_REQUESTS,
                     "Subscribed to ControlRequests (Discovery)"
                 );
+                set_readiness_control_sub_active(true);
                 Some(sub)
             }
             Err(e) => {

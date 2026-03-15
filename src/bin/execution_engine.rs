@@ -70,17 +70,19 @@ use ironcrab::ipc::{
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
-    record_recent_trade, record_tx_slot_to_send_ms, serve_metrics, RecentTrade,
-    ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS, AVAILABLE_SOL_LAMPORTS, CONCURRENT_INTENTS_GAUGE,
-    INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
-    JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL,
-    JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE,
-    NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE,
-    REJECT_RESOURCE_LOCK, REJECT_SEND_FAILED, REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL,
-    TX_CONFIRMED_TOTAL, TX_CONFIRM_GEYSER_TOTAL, TX_CONFIRM_LATENCY_MS,
-    TX_CONFIRM_RPC_FALLBACK_TOTAL, TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL,
-    TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL, TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL,
-    WALLET_TOTAL_SOL_LAMPORTS,
+    record_recent_trade, record_tx_slot_to_send_ms, serve_metrics,
+    set_readiness_control_response_sub_active, set_readiness_control_sub_active,
+    set_readiness_mode, set_readiness_nats_connected, set_readiness_state_paths_initialized,
+    MetricsComponent, RecentTrade, ACTIVE_CAPITAL_LOCKS, ACTIVE_RESOURCE_LOCKS,
+    AVAILABLE_SOL_LAMPORTS, CONCURRENT_INTENTS_GAUGE, INTENTS_EXECUTED_TOTAL,
+    INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL, JITO_BUNDLES_LANDED_TOTAL,
+    JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL, JITO_BUNDLES_TIMEOUT_TOTAL,
+    JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE, NATS_MESSAGES_RECEIVED_TOTAL,
+    OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK,
+    REJECT_SEND_FAILED, REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL,
+    TX_CONFIRM_GEYSER_TOTAL, TX_CONFIRM_LATENCY_MS, TX_CONFIRM_RPC_FALLBACK_TOTAL,
+    TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL,
+    TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -4612,10 +4614,19 @@ async fn main() -> Result<()> {
         "Starting execution-engine service"
     );
 
+    // Set readiness mode for /status (E2E blackbox)
+    set_readiness_mode(if args.dry_run {
+        1
+    } else if args.simulate_only {
+        3
+    } else {
+        0
+    });
+
     // Start metrics server
     let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
     tokio::spawn(async move {
-        if let Err(e) = serve_metrics(metrics_addr).await {
+        if let Err(e) = serve_metrics(metrics_addr, MetricsComponent::ExecutionEngine).await {
             error!(error = %e, "Metrics server failed");
         }
     });
@@ -4938,6 +4949,7 @@ async fn main() -> Result<()> {
             None
         } else {
             info!(url = %args.nats_url, "Connected to NATS");
+            set_readiness_nats_connected(true);
             Some(client)
         }
     };
@@ -5715,6 +5727,7 @@ async fn main() -> Result<()> {
                     topic = TOPIC_CONTROL_REQUESTS,
                     "Subscribed to ControlRequests"
                 );
+                set_readiness_control_sub_active(true);
                 let tx = control_tx.clone();
                 tokio::spawn(async move {
                     while let Some(msg) = control_sub.next().await {
@@ -5746,6 +5759,7 @@ async fn main() -> Result<()> {
                     topic = TOPIC_CONTROL_RESPONSES,
                     "Subscribed to ControlResponses (Discovery Request/Reply)"
                 );
+                set_readiness_control_response_sub_active(true);
                 let pending = Arc::clone(&ctx.pending_discovery_responses);
                 tokio::spawn(async move {
                     while let Some(msg) = resp_sub.next().await {
@@ -6021,6 +6035,9 @@ async fn main() -> Result<()> {
     };
 
     let mut wallet_snapshot_consumer_opt = wallet_snapshot_consumer;
+
+    // E2E Readiness: consuming state paths (LockManager, LivePoolCache, JetStream consumers) initialized
+    set_readiness_state_paths_initialized(true);
 
     // FIX-31: Track spawned intent tasks for graceful shutdown
     let mut task_set = tokio::task::JoinSet::new();

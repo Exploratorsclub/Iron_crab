@@ -289,6 +289,67 @@ pub static WALLET_TOTAL_SOL_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::
 /// Control plane queries this via /status to sync UI display after restarts.
 pub static KILL_SWITCH_ACTIVE: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 
+// =============================================================================
+// E2E Readiness (market-data, execution-engine) – Blackbox-stable Status
+// =============================================================================
+// Process-local statics. Each binary sets its own values. Used by /status for
+// structured readiness so Eval-E2E-Harness can verify contract readiness without
+// reading Iron_crab/src, logs, or NATS connz.
+
+/// NATS connected (set by binary when connection established)
+pub static READINESS_NATS_CONNECTED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+/// Control-Request subscription active (market-data) or ControlRequests+ControlResponses (execution-engine)
+pub static READINESS_CONTROL_SUB_ACTIVE: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+/// Control-Response subscription active (execution-engine only)
+pub static READINESS_CONTROL_RESPONSE_SUB_ACTIVE: Lazy<AtomicBool> =
+    Lazy::new(|| AtomicBool::new(false));
+/// JetStream / state-recovery infrastructure initialized (market-data: streams; execution-engine: bootstrap)
+pub static READINESS_JETSTREAM_INITIALIZED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+/// Consuming state paths initialized (execution-engine: LockManager, LivePoolCache bootstrap)
+pub static READINESS_STATE_PATHS_INITIALIZED: Lazy<AtomicBool> =
+    Lazy::new(|| AtomicBool::new(false));
+/// Mode: 0=live, 1=dry_run, 2=simulate, 3=simulate_only
+pub static READINESS_MODE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+/// Component identifier for /status JSON (determines which readiness checks apply)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsComponent {
+    MarketData,
+    ExecutionEngine,
+    MomentumBot,
+    ArbStrategy,
+}
+
+/// Set readiness: NATS connected
+pub fn set_readiness_nats_connected(connected: bool) {
+    READINESS_NATS_CONNECTED.store(connected, Ordering::Relaxed);
+}
+
+/// Set readiness: Control-Request subscription active
+pub fn set_readiness_control_sub_active(active: bool) {
+    READINESS_CONTROL_SUB_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// Set readiness: Control-Response subscription active (execution-engine)
+pub fn set_readiness_control_response_sub_active(active: bool) {
+    READINESS_CONTROL_RESPONSE_SUB_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// Set readiness: JetStream / state-recovery initialized
+pub fn set_readiness_jetstream_initialized(initialized: bool) {
+    READINESS_JETSTREAM_INITIALIZED.store(initialized, Ordering::Relaxed);
+}
+
+/// Set readiness: State paths initialized (execution-engine)
+pub fn set_readiness_state_paths_initialized(initialized: bool) {
+    READINESS_STATE_PATHS_INITIALIZED.store(initialized, Ordering::Relaxed);
+}
+
+/// Set readiness mode: 0=live, 1=dry_run, 2=simulate, 3=simulate_only
+pub fn set_readiness_mode(mode: u8) {
+    READINESS_MODE.store(mode as u64, Ordering::Relaxed);
+}
+
 // --- WsolManager metrics ---
 pub static WSOL_BALANCE_LAMPORTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static WSOL_WRAP_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -1506,63 +1567,180 @@ async fn metrics_response() -> Response<Body> {
         .unwrap()
 }
 
-pub async fn serve_metrics(addr: SocketAddr) -> anyhow::Result<()> {
-    let make_svc = make_service_fn(|_conn| async {
-        Ok::<_, hyper::Error>(service_fn(|req: Request<Body>| async move {
-            let path = req.uri().path();
-            if path == "/metrics" {
-                record_activity();
-                return Ok::<_, hyper::Error>(metrics_response().await);
+/// Build structured /status JSON for E2E Readiness (market-data, execution-engine)
+fn status_response(component: MetricsComponent) -> String {
+    let nats = READINESS_NATS_CONNECTED.load(Ordering::Relaxed);
+    let control_sub = READINESS_CONTROL_SUB_ACTIVE.load(Ordering::Relaxed);
+    let control_resp = READINESS_CONTROL_RESPONSE_SUB_ACTIVE.load(Ordering::Relaxed);
+    let jetstream = READINESS_JETSTREAM_INITIALIZED.load(Ordering::Relaxed);
+    let state_paths = READINESS_STATE_PATHS_INITIALIZED.load(Ordering::Relaxed);
+    let mode_u64 = READINESS_MODE.load(Ordering::Relaxed);
+    let mode_str = match mode_u64 {
+        1 => "dry_run",
+        2 => "simulate",
+        3 => "simulate_only",
+        _ => "live",
+    };
+
+    let (component_name, ready, missing_checks): (&str, bool, Vec<String>) = match component {
+        MetricsComponent::MarketData => {
+            let mut missing = Vec::new();
+            if !nats {
+                missing.push("nats_connected".to_string());
             }
-            if path == "/trades" {
-                // Return recent trades as JSON for Grafana
-                let json = get_recent_trades_json();
-                return Ok::<_, hyper::Error>(
-                    Response::builder()
-                        .status(200)
-                        .header("Content-Type", "application/json")
-                        .header("Access-Control-Allow-Origin", "*")
-                        .body(Body::from(json))
-                        .unwrap(),
-                );
+            if !control_sub {
+                missing.push("control_request_sub_active".to_string());
             }
-            if path == "/live" {
-                record_activity();
-                return Ok::<_, hyper::Error>(Response::new(Body::from("ok")));
+            if !jetstream {
+                missing.push("jetstream_initialized".to_string());
             }
-            if path == "/status" {
-                // JSON status for control plane (kill switch sync after restarts)
-                record_activity();
-                let active = KILL_SWITCH_ACTIVE.load(Ordering::Relaxed);
-                let json = format!(r#"{{"kill_switch_active":{}}}"#, active);
-                return Ok::<_, hyper::Error>(
-                    Response::builder()
-                        .status(200)
-                        .header("Content-Type", "application/json")
-                        .header("Access-Control-Allow-Origin", "*")
-                        .body(Body::from(json))
-                        .unwrap(),
-                );
+            let ready = nats && control_sub && jetstream;
+            ("market-data", ready, missing)
+        }
+        MetricsComponent::ExecutionEngine => {
+            let mut missing = Vec::new();
+            if !nats {
+                missing.push("nats_connected".to_string());
             }
-            if path == "/ready" {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let last = LAST_ACTIVITY_TS.load(Ordering::Relaxed);
-                if last > 0 && now.saturating_sub(last) <= 120 {
-                    return Ok::<_, hyper::Error>(Response::new(Body::from("ready")));
+            if !control_sub {
+                missing.push("control_request_sub_active".to_string());
+            }
+            if !control_resp {
+                missing.push("control_response_sub_active".to_string());
+            }
+            if !state_paths {
+                missing.push("state_paths_initialized".to_string());
+            }
+            let ready = nats && control_sub && control_resp && state_paths;
+            ("execution-engine", ready, missing)
+        }
+        MetricsComponent::MomentumBot | MetricsComponent::ArbStrategy => {
+            let name = match component {
+                MetricsComponent::MomentumBot => "momentum-bot",
+                _ => "arb-strategy",
+            };
+            (
+                name,
+                nats,
+                if nats {
+                    vec![]
                 } else {
-                    return Ok::<_, hyper::Error>(
-                        Response::builder()
-                            .status(503)
-                            .body(Body::from("stale"))
-                            .unwrap(),
-                    );
+                    vec!["nats_connected".to_string()]
+                },
+            )
+        }
+    };
+
+    let reason_not_ready = if !ready && !missing_checks.is_empty() {
+        Some(format!("missing: {}", missing_checks.join(", ")))
+    } else {
+        None
+    };
+
+    #[derive(serde::Serialize)]
+    struct ReadinessSection {
+        nats_connected: bool,
+        public_http_ready: bool,
+        mode: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason_not_ready: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        missing_checks: Vec<String>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct StatusPayload<'a> {
+        component: &'a str,
+        ready: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kill_switch_active: Option<bool>,
+        readiness: ReadinessSection,
+    }
+
+    let kill_switch = match component {
+        MetricsComponent::ExecutionEngine => Some(KILL_SWITCH_ACTIVE.load(Ordering::Relaxed)),
+        _ => None,
+    };
+
+    let payload = StatusPayload {
+        component: component_name,
+        ready,
+        kill_switch_active: kill_switch,
+        readiness: ReadinessSection {
+            nats_connected: nats,
+            public_http_ready: true,
+            mode: mode_str,
+            reason_not_ready,
+            missing_checks,
+        },
+    };
+
+    serde_json::to_string(&payload)
+        .unwrap_or_else(|_| r#"{"component":"unknown","ready":false}"#.to_string())
+}
+
+pub async fn serve_metrics(addr: SocketAddr, component: MetricsComponent) -> anyhow::Result<()> {
+    let make_svc = make_service_fn(move |_conn| {
+        let component = component;
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                let component = component;
+                async move {
+                    let path = req.uri().path();
+                    if path == "/metrics" {
+                        record_activity();
+                        return Ok::<_, hyper::Error>(metrics_response().await);
+                    }
+                    if path == "/trades" {
+                        // Return recent trades as JSON for Grafana
+                        let json = get_recent_trades_json();
+                        return Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(200)
+                                .header("Content-Type", "application/json")
+                                .header("Access-Control-Allow-Origin", "*")
+                                .body(Body::from(json))
+                                .unwrap(),
+                        );
+                    }
+                    if path == "/live" {
+                        record_activity();
+                        return Ok::<_, hyper::Error>(Response::new(Body::from("ok")));
+                    }
+                    if path == "/status" {
+                        // JSON status: structured readiness for E2E, backward-compat kill_switch_active
+                        record_activity();
+                        let json = status_response(component);
+                        return Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(200)
+                                .header("Content-Type", "application/json")
+                                .header("Access-Control-Allow-Origin", "*")
+                                .body(Body::from(json))
+                                .unwrap(),
+                        );
+                    }
+                    if path == "/ready" {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        let last = LAST_ACTIVITY_TS.load(Ordering::Relaxed);
+                        if last > 0 && now.saturating_sub(last) <= 120 {
+                            return Ok::<_, hyper::Error>(Response::new(Body::from("ready")));
+                        } else {
+                            return Ok::<_, hyper::Error>(
+                                Response::builder()
+                                    .status(503)
+                                    .body(Body::from("stale"))
+                                    .unwrap(),
+                            );
+                        }
+                    }
+                    Ok::<_, hyper::Error>(metrics_response().await)
                 }
-            }
-            Ok::<_, hyper::Error>(metrics_response().await)
-        }))
+            }))
+        }
     });
     Server::bind(&addr).serve(make_svc).await?;
     Ok(())
