@@ -303,8 +303,8 @@ pub static READINESS_CONTROL_SUB_ACTIVE: Lazy<AtomicBool> = Lazy::new(|| AtomicB
 /// Control-Response subscription active (execution-engine only)
 pub static READINESS_CONTROL_RESPONSE_SUB_ACTIVE: Lazy<AtomicBool> =
     Lazy::new(|| AtomicBool::new(false));
-/// JetStream / state-recovery infrastructure initialized (market-data: streams; execution-engine: bootstrap)
-pub static READINESS_JETSTREAM_INITIALIZED: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+/// JetStream currently usable (market-data: runtime get_stream check; not startup-latch)
+pub static READINESS_JETSTREAM_READY: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 /// Consuming state paths initialized (execution-engine: LockManager, LivePoolCache bootstrap)
 pub static READINESS_STATE_PATHS_INITIALIZED: Lazy<AtomicBool> =
     Lazy::new(|| AtomicBool::new(false));
@@ -335,9 +335,9 @@ pub fn set_readiness_control_response_sub_active(active: bool) {
     READINESS_CONTROL_RESPONSE_SUB_ACTIVE.store(active, Ordering::Relaxed);
 }
 
-/// Set readiness: JetStream / state-recovery initialized
-pub fn set_readiness_jetstream_initialized(initialized: bool) {
-    READINESS_JETSTREAM_INITIALIZED.store(initialized, Ordering::Relaxed);
+/// Set readiness: JetStream currently usable (runtime state, not startup-latch)
+pub fn set_readiness_jetstream_ready(ready: bool) {
+    READINESS_JETSTREAM_READY.store(ready, Ordering::Relaxed);
 }
 
 /// Set readiness: State paths initialized (execution-engine)
@@ -359,7 +359,7 @@ pub fn update_readiness_market_data_current(
 ) {
     READINESS_NATS_CONNECTED.store(nats_connected, Ordering::Relaxed);
     READINESS_CONTROL_SUB_ACTIVE.store(control_sub_active, Ordering::Relaxed);
-    READINESS_JETSTREAM_INITIALIZED.store(jetstream_ready, Ordering::Relaxed);
+    READINESS_JETSTREAM_READY.store(jetstream_ready, Ordering::Relaxed);
 }
 
 /// Stale threshold for subscription liveness (seconds): if no heartbeat in this time, consider dead.
@@ -1613,7 +1613,7 @@ fn status_response(component: MetricsComponent) -> String {
     let nats = READINESS_NATS_CONNECTED.load(Ordering::Relaxed);
     let control_sub = READINESS_CONTROL_SUB_ACTIVE.load(Ordering::Relaxed);
     let control_resp = READINESS_CONTROL_RESPONSE_SUB_ACTIVE.load(Ordering::Relaxed);
-    let jetstream = READINESS_JETSTREAM_INITIALIZED.load(Ordering::Relaxed);
+    let jetstream = READINESS_JETSTREAM_READY.load(Ordering::Relaxed);
     let state_paths = READINESS_STATE_PATHS_INITIALIZED.load(Ordering::Relaxed);
     let mode_u64 = READINESS_MODE.load(Ordering::Relaxed);
     let mode_str = match mode_u64 {
@@ -1646,7 +1646,7 @@ fn status_response(component: MetricsComponent) -> String {
                     missing.push("control_request_sub_active".to_string());
                 }
                 if !jetstream {
-                    missing.push("jetstream_initialized".to_string());
+                    missing.push("jetstream_ready".to_string());
                 }
                 let ready = nats && control_sub && jetstream;
                 ("market-data", ready, missing)
@@ -1698,6 +1698,8 @@ fn status_response(component: MetricsComponent) -> String {
     struct ReadinessSection {
         nats_connected: bool,
         public_http_ready: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        jetstream_ready: Option<bool>,
         mode: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason_not_ready: Option<String>,
@@ -1719,6 +1721,11 @@ fn status_response(component: MetricsComponent) -> String {
         _ => None,
     };
 
+    let jetstream_ready_field = match component {
+        MetricsComponent::MarketData => Some(jetstream),
+        _ => None,
+    };
+
     let payload = StatusPayload {
         component: component_name,
         ready,
@@ -1726,6 +1733,7 @@ fn status_response(component: MetricsComponent) -> String {
         readiness: ReadinessSection {
             nats_connected: nats,
             public_http_ready: true,
+            jetstream_ready: jetstream_ready_field,
             mode: mode_str,
             reason_not_ready,
             missing_checks,
