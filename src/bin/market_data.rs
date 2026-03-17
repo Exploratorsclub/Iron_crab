@@ -4288,6 +4288,38 @@ async fn run_simulation_loop(
     run_id: &str,
     mut config_subscription: Option<ironcrab::nats::NatsSubscription>,
 ) -> Result<()> {
+    // RPC client for EnsurePumpAmmPoolAccounts (Cold Path Discovery, same handler as Normalmodus)
+    let rpc_url =
+        std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
+    let rpc = Arc::new(SolanaRpc::new(&rpc_url));
+    info!(rpc_url = %rpc_url, "Simulation mode: RPC client for ControlRequest Discovery");
+
+    // I-24d: Subscribe to ControlRequests (same contract as Normalmodus)
+    let mut control_subscription = if let Some(ref nats) = ctx.nats {
+        match nats.subscribe(TOPIC_CONTROL_REQUESTS).await {
+            Ok(sub) => {
+                info!(
+                    topic = TOPIC_CONTROL_REQUESTS,
+                    "Simulation mode: Subscribed to ControlRequests (Discovery)"
+                );
+                set_readiness_control_sub_active(true);
+                Some(sub)
+            }
+            Err(e) => {
+                warn!(error = %e, "Simulation mode: Failed to subscribe to ControlRequests");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let pump_amm_dex = Arc::new(PumpFunAmmDex::new_with_cache(
+        rpc,
+        ctx.live_pool_cache.clone(),
+        true, // allow_rpc_on_miss: Cold Path Discovery
+    ));
+
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut slot: u64 = 0;
 
@@ -4303,8 +4335,9 @@ async fn run_simulation_loop(
                 // Keep /ready fresh even when only simulating.
                 ironcrab::metrics::record_activity();
 
-                // Refresh readiness from current runtime state (simulate: no control_sub)
+                // Refresh readiness from current runtime state (simulate: control_sub if subscribed)
                 let nats_connected = ctx.nats.as_ref().is_some_and(|n| n.is_connected());
+                let control_sub_active = nats_connected && control_subscription.is_some();
                 let jetstream_ready = if nats_connected {
                     if let Some(ref nats) = ctx.nats {
                         use async_nats::jetstream;
@@ -4322,7 +4355,7 @@ async fn run_simulation_loop(
                 } else {
                     false
                 };
-                update_readiness_market_data_current(nats_connected, false, jetstream_ready);
+                update_readiness_market_data_current(nats_connected, control_sub_active, jetstream_ready);
 
                 let event = MarketEvent::new(
                     "market-data",
@@ -4361,6 +4394,43 @@ async fn run_simulation_loop(
                 if slot % 10 == 0 {
                     #[cfg(unix)]
                     let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+                }
+            }
+
+            // I-24d: ControlRequests (EnsurePumpAmmPoolAccounts Discovery, same handler as Normalmodus)
+            msg = async {
+                if let Some(ref mut sub) = control_subscription {
+                    sub.next().await
+                } else {
+                    std::future::pending::<Option<ironcrab::nats::NatsMessage>>().await
+                }
+            } => {
+                if let Some(nats_msg) = msg {
+                    match nats_msg.deserialize::<ControlRequest>() {
+                        Ok(req) => {
+                            if req.target != "market-data" {
+                                debug!(target = %req.target, "Ignoring ControlRequest for other target");
+                            } else if let ControlRequestKind::EnsurePumpAmmPoolAccounts { base_mint } = req.kind {
+                                let run_id = ctx.run_id.clone();
+                                let request_id = req.request_id.clone();
+                                let ctx_clone = ctx.clone();
+                                let dex_clone = Arc::clone(&pump_amm_dex);
+                                tokio::spawn(async move {
+                                    handle_ensure_pump_amm_pool_accounts(
+                                        &ctx_clone,
+                                        dex_clone.as_ref(),
+                                        run_id.as_str(),
+                                        &request_id,
+                                        &base_mint,
+                                    )
+                                    .await;
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to deserialize ControlRequest");
+                        }
+                    }
                 }
             }
 
