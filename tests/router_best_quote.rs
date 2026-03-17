@@ -1,3 +1,6 @@
+use ironcrab::execution::live_pool_cache::{
+    CachedPoolState, LivePoolCache, OrcaWhirlpoolState, SharedLivePoolCache,
+};
 use ironcrab::solana::dex::{orca::Orca, raydium::Raydium, router::Router, Dex};
 use ironcrab::solana::rpc::SolanaRpc;
 use solana_sdk::pubkey::Pubkey;
@@ -9,13 +12,53 @@ async fn router_picks_higher_out_amount() {
     // Use an invalid/dummy RPC URL to guarantee no real network dependency for this unit test.
     let rpc = Arc::new(SolanaRpc::new("http://localhost:0"));
     let raydium = Arc::new(Raydium::new(rpc.clone()));
-    let orca = Arc::new(Orca::new(rpc.clone()));
-    // Insert mock pool into Orca with deterministic reserves
+
+    // Orca with LivePoolCache (GEYSER-FIRST): cache provides vault reserves, no RPC in Hot Path
     let base = Pubkey::new_from_array([3u8; 32]);
     let quote = Pubkey::new_from_array([4u8; 32]);
-    orca.insert_mock_pool(base, quote, 1_000_000_000u128, 2_000_000_000u128, 30);
-
-    // Skip refresh_pools to avoid network; we rely solely on the manually inserted mock pool.
+    let pool_addr = base; // insert_mock_pool uses base as pool key
+    let cache: SharedLivePoolCache = Arc::new(LivePoolCache::new());
+    cache.upsert(
+        pool_addr,
+        CachedPoolState::Orca(OrcaWhirlpoolState {
+            token_mint_a: base,
+            token_mint_b: quote,
+            token_vault_a: Pubkey::new_unique(),
+            token_vault_b: Pubkey::new_unique(),
+            tick_current_index: 0,
+            sqrt_price: 1,
+            liquidity: 1,
+            fee_rate: 300,
+            protocol_fee_rate: 0,
+            tick_spacing: 64,
+            vault_a_balance: Some(1_000_000_000),
+            vault_b_balance: Some(2_000_000_000),
+            token_a_program: None,
+            token_b_program: None,
+        }),
+        100,
+    );
+    let orca = Arc::new(Orca::new_with_cache(rpc.clone(), None, Some(cache), false));
+    orca.inject_cached_orca_state(
+        &pool_addr,
+        &OrcaWhirlpoolState {
+            token_mint_a: base,
+            token_mint_b: quote,
+            token_vault_a: Pubkey::new_unique(),
+            token_vault_b: Pubkey::new_unique(),
+            tick_current_index: 0,
+            sqrt_price: 1,
+            liquidity: 1,
+            fee_rate: 300,
+            protocol_fee_rate: 0,
+            tick_spacing: 64,
+            vault_a_balance: Some(1_000_000_000),
+            vault_b_balance: Some(2_000_000_000),
+            token_a_program: None,
+            token_b_program: None,
+        },
+    )
+    .expect("inject_cached_orca_state");
 
     let router = Router::new(vec![
         raydium.clone() as Arc<dyn Dex>,

@@ -465,7 +465,12 @@ pub async fn build_tx_plan(
             }
         };
 
-        let orca = Orca::new_with_cache(Arc::clone(&rpc), None, cache.map(Arc::clone));
+        let orca = Orca::new_with_cache(
+            Arc::clone(&rpc),
+            None,
+            cache.map(Arc::clone),
+            allow_rpc_fallback,
+        );
         orca.set_user_authority(wallet_pubkey);
         orca.set_skip_tick_array_rpc_validation(!allow_rpc_fallback);
 
@@ -1660,8 +1665,14 @@ async fn build_hop_orca(
     cache: Option<&SharedLivePoolCache>,
     allow_rpc_fallback: bool,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
-    let orca = Orca::new_with_cache(Arc::clone(rpc), None, cache.map(Arc::clone));
+    let orca = Orca::new_with_cache(
+        Arc::clone(rpc),
+        None,
+        cache.map(Arc::clone),
+        allow_rpc_fallback,
+    );
     orca.set_user_authority(wallet_pubkey);
+    orca.set_skip_tick_array_rpc_validation(!allow_rpc_fallback);
 
     // Get pool state from cache or RPC
     let parsed = if let Some(cache) = cache {
