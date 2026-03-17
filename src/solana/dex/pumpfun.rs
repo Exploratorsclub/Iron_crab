@@ -1187,27 +1187,36 @@ impl PumpFunDex {
         // 2. Cached creator (from DashMap, populated from previous lookups)
         // 3. LivePoolCache (GEYSER-FIRST, populated by market-data)
         // 4. RPC fallback (DEPRECATED - should not happen in production)
+        // Cashback resolution: Cold Path MUST verify via RPC — Cache-HIT with stale
+        // cashback_enabled=false must NOT short-circuit (Bug #25). If RPC fails → Err.
+        // Hot Path: trust Geyser-fed cache only (I-7: no RPC).
+        let cashback_from_rpc_or_cache = |allow_rpc: bool| async move {
+            if allow_rpc {
+                // Cold Path: ALWAYS verify via RPC. No fallback to cache on RPC failure.
+                match self.fetch_bonding_curve(&bonding_curve).await {
+                    Ok(state) => Ok(state.cashback_enabled),
+                    Err(e) => Err(anyhow!(
+                        "Cold Path: RPC verification of cashback_enabled failed for bonding curve {} — \
+                         cannot proceed without authoritative on-chain state (RPC unreachable): {}",
+                        bonding_curve,
+                        e
+                    )),
+                }
+            } else {
+                Ok(self
+                    .get_bonding_curve_from_cache(&bonding_curve)
+                    .map(|s| s.cashback_enabled)
+                    .unwrap_or(false))
+            }
+        };
+
         let (creator, cashback_enabled) = if let Some(c) = fallback_creator {
             debug!(
                 token_mint = %token_mint_str,
                 creator = %c,
                 "pump.fun: using creator from producer"
             );
-            let cashback = if allow_rpc_fallback {
-                // Cold Path (Liquidation): ALWAYS verify via RPC — JetStream cache may have stale cashback_enabled
-                match self.fetch_bonding_curve_fast(&bonding_curve).await {
-                    Some(state) => state.cashback_enabled,
-                    None => self
-                        .get_bonding_curve_from_cache(&bonding_curve)
-                        .map(|s| s.cashback_enabled)
-                        .unwrap_or(false),
-                }
-            } else {
-                // Hot Path: trust Geyser-fed cache (I-7: no RPC)
-                self.get_bonding_curve_from_cache(&bonding_curve)
-                    .map(|s| s.cashback_enabled)
-                    .unwrap_or(false)
-            };
+            let cashback = cashback_from_rpc_or_cache(allow_rpc_fallback).await?;
             (c, cashback)
         } else if let Some(c) = self.get_cached_creator(&token_mint) {
             debug!(
@@ -1215,21 +1224,7 @@ impl PumpFunDex {
                 creator = %c,
                 "pump.fun: using creator from DashMap cache"
             );
-            let cashback = if allow_rpc_fallback {
-                // Cold Path (Liquidation): ALWAYS verify via RPC — JetStream cache may have stale cashback_enabled
-                match self.fetch_bonding_curve_fast(&bonding_curve).await {
-                    Some(state) => state.cashback_enabled,
-                    None => self
-                        .get_bonding_curve_from_cache(&bonding_curve)
-                        .map(|s| s.cashback_enabled)
-                        .unwrap_or(false),
-                }
-            } else {
-                // Hot Path: trust Geyser-fed cache (I-7: no RPC)
-                self.get_bonding_curve_from_cache(&bonding_curve)
-                    .map(|s| s.cashback_enabled)
-                    .unwrap_or(false)
-            };
+            let cashback = cashback_from_rpc_or_cache(allow_rpc_fallback).await?;
             (c, cashback)
         } else if let Some(c) = self.get_creator_from_cache(&bonding_curve) {
             debug!(
@@ -1239,21 +1234,7 @@ impl PumpFunDex {
             );
             // Also cache in DashMap for faster subsequent lookups
             self.cached_creators.insert(token_mint, c);
-            let cashback = if allow_rpc_fallback {
-                // Cold Path (Liquidation): ALWAYS verify via RPC — JetStream cache may have stale cashback_enabled
-                match self.fetch_bonding_curve_fast(&bonding_curve).await {
-                    Some(state) => state.cashback_enabled,
-                    None => self
-                        .get_bonding_curve_from_cache(&bonding_curve)
-                        .map(|s| s.cashback_enabled)
-                        .unwrap_or(false),
-                }
-            } else {
-                // Hot Path: trust Geyser-fed cache (I-7: no RPC)
-                self.get_bonding_curve_from_cache(&bonding_curve)
-                    .map(|s| s.cashback_enabled)
-                    .unwrap_or(false)
-            };
+            let cashback = cashback_from_rpc_or_cache(allow_rpc_fallback).await?;
             (c, cashback)
         } else {
             // RPC FALLBACK - Only allowed in Cold Path (Liquidation).

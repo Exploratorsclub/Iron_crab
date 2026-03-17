@@ -206,3 +206,48 @@ async fn test_tx_builder_supports_pumpfun_sell_pure_derivation() {
         "SELL ix must have at least 15 accounts (bonding_curve_v2 required since Feb 2026)"
     );
 }
+
+/// Regression test for Bug #25: Cold Path must verify cashback_enabled via RPC even on Cache-HIT.
+/// When allow_rpc_fallback=true and RPC is unreachable, build must return Err (no silent fallback
+/// to stale cache with cashback_enabled=false).
+/// Ignored by default: uses unreachable RPC, can take 30s+ due to retries. Run with:
+///   cargo test test_pumpfun_cold_path_rpc_verification_required -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn test_pumpfun_cold_path_rpc_verification_required() {
+    // Use unreachable RPC — Cold Path requires verification, must fail clearly
+    let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:1"));
+    let mut dex = PumpFunDex::new(rpc, None).expect("PumpFunDex::new");
+
+    let wallet =
+        Pubkey::from_str("Ase7z1mRLps2cTNQnRHpLyQL4Q5FHwonjmZnYCTuUDZM").expect("wallet pubkey");
+    dex.set_user_authority(wallet);
+
+    let creator =
+        Pubkey::from_str("2tFqgkJX6kqz8q6o9tFv3oJ9nQx7n1m3fHk2m8f3oKpZ").expect("creator pubkey");
+    let token_mint = "9xQeWvG816bUx9EPfKJb9N9dKz5wW7Yy2hBzXv4mQ4kG";
+
+    let result = dex
+        .build_swap_ix_async_with_slippage(
+            "So11111111111111111111111111111111111111112",
+            token_mint,
+            1_000_000,
+            123_456,
+            Some(creator),
+            500,
+            None,
+            false, // market_order
+            true,  // allow_rpc_fallback: Cold Path — must verify via RPC
+        )
+        .await;
+
+    // Cold Path with unreachable RPC must return Err, not silently use stale cache
+    let err = result
+        .expect_err("Cold Path with unreachable RPC must fail (Err), not succeed with stale cache");
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("Cold Path") || err_str.contains("RPC verification"),
+        "error should mention Cold Path / RPC verification: {}",
+        err_str
+    );
+}
