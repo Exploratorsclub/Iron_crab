@@ -3,27 +3,17 @@ use ironcrab::solana::rpc::SolanaRpc;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 
-// Integration-style test: Stub signals -> Router -> Swap plan assembly (2 hops)
-// Builds two Orca connectors with deterministic mock pools A-B and B-C, then asks the Router
-// to find the best 2-hop route A->B->C and assemble a swap plan with min_out.
+// Integration-style test: Orca::new() + insert_mock_pool — bestehender Contract.
 #[tokio::test]
 async fn router_builds_hops2_plan_with_min_out() {
-    // Use dummy RPC URL to avoid any network access in tests
     let rpc = Arc::new(SolanaRpc::new("http://localhost:0"));
-
-    // Two independent Orca connectors (both implement Dex)
-    let orca0 = Arc::new(Orca::new(rpc.clone()));
-    let orca1 = Arc::new(Orca::new(rpc.clone()));
-
-    // Deterministic mints
     let a = Pubkey::new_from_array([10u8; 32]);
     let b = Pubkey::new_from_array([11u8; 32]);
     let c = Pubkey::new_from_array([12u8; 32]);
 
-    // Insert mock pools
-    // orca0: A <-> B with ample reserves
+    let orca0 = Arc::new(Orca::new(rpc.clone()));
+    let orca1 = Arc::new(Orca::new(rpc.clone()));
     orca0.insert_mock_pool(a, b, 1_000_000_000u128, 2_000_000_000u128, 30);
-    // orca1: B <-> C with ample reserves
     orca1.insert_mock_pool(b, c, 2_000_000_000u128, 3_000_000_000u128, 30);
 
     // Prepare user authority and token accounts for both connectors (required by build_swap_ix)

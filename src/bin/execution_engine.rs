@@ -2024,7 +2024,12 @@ impl ExecutionContext {
             Some(lpc.clone()),
             true, // Liquidation = Cold Path — RPC fallback allowed
         );
-        let orca = Orca::new_with_cache(Arc::clone(&ctx.rpc), None, Some(lpc));
+        let orca = Orca::new_with_cache_ext(
+            Arc::clone(&ctx.rpc),
+            None,
+            Some(lpc),
+            true, // Liquidation = Cold Path — RPC fallback allowed
+        );
         orca.set_user_authority(owner);
 
         if let Err(e) = raydium.refresh_pools().await {
