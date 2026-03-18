@@ -63,8 +63,18 @@ async fn router_builds_hops2_plan_with_min_out() {
     );
 
     // Two independent Orca connectors with shared cache (Hot Path: no RPC on cache hit)
-    let orca0 = Arc::new(Orca::new_with_cache(rpc.clone(), None, Some(cache.clone()), false));
-    let orca1 = Arc::new(Orca::new_with_cache(rpc.clone(), None, Some(cache.clone()), false));
+    let orca0 = Arc::new(Orca::new_with_cache(
+        rpc.clone(),
+        None,
+        Some(cache.clone()),
+        false,
+    ));
+    let orca1 = Arc::new(Orca::new_with_cache(
+        rpc.clone(),
+        None,
+        Some(cache.clone()),
+        false,
+    ));
 
     // Inject pool state into both Orca instances
     let state_ab = OrcaWhirlpoolState {
@@ -99,8 +109,12 @@ async fn router_builds_hops2_plan_with_min_out() {
         token_a_program: None,
         token_b_program: None,
     };
-    orca0.inject_cached_orca_state(&a, &state_ab).expect("inject ab");
-    orca1.inject_cached_orca_state(&b, &state_bc).expect("inject bc");
+    orca0
+        .inject_cached_orca_state(&a, &state_ab)
+        .expect("inject ab");
+    orca1
+        .inject_cached_orca_state(&b, &state_bc)
+        .expect("inject bc");
 
     // Prepare user authority and token accounts for both connectors (required by build_swap_ix)
     let auth = Pubkey::new_unique();
