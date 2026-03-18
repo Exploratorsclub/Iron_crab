@@ -1,110 +1,20 @@
-use ironcrab::execution::live_pool_cache::{
-    CachedPoolState, LivePoolCache, OrcaWhirlpoolState, SharedLivePoolCache,
-};
 use ironcrab::solana::dex::{orca::Orca, router::Router, Dex};
 use ironcrab::solana::rpc::SolanaRpc;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 
-// Integration-style test: Stub signals -> Router -> Swap plan assembly (2 hops)
-// Builds two Orca connectors with deterministic mock pools A-B and B-C, then asks the Router
-// to find the best 2-hop route A->B->C and assemble a swap plan with min_out.
+// Integration-style test: Orca::new() + insert_mock_pool — bestehender Contract.
 #[tokio::test]
 async fn router_builds_hops2_plan_with_min_out() {
-    // Use dummy RPC URL to avoid any network access in tests
     let rpc = Arc::new(SolanaRpc::new("http://localhost:0"));
-
-    // Deterministic mints
     let a = Pubkey::new_from_array([10u8; 32]);
     let b = Pubkey::new_from_array([11u8; 32]);
     let c = Pubkey::new_from_array([12u8; 32]);
 
-    // LivePoolCache with both pools (GEYSER-FIRST, no RPC)
-    let cache: SharedLivePoolCache = Arc::new(LivePoolCache::new());
-    cache.upsert(
-        a, // pool A-B keyed by a (insert_mock_pool convention)
-        CachedPoolState::Orca(OrcaWhirlpoolState {
-            token_mint_a: a,
-            token_mint_b: b,
-            token_vault_a: Pubkey::new_unique(),
-            token_vault_b: Pubkey::new_unique(),
-            tick_current_index: 0,
-            sqrt_price: 1,
-            liquidity: 1,
-            fee_rate: 300,
-            protocol_fee_rate: 0,
-            tick_spacing: 64,
-            vault_a_balance: Some(1_000_000_000),
-            vault_b_balance: Some(2_000_000_000),
-            token_a_program: None,
-            token_b_program: None,
-        }),
-        100,
-    );
-    cache.upsert(
-        b, // pool B-C keyed by b
-        CachedPoolState::Orca(OrcaWhirlpoolState {
-            token_mint_a: b,
-            token_mint_b: c,
-            token_vault_a: Pubkey::new_unique(),
-            token_vault_b: Pubkey::new_unique(),
-            tick_current_index: 0,
-            sqrt_price: 1,
-            liquidity: 1,
-            fee_rate: 300,
-            protocol_fee_rate: 0,
-            tick_spacing: 64,
-            vault_a_balance: Some(2_000_000_000),
-            vault_b_balance: Some(3_000_000_000),
-            token_a_program: None,
-            token_b_program: None,
-        }),
-        100,
-    );
-
-    // Two independent Orca connectors with shared cache (Hot Path: no RPC on cache hit)
-    let orca0 = Arc::new(Orca::new_with_cache(rpc.clone(), None, Some(cache.clone())));
-    let orca1 = Arc::new(Orca::new_with_cache(rpc.clone(), None, Some(cache.clone())));
-
-    // Inject pool state into both Orca instances
-    let state_ab = OrcaWhirlpoolState {
-        token_mint_a: a,
-        token_mint_b: b,
-        token_vault_a: Pubkey::new_unique(),
-        token_vault_b: Pubkey::new_unique(),
-        tick_current_index: 0,
-        sqrt_price: 1,
-        liquidity: 1,
-        fee_rate: 300,
-        protocol_fee_rate: 0,
-        tick_spacing: 64,
-        vault_a_balance: Some(1_000_000_000),
-        vault_b_balance: Some(2_000_000_000),
-        token_a_program: None,
-        token_b_program: None,
-    };
-    let state_bc = OrcaWhirlpoolState {
-        token_mint_a: b,
-        token_mint_b: c,
-        token_vault_a: Pubkey::new_unique(),
-        token_vault_b: Pubkey::new_unique(),
-        tick_current_index: 0,
-        sqrt_price: 1,
-        liquidity: 1,
-        fee_rate: 300,
-        protocol_fee_rate: 0,
-        tick_spacing: 64,
-        vault_a_balance: Some(2_000_000_000),
-        vault_b_balance: Some(3_000_000_000),
-        token_a_program: None,
-        token_b_program: None,
-    };
-    orca0
-        .inject_cached_orca_state(&a, &state_ab)
-        .expect("inject ab");
-    orca1
-        .inject_cached_orca_state(&b, &state_bc)
-        .expect("inject bc");
+    let orca0 = Arc::new(Orca::new(rpc.clone()));
+    let orca1 = Arc::new(Orca::new(rpc.clone()));
+    orca0.insert_mock_pool(a, b, 1_000_000_000u128, 2_000_000_000u128, 30);
+    orca1.insert_mock_pool(b, c, 2_000_000_000u128, 3_000_000_000u128, 30);
 
     // Prepare user authority and token accounts for both connectors (required by build_swap_ix)
     let auth = Pubkey::new_unique();

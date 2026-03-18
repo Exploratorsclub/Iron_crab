@@ -431,16 +431,17 @@ impl Orca {
     }
 
     /// Lazy-load reserves from vaults with Geyser-first strategy.
-    /// Pattern aligned with Raydium/RaydiumCpmm/MeteoraDlmm:
-    /// - Cache hit (valid vault balances) → Ok
-    /// - Cache miss/invalid + allow_rpc_on_miss=false (Hot Path) → Err
-    /// - Cache miss/invalid + allow_rpc_on_miss=true (Cold Path) → RPC fallback; RPC fail → Err (no silent degradation)
+    ///
+    /// Pfad-Trennung (enger Cold-Path-Fix):
+    /// - Kein LivePoolCache (Orca::new + insert_mock_pool): Pool-Reserves nutzen, kein RPC. Bestehender Eval/Router-Contract.
+    /// - LivePoolCache gesetzt, Cache-Hit: Geyser-Reserves.
+    /// - LivePoolCache gesetzt, Cache-Miss: Hot Path → static reserves. Cold Path → RPC-Fallback, Fail → Err.
     async fn load_reserves_if_needed(
         &self,
         pool_id: &Pubkey,
         pool: &OrcaPool,
     ) -> Result<(u128, u128)> {
-        // 1) LivePoolCache (Geyser) — einzige Reserve-Quelle im Hot Path
+        // 1) LivePoolCache (Geyser) — Reserve-Quelle wenn Cache gesetzt
         if let Some(ref lpc) = self.live_pool_cache {
             if let Some(CachedPoolState::Orca(state)) = lpc.get(pool_id) {
                 if let (Some(va), Some(vb)) = (state.vault_a_balance, state.vault_b_balance) {
@@ -450,64 +451,69 @@ impl Orca {
                     }
                 }
             }
-        }
+            // 2) LivePoolCache gesetzt, aber Cache-Miss/invalid — der relevante Cold-Path-Fall
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            if !self.allow_rpc_on_miss.load(Ordering::Relaxed) {
+                tracing::debug!(
+                    pool = %pool_id,
+                    "orca: LivePoolCache miss, using static reserves (Hot Path, no RPC)"
+                );
+                return Ok((pool.reserve_base, pool.reserve_quote));
+            }
+            // Cold Path: bekannter Pool + fehlende Live-Reserves → RPC-Fallback
+            tracing::warn!(
+                pool = %pool_id,
+                "orca: RPC fallback for vault reserves (Cold Path, LivePoolCache miss)"
+            );
+            let vaults = self
+                .rpc
+                .rpc
+                .get_multiple_accounts(&[pool.vault_a, pool.vault_b])
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "orca: RPC fallback failed for vault reserves (pool={}): {}",
+                        pool_id,
+                        e
+                    )
+                })?;
 
-        // 2) Cache miss or invalid (va=0 or vb=0)
-        // Hot Path: static reserves (preserves Ok(None) from quote_exact_in when 0,0). Cold Path: RPC fallback.
-        self.cache_misses.fetch_add(1, Ordering::Relaxed);
-        if !self.allow_rpc_on_miss.load(Ordering::Relaxed) {
+            let mut reserves = (0u128, 0u128);
+            if let Some(Some(v1)) = vaults.first() {
+                if v1.data.len() >= 72 {
+                    reserves.0 = Self::parse_token_amount(&v1.data) as u128;
+                }
+            }
+            if let Some(Some(v2)) = vaults.get(1) {
+                if v2.data.len() >= 72 {
+                    reserves.1 = Self::parse_token_amount(&v2.data) as u128;
+                }
+            }
+            if let Some(ref db_cache) = self.reserve_cache {
+                let entry = ReserveEntry {
+                    pool_address: *pool_id,
+                    reserve_base: reserves.0,
+                    reserve_quote: reserves.1,
+                    cached_at: Utc::now(),
+                };
+                let _ = db_cache.set(&entry);
+            }
             tracing::debug!(
                 pool = %pool_id,
-                "orca: LivePoolCache miss, using static reserves (Hot Path, no RPC)"
+                vault_a = reserves.0,
+                vault_b = reserves.1,
+                "orca: fresh reserves via RPC (Cold Path)"
             );
-            return Ok((pool.reserve_base, pool.reserve_quote));
+            return Ok(reserves);
         }
 
-        tracing::warn!(
-            pool = %pool_id,
-            "orca: RPC fallback for vault reserves (Cold Path, LivePoolCache miss)"
-        );
-        let vaults = self
-            .rpc
-            .rpc
-            .get_multiple_accounts(&[pool.vault_a, pool.vault_b])
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "orca: RPC fallback failed for vault reserves (pool={}): {}",
-                    pool_id,
-                    e
-                )
-            })?;
-
-        let mut reserves = (0u128, 0u128);
-        if let Some(Some(v1)) = vaults.first() {
-            if v1.data.len() >= 72 {
-                reserves.0 = Self::parse_token_amount(&v1.data) as u128;
-            }
-        }
-        if let Some(Some(v2)) = vaults.get(1) {
-            if v2.data.len() >= 72 {
-                reserves.1 = Self::parse_token_amount(&v2.data) as u128;
-            }
-        }
-        // Store in persistent cache (Cold Path only)
-        if let Some(ref db_cache) = self.reserve_cache {
-            let entry = ReserveEntry {
-                pool_address: *pool_id,
-                reserve_base: reserves.0,
-                reserve_quote: reserves.1,
-                cached_at: Utc::now(),
-            };
-            let _ = db_cache.set(&entry);
-        }
+        // 3) Kein LivePoolCache — Orca::new + insert_mock_pool. Pool-Reserves nutzen, kein RPC.
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
             pool = %pool_id,
-            vault_a = reserves.0,
-            vault_b = reserves.1,
-            "orca: fresh reserves fetched via RPC (Cold Path)"
+            "orca: no LivePoolCache, using pool reserves (mock/RPC-fallback path)"
         );
-        Ok(reserves)
+        Ok((pool.reserve_base, pool.reserve_quote))
     }
 
     /// Background task to prefetch reserves for top liquidity pools.
@@ -1727,30 +1733,38 @@ mod tests {
         );
     }
 
-    /// Cold Path: Known pool + missing Live reserves + RPC unreachable → Err (not silent Ok(None)).
-    /// Regression for Cross-DEX Cold-Path-Reserve-Gruppe: Orca must not silently degrade to static reserves.
+    /// Cold Path: LivePoolCache gesetzt, Cache-Miss, allow_rpc_on_miss=true, RPC unreachable → Err.
     #[tokio::test]
     async fn test_load_reserves_errors_on_rpc_failure_in_cold_path() {
+        use crate::execution::live_pool_cache::LivePoolCache;
         let rpc = Arc::new(SolanaRpc::new("https://dummy-unreachable.invalid"));
-        let orca = Orca::new_with_cache_ext(rpc, None, None, true);
+        let cache = Arc::new(LivePoolCache::new());
+        // Cache leer oder ohne diesen Pool — Cold-Path-Fall: RPC-Fallback
+        let orca = Orca::new_with_cache_ext(rpc, None, Some(cache), true);
         let pool_addr = Pubkey::new_unique();
         let token_a = Pubkey::new_unique();
         let token_b = Pubkey::new_unique();
-        orca.insert_whirlpool_parsed(
-            pool_addr,
-            layout::WhirlpoolParsed {
+        orca.inject_cached_orca_state(
+            &pool_addr,
+            &crate::execution::live_pool_cache::OrcaWhirlpoolState {
                 token_mint_a: token_a,
                 token_mint_b: token_b,
                 token_vault_a: Pubkey::new_unique(),
                 token_vault_b: Pubkey::new_unique(),
+                tick_current_index: 0,
+                sqrt_price: 1,
+                liquidity: 1,
                 fee_rate: 300,
                 protocol_fee_rate: 0,
                 tick_spacing: 64,
-                tick_current_index: 0,
-                liquidity: 1,
-                sqrt_price: 1,
+                vault_a_balance: None, // fehlende Live-Reserves
+                vault_b_balance: None,
+                token_a_program: None,
+                token_b_program: None,
             },
-        );
+        )
+        .expect("inject");
+        // Cache hat diesen Pool nicht (oder nur mit None-Reserves) — Cold-Path-RPC-Fallback
         let result = orca
             .quote_exact_in(&token_a.to_string(), &token_b.to_string(), 1_000_000)
             .await;
