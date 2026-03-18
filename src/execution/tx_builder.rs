@@ -465,7 +465,7 @@ pub async fn build_tx_plan(
             }
         };
 
-        let orca = Orca::new_with_cache(
+        let orca = Orca::new_with_cache_ext(
             Arc::clone(&rpc),
             None,
             cache.map(Arc::clone),
@@ -1665,7 +1665,7 @@ async fn build_hop_orca(
     cache: Option<&SharedLivePoolCache>,
     allow_rpc_fallback: bool,
 ) -> Result<Vec<Instruction>, UnsupportedTxPlan> {
-    let orca = Orca::new_with_cache(
+    let orca = Orca::new_with_cache_ext(
         Arc::clone(rpc),
         None,
         cache.map(Arc::clone),

@@ -63,18 +63,8 @@ async fn router_builds_hops2_plan_with_min_out() {
     );
 
     // Two independent Orca connectors with shared cache (Hot Path: no RPC on cache hit)
-    let orca0 = Arc::new(Orca::new_with_cache(
-        rpc.clone(),
-        None,
-        Some(cache.clone()),
-        false,
-    ));
-    let orca1 = Arc::new(Orca::new_with_cache(
-        rpc.clone(),
-        None,
-        Some(cache.clone()),
-        false,
-    ));
+    let orca0 = Arc::new(Orca::new_with_cache(rpc.clone(), None, Some(cache.clone())));
+    let orca1 = Arc::new(Orca::new_with_cache(rpc.clone(), None, Some(cache.clone())));
 
     // Inject pool state into both Orca instances
     let state_ab = OrcaWhirlpoolState {

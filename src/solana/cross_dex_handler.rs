@@ -250,12 +250,7 @@ impl CrossDexHandler {
         info!("Initialized Meteora CPMM connector (for IX building only)");
 
         // Initialize Orca Whirlpool - for build_swap_ix() only
-        let orca = Orca::new_with_cache(
-            Arc::clone(&self.rpc),
-            None,
-            self.pool_cache.clone(),
-            false, // Arb = Hot Path — no RPC on vault reserve miss
-        );
+        let orca = Orca::new_with_cache(Arc::clone(&self.rpc), None, self.pool_cache.clone()); // Hot Path default (cache miss → static reserves, no RPC)
         if let Some(pk) = self.wallet_pubkey {
             orca.set_user_authority(pk);
         }

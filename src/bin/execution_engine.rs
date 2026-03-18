@@ -2024,7 +2024,7 @@ impl ExecutionContext {
             Some(lpc.clone()),
             true, // Liquidation = Cold Path — RPC fallback allowed
         );
-        let orca = Orca::new_with_cache(
+        let orca = Orca::new_with_cache_ext(
             Arc::clone(&ctx.rpc),
             None,
             Some(lpc),

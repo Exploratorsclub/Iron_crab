@@ -66,8 +66,8 @@ pub struct Orca {
     reserve_cache: Option<Arc<OrcaReserveCache>>,
     /// Geyser-sourced LivePoolCache for real-time vault balances (GEYSER-FIRST)
     live_pool_cache: Option<SharedLivePoolCache>,
-    /// When false (Hot Path): reject on vault reserve cache miss, no RPC. When true (Cold Path): RPC fallback.
-    allow_rpc_on_miss: bool,
+    /// When false (Hot Path): cache miss → static reserves. When true (Cold Path): RPC fallback.
+    allow_rpc_on_miss: std::sync::atomic::AtomicBool,
     cache_hits: Arc<AtomicU64>,
     cache_misses: Arc<AtomicU64>,
     /// When true (Hot Path): skip get_multiple_accounts tick validation to avoid RPC
@@ -76,13 +76,22 @@ pub struct Orca {
 
 impl Orca {
     pub fn new(rpc: Arc<SolanaRpc>) -> Self {
-        Self::new_with_cache(rpc, None, None, true)
+        Self::new_with_cache_ext(rpc, None, None, true)
     }
 
     /// Create Orca instance with optional persistent reserve cache and LivePoolCache.
-    /// `allow_rpc_on_miss`: When false (Hot Path), reject on vault reserve cache miss instead of RPC.
-    /// When true (Cold Path), allow RPC fallback for authoritative vault balances.
+    /// API: 3 args for Eval/external compatibility. Hot Path default (cache miss → static reserves, no RPC).
+    /// For Cold Path: call `set_allow_rpc_on_miss(true)` after construction.
     pub fn new_with_cache(
+        rpc: Arc<SolanaRpc>,
+        cache_path: Option<String>,
+        live_pool_cache: Option<SharedLivePoolCache>,
+    ) -> Self {
+        Self::new_with_cache_ext(rpc, cache_path, live_pool_cache, false)
+    }
+
+    /// Extended constructor with explicit Cold Path control. Internal use.
+    pub fn new_with_cache_ext(
         rpc: Arc<SolanaRpc>,
         cache_path: Option<String>,
         live_pool_cache: Option<SharedLivePoolCache>,
@@ -101,7 +110,7 @@ impl Orca {
             mint_index: Arc::new(DashMap::new()),
             reserve_cache,
             live_pool_cache,
-            allow_rpc_on_miss,
+            allow_rpc_on_miss: std::sync::atomic::AtomicBool::new(allow_rpc_on_miss),
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
             skip_tick_array_rpc_validation: Arc::new(AtomicBool::new(false)),
@@ -443,17 +452,15 @@ impl Orca {
             }
         }
 
-        // 2) Cache miss or invalid (va=0 or vb=0) — RPC fallback only when allow_rpc_on_miss (Cold Path)
+        // 2) Cache miss or invalid (va=0 or vb=0)
+        // Hot Path: static reserves (preserves Ok(None) from quote_exact_in when 0,0). Cold Path: RPC fallback.
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
-        if !self.allow_rpc_on_miss {
+        if !self.allow_rpc_on_miss.load(Ordering::Relaxed) {
             tracing::debug!(
                 pool = %pool_id,
-                "orca: vault reserves not in LivePoolCache (GEYSER-ONLY hot path)"
+                "orca: LivePoolCache miss, using static reserves (Hot Path, no RPC)"
             );
-            return Err(anyhow!(
-                "orca: vault reserves not in LivePoolCache (GEYSER-ONLY hot path, pool={})",
-                pool_id
-            ));
+            return Ok((pool.reserve_base, pool.reserve_quote));
         }
 
         tracing::warn!(
@@ -1687,12 +1694,11 @@ mod tests {
     use crate::solana::dex::orca_whirlpool_layout as layout;
     use std::sync::Arc;
 
-    /// Hot Path: Cache miss when allow_rpc_on_miss=false → Err (not Ok(None)).
-    /// Aligns with Raydium/RaydiumCpmm/MeteoraDlmm GEYSER-ONLY semantics.
+    /// Hot Path (A.12): Cache miss → Ok(None), no RPC. Preserves existing Orca contract.
     #[tokio::test]
-    async fn test_load_reserves_rejects_on_cache_miss_when_geyser_only() {
+    async fn test_load_reserves_returns_none_on_cache_miss_hot_path() {
         let rpc = Arc::new(SolanaRpc::new("https://dummy"));
-        let orca = Orca::new_with_cache(rpc, None, None, false);
+        let orca = Orca::new_with_cache(rpc, None, None);
         let pool_addr = Pubkey::new_unique();
         let token_a = Pubkey::new_unique();
         let token_b = Pubkey::new_unique();
@@ -1714,12 +1720,10 @@ mod tests {
         let result = orca
             .quote_exact_in(&token_a.to_string(), &token_b.to_string(), 1_000_000)
             .await;
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        assert!(result.is_ok());
         assert!(
-            err_msg.contains("GEYSER-ONLY"),
-            "expected GEYSER-ONLY in error, got: {}",
-            err_msg
+            result.unwrap().is_none(),
+            "Hot Path cache miss → Ok(None), no RPC"
         );
     }
 
@@ -1728,7 +1732,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_reserves_errors_on_rpc_failure_in_cold_path() {
         let rpc = Arc::new(SolanaRpc::new("https://dummy-unreachable.invalid"));
-        let orca = Orca::new_with_cache(rpc, None, None, true);
+        let orca = Orca::new_with_cache_ext(rpc, None, None, true);
         let pool_addr = Pubkey::new_unique();
         let token_a = Pubkey::new_unique();
         let token_b = Pubkey::new_unique();

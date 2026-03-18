@@ -38,7 +38,7 @@ async fn router_picks_higher_out_amount() {
         }),
         100,
     );
-    let orca = Arc::new(Orca::new_with_cache(rpc.clone(), None, Some(cache), false));
+    let orca = Arc::new(Orca::new_with_cache(rpc.clone(), None, Some(cache)));
     orca.inject_cached_orca_state(
         &pool_addr,
         &OrcaWhirlpoolState {
