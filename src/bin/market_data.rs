@@ -1611,11 +1611,25 @@ async fn handle_ensure_pump_amm_pool_accounts(
     };
 
     let pool_hint = pool_address_hint.and_then(|s| Pubkey::from_str(s).ok());
+    info!(
+        request_id = %request_id,
+        base_mint = %base_mint_str,
+        pool_address_hint = ?pool_address_hint,
+        has_pool_hint = pool_hint.is_some(),
+        "I-24d Discovery: EnsurePumpAmmPoolAccounts start (Geyser cache check then RPC fast path if hint)"
+    );
     match dex
         .pool_accounts_v1_for_base_mint_with_hint(base_mint, pool_hint)
         .await
     {
         Ok(Some(accounts)) if accounts.len() >= 14 => {
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                outcome = "ok",
+                rpc_global_scan = "no",
+                "I-24d Discovery: pump_amm pool_accounts resolved (terminal)"
+            );
             let pool_address = accounts[0];
             let pool_address_str = pool_address.to_string();
             let base_mint_str = base_mint.to_string();
@@ -1706,6 +1720,8 @@ async fn handle_ensure_pump_amm_pool_accounts(
                         request_id = %request_id,
                         base_mint = %base_mint_str,
                         pool_address = %pool_address_str,
+                        rpc_global_scan = "no",
+                        control_response = "pending_publish",
                         "I-24d Discovery: terminal outcome ok"
                     );
                     (ControlResponseStatus::Ok, None)
@@ -1735,6 +1751,8 @@ async fn handle_ensure_pump_amm_pool_accounts(
             warn!(
                 request_id = %request_id,
                 base_mint = %base_mint_str,
+                outcome = "error",
+                reason = "pool_accounts_incomplete",
                 "I-24d Discovery: terminal outcome error (pool_accounts incomplete <14)"
             );
             if let Some(ref nats) = ctx.nats {
@@ -1753,6 +1771,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
             info!(
                 request_id = %request_id,
                 base_mint = %base_mint_str,
+                outcome = "not_found",
                 "I-24d Discovery: terminal outcome not_found"
             );
             if let Some(ref nats) = ctx.nats {
@@ -1771,6 +1790,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
             warn!(
                 request_id = %request_id,
                 base_mint = %base_mint_str,
+                outcome = "error",
                 error = %e,
                 "I-24d Discovery: terminal outcome error (discovery failed)"
             );
