@@ -2392,25 +2392,33 @@ impl ExecutionContext {
                                                     )
                                                     .await
                                                     {
-                                                        if let Some(accounts) = cache
-                                                            .get_pump_amm_pool_accounts_by_base_mint(&mint)
-                                                        {
-                                                            let acct_strings: Vec<String> = accounts
-                                                                .into_iter()
-                                                                .map(|p| p.to_string())
-                                                                .collect();
-                                                            quote_attempts.push(format!(
-                                                                "pump_amm=ok amount_out={} pool={} accounts_len={} (after discovery)",
-                                                                q.amount_out,
-                                                                pool_id,
-                                                                acct_strings.len()
-                                                            ));
-                                                            record_candidate(
-                                                                "pump_amm",
-                                                                q.amount_out,
-                                                                pool_id,
-                                                                acct_strings,
-                                                            );
+                                                        let accounts = cache
+                                                            .get_pump_amm_pool_accounts_by_base_mint(&mint);
+                                                        if let Some(accounts) = accounts {
+                                                            if accounts.len() >= 14 {
+                                                                let acct_strings: Vec<String> =
+                                                                    accounts
+                                                                        .into_iter()
+                                                                        .map(|p| p.to_string())
+                                                                        .collect();
+                                                                quote_attempts.push(format!(
+                                                                    "pump_amm=ok amount_out={} pool={} accounts_len={} (after discovery)",
+                                                                    q.amount_out,
+                                                                    pool_id,
+                                                                    acct_strings.len()
+                                                                ));
+                                                                record_candidate(
+                                                                    "pump_amm",
+                                                                    q.amount_out,
+                                                                    pool_id,
+                                                                    acct_strings,
+                                                                );
+                                                            } else {
+                                                                quote_attempts.push(format!(
+                                                                    "pump_amm=skip no_pool_accounts amount_out={} pool={}",
+                                                                    q.amount_out, pool_id
+                                                                ));
+                                                            }
                                                         } else {
                                                             warn!(mint = %mint, "pump_amm pool_accounts still missing after discovery");
                                                             quote_attempts.push(format!(
