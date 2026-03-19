@@ -188,9 +188,12 @@ impl PumpFunAmmDex {
     /// [7] protocol_fee_recipient_ta, [8] event_authority, [9] coin_creator_vault_ata,
     /// [10] coin_creator_vault_authority, [11] global_volume_accumulator,
     /// [12] fee_config, [13] fee_program
-    pub async fn pool_accounts_v1_for_base_mint(
+    /// Optional pool_address hint for fast-path discovery (single getAccount vs slow getProgramAccounts).
+    /// Used by I-24d EnsurePumpAmmPoolAccounts when execution-engine knows pool from cache/position.
+    pub async fn pool_accounts_v1_for_base_mint_with_hint(
         &self,
         base_mint: Pubkey,
+        pool_address_hint: Option<Pubkey>,
     ) -> Result<Option<Vec<Pubkey>>> {
         // GEYSER-FIRST: Check LivePoolCache for pre-cached pool_accounts before RPC discovery.
         // These come from DexPoolAccounts events (parsed from verified on-chain swap txs)
@@ -210,6 +213,61 @@ impl PumpFunAmmDex {
             if !self.allow_rpc_on_miss {
                 debug!(base_mint = %base_mint, "pump_amm: pool_accounts cache miss, returning None (no RPC)");
                 return Ok(None);
+            }
+        }
+
+        // I-24d FAST PATH: When pool_address_hint provided, try single getAccount first.
+        // Avoids slow getProgramAccounts scan that routinely exceeds 15s discovery timeout.
+        if let Some(pool_market) = pool_address_hint {
+            info!(
+                base_mint = %base_mint,
+                pool = %pool_market,
+                "pump_amm: pool_address hint provided, trying direct getAccount (fast path)"
+            );
+            match self
+                .try_parse_pool_static_from_market_account(pool_market, base_mint)
+                .await
+            {
+                Ok(Some(pool)) => {
+                    self.pools_by_base.insert(base_mint, pool.clone());
+                    self.pools_by_market.insert(pool.pool_market, base_mint);
+                    info!(
+                        base_mint = %base_mint,
+                        pool_market = %pool.pool_market,
+                        "pump_amm: PumpAmmPoolStatic from pool_address hint (fast path)"
+                    );
+                    return Ok(Some(vec![
+                        pool.pool_market,
+                        pool.global_config,
+                        pool.base_mint,
+                        pool.quote_mint,
+                        pool.pool_base_vault,
+                        pool.pool_quote_vault,
+                        pool.protocol_fee_recipient,
+                        pool.protocol_fee_recipient_ta,
+                        pool.event_authority,
+                        pool.coin_creator_vault_ata,
+                        pool.coin_creator_vault_authority,
+                        pool.global_volume_accumulator,
+                        pool.fee_config,
+                        pool.fee_program,
+                    ]));
+                }
+                Ok(None) => {
+                    warn!(
+                        base_mint = %base_mint,
+                        pool = %pool_market,
+                        "pump_amm: pool_address hint parse returned None, falling through to discover_pool_static"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        base_mint = %base_mint,
+                        pool = %pool_market,
+                        error = %e,
+                        "pump_amm: pool_address hint parse failed, falling through to discover_pool_static"
+                    );
+                }
             }
         }
 
@@ -238,6 +296,15 @@ impl PumpFunAmmDex {
             pool.fee_config,                   // [12]
             pool.fee_program,                  // [13]
         ]))
+    }
+
+    /// Convenience wrapper: pool_accounts_v1_for_base_mint without hint.
+    pub async fn pool_accounts_v1_for_base_mint(
+        &self,
+        base_mint: Pubkey,
+    ) -> Result<Option<Vec<Pubkey>>> {
+        self.pool_accounts_v1_for_base_mint_with_hint(base_mint, None)
+            .await
     }
 
     fn derive_user_volume_accumulator(

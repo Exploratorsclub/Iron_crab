@@ -1582,12 +1582,14 @@ async fn main() -> Result<()> {
 /// Performs RPC-based discovery (Cold Path), updates MASTER cache, publishes
 /// JetStream PoolCacheUpdate (SSOT), and ControlResponse (correlation only).
 /// Uses shared PumpFunAmmDex for dedupe/storm protection.
+/// When pool_address_hint is provided, uses fast getAccount path (<1s) instead of slow getProgramAccounts.
 async fn handle_ensure_pump_amm_pool_accounts(
     ctx: &MarketDataContext,
     dex: &ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex,
     run_id: &str,
     request_id: &str,
     base_mint_str: &str,
+    pool_address_hint: Option<&str>,
 ) {
     let base_mint = match Pubkey::from_str(base_mint_str) {
         Ok(p) => p,
@@ -1608,7 +1610,11 @@ async fn handle_ensure_pump_amm_pool_accounts(
         }
     };
 
-    match dex.pool_accounts_v1_for_base_mint(base_mint).await {
+    let pool_hint = pool_address_hint.and_then(|s| Pubkey::from_str(s).ok());
+    match dex
+        .pool_accounts_v1_for_base_mint_with_hint(base_mint, pool_hint)
+        .await
+    {
         Ok(Some(accounts)) if accounts.len() >= 14 => {
             let pool_address = accounts[0];
             let pool_address_str = pool_address.to_string();
@@ -1696,8 +1702,19 @@ async fn handle_ensure_pump_amm_pool_accounts(
 
             if let Some(ref nats) = ctx.nats {
                 let (status, message) = if jetstream_ok {
+                    info!(
+                        request_id = %request_id,
+                        base_mint = %base_mint_str,
+                        pool_address = %pool_address_str,
+                        "I-24d Discovery: terminal outcome ok"
+                    );
                     (ControlResponseStatus::Ok, None)
                 } else {
+                    warn!(
+                        request_id = %request_id,
+                        base_mint = %base_mint_str,
+                        "I-24d Discovery: terminal outcome error (JetStream publish failed)"
+                    );
                     (
                         ControlResponseStatus::Error,
                         Some("JetStream publish failed".to_string()),
@@ -1715,7 +1732,11 @@ async fn handle_ensure_pump_amm_pool_accounts(
             }
         }
         Ok(Some(_)) => {
-            warn!(base_mint = %base_mint_str, "EnsurePumpAmmPoolAccounts: pool_accounts incomplete (<14)");
+            warn!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                "I-24d Discovery: terminal outcome error (pool_accounts incomplete <14)"
+            );
             if let Some(ref nats) = ctx.nats {
                 publish_control_response(
                     nats,
@@ -1729,7 +1750,11 @@ async fn handle_ensure_pump_amm_pool_accounts(
             }
         }
         Ok(None) => {
-            info!(base_mint = %base_mint_str, "EnsurePumpAmmPoolAccounts: pool not found");
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                "I-24d Discovery: terminal outcome not_found"
+            );
             if let Some(ref nats) = ctx.nats {
                 publish_control_response(
                     nats,
@@ -1743,7 +1768,12 @@ async fn handle_ensure_pump_amm_pool_accounts(
             }
         }
         Err(e) => {
-            warn!(base_mint = %base_mint_str, error = %e, "EnsurePumpAmmPoolAccounts: discovery failed");
+            warn!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                error = %e,
+                "I-24d Discovery: terminal outcome error (discovery failed)"
+            );
             if let Some(ref nats) = ctx.nats {
                 publish_control_response(
                     nats,
@@ -1775,14 +1805,29 @@ async fn publish_control_response(
         "market-data",
         status,
     );
+    let pool_for_log = pool_address.clone();
     if let Some(pa) = pool_address {
         resp = resp.with_pool_address(pa);
     }
     if let Some(m) = message {
         resp = resp.with_message(m);
     }
+    let status_str = format!("{:?}", status);
     if let Err(e) = nats.publish(TOPIC_CONTROL_RESPONSES, &resp).await {
-        warn!(error = %e, "Failed to publish ControlResponse");
+        warn!(
+            request_id = %request_id,
+            status = %status_str,
+            pool_address = ?pool_for_log,
+            error = %e,
+            "I-24d Discovery: Failed to publish ControlResponse"
+        );
+    } else {
+        info!(
+            request_id = %request_id,
+            status = %status_str,
+            pool_address = ?pool_for_log,
+            "I-24d Discovery: ControlResponse published"
+        );
     }
 }
 
@@ -2001,9 +2046,19 @@ async fn run_geyser_loop(
                         Ok(req) => {
                             if req.target != "market-data" {
                                 debug!(target = %req.target, "Ignoring ControlRequest for other target");
-                            } else if let ControlRequestKind::EnsurePumpAmmPoolAccounts { base_mint } = req.kind {
+                            } else if let ControlRequestKind::EnsurePumpAmmPoolAccounts {
+                                base_mint,
+                            } = req.kind
+                            {
                                 let run_id = ctx.run_id.clone();
                                 let request_id = req.request_id.clone();
+                                let pool_hint = req.pool_address_hint.clone();
+                                info!(
+                                    request_id = %request_id,
+                                    base_mint = %base_mint,
+                                    pool_address_hint = ?pool_hint,
+                                    "I-24d Discovery: EnsurePumpAmmPoolAccounts received"
+                                );
                                 let ctx_clone = ctx.clone();
                                 let dex_clone = Arc::clone(&pump_amm_dex);
                                 tokio::spawn(async move {
@@ -2013,6 +2068,7 @@ async fn run_geyser_loop(
                                         run_id.as_str(),
                                         &request_id,
                                         &base_mint,
+                                        pool_hint.as_deref(),
                                     )
                                     .await;
                                 });
@@ -4410,9 +4466,19 @@ async fn run_simulation_loop(
                         Ok(req) => {
                             if req.target != "market-data" {
                                 debug!(target = %req.target, "Ignoring ControlRequest for other target");
-                            } else if let ControlRequestKind::EnsurePumpAmmPoolAccounts { base_mint } = req.kind {
+                            } else if let ControlRequestKind::EnsurePumpAmmPoolAccounts {
+                                base_mint,
+                            } = req.kind
+                            {
                                 let run_id = ctx.run_id.clone();
                                 let request_id = req.request_id.clone();
+                                let pool_hint = req.pool_address_hint.clone();
+                                info!(
+                                    request_id = %request_id,
+                                    base_mint = %base_mint,
+                                    pool_address_hint = ?pool_hint,
+                                    "I-24d Discovery: EnsurePumpAmmPoolAccounts received (simulation)"
+                                );
                                 let ctx_clone = ctx.clone();
                                 let dex_clone = Arc::clone(&pump_amm_dex);
                                 tokio::spawn(async move {
@@ -4422,6 +4488,7 @@ async fn run_simulation_loop(
                                         run_id.as_str(),
                                         &request_id,
                                         &base_mint,
+                                        pool_hint.as_deref(),
                                     )
                                     .await;
                                 });

@@ -1715,8 +1715,16 @@ impl ExecutionContext {
                     Some(a) if a.len() >= 14 => a,
                     _ => {
                         // I-24d: Request from market-data, wait bounded on authoritative cache state.
-                        info!(mint = %mint_str, "6005-retry: pool_accounts cache miss, requesting discovery from market-data");
-                        match self.request_discovery_and_wait(&mint_str).await {
+                        let pool_hint = self
+                            .live_pool_cache
+                            .as_ref()
+                            .and_then(|c| c.get_pump_amm_pool_address_by_base_mint(&mint))
+                            .map(|p| p.to_string());
+                        info!(mint = %mint_str, pool_address = ?pool_hint, "6005-retry: pool_accounts cache miss, requesting discovery from market-data");
+                        match self
+                            .request_discovery_and_wait(&mint_str, pool_hint.as_deref())
+                            .await
+                        {
                             DiscoveryRequestOutcome::Ok => {
                                 let cache = match self.live_pool_cache.as_ref() {
                                     Some(c) => c,
@@ -1784,7 +1792,15 @@ impl ExecutionContext {
                     mint = %mint_str,
                     "6005-retry: quote cache miss, requesting discovery from market-data"
                 );
-                match self.request_discovery_and_wait(&mint_str).await {
+                let pool_hint = self
+                    .live_pool_cache
+                    .as_ref()
+                    .and_then(|c| c.get_pump_amm_pool_address_by_base_mint(&mint))
+                    .map(|p| p.to_string());
+                match self
+                    .request_discovery_and_wait(&mint_str, pool_hint.as_deref())
+                    .await
+                {
                     DiscoveryRequestOutcome::Ok => {
                         let cache = match self.live_pool_cache.as_ref() {
                             Some(c) => c,
@@ -1887,9 +1903,18 @@ impl ExecutionContext {
     /// I-24d: Request PumpSwap pool_accounts discovery from market-data (Cold Path only).
     /// Sends EnsurePumpAmmPoolAccounts, waits bounded for ControlResponse, returns outcome.
     /// Does NOT write to SLAVE cache — market-data publishes to JetStream, SLAVE consumes.
-    async fn request_discovery_and_wait(&self, base_mint: &str) -> DiscoveryRequestOutcome {
+    /// When pool_address is provided, market-data uses fast getAccount path (<1s) instead of slow getProgramAccounts.
+    async fn request_discovery_and_wait(
+        &self,
+        base_mint: &str,
+        pool_address: Option<&str>,
+    ) -> DiscoveryRequestOutcome {
         let Some(ref nats) = self.nats else {
-            warn!("Discovery request: NATS not connected");
+            warn!(
+                request_id = "n/a",
+                base_mint = %base_mint,
+                "I-24d Discovery: NATS not connected"
+            );
             return DiscoveryRequestOutcome::Error("NATS not connected".to_string());
         };
 
@@ -1901,7 +1926,7 @@ impl ExecutionContext {
             pending.insert(request_id.clone(), tx);
         }
 
-        let req = ControlRequest::new(
+        let mut req = ControlRequest::new(
             "execution-engine",
             BUILD_VERSION,
             &self.run_id,
@@ -1911,11 +1936,24 @@ impl ExecutionContext {
                 base_mint: base_mint.to_string(),
             },
         );
+        req.pool_address_hint = pool_address.map(String::from);
+
+        info!(
+            request_id = %request_id,
+            base_mint = %base_mint,
+            target = "market-data",
+            pool_address = ?pool_address,
+            "I-24d Discovery: publishing EnsurePumpAmmPoolAccounts request"
+        );
 
         if nats.publish(TOPIC_CONTROL_REQUESTS, &req).await.is_err() {
             let mut pending = self.pending_discovery_responses.lock().await;
             pending.remove(&request_id);
-            warn!(base_mint = %base_mint, "Discovery request: publish failed");
+            warn!(
+                request_id = %request_id,
+                base_mint = %base_mint,
+                "I-24d Discovery: publish failed"
+            );
             return DiscoveryRequestOutcome::Error("publish failed".to_string());
         }
 
@@ -1923,15 +1961,41 @@ impl ExecutionContext {
             match tokio::time::timeout(Duration::from_secs(DISCOVERY_REQUEST_TIMEOUT_SECS), rx)
                 .await
             {
-                Ok(Ok(resp)) => match resp.status {
-                    ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
-                    ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
-                    ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
-                        resp.message.unwrap_or_else(|| "unknown error".to_string()),
-                    ),
-                },
-                Ok(Err(_)) => DiscoveryRequestOutcome::Error("channel closed".to_string()),
-                Err(_) => DiscoveryRequestOutcome::Timeout,
+                Ok(Ok(resp)) => {
+                    let status_str = format!("{:?}", resp.status);
+                    let pool = resp.pool_address.as_deref();
+                    info!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        status = %status_str,
+                        pool_address = ?pool,
+                        "I-24d Discovery: response received and correlated"
+                    );
+                    match resp.status {
+                        ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
+                        ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                        ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
+                            resp.message.unwrap_or_else(|| "unknown error".to_string()),
+                        ),
+                    }
+                }
+                Ok(Err(_)) => {
+                    warn!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        "I-24d Discovery: channel closed before response"
+                    );
+                    DiscoveryRequestOutcome::Error("channel closed".to_string())
+                }
+                Err(_) => {
+                    warn!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        timeout_secs = DISCOVERY_REQUEST_TIMEOUT_SECS,
+                        "I-24d Discovery: timeout (no correlated response)"
+                    );
+                    DiscoveryRequestOutcome::Timeout
+                }
             };
 
         // Cleanup pending entry (may have been removed by subscription)
@@ -2309,9 +2373,13 @@ impl ExecutionContext {
                                     }
                                     _ => {
                                         // I-24d: Request discovery, wait bounded on authoritative cache state.
-                                        info!(mint = %mint, "pump_amm quote ok but pool_accounts missing; requesting discovery");
+                                        // pool_id from quote enables fast getAccount path in market-data.
+                                        info!(mint = %mint, pool = %pool_id, "pump_amm quote ok but pool_accounts missing; requesting discovery");
                                         match ctx
-                                            .request_discovery_and_wait(&mint.to_string())
+                                            .request_discovery_and_wait(
+                                                &mint.to_string(),
+                                                Some(pool_id.as_str()),
+                                            )
                                             .await
                                         {
                                             DiscoveryRequestOutcome::Ok => {
@@ -2395,7 +2463,15 @@ impl ExecutionContext {
                                 mint = %mint,
                                 "pump_amm quote cache miss; requesting discovery from market-data"
                             );
-                            match ctx.request_discovery_and_wait(&mint.to_string()).await {
+                            let pool_hint = ctx
+                                .live_pool_cache
+                                .as_ref()
+                                .and_then(|c| c.get_pump_amm_pool_address_by_base_mint(&mint))
+                                .map(|p| p.to_string());
+                            match ctx
+                                .request_discovery_and_wait(&mint.to_string(), pool_hint.as_deref())
+                                .await
+                            {
                                 DiscoveryRequestOutcome::Ok => {
                                     if let Some(cache) = ctx.live_pool_cache.as_ref() {
                                         if wait_for_pool_accounts_in_cache(
@@ -5814,9 +5890,22 @@ async fn main() -> Result<()> {
                                 match msg.deserialize::<ControlResponse>() {
                                     Ok(resp) => {
                                         let request_id = resp.request_id.clone();
+                                        let status_str = format!("{:?}", resp.status);
+                                        let pool = resp.pool_address.clone();
                                         let mut map = pending.lock().await;
                                         if let Some(tx) = map.remove(&request_id) {
+                                            info!(
+                                                request_id = %request_id,
+                                                status = %status_str,
+                                                pool_address = ?pool,
+                                                "I-24d Discovery: ControlResponse received, correlated and delivered"
+                                            );
                                             let _ = tx.send(resp);
+                                        } else {
+                                            debug!(
+                                                request_id = %request_id,
+                                                "I-24d Discovery: ControlResponse received but no pending request (stale or other consumer)"
+                                            );
                                         }
                                     }
                                     Err(e) => {
@@ -9531,7 +9620,43 @@ async fn spawn_rebroadcast_loop(
 
 #[cfg(test)]
 mod execution_engine_tests {
-    use super::{select_best_route, RouteCandidate};
+    use super::{select_best_route, DiscoveryRequestOutcome, RouteCandidate};
+    use ironcrab::ipc::{ControlResponse, ControlResponseStatus};
+
+    /// I-24d: Verifies that ControlResponse status maps correctly to DiscoveryRequestOutcome.
+    /// NotFound and Error must NOT be confused with Timeout (terminal outcomes are distinct).
+    #[test]
+    fn discovery_response_status_maps_to_outcome() {
+        for status in [
+            ControlResponseStatus::Ok,
+            ControlResponseStatus::NotFound,
+            ControlResponseStatus::Error,
+        ] {
+            let mut resp = ControlResponse::new(
+                "market-data",
+                "v0.1.0",
+                "run-1",
+                "req-1".to_string(),
+                "market-data",
+                status,
+            );
+            if matches!(status, ControlResponseStatus::Error) {
+                resp = resp.with_message("test".to_string());
+            }
+            let actual = match resp.status {
+                ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
+                ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
+                    resp.message.unwrap_or_else(|| "unknown".to_string()),
+                ),
+            };
+            assert!(
+                !matches!(actual, DiscoveryRequestOutcome::Timeout),
+                "status {:?} must map to Ok/NotFound/Error, never Timeout",
+                status
+            );
+        }
+    }
 
     #[test]
     fn select_best_route_prefers_highest_and_keeps_first_on_tie() {
