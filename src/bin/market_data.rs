@@ -2048,15 +2048,15 @@ async fn run_geyser_loop(
                                 debug!(target = %req.target, "Ignoring ControlRequest for other target");
                             } else if let ControlRequestKind::EnsurePumpAmmPoolAccounts {
                                 base_mint,
-                                pool_address,
                             } = req.kind
                             {
                                 let run_id = ctx.run_id.clone();
                                 let request_id = req.request_id.clone();
+                                let pool_hint = req.pool_address_hint.clone();
                                 info!(
                                     request_id = %request_id,
                                     base_mint = %base_mint,
-                                    pool_address = ?pool_address,
+                                    pool_address_hint = ?pool_hint,
                                     "I-24d Discovery: EnsurePumpAmmPoolAccounts received"
                                 );
                                 let ctx_clone = ctx.clone();
@@ -2068,7 +2068,7 @@ async fn run_geyser_loop(
                                         run_id.as_str(),
                                         &request_id,
                                         &base_mint,
-                                        pool_address.as_deref(),
+                                        pool_hint.as_deref(),
                                     )
                                     .await;
                                 });
@@ -4468,15 +4468,15 @@ async fn run_simulation_loop(
                                 debug!(target = %req.target, "Ignoring ControlRequest for other target");
                             } else if let ControlRequestKind::EnsurePumpAmmPoolAccounts {
                                 base_mint,
-                                pool_address,
                             } = req.kind
                             {
                                 let run_id = ctx.run_id.clone();
                                 let request_id = req.request_id.clone();
+                                let pool_hint = req.pool_address_hint.clone();
                                 info!(
                                     request_id = %request_id,
                                     base_mint = %base_mint,
-                                    pool_address = ?pool_address,
+                                    pool_address_hint = ?pool_hint,
                                     "I-24d Discovery: EnsurePumpAmmPoolAccounts received (simulation)"
                                 );
                                 let ctx_clone = ctx.clone();
@@ -4488,7 +4488,7 @@ async fn run_simulation_loop(
                                         run_id.as_str(),
                                         &request_id,
                                         &base_mint,
-                                        pool_address.as_deref(),
+                                        pool_hint.as_deref(),
                                     )
                                     .await;
                                 });

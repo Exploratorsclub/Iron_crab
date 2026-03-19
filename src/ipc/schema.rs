@@ -1101,12 +1101,12 @@ pub enum ControlRequestKind {
     /// Sent by execution-engine (Cold Path) when pool_accounts are needed but missing in SLAVE cache.
     /// market-data performs discovery, updates MASTER cache, publishes JetStream PoolCacheUpdate,
     /// and replies with ControlResponse. Truth Source = JetStream, not the reply.
+    ///
+    /// Optional pool address hint: use top-level `pool_address_hint` on ControlRequest for
+    /// backward-compatible fast-path (avoids breaking enum variant shape for external callers).
     EnsurePumpAmmPoolAccounts {
         /// Base mint address (base58) of the PumpSwap pool to discover.
         base_mint: String,
-        /// Optional pool address (base58) when known. Enables fast getAccount path instead of slow getProgramAccounts.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pool_address: Option<String>,
     },
 }
 
@@ -1126,6 +1126,11 @@ pub struct ControlRequest {
     /// Target component (e.g., "execution-engine").
     pub target: String,
 
+    /// Optional pool address hint for EnsurePumpAmmPoolAccounts. Enables fast getAccount path.
+    /// Kept at top-level for backward compatibility (no enum variant shape change).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pool_address_hint: Option<String>,
+
     #[serde(flatten)]
     pub kind: ControlRequestKind,
 }
@@ -1143,6 +1148,7 @@ impl ControlRequest {
             header: RecordHeader::new(component, build, run_id),
             request_id,
             target: target.to_string(),
+            pool_address_hint: None,
             kind,
         }
     }
@@ -2077,7 +2083,8 @@ mod tests {
 
     #[test]
     fn test_control_request_ensure_pump_amm_pool_accounts_serde() {
-        let req = ControlRequest::new(
+        // Source-compatible: old callers use only base_mint (no pool_address in enum).
+        let mut req = ControlRequest::new(
             "execution-engine",
             "v0.1.0",
             "run-123",
@@ -2085,13 +2092,14 @@ mod tests {
             "market-data",
             ControlRequestKind::EnsurePumpAmmPoolAccounts {
                 base_mint: "TokenMint11111111111111111111111111111111".to_string(),
-                pool_address: Some("PoolAddr11111111111111111111111111111111".to_string()),
             },
         );
+        req.pool_address_hint = Some("PoolAddr11111111111111111111111111111111".to_string());
 
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("ensure_pump_amm_pool_accounts"));
         assert!(json.contains("TokenMint11111111111111111111111111111111"));
+        assert!(json.contains("pool_address_hint"));
         assert!(json.contains("PoolAddr11111111111111111111111111111111"));
         assert!(json.contains("market-data"));
         assert!(json.contains("req-ensure-001"));
@@ -2099,21 +2107,18 @@ mod tests {
         let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.request_id, "req-ensure-001");
         assert_eq!(parsed.target, "market-data");
+        assert_eq!(
+            parsed.pool_address_hint.as_deref(),
+            Some("PoolAddr11111111111111111111111111111111")
+        );
         match &parsed.kind {
-            ControlRequestKind::EnsurePumpAmmPoolAccounts {
-                base_mint,
-                pool_address,
-            } => {
+            ControlRequestKind::EnsurePumpAmmPoolAccounts { base_mint } => {
                 assert_eq!(base_mint, "TokenMint11111111111111111111111111111111");
-                assert_eq!(
-                    pool_address.as_deref(),
-                    Some("PoolAddr11111111111111111111111111111111")
-                );
             }
             _ => panic!("expected EnsurePumpAmmPoolAccounts"),
         }
 
-        // Backward compatibility: request without pool_address (base_mint only)
+        // Backward compatibility: request without pool_address_hint (old wire format).
         let req_no_pool = ControlRequest::new(
             "execution-engine",
             "v0.1.0",
@@ -2122,19 +2127,15 @@ mod tests {
             "market-data",
             ControlRequestKind::EnsurePumpAmmPoolAccounts {
                 base_mint: "Mint22222222222222222222222222222222".to_string(),
-                pool_address: None,
             },
         );
         let json_no_pool = serde_json::to_string(&req_no_pool).unwrap();
-        assert!(!json_no_pool.contains("pool_address"));
+        assert!(!json_no_pool.contains("pool_address_hint"));
         let parsed_no_pool: ControlRequest = serde_json::from_str(&json_no_pool).unwrap();
+        assert!(parsed_no_pool.pool_address_hint.is_none());
         match &parsed_no_pool.kind {
-            ControlRequestKind::EnsurePumpAmmPoolAccounts {
-                base_mint,
-                pool_address,
-            } => {
+            ControlRequestKind::EnsurePumpAmmPoolAccounts { base_mint } => {
                 assert_eq!(base_mint, "Mint22222222222222222222222222222222");
-                assert!(pool_address.is_none());
             }
             _ => panic!("expected EnsurePumpAmmPoolAccounts"),
         }

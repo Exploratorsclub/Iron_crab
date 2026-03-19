@@ -1926,8 +1926,7 @@ impl ExecutionContext {
             pending.insert(request_id.clone(), tx);
         }
 
-        let pool_address_owned = pool_address.map(String::from);
-        let req = ControlRequest::new(
+        let mut req = ControlRequest::new(
             "execution-engine",
             BUILD_VERSION,
             &self.run_id,
@@ -1935,9 +1934,9 @@ impl ExecutionContext {
             "market-data",
             ControlRequestKind::EnsurePumpAmmPoolAccounts {
                 base_mint: base_mint.to_string(),
-                pool_address: pool_address_owned.clone(),
             },
         );
+        req.pool_address_hint = pool_address.map(String::from);
 
         info!(
             request_id = %request_id,
