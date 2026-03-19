@@ -49,6 +49,10 @@ const PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET: u64 = 75;
 // global_config appears to be a Pubkey at offset 11, followed by base/quote mints.
 const PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET: usize = 11;
 
+// PumpSwap AMM market account (301 bytes on mainnet): seed pubkey for `creator_vault` PDA lives here.
+// Distinct from bonding-curve `creator-vault` (hyphen) — AMM uses underscore `creator_vault` + this seed.
+const PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET: usize = 211;
+
 // Observed on-chain: buy_exact_quote_in fee fields sum to 125 bps (lp 2 + protocol 93 + creator 30).
 // We use that as a conservative default for quoting.
 const DEFAULT_TOTAL_FEE_BPS: u32 = 125;
@@ -829,20 +833,98 @@ impl PumpFunAmmDex {
             }
         };
 
-        // Creator vault ATA: prefer an embedded base token account; otherwise derive ATA.
+        // Creator vault: prefer an embedded second base token account; else canonical layout at
+        // offset 211 (`creator_vault` PDA + WSOL ATA); else authority heuristics / legacy PDAs.
         let (coin_creator_vault_authority, coin_creator_vault_ata) = if let Some(t) =
             base_token_accounts
                 .iter()
                 .find(|t| t.address != pool_base_vault)
         {
             (t.token_owner, t.address)
+        } else if data.len() >= PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET + 32 {
+            let creator_seed = Pubkey::new_from_array(
+                data[PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET
+                    ..PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET + 32]
+                    .try_into()
+                    .map_err(|_| anyhow!("market creator_seed slice"))?,
+            );
+            if creator_seed != Pubkey::default() {
+                let (auth, _) = Pubkey::find_program_address(
+                    &[b"creator_vault", creator_seed.as_ref()],
+                    &pump_amm_program,
+                );
+                // On-chain swaps use the creator fee vault as a WSOL (quote) token account for this authority.
+                let ata = Self::derive_ata_with_program(auth, quote_mint, token_program);
+                info!(
+                    pool = %pool_market,
+                    creator_seed = %creator_seed,
+                    coin_creator_vault_authority = %auth,
+                    coin_creator_vault_ata = %ata,
+                    "pump_amm: creator vault from market offset 211 + creator_vault PDA (quote-mint ATA)"
+                );
+                (auth, ata)
+            } else if let Some((auth, ta)) =
+                find_authority_with_existing_token_account(authority_candidates.clone(), base_mint)
+                    .await?
+            {
+                (auth, ta)
+            } else if let Some((auth, ta)) =
+                find_authority_with_existing_token_account(authority_candidates.clone(), quote_mint)
+                    .await?
+            {
+                (auth, ta)
+            } else {
+                match self
+                    .derive_existing_pda(
+                        pump_amm_program,
+                        &[
+                            vec![
+                                b"creator_vault_authority".to_vec(),
+                                pool_market.to_bytes().to_vec(),
+                            ],
+                            vec![b"creator_vault".to_vec(), pool_market.to_bytes().to_vec()],
+                            vec![b"creator".to_vec(), pool_market.to_bytes().to_vec()],
+                            vec![b"vault_authority".to_vec(), pool_market.to_bytes().to_vec()],
+                            vec![b"token_creator".to_vec(), pool_market.to_bytes().to_vec()],
+                        ],
+                    )
+                    .await?
+                {
+                    Some(derived_authority) => {
+                        let derived_ata = Self::derive_ata(derived_authority, base_mint);
+                        warn!(
+                            pool = %pool_market,
+                            base_mint = %base_mint,
+                            derived_ata = %derived_ata,
+                            authority_candidates_count = authority_candidates.len(),
+                            "pump_amm: creator vault ATA not on-chain; using derived address (FIX-32 parity)"
+                        );
+                        (derived_authority, derived_ata)
+                    }
+                    None => {
+                        warn!(
+                            pool = %pool_market,
+                            base_mint = %base_mint,
+                            "pump_amm market parse FAIL: no creator vault token account \
+                             (no embedded ATA; offset 211 path unavailable; no ATA found; no valid PDA; \
+                             authority_candidates_count={})",
+                            authority_candidates.len()
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
         } else if let Some((auth, ta)) =
             find_authority_with_existing_token_account(authority_candidates.clone(), base_mint)
                 .await?
         {
             (auth, ta)
+        } else if let Some((auth, ta)) =
+            find_authority_with_existing_token_account(authority_candidates.clone(), quote_mint)
+                .await?
+        {
+            (auth, ta)
         } else {
-            // Try deriving creator vault authority as PDA from AMM program with common seed patterns
             match self
                 .derive_existing_pda(
                     pump_amm_program,
@@ -860,9 +942,6 @@ impl PumpFunAmmDex {
                 .await?
             {
                 Some(derived_authority) => {
-                    // Derive ATA for creator vault. FIX-32 parity: do not require the ATA to exist
-                    // yet — PumpSwap may create it via CreateIdempotent on swap (same rationale as
-                    // protocol_fee_recipient_ta for quote mint).
                     let derived_ata = Self::derive_ata(derived_authority, base_mint);
                     warn!(
                         pool = %pool_market,
@@ -932,10 +1011,11 @@ impl PumpFunAmmDex {
             sorted.sort_by_key(|m| m.data_len);
             sorted.last().map(|m| m.address).unwrap_or_default()
         } else {
-            // Fallback: try deriving from AMM program
+            // Fallback: try deriving from AMM program (singleton first — matches on-chain PumpSwap).
             self.derive_existing_pda(
                 pump_amm_program,
                 &[
+                    vec![b"global_volume_accumulator".to_vec()],
                     vec![
                         b"global_volume_accumulator".to_vec(),
                         global_config.to_bytes().to_vec(),
@@ -956,6 +1036,13 @@ impl PumpFunAmmDex {
             )
             .await?
             .unwrap_or_default()
+        };
+
+        // Same global fee_config pubkey for all PumpSwap pools (see build_swap_ix_from_pool_accounts).
+        let fee_config = if fee_config == Pubkey::default() {
+            Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG)?
+        } else {
+            fee_config
         };
 
         if fee_config == Pubkey::default() || global_volume_accumulator == Pubkey::default() {
