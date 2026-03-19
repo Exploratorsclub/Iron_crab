@@ -257,16 +257,25 @@ impl PumpFunAmmDex {
                     warn!(
                         base_mint = %base_mint,
                         pool = %pool_market,
-                        "pump_amm: pool_address hint parse returned None, falling through to discover_pool_static"
+                        "pump_amm: pool_address hint parse returned None; refusing discover_pool_static (no unbounded getProgramAccounts)"
                     );
+                    return Err(anyhow!(
+                        "pump_amm: pool_address hint parse returned no usable pool (base_mint={}, pool={}); refusing unbounded RPC discovery (I-24d)",
+                        base_mint,
+                        pool_market
+                    ));
                 }
                 Err(e) => {
                     warn!(
                         base_mint = %base_mint,
                         pool = %pool_market,
                         error = %e,
-                        "pump_amm: pool_address hint parse failed, falling through to discover_pool_static"
+                        "pump_amm: pool_address hint parse failed; refusing discover_pool_static (no unbounded getProgramAccounts)"
                     );
+                    return Err(e.context(format!(
+                        "pump_amm: pool_address hint parse error (base_mint={}, pool={}); refusing unbounded RPC discovery (I-24d)",
+                        base_mint, pool_market
+                    )));
                 }
             }
         }
@@ -851,27 +860,18 @@ impl PumpFunAmmDex {
                 .await?
             {
                 Some(derived_authority) => {
-                    // Derive ATA for creator vault
+                    // Derive ATA for creator vault. FIX-32 parity: do not require the ATA to exist
+                    // yet — PumpSwap may create it via CreateIdempotent on swap (same rationale as
+                    // protocol_fee_recipient_ta for quote mint).
                     let derived_ata = Self::derive_ata(derived_authority, base_mint);
-
-                    // Verify ATA exists
-                    match self
-                        .rpc_get_account_owner_and_executable(derived_ata)
-                        .await?
-                    {
-                        Some(_) => (derived_authority, derived_ata),
-                        None => {
-                            warn!(
-                                pool = %pool_market,
-                                base_mint = %base_mint,
-                                "pump_amm market parse FAIL: no creator vault token account \
-                                 (no embedded creator ATA; PDA derivation ATA does not exist; \
-                                 authority_candidates_count={})",
-                                authority_candidates.len()
-                            );
-                            return Ok(None);
-                        }
-                    }
+                    warn!(
+                        pool = %pool_market,
+                        base_mint = %base_mint,
+                        derived_ata = %derived_ata,
+                        authority_candidates_count = authority_candidates.len(),
+                        "pump_amm: creator vault ATA not on-chain; using derived address (FIX-32 parity)"
+                    );
+                    (derived_authority, derived_ata)
                 }
                 None => {
                     warn!(
@@ -1435,16 +1435,25 @@ impl PumpFunAmmDex {
                         warn!(
                             base_mint = %base_mint,
                             pool = %pool_address,
-                            "pump_amm: direct getAccount parse returned None, falling through to getProgramAccounts"
+                            "pump_amm: cached pool address parse returned None; refusing getProgramAccounts (no unbounded scan)"
                         );
+                        return Err(anyhow!(
+                            "pump_amm: LivePoolCache pool address present but market parse returned no usable pool (base_mint={}, pool={}); refusing unbounded RPC discovery",
+                            base_mint,
+                            pool_address
+                        ));
                     }
                     Err(e) => {
                         warn!(
                             base_mint = %base_mint,
                             pool = %pool_address,
                             error = %e,
-                            "pump_amm: direct getAccount parse failed, falling through to getProgramAccounts"
+                            "pump_amm: cached pool address parse failed; refusing getProgramAccounts (no unbounded scan)"
                         );
+                        return Err(e.context(format!(
+                            "pump_amm: cached pool address parse error (base_mint={}, pool={}); refusing unbounded RPC discovery",
+                            base_mint, pool_address
+                        )));
                     }
                 }
             }
@@ -2857,6 +2866,32 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    /// I-24d: A bad `pool_address_hint` must not fall through to `getProgramAccounts` (~20s+).
+    #[tokio::test]
+    async fn test_pool_address_hint_parse_fail_errors_without_global_scan() {
+        let base_mint = Pubkey::new_unique();
+        // Missing account → try_parse returns Ok(None) after one cheap RPC attempt.
+        let bad_hint = Pubkey::new_unique();
+        let cache = make_empty_cache();
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let dex = PumpFunAmmDex::new_with_cache(rpc, cache, true);
+
+        let fut = dex.pool_accounts_v1_for_base_mint_with_hint(base_mint, Some(bad_hint));
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(3), fut)
+            .await
+            .expect("must not block on getProgramAccounts global scan");
+
+        assert!(
+            completed.is_err(),
+            "expected Err for failed hint parse; got {completed:?}"
+        );
+        let msg = format!("{:#}", completed.unwrap_err());
+        assert!(
+            msg.contains("I-24d") || msg.contains("pool_address hint"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
