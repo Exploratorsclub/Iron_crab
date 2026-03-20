@@ -223,35 +223,69 @@ impl PumpFunAmmDex {
     /// [12] fee_config, [13] fee_program
     /// Optional pool_address hint for fast-path discovery (single getAccount vs slow getProgramAccounts).
     /// Used by I-24d EnsurePumpAmmPoolAccounts when execution-engine knows pool from cache/position.
+    ///
+    /// `force_refresh`: Cold-path recovery — skip LivePoolCache `pool_accounts` and in-memory
+    /// `pools_by_base`, then re-parse the market account via RPC (fixes stale creator-vault / 14er set).
     pub async fn pool_accounts_v1_for_base_mint_with_hint(
         &self,
         base_mint: Pubkey,
         pool_address_hint: Option<Pubkey>,
+        force_refresh: bool,
     ) -> Result<Option<Vec<Pubkey>>> {
+        if force_refresh {
+            if let Some((_, pool)) = self.pools_by_base.remove(&base_mint) {
+                self.pools_by_market.remove(&pool.pool_market);
+            }
+            warn!(
+                base_mint = %base_mint,
+                "pump_amm: force_refresh — skipping LivePoolCache pool_accounts; authoritative RPC parse (Cold Path recovery)"
+            );
+        }
+
         // GEYSER-FIRST: Check LivePoolCache for pre-cached pool_accounts before RPC discovery.
         // These come from DexPoolAccounts events (parsed from verified on-chain swap txs)
         // and are more reliable than the heuristic-based RPC discovery.
-        if let Some(ref cache) = self.live_pool_cache {
-            if let Some(accounts) = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint) {
-                if accounts.len() >= 14 {
-                    debug!(
-                        base_mint = %base_mint,
-                        accounts_len = accounts.len(),
-                        "pump_amm: pool_accounts from LivePoolCache (ZERO RPC)"
-                    );
-                    return Ok(Some(accounts));
+        if !force_refresh {
+            if let Some(ref cache) = self.live_pool_cache {
+                if let Some(accounts) = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint) {
+                    if accounts.len() >= 14 {
+                        debug!(
+                            base_mint = %base_mint,
+                            accounts_len = accounts.len(),
+                            "pump_amm: pool_accounts from LivePoolCache (ZERO RPC)"
+                        );
+                        return Ok(Some(accounts));
+                    }
+                }
+                // Cache miss: Hot Path (allow_rpc_on_miss=false) → None. Cold Path (true) → RPC fallback. P3 #12.
+                if !self.allow_rpc_on_miss {
+                    debug!(base_mint = %base_mint, "pump_amm: pool_accounts cache miss, returning None (no RPC)");
+                    return Ok(None);
                 }
             }
-            // Cache miss: Hot Path (allow_rpc_on_miss=false) → None. Cold Path (true) → RPC fallback. P3 #12.
-            if !self.allow_rpc_on_miss {
-                debug!(base_mint = %base_mint, "pump_amm: pool_accounts cache miss, returning None (no RPC)");
-                return Ok(None);
-            }
+        } else if !self.allow_rpc_on_miss {
+            // force_refresh requires RPC; refuse when this dex instance is Hot-Path-only.
+            debug!(
+                base_mint = %base_mint,
+                "pump_amm: force_refresh but allow_rpc_on_miss=false — cannot RPC refresh"
+            );
+            return Ok(None);
         }
+
+        // Resolve pool market for fast path: explicit hint, else (recovery only) pool address from cache.
+        let effective_pool_hint = pool_address_hint.or_else(|| {
+            if force_refresh {
+                self.live_pool_cache
+                    .as_ref()
+                    .and_then(|c| c.get_pump_amm_pool_address_by_base_mint(&base_mint))
+            } else {
+                None
+            }
+        });
 
         // I-24d FAST PATH: When pool_address_hint provided, try single getAccount first.
         // Avoids slow getProgramAccounts scan that routinely exceeds 15s discovery timeout.
-        if let Some(pool_market) = pool_address_hint {
+        if let Some(pool_market) = effective_pool_hint {
             info!(
                 base_mint = %base_mint,
                 pool = %pool_market,
@@ -314,7 +348,7 @@ impl PumpFunAmmDex {
         }
 
         // RPC FALLBACK (Cold Path only): No LivePoolCache or allow_rpc_on_miss — discover pool via RPC heuristics.
-        let pool = match self.discover_pool_static(base_mint).await? {
+        let pool = match self.discover_pool_static(base_mint, force_refresh).await? {
             Some(p) => p,
             None => return Ok(None),
         };
@@ -345,7 +379,7 @@ impl PumpFunAmmDex {
         &self,
         base_mint: Pubkey,
     ) -> Result<Option<Vec<Pubkey>>> {
-        self.pool_accounts_v1_for_base_mint_with_hint(base_mint, None)
+        self.pool_accounts_v1_for_base_mint_with_hint(base_mint, None, false)
             .await
     }
 
@@ -1468,60 +1502,71 @@ impl PumpFunAmmDex {
     }
 
     /// COLD PATH ONLY — RPC fallback when LivePoolCache misses. Never called in Hot Path. P3 #12.
-    async fn discover_pool_static(&self, base_mint: Pubkey) -> Result<Option<PumpAmmPoolStatic>> {
-        if let Some(v) = self.pools_by_base.get(&base_mint) {
-            return Ok(Some(v.clone()));
+    ///
+    /// `force_refresh`: skip in-memory and LivePoolCache `pool_accounts` reconstruction so RPC
+    /// market parse / heuristics run (EnsurePumpAmm recovery).
+    async fn discover_pool_static(
+        &self,
+        base_mint: Pubkey,
+        force_refresh: bool,
+    ) -> Result<Option<PumpAmmPoolStatic>> {
+        if !force_refresh {
+            if let Some(v) = self.pools_by_base.get(&base_mint) {
+                return Ok(Some(v.clone()));
+            }
         }
 
         // FIX-23: GEYSER-FIRST — Construct PumpAmmPoolStatic from LivePoolCache before any RPC.
         // The cache contains all 14 pool_accounts from DexPoolAccounts events (parsed from
         // verified on-chain swap txs). This eliminates getProgramAccounts + getMultipleAccounts
         // RPC calls (~500-3000ms) in the hot path.
-        if let Some(ref cache) = self.live_pool_cache {
-            if let Some(accounts) = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint) {
-                if accounts.len() >= 14 {
-                    let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
-                    let global_config = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG)?;
-                    if accounts[1] != global_config {
-                        warn!(
-                            cached = %accounts[1],
-                            expected = %global_config,
-                            "pump_amm: cache pool_accounts[1] != canonical global_config; using canonical"
+        if !force_refresh {
+            if let Some(ref cache) = self.live_pool_cache {
+                if let Some(accounts) = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint) {
+                    if accounts.len() >= 14 {
+                        let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
+                        let global_config = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG)?;
+                        if accounts[1] != global_config {
+                            warn!(
+                                cached = %accounts[1],
+                                expected = %global_config,
+                                "pump_amm: cache pool_accounts[1] != canonical global_config; using canonical"
+                            );
+                        }
+                        let event_authority = pump_amm_canonical_event_authority(&pump_amm_program);
+                        if accounts[8] != event_authority {
+                            warn!(
+                                cached = %accounts[8],
+                                expected = %event_authority,
+                                "pump_amm: cache pool_accounts[8] != canonical event_authority; using canonical"
+                            );
+                        }
+                        let pool = PumpAmmPoolStatic {
+                            pool_market: accounts[0],
+                            global_config,
+                            base_mint: accounts[2],
+                            quote_mint: accounts[3],
+                            pool_base_vault: accounts[4],
+                            pool_quote_vault: accounts[5],
+                            protocol_fee_recipient: accounts[6],
+                            protocol_fee_recipient_ta: accounts[7],
+                            event_authority,
+                            coin_creator_vault_ata: accounts[9],
+                            coin_creator_vault_authority: accounts[10],
+                            global_volume_accumulator: accounts[11],
+                            fee_config: accounts[12],
+                            fee_program: accounts[13],
+                        };
+                        // Cache internally for build_swap_ix() (sync path)
+                        self.pools_by_base.insert(base_mint, pool.clone());
+                        self.pools_by_market.insert(pool.pool_market, base_mint);
+                        info!(
+                            base_mint = %base_mint,
+                            pool_market = %pool.pool_market,
+                            "pump_amm: PumpAmmPoolStatic from LivePoolCache (ZERO RPC discovery)"
                         );
+                        return Ok(Some(pool));
                     }
-                    let event_authority = pump_amm_canonical_event_authority(&pump_amm_program);
-                    if accounts[8] != event_authority {
-                        warn!(
-                            cached = %accounts[8],
-                            expected = %event_authority,
-                            "pump_amm: cache pool_accounts[8] != canonical event_authority; using canonical"
-                        );
-                    }
-                    let pool = PumpAmmPoolStatic {
-                        pool_market: accounts[0],
-                        global_config,
-                        base_mint: accounts[2],
-                        quote_mint: accounts[3],
-                        pool_base_vault: accounts[4],
-                        pool_quote_vault: accounts[5],
-                        protocol_fee_recipient: accounts[6],
-                        protocol_fee_recipient_ta: accounts[7],
-                        event_authority,
-                        coin_creator_vault_ata: accounts[9],
-                        coin_creator_vault_authority: accounts[10],
-                        global_volume_accumulator: accounts[11],
-                        fee_config: accounts[12],
-                        fee_program: accounts[13],
-                    };
-                    // Cache internally for build_swap_ix() (sync path)
-                    self.pools_by_base.insert(base_mint, pool.clone());
-                    self.pools_by_market.insert(pool.pool_market, base_mint);
-                    info!(
-                        base_mint = %base_mint,
-                        pool_market = %pool.pool_market,
-                        "pump_amm: PumpAmmPoolStatic from LivePoolCache (ZERO RPC discovery)"
-                    );
-                    return Ok(Some(pool));
                 }
             }
         }
@@ -2531,7 +2576,7 @@ impl Dex for PumpFunAmmDex {
             "pump_amm: no LivePoolCache, using RPC fallback for quote"
         );
 
-        let pool = match self.discover_pool_static(base_mint).await? {
+        let pool = match self.discover_pool_static(base_mint, false).await? {
             Some(p) => p,
             None => return Ok(None),
         };
@@ -2951,7 +2996,7 @@ impl PumpFunAmmDex {
     /// Prime discovery caches for a base mint (static pool) and a user (user-specific accounts).
     pub async fn ensure_discovered_for_user(&self, base_mint: Pubkey, user: Pubkey) -> Result<()> {
         let pool = self
-            .discover_pool_static(base_mint)
+            .discover_pool_static(base_mint, false)
             .await?
             .ok_or_else(|| anyhow!("pump_amm: no pool found for base_mint={base_mint}"))?;
 
@@ -3133,6 +3178,45 @@ mod tests {
         assert!(result.unwrap().is_none());
     }
 
+    /// force_refresh requires RPC; Hot-Path dex (`allow_rpc_on_miss=false`) must not return stale cache.
+    #[tokio::test]
+    async fn test_pool_accounts_force_refresh_refuses_without_rpc_permission() {
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let base_mint = Pubkey::new_unique();
+        let pool_market = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = vec![
+            pool_market,
+            Pubkey::new_unique(),
+            base_mint,
+            wsol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        let cache =
+            make_pump_amm_cache_with_pool_accounts(pool_market, base_mint, pool_accounts.clone());
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let dex = PumpFunAmmDex::new_with_cache(rpc, cache, false);
+
+        let result = dex
+            .pool_accounts_v1_for_base_mint_with_hint(base_mint, Some(pool_market), true)
+            .await;
+
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "force_refresh with allow_rpc_on_miss=false must not use cache or RPC"
+        );
+    }
+
     /// I-24d: A bad `pool_address_hint` must not fall through to `getProgramAccounts` (~20s+).
     #[tokio::test]
     async fn test_pool_address_hint_parse_fail_errors_without_global_scan() {
@@ -3143,7 +3227,7 @@ mod tests {
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
         let dex = PumpFunAmmDex::new_with_cache(rpc, cache, true);
 
-        let fut = dex.pool_accounts_v1_for_base_mint_with_hint(base_mint, Some(bad_hint));
+        let fut = dex.pool_accounts_v1_for_base_mint_with_hint(base_mint, Some(bad_hint), false);
         let completed = tokio::time::timeout(std::time::Duration::from_secs(3), fut)
             .await
             .expect("must not block on getProgramAccounts global scan");
