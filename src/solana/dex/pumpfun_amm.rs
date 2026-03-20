@@ -31,6 +31,10 @@ const PUMPFUN_AMM_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6
 // Global fee_config account - owned by Fee Program, same for ALL pools.
 // Observed in successful on-chain SELL and BUY transactions.
 const PUMPFUN_AMM_FEE_CONFIG: &str = "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx";
+/// Global config account — same for **all** PumpSwap pools (swap instruction account #2).
+/// Verified from successful mainnet SELL/BUY txs; must not be read from market account bytes at
+/// misaligned offsets (see incident: wrong bytes → pubkey with no account → Anchor 3012 on `global_config`).
+const PUMPFUN_AMM_GLOBAL_CONFIG: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
 
 // Fallback protocol fee recipient when automatic discovery fails (observed in many PumpSwap pools).
 // This is the canonical Pump.fun protocol fee recipient wallet (owned by System Program, not a PDA).
@@ -44,10 +48,8 @@ const PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT: &str =
 // Using `getProgramAccounts` with memcmp filters avoids reliance on tx-history on pruned RPC.
 const PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET: u64 = 43;
 const PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET: u64 = 75;
-
-// Observed on-chain for at least one PumpSwap market account:
-// global_config appears to be a Pubkey at offset 11, followed by base/quote mints.
-const PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET: usize = 11;
+/// Minimum market account data length to read base_mint + quote_mint at fixed offsets.
+const PUMPFUN_AMM_MARKET_MIN_DATA_LEN: usize = PUMPFUN_AMM_MARKET_QUOTE_MINT_OFFSET as usize + 32;
 
 // PumpSwap AMM market account (301 bytes on mainnet): seed pubkey for `creator_vault` PDA lives here.
 // Distinct from bonding-curve `creator-vault` (hyphen) — AMM uses underscore `creator_vault` + this seed.
@@ -449,18 +451,13 @@ impl PumpFunAmmDex {
             return Ok(None);
         }
 
-        // Require at least the global_config + base + quote mints.
-        let min_len = PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET + (32 * 3);
-        if data.len() < min_len {
+        if data.len() < PUMPFUN_AMM_MARKET_MIN_DATA_LEN {
             return Ok(None);
         }
 
-        let global_config = Pubkey::new_from_array(
-            data[PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET
-                ..PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET + 32]
-                .try_into()
-                .map_err(|_| anyhow!("market global_config slice"))?,
-        );
+        // Canonical global config (same for every pool). Do **not** slice from market bytes:
+        // misaligned/wrong offsets yield pubkeys with no on-chain account → Anchor 3012 on swap.
+        let global_config = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG)?;
         let base_mint = Pubkey::new_from_array(
             data[PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET as usize
                 ..(PUMPFUN_AMM_MARKET_BASE_MINT_OFFSET as usize + 32)]
@@ -1465,9 +1462,17 @@ impl PumpFunAmmDex {
         if let Some(ref cache) = self.live_pool_cache {
             if let Some(accounts) = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint) {
                 if accounts.len() >= 14 {
+                    let global_config = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG)?;
+                    if accounts[1] != global_config {
+                        warn!(
+                            cached = %accounts[1],
+                            expected = %global_config,
+                            "pump_amm: cache pool_accounts[1] != canonical global_config; using canonical"
+                        );
+                    }
                     let pool = PumpAmmPoolStatic {
                         pool_market: accounts[0],
-                        global_config: accounts[1],
+                        global_config,
                         base_mint: accounts[2],
                         quote_mint: accounts[3],
                         pool_base_vault: accounts[4],
@@ -2142,13 +2147,12 @@ impl Dex for PumpFunAmmDex {
         }
 
         // Parse base_mint from market account data
-        let min_len = PUMPFUN_AMM_MARKET_GLOBAL_CONFIG_OFFSET + (32 * 3);
-        if account.data.len() < min_len {
+        if account.data.len() < PUMPFUN_AMM_MARKET_MIN_DATA_LEN {
             return Err(anyhow!(
                 "pump_amm pool {} data too short: {} < {}",
                 pool_address,
                 account.data.len(),
-                min_len
+                PUMPFUN_AMM_MARKET_MIN_DATA_LEN
             ));
         }
 
@@ -2298,7 +2302,18 @@ impl Dex for PumpFunAmmDex {
         };
 
         let pool_market = parse_pubkey(&accounts[0], "pool_market")?;
-        let global_config = parse_pubkey(&accounts[1], "global_config")?;
+        let global_config = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG)?;
+        if accounts.len() > 1 {
+            if let Ok(parsed_gc) = parse_pubkey(&accounts[1], "global_config") {
+                if parsed_gc != global_config {
+                    warn!(
+                        intent = %parsed_gc,
+                        expected = %global_config,
+                        "pump_amm set_pool_from_accounts: accounts[1] != canonical global_config; using canonical"
+                    );
+                }
+            }
+        }
         let base_mint = parse_pubkey(&accounts[2], "base_mint")?;
         let quote_mint = parse_pubkey(&accounts[3], "quote_mint")?;
         let pool_base_vault = parse_pubkey(&accounts[4], "pool_base_vault")?;
@@ -2570,16 +2585,24 @@ impl Dex for PumpFunAmmDex {
         // Account ordering differs between BUY (23 accounts) and SELL (21 accounts).
         // Reference: observed on-chain Pump.fun AMM swap transactions.
         // BUY includes global_volume_accumulator (#16) and user_volume (#19), SELL does not.
+        let global_config = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG)?;
+        if pool.global_config != global_config {
+            warn!(
+                pool = %pool.global_config,
+                expected = %global_config,
+                "pump_amm build_swap_ix: cached pool.global_config != canonical; using canonical"
+            );
+        }
         let mut metas = vec![
-            AccountMeta::new(pool.pool_market, false),            // 0
-            AccountMeta::new(user, true),                         // 1
-            AccountMeta::new_readonly(pool.global_config, false), // 2
-            AccountMeta::new_readonly(pool.base_mint, false),     // 3
-            AccountMeta::new_readonly(pool.quote_mint, false),    // 4
-            AccountMeta::new(user_base_ta, false),                // 5
-            AccountMeta::new(user_quote_ta, false),               // 6
-            AccountMeta::new(pool.pool_base_vault, false),        // 7
-            AccountMeta::new(pool.pool_quote_vault, false),       // 8
+            AccountMeta::new(pool.pool_market, false),         // 0
+            AccountMeta::new(user, true),                      // 1
+            AccountMeta::new_readonly(global_config, false),   // 2
+            AccountMeta::new_readonly(pool.base_mint, false),  // 3
+            AccountMeta::new_readonly(pool.quote_mint, false), // 4
+            AccountMeta::new(user_base_ta, false),             // 5
+            AccountMeta::new(user_quote_ta, false),            // 6
+            AccountMeta::new(pool.pool_base_vault, false),     // 7
+            AccountMeta::new(pool.pool_quote_vault, false),    // 8
             AccountMeta::new_readonly(pool.protocol_fee_recipient, false), // 9
             AccountMeta::new(pool.protocol_fee_recipient_ta, false), // 10
             AccountMeta::new_readonly(base_token_program, false), // 11
@@ -2682,7 +2705,14 @@ impl PumpFunAmmDex {
         let expected_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
 
         let pool_market = pool_accounts[0];
-        let global_config = pool_accounts[1];
+        let global_config = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG)?;
+        if pool_accounts.len() > 1 && pool_accounts[1] != global_config {
+            warn!(
+                from_pool_accounts = %pool_accounts[1],
+                expected = %global_config,
+                "pump_amm build_swap_ix_from_pool_accounts: pool_accounts[1] != canonical global_config; using canonical"
+            );
+        }
         let base_mint = pool_accounts[2];
         let quote_mint = pool_accounts[3];
         let pool_base_vault = pool_accounts[4];
@@ -3064,5 +3094,47 @@ mod tests {
             Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).unwrap()
         );
         assert!(!ixs[0].data.is_empty());
+    }
+
+    /// SELL path: instruction account #2 must be the canonical global_config (not pool_accounts[1]).
+    #[test]
+    fn test_pumpswap_sell_global_config_meta_is_canonical() {
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let base_mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let canonical_gc = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap();
+
+        let pool_accounts: Vec<Pubkey> = vec![
+            Pubkey::new_unique(), // pool
+            Pubkey::new_unique(), // wrong on purpose — must not appear at ix[2]
+            base_mint,
+            wsol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        assert_eq!(pool_accounts.len(), 14);
+        assert_ne!(pool_accounts[1], canonical_gc);
+
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+            &base_mint.to_string(),
+            WSOL_MINT,
+            1_000_000,
+            1,
+            user,
+            &pool_accounts,
+            None,
+        )
+        .expect("SELL build");
+
+        assert_eq!(ixs[0].accounts.len(), 21);
+        assert_eq!(ixs[0].accounts[2].pubkey, canonical_gc);
     }
 }
