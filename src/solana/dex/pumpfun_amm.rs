@@ -36,6 +36,15 @@ const PUMPFUN_AMM_FEE_CONFIG: &str = "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaT
 /// misaligned offsets (see incident: wrong bytes → pubkey with no account → Anchor 3012 on `global_config`).
 const PUMPFUN_AMM_GLOBAL_CONFIG: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
 
+/// Canonical PumpSwap `event_authority` PDA for swap instructions (Anchor seed `__event_authority`).
+///
+/// Same for all pools under `PUMPFUN_AMM_PROGRAM_ID`. DexPoolAccounts / cache slot [8] may carry a
+/// wrong pubkey (mis-parse or stale layout); the program validates this account with seeds →
+/// `ConstraintSeeds` (2006) if the passed key is not this PDA. See `dex_parser.rs` (SELL ix account 15).
+fn pump_amm_canonical_event_authority(program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"__event_authority"], program_id).0
+}
+
 // Fallback protocol fee recipient when automatic discovery fails (observed in many PumpSwap pools).
 // This is the canonical Pump.fun protocol fee recipient wallet (owned by System Program, not a PDA).
 // Account: JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU (verified from multiple successful swap txs).
@@ -963,18 +972,9 @@ impl PumpFunAmmDex {
             }
         };
 
-        // Derive remaining PDAs with a small set of common seed patterns and validate existence.
-        let event_authority = {
-            // Prefer the canonical Anchor seed "__event_authority".
-            let candidate =
-                Pubkey::find_program_address(&[b"__event_authority"], &pump_amm_program).0;
-            if non_token_pubkeys.contains(&candidate) {
-                candidate
-            } else {
-                // Fallback to the common seed without leading underscores.
-                Pubkey::find_program_address(&[b"event_authority"], &pump_amm_program).0
-            }
-        };
+        // Swap ix account #15 must be the `__event_authority` PDA (ConstraintSeeds). Do not infer
+        // from market bytes; same pattern as `global_config`.
+        let event_authority = pump_amm_canonical_event_authority(&pump_amm_program);
 
         // Extract fee_config from fee-program owned accounts (CRITICAL: fee_config must be owned
         // by pfeeUxB6... Fee Program, not the AMM program).
@@ -1462,12 +1462,21 @@ impl PumpFunAmmDex {
         if let Some(ref cache) = self.live_pool_cache {
             if let Some(accounts) = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint) {
                 if accounts.len() >= 14 {
+                    let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
                     let global_config = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG)?;
                     if accounts[1] != global_config {
                         warn!(
                             cached = %accounts[1],
                             expected = %global_config,
                             "pump_amm: cache pool_accounts[1] != canonical global_config; using canonical"
+                        );
+                    }
+                    let event_authority = pump_amm_canonical_event_authority(&pump_amm_program);
+                    if accounts[8] != event_authority {
+                        warn!(
+                            cached = %accounts[8],
+                            expected = %event_authority,
+                            "pump_amm: cache pool_accounts[8] != canonical event_authority; using canonical"
                         );
                     }
                     let pool = PumpAmmPoolStatic {
@@ -1479,7 +1488,7 @@ impl PumpFunAmmDex {
                         pool_quote_vault: accounts[5],
                         protocol_fee_recipient: accounts[6],
                         protocol_fee_recipient_ta: accounts[7],
-                        event_authority: accounts[8],
+                        event_authority,
                         coin_creator_vault_ata: accounts[9],
                         coin_creator_vault_authority: accounts[10],
                         global_volume_accumulator: accounts[11],
@@ -2320,7 +2329,16 @@ impl Dex for PumpFunAmmDex {
         let pool_quote_vault = parse_pubkey(&accounts[5], "pool_quote_vault")?;
         let protocol_fee_recipient = parse_pubkey(&accounts[6], "protocol_fee_recipient")?;
         let protocol_fee_recipient_ta = parse_pubkey(&accounts[7], "protocol_fee_recipient_ta")?;
-        let event_authority = parse_pubkey(&accounts[8], "event_authority")?;
+        let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
+        let parsed_event_authority = parse_pubkey(&accounts[8], "event_authority")?;
+        let event_authority = pump_amm_canonical_event_authority(&pump_amm_program);
+        if parsed_event_authority != event_authority {
+            warn!(
+                intent = %parsed_event_authority,
+                expected = %event_authority,
+                "pump_amm set_pool_from_accounts: accounts[8] != canonical event_authority; using canonical"
+            );
+        }
         let coin_creator_vault_ata = parse_pubkey(&accounts[9], "coin_creator_vault_ata")?;
         let coin_creator_vault_authority =
             parse_pubkey(&accounts[10], "coin_creator_vault_authority")?;
@@ -2593,6 +2611,14 @@ impl Dex for PumpFunAmmDex {
                 "pump_amm build_swap_ix: cached pool.global_config != canonical; using canonical"
             );
         }
+        let event_authority = pump_amm_canonical_event_authority(&program_id);
+        if pool.event_authority != event_authority {
+            warn!(
+                pool = %pool.event_authority,
+                expected = %event_authority,
+                "pump_amm build_swap_ix: cached pool.event_authority != canonical; using canonical"
+            );
+        }
         let mut metas = vec![
             AccountMeta::new(pool.pool_market, false),         // 0
             AccountMeta::new(user, true),                      // 1
@@ -2615,7 +2641,7 @@ impl Dex for PumpFunAmmDex {
                 Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
                 false,
             ), // 14
-            AccountMeta::new_readonly(pool.event_authority, false), // 15
+            AccountMeta::new_readonly(event_authority, false), // 15
         ];
 
         if is_buy {
@@ -2674,7 +2700,7 @@ impl PumpFunAmmDex {
     /// [5] pool_quote_vault
     /// [6] protocol_fee_recipient
     /// [7] protocol_fee_recipient_ta
-    /// [8] event_authority
+    /// [8] event_authority (cache slot; builders use canonical `__event_authority` PDA for ix metas)
     /// [9] coin_creator_vault_ata
     /// [10] coin_creator_vault_authority
     /// [11] global_volume_accumulator
@@ -2719,7 +2745,14 @@ impl PumpFunAmmDex {
         let pool_quote_vault = pool_accounts[5];
         let protocol_fee_recipient = pool_accounts[6];
         let protocol_fee_recipient_ta = pool_accounts[7];
-        let event_authority = pool_accounts[8];
+        let event_authority = pump_amm_canonical_event_authority(&program_id);
+        if pool_accounts.len() > 8 && pool_accounts[8] != event_authority {
+            warn!(
+                from_pool_accounts = %pool_accounts[8],
+                expected = %event_authority,
+                "pump_amm build_swap_ix_from_pool_accounts: pool_accounts[8] != canonical event_authority; using canonical"
+            );
+        }
         let coin_creator_vault_ata = pool_accounts[9];
         let coin_creator_vault_authority = pool_accounts[10];
         let global_volume_accumulator = pool_accounts[11]; // REQUIRED for BUY!
@@ -3136,5 +3169,48 @@ mod tests {
 
         assert_eq!(ixs[0].accounts.len(), 21);
         assert_eq!(ixs[0].accounts[2].pubkey, canonical_gc);
+    }
+
+    /// SELL path: instruction account #15 must be the canonical `__event_authority` PDA (not pool_accounts[8]).
+    #[test]
+    fn test_pumpswap_sell_event_authority_meta_is_canonical() {
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let base_mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).unwrap();
+        let canonical_ea = pump_amm_canonical_event_authority(&program_id);
+
+        let pool_accounts: Vec<Pubkey> = vec![
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            wsol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(), // wrong on purpose — must not appear at ix[15]
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        assert_eq!(pool_accounts.len(), 14);
+        assert_ne!(pool_accounts[8], canonical_ea);
+
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+            &base_mint.to_string(),
+            WSOL_MINT,
+            1_000_000,
+            1,
+            user,
+            &pool_accounts,
+            None,
+        )
+        .expect("SELL build");
+
+        assert_eq!(ixs[0].accounts.len(), 21);
+        assert_eq!(ixs[0].accounts[15].pubkey, canonical_ea);
     }
 }
