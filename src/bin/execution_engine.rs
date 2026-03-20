@@ -1317,10 +1317,10 @@ const MAX_BLOCKHASH_AGE_SECS: u64 = 30;
 /// I-24d: Bounded wait timeout for Discovery Request/Reply (market-data).
 const DISCOVERY_REQUEST_TIMEOUT_SECS: u64 = 15;
 
-/// I-24d: Bounded wait for authoritative SLAVE cache state (pool_accounts from JetStream).
+/// I-24d: Bounded wait for authoritative SLAVE PumpAmm state (JetStream `PoolCacheUpdate` merge).
 const DISCOVERY_CACHE_WAIT_TIMEOUT_MS: u64 = 10_000;
 
-/// I-24d: Poll interval when waiting for pool_accounts in SLAVE cache.
+/// I-24d: Poll interval when waiting for usable PumpAmm cache state in SLAVE cache.
 const DISCOVERY_CACHE_POLL_INTERVAL_MS: u64 = 100;
 
 /// Outcome of a Discovery Request (I-24d). Used for bounded wait + single retry.
@@ -1332,9 +1332,12 @@ enum DiscoveryRequestOutcome {
     Timeout,
 }
 
-/// I-24d: Wait bounded for authoritative pool_accounts in SLAVE cache (from JetStream).
-/// Polls until pool_accounts present or timeout. Returns true if found.
-async fn wait_for_pool_accounts_in_cache(
+/// I-24d: Bounded wait until PumpSwap AMM is quote-ready in SLAVE cache (JetStream path).
+///
+/// `ControlResponse=Ok` can correlate before `apply_pool_cache_update` exposes non-degenerate
+/// `base_reserve`/`quote_reserve` (Bug #27): `pool_accounts` alone is a weak readiness signal.
+/// Polls until `LivePoolCache::pump_amm_quote_ready_by_base_mint` is true or timeout.
+async fn wait_for_usable_pump_amm_cache_state(
     cache: &LivePoolCache,
     base_mint: &Pubkey,
     timeout_ms: u64,
@@ -1342,10 +1345,7 @@ async fn wait_for_pool_accounts_in_cache(
 ) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     while std::time::Instant::now() < deadline {
-        if cache
-            .get_pump_amm_pool_accounts_by_base_mint(base_mint)
-            .is_some()
-        {
+        if cache.pump_amm_quote_ready_by_base_mint(base_mint) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
@@ -1733,7 +1733,7 @@ impl ExecutionContext {
                                         return None;
                                     }
                                 };
-                                if !wait_for_pool_accounts_in_cache(
+                                if !wait_for_usable_pump_amm_cache_state(
                                     cache,
                                     &mint,
                                     DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
@@ -1741,7 +1741,7 @@ impl ExecutionContext {
                                 )
                                 .await
                                 {
-                                    warn!(mint = %mint_str, "6005-retry: pool_accounts not in cache after discovery timeout");
+                                    warn!(mint = %mint_str, "6005-retry: usable PumpAmm cache state not visible after discovery timeout (pool_accounts+reserves)");
                                     return None;
                                 }
                                 match cache.get_pump_amm_pool_accounts_by_base_mint(&mint) {
@@ -1809,7 +1809,7 @@ impl ExecutionContext {
                                 return None;
                             }
                         };
-                        if !wait_for_pool_accounts_in_cache(
+                        if !wait_for_usable_pump_amm_cache_state(
                             cache,
                             &mint,
                             DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
@@ -1819,7 +1819,7 @@ impl ExecutionContext {
                         {
                             warn!(
                                 mint = %mint_str,
-                                "6005-retry: pool_accounts not in cache after discovery timeout"
+                                "6005-retry: usable PumpAmm cache state not visible after discovery timeout (pool_accounts+reserves)"
                             );
                             return None;
                         }
@@ -2384,7 +2384,7 @@ impl ExecutionContext {
                                         {
                                             DiscoveryRequestOutcome::Ok => {
                                                 if let Some(cache) = ctx.live_pool_cache.as_ref() {
-                                                    if wait_for_pool_accounts_in_cache(
+                                                    if wait_for_usable_pump_amm_cache_state(
                                                         cache,
                                                         &mint,
                                                         DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
@@ -2427,7 +2427,7 @@ impl ExecutionContext {
                                                             ));
                                                         }
                                                     } else {
-                                                        warn!(mint = %mint, "pump_amm pool_accounts not in cache after discovery timeout");
+                                                        warn!(mint = %mint, "pump_amm: usable cache state not visible after discovery timeout (pool_accounts+nonzero reserves)");
                                                         quote_attempts.push(format!(
                                                             "pump_amm=skip timeout amount_out={} pool={}",
                                                             q.amount_out, pool_id
@@ -2482,7 +2482,7 @@ impl ExecutionContext {
                             {
                                 DiscoveryRequestOutcome::Ok => {
                                     if let Some(cache) = ctx.live_pool_cache.as_ref() {
-                                        if wait_for_pool_accounts_in_cache(
+                                        if wait_for_usable_pump_amm_cache_state(
                                             cache,
                                             &mint,
                                             DISCOVERY_CACHE_WAIT_TIMEOUT_MS,

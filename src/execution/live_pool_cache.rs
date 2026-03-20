@@ -856,6 +856,22 @@ impl LivePoolCache {
         None
     }
 
+    /// I-24d / Bug #27: Readiness for PumpSwap quotes after authoritative `PoolCacheUpdate`.
+    ///
+    /// `pool_accounts` alone is insufficient: SLAVE cache can still show stale
+    /// `base_reserve`/`quote_reserve` (e.g. `None` or 0) until JetStream merge completes.
+    /// Matches what [`crate::execution::quote_calculator::quote_output_amount`] requires
+    /// for `CachedPoolState::PumpAmm`.
+    pub fn pump_amm_quote_ready_by_base_mint(&self, base_mint: &Pubkey) -> bool {
+        match self.get_pump_amm_pool_accounts_by_base_mint(base_mint) {
+            Some(a) if a.len() >= 14 => {}
+            _ => return false,
+        }
+        self.get_pump_amm_reserves_by_base_mint(base_mint)
+            .map(|(b, q, _)| b > 0 && q > 0)
+            .unwrap_or(false)
+    }
+
     // ========================================================================
     // Stats
     // ========================================================================
@@ -1583,6 +1599,65 @@ mod tests {
 
         let result = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint);
         assert_eq!(result, None);
+    }
+
+    /// I-24d: After `ControlResponse=Ok`, execution-engine must not treat `pool_accounts`
+    /// alone as quote-ready — reserves must be non-degenerate (matches incident B8bvg…).
+    #[test]
+    fn test_pump_amm_quote_ready_requires_accounts_and_nonzero_reserves() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts.clone(),
+            ),
+            100,
+        );
+        assert!(cache.pump_amm_quote_ready_by_base_mint(&base_mint));
+
+        // Stale / pre-hydration: accounts present but reserves missing (quote would fail).
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(base_mint, quote_mint, None, None, pool_accounts.clone()),
+            101,
+        );
+        assert!(!cache.pump_amm_quote_ready_by_base_mint(&base_mint));
+
+        // Degenerate reserves
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(0),
+                Some(0),
+                pool_accounts.clone(),
+            ),
+            102,
+        );
+        assert!(!cache.pump_amm_quote_ready_by_base_mint(&base_mint));
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts,
+            ),
+            103,
+        );
+        assert!(cache.pump_amm_quote_ready_by_base_mint(&base_mint));
     }
 
     #[test]
