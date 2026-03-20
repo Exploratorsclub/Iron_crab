@@ -173,3 +173,22 @@ fn test_build_swap_ix_with_cached_accounts() {
     );
     assert!(!ixs[0].data.is_empty());
 }
+
+/// I-24d / Bug #27: After successful EnsurePumpAmmPoolAccounts, market-data must hydrate SPL vault
+/// balances for `pool_accounts[4]` / `[5]` so JetStream PoolCacheUpdate is not degenerate 0/0.
+/// This test guards the public Cold-Path helper used for that hydration.
+#[tokio::test]
+async fn pump_amm_fetch_vault_reserves_requires_canonical_layout_len() {
+    let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+    let cache = Arc::new(LivePoolCache::new());
+    let dex = PumpFunAmmDex::new_with_cache(rpc, cache, false);
+    let short = vec![Pubkey::new_unique(); 5];
+    let err = dex
+        .fetch_pump_amm_vault_reserves(&short)
+        .await
+        .expect_err("short pool_accounts must error");
+    assert!(
+        err.to_string().contains("pool_accounts len"),
+        "unexpected err: {err}"
+    );
+}

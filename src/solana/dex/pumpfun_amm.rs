@@ -2035,6 +2035,31 @@ impl PumpFunAmmDex {
             .ok_or_else(|| anyhow!("invalid token account data for {ta}"))
     }
 
+    /// Cold Path only: authoritative SPL token balances for PumpSwap pool vaults.
+    ///
+    /// `pool_accounts` must follow the canonical layout where `[4]` is `pool_base_vault` and
+    /// `[5]` is `pool_quote_vault` (same as `PumpAmmState::pool_base_token_account` / quote).
+    /// Used after successful I-24d discovery so JetStream/SLAVE caches receive non-degenerate
+    /// reserves without local healing in execution-engine.
+    pub async fn fetch_pump_amm_vault_reserves(
+        &self,
+        pool_accounts: &[Pubkey],
+    ) -> Result<(u64, u64)> {
+        if pool_accounts.len() < 6 {
+            return Err(anyhow!(
+                "pool_accounts len {} < 6 (cannot read vault pubkeys)",
+                pool_accounts.len()
+            ));
+        }
+        let base_vault = pool_accounts[4];
+        let quote_vault = pool_accounts[5];
+        let (base_res, quote_res) = tokio::try_join!(
+            self.get_vault_amount(base_vault),
+            self.get_vault_amount(quote_vault),
+        )?;
+        Ok((base_res, quote_res))
+    }
+
     fn quote_cp(
         &self,
         amount_in: u64,
@@ -2886,6 +2911,21 @@ mod tests {
         assert!(quote.amount_out > 0);
         assert!(quote.route.contains(&pool_market.to_string()));
         assert_eq!(quote.fee_bps, 125);
+    }
+
+    #[tokio::test]
+    async fn fetch_pump_amm_vault_reserves_rejects_short_accounts() {
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let dex = PumpFunAmmDex::new_with_cache(rpc, make_empty_cache(), false);
+        let short = vec![Pubkey::new_unique(); 5];
+        let err = dex
+            .fetch_pump_amm_vault_reserves(&short)
+            .await
+            .expect_err("expected err");
+        assert!(
+            err.to_string().contains("pool_accounts len"),
+            "unexpected err: {err}"
+        );
     }
 
     #[tokio::test]

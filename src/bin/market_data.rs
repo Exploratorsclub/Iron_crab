@@ -1577,6 +1577,64 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Cold Path: merge existing PumpAmm reserves with authoritative vault RPC reads for I-24d Ensure.
+///
+/// If the cache already has both reserves present and strictly positive, keep them (Geyser may be
+/// fresher). Otherwise load `[4]`/`[5]` vault balances via RPC so PoolCacheUpdate is not published
+/// as degenerate 0/0 after successful discovery when on-chain balances are available.
+async fn resolve_pump_amm_reserves_for_ensure_discovery(
+    request_id: &str,
+    base_mint_str: &str,
+    pool_address_str: &str,
+    existing: Option<&CachedPoolState>,
+    pool_accounts: &[Pubkey],
+    dex: &ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex,
+) -> (u64, u64) {
+    if let Some(CachedPoolState::PumpAmm(s)) = existing {
+        if let (Some(br), Some(qr)) = (s.base_reserve, s.quote_reserve) {
+            if br > 0 && qr > 0 {
+                info!(
+                    request_id = %request_id,
+                    base_mint = %base_mint_str,
+                    pool = %pool_address_str,
+                    base_reserve = br,
+                    quote_reserve = qr,
+                    "EnsurePumpAmmPoolAccounts: using existing non-degenerate reserves (skip vault RPC)"
+                );
+                return (br, qr);
+            }
+        }
+    }
+
+    match dex.fetch_pump_amm_vault_reserves(pool_accounts).await {
+        Ok((b, q)) => {
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                pool = %pool_address_str,
+                base_reserve = b,
+                quote_reserve = q,
+                "EnsurePumpAmmPoolAccounts: hydrated vault reserves via RPC (Cold Path)"
+            );
+            (b, q)
+        }
+        Err(e) => {
+            warn!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                pool = %pool_address_str,
+                error = %e,
+                "EnsurePumpAmmPoolAccounts: vault reserve RPC failed; falling back to existing or zero"
+            );
+            if let Some(CachedPoolState::PumpAmm(s)) = existing {
+                (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
+            } else {
+                (0, 0)
+            }
+        }
+    }
+}
+
 /// I-24d: Handle EnsurePumpAmmPoolAccounts Discovery Request.
 ///
 /// Performs RPC-based discovery (Cold Path), updates MASTER cache, publishes
@@ -1636,33 +1694,33 @@ async fn handle_ensure_pump_amm_pool_accounts(
             let quote_mint = accounts[3];
             let quote_mint_str = quote_mint.to_string();
 
-            // Preserve existing reserves/creator: only set pool_accounts if pool exists,
-            // else upsert minimal state. Never degrade existing good data with 0/0.
             let existing = ctx.live_pool_cache.get(&pool_address);
-            if let Some(CachedPoolState::PumpAmm(ref _existing_pump)) = existing {
-                ctx.live_pool_cache
-                    .set_pump_amm_pool_accounts(&pool_address, accounts.clone());
-            } else {
-                let state = CachedPoolState::PumpAmm(PumpAmmState {
-                    base_mint,
-                    quote_mint,
-                    pool_base_token_account: accounts[4],
-                    pool_quote_token_account: accounts[5],
-                    base_reserve: None,
-                    quote_reserve: None,
-                    pool_accounts: accounts.clone(),
-                    creator: None,
-                });
-                ctx.live_pool_cache.upsert(pool_address, state, 0);
-            }
+            let creator_opt = existing.as_ref().and_then(|st| match st {
+                CachedPoolState::PumpAmm(s) => s.creator,
+                _ => None,
+            });
 
-            // Use existing reserves for JetStream publish when available (don't degrade with 0/0).
-            let (base_reserve, quote_reserve) =
-                if let Some(CachedPoolState::PumpAmm(ref s)) = existing {
-                    (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
-                } else {
-                    (0u64, 0u64)
-                };
+            let (base_reserve, quote_reserve) = resolve_pump_amm_reserves_for_ensure_discovery(
+                request_id,
+                &base_mint_str,
+                &pool_address_str,
+                existing.as_ref(),
+                &accounts,
+                dex,
+            )
+            .await;
+
+            let state = CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint,
+                pool_base_token_account: accounts[4],
+                pool_quote_token_account: accounts[5],
+                base_reserve: Some(base_reserve),
+                quote_reserve: Some(quote_reserve),
+                pool_accounts: accounts.clone(),
+                creator: creator_opt,
+            });
+            ctx.live_pool_cache.upsert(pool_address, state, 0);
 
             // Publish JetStream PoolCacheUpdate (authoritative SSOT).
             // Reply Ok ONLY when JetStream write succeeds (I-24a).
@@ -1683,10 +1741,8 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 let mut meta = std::collections::HashMap::new();
                 let accounts_str: Vec<String> = accounts.iter().map(|p| p.to_string()).collect();
                 meta.insert("pool_accounts".to_string(), accounts_str.join(","));
-                if let Some(CachedPoolState::PumpAmm(ref s)) = existing {
-                    if let Some(creator) = s.creator {
-                        meta.insert("creator".to_string(), creator.to_string());
-                    }
+                if let Some(creator) = creator_opt {
+                    meta.insert("creator".to_string(), creator.to_string());
                 }
                 pool_update.metadata = Some(meta);
                 let subject = pool_subject(&pool_address_str);
