@@ -55,13 +55,11 @@ fn pump_amm_canonical_protocol_fee_accounts(
 ) -> (Pubkey, Pubkey) {
     let protocol_fee_recipient = Pubkey::from_str(PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT)
         .expect("PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT must be valid base58");
-    let owner_spl = SplProgramPubkey::new_from_array(protocol_fee_recipient.to_bytes());
-    let mint_spl = SplProgramPubkey::new_from_array(quote_mint.to_bytes());
-    let tp_spl = SplProgramPubkey::new_from_array(quote_token_program.to_bytes());
-    let ata_spl = spl_associated_token_account::get_associated_token_address_with_program_id(
-        &owner_spl, &mint_spl, &tp_spl,
+    let protocol_fee_recipient_ta = PumpFunAmmDex::derive_ata_with_program(
+        protocol_fee_recipient,
+        quote_mint,
+        quote_token_program,
     );
-    let protocol_fee_recipient_ta = Pubkey::new_from_array(ata_spl.to_bytes());
     (protocol_fee_recipient, protocol_fee_recipient_ta)
 }
 
