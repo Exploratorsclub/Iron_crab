@@ -1579,9 +1579,10 @@ async fn main() -> Result<()> {
 
 /// Cold Path: merge existing PumpAmm reserves with authoritative vault RPC reads for I-24d Ensure.
 ///
-/// If the cache already has both reserves present and strictly positive, keep them (Geyser may be
-/// fresher). Otherwise load `[4]`/`[5]` vault balances via RPC so PoolCacheUpdate is not published
-/// as degenerate 0/0 after successful discovery when on-chain balances are available.
+/// - If the cache already has **both** reserves present and strictly positive, returns `Ok` with
+///   those values (skip vault RPC).
+/// - Otherwise vault RPC **must** succeed. On RPC failure there is **no** silent fallback to
+///   `0/0` — that would let the handler publish a false “success” SSOT (I-24d / I-12).
 async fn resolve_pump_amm_reserves_for_ensure_discovery(
     request_id: &str,
     base_mint_str: &str,
@@ -1589,7 +1590,7 @@ async fn resolve_pump_amm_reserves_for_ensure_discovery(
     existing: Option<&CachedPoolState>,
     pool_accounts: &[Pubkey],
     dex: &ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex,
-) -> (u64, u64) {
+) -> Result<(u64, u64), String> {
     if let Some(CachedPoolState::PumpAmm(s)) = existing {
         if let (Some(br), Some(qr)) = (s.base_reserve, s.quote_reserve) {
             if br > 0 && qr > 0 {
@@ -1601,7 +1602,7 @@ async fn resolve_pump_amm_reserves_for_ensure_discovery(
                     quote_reserve = qr,
                     "EnsurePumpAmmPoolAccounts: using existing non-degenerate reserves (skip vault RPC)"
                 );
-                return (br, qr);
+                return Ok((br, qr));
             }
         }
     }
@@ -1616,7 +1617,7 @@ async fn resolve_pump_amm_reserves_for_ensure_discovery(
                 quote_reserve = q,
                 "EnsurePumpAmmPoolAccounts: hydrated vault reserves via RPC (Cold Path)"
             );
-            (b, q)
+            Ok((b, q))
         }
         Err(e) => {
             warn!(
@@ -1624,13 +1625,9 @@ async fn resolve_pump_amm_reserves_for_ensure_discovery(
                 base_mint = %base_mint_str,
                 pool = %pool_address_str,
                 error = %e,
-                "EnsurePumpAmmPoolAccounts: vault reserve RPC failed; falling back to existing or zero"
+                "EnsurePumpAmmPoolAccounts: vault reserve RPC failed (no non-degenerate cached reserves)"
             );
-            if let Some(CachedPoolState::PumpAmm(s)) = existing {
-                (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0))
-            } else {
-                (0, 0)
-            }
+            Err(format!("vault reserve RPC failed: {e}"))
         }
     }
 }
@@ -1700,15 +1697,40 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 _ => None,
             });
 
-            let (base_reserve, quote_reserve) = resolve_pump_amm_reserves_for_ensure_discovery(
-                request_id,
-                &base_mint_str,
-                &pool_address_str,
-                existing.as_ref(),
-                &accounts,
-                dex,
-            )
-            .await;
+            let (base_reserve, quote_reserve) =
+                match resolve_pump_amm_reserves_for_ensure_discovery(
+                    request_id,
+                    &base_mint_str,
+                    &pool_address_str,
+                    existing.as_ref(),
+                    &accounts,
+                    dex,
+                )
+                .await
+                {
+                    Ok(pair) => pair,
+                    Err(msg) => {
+                        warn!(
+                            request_id = %request_id,
+                            base_mint = %base_mint_str,
+                            pool = %pool_address_str,
+                            error = %msg,
+                            "I-24d Discovery: terminal outcome error (reserve hydration required)"
+                        );
+                        if let Some(ref nats) = ctx.nats {
+                            publish_control_response(
+                                nats,
+                                &ctx.run_id,
+                                request_id,
+                                ControlResponseStatus::Error,
+                                Some(pool_address_str),
+                                Some(msg),
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                };
 
             let state = CachedPoolState::PumpAmm(PumpAmmState {
                 base_mint,
