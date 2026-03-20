@@ -13,6 +13,7 @@ use solana_sdk::instruction::AccountMeta;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
+use spl_token_2022;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
@@ -825,12 +826,30 @@ pub async fn build_tx_plan(
             });
         }
 
-        // Parse token_program from intent for Token-2022 support (same as pumpfun path)
-        let token_program_override = intent
+        // Parse token_program from intent for Token-2022 support (same as pumpfun path).
+        // TradeResources documents token_program as "output_mint" — on SELL, output is WSOL (SPL Token).
+        // Producers may therefore set SPL Token program here even when the *input* (base) mint uses
+        // Token-2022: wrong base ATA derivation → on-chain Custom(6023) NotEnoughTokensToSell.
+        // Geyser-cached mint owner (LivePoolCache) is authoritative for the base mint's program.
+        let token_2022_pk = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+
+        let mut token_program_override = intent
             .resources
             .token_program
             .as_ref()
-            .and_then(|s| Pubkey::from_str(s).ok());
+            .and_then(|s| Pubkey::from_str(s.trim()).ok());
+
+        if let (Ok(input_mint_pk), Some(c)) =
+            (Pubkey::from_str(&intent.resources.input_mint), cache)
+        {
+            if let Some(cached_tp) = c.get_mint_program(&input_mint_pk) {
+                if cached_tp == token_2022_pk {
+                    token_program_override = Some(token_2022_pk);
+                } else if token_program_override.is_none() {
+                    token_program_override = Some(cached_tp);
+                }
+            }
+        }
 
         let mut ixs = match PumpFunAmmDex::build_swap_ix_from_pool_accounts(
             &intent.resources.input_mint,

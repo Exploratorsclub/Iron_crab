@@ -3335,6 +3335,58 @@ mod tests {
         assert_eq!(ixs[0].accounts[10].pubkey, expected_pfr_ta);
     }
 
+    /// SELL path: Token-2022 base mint — ix[11] must be Token-2022 program; user base ATA (ix[5]) must match derivation.
+    /// Wrong SPL program → wrong ATA → Custom(6023) NotEnoughTokensToSell on-chain.
+    #[test]
+    fn test_pumpswap_sell_token2022_base_program_and_user_ata() {
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let base_mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let token_2022 = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+
+        let pool_accounts: Vec<Pubkey> = vec![
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            wsol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        assert_eq!(pool_accounts.len(), 14);
+
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+            &base_mint.to_string(),
+            WSOL_MINT,
+            1_000_000,
+            1,
+            user,
+            &pool_accounts,
+            Some(token_2022),
+        )
+        .expect("SELL build Token-2022");
+
+        assert_eq!(ixs[0].accounts[11].pubkey, token_2022);
+        let owner_spl = SplProgramPubkey::new_from_array(user.to_bytes());
+        let mint_spl = SplProgramPubkey::new_from_array(base_mint.to_bytes());
+        let token_program_spl = SplProgramPubkey::new_from_array(token_2022.to_bytes());
+        let expected_user_base =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &owner_spl,
+                &mint_spl,
+                &token_program_spl,
+            );
+        let expected_user_base = Pubkey::new_from_array(expected_user_base.to_bytes());
+        assert_eq!(ixs[0].accounts[5].pubkey, expected_user_base);
+    }
+
     /// Cached/sync `build_swap_ix`: stale `PumpAmmPoolStatic.protocol_fee_*` must not reach ix #9/#10.
     #[test]
     fn test_build_swap_ix_protocol_fee_metas_canonical_despite_stale_cached_pool() {
