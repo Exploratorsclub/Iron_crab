@@ -120,6 +120,41 @@ use spl_token_2022::{
 };
 use std::sync::atomic::AtomicBool;
 
+/// Primary `intent.resources.pools[0]`, else cache base→pool mapping.
+#[inline]
+fn pump_amm_pool_market_hint_merge(
+    intent_pool: Option<Pubkey>,
+    cache_pool: Option<Pubkey>,
+) -> Option<Pubkey> {
+    intent_pool.or(cache_pool)
+}
+
+/// PumpSwap AMM: pool market address for EnsurePumpAmmPoolAccounts / recovery.
+/// Primary: `intent.resources.pools[0]` (explicit route + resource lock). Fallback: base→pool in LivePoolCache.
+fn pump_amm_pool_market_hint_pk(intent: &TradeIntent, ctx: &ExecutionContext) -> Option<Pubkey> {
+    let intent_pool = intent
+        .resources
+        .pools
+        .first()
+        .and_then(|s| Pubkey::from_str(s).ok());
+    let base_mint = Pubkey::from_str(&intent.resources.input_mint).ok()?;
+    let cache_pool = ctx
+        .live_pool_cache
+        .as_ref()
+        .and_then(|c| c.get_pump_amm_pool_address_by_base_mint(&base_mint));
+    if let (Some(a), Some(b)) = (intent_pool, cache_pool) {
+        if a != b {
+            warn!(
+                intent_id = %intent.intent_id,
+                intent_pool = %a,
+                cache_pool = %b,
+                "PumpSwap pool hint: intent.resources.pools[0] overrides LivePoolCache base→pool (differs)"
+            );
+        }
+    }
+    pump_amm_pool_market_hint_merge(intent_pool, cache_pool)
+}
+
 fn extract_owner_mint_delta_raw(
     tx: &EncodedConfirmedTransactionWithStatusMeta,
     owner: &Pubkey,
@@ -5330,7 +5365,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let ctx = Arc::new(ctx);
+    let ctx: Arc<ExecutionContext> = Arc::new(ctx);
 
     // LivePoolCache is now synced via NATS from market-data (Single Source of Truth)
     // No longer spawning cache_geyser_task - execution-engine subscribes to PoolCacheUpdates instead
@@ -7931,11 +7966,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                     )
                 }
             };
-            let pool_hint = ctx
-                .live_pool_cache
-                .as_ref()
-                .and_then(|c| c.get_pump_amm_pool_address_by_base_mint(&base_mint_pk));
-            if let Some(pool_pk) = pool_hint {
+            let pool_pk = pump_amm_pool_market_hint_pk(&intent, ctx);
+            if let Some(pool_pk) = pool_pk {
                 if let DiscoveryRequestOutcome::Ok = ctx
                     .request_discovery_and_wait(
                         &intent.resources.input_mint,
@@ -9736,8 +9768,11 @@ async fn spawn_rebroadcast_loop(
 
 #[cfg(test)]
 mod execution_engine_tests {
-    use super::{select_best_route, DiscoveryRequestOutcome, RouteCandidate};
+    use super::{
+        pump_amm_pool_market_hint_merge, select_best_route, DiscoveryRequestOutcome, RouteCandidate,
+    };
     use ironcrab::ipc::{ControlResponse, ControlResponseStatus};
+    use solana_sdk::pubkey::Pubkey;
 
     /// I-24d: Verifies that ControlResponse status maps correctly to DiscoveryRequestOutcome.
     /// NotFound and Error must NOT be confused with Timeout (terminal outcomes are distinct).
@@ -9804,5 +9839,23 @@ mod execution_engine_tests {
         assert_eq!(best.dex, "orca");
         assert_eq!(best.pool_id, "pool-2");
         assert_eq!(best.amount_out, 200);
+    }
+
+    #[test]
+    fn pump_amm_pool_hint_prefers_intent_pool_over_cache() {
+        let from_intent = Pubkey::new_unique();
+        let from_cache = Pubkey::new_unique();
+        assert_eq!(
+            pump_amm_pool_market_hint_merge(Some(from_intent), Some(from_cache)),
+            Some(from_intent)
+        );
+        assert_eq!(
+            pump_amm_pool_market_hint_merge(None, Some(from_cache)),
+            Some(from_cache)
+        );
+        assert_eq!(
+            pump_amm_pool_market_hint_merge(Some(from_intent), None),
+            Some(from_intent)
+        );
     }
 }
