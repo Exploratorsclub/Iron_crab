@@ -275,6 +275,23 @@ pub static REJECT_RISK_LIMIT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static REJECT_SIMULATION_FAIL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static REJECT_SEND_FAILED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+/// PumpSwap hot-path async healing (regular momentum SELL, structural sim error): eligible trigger
+/// reached while **not** in per-base-mint cooldown (decision = publish path).
+pub static PUMPSWAP_HOT_PATH_HEALING_TRIGGER_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Same path: trigger suppressed because per-base-mint cooldown still active.
+pub static PUMPSWAP_HOT_PATH_HEALING_COOLDOWN_SUPPRESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Async `EnsurePumpAmmPoolAccounts` NATS publish returned `Ok(true)` (cooldown start in engine).
+pub static PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_SUCCESS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Async publish returned `Ok(false)` or `Err` (no cooldown advance).
+pub static PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Healing branch chose publish but NATS client missing (cannot spawn async publish).
+pub static PUMPSWAP_HOT_PATH_HEALING_SKIPPED_NO_NATS_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 // --- NATS messaging metrics ---
 pub static NATS_MESSAGES_PUBLISHED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static NATS_MESSAGES_RECEIVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -1075,6 +1092,26 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("intent_rejection_by_reason{reason=\"send_failed\"} ");
     out.push_str(&REJECT_SEND_FAILED.load(Ordering::Relaxed).to_string());
     out.push('\n');
+    line!(
+        "pumpswap_hot_path_healing_trigger_total",
+        PUMPSWAP_HOT_PATH_HEALING_TRIGGER_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "pumpswap_hot_path_healing_cooldown_suppressed_total",
+        PUMPSWAP_HOT_PATH_HEALING_COOLDOWN_SUPPRESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "pumpswap_hot_path_healing_async_publish_success_total",
+        PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_SUCCESS_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "pumpswap_hot_path_healing_async_publish_fail_total",
+        PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "pumpswap_hot_path_healing_skipped_no_nats_total",
+        PUMPSWAP_HOT_PATH_HEALING_SKIPPED_NO_NATS_TOTAL.load(Ordering::Relaxed)
+    );
 
     // --- NATS messaging ---
     line!(
