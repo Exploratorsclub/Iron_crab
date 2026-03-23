@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
@@ -78,12 +78,16 @@ use ironcrab::metrics::{
     INTENTS_EXECUTED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
     JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL, JITO_BUNDLES_SUBMITTED_TOTAL,
     JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE,
-    NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE, REJECT_CAPITAL_LOCK, REJECT_DUPLICATE,
-    REJECT_RESOURCE_LOCK, REJECT_SEND_FAILED, REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL,
-    TX_CONFIRMED_TOTAL, TX_CONFIRM_GEYSER_TOTAL, TX_CONFIRM_LATENCY_MS,
-    TX_CONFIRM_RPC_FALLBACK_TOTAL, TX_CONFIRM_TIMEOUT_TOTAL, TX_SEND_ATTEMPTS_TOTAL,
-    TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL, TX_SEND_SUCCESS_TOTAL, TX_SEND_TPU_TOTAL,
-    WALLET_TOTAL_SOL_LAMPORTS,
+    NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE,
+    PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL,
+    PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_SUCCESS_TOTAL,
+    PUMPSWAP_HOT_PATH_HEALING_COOLDOWN_SUPPRESSED_TOTAL,
+    PUMPSWAP_HOT_PATH_HEALING_SKIPPED_NO_NATS_TOTAL, PUMPSWAP_HOT_PATH_HEALING_TRIGGER_TOTAL,
+    REJECT_CAPITAL_LOCK, REJECT_DUPLICATE, REJECT_RESOURCE_LOCK, REJECT_SEND_FAILED,
+    REJECT_SIMULATION_FAIL, SIMULATION_FAILURES_TOTAL, TX_CONFIRMED_TOTAL, TX_CONFIRM_GEYSER_TOTAL,
+    TX_CONFIRM_LATENCY_MS, TX_CONFIRM_RPC_FALLBACK_TOTAL, TX_CONFIRM_TIMEOUT_TOTAL,
+    TX_SEND_ATTEMPTS_TOTAL, TX_SEND_JITO_TOTAL, TX_SEND_RPC_TOTAL, TX_SEND_SUCCESS_TOTAL,
+    TX_SEND_TPU_TOTAL, WALLET_TOTAL_SOL_LAMPORTS,
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
@@ -119,8 +123,6 @@ use spl_token_2022::instruction as spl22_ix;
 use spl_token_2022::{
     extension::StateWithExtensions as Spl22StateWithExtensions, state::Account as Spl22TokenAccount,
 };
-use std::sync::atomic::AtomicBool;
-
 /// Primary `intent.resources.pools[0]`, else cache base→pool mapping.
 #[inline]
 fn pump_amm_pool_market_hint_merge(
@@ -2159,6 +2161,8 @@ impl ExecutionContext {
 
             match nats.publish(TOPIC_CONTROL_REQUESTS, &req).await {
                 Ok(true) => {
+                    PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_SUCCESS_TOTAL
+                        .fetch_add(1, Ordering::Relaxed);
                     if let Some(pk) = base_mint_pk_for_cooldown {
                         record_pump_amm_hot_path_refresh_after_success(
                             &cooldown_last,
@@ -2168,6 +2172,8 @@ impl ExecutionContext {
                     }
                 }
                 Ok(false) => {
+                    PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!(
                         request_id = %req.request_id,
                         base_mint = %base_mint,
@@ -2176,6 +2182,8 @@ impl ExecutionContext {
                     );
                 }
                 Err(e) => {
+                    PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!(
                         request_id = %req.request_id,
                         base_mint = %base_mint,
@@ -8110,6 +8118,16 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 }
             };
 
+            match &refresh_decision {
+                PumpAmmHotPathRefreshDecision::Publish => {
+                    PUMPSWAP_HOT_PATH_HEALING_TRIGGER_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+                PumpAmmHotPathRefreshDecision::Suppress { .. } => {
+                    PUMPSWAP_HOT_PATH_HEALING_COOLDOWN_SUPPRESSED_TOTAL
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
             match refresh_decision {
                 PumpAmmHotPathRefreshDecision::Publish => {
                     warn!(
@@ -8129,6 +8147,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                             base_mint_parse.ok(),
                         );
                     } else {
+                        PUMPSWAP_HOT_PATH_HEALING_SKIPPED_NO_NATS_TOTAL
+                            .fetch_add(1, Ordering::Relaxed);
                         warn!(
                             intent_id = %intent.intent_id,
                             mint = %intent.resources.input_mint,
