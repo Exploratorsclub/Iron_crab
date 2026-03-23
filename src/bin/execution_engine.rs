@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
@@ -111,6 +111,7 @@ use ironcrab::storage::{
     JsonlWriter, JsonlWriterConfig,
 };
 use ironcrab::wallet::Treasury;
+use parking_lot::Mutex as ParkingMutex;
 use spl_token::instruction as spl_ix;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::solana_program::pubkey::Pubkey as SplProgPubkey;
@@ -182,6 +183,52 @@ fn is_regular_momentum_hot_path_sell(intent: &TradeIntent) -> bool {
         return false;
     }
     true
+}
+
+/// Scope-2: dedupe repeated async `EnsurePumpAmmPoolAccounts` publishes for the same base mint
+/// (regular momentum PumpSwap SELL hot path). Static window — no new runtime config in this scope.
+const PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Outcome of [`try_pump_amm_hot_path_refresh_publish`]: whether to fire async NATS publish or suppress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpAmmHotPathRefreshDecision {
+    Publish,
+    Suppress { age: Duration, remaining: Duration },
+}
+
+/// Returns whether the async hot-path healing publish should run, or be suppressed by cooldown.
+/// Does **not** record a cooldown start — that happens only after a successful NATS publish
+/// ([`record_pump_amm_hot_path_refresh_after_success`]) so transient NATS failures do not block retries.
+/// `now` is injectable for unit tests.
+fn try_pump_amm_hot_path_refresh_publish(
+    last_by_mint: &ParkingMutex<HashMap<Pubkey, Instant>>,
+    base_mint: Pubkey,
+    now: Instant,
+) -> PumpAmmHotPathRefreshDecision {
+    let map = last_by_mint.lock();
+    match map.get(&base_mint).copied() {
+        Some(prev) => {
+            let age = now.saturating_duration_since(prev);
+            if age < PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN {
+                PumpAmmHotPathRefreshDecision::Suppress {
+                    age,
+                    remaining: PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN.saturating_sub(age),
+                }
+            } else {
+                PumpAmmHotPathRefreshDecision::Publish
+            }
+        }
+        None => PumpAmmHotPathRefreshDecision::Publish,
+    }
+}
+
+/// Call after `nats.publish` returned `Ok(true)` for the hot-path async refresh — starts per-mint cooldown.
+fn record_pump_amm_hot_path_refresh_after_success(
+    last_by_mint: &ParkingMutex<HashMap<Pubkey, Instant>>,
+    base_mint: Pubkey,
+    now: Instant,
+) {
+    last_by_mint.lock().insert(base_mint, now);
 }
 
 fn extract_owner_mint_delta_raw(
@@ -1523,6 +1570,11 @@ struct ExecutionContext {
 
     /// Golden Replay Mode: true = no RPC/TX send, early-exit for SIMFAIL intents.
     replay_mode: bool,
+
+    /// Scope-2: last `Instant` a hot-path async `EnsurePumpAmmPoolAccounts` was **successfully** published
+    /// (`nats.publish` → `Ok(true)`) per base mint. Dedupes within [`PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN`].
+    /// No RPC; in-memory only.
+    pump_amm_hot_path_refresh_last: Arc<ParkingMutex<HashMap<Pubkey, Instant>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2079,11 +2131,15 @@ impl ExecutionContext {
     /// Hot-path healing: publish `EnsurePumpAmmPoolAccounts` to market-data with `force_refresh=true`
     /// without registering for ControlResponse (no wait, no retry in the same intent).
     /// RPC work happens only in market-data (Cold Path); this path is fire-and-forget NATS publish.
+    /// On `Ok(true)` from publish, updates per-mint cooldown ([`record_pump_amm_hot_path_refresh_after_success`])
+    /// when `base_mint_pk_for_cooldown` is `Some`.
     fn fire_pump_amm_pool_accounts_refresh_async(
         nats: &NatsClient,
         run_id: String,
         base_mint: String,
         pool_address_hint: Option<String>,
+        cooldown_last: Arc<ParkingMutex<HashMap<Pubkey, Instant>>>,
+        base_mint_pk_for_cooldown: Option<Pubkey>,
     ) {
         let nats = nats.clone_for_spawned_publish();
         tokio::spawn(async move {
@@ -2102,7 +2158,15 @@ impl ExecutionContext {
             req.force_refresh = true;
 
             match nats.publish(TOPIC_CONTROL_REQUESTS, &req).await {
-                Ok(true) => {}
+                Ok(true) => {
+                    if let Some(pk) = base_mint_pk_for_cooldown {
+                        record_pump_amm_hot_path_refresh_after_success(
+                            &cooldown_last,
+                            pk,
+                            Instant::now(),
+                        );
+                    }
+                }
                 Ok(false) => {
                     warn!(
                         request_id = %req.request_id,
@@ -5362,6 +5426,7 @@ async fn main() -> Result<()> {
         arb_validated: std::sync::atomic::AtomicU64::new(0),
         arb_executed: std::sync::atomic::AtomicU64::new(0),
         replay_mode: false,
+        pump_amm_hot_path_refresh_last: Arc::new(ParkingMutex::new(HashMap::new())),
     };
 
     // Sync kill switch to global metric so control plane /status can display correct state after restarts
@@ -6882,6 +6947,7 @@ async fn build_replay_context(
         arb_validated: std::sync::atomic::AtomicU64::new(0),
         arb_executed: std::sync::atomic::AtomicU64::new(0),
         replay_mode: true,
+        pump_amm_hot_path_refresh_last: Arc::new(ParkingMutex::new(HashMap::new())),
     };
 
     Ok(ctx)
@@ -8027,26 +8093,61 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             && is_pump_amm_structural_sim_error(sim_result.error_code.as_deref())
         {
             let pool_hint_str = pump_amm_pool_market_hint_pk(&intent, ctx).map(|p| p.to_string());
-            warn!(
-                intent_id = %intent.intent_id,
-                mint = %intent.resources.input_mint,
-                pool_hint = ?pool_hint_str,
-                sim_error = ?sim_result.error_code,
-                "PumpSwap regular SELL: simulation structural error (6023/Overflow family); triggering async non-blocking EnsurePumpAmmPoolAccounts force_refresh to market-data (no wait, no retry this intent)"
-            );
-            if let Some(ref nats) = ctx.nats {
-                ExecutionContext::fire_pump_amm_pool_accounts_refresh_async(
-                    nats,
-                    ctx.run_id.clone(),
-                    intent.resources.input_mint.clone(),
-                    pool_hint_str,
-                );
-            } else {
-                warn!(
-                    intent_id = %intent.intent_id,
-                    mint = %intent.resources.input_mint,
-                    "PumpSwap regular SELL: async healing skipped — NATS not connected"
-                );
+            let base_mint_parse = Pubkey::from_str(&intent.resources.input_mint);
+            let refresh_decision = match base_mint_parse {
+                Ok(pk) => try_pump_amm_hot_path_refresh_publish(
+                    &ctx.pump_amm_hot_path_refresh_last,
+                    pk,
+                    Instant::now(),
+                ),
+                Err(_) => {
+                    debug!(
+                        intent_id = %intent.intent_id,
+                        mint = %intent.resources.input_mint,
+                        "PumpSwap regular SELL: base_mint not a valid pubkey; async refresh cooldown not applied"
+                    );
+                    PumpAmmHotPathRefreshDecision::Publish
+                }
+            };
+
+            match refresh_decision {
+                PumpAmmHotPathRefreshDecision::Publish => {
+                    warn!(
+                        intent_id = %intent.intent_id,
+                        mint = %intent.resources.input_mint,
+                        pool_hint = ?pool_hint_str,
+                        sim_error = ?sim_result.error_code,
+                        "PumpSwap regular SELL: simulation structural error (6023/Overflow family); triggering async non-blocking EnsurePumpAmmPoolAccounts force_refresh to market-data (no wait, no retry this intent)"
+                    );
+                    if let Some(ref nats) = ctx.nats {
+                        ExecutionContext::fire_pump_amm_pool_accounts_refresh_async(
+                            nats,
+                            ctx.run_id.clone(),
+                            intent.resources.input_mint.clone(),
+                            pool_hint_str,
+                            Arc::clone(&ctx.pump_amm_hot_path_refresh_last),
+                            base_mint_parse.ok(),
+                        );
+                    } else {
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            mint = %intent.resources.input_mint,
+                            "PumpSwap regular SELL: async healing skipped — NATS not connected"
+                        );
+                    }
+                }
+                PumpAmmHotPathRefreshDecision::Suppress { age, remaining } => {
+                    warn!(
+                        intent_id = %intent.intent_id,
+                        mint = %intent.resources.input_mint,
+                        pool_hint = ?pool_hint_str,
+                        sim_error = ?sim_result.error_code,
+                        cooldown_secs = PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN.as_secs(),
+                        age_ms = age.as_millis(),
+                        remaining_ms = remaining.as_millis(),
+                        "PumpSwap regular SELL: structural sim error again; suppressing duplicate async EnsurePumpAmmPoolAccounts publish (hot-path cooldown, no NATS publish)"
+                    );
+                }
             }
         }
 
@@ -9875,14 +9976,18 @@ async fn spawn_rebroadcast_loop(
 mod execution_engine_tests {
     use super::{
         is_pump_amm_structural_sim_error, is_regular_momentum_hot_path_sell,
-        pump_amm_pool_market_hint_merge, select_best_route, DiscoveryRequestOutcome,
-        RouteCandidate,
+        pump_amm_pool_market_hint_merge, record_pump_amm_hot_path_refresh_after_success,
+        select_best_route, try_pump_amm_hot_path_refresh_publish, DiscoveryRequestOutcome,
+        PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
     };
     use ironcrab::ipc::{
         ControlResponse, ControlResponseStatus, ExplicitAmount, IntentOrigin, IntentTier,
         TradeIntent, TradeResources, TradeSide, TradingRegime,
     };
+    use parking_lot::Mutex as ParkingMutex;
     use solana_sdk::pubkey::Pubkey;
+    use std::collections::HashMap;
+    use std::time::Instant;
 
     #[test]
     fn pump_amm_structural_sim_error_matches_liquidation_pattern() {
@@ -10013,5 +10118,72 @@ mod execution_engine_tests {
             pump_amm_pool_market_hint_merge(Some(from_intent), None),
             Some(from_intent)
         );
+    }
+
+    #[test]
+    fn pump_amm_hot_path_refresh_cooldown_suppresses_repeat_then_allows_after_window() {
+        let map = ParkingMutex::new(HashMap::new());
+        let mint = Pubkey::new_unique();
+        let t0 = Instant::now();
+        assert!(matches!(
+            try_pump_amm_hot_path_refresh_publish(&map, mint, t0),
+            PumpAmmHotPathRefreshDecision::Publish
+        ));
+        // Cooldown starts only after a successful NATS publish (simulated here).
+        record_pump_amm_hot_path_refresh_after_success(&map, mint, t0);
+        let r = try_pump_amm_hot_path_refresh_publish(
+            &map,
+            mint,
+            t0 + std::time::Duration::from_millis(10),
+        );
+        match r {
+            PumpAmmHotPathRefreshDecision::Suppress { age, remaining } => {
+                assert!(age <= std::time::Duration::from_millis(10));
+                assert!(remaining > std::time::Duration::ZERO);
+            }
+            _ => panic!("expected suppress"),
+        }
+        let t_after = t0 + PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN + std::time::Duration::from_millis(1);
+        assert!(matches!(
+            try_pump_amm_hot_path_refresh_publish(&map, mint, t_after),
+            PumpAmmHotPathRefreshDecision::Publish
+        ));
+    }
+
+    /// Without a successful publish, repeated try must not suppress (NATS drop must not start cooldown).
+    #[test]
+    fn pump_amm_hot_path_refresh_no_cooldown_without_successful_publish() {
+        let map = ParkingMutex::new(HashMap::new());
+        let mint = Pubkey::new_unique();
+        let t0 = Instant::now();
+        assert!(matches!(
+            try_pump_amm_hot_path_refresh_publish(&map, mint, t0),
+            PumpAmmHotPathRefreshDecision::Publish
+        ));
+        assert!(matches!(
+            try_pump_amm_hot_path_refresh_publish(
+                &map,
+                mint,
+                t0 + std::time::Duration::from_millis(10)
+            ),
+            PumpAmmHotPathRefreshDecision::Publish
+        ));
+    }
+
+    #[test]
+    fn pump_amm_hot_path_refresh_cooldown_is_per_base_mint() {
+        let map = ParkingMutex::new(HashMap::new());
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let t0 = Instant::now();
+        assert!(matches!(
+            try_pump_amm_hot_path_refresh_publish(&map, mint_a, t0),
+            PumpAmmHotPathRefreshDecision::Publish
+        ));
+        record_pump_amm_hot_path_refresh_after_success(&map, mint_a, t0);
+        assert!(matches!(
+            try_pump_amm_hot_path_refresh_publish(&map, mint_b, t0),
+            PumpAmmHotPathRefreshDecision::Publish
+        ));
     }
 }
