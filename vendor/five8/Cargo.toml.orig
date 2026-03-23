@@ -1,0 +1,27 @@
+[package]
+name = "five8"
+version = "1.0.0"
+edition = "2021"
+resolver = "2"
+description = "Fast base58 encoding and decoding for 32-byte and 64-byte arrays."
+license = "MIT"
+readme = "README.md"
+homepage.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[features]
+dev-utils = [] # internal use only
+
+[dependencies]
+five8_core.workspace = true
+
+[dev-dependencies]
+bs58 = "0.5.1"
+five8 = { path = "." }
+five8_const = { workspace = true }
+proptest = "1.5.0"
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg=docsrs"]

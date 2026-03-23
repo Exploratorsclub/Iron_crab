@@ -120,6 +120,41 @@ use spl_token_2022::{
 };
 use std::sync::atomic::AtomicBool;
 
+/// Primary `intent.resources.pools[0]`, else cache base→pool mapping.
+#[inline]
+fn pump_amm_pool_market_hint_merge(
+    intent_pool: Option<Pubkey>,
+    cache_pool: Option<Pubkey>,
+) -> Option<Pubkey> {
+    intent_pool.or(cache_pool)
+}
+
+/// PumpSwap AMM: pool market address for EnsurePumpAmmPoolAccounts / recovery.
+/// Primary: `intent.resources.pools[0]` (explicit route + resource lock). Fallback: base→pool in LivePoolCache.
+fn pump_amm_pool_market_hint_pk(intent: &TradeIntent, ctx: &ExecutionContext) -> Option<Pubkey> {
+    let intent_pool = intent
+        .resources
+        .pools
+        .first()
+        .and_then(|s| Pubkey::from_str(s).ok());
+    let base_mint = Pubkey::from_str(&intent.resources.input_mint).ok()?;
+    let cache_pool = ctx
+        .live_pool_cache
+        .as_ref()
+        .and_then(|c| c.get_pump_amm_pool_address_by_base_mint(&base_mint));
+    if let (Some(a), Some(b)) = (intent_pool, cache_pool) {
+        if a != b {
+            warn!(
+                intent_id = %intent.intent_id,
+                intent_pool = %a,
+                cache_pool = %b,
+                "PumpSwap pool hint: intent.resources.pools[0] overrides LivePoolCache base→pool (differs)"
+            );
+        }
+    }
+    pump_amm_pool_market_hint_merge(intent_pool, cache_pool)
+}
+
 fn extract_owner_mint_delta_raw(
     tx: &EncodedConfirmedTransactionWithStatusMeta,
     owner: &Pubkey,
@@ -1722,7 +1757,7 @@ impl ExecutionContext {
                             .map(|p| p.to_string());
                         info!(mint = %mint_str, pool_address = ?pool_hint, "6005-retry: pool_accounts cache miss, requesting discovery from market-data");
                         match self
-                            .request_discovery_and_wait(&mint_str, pool_hint.as_deref())
+                            .request_discovery_and_wait(&mint_str, pool_hint.as_deref(), false)
                             .await
                         {
                             DiscoveryRequestOutcome::Ok => {
@@ -1798,7 +1833,7 @@ impl ExecutionContext {
                     .and_then(|c| c.get_pump_amm_pool_address_by_base_mint(&mint))
                     .map(|p| p.to_string());
                 match self
-                    .request_discovery_and_wait(&mint_str, pool_hint.as_deref())
+                    .request_discovery_and_wait(&mint_str, pool_hint.as_deref(), false)
                     .await
                 {
                     DiscoveryRequestOutcome::Ok => {
@@ -1904,10 +1939,12 @@ impl ExecutionContext {
     /// Sends EnsurePumpAmmPoolAccounts, waits bounded for ControlResponse, returns outcome.
     /// Does NOT write to SLAVE cache — market-data publishes to JetStream, SLAVE consumes.
     /// When pool_address is provided, market-data uses fast getAccount path (<1s) instead of slow getProgramAccounts.
+    /// `force_refresh`: market-data must re-resolve pool_accounts via RPC (not cache-first 14er set).
     async fn request_discovery_and_wait(
         &self,
         base_mint: &str,
         pool_address: Option<&str>,
+        force_refresh: bool,
     ) -> DiscoveryRequestOutcome {
         let Some(ref nats) = self.nats else {
             warn!(
@@ -1937,12 +1974,14 @@ impl ExecutionContext {
             },
         );
         req.pool_address_hint = pool_address.map(String::from);
+        req.force_refresh = force_refresh;
 
         info!(
             request_id = %request_id,
             base_mint = %base_mint,
             target = "market-data",
             pool_address = ?pool_address,
+            force_refresh = %force_refresh,
             "I-24d Discovery: publishing EnsurePumpAmmPoolAccounts request"
         );
 
@@ -2379,6 +2418,7 @@ impl ExecutionContext {
                                             .request_discovery_and_wait(
                                                 &mint.to_string(),
                                                 Some(pool_id.as_str()),
+                                                false,
                                             )
                                             .await
                                         {
@@ -2477,7 +2517,11 @@ impl ExecutionContext {
                                 .and_then(|c| c.get_pump_amm_pool_address_by_base_mint(&mint))
                                 .map(|p| p.to_string());
                             match ctx
-                                .request_discovery_and_wait(&mint.to_string(), pool_hint.as_deref())
+                                .request_discovery_and_wait(
+                                    &mint.to_string(),
+                                    pool_hint.as_deref(),
+                                    false,
+                                )
                                 .await
                             {
                                 DiscoveryRequestOutcome::Ok => {
@@ -5321,7 +5365,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let ctx = Arc::new(ctx);
+    let ctx: Arc<ExecutionContext> = Arc::new(ctx);
 
     // LivePoolCache is now synced via NATS from market-data (Single Source of Truth)
     // No longer spawning cache_geyser_task - execution-engine subscribes to PoolCacheUpdates instead
@@ -7599,277 +7643,373 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // Planned tx (RS-2.1): deterministic tx plan + plan_hash
     // NOTE: Cross-DEX arb intents are NOT single-swap plans and therefore must not go through
     // tx_builder::build_tx_plan (which requires metadata.dex and pools_len==1).
-    let (tx_plan, plan_hash_str) = {
-        info!(intent_id = %intent.intent_id, "Building tx plan");
+    let checks_len_before_tx_plan_build = checks.len();
+    let mut pump_amm_recovery_attempted = false;
+    let (
+        tx_plan,
+        plan_hash_str,
+        sim_result,
+        requires_bundle,
+        bundle_tip_ix,
+        wallet_pubkey,
+        bundle_tip_lamports,
+    ) = loop {
+        if pump_amm_recovery_attempted {
+            checks.truncate(checks_len_before_tx_plan_build);
+        }
+        let (tx_plan, plan_hash_str) = {
+            info!(intent_id = %intent.intent_id, "Building tx plan");
 
-        let wallet_pubkey = match ctx.wallet_pubkey {
-            Some(pk) => pk,
-            None => {
-                let reason = RejectReason::InternalError;
-                checks.push(CheckResult {
-                    check_name: "tx_plan".to_string(),
-                    passed: false,
-                    reason_code: Some(reason.to_string()),
-                    details: Some("wallet_pubkey_unavailable (keys not loaded)".to_string()),
-                });
-                ctx.lock_manager.release_locks(&intent.intent_id);
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-            }
-        };
-
-        if is_cross_dex_arb {
-            info!(intent_id = %intent.intent_id, "Planning cross-DEX arb tx (atomic bundle)");
-
-            let Some(ref handler) = ctx.cross_dex_handler else {
-                let reason = RejectReason::ArbHandlerNotConfigured;
-                checks.push(CheckResult {
-                    check_name: "cross_dex_handler".to_string(),
-                    passed: false,
-                    reason_code: Some(reason.to_string()),
-                    details: Some("Cross-DEX handler not initialized".to_string()),
-                });
-                ctx.lock_manager.release_locks(&intent.intent_id);
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            let wallet_pubkey = match ctx.wallet_pubkey {
+                Some(pk) => pk,
+                None => {
+                    let reason = RejectReason::InternalError;
+                    checks.push(CheckResult {
+                        check_name: "tx_plan".to_string(),
+                        passed: false,
+                        reason_code: Some(reason.to_string()),
+                        details: Some("wallet_pubkey_unavailable (keys not loaded)".to_string()),
+                    });
+                    ctx.lock_manager.release_locks(&intent.intent_id);
+                    return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+                }
             };
 
-            // Use the same fee policy estimates that will be used for the actual send path.
-            let (_base_fee, _priority_fee_lamports, total_cost_lamports) =
-                effective_fee_policy.estimate_tx_cost(&intent);
+            if is_cross_dex_arb {
+                info!(intent_id = %intent.intent_id, "Planning cross-DEX arb tx (atomic bundle)");
 
-            // Cross-DEX arb must be revalidated with live quotes before plan is built.
-            let validation = match handler
-                .validate_arb_opportunity(&intent, total_cost_lamports)
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(error = %e, "Cross-DEX validation failed");
-                    let reason = RejectReason::ArbValidationError;
+                let Some(ref handler) = ctx.cross_dex_handler else {
+                    let reason = RejectReason::ArbHandlerNotConfigured;
+                    checks.push(CheckResult {
+                        check_name: "cross_dex_handler".to_string(),
+                        passed: false,
+                        reason_code: Some(reason.to_string()),
+                        details: Some("Cross-DEX handler not initialized".to_string()),
+                    });
+                    ctx.lock_manager.release_locks(&intent.intent_id);
+                    return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+                };
+
+                // Use the same fee policy estimates that will be used for the actual send path.
+                let (_base_fee, _priority_fee_lamports, total_cost_lamports) =
+                    effective_fee_policy.estimate_tx_cost(&intent);
+
+                // Cross-DEX arb must be revalidated with live quotes before plan is built.
+                let validation = match handler
+                    .validate_arb_opportunity(&intent, total_cost_lamports)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "Cross-DEX validation failed");
+                        let reason = RejectReason::ArbValidationError;
+                        checks.push(CheckResult {
+                            check_name: "cross_dex_validation".to_string(),
+                            passed: false,
+                            reason_code: Some(reason.to_string()),
+                            details: Some(e.to_string()),
+                        });
+                        ctx.lock_manager.release_locks(&intent.intent_id);
+                        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason)
+                            .await;
+                    }
+                };
+
+                ctx.arb_validated
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                if !validation.is_valid {
+                    let reason = RejectReason::ArbSpreadInsufficient;
                     checks.push(CheckResult {
                         check_name: "cross_dex_validation".to_string(),
                         passed: false,
                         reason_code: Some(reason.to_string()),
-                        details: Some(e.to_string()),
+                        details: validation.reject_reason.clone(),
                     });
                     ctx.lock_manager.release_locks(&intent.intent_id);
                     return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
                 }
-            };
 
-            ctx.arb_validated
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            if !validation.is_valid {
-                let reason = RejectReason::ArbSpreadInsufficient;
                 checks.push(CheckResult {
                     check_name: "cross_dex_validation".to_string(),
-                    passed: false,
-                    reason_code: Some(reason.to_string()),
-                    details: validation.reject_reason.clone(),
+                    passed: true,
+                    reason_code: None,
+                    details: Some(format!(
+                        "spread={}bps profit={}lamports tx_cost={}lamports",
+                        validation.actual_spread_bps,
+                        validation.estimated_profit_lamports,
+                        total_cost_lamports
+                    )),
                 });
-                ctx.lock_manager.release_locks(&intent.intent_id);
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-            }
 
-            checks.push(CheckResult {
-                check_name: "cross_dex_validation".to_string(),
-                passed: true,
-                reason_code: None,
-                details: Some(format!(
-                    "spread={}bps profit={}lamports tx_cost={}lamports",
-                    validation.actual_spread_bps,
-                    validation.estimated_profit_lamports,
-                    total_cost_lamports
-                )),
-            });
+                // Build the two-leg swap instruction plan.
+                let plan = match handler.build_swap_plan(&intent, &validation).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let reason = RejectReason::UnsupportedIntent;
+                        checks.push(CheckResult {
+                            check_name: "tx_plan".to_string(),
+                            passed: false,
+                            reason_code: Some(reason.to_string()),
+                            details: Some(format!("cross_dex_plan_error:{e}")),
+                        });
+                        ctx.lock_manager.release_locks(&intent.intent_id);
+                        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason)
+                            .await;
+                    }
+                };
 
-            // Build the two-leg swap instruction plan.
-            let plan = match handler.build_swap_plan(&intent, &validation).await {
-                Ok(p) => p,
-                Err(e) => {
-                    let reason = RejectReason::UnsupportedIntent;
-                    checks.push(CheckResult {
-                        check_name: "tx_plan".to_string(),
-                        passed: false,
-                        reason_code: Some(reason.to_string()),
-                        details: Some(format!("cross_dex_plan_error:{e}")),
-                    });
-                    ctx.lock_manager.release_locks(&intent.intent_id);
-                    return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-                }
-            };
+                // Include compute budget ixs so simulation matches send (and CU limit is sufficient).
+                // P2: Use dynamic priority fees if available from Geyser
+                let compute_units = effective_fee_policy.compute_units_for_intent(&intent);
+                let micro_lamports_per_cu =
+                    ctx.get_priority_fee_for_intent(&intent, &effective_fee_policy);
 
-            // Include compute budget ixs so simulation matches send (and CU limit is sufficient).
-            // P2: Use dynamic priority fees if available from Geyser
-            let compute_units = effective_fee_policy.compute_units_for_intent(&intent);
-            let micro_lamports_per_cu =
-                ctx.get_priority_fee_for_intent(&intent, &effective_fee_policy);
-
-            let mut ixs = Vec::new();
-            ixs.push(
-                ironcrab::solana::compute_budget_helper::set_compute_unit_limit(compute_units),
-            );
-            if micro_lamports_per_cu > 0 {
+                let mut ixs = Vec::new();
                 ixs.push(
-                    ironcrab::solana::compute_budget_helper::set_compute_unit_price(
-                        micro_lamports_per_cu,
-                    ),
+                    ironcrab::solana::compute_budget_helper::set_compute_unit_limit(compute_units),
                 );
-            }
-            ixs.extend(plan.buy_instructions);
-            ixs.extend(plan.sell_instructions);
-
-            let tx_plan = tx_builder::TxPlan { instructions: ixs };
-            let plan_hash_str = tx_plan.hash_string();
-            checks.push(CheckResult {
-                check_name: "tx_plan".to_string(),
-                passed: true,
-                reason_code: None,
-                details: Some(format!(
-                    "ix_count={} plan_hash={} buy_dex={} sell_dex={}",
-                    tx_plan.instructions.len(),
-                    plan_hash_str,
-                    plan.buy_dex,
-                    plan.sell_dex
-                )),
-            });
-
-            (tx_plan, plan_hash_str)
-        } else {
-            // Option C: Pass LivePoolCache for zero-RPC quote calculation
-            match tx_builder::build_tx_plan(
-                &intent,
-                wallet_pubkey,
-                Arc::clone(&ctx.rpc),
-                ctx.live_pool_cache.as_ref(),
-                sell_balance_hint,
-                intent.origin_type == IntentOrigin::ExecutionMevB,
-            )
-            .await
-            {
-                tx_builder::TxPlanOutcome::Planned(plan) => {
-                    let plan_hash_str = plan.hash_string();
-                    checks.push(CheckResult {
-                        check_name: "tx_plan".to_string(),
-                        passed: true,
-                        reason_code: None,
-                        details: Some(format!(
-                            "ix_count={} plan_hash={}",
-                            plan.instructions.len(),
-                            plan_hash_str
-                        )),
-                    });
-                    (plan, plan_hash_str)
+                if micro_lamports_per_cu > 0 {
+                    ixs.push(
+                        ironcrab::solana::compute_budget_helper::set_compute_unit_price(
+                            micro_lamports_per_cu,
+                        ),
+                    );
                 }
-                tx_builder::TxPlanOutcome::Unsupported(u) => {
-                    checks.push(CheckResult {
-                        check_name: "tx_plan".to_string(),
-                        passed: false,
-                        reason_code: Some(u.reason.to_string()),
-                        details: Some(u.details),
-                    });
-                    ctx.lock_manager.release_locks(&intent.intent_id);
-                    return emit_rejected_decision(ctx, decision_id, &intent, checks, u.reason)
-                        .await;
-                }
-            }
-        }
-    };
+                ixs.extend(plan.buy_instructions);
+                ixs.extend(plan.sell_instructions);
 
-    let plan_hash: Option<String> = Some(plan_hash_str.clone());
-
-    // === P1: Check if bundle required for atomic execution ===
-    let requires_bundle = intent.requires_bundle();
-
-    // Debug: Log bundle requirement and send_enabled status
-    info!(
-        intent_id = %intent.intent_id,
-        requires_bundle = %requires_bundle,
-        send_enabled = %config.send_enabled,
-        jito_configured = %ctx.jito_client.is_some(),
-        bundle_tip_in_intent = ?intent.bundle_tip_lamports,
-        "Bundle requirement check"
-    );
-
-    let wallet_pubkey = ctx
-        .wallet_pubkey
-        .expect("wallet_pubkey must be present after successful planning");
-
-    if requires_bundle && config.send_enabled && ctx.jito_client.is_none() {
-        // Intent requires bundle but Jito not configured
-        let reason = RejectReason::BundleNotConfigured;
-        checks.push(CheckResult {
-            check_name: "bundle_config".to_string(),
-            passed: false,
-            reason_code: Some(reason.to_string()),
-            details: Some("Intent requires atomic bundle but Jito not configured".to_string()),
-        });
-        ctx.lock_manager.release_locks(&intent.intent_id);
-        return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
-    }
-
-    // If bundle execution is required, include the tip instruction in both simulation and send.
-    // This preserves simulate-gated correctness (we simulate exactly what we will send).
-    let mut bundle_tip_ix: Option<solana_sdk::instruction::Instruction> = None;
-    let mut bundle_tip_lamports: Option<u64> = None;
-    if requires_bundle && config.send_enabled {
-        let tip_lamports = intent
-            .bundle_tip_lamports
-            .unwrap_or(config.jito_tip_lamports);
-        info!(
-            intent_id = %intent.intent_id,
-            tip_lamports = %tip_lamports,
-            "Building Jito tip instruction for bundle"
-        );
-        let jito_client = ctx
-            .jito_client
-            .as_ref()
-            .expect("bundle_config gate ensures jito_client is present");
-
-        match jito_client.build_tip_instruction(&wallet_pubkey, tip_lamports) {
-            Ok(ix) => {
-                info!(
-                    intent_id = %intent.intent_id,
-                    tip_lamports = %tip_lamports,
-                    tip_account = %ix.accounts[1].pubkey,
-                    "✅ Tip instruction built successfully"
-                );
-                bundle_tip_ix = Some(ix);
-                bundle_tip_lamports = Some(tip_lamports);
-            }
-            Err(e) => {
-                let reason = RejectReason::InternalError;
+                let tx_plan = tx_builder::TxPlan { instructions: ixs };
+                let plan_hash_str = tx_plan.hash_string();
                 checks.push(CheckResult {
-                    check_name: "bundle_tip_ix".to_string(),
-                    passed: false,
-                    reason_code: Some(reason.to_string()),
-                    details: Some(format!("failed to build tip instruction: {e}")),
+                    check_name: "tx_plan".to_string(),
+                    passed: true,
+                    reason_code: None,
+                    details: Some(format!(
+                        "ix_count={} plan_hash={} buy_dex={} sell_dex={}",
+                        tx_plan.instructions.len(),
+                        plan_hash_str,
+                        plan.buy_dex,
+                        plan.sell_dex
+                    )),
                 });
-                ctx.lock_manager.release_locks(&intent.intent_id);
-                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+
+                (tx_plan, plan_hash_str)
+            } else {
+                // Option C: Pass LivePoolCache for zero-RPC quote calculation
+                match tx_builder::build_tx_plan(
+                    &intent,
+                    wallet_pubkey,
+                    Arc::clone(&ctx.rpc),
+                    ctx.live_pool_cache.as_ref(),
+                    sell_balance_hint,
+                    intent.origin_type == IntentOrigin::ExecutionMevB,
+                )
+                .await
+                {
+                    tx_builder::TxPlanOutcome::Planned(plan) => {
+                        let plan_hash_str = plan.hash_string();
+                        checks.push(CheckResult {
+                            check_name: "tx_plan".to_string(),
+                            passed: true,
+                            reason_code: None,
+                            details: Some(format!(
+                                "ix_count={} plan_hash={}",
+                                plan.instructions.len(),
+                                plan_hash_str
+                            )),
+                        });
+                        (plan, plan_hash_str)
+                    }
+                    tx_builder::TxPlanOutcome::Unsupported(u) => {
+                        checks.push(CheckResult {
+                            check_name: "tx_plan".to_string(),
+                            passed: false,
+                            reason_code: Some(u.reason.to_string()),
+                            details: Some(u.details),
+                        });
+                        ctx.lock_manager.release_locks(&intent.intent_id);
+                        return emit_rejected_decision(ctx, decision_id, &intent, checks, u.reason)
+                            .await;
+                    }
+                }
             }
-        }
-    } else {
+        };
+
+        // === P1: Check if bundle required for atomic execution ===
+        let requires_bundle = intent.requires_bundle();
+
+        // Debug: Log bundle requirement and send_enabled status
         info!(
             intent_id = %intent.intent_id,
             requires_bundle = %requires_bundle,
             send_enabled = %config.send_enabled,
-            "⚠️ NOT building tip instruction (condition not met)"
+            jito_configured = %ctx.jito_client.is_some(),
+            bundle_tip_in_intent = ?intent.bundle_tip_lamports,
+            "Bundle requirement check"
         );
-    }
 
-    let tx_plan_for_sim = if let Some(ref ix) = bundle_tip_ix {
-        let mut ixs = tx_plan.instructions.clone();
-        ixs.push(ix.clone());
-        tx_builder::TxPlan { instructions: ixs }
-    } else {
-        tx_plan.clone()
+        let wallet_pubkey = ctx
+            .wallet_pubkey
+            .expect("wallet_pubkey must be present after successful planning");
+
+        if requires_bundle && config.send_enabled && ctx.jito_client.is_none() {
+            // Intent requires bundle but Jito not configured
+            let reason = RejectReason::BundleNotConfigured;
+            checks.push(CheckResult {
+                check_name: "bundle_config".to_string(),
+                passed: false,
+                reason_code: Some(reason.to_string()),
+                details: Some("Intent requires atomic bundle but Jito not configured".to_string()),
+            });
+            ctx.lock_manager.release_locks(&intent.intent_id);
+            return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+        }
+
+        // If bundle execution is required, include the tip instruction in both simulation and send.
+        // This preserves simulate-gated correctness (we simulate exactly what we will send).
+        let mut bundle_tip_ix: Option<solana_sdk::instruction::Instruction> = None;
+        let mut bundle_tip_lamports: Option<u64> = None;
+        if requires_bundle && config.send_enabled {
+            let tip_lamports = intent
+                .bundle_tip_lamports
+                .unwrap_or(config.jito_tip_lamports);
+            info!(
+                intent_id = %intent.intent_id,
+                tip_lamports = %tip_lamports,
+                "Building Jito tip instruction for bundle"
+            );
+            let jito_client = ctx
+                .jito_client
+                .as_ref()
+                .expect("bundle_config gate ensures jito_client is present");
+
+            match jito_client.build_tip_instruction(&wallet_pubkey, tip_lamports) {
+                Ok(ix) => {
+                    info!(
+                        intent_id = %intent.intent_id,
+                        tip_lamports = %tip_lamports,
+                        tip_account = %ix.accounts[1].pubkey,
+                        "✅ Tip instruction built successfully"
+                    );
+                    bundle_tip_ix = Some(ix);
+                    bundle_tip_lamports = Some(tip_lamports);
+                }
+                Err(e) => {
+                    let reason = RejectReason::InternalError;
+                    checks.push(CheckResult {
+                        check_name: "bundle_tip_ix".to_string(),
+                        passed: false,
+                        reason_code: Some(reason.to_string()),
+                        details: Some(format!("failed to build tip instruction: {e}")),
+                    });
+                    ctx.lock_manager.release_locks(&intent.intent_id);
+                    return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+                }
+            }
+        } else {
+            info!(
+                intent_id = %intent.intent_id,
+                requires_bundle = %requires_bundle,
+                send_enabled = %config.send_enabled,
+                "⚠️ NOT building tip instruction (condition not met)"
+            );
+        }
+
+        let tx_plan_for_sim = if let Some(ref ix) = bundle_tip_ix {
+            let mut ixs = tx_plan.instructions.clone();
+            ixs.push(ix.clone());
+            tx_builder::TxPlan { instructions: ixs }
+        } else {
+            tx_plan.clone()
+        };
+
+        // === Simulate (P0: simulate-gated) ===
+        info!(intent_id = %intent.intent_id, "Running simulation");
+
+        let sim_result = simulate_transaction(ctx, wallet_pubkey, &tx_plan_for_sim).await;
+
+        if sim_result.success {
+            break (
+                tx_plan,
+                plan_hash_str,
+                sim_result,
+                requires_bundle,
+                bundle_tip_ix,
+                wallet_pubkey,
+                bundle_tip_lamports,
+            );
+        }
+
+        // PumpSwap SELL: stale/wrong creator-vault accounts in cached pool_accounts → Overflow Custom(6023).
+        // Cold-path recovery: one EnsurePumpAmmPoolAccounts with force_refresh (RPC market parse).
+        if !pump_amm_recovery_attempted
+            && is_liquidation_sell
+            && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pump_amm")
+            && sim_result
+                .error_code
+                .as_ref()
+                .map(|e| e.contains("6023") || e.contains("Overflow") || e.contains("0x1787"))
+                .unwrap_or(false)
+        {
+            let base_mint_pk = match Pubkey::from_str(&intent.resources.input_mint) {
+                Ok(p) => p,
+                Err(_) => {
+                    break (
+                        tx_plan,
+                        plan_hash_str,
+                        sim_result,
+                        requires_bundle,
+                        bundle_tip_ix,
+                        wallet_pubkey,
+                        bundle_tip_lamports,
+                    )
+                }
+            };
+            let pool_pk = pump_amm_pool_market_hint_pk(&intent, ctx);
+            if let Some(pool_pk) = pool_pk {
+                if let DiscoveryRequestOutcome::Ok = ctx
+                    .request_discovery_and_wait(
+                        &intent.resources.input_mint,
+                        Some(&pool_pk.to_string()),
+                        true,
+                    )
+                    .await
+                {
+                    if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                        if wait_for_usable_pump_amm_cache_state(
+                            cache,
+                            &base_mint_pk,
+                            DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                            DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                        )
+                        .await
+                        {
+                            pump_amm_recovery_attempted = true;
+                            warn!(
+                                intent_id = %intent.intent_id,
+                                pool = %pool_pk,
+                                "PumpSwap liquidation: simulation 6023/Overflow — force-refresh pool_accounts (market-data RPC), rebuilding tx (one retry)"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        break (
+            tx_plan,
+            plan_hash_str,
+            sim_result,
+            requires_bundle,
+            bundle_tip_ix,
+            wallet_pubkey,
+            bundle_tip_lamports,
+        );
     };
 
-    // === Simulate (P0: simulate-gated) ===
-    info!(intent_id = %intent.intent_id, "Running simulation");
-
-    let sim_result = simulate_transaction(ctx, wallet_pubkey, &tx_plan_for_sim).await;
+    let plan_hash: Option<String> = Some(plan_hash_str.clone());
 
     if !sim_result.success {
         let reason = RejectReason::SimFailed;
@@ -9628,8 +9768,11 @@ async fn spawn_rebroadcast_loop(
 
 #[cfg(test)]
 mod execution_engine_tests {
-    use super::{select_best_route, DiscoveryRequestOutcome, RouteCandidate};
+    use super::{
+        pump_amm_pool_market_hint_merge, select_best_route, DiscoveryRequestOutcome, RouteCandidate,
+    };
     use ironcrab::ipc::{ControlResponse, ControlResponseStatus};
+    use solana_sdk::pubkey::Pubkey;
 
     /// I-24d: Verifies that ControlResponse status maps correctly to DiscoveryRequestOutcome.
     /// NotFound and Error must NOT be confused with Timeout (terminal outcomes are distinct).
@@ -9696,5 +9839,23 @@ mod execution_engine_tests {
         assert_eq!(best.dex, "orca");
         assert_eq!(best.pool_id, "pool-2");
         assert_eq!(best.amount_out, 200);
+    }
+
+    #[test]
+    fn pump_amm_pool_hint_prefers_intent_pool_over_cache() {
+        let from_intent = Pubkey::new_unique();
+        let from_cache = Pubkey::new_unique();
+        assert_eq!(
+            pump_amm_pool_market_hint_merge(Some(from_intent), Some(from_cache)),
+            Some(from_intent)
+        );
+        assert_eq!(
+            pump_amm_pool_market_hint_merge(None, Some(from_cache)),
+            Some(from_cache)
+        );
+        assert_eq!(
+            pump_amm_pool_market_hint_merge(Some(from_intent), None),
+            Some(from_intent)
+        );
     }
 }

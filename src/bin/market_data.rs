@@ -1590,21 +1590,31 @@ async fn resolve_pump_amm_reserves_for_ensure_discovery(
     existing: Option<&CachedPoolState>,
     pool_accounts: &[Pubkey],
     dex: &ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex,
+    force_refresh: bool,
 ) -> Result<(u64, u64), String> {
-    if let Some(CachedPoolState::PumpAmm(s)) = existing {
-        if let (Some(br), Some(qr)) = (s.base_reserve, s.quote_reserve) {
-            if br > 0 && qr > 0 {
-                info!(
-                    request_id = %request_id,
-                    base_mint = %base_mint_str,
-                    pool = %pool_address_str,
-                    base_reserve = br,
-                    quote_reserve = qr,
-                    "EnsurePumpAmmPoolAccounts: using existing non-degenerate reserves (skip vault RPC)"
-                );
-                return Ok((br, qr));
+    if !force_refresh {
+        if let Some(CachedPoolState::PumpAmm(s)) = existing {
+            if let (Some(br), Some(qr)) = (s.base_reserve, s.quote_reserve) {
+                if br > 0 && qr > 0 {
+                    info!(
+                        request_id = %request_id,
+                        base_mint = %base_mint_str,
+                        pool = %pool_address_str,
+                        base_reserve = br,
+                        quote_reserve = qr,
+                        "EnsurePumpAmmPoolAccounts: using existing non-degenerate reserves (skip vault RPC)"
+                    );
+                    return Ok((br, qr));
+                }
             }
         }
+    } else {
+        warn!(
+            request_id = %request_id,
+            base_mint = %base_mint_str,
+            pool = %pool_address_str,
+            "EnsurePumpAmmPoolAccounts: force_refresh — always hydrating vault reserves via RPC (no cache-first reserves)"
+        );
     }
 
     match dex.fetch_pump_amm_vault_reserves(pool_accounts).await {
@@ -1645,6 +1655,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
     request_id: &str,
     base_mint_str: &str,
     pool_address_hint: Option<&str>,
+    force_refresh: bool,
 ) {
     let base_mint = match Pubkey::from_str(base_mint_str) {
         Ok(p) => p,
@@ -1671,10 +1682,11 @@ async fn handle_ensure_pump_amm_pool_accounts(
         base_mint = %base_mint_str,
         pool_address_hint = ?pool_address_hint,
         has_pool_hint = pool_hint.is_some(),
+        force_refresh = %force_refresh,
         "I-24d Discovery: EnsurePumpAmmPoolAccounts start (Geyser cache check then RPC fast path if hint)"
     );
     match dex
-        .pool_accounts_v1_for_base_mint_with_hint(base_mint, pool_hint)
+        .pool_accounts_v1_for_base_mint_with_hint(base_mint, pool_hint, force_refresh)
         .await
     {
         Ok(Some(accounts)) if accounts.len() >= 14 => {
@@ -1705,6 +1717,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     existing.as_ref(),
                     &accounts,
                     dex,
+                    force_refresh,
                 )
                 .await
                 {
@@ -2151,10 +2164,12 @@ async fn run_geyser_loop(
                                 let run_id = ctx.run_id.clone();
                                 let request_id = req.request_id.clone();
                                 let pool_hint = req.pool_address_hint.clone();
+                                let force_refresh = req.force_refresh;
                                 info!(
                                     request_id = %request_id,
                                     base_mint = %base_mint,
                                     pool_address_hint = ?pool_hint,
+                                    force_refresh = %force_refresh,
                                     "I-24d Discovery: EnsurePumpAmmPoolAccounts received"
                                 );
                                 let ctx_clone = ctx.clone();
@@ -2167,6 +2182,7 @@ async fn run_geyser_loop(
                                         &request_id,
                                         &base_mint,
                                         pool_hint.as_deref(),
+                                        force_refresh,
                                     )
                                     .await;
                                 });
@@ -4571,10 +4587,12 @@ async fn run_simulation_loop(
                                 let run_id = ctx.run_id.clone();
                                 let request_id = req.request_id.clone();
                                 let pool_hint = req.pool_address_hint.clone();
+                                let force_refresh = req.force_refresh;
                                 info!(
                                     request_id = %request_id,
                                     base_mint = %base_mint,
                                     pool_address_hint = ?pool_hint,
+                                    force_refresh = %force_refresh,
                                     "I-24d Discovery: EnsurePumpAmmPoolAccounts received (simulation)"
                                 );
                                 let ctx_clone = ctx.clone();
@@ -4587,6 +4605,7 @@ async fn run_simulation_loop(
                                         &request_id,
                                         &base_mint,
                                         pool_hint.as_deref(),
+                                        force_refresh,
                                     )
                                     .await;
                                 });

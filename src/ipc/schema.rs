@@ -1131,6 +1131,12 @@ pub struct ControlRequest {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pool_address_hint: Option<String>,
 
+    /// When true, market-data must **not** answer EnsurePumpAmmPoolAccounts from LivePoolCache
+    /// alone: re-resolve pool_accounts via RPC (authoritative market parse). Cold-path recovery
+    /// only (I-5); default false for backward-compatible wire format.
+    #[serde(default)]
+    pub force_refresh: bool,
+
     #[serde(flatten)]
     pub kind: ControlRequestKind,
 }
@@ -1149,6 +1155,7 @@ impl ControlRequest {
             request_id,
             target: target.to_string(),
             pool_address_hint: None,
+            force_refresh: false,
             kind,
         }
     }
@@ -2133,12 +2140,30 @@ mod tests {
         assert!(!json_no_pool.contains("pool_address_hint"));
         let parsed_no_pool: ControlRequest = serde_json::from_str(&json_no_pool).unwrap();
         assert!(parsed_no_pool.pool_address_hint.is_none());
+        assert!(!parsed_no_pool.force_refresh);
         match &parsed_no_pool.kind {
             ControlRequestKind::EnsurePumpAmmPoolAccounts { base_mint } => {
                 assert_eq!(base_mint, "Mint22222222222222222222222222222222");
             }
             _ => panic!("expected EnsurePumpAmmPoolAccounts"),
         }
+
+        let mut req_force = ControlRequest::new(
+            "execution-engine",
+            "v0.1.0",
+            "run-123",
+            "req-ensure-force".to_string(),
+            "market-data",
+            ControlRequestKind::EnsurePumpAmmPoolAccounts {
+                base_mint: "Mint33333333333333333333333333333333".to_string(),
+            },
+        );
+        req_force.pool_address_hint = Some("Pool33333333333333333333333333333333".to_string());
+        req_force.force_refresh = true;
+        let json_force = serde_json::to_string(&req_force).unwrap();
+        assert!(json_force.contains("\"force_refresh\":true"));
+        let parsed_force: ControlRequest = serde_json::from_str(&json_force).unwrap();
+        assert!(parsed_force.force_refresh);
     }
 
     #[test]

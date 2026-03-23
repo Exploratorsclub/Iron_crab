@@ -121,6 +121,14 @@ serial_test = "2"
 features = ["python"]
 no-default-features = true
 
+# RUSTSEC-2026-0049: rustls-webpki < 0.103.10. Upstream async-nats still pins 0.102.x; Solana 3.0
+# pubsub still uses tungstenite 0.20 / rustls 0.21. Vendor-patched crates until ecosystem releases.
+[patch.crates-io]
+async-nats = { path = "vendor/async-nats" }
+solana-pubsub-client = { path = "vendor/solana-pubsub-client" }
+# five8 1.0.0 allows five8_core 0.1.x; Solana needs five8_core 1.x for DecodeError: Error.
+five8 = { path = "vendor/five8" }
+
 # New binaries for target architecture
 [[bin]]
 name = "market-data"
