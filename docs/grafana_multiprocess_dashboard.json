@@ -2,7 +2,7 @@
   "title": "IronCrab Multi-Process Architecture",
   "description": "Dashboard for the Debuggable-First Multi-Process Architecture",
   "schemaVersion": 39,
-  "version": 5,
+  "version": 6,
   "time": {
     "from": "now-1h",
     "to": "now"
@@ -1888,13 +1888,195 @@
       }
     },
     {
+      "type": "row",
+      "title": "PumpSwap async healing (execution-engine)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 65
+      },
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "Healing triggers",
+      "description": "PumpSwap hot-path async healing: trigger counter (total)",
+      "targets": [
+        {
+          "expr": "pumpswap_hot_path_healing_trigger_total{job=\"execution-engine\"}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 0,
+        "y": 66
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Suppressed (cooldown)",
+      "description": "Would have triggered but cooldown blocked",
+      "targets": [
+        {
+          "expr": "pumpswap_hot_path_healing_cooldown_suppressed_total{job=\"execution-engine\"}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 5,
+        "y": 66
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Async publish OK",
+      "description": "Cold-path async publish succeeded",
+      "targets": [
+        {
+          "expr": "pumpswap_hot_path_healing_async_publish_success_total{job=\"execution-engine\"}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 10,
+        "y": 66
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Async publish fail",
+      "description": "Cold-path async publish failed",
+      "targets": [
+        {
+          "expr": "pumpswap_hot_path_healing_async_publish_fail_total{job=\"execution-engine\"}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 15,
+        "y": 66
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Skipped (no NATS)",
+      "description": "Healing skipped because NATS client unavailable",
+      "targets": [
+        {
+          "expr": "pumpswap_hot_path_healing_skipped_no_nats_total{job=\"execution-engine\"}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 66
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "yellow"
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "PumpSwap healing activity (rate)",
+      "description": "Per-minute rates for triggers, suppression, publishes, and no-NATS skips",
+      "targets": [
+        {
+          "expr": "rate(pumpswap_hot_path_healing_trigger_total{job=\"execution-engine\"}[5m]) * 60",
+          "refId": "A",
+          "legendFormat": "triggers/min"
+        },
+        {
+          "expr": "rate(pumpswap_hot_path_healing_cooldown_suppressed_total{job=\"execution-engine\"}[5m]) * 60",
+          "refId": "B",
+          "legendFormat": "cooldown suppressed/min"
+        },
+        {
+          "expr": "rate(pumpswap_hot_path_healing_async_publish_success_total{job=\"execution-engine\"}[5m]) * 60",
+          "refId": "C",
+          "legendFormat": "publish OK/min"
+        },
+        {
+          "expr": "rate(pumpswap_hot_path_healing_async_publish_fail_total{job=\"execution-engine\"}[5m]) * 60",
+          "refId": "D",
+          "legendFormat": "publish fail/min"
+        },
+        {
+          "expr": "rate(pumpswap_hot_path_healing_skipped_no_nats_total{job=\"execution-engine\"}[5m]) * 60",
+          "refId": "E",
+          "legendFormat": "no NATS skip/min"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
       "type": "table",
       "title": "Recent Trades (Current Run)",
       "gridPos": {
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 59
+        "y": 76
       },
       "datasource": {
         "type": "yesoreyeram-infinity-datasource",
@@ -2317,7 +2499,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 71
+        "y": 88
       },
       "collapsed": false
     },
@@ -2350,7 +2532,7 @@
         "h": 6,
         "w": 12,
         "x": 0,
-        "y": 72
+        "y": 89
       },
       "fieldConfig": {
         "defaults": {
@@ -2371,7 +2553,7 @@
         "h": 3,
         "w": 4,
         "x": 12,
-        "y": 72
+        "y": 89
       },
       "fieldConfig": {
         "defaults": {
@@ -2411,7 +2593,7 @@
         "h": 3,
         "w": 4,
         "x": 16,
-        "y": 72
+        "y": 89
       },
       "fieldConfig": {
         "defaults": {
@@ -2447,7 +2629,7 @@
         "h": 3,
         "w": 4,
         "x": 20,
-        "y": 72
+        "y": 89
       }
     }
   ]
