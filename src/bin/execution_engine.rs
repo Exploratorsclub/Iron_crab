@@ -155,6 +155,15 @@ fn pump_amm_pool_market_hint_pk(intent: &TradeIntent, ctx: &ExecutionContext) ->
     pump_amm_pool_market_hint_merge(intent_pool, cache_pool)
 }
 
+/// Stale/wrong PumpSwap `pool_accounts` (e.g. creator vault) → simulation Overflow / Custom(6023) / 0x1787.
+/// Must match the liquidation cold-path recovery matcher.
+#[inline]
+fn is_pump_amm_structural_sim_error(error_code: Option<&str>) -> bool {
+    error_code
+        .map(|e| e.contains("6023") || e.contains("Overflow") || e.contains("0x1787"))
+        .unwrap_or(false)
+}
+
 fn extract_owner_mint_delta_raw(
     tx: &EncodedConfirmedTransactionWithStatusMeta,
     owner: &Pubkey,
@@ -2045,6 +2054,54 @@ impl ExecutionContext {
             .remove(&request_id);
 
         outcome
+    }
+
+    /// Hot-path healing: publish `EnsurePumpAmmPoolAccounts` to market-data with `force_refresh=true`
+    /// without registering for ControlResponse (no wait, no retry in the same intent).
+    /// RPC work happens only in market-data (Cold Path); this path is fire-and-forget NATS publish.
+    fn fire_pump_amm_pool_accounts_refresh_async(
+        nats: &NatsClient,
+        run_id: String,
+        base_mint: String,
+        pool_address_hint: Option<String>,
+    ) {
+        let nats = nats.clone_for_spawned_publish();
+        tokio::spawn(async move {
+            let request_id = Uuid::new_v4().to_string();
+            let mut req = ControlRequest::new(
+                "execution-engine",
+                BUILD_VERSION,
+                &run_id,
+                request_id,
+                "market-data",
+                ControlRequestKind::EnsurePumpAmmPoolAccounts {
+                    base_mint: base_mint.clone(),
+                },
+            );
+            req.pool_address_hint = pool_address_hint.clone();
+            req.force_refresh = true;
+
+            match nats.publish(TOPIC_CONTROL_REQUESTS, &req).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        request_id = %req.request_id,
+                        base_mint = %base_mint,
+                        pool_address_hint = ?pool_address_hint,
+                        "PumpSwap hot-path: async EnsurePumpAmmPoolAccounts publish dropped or failed (NATS)"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        request_id = %req.request_id,
+                        base_mint = %base_mint,
+                        pool_address_hint = ?pool_address_hint,
+                        error = %e,
+                        "PumpSwap hot-path: async EnsurePumpAmmPoolAccounts publish error"
+                    );
+                }
+            }
+        });
     }
 
     async fn run_liquidation_job(
@@ -7941,16 +7998,44 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             );
         }
 
+        // Regular PumpSwap SELL hot path: on structural sim failure, trigger async pool_accounts refresh
+        // (no wait, no retry this intent). Liquidation uses synchronous wait+retry below.
+        if !ctx.replay_mode
+            && !is_liquidation_sell
+            && intent.side == TradeSide::Sell
+            && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pump_amm")
+            && is_pump_amm_structural_sim_error(sim_result.error_code.as_deref())
+        {
+            let pool_hint_str = pump_amm_pool_market_hint_pk(&intent, ctx).map(|p| p.to_string());
+            warn!(
+                intent_id = %intent.intent_id,
+                mint = %intent.resources.input_mint,
+                pool_hint = ?pool_hint_str,
+                sim_error = ?sim_result.error_code,
+                "PumpSwap regular SELL: simulation structural error (6023/Overflow family); triggering async non-blocking EnsurePumpAmmPoolAccounts force_refresh to market-data (no wait, no retry this intent)"
+            );
+            if let Some(ref nats) = ctx.nats {
+                ExecutionContext::fire_pump_amm_pool_accounts_refresh_async(
+                    nats,
+                    ctx.run_id.clone(),
+                    intent.resources.input_mint.clone(),
+                    pool_hint_str,
+                );
+            } else {
+                warn!(
+                    intent_id = %intent.intent_id,
+                    mint = %intent.resources.input_mint,
+                    "PumpSwap regular SELL: async healing skipped — NATS not connected"
+                );
+            }
+        }
+
         // PumpSwap SELL: stale/wrong creator-vault accounts in cached pool_accounts → Overflow Custom(6023).
         // Cold-path recovery: one EnsurePumpAmmPoolAccounts with force_refresh (RPC market parse).
         if !pump_amm_recovery_attempted
             && is_liquidation_sell
             && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pump_amm")
-            && sim_result
-                .error_code
-                .as_ref()
-                .map(|e| e.contains("6023") || e.contains("Overflow") || e.contains("0x1787"))
-                .unwrap_or(false)
+            && is_pump_amm_structural_sim_error(sim_result.error_code.as_deref())
         {
             let base_mint_pk = match Pubkey::from_str(&intent.resources.input_mint) {
                 Ok(p) => p,
@@ -9769,10 +9854,22 @@ async fn spawn_rebroadcast_loop(
 #[cfg(test)]
 mod execution_engine_tests {
     use super::{
-        pump_amm_pool_market_hint_merge, select_best_route, DiscoveryRequestOutcome, RouteCandidate,
+        is_pump_amm_structural_sim_error, pump_amm_pool_market_hint_merge, select_best_route,
+        DiscoveryRequestOutcome, RouteCandidate,
     };
     use ironcrab::ipc::{ControlResponse, ControlResponseStatus};
     use solana_sdk::pubkey::Pubkey;
+
+    #[test]
+    fn pump_amm_structural_sim_error_matches_liquidation_pattern() {
+        assert!(is_pump_amm_structural_sim_error(Some(
+            "Simulation failed: Custom(6023)"
+        )));
+        assert!(is_pump_amm_structural_sim_error(Some("Overflow")));
+        assert!(is_pump_amm_structural_sim_error(Some("0x1787")));
+        assert!(!is_pump_amm_structural_sim_error(Some("Custom(6005)")));
+        assert!(!is_pump_amm_structural_sim_error(None));
+    }
 
     /// I-24d: Verifies that ControlResponse status maps correctly to DiscoveryRequestOutcome.
     /// NotFound and Error must NOT be confused with Timeout (terminal outcomes are distinct).
