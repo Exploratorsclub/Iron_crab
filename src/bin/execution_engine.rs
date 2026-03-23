@@ -164,6 +164,26 @@ fn is_pump_amm_structural_sim_error(error_code: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Scope-1 async PumpSwap healing: only **regular momentum strategy** SELLs (hot path).
+///
+/// Excludes cold-path / manual safety tooling (e.g. `sell-all` uses `source == "sell-all"` and
+/// `sell_all == "true"`), and anything already classified as liquidation/kill-switch sell via
+/// `is_liquidation_sell` (`purpose=liquidation` or `kill_switch=true`).
+#[inline]
+fn is_regular_momentum_hot_path_sell(intent: &TradeIntent) -> bool {
+    if intent.side != TradeSide::Sell {
+        return false;
+    }
+    if intent.source != "momentum-bot" {
+        return false;
+    }
+    // Belt-and-suspenders: sell-all / liquidation helpers may set this marker.
+    if intent.metadata.get("sell_all").map(|v| v.as_str()) == Some("true") {
+        return false;
+    }
+    true
+}
+
 fn extract_owner_mint_delta_raw(
     tx: &EncodedConfirmedTransactionWithStatusMeta,
     owner: &Pubkey,
@@ -8002,7 +8022,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         // (no wait, no retry this intent). Liquidation uses synchronous wait+retry below.
         if !ctx.replay_mode
             && !is_liquidation_sell
-            && intent.side == TradeSide::Sell
+            && is_regular_momentum_hot_path_sell(&intent)
             && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pump_amm")
             && is_pump_amm_structural_sim_error(sim_result.error_code.as_deref())
         {
@@ -9854,10 +9874,14 @@ async fn spawn_rebroadcast_loop(
 #[cfg(test)]
 mod execution_engine_tests {
     use super::{
-        is_pump_amm_structural_sim_error, pump_amm_pool_market_hint_merge, select_best_route,
-        DiscoveryRequestOutcome, RouteCandidate,
+        is_pump_amm_structural_sim_error, is_regular_momentum_hot_path_sell,
+        pump_amm_pool_market_hint_merge, select_best_route, DiscoveryRequestOutcome,
+        RouteCandidate,
     };
-    use ironcrab::ipc::{ControlResponse, ControlResponseStatus};
+    use ironcrab::ipc::{
+        ControlResponse, ControlResponseStatus, ExplicitAmount, IntentOrigin, IntentTier,
+        TradeIntent, TradeResources, TradeSide, TradingRegime,
+    };
     use solana_sdk::pubkey::Pubkey;
 
     #[test]
@@ -9869,6 +9893,41 @@ mod execution_engine_tests {
         assert!(is_pump_amm_structural_sim_error(Some("0x1787")));
         assert!(!is_pump_amm_structural_sim_error(Some("Custom(6005)")));
         assert!(!is_pump_amm_structural_sim_error(None));
+    }
+
+    #[test]
+    fn regular_momentum_hot_path_sell_requires_momentum_source_and_not_sell_all() {
+        let mut intent = TradeIntent::new(
+            "momentum-bot",
+            "v0.1.0",
+            "run-1",
+            "id-1".to_string(),
+            "momentum-bot",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(1_000_000, 6),
+            TradeResources {
+                input_mint: "Mint111111111111111111111111111111111111111".to_string(),
+                output_mint: ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+                pools: vec!["Pool123".to_string()],
+                accounts: vec![],
+                token_program: None,
+            },
+            0,
+            200,
+            TradeSide::Sell,
+            TradingRegime::Early,
+        );
+        assert!(is_regular_momentum_hot_path_sell(&intent));
+
+        intent.source = "sell-all".to_string();
+        assert!(!is_regular_momentum_hot_path_sell(&intent));
+
+        intent.source = "momentum-bot".to_string();
+        intent
+            .metadata
+            .insert("sell_all".to_string(), "true".to_string());
+        assert!(!is_regular_momentum_hot_path_sell(&intent));
     }
 
     /// I-24d: Verifies that ControlResponse status maps correctly to DiscoveryRequestOutcome.
