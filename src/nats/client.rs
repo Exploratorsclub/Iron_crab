@@ -77,6 +77,16 @@ impl NatsClient {
         }
     }
 
+    /// Second handle for `tokio::spawn` publish paths (metrics counters are per-handle).
+    pub fn clone_for_spawned_publish(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            client: self.client.clone(),
+            messages_published: std::sync::atomic::AtomicU64::new(0),
+            messages_dropped: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
     pub async fn connect(&mut self) -> anyhow::Result<()> {
         info!(url = %self.config.url, name = %self.config.name, "Connecting to NATS");
 
