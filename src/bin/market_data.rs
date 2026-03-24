@@ -3983,12 +3983,13 @@ async fn run_geyser_loop(
                 // PumpSwap create_pool: observation only. Do not emit DexPoolAccounts, cache, or
                 // JetStream pool_accounts — synthetic reconstruction is not swap-verified (Bug #36).
                 // First trade / EnsurePumpAmmPoolAccounts supply usable pool_accounts.
+                // Ignore `pool_accounts` in the match so a future parser change (Some vs None) does
+                // not silently skip PoolCreated / known_pump_amm_pools / pool_mint_map.
                 if let Some(ParsedDexEvent::PoolCreated {
                     pool_address,
                     base_mint: base_mint_pk,
                     quote_mint: quote_mint_pk,
                     dex: DexType::PumpFunAmm,
-                    pool_accounts: None,
                     ..
                 }) = parsed_event.as_ref()
                 {
