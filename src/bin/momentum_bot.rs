@@ -7953,7 +7953,6 @@ async fn process_market_event(ctx: &MomentumContext, event: &MarketEvent) -> Res
             base_mint,
             quote_mint,
             accounts,
-            ..
         } => {
             ctx.record_pool_seen(pool_address, event.slot.unwrap_or(0));
             ctx.record_dex_pool_accounts(dex, pool_address, base_mint, quote_mint, accounts);

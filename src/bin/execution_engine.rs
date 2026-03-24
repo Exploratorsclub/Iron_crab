@@ -6395,7 +6395,6 @@ async fn main() -> Result<()> {
                                 dex,
                                 pool_address,
                                 accounts,
-                                pool_readiness,
                                 ..
                             } => {
                                 // Populate PumpAmm pool_accounts in LivePoolCache.
@@ -6408,12 +6407,7 @@ async fn main() -> Result<()> {
                                             .filter_map(|s| Pubkey::from_str(s).ok())
                                             .collect();
                                         if parsed.len() >= 12 {
-                                            use ironcrab::ipc::DexPoolReadiness;
-                                            let readiness =
-                                                pool_readiness.unwrap_or(DexPoolReadiness::Ready);
-                                            cache.set_pump_amm_pool_accounts(
-                                                &pool_pk, parsed, readiness,
-                                            );
+                                            cache.set_pump_amm_pool_accounts(&pool_pk, parsed);
                                         } else {
                                             debug!(
                                                 pool = %pool_address,

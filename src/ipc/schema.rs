@@ -184,9 +184,6 @@ pub enum MarketEventKind {
         #[serde(default = "default_sol_mint")]
         quote_mint: String,
         accounts: Vec<String>,
-        /// When absent, consumers treat as [`DexPoolReadiness::Ready`] (legacy events).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pool_readiness: Option<DexPoolReadiness>,
     },
     /// Trade/swap observed on-chain (detailed for 4-filter strategy)
     Trade {

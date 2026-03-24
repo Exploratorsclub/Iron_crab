@@ -4116,7 +4116,6 @@ async fn run_geyser_loop(
                             base_mint: base_mint.clone(),
                             quote_mint: quote_mint.clone(),
                             accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
-                            pool_readiness: Some(DexPoolReadiness::Ready),
                         },
                     );
 
@@ -4138,11 +4137,8 @@ async fn run_geyser_loop(
                     // Ensures the Geyser PoolCacheUpdate builder can use these as fallback
                     // when the parsed Geyser state has empty pool_accounts.
                     if pool_accounts.len() >= 14 {
-                        ctx.live_pool_cache.set_pump_amm_pool_accounts(
-                            pool_address,
-                            pool_accounts.clone(),
-                            DexPoolReadiness::Ready,
-                        );
+                        ctx.live_pool_cache
+                            .set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
 
                         // FIX-33: Persist pool_accounts to JetStream so bootstrap recovers them after restart.
                         if let Some(ref nats) = ctx.nats {
@@ -4201,7 +4197,6 @@ async fn run_geyser_loop(
                                     base_mint: mint.to_string(),
                                     quote_mint: quote_mint.to_string(),
                                     accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
-                                    pool_readiness: None,
                                 },
                             );
 
@@ -4483,7 +4478,6 @@ async fn run_geyser_loop(
                             base_mint: pool_event.base_mint.to_string(),
                             quote_mint: pool_event.quote_mint.to_string(),
                             accounts,
-                            pool_readiness: None,
                         },
                     );
 

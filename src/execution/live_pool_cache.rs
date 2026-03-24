@@ -726,17 +726,14 @@ impl LivePoolCache {
         }
     }
 
-    pub fn set_pump_amm_pool_accounts(
-        &self,
-        pool: &Pubkey,
-        accounts: Vec<Pubkey>,
-        readiness: DexPoolReadiness,
-    ) {
+    /// `pool_accounts` from verified DexPoolAccounts / discovery paths are treated as [`DexPoolReadiness::Ready`].
+    pub fn set_pump_amm_pool_accounts(&self, pool: &Pubkey, accounts: Vec<Pubkey>) {
         if let Some(mut entry) = self.pools.get_mut(pool) {
             if let CachedPoolState::PumpAmm(ref mut s) = entry.value_mut().state {
                 let was_empty = s.pool_accounts.is_empty();
                 s.pool_accounts = accounts.clone();
-                s.pool_readiness = merge_dex_pool_readiness(s.pool_readiness, readiness);
+                s.pool_readiness =
+                    merge_dex_pool_readiness(s.pool_readiness, DexPoolReadiness::Ready);
                 if was_empty {
                     tracing::info!(
                         pool = %pool,
@@ -1755,11 +1752,7 @@ mod tests {
             100,
         );
 
-        cache.set_pump_amm_pool_accounts(
-            &pool_market,
-            accounts_to_set.clone(),
-            DexPoolReadiness::Ready,
-        );
+        cache.set_pump_amm_pool_accounts(&pool_market, accounts_to_set.clone());
 
         let result = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint);
         assert!(result.is_some());
@@ -1799,11 +1792,7 @@ mod tests {
             100,
         );
 
-        cache.set_pump_amm_pool_accounts(
-            &pool_market,
-            new_accounts.clone(),
-            DexPoolReadiness::Ready,
-        );
+        cache.set_pump_amm_pool_accounts(&pool_market, new_accounts.clone());
 
         let (r_base, r_quote, _) = cache
             .get_pump_amm_reserves_by_base_mint(&base_mint)
