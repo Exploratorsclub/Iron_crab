@@ -11,13 +11,8 @@ use crate::solana::geyser_listener::{GeyserAccountUpdate, GeyserTransactionUpdat
 use rust_decimal::Decimal;
 use solana_sdk::hash::hash;
 use solana_sdk::pubkey::Pubkey;
-use spl_token::solana_program::pubkey::Pubkey as SplPubkey;
 use std::str::FromStr;
 use tracing::{debug, info, trace};
-
-fn to_spl_pubkey(p: &Pubkey) -> SplPubkey {
-    SplPubkey::new_from_array(p.to_bytes())
-}
 
 // ============================================================================
 // Program IDs
@@ -1006,73 +1001,11 @@ fn parse_pumpfun_swap(update: &GeyserTransactionUpdate, is_buy: bool) -> Option<
 // Pump.fun AMM (PumpSwap) Parsing
 // ============================================================================
 
-/// Build 14 swap pool_accounts from create_pool instruction accounts.
-/// IDL order: pool[0], global_config[1], creator[2], base_mint[3], quote_mint[4],
-/// lp_mint[5], user_base[6], user_quote[7], user_pool[8], pool_base_vault[9],
-/// pool_quote_vault[10], system[11], token_2022[12], base_tp[13], quote_tp[14],
-/// ata_program[15], event_authority[16], program[17].
-fn build_pool_accounts_from_create_pool(accounts: &[Pubkey]) -> Option<Vec<Pubkey>> {
-    if accounts.len() < 18 {
-        return None;
-    }
-    // Resolve accounts: for top-level, accounts IS the list. For inner, accounts are indices.
-    // We receive already-resolved Pubkeys in accounts from the caller.
-    let get = |i: usize| accounts.get(i).copied();
-
-    let pool = get(0)?;
-    let global_config = get(1)?;
-    let creator = get(2)?;
-    let base_mint = get(3)?;
-    let quote_mint = get(4)?;
-    let pool_base_vault = get(9)?;
-    let pool_quote_vault = get(10)?;
-    let base_token_program = get(13)?;
-    let quote_token_program = get(14)?;
-    let event_authority = get(16)?;
-
-    let fee_config = Pubkey::from_str("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx").ok()?;
-    let fee_program = Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ").ok()?;
-    // `create_pool` does not include protocol fee metas in the instruction; swap txs do. Use the
-    // same JCR+ATA fallback as cold-path market parse when no better data exists (not a global
-    // truth for all pools — see pumpfun_amm `pump_amm_fallback_protocol_fee_accounts`).
-    let protocol_fee_recipient =
-        Pubkey::from_str("JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU").ok()?;
-
-    let protocol_fee_recipient_ta =
-        spl_associated_token_account::get_associated_token_address_with_program_id(
-            &to_spl_pubkey(&protocol_fee_recipient),
-            &to_spl_pubkey(&quote_mint),
-            &to_spl_pubkey(&quote_token_program),
-        );
-    let protocol_fee_recipient_ta = Pubkey::new_from_array(protocol_fee_recipient_ta.to_bytes());
-    let coin_creator_vault_ata =
-        spl_associated_token_account::get_associated_token_address_with_program_id(
-            &to_spl_pubkey(&creator),
-            &to_spl_pubkey(&base_mint),
-            &to_spl_pubkey(&base_token_program),
-        );
-    let coin_creator_vault_ata = Pubkey::new_from_array(coin_creator_vault_ata.to_bytes());
-
-    let pool_accounts = vec![
-        pool,
-        global_config,
-        base_mint,
-        quote_mint,
-        pool_base_vault,
-        pool_quote_vault,
-        protocol_fee_recipient,
-        protocol_fee_recipient_ta,
-        event_authority,
-        coin_creator_vault_ata,
-        creator,           // coin_creator_vault_authority
-        Pubkey::default(), // global_volume_accumulator (not in create)
-        fee_config,
-        fee_program,
-    ];
-    Some(pool_accounts)
-}
-
 /// Try to parse create_pool from top-level or inner instructions.
+///
+/// Does **not** attach synthetic `pool_accounts` — create_pool lacks swap-instruction metas (fee
+/// recipients, volume accumulators, etc.); usable accounts come from verified swap trades or
+/// cold-path discovery (`EnsurePumpAmmPoolAccounts`).
 fn try_parse_pumpfun_amm_create_pool(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
     let pumpfun_amm = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).ok()?;
 
@@ -1081,29 +1014,25 @@ fn try_parse_pumpfun_amm_create_pool(update: &GeyserTransactionUpdate) -> Option
         && update.instruction_data[0..8] == PUMPFUN_AMM_CREATE_POOL
         && update.instruction_accounts.len() >= 18
     {
-        if let Some(pool_accounts) =
-            build_pool_accounts_from_create_pool(&update.instruction_accounts)
-        {
-            let pool = update.instruction_accounts[0];
-            let base_mint = update.instruction_accounts[3];
-            let quote_mint = update.instruction_accounts[4];
-            let creator = update.instruction_accounts[2];
-            info!(
-                pool = %pool,
-                base_mint = %base_mint,
-                "PumpSwap create_pool detected (top-level) - pool_accounts available"
-            );
-            return Some(ParsedDexEvent::PoolCreated {
-                pool_address: pool,
-                base_mint,
-                quote_mint,
-                dex: DexType::PumpFunAmm,
-                initial_liquidity_lamports: 0,
-                slot: update.slot,
-                creator: Some(creator),
-                pool_accounts: Some(pool_accounts),
-            });
-        }
+        let pool = update.instruction_accounts[0];
+        let base_mint = update.instruction_accounts[3];
+        let quote_mint = update.instruction_accounts[4];
+        let creator = update.instruction_accounts[2];
+        info!(
+            pool = %pool,
+            base_mint = %base_mint,
+            "PumpSwap create_pool detected (top-level) — observation only (no synthetic pool_accounts)"
+        );
+        return Some(ParsedDexEvent::PoolCreated {
+            pool_address: pool,
+            base_mint,
+            quote_mint,
+            dex: DexType::PumpFunAmm,
+            initial_liquidity_lamports: 0,
+            slot: update.slot,
+            creator: Some(creator),
+            pool_accounts: None,
+        });
     }
 
     // 2. Check inner instructions (e.g. migrate CPI)
@@ -1129,34 +1058,32 @@ fn try_parse_pumpfun_amm_create_pool(update: &GeyserTransactionUpdate) -> Option
         if accounts.len() < 18 {
             continue;
         }
-        if let Some(pool_accounts) = build_pool_accounts_from_create_pool(&accounts) {
-            let pool = accounts[0];
-            let base_mint = accounts[3];
-            let quote_mint = accounts[4];
-            let creator = accounts[2];
-            info!(
-                pool = %pool,
-                base_mint = %base_mint,
-                "PumpSwap create_pool detected (inner/CPI) - pool_accounts available"
-            );
-            return Some(ParsedDexEvent::PoolCreated {
-                pool_address: pool,
-                base_mint,
-                quote_mint,
-                dex: DexType::PumpFunAmm,
-                initial_liquidity_lamports: 0,
-                slot: update.slot,
-                creator: Some(creator),
-                pool_accounts: Some(pool_accounts),
-            });
-        }
+        let pool = accounts[0];
+        let base_mint = accounts[3];
+        let quote_mint = accounts[4];
+        let creator = accounts[2];
+        info!(
+            pool = %pool,
+            base_mint = %base_mint,
+            "PumpSwap create_pool detected (inner/CPI) — observation only (no synthetic pool_accounts)"
+        );
+        return Some(ParsedDexEvent::PoolCreated {
+            pool_address: pool,
+            base_mint,
+            quote_mint,
+            dex: DexType::PumpFunAmm,
+            initial_liquidity_lamports: 0,
+            slot: update.slot,
+            creator: Some(creator),
+            pool_accounts: None,
+        });
     }
 
     None
 }
 
 fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedDexEvent> {
-    // P12 Option A: Try create_pool first (pool_accounts from Create-IX)
+    // Try create_pool first (observation-only; no synthetic pool_accounts)
     if let Some(created) = try_parse_pumpfun_amm_create_pool(update) {
         return Some(created);
     }
@@ -1779,7 +1706,7 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solana::geyser_listener::GeyserTransactionUpdate;
+    use crate::solana::geyser_listener::{GeyserTransactionUpdate, TokenAmount, TokenBalance};
 
     #[test]
     fn test_dex_type_display() {
@@ -1841,14 +1768,128 @@ mod tests {
                 assert_eq!(q, &quote_mint);
                 assert_eq!(dex, &DexType::PumpFunAmm);
                 assert_eq!(c, &Some(creator));
-                let accounts = pool_accounts.as_ref().expect("pool_accounts");
-                assert_eq!(accounts.len(), 14);
-                assert_eq!(accounts[0], pool);
-                assert_eq!(accounts[1], global_config);
-                assert_eq!(accounts[2], base_mint);
-                assert_eq!(accounts[3], quote_mint);
+                assert!(
+                    pool_accounts.is_none(),
+                    "create_pool must not carry synthetic pool_accounts (wait for swap-verified path)"
+                );
             }
             _ => panic!("expected PoolCreated, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_pumpfun_amm_sell_trade_includes_verified_pool_accounts() {
+        let pool_market = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let global_config = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let user_base = Pubkey::new_unique();
+        let user_quote = Pubkey::new_unique();
+        let pool_base_vault = Pubkey::new_unique();
+        let pool_quote_vault = Pubkey::new_unique();
+        let protocol_fee_recipient = Pubkey::new_unique();
+        let protocol_fee_recipient_ta = Pubkey::new_unique();
+        let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let system = Pubkey::from_str("11111111111111111111111111111111").unwrap();
+        let ata_program = Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap();
+        let event_authority = Pubkey::new_unique();
+        let pumpfun_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).unwrap();
+        let coin_creator_vault_ata = Pubkey::new_unique();
+        let coin_creator_vault_authority = Pubkey::new_unique();
+        let fee_config = Pubkey::from_str("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx").unwrap();
+        let fee_program = Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ").unwrap();
+
+        let instruction_accounts = vec![
+            pool_market,
+            user,
+            global_config,
+            base_mint,
+            quote_mint,
+            user_base,
+            user_quote,
+            pool_base_vault,
+            pool_quote_vault,
+            protocol_fee_recipient,
+            protocol_fee_recipient_ta,
+            spl_token,
+            spl_token,
+            system,
+            ata_program,
+            event_authority,
+            pumpfun_amm_program,
+            coin_creator_vault_ata,
+            coin_creator_vault_authority,
+            fee_config,
+            fee_program,
+        ];
+        assert_eq!(instruction_accounts.len(), 21);
+
+        let sell_disc = anchor_disc("sell");
+        let mut instruction_data = sell_disc.to_vec();
+        let amount_in: u64 = 1_000_000;
+        instruction_data.extend_from_slice(&amount_in.to_le_bytes());
+        instruction_data.extend_from_slice(&0u64.to_le_bytes()); // min_out
+
+        let mut account_keys = instruction_accounts.clone();
+        account_keys.insert(0, user);
+
+        let base_mint_str = base_mint.to_string();
+        let pre_token = vec![TokenBalance {
+            account_index: 5,
+            mint: base_mint_str.clone(),
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: "2000000".to_string(),
+            },
+            program_id: Some(spl_token.to_string()),
+        }];
+        let post_token = vec![TokenBalance {
+            account_index: 5,
+            mint: base_mint_str,
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals: 6,
+                amount: "1000000".to_string(),
+            },
+            program_id: Some(spl_token.to_string()),
+        }];
+
+        let pre_balances = vec![1_000_000_000u64; account_keys.len()];
+        let mut post_balances = pre_balances.clone();
+        post_balances[0] = 1_000_050_000_000;
+
+        let update = GeyserTransactionUpdate {
+            signature: "sell_synth_sig".to_string(),
+            slot: 200,
+            account_keys,
+            instruction_accounts,
+            instruction_data,
+            inner_instructions: vec![],
+            pre_token_balances: pre_token,
+            post_token_balances: post_token,
+            pre_balances,
+            post_balances,
+            fee_lamports: 5000,
+            compute_units_consumed: None,
+        };
+
+        let parsed = parse_transaction_update(&update);
+        let event = parsed.expect("sell parse");
+        match &event {
+            ParsedDexEvent::Trade {
+                dex, pool_accounts, ..
+            } => {
+                assert_eq!(dex, &DexType::PumpFunAmm);
+                let accts = pool_accounts
+                    .as_ref()
+                    .expect("swap path must carry pool_accounts");
+                assert_eq!(accts.len(), 14);
+                assert_eq!(accts[0], pool_market);
+                assert_eq!(accts[6], protocol_fee_recipient);
+            }
+            _ => panic!("expected Trade, got {:?}", event),
         }
     }
 }
