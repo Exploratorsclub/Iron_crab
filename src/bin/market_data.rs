@@ -31,9 +31,9 @@ use uuid::Uuid;
 use ironcrab::config::WalletTrackerCfg;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest,
-    ControlRequestKind, ControlResponse, ControlResponseStatus, ExecutionResult, ExecutionStatus,
-    IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles,
-    NATIVE_SOL_MINT,
+    ControlRequestKind, ControlResponse, ControlResponseStatus, DexPoolReadiness, ExecutionResult,
+    ExecutionStatus, IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate,
+    PriorityFeePercentiles, NATIVE_SOL_MINT,
 };
 use ironcrab::metrics::{
     serve_metrics, set_readiness_control_sub_active, set_readiness_mode,
@@ -1757,6 +1757,8 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 creator: creator_opt,
             });
             ctx.live_pool_cache.upsert(pool_address, state, 0);
+            ctx.live_pool_cache
+                .merge_pump_amm_pool_accounts_readiness(pool_address, DexPoolReadiness::Ready);
 
             // Publish JetStream PoolCacheUpdate (authoritative SSOT).
             // Reply Ok ONLY when JetStream write succeeds (I-24a).
@@ -1774,6 +1776,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     None,
                     0,
                 );
+                pool_update.dex_readiness = DexPoolReadiness::Ready;
                 let mut meta = std::collections::HashMap::new();
                 let accounts_str: Vec<String> = accounts.iter().map(|p| p.to_string()).collect();
                 meta.insert("pool_accounts".to_string(), accounts_str.join(","));
@@ -3462,6 +3465,12 @@ async fn run_geyser_loop(
                                 if !meta.is_empty() {
                                     pool_update.metadata = Some(meta);
                                 }
+                                // Geyser-fed accounts + reserves: stronger than observation-only, not Ready until verified trade/discovery.
+                                pool_update.dex_readiness = DexPoolReadiness::Partial;
+                                ctx.live_pool_cache.merge_pump_amm_pool_accounts_readiness(
+                                    account_update.pubkey,
+                                    DexPoolReadiness::Partial,
+                                );
                             }
                             CachedPoolState::RaydiumAmm(s) => {
                                 // FIX-29: Always propagate market_id (from Geyser parse),
@@ -4127,6 +4136,10 @@ async fn run_geyser_loop(
                     // when the parsed Geyser state has empty pool_accounts.
                     if pool_accounts.len() >= 14 {
                         ctx.live_pool_cache.set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
+                        ctx.live_pool_cache.merge_pump_amm_pool_accounts_readiness(
+                            *pool_address,
+                            DexPoolReadiness::Ready,
+                        );
 
                         // FIX-33: Persist pool_accounts to JetStream so bootstrap recovers them after restart.
                         if let Some(ref nats) = ctx.nats {
@@ -4143,6 +4156,7 @@ async fn run_geyser_loop(
                                 None,
                                 tx_update.slot,
                             );
+                            pool_update.dex_readiness = DexPoolReadiness::Ready;
                             let mut meta = std::collections::HashMap::new();
                             let accounts_str: Vec<String> = pool_accounts.iter().map(|p| p.to_string()).collect();
                             meta.insert("pool_accounts".to_string(), accounts_str.join(","));

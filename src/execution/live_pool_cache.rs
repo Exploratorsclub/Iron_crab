@@ -39,6 +39,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
 
+use crate::ipc::DexPoolReadiness;
+
 // Re-export parsers
 use crate::solana::dex::meteora_dlmm_layout::DlmmPool;
 use crate::solana::dex::orca_whirlpool_layout::{self, WhirlpoolParsed};
@@ -303,6 +305,11 @@ pub struct LivePoolCache {
 
     /// Count of vaults at last notification (to avoid spamming)
     last_notified_vault_count: AtomicU64,
+
+    /// PumpSwap pool-market (pool address) → explicit readiness for cache-first `pool_accounts` use.
+    /// Monotonic: [`DexPoolReadiness::merge`] on update; never stored inside `PumpAmmState` to avoid
+    /// touching every constructor site.
+    pool_accounts_readiness_by_market: DashMap<Pubkey, DexPoolReadiness>,
 }
 
 /// Which vault position (A/B or X/Y or 0/1) this vault represents
@@ -332,6 +339,7 @@ impl LivePoolCache {
             max_age_ms: 10_000, // 10 seconds default
             vault_update_tx: Mutex::new(None),
             last_notified_vault_count: AtomicU64::new(0),
+            pool_accounts_readiness_by_market: DashMap::new(),
         }
     }
 
@@ -870,6 +878,47 @@ impl LivePoolCache {
         for entry in self.pools.iter() {
             if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
                 if s.base_mint == *base_mint && !s.pool_accounts.is_empty() {
+                    return Some(s.pool_accounts.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Merge PumpSwap `pool_accounts` readiness for `pool_market` (monotonic — never downgrade).
+    pub fn merge_pump_amm_pool_accounts_readiness(
+        &self,
+        pool_market: Pubkey,
+        incoming: DexPoolReadiness,
+    ) {
+        self.pool_accounts_readiness_by_market
+            .entry(pool_market)
+            .and_modify(|stored| *stored = stored.merge(incoming))
+            .or_insert(incoming);
+    }
+
+    fn pump_amm_pool_accounts_readiness_for_market(
+        &self,
+        pool_market: &Pubkey,
+    ) -> DexPoolReadiness {
+        self.pool_accounts_readiness_by_market
+            .get(pool_market)
+            .map(|r| *r)
+            .unwrap_or(DexPoolReadiness::Observed)
+    }
+
+    /// PumpSwap `pool_accounts` for hot-path cache-first use only when JetStream/market-data marked [`DexPoolReadiness::Ready`].
+    pub fn get_ready_pump_amm_pool_accounts_by_base_mint(
+        &self,
+        base_mint: &Pubkey,
+    ) -> Option<Vec<Pubkey>> {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
+                if s.base_mint == *base_mint
+                    && !s.pool_accounts.is_empty()
+                    && self.pump_amm_pool_accounts_readiness_for_market(entry.key())
+                        == DexPoolReadiness::Ready
+                {
                     return Some(s.pool_accounts.clone());
                 }
             }

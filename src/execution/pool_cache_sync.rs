@@ -24,8 +24,21 @@ use crate::execution::live_pool_cache::{
     CachedPoolState, LivePoolCache, MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState,
     RaydiumAmmState, RaydiumCpmmState,
 };
-use crate::ipc::{PoolCacheUpdate, PoolCacheUpdateType};
+use crate::ipc::{DexPoolReadiness, PoolCacheUpdate, PoolCacheUpdateType};
 use crate::nats::{slave_consumer_config, NatsClient, STREAM_NAME};
+
+/// Effective readiness from `PoolCacheUpdate` (top-level field + optional metadata for older payloads).
+fn effective_pump_amm_readiness_from_update(update: &PoolCacheUpdate) -> DexPoolReadiness {
+    let mut r = update.dex_readiness;
+    if let Some(m) = update.metadata.as_ref() {
+        if let Some(s) = m.get("dex_pool_readiness") {
+            if let Some(p) = DexPoolReadiness::parse_from_metadata(s) {
+                r = r.merge(p);
+            }
+        }
+    }
+    r
+}
 
 /// Extract base_reserve and quote_reserve from CachedPoolState (for merge logic).
 fn extract_reserves(state: &CachedPoolState) -> (u64, u64) {
@@ -292,6 +305,12 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                     }
                 }
                 cache.upsert(pool_addr, minimal_state, update.geyser_slot);
+                if update.dex == "pump_amm" {
+                    cache.merge_pump_amm_pool_accounts_readiness(
+                        pool_addr,
+                        effective_pump_amm_readiness_from_update(update),
+                    );
+                }
                 // P3 #13: Propagate base_decimals and quote_decimals to SLAVE cache
                 apply_decimals_from_metadata(cache, update);
                 return true;
@@ -360,6 +379,12 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                     }
                 }
                 cache.upsert(addr, minimal_state, update.geyser_slot);
+                if update.dex == "pump_amm" {
+                    cache.merge_pump_amm_pool_accounts_readiness(
+                        addr,
+                        effective_pump_amm_readiness_from_update(update),
+                    );
+                }
                 // P3 #13: Apply decimals from metadata when present (e.g. BalanceUpdated with metadata)
                 apply_decimals_from_metadata(cache, update);
                 return true;
@@ -510,5 +535,112 @@ mod tests {
             }
             other => panic!("expected PumpFun state, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_pump_amm_readiness_ready_enables_ready_only_pool_accounts() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "pool_accounts".to_string(),
+            accounts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            1,
+        );
+        update.metadata = Some(meta.clone());
+        assert!(apply_pool_cache_update(&cache, &update));
+        assert!(cache
+            .get_pump_amm_pool_accounts_by_base_mint(&base_mint)
+            .is_some());
+        assert!(cache
+            .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+            .is_none());
+
+        update.dex_readiness = DexPoolReadiness::Ready;
+        assert!(apply_pool_cache_update(&cache, &update));
+        assert!(cache
+            .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+            .is_some());
+    }
+
+    #[test]
+    fn test_pump_amm_readiness_merge_never_downgrades() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "pool_accounts".to_string(),
+            accounts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+
+        let mut ready_update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            1,
+        );
+        ready_update.metadata = Some(meta.clone());
+        ready_update.dex_readiness = DexPoolReadiness::Ready;
+        assert!(apply_pool_cache_update(&cache, &ready_update));
+        assert!(cache
+            .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+            .is_some());
+
+        let mut weak_update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            2,
+        );
+        weak_update.metadata = Some(meta);
+        weak_update.dex_readiness = DexPoolReadiness::Observed;
+        assert!(apply_pool_cache_update(&cache, &weak_update));
+        assert!(
+            cache
+                .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+                .is_some(),
+            "merge must not downgrade Ready to Observed"
+        );
     }
 }

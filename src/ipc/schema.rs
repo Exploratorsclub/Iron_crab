@@ -2264,6 +2264,46 @@ mod tests {
 // Pool Cache Updates (for market-data → execution-engine propagation)
 // ============================================================================
 
+/// DEX-agnostic readiness for pool cache entries (JetStream → SLAVE / LivePoolCache).
+///
+/// **Semantics:** `Ready` must be set only by explicit, trustworthy publishers
+/// (e.g. verified swap path or cold-path discovery with hydrated reserves).
+/// A cache hit alone must not imply `Ready` (Bug #36).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DexPoolReadiness {
+    /// Pool or accounts observed on-chain; not sufficient for hot-path swap account lists alone.
+    #[default]
+    Observed,
+    /// Stronger than Observed (e.g. Geyser-fed accounts + reserves); still not `Ready`.
+    Partial,
+    /// Explicitly safe for cache-first hot-path use of propagated account sets (e.g. PumpSwap `pool_accounts`).
+    Ready,
+}
+
+impl DexPoolReadiness {
+    /// Monotonic merge: never downgrade a stronger stored state to a weaker incoming one.
+    #[must_use]
+    pub fn merge(self, incoming: DexPoolReadiness) -> DexPoolReadiness {
+        use DexPoolReadiness::*;
+        match (self, incoming) {
+            (Ready, _) | (_, Ready) => Ready,
+            (Partial, Partial) | (Partial, Observed) | (Observed, Partial) => Partial,
+            (Observed, Observed) => Observed,
+        }
+    }
+
+    /// Parse from PoolCacheUpdate metadata value (same strings as JSON).
+    pub fn parse_from_metadata(s: &str) -> Option<DexPoolReadiness> {
+        match s.trim() {
+            "OBSERVED" => Some(Self::Observed),
+            "PARTIAL" => Some(Self::Partial),
+            "READY" => Some(Self::Ready),
+            _ => None,
+        }
+    }
+}
+
 /// Pool cache update type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -2313,6 +2353,10 @@ pub struct PoolCacheUpdate {
     /// Additional DEX-specific metadata (JSON string)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
+
+    /// Explicit pool / account-list readiness for DEX consumers (never infer from cache hit alone).
+    #[serde(default)]
+    pub dex_readiness: DexPoolReadiness,
 }
 
 impl PoolCacheUpdate {
@@ -2341,6 +2385,7 @@ impl PoolCacheUpdate {
             liquidity_lamports,
             geyser_slot,
             metadata: None,
+            dex_readiness: DexPoolReadiness::default(),
         }
     }
 
@@ -2368,6 +2413,7 @@ impl PoolCacheUpdate {
             liquidity_lamports: None,
             geyser_slot,
             metadata: None,
+            dex_readiness: DexPoolReadiness::default(),
         }
     }
 
@@ -2391,6 +2437,7 @@ impl PoolCacheUpdate {
             liquidity_lamports: None,
             geyser_slot,
             metadata: None,
+            dex_readiness: DexPoolReadiness::default(),
         }
     }
 }
