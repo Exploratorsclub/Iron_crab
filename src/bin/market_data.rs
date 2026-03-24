@@ -3980,14 +3980,16 @@ async fn run_geyser_loop(
                     }
                 }
 
-                // P12 Option A: PumpSwap create_pool - pool_accounts available at creation time.
-                // Emit PoolCreated + DexPoolAccounts immediately (no need to wait for first trade).
+                // PumpSwap create_pool: observation only. Do not emit DexPoolAccounts, cache, or
+                // JetStream pool_accounts — synthetic reconstruction is not swap-verified (Bug #36).
+                // First trade / EnsurePumpAmmPoolAccounts supply usable pool_accounts.
+                // Ignore `pool_accounts` in the match so a future parser change (Some vs None) does
+                // not silently skip PoolCreated / known_pump_amm_pools / pool_mint_map.
                 if let Some(ParsedDexEvent::PoolCreated {
                     pool_address,
                     base_mint: base_mint_pk,
                     quote_mint: quote_mint_pk,
                     dex: DexType::PumpFunAmm,
-                    pool_accounts: Some(pool_accounts),
                     ..
                 }) = parsed_event.as_ref()
                 {
@@ -3998,7 +4000,7 @@ async fn run_geyser_loop(
                         info!(
                             pool = %pool_address,
                             base_mint = %base_mint_pk,
-                            "pump_amm pool discovered via create_pool - emitting PoolCreated + DexPoolAccounts"
+                            "pump_amm pool observed via create_pool — PoolCreated only (DexPoolAccounts/cache deferred to verified path)"
                         );
                         let pool_created_event = MarketEvent::new(
                             "market-data",
@@ -4025,64 +4027,6 @@ async fn run_geyser_loop(
                             } else {
                                 NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                                 MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        let accounts_event = MarketEvent::new(
-                            "market-data",
-                            BUILD_VERSION,
-                            run_id,
-                            ctx.next_event_id(),
-                            "geyser_create_pool",
-                            Some(tx_update.slot),
-                            MarketEventKind::DexPoolAccounts {
-                                dex: DexType::PumpFunAmm.to_string(),
-                                pool_address: pool_address.to_string(),
-                                base_mint: base_mint.clone(),
-                                quote_mint: quote_mint.clone(),
-                                accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
-                            },
-                        );
-                        if let Err(e) = ctx.jsonl_writer.write(&accounts_event) {
-                            error!(error = %e, "Failed to write DexPoolAccounts (create_pool) to JSONL");
-                        }
-                        if let Some(ref nats) = ctx.nats {
-                            if let Err(e) = nats.publish(TOPIC_MARKET_EVENTS, &accounts_event).await {
-                                warn!(error = %e, "Failed to publish DexPoolAccounts (create_pool) to NATS");
-                                NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                MARKET_EVENTS_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        if pool_accounts.len() >= 14 {
-                            ctx.live_pool_cache.set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
-
-                            // FIX-33: Persist pool_accounts to JetStream so bootstrap recovers them after restart.
-                            if let Some(ref nats) = ctx.nats {
-                                let mut pool_update = PoolCacheUpdate::new_pool_discovered(
-                                    "market-data",
-                                    BUILD_VERSION,
-                                    run_id,
-                                    pool_address.to_string(),
-                                    "pump_amm".to_string(),
-                                    base_mint.clone(),
-                                    quote_mint.clone(),
-                                    0,
-                                    0,
-                                    None,
-                                    tx_update.slot,
-                                );
-                                let mut meta = std::collections::HashMap::new();
-                                let accounts_str: Vec<String> = pool_accounts.iter().map(|p| p.to_string()).collect();
-                                meta.insert("pool_accounts".to_string(), accounts_str.join(","));
-                                pool_update.metadata = Some(meta);
-                                let subject = pool_subject(&pool_address.to_string());
-                                if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
-                                    warn!(error = %e, "FIX-33: Failed to publish pump_amm pool_accounts PoolCacheUpdate to JetStream (create_pool)");
-                                    NATS_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                }
                             }
                         }
                         ctx.pool_mint_map.write().insert(pool_address.to_string(), base_mint.clone());

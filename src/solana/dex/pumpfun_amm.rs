@@ -46,8 +46,7 @@ fn pump_amm_canonical_event_authority(program_id: &Pubkey) -> Pubkey {
 }
 
 /// Fallback `protocol_fee_recipient` + `protocol_fee_recipient_ta` when pool/cache data is missing
-/// (`Pubkey::default()`), or for `create_pool` parsing where the instruction does not carry fee
-/// metas (see `dex_parser::build_pool_accounts_from_create_pool`).
+/// (`Pubkey::default()`), or when create_pool observation has not yet supplied swap-verified metas.
 ///
 /// **Do not** replace observed on-chain swap/create values with this — mainnet pools use distinct
 /// protocol fee recipients; see incident: Bug #35 / successful ref sell
