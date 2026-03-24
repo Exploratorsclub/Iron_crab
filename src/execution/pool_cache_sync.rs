@@ -532,10 +532,11 @@ mod tests {
         let base_mint = Pubkey::new_unique();
         let quote_mint = Pubkey::new_unique();
         let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
-        let mut meta = std::collections::HashMap::new();
-        meta.insert(
+        // Fewer than 14 accounts: not legacy-authoritative → no Ready without explicit key.
+        let mut meta_short = std::collections::HashMap::new();
+        meta_short.insert(
             "pool_accounts".to_string(),
-            accounts
+            accounts[..13]
                 .iter()
                 .map(|p| p.to_string())
                 .collect::<Vec<_>>()
@@ -555,7 +556,7 @@ mod tests {
             None,
             1,
         );
-        update.metadata = Some(meta.clone());
+        update.metadata = Some(meta_short);
         assert!(apply_pool_cache_update(&cache, &update));
         assert!(cache
             .get_pump_amm_pool_accounts_by_base_mint(&base_mint)
@@ -564,7 +565,72 @@ mod tests {
             .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
             .is_none());
 
+        let mut meta_full = std::collections::HashMap::new();
+        meta_full.insert(
+            "pool_accounts".to_string(),
+            accounts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            2,
+        );
+        update.metadata = Some(meta_full);
         update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        assert!(apply_pool_cache_update(&cache, &update));
+        assert!(cache
+            .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+            .is_some());
+    }
+
+    /// I-24d / legacy JetStream: struct literal with 14 pool_accounts + non-zero reserves, no readiness key.
+    #[test]
+    fn test_pump_amm_legacy_authoritative_no_readiness_key_is_ready() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "pool_accounts".to_string(),
+            accounts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            100,
+            200,
+            None,
+            1,
+        );
+        update.metadata = Some(meta);
+        assert_eq!(
+            update.effective_dex_readiness(),
+            DexPoolReadiness::Ready,
+            "legacy authoritative pump_amm update without dex_pool_readiness key"
+        );
         assert!(apply_pool_cache_update(&cache, &update));
         assert!(cache
             .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)

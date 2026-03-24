@@ -13,7 +13,9 @@
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
+use std::str::FromStr;
 
 /// Current schema version for all IPC types
 pub const SCHEMA_VERSION: u32 = 1;
@@ -2282,6 +2284,39 @@ mod tests {
         let parsed: PoolCacheUpdate = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.effective_dex_readiness(), DexPoolReadiness::Ready);
     }
+
+    #[test]
+    fn legacy_pump_amm_effective_readiness_without_key_requires_full_accounts_and_reserves() {
+        let pool_market = "Pool111111111111111111111111111111111111111";
+        let base_mint = "Mint1111111111111111111111111111111111111";
+        let quote_mint = NATIVE_SOL_MINT;
+        let accounts: Vec<&str> = (0..14)
+            .map(|_| "11111111111111111111111111111111")
+            .collect();
+        let mut meta = HashMap::new();
+        meta.insert(
+            POOL_CACHE_UPDATE_POOL_ACCOUNTS_KEY.to_string(),
+            accounts.join(","),
+        );
+        let mut u = PoolCacheUpdate::new_pool_discovered(
+            "t",
+            "0.1.0",
+            "r",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            100,
+            200,
+            None,
+            1,
+        );
+        u.metadata = Some(meta);
+        assert_eq!(u.effective_dex_readiness(), DexPoolReadiness::Ready);
+
+        u.base_reserve = 0;
+        assert_eq!(u.effective_dex_readiness(), DexPoolReadiness::Observed);
+    }
 }
 
 // ============================================================================
@@ -2343,6 +2378,9 @@ impl DexPoolReadiness {
 /// Kept as the only transport for readiness so downstream crates can keep using
 /// struct literals for `PoolCacheUpdate` without new required fields (API compat).
 pub const POOL_CACHE_UPDATE_DEX_READINESS_KEY: &str = "dex_pool_readiness";
+
+/// Metadata key for comma-separated PumpSwap account pubkeys on [`PoolCacheUpdate`].
+pub const POOL_CACHE_UPDATE_POOL_ACCOUNTS_KEY: &str = "pool_accounts";
 
 /// Pool cache update type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2474,14 +2512,57 @@ impl PoolCacheUpdate {
         }
     }
 
-    /// Readiness from metadata (default [`DexPoolReadiness::Observed`] if absent).
+    /// Readiness for consumers (JetStream / SLAVE merge).
+    ///
+    /// 1. If [`POOL_CACHE_UPDATE_DEX_READINESS_KEY`] is present and parses, that value wins (explicit).
+    /// 2. Else **legacy** (pre–readiness-key) `pump_amm`: treat as [`DexPoolReadiness::Ready`] only when
+    ///    this message is authoritatively usable for swap account lists — `pool_accounts` metadata has
+    ///    at least 14 valid pubkeys **and** both reserves are non-zero. Matches I-24d Eval expectations
+    ///    for struct literals without readiness metadata; does **not** treat observation-only
+    ///    `create_pool` style payloads (no full account list / zero reserves) as Ready.
     #[must_use]
     pub fn effective_dex_readiness(&self) -> DexPoolReadiness {
-        self.metadata
+        if let Some(r) = self
+            .metadata
             .as_ref()
             .and_then(|m| m.get(POOL_CACHE_UPDATE_DEX_READINESS_KEY))
             .and_then(|s| DexPoolReadiness::parse_from_metadata(s))
-            .unwrap_or_default()
+        {
+            return r;
+        }
+        if self.legacy_pump_amm_metadata_implies_ready() {
+            DexPoolReadiness::Ready
+        } else {
+            DexPoolReadiness::Observed
+        }
+    }
+
+    /// Legacy JetStream messages: `pump_amm` + non-degenerate reserves + full `pool_accounts` list.
+    fn legacy_pump_amm_metadata_implies_ready(&self) -> bool {
+        if self.dex != "pump_amm" {
+            return false;
+        }
+        if !matches!(
+            self.update_type,
+            PoolCacheUpdateType::PoolDiscovered | PoolCacheUpdateType::BalanceUpdated
+        ) {
+            return false;
+        }
+        if self.base_reserve == 0 || self.quote_reserve == 0 {
+            return false;
+        }
+        let Some(m) = self.metadata.as_ref() else {
+            return false;
+        };
+        let Some(s) = m.get(POOL_CACHE_UPDATE_POOL_ACCOUNTS_KEY) else {
+            return false;
+        };
+        let valid_pubkeys = s
+            .split(',')
+            .filter(|x| !x.is_empty())
+            .filter_map(|a| Pubkey::from_str(a.trim()).ok())
+            .count();
+        valid_pubkeys >= 14
     }
 
     /// Set readiness in `metadata` under [`POOL_CACHE_UPDATE_DEX_READINESS_KEY`].
