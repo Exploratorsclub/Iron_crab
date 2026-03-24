@@ -2258,6 +2258,30 @@ mod tests {
             assert_eq!(parsed.status, status);
         }
     }
+
+    #[test]
+    fn pool_cache_update_struct_literal_without_readiness_field_roundtrips() {
+        let mut u = PoolCacheUpdate {
+            header: RecordHeader::new("t", "0.1.0", "run"),
+            update_type: PoolCacheUpdateType::PoolDiscovered,
+            pool_address: "Pool111111111111111111111111111111111111111".to_string(),
+            dex: "pump_amm".to_string(),
+            base_mint: "Mint1111111111111111111111111111111111111".to_string(),
+            quote_mint: NATIVE_SOL_MINT.to_string(),
+            base_reserve: 1,
+            quote_reserve: 2,
+            liquidity_lamports: None,
+            geyser_slot: 99,
+            metadata: None,
+        };
+        assert_eq!(u.effective_dex_readiness(), DexPoolReadiness::Observed);
+        u.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        assert_eq!(u.effective_dex_readiness(), DexPoolReadiness::Ready);
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(json.contains(POOL_CACHE_UPDATE_DEX_READINESS_KEY));
+        let parsed: PoolCacheUpdate = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.effective_dex_readiness(), DexPoolReadiness::Ready);
+    }
 }
 
 // ============================================================================
@@ -2293,7 +2317,7 @@ impl DexPoolReadiness {
         }
     }
 
-    /// Parse from PoolCacheUpdate metadata value (same strings as JSON).
+    /// Parse from `PoolCacheUpdate` metadata value (SCREAMING_SNAKE_CASE strings).
     pub fn parse_from_metadata(s: &str) -> Option<DexPoolReadiness> {
         match s.trim() {
             "OBSERVED" => Some(Self::Observed),
@@ -2302,7 +2326,23 @@ impl DexPoolReadiness {
             _ => None,
         }
     }
+
+    /// Serialized form for [`POOL_CACHE_UPDATE_DEX_READINESS_KEY`] metadata.
+    #[must_use]
+    pub const fn as_metadata_str(self) -> &'static str {
+        match self {
+            Self::Observed => "OBSERVED",
+            Self::Partial => "PARTIAL",
+            Self::Ready => "READY",
+        }
+    }
 }
+
+/// Metadata key for [`DexPoolReadiness`] on [`PoolCacheUpdate`] (JetStream / JSON).
+///
+/// Kept as the only transport for readiness so downstream crates can keep using
+/// struct literals for `PoolCacheUpdate` without new required fields (API compat).
+pub const POOL_CACHE_UPDATE_DEX_READINESS_KEY: &str = "dex_pool_readiness";
 
 /// Pool cache update type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2353,10 +2393,6 @@ pub struct PoolCacheUpdate {
     /// Additional DEX-specific metadata (JSON string)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
-
-    /// Explicit pool / account-list readiness for DEX consumers (never infer from cache hit alone).
-    #[serde(default)]
-    pub dex_readiness: DexPoolReadiness,
 }
 
 impl PoolCacheUpdate {
@@ -2385,7 +2421,6 @@ impl PoolCacheUpdate {
             liquidity_lamports,
             geyser_slot,
             metadata: None,
-            dex_readiness: DexPoolReadiness::default(),
         }
     }
 
@@ -2413,7 +2448,6 @@ impl PoolCacheUpdate {
             liquidity_lamports: None,
             geyser_slot,
             metadata: None,
-            dex_readiness: DexPoolReadiness::default(),
         }
     }
 
@@ -2437,7 +2471,25 @@ impl PoolCacheUpdate {
             liquidity_lamports: None,
             geyser_slot,
             metadata: None,
-            dex_readiness: DexPoolReadiness::default(),
         }
+    }
+
+    /// Readiness from metadata (default [`DexPoolReadiness::Observed`] if absent).
+    #[must_use]
+    pub fn effective_dex_readiness(&self) -> DexPoolReadiness {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(POOL_CACHE_UPDATE_DEX_READINESS_KEY))
+            .and_then(|s| DexPoolReadiness::parse_from_metadata(s))
+            .unwrap_or_default()
+    }
+
+    /// Set readiness in `metadata` under [`POOL_CACHE_UPDATE_DEX_READINESS_KEY`].
+    pub fn set_dex_readiness_in_metadata(&mut self, readiness: DexPoolReadiness) {
+        let m = self.metadata.get_or_insert_with(HashMap::new);
+        m.insert(
+            POOL_CACHE_UPDATE_DEX_READINESS_KEY.to_string(),
+            readiness.as_metadata_str().to_string(),
+        );
     }
 }

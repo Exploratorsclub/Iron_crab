@@ -1776,7 +1776,6 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     None,
                     0,
                 );
-                pool_update.dex_readiness = DexPoolReadiness::Ready;
                 let mut meta = std::collections::HashMap::new();
                 let accounts_str: Vec<String> = accounts.iter().map(|p| p.to_string()).collect();
                 meta.insert("pool_accounts".to_string(), accounts_str.join(","));
@@ -1784,6 +1783,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     meta.insert("creator".to_string(), creator.to_string());
                 }
                 pool_update.metadata = Some(meta);
+                pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
                 let subject = pool_subject(&pool_address_str);
                 match nats.jetstream_publish(&subject, &pool_update).await {
                     Ok(true) => {
@@ -3466,7 +3466,7 @@ async fn run_geyser_loop(
                                     pool_update.metadata = Some(meta);
                                 }
                                 // Geyser-fed accounts + reserves: stronger than observation-only, not Ready until verified trade/discovery.
-                                pool_update.dex_readiness = DexPoolReadiness::Partial;
+                                pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
                                 ctx.live_pool_cache.merge_pump_amm_pool_accounts_readiness(
                                     account_update.pubkey,
                                     DexPoolReadiness::Partial,
@@ -4156,11 +4156,11 @@ async fn run_geyser_loop(
                                 None,
                                 tx_update.slot,
                             );
-                            pool_update.dex_readiness = DexPoolReadiness::Ready;
                             let mut meta = std::collections::HashMap::new();
                             let accounts_str: Vec<String> = pool_accounts.iter().map(|p| p.to_string()).collect();
                             meta.insert("pool_accounts".to_string(), accounts_str.join(","));
                             pool_update.metadata = Some(meta);
+                            pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
                             let subject = pool_subject(&pool_address.to_string());
                             if let Err(e) = nats.jetstream_publish(&subject, &pool_update).await {
                                 warn!(error = %e, "FIX-33: Failed to publish pump_amm pool_accounts PoolCacheUpdate to JetStream (trade)");

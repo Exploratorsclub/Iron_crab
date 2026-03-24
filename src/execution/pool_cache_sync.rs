@@ -24,21 +24,8 @@ use crate::execution::live_pool_cache::{
     CachedPoolState, LivePoolCache, MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState,
     RaydiumAmmState, RaydiumCpmmState,
 };
-use crate::ipc::{DexPoolReadiness, PoolCacheUpdate, PoolCacheUpdateType};
+use crate::ipc::{PoolCacheUpdate, PoolCacheUpdateType};
 use crate::nats::{slave_consumer_config, NatsClient, STREAM_NAME};
-
-/// Effective readiness from `PoolCacheUpdate` (top-level field + optional metadata for older payloads).
-fn effective_pump_amm_readiness_from_update(update: &PoolCacheUpdate) -> DexPoolReadiness {
-    let mut r = update.dex_readiness;
-    if let Some(m) = update.metadata.as_ref() {
-        if let Some(s) = m.get("dex_pool_readiness") {
-            if let Some(p) = DexPoolReadiness::parse_from_metadata(s) {
-                r = r.merge(p);
-            }
-        }
-    }
-    r
-}
 
 /// Extract base_reserve and quote_reserve from CachedPoolState (for merge logic).
 fn extract_reserves(state: &CachedPoolState) -> (u64, u64) {
@@ -308,7 +295,7 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_pool_accounts_readiness(
                         pool_addr,
-                        effective_pump_amm_readiness_from_update(update),
+                        update.effective_dex_readiness(),
                     );
                 }
                 // P3 #13: Propagate base_decimals and quote_decimals to SLAVE cache
@@ -382,7 +369,7 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_pool_accounts_readiness(
                         addr,
-                        effective_pump_amm_readiness_from_update(update),
+                        update.effective_dex_readiness(),
                     );
                 }
                 // P3 #13: Apply decimals from metadata when present (e.g. BalanceUpdated with metadata)
@@ -487,6 +474,7 @@ pub async fn bootstrap_pool_cache_from_jetstream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::DexPoolReadiness;
 
     /// A.30 Regression: cashback_enabled must be true when JetStream metadata contains
     /// cashback_enabled="true". Verifies pool_cache_sync propagates metadata correctly.
@@ -576,7 +564,7 @@ mod tests {
             .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
             .is_none());
 
-        update.dex_readiness = DexPoolReadiness::Ready;
+        update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
         assert!(apply_pool_cache_update(&cache, &update));
         assert!(cache
             .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
@@ -614,7 +602,7 @@ mod tests {
             1,
         );
         ready_update.metadata = Some(meta.clone());
-        ready_update.dex_readiness = DexPoolReadiness::Ready;
+        ready_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
         assert!(apply_pool_cache_update(&cache, &ready_update));
         assert!(cache
             .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
@@ -634,7 +622,7 @@ mod tests {
             2,
         );
         weak_update.metadata = Some(meta);
-        weak_update.dex_readiness = DexPoolReadiness::Observed;
+        weak_update.set_dex_readiness_in_metadata(DexPoolReadiness::Observed);
         assert!(apply_pool_cache_update(&cache, &weak_update));
         assert!(
             cache
