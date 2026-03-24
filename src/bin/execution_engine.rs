@@ -167,6 +167,21 @@ fn is_pump_amm_structural_sim_error(error_code: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// PumpFun bonding curve: stale reserves / wrong account count (cashback) → Custom(6023/6024), Overflow.
+/// Cold-path recovery matcher (liquidation / manual); must stay aligned with handler below.
+#[inline]
+fn is_pumpfun_bonding_curve_structural_sim_error(error_code: Option<&str>) -> bool {
+    error_code
+        .map(|e| {
+            e.contains("6023")
+                || e.contains("6024")
+                || e.contains("Overflow")
+                || e.contains("0x1787")
+                || e.contains("0x1788")
+        })
+        .unwrap_or(false)
+}
+
 /// Scope-1 async PumpSwap healing: only **regular momentum strategy** SELLs (hot path).
 ///
 /// Excludes cold-path / manual safety tooling (e.g. `sell-all` uses `source == "sell-all"` and
@@ -1466,6 +1481,26 @@ async fn wait_for_usable_pump_amm_cache_state(
     false
 }
 
+/// After `EnsurePumpfunBondingCurve` + JetStream merge: wait until SLAVE cache reflects a change
+/// vs the pre-request snapshot (or new entry appears).
+async fn wait_for_pumpfun_bonding_cache_refresh(
+    cache: &LivePoolCache,
+    bonding_curve: &Pubkey,
+    before: Option<(u64, u64, u64, u64, bool, bool)>,
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        let after = cache.pumpfun_bonding_curve_reserves_snapshot(bonding_curve);
+        if after != before {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+    }
+    false
+}
+
 /// Runtime context for execution-engine
 struct ExecutionContext {
     run_id: String,
@@ -2121,6 +2156,110 @@ impl ExecutionContext {
             };
 
         // Cleanup pending entry (may have been removed by subscription)
+        let _ = self
+            .pending_discovery_responses
+            .lock()
+            .await
+            .remove(&request_id);
+
+        outcome
+    }
+
+    /// I-24d: Request PumpFun bonding curve RPC refresh from market-data (Cold Path only).
+    /// Sends EnsurePumpfunBondingCurve with `force_refresh_pumpfun=true`, waits bounded for ControlResponse.
+    /// Does NOT write to SLAVE cache — market-data publishes PoolCacheUpdate to JetStream.
+    async fn request_pumpfun_bonding_recovery_and_wait(
+        &self,
+        base_mint: &str,
+    ) -> DiscoveryRequestOutcome {
+        let Some(ref nats) = self.nats else {
+            warn!(
+                request_id = "n/a",
+                base_mint = %base_mint,
+                "PumpFun bonding recovery: NATS not connected"
+            );
+            return DiscoveryRequestOutcome::Error("NATS not connected".to_string());
+        };
+
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        {
+            let mut pending = self.pending_discovery_responses.lock().await;
+            pending.insert(request_id.clone(), tx);
+        }
+
+        let mut req = ControlRequest::new(
+            "execution-engine",
+            BUILD_VERSION,
+            &self.run_id,
+            request_id.clone(),
+            "market-data",
+            ControlRequestKind::EnsurePumpfunBondingCurve {
+                base_mint: base_mint.to_string(),
+            },
+        );
+        req.force_refresh_pumpfun = true;
+
+        warn!(
+            request_id = %request_id,
+            base_mint = %base_mint,
+            target = "market-data",
+            "PumpFun cold-path: EnsurePumpfunBondingCurve force_refresh (stale bonding-curve sim fail recovery)"
+        );
+
+        if nats.publish(TOPIC_CONTROL_REQUESTS, &req).await.is_err() {
+            let mut pending = self.pending_discovery_responses.lock().await;
+            pending.remove(&request_id);
+            warn!(
+                request_id = %request_id,
+                base_mint = %base_mint,
+                "PumpFun bonding recovery: publish failed"
+            );
+            return DiscoveryRequestOutcome::Error("publish failed".to_string());
+        }
+
+        let outcome =
+            match tokio::time::timeout(Duration::from_secs(DISCOVERY_REQUEST_TIMEOUT_SECS), rx)
+                .await
+            {
+                Ok(Ok(resp)) => {
+                    let status_str = format!("{:?}", resp.status);
+                    let pool = resp.pool_address.as_deref();
+                    info!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        status = %status_str,
+                        pool_address = ?pool,
+                        "PumpFun bonding recovery: ControlResponse received"
+                    );
+                    match resp.status {
+                        ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
+                        ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                        ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
+                            resp.message.unwrap_or_else(|| "unknown error".to_string()),
+                        ),
+                    }
+                }
+                Ok(Err(_)) => {
+                    warn!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        "PumpFun bonding recovery: channel closed before response"
+                    );
+                    DiscoveryRequestOutcome::Error("channel closed".to_string())
+                }
+                Err(_) => {
+                    warn!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        timeout_secs = DISCOVERY_REQUEST_TIMEOUT_SECS,
+                        "PumpFun bonding recovery: timeout (no correlated response)"
+                    );
+                    DiscoveryRequestOutcome::Timeout
+                }
+            };
+
         let _ = self
             .pending_discovery_responses
             .lock()
@@ -7796,6 +7935,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // tx_builder::build_tx_plan (which requires metadata.dex and pools_len==1).
     let checks_len_before_tx_plan_build = checks.len();
     let mut pump_amm_recovery_attempted = false;
+    let mut pumpfun_bonding_recovery_attempted = false;
     let (
         tx_plan,
         plan_hash_str,
@@ -7805,7 +7945,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         wallet_pubkey,
         bundle_tip_lamports,
     ) = loop {
-        if pump_amm_recovery_attempted {
+        if pump_amm_recovery_attempted || pumpfun_bonding_recovery_attempted {
             checks.truncate(checks_len_before_tx_plan_build);
         }
         let (tx_plan, plan_hash_str) = {
@@ -8216,6 +8356,81 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                                 intent_id = %intent.intent_id,
                                 pool = %pool_pk,
                                 "PumpSwap liquidation: simulation 6023/Overflow — force-refresh pool_accounts (market-data RPC), rebuilding tx (one retry)"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // PumpFun bonding curve SELL: stale virtual/real reserves or cashback layout → 6023/6024/Overflow.
+        // Cold-path recovery: EnsurePumpfunBondingCurve with force_refresh (RPC in market-data), bounded JetStream wait, one retry.
+        if !pumpfun_bonding_recovery_attempted
+            && is_liquidation_sell
+            && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun")
+            && intent.resources.pools.len() == 1
+            && is_pumpfun_bonding_curve_structural_sim_error(sim_result.error_code.as_deref())
+        {
+            let base_mint_pk = match Pubkey::from_str(&intent.resources.input_mint) {
+                Ok(p) => p,
+                Err(_) => {
+                    break (
+                        tx_plan,
+                        plan_hash_str,
+                        sim_result,
+                        requires_bundle,
+                        bundle_tip_ix,
+                        wallet_pubkey,
+                        bundle_tip_lamports,
+                    )
+                }
+            };
+            let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc), None) {
+                Ok(d) => d,
+                Err(_) => {
+                    break (
+                        tx_plan,
+                        plan_hash_str,
+                        sim_result,
+                        requires_bundle,
+                        bundle_tip_ix,
+                        wallet_pubkey,
+                        bundle_tip_lamports,
+                    )
+                }
+            };
+            let (bonding_curve, _) = pumpfun.derive_bonding_curve(&base_mint_pk);
+            let pool_str = intent.resources.pools[0].as_str();
+            let pool_ok = Pubkey::from_str(pool_str)
+                .map(|p| p == bonding_curve)
+                .unwrap_or(false);
+            if pool_ok {
+                let before_snap = ctx
+                    .live_pool_cache
+                    .as_ref()
+                    .and_then(|c| c.pumpfun_bonding_curve_reserves_snapshot(&bonding_curve));
+                if let DiscoveryRequestOutcome::Ok = ctx
+                    .request_pumpfun_bonding_recovery_and_wait(&intent.resources.input_mint)
+                    .await
+                {
+                    if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                        if wait_for_pumpfun_bonding_cache_refresh(
+                            cache,
+                            &bonding_curve,
+                            before_snap,
+                            DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                            DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                        )
+                        .await
+                        {
+                            pumpfun_bonding_recovery_attempted = true;
+                            warn!(
+                                intent_id = %intent.intent_id,
+                                mint = %intent.resources.input_mint,
+                                bonding_curve = %bonding_curve,
+                                sim_error = ?sim_result.error_code,
+                                "PumpFun liquidation: bonding-curve structural sim fail — force_refresh via market-data RPC, one tx rebuild retry"
                             );
                             continue;
                         }

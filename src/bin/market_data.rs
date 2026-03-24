@@ -52,6 +52,7 @@ use ironcrab::nats::{
 use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
+use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
 use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use ironcrab::solana::dex_parser::{
     parse_account_update, parse_transaction_update_with_pool_lookup, DexType, OrcaPoolInfo,
@@ -1900,6 +1901,235 @@ async fn handle_ensure_pump_amm_pool_accounts(
     }
 }
 
+/// Cold-path recovery: fetch PumpFun bonding curve account via RPC (force_refresh), update MASTER
+/// cache, publish JetStream PoolCacheUpdate. Does not short-circuit on cache when `force_refresh`.
+async fn handle_ensure_pumpfun_bonding_curve(
+    ctx: &MarketDataContext,
+    rpc: &Arc<SolanaRpc>,
+    run_id: &str,
+    request_id: &str,
+    base_mint_str: &str,
+    force_refresh: bool,
+) {
+    let base_mint = match Pubkey::from_str(base_mint_str) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(base_mint = %base_mint_str, error = %e, "EnsurePumpfunBondingCurve: invalid base_mint");
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::Error,
+                    None,
+                    Some(e.to_string()),
+                )
+                .await;
+            }
+            return;
+        }
+    };
+
+    let pumpfun = match PumpFunDex::new(Arc::clone(rpc), Some(ctx.live_pool_cache.clone())) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "EnsurePumpfunBondingCurve: PumpFunDex init failed");
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::Error,
+                    None,
+                    Some(e.to_string()),
+                )
+                .await;
+            }
+            return;
+        }
+    };
+
+    let (bonding_curve, _) = pumpfun.derive_bonding_curve(&base_mint);
+    let bonding_curve_str = bonding_curve.to_string();
+
+    if !force_refresh {
+        if let Some(CachedPoolState::PumpFun(_)) = ctx.live_pool_cache.get(&bonding_curve) {
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                pool = %bonding_curve_str,
+                "EnsurePumpfunBondingCurve: cache hit (skip RPC)"
+            );
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::Ok,
+                    Some(bonding_curve_str),
+                    None,
+                )
+                .await;
+            }
+            return;
+        }
+    } else {
+        warn!(
+            request_id = %request_id,
+            base_mint = %base_mint_str,
+            pool = %bonding_curve_str,
+            "EnsurePumpfunBondingCurve: force_refresh — always fetching bonding curve via RPC (no cache-first)"
+        );
+    }
+
+    let state = match rpc.get_account_retry(&bonding_curve).await {
+        Ok(acct) => match BondingCurveState::parse(&acct.data) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    request_id = %request_id,
+                    pool = %bonding_curve_str,
+                    error = %e,
+                    "EnsurePumpfunBondingCurve: parse bonding curve failed"
+                );
+                if let Some(ref nats) = ctx.nats {
+                    publish_control_response(
+                        nats,
+                        &ctx.run_id,
+                        request_id,
+                        ControlResponseStatus::Error,
+                        Some(bonding_curve_str),
+                        Some(format!("parse error: {e}")),
+                    )
+                    .await;
+                }
+                return;
+            }
+        },
+        Err(e) => {
+            warn!(
+                request_id = %request_id,
+                pool = %bonding_curve_str,
+                error = %e,
+                "EnsurePumpfunBondingCurve: RPC get_account failed"
+            );
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::Error,
+                    Some(bonding_curve_str),
+                    Some(e.to_string()),
+                )
+                .await;
+            }
+            return;
+        }
+    };
+
+    let token_program = ctx
+        .live_pool_cache
+        .get_mint_program(&base_mint)
+        .unwrap_or_else(|| Pubkey::new_from_array(spl_token::id().to_bytes()));
+    let (associated_bonding_curve, _) =
+        pumpfun.derive_associated_bonding_curve(&bonding_curve, &base_mint, &token_program);
+
+    let cached = CachedPoolState::PumpFun(PumpFunState {
+        token_mint: base_mint,
+        bonding_curve,
+        associated_bonding_curve,
+        virtual_sol_reserves: state.virtual_sol_reserves,
+        virtual_token_reserves: state.virtual_token_reserves,
+        real_sol_reserves: state.real_sol_reserves,
+        real_token_reserves: state.real_token_reserves,
+        complete: state.complete,
+        creator: state.creator,
+        cashback_enabled: state.cashback_enabled,
+    });
+    ctx.live_pool_cache.upsert(bonding_curve, cached, 0);
+
+    let jetstream_ok = if let Some(ref nats) = ctx.nats {
+        let mut pool_update = PoolCacheUpdate::new_pool_discovered(
+            "market-data",
+            BUILD_VERSION,
+            run_id,
+            bonding_curve_str.clone(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            NATIVE_SOL_MINT.to_string(),
+            state.virtual_token_reserves,
+            state.virtual_sol_reserves,
+            Some(0),
+            0,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("creator".to_string(), state.creator.to_string());
+        meta.insert(
+            "associated_bonding_curve".to_string(),
+            associated_bonding_curve.to_string(),
+        );
+        meta.insert("complete".to_string(), state.complete.to_string());
+        meta.insert(
+            "real_token_reserves".to_string(),
+            state.real_token_reserves.to_string(),
+        );
+        meta.insert(
+            "real_sol_reserves".to_string(),
+            state.real_sol_reserves.to_string(),
+        );
+        meta.insert(
+            "cashback_enabled".to_string(),
+            state.cashback_enabled.to_string(),
+        );
+        pool_update.metadata = Some(meta);
+        let subject = pool_subject(&bonding_curve_str);
+        match nats.jetstream_publish(&subject, &pool_update).await {
+            Ok(true) => {
+                info!(
+                    pool = %bonding_curve_str,
+                    base_mint = %base_mint_str,
+                    "EnsurePumpfunBondingCurve: Published PoolCacheUpdate to JetStream"
+                );
+                true
+            }
+            Ok(false) => {
+                warn!("EnsurePumpfunBondingCurve: JetStream publish failed (timeout or drop)");
+                false
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "EnsurePumpfunBondingCurve: Failed to publish PoolCacheUpdate to JetStream"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if let Some(ref nats) = ctx.nats {
+        let (status, message) = if jetstream_ok {
+            (ControlResponseStatus::Ok, None)
+        } else {
+            (
+                ControlResponseStatus::Error,
+                Some("JetStream publish failed".to_string()),
+            )
+        };
+        publish_control_response(
+            nats,
+            &ctx.run_id,
+            request_id,
+            status,
+            Some(bonding_curve_str),
+            message,
+        )
+        .await;
+    }
+}
+
 async fn publish_control_response(
     nats: &NatsClient,
     run_id: &str,
@@ -2157,37 +2387,64 @@ async fn run_geyser_loop(
                         Ok(req) => {
                             if req.target != "market-data" {
                                 debug!(target = %req.target, "Ignoring ControlRequest for other target");
-                            } else if let ControlRequestKind::EnsurePumpAmmPoolAccounts {
-                                base_mint,
-                            } = req.kind
-                            {
-                                let run_id = ctx.run_id.clone();
-                                let request_id = req.request_id.clone();
-                                let pool_hint = req.pool_address_hint.clone();
-                                let force_refresh = req.force_refresh;
-                                info!(
-                                    request_id = %request_id,
-                                    base_mint = %base_mint,
-                                    pool_address_hint = ?pool_hint,
-                                    force_refresh = %force_refresh,
-                                    "I-24d Discovery: EnsurePumpAmmPoolAccounts received"
-                                );
-                                let ctx_clone = ctx.clone();
-                                let dex_clone = Arc::clone(&pump_amm_dex);
-                                tokio::spawn(async move {
-                                    handle_ensure_pump_amm_pool_accounts(
-                                        &ctx_clone,
-                                        dex_clone.as_ref(),
-                                        run_id.as_str(),
-                                        &request_id,
-                                        &base_mint,
-                                        pool_hint.as_deref(),
-                                        force_refresh,
-                                    )
-                                    .await;
-                                });
+                            } else {
+                                match req.kind {
+                                    ControlRequestKind::EnsurePumpAmmPoolAccounts { base_mint } => {
+                                        let run_id = ctx.run_id.clone();
+                                        let request_id = req.request_id.clone();
+                                        let pool_hint = req.pool_address_hint.clone();
+                                        let force_refresh = req.force_refresh;
+                                        info!(
+                                            request_id = %request_id,
+                                            base_mint = %base_mint,
+                                            pool_address_hint = ?pool_hint,
+                                            force_refresh = %force_refresh,
+                                            "I-24d Discovery: EnsurePumpAmmPoolAccounts received"
+                                        );
+                                        let ctx_clone = ctx.clone();
+                                        let dex_clone = Arc::clone(&pump_amm_dex);
+                                        tokio::spawn(async move {
+                                            handle_ensure_pump_amm_pool_accounts(
+                                                &ctx_clone,
+                                                dex_clone.as_ref(),
+                                                run_id.as_str(),
+                                                &request_id,
+                                                &base_mint,
+                                                pool_hint.as_deref(),
+                                                force_refresh,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                    ControlRequestKind::EnsurePumpfunBondingCurve { base_mint } => {
+                                        let run_id = ctx.run_id.clone();
+                                        let request_id = req.request_id.clone();
+                                        let force_refresh = req.force_refresh_pumpfun;
+                                        info!(
+                                            request_id = %request_id,
+                                            base_mint = %base_mint,
+                                            force_refresh_pumpfun = %force_refresh,
+                                            "EnsurePumpfunBondingCurve received"
+                                        );
+                                        let ctx_clone = ctx.clone();
+                                        let rpc_clone = rpc.clone();
+                                        tokio::spawn(async move {
+                                            handle_ensure_pumpfun_bonding_curve(
+                                                &ctx_clone,
+                                                &rpc_clone,
+                                                run_id.as_str(),
+                                                &request_id,
+                                                &base_mint,
+                                                force_refresh,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                    _ => {
+                                        debug!(kind = ?req.kind, "Ignoring ControlRequest kind for market-data");
+                                    }
+                                }
                             }
-                            // Other ControlRequestKind variants are for execution-engine, ignore.
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to deserialize ControlRequest");
@@ -4485,7 +4742,7 @@ async fn run_simulation_loop(
     };
 
     let pump_amm_dex = Arc::new(PumpFunAmmDex::new_with_cache(
-        rpc,
+        Arc::clone(&rpc),
         ctx.live_pool_cache.clone(),
         true, // allow_rpc_on_miss: Cold Path Discovery
     ));
@@ -4580,35 +4837,63 @@ async fn run_simulation_loop(
                         Ok(req) => {
                             if req.target != "market-data" {
                                 debug!(target = %req.target, "Ignoring ControlRequest for other target");
-                            } else if let ControlRequestKind::EnsurePumpAmmPoolAccounts {
-                                base_mint,
-                            } = req.kind
-                            {
-                                let run_id = ctx.run_id.clone();
-                                let request_id = req.request_id.clone();
-                                let pool_hint = req.pool_address_hint.clone();
-                                let force_refresh = req.force_refresh;
-                                info!(
-                                    request_id = %request_id,
-                                    base_mint = %base_mint,
-                                    pool_address_hint = ?pool_hint,
-                                    force_refresh = %force_refresh,
-                                    "I-24d Discovery: EnsurePumpAmmPoolAccounts received (simulation)"
-                                );
-                                let ctx_clone = ctx.clone();
-                                let dex_clone = Arc::clone(&pump_amm_dex);
-                                tokio::spawn(async move {
-                                    handle_ensure_pump_amm_pool_accounts(
-                                        &ctx_clone,
-                                        dex_clone.as_ref(),
-                                        run_id.as_str(),
-                                        &request_id,
-                                        &base_mint,
-                                        pool_hint.as_deref(),
-                                        force_refresh,
-                                    )
-                                    .await;
-                                });
+                            } else {
+                                match req.kind {
+                                    ControlRequestKind::EnsurePumpAmmPoolAccounts { base_mint } => {
+                                        let run_id = ctx.run_id.clone();
+                                        let request_id = req.request_id.clone();
+                                        let pool_hint = req.pool_address_hint.clone();
+                                        let force_refresh = req.force_refresh;
+                                        info!(
+                                            request_id = %request_id,
+                                            base_mint = %base_mint,
+                                            pool_address_hint = ?pool_hint,
+                                            force_refresh = %force_refresh,
+                                            "I-24d Discovery: EnsurePumpAmmPoolAccounts received (simulation)"
+                                        );
+                                        let ctx_clone = ctx.clone();
+                                        let dex_clone = Arc::clone(&pump_amm_dex);
+                                        tokio::spawn(async move {
+                                            handle_ensure_pump_amm_pool_accounts(
+                                                &ctx_clone,
+                                                dex_clone.as_ref(),
+                                                run_id.as_str(),
+                                                &request_id,
+                                                &base_mint,
+                                                pool_hint.as_deref(),
+                                                force_refresh,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                    ControlRequestKind::EnsurePumpfunBondingCurve { base_mint } => {
+                                        let run_id = ctx.run_id.clone();
+                                        let request_id = req.request_id.clone();
+                                        let force_refresh = req.force_refresh_pumpfun;
+                                        info!(
+                                            request_id = %request_id,
+                                            base_mint = %base_mint,
+                                            force_refresh_pumpfun = %force_refresh,
+                                            "EnsurePumpfunBondingCurve received (simulation)"
+                                        );
+                                        let ctx_clone = ctx.clone();
+                                        let rpc_clone = rpc.clone();
+                                        tokio::spawn(async move {
+                                            handle_ensure_pumpfun_bonding_curve(
+                                                &ctx_clone,
+                                                &rpc_clone,
+                                                run_id.as_str(),
+                                                &request_id,
+                                                &base_mint,
+                                                force_refresh,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                    _ => {
+                                        debug!(kind = ?req.kind, "Ignoring ControlRequest kind for market-data (simulation)");
+                                    }
+                                }
                             }
                         }
                         Err(e) => {

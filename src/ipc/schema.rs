@@ -1108,6 +1108,16 @@ pub enum ControlRequestKind {
         /// Base mint address (base58) of the PumpSwap pool to discover.
         base_mint: String,
     },
+
+    /// Cold-path recovery: refresh PumpFun bonding curve state from RPC and publish PoolCacheUpdate.
+    ///
+    /// Sent by execution-engine when a liquidation/manual PumpFun bonding-curve SELL fails
+    /// simulation with a stale-state signature. market-data performs authoritative RPC fetch,
+    /// updates MASTER cache, publishes JetStream `PoolCacheUpdate`. Truth source = JetStream.
+    EnsurePumpfunBondingCurve {
+        /// Token mint (base58) whose bonding curve PDA should be refreshed.
+        base_mint: String,
+    },
 }
 
 fn default_true() -> bool {
@@ -1137,6 +1147,12 @@ pub struct ControlRequest {
     #[serde(default)]
     pub force_refresh: bool,
 
+    /// When true, market-data must **not** answer EnsurePumpfunBondingCurve from LivePoolCache
+    /// alone: fetch bonding curve account via RPC and publish PoolCacheUpdate. Cold-path recovery
+    /// only (I-5); default false for backward-compatible wire format.
+    #[serde(default)]
+    pub force_refresh_pumpfun: bool,
+
     #[serde(flatten)]
     pub kind: ControlRequestKind,
 }
@@ -1156,6 +1172,7 @@ impl ControlRequest {
             target: target.to_string(),
             pool_address_hint: None,
             force_refresh: false,
+            force_refresh_pumpfun: false,
             kind,
         }
     }
@@ -2164,6 +2181,34 @@ mod tests {
         assert!(json_force.contains("\"force_refresh\":true"));
         let parsed_force: ControlRequest = serde_json::from_str(&json_force).unwrap();
         assert!(parsed_force.force_refresh);
+    }
+
+    #[test]
+    fn test_control_request_ensure_pumpfun_bonding_curve_serde() {
+        let mut req = ControlRequest::new(
+            "execution-engine",
+            "v0.1.0",
+            "run-123",
+            "req-pumpfun-bc-001".to_string(),
+            "market-data",
+            ControlRequestKind::EnsurePumpfunBondingCurve {
+                base_mint: "MintPumpFun111111111111111111111111111111".to_string(),
+            },
+        );
+        req.force_refresh_pumpfun = true;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("ensure_pumpfun_bonding_curve"));
+        assert!(json.contains("MintPumpFun111111111111111111111111111111"));
+        assert!(json.contains("\"force_refresh_pumpfun\":true"));
+
+        let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
+        assert!(parsed.force_refresh_pumpfun);
+        match &parsed.kind {
+            ControlRequestKind::EnsurePumpfunBondingCurve { base_mint } => {
+                assert_eq!(base_mint, "MintPumpFun111111111111111111111111111111");
+            }
+            _ => panic!("expected EnsurePumpfunBondingCurve"),
+        }
     }
 
     #[test]
