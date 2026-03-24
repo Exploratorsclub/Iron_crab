@@ -814,6 +814,286 @@
     },
     {
       "orgId": 1,
+      "name": "IronCrab PumpSwap Hot-Path Healing",
+      "folder": "IronCrab Alerts",
+      "interval": "1m",
+      "rules": [
+        {
+          "uid": "ironcrab-pumpswap-healing-skipped-no-nats",
+          "title": "PumpSwap Healing Skipped (No NATS)",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "bf5zln2g4x5vka",
+              "model": {
+                "expr": "increase(pumpswap_hot_path_healing_skipped_no_nats_total[5m])",
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "last",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [0],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "OK",
+          "for": "2m",
+          "annotations": {
+            "summary": "PumpSwap async healing reached but cannot publish (no NATS)",
+            "description": "pumpswap_hot_path_healing_skipped_no_nats_total increased in the last 5m window. Hot-path healing cannot enqueue work; check NATS connectivity and execution-engine messaging."
+          },
+          "labels": {
+            "severity": "warning",
+            "component": "execution-engine",
+            "type": "pumpswap_healing"
+          }
+        },
+        {
+          "uid": "ironcrab-pumpswap-healing-async-publish-fail",
+          "title": "PumpSwap Healing Async Publish Failures",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "bf5zln2g4x5vka",
+              "model": {
+                "expr": "rate(pumpswap_hot_path_healing_async_publish_fail_total[5m])",
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "mean",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [0.02],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "OK",
+          "for": "5m",
+          "annotations": {
+            "summary": "PumpSwap healing async publish is failing repeatedly",
+            "description": "rate(pumpswap_hot_path_healing_async_publish_fail_total[5m]) exceeds 0.02/s sustained. The async healing path is degraded; investigate NATS/JetStream and execution-engine logs."
+          },
+          "labels": {
+            "severity": "warning",
+            "component": "execution-engine",
+            "type": "pumpswap_healing"
+          }
+        },
+        {
+          "uid": "ironcrab-pumpswap-healing-trigger-spike",
+          "title": "PumpSwap Healing Trigger Rate Unusually High",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 1200,
+                "to": 0
+              },
+              "datasourceUid": "bf5zln2g4x5vka",
+              "model": {
+                "expr": "rate(pumpswap_hot_path_healing_trigger_total[5m])",
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "relativeTimeRange": {
+                "from": 1200,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "mean",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 1200,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [0.03],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "OK",
+          "for": "10m",
+          "annotations": {
+            "summary": "PumpSwap hot-path healing triggers much more often than expected",
+            "description": "rate(pumpswap_hot_path_healing_trigger_total[5m]) exceeds 0.03/s for 10m. Edge-case healing should be rare; investigate stale pools, Geyser/LivePoolCache health, and repeated mint/pool failures."
+          },
+          "labels": {
+            "severity": "warning",
+            "component": "execution-engine",
+            "type": "pumpswap_healing"
+          }
+        },
+        {
+          "uid": "ironcrab-pumpswap-healing-cooldown-suppressed-spike",
+          "title": "PumpSwap Healing Cooldown Suppressions High",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 1200,
+                "to": 0
+              },
+              "datasourceUid": "bf5zln2g4x5vka",
+              "model": {
+                "expr": "increase(pumpswap_hot_path_healing_cooldown_suppressed_total[15m])",
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "relativeTimeRange": {
+                "from": 1200,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "expression": "A",
+                "reducer": "last",
+                "refId": "B",
+                "type": "reduce"
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 1200,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [12],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "expression": "B",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "OK",
+          "for": "5m",
+          "annotations": {
+            "summary": "Many PumpSwap healing attempts suppressed by cooldown",
+            "description": "increase(pumpswap_hot_path_healing_cooldown_suppressed_total[15m]) exceeds 12. Suggests repeated structural failures for the same mint/pool; cross-check with healing trigger and pool/Geyser health."
+          },
+          "labels": {
+            "severity": "warning",
+            "component": "execution-engine",
+            "type": "pumpswap_healing"
+          }
+        }
+      ]
+    },
+    {
+      "orgId": 1,
       "name": "Validator Health",
       "folder": "IronCrab Alerts",
       "interval": "30s",
