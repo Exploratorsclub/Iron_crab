@@ -609,6 +609,27 @@ impl LivePoolCache {
         self.mint_decimals.entry(mint).or_insert(decimals);
     }
 
+    /// Fields from cached PumpFun bonding curve relevant to SELL simulation / recovery waits.
+    ///
+    /// Used by execution-engine to detect JetStream-applied `PoolCacheUpdate` after market-data
+    /// RPC refresh (Cold Path recovery).
+    pub fn pumpfun_bonding_curve_reserves_snapshot(
+        &self,
+        bonding_curve: &Pubkey,
+    ) -> Option<(u64, u64, u64, u64, bool, bool)> {
+        match self.get(bonding_curve)? {
+            CachedPoolState::PumpFun(s) => Some((
+                s.virtual_token_reserves,
+                s.virtual_sol_reserves,
+                s.real_token_reserves,
+                s.real_sol_reserves,
+                s.complete,
+                s.cashback_enabled,
+            )),
+            _ => None,
+        }
+    }
+
     /// Get the creator from a PumpFun bonding curve cached state
     /// Returns None if the bonding curve is not cached or is not a PumpFun pool
     /// This is the GEYSER-FIRST source of truth - NO RPC calls needed!
