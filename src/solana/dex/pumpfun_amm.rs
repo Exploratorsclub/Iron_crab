@@ -45,11 +45,14 @@ fn pump_amm_canonical_event_authority(program_id: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"__event_authority"], program_id).0
 }
 
-/// Canonical `protocol_fee_recipient` + `protocol_fee_recipient_ta` for PumpSwap swap metas (#9/#10).
+/// Fallback `protocol_fee_recipient` + `protocol_fee_recipient_ta` when pool/cache data is missing
+/// (`Pubkey::default()`), or for `create_pool` parsing where the instruction does not carry fee
+/// metas (see `dex_parser::build_pool_accounts_from_create_pool`).
 ///
-/// Same derivation as `dex_parser.rs` `build_pool_accounts_from_create_pool` and
-/// `build_swap_ix_from_pool_accounts`. Quote side is WSOL (SPL Token program) for all supported pools.
-fn pump_amm_canonical_protocol_fee_accounts(
+/// **Do not** replace observed on-chain swap/create values with this — mainnet pools use distinct
+/// protocol fee recipients; see incident: Bug #35 / successful ref sell
+/// `2XvVpoa5diiTPTf5o55FWM7id1Pu8FSu2VvoT6QNVash2D3uF7hh2LETLHxv5EQibqAvirPykomD6tUbJUNFoHBE`.
+fn pump_amm_fallback_protocol_fee_accounts(
     quote_mint: Pubkey,
     quote_token_program: Pubkey,
 ) -> (Pubkey, Pubkey) {
@@ -63,9 +66,32 @@ fn pump_amm_canonical_protocol_fee_accounts(
     (protocol_fee_recipient, protocol_fee_recipient_ta)
 }
 
-// Fallback protocol fee recipient when automatic discovery fails (observed in many PumpSwap pools).
-// This is the canonical Pump.fun protocol fee recipient wallet (owned by System Program, not a PDA).
-// Account: JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU (verified from multiple successful swap txs).
+/// Resolve swap metas #9/#10: prefer observed pool/parser values; fall back only on missing data.
+fn pump_amm_resolve_protocol_fee_accounts(
+    protocol_fee_recipient: Pubkey,
+    protocol_fee_recipient_ta: Pubkey,
+    quote_mint: Pubkey,
+    quote_token_program: Pubkey,
+) -> (Pubkey, Pubkey) {
+    match (
+        protocol_fee_recipient == Pubkey::default(),
+        protocol_fee_recipient_ta == Pubkey::default(),
+    ) {
+        (false, false) => (protocol_fee_recipient, protocol_fee_recipient_ta),
+        (false, true) => (
+            protocol_fee_recipient,
+            PumpFunAmmDex::derive_ata_with_program(
+                protocol_fee_recipient,
+                quote_mint,
+                quote_token_program,
+            ),
+        ),
+        _ => pump_amm_fallback_protocol_fee_accounts(quote_mint, quote_token_program),
+    }
+}
+
+// Fallback protocol fee recipient when pool accounts do not specify one (e.g. create_pool-only path).
+// Not globally valid for all pools — many mainnet swaps use other recipients (see Bug #35).
 const PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT: &str =
     "JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU";
 
@@ -2352,8 +2378,8 @@ impl Dex for PumpFunAmmDex {
     /// [3] quote_mint
     /// [4] pool_base_vault
     /// [5] pool_quote_vault
-    /// [6] protocol_fee_recipient (intent/cache slot; persisted value is canonical — see set_pool_from_accounts)
-    /// [7] protocol_fee_recipient_ta (intent/cache slot; persisted value is canonical derivation)
+    /// [6] protocol_fee_recipient (from Geyser/RPC/intent; must not be overwritten with a global constant)
+    /// [7] protocol_fee_recipient_ta (observed fee TA for this pool)
     /// [8] event_authority
     /// [9] coin_creator_vault_ata
     /// [10] coin_creator_vault_authority
@@ -2396,21 +2422,12 @@ impl Dex for PumpFunAmmDex {
         // PumpSwap only uses WSOL quote; fee recipient ATA uses SPL Token program for quote mint.
         let quote_token_program_for_fee = Pubkey::new_from_array(spl_token::id().to_bytes());
         let (protocol_fee_recipient, protocol_fee_recipient_ta) =
-            pump_amm_canonical_protocol_fee_accounts(quote_mint, quote_token_program_for_fee);
-        if parsed_protocol_fee_recipient != protocol_fee_recipient {
-            warn!(
-                intent = %parsed_protocol_fee_recipient,
-                expected = %protocol_fee_recipient,
-                "pump_amm set_pool_from_accounts: accounts[6] != canonical protocol_fee_recipient; using canonical"
+            pump_amm_resolve_protocol_fee_accounts(
+                parsed_protocol_fee_recipient,
+                parsed_protocol_fee_recipient_ta,
+                quote_mint,
+                quote_token_program_for_fee,
             );
-        }
-        if parsed_protocol_fee_recipient_ta != protocol_fee_recipient_ta {
-            warn!(
-                intent = %parsed_protocol_fee_recipient_ta,
-                expected = %protocol_fee_recipient_ta,
-                "pump_amm set_pool_from_accounts: accounts[7] != derived protocol_fee_recipient_ta; using canonical derivation"
-            );
-        }
         let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
         let parsed_event_authority = parse_pubkey(&accounts[8], "event_authority")?;
         let event_authority = pump_amm_canonical_event_authority(&pump_amm_program);
@@ -2702,21 +2719,12 @@ impl Dex for PumpFunAmmDex {
             );
         }
         let (protocol_fee_recipient, protocol_fee_recipient_ta) =
-            pump_amm_canonical_protocol_fee_accounts(pool.quote_mint, quote_token_program);
-        if pool.protocol_fee_recipient != protocol_fee_recipient {
-            warn!(
-                pool = %pool.protocol_fee_recipient,
-                expected = %protocol_fee_recipient,
-                "pump_amm build_swap_ix: cached pool.protocol_fee_recipient != canonical; using canonical"
+            pump_amm_resolve_protocol_fee_accounts(
+                pool.protocol_fee_recipient,
+                pool.protocol_fee_recipient_ta,
+                pool.quote_mint,
+                quote_token_program,
             );
-        }
-        if pool.protocol_fee_recipient_ta != protocol_fee_recipient_ta {
-            warn!(
-                pool = %pool.protocol_fee_recipient_ta,
-                expected = %protocol_fee_recipient_ta,
-                "pump_amm build_swap_ix: cached pool.protocol_fee_recipient_ta != derived canonical; using canonical"
-            );
-        }
         let mut metas = vec![
             AccountMeta::new(pool.pool_market, false),         // 0
             AccountMeta::new(user, true),                      // 1
@@ -2796,8 +2804,8 @@ impl PumpFunAmmDex {
     /// [3] quote_mint
     /// [4] pool_base_vault
     /// [5] pool_quote_vault
-    /// [6] protocol_fee_recipient (cache slot; builder uses canonical mainnet recipient, see dex_parser)
-    /// [7] protocol_fee_recipient_ta (cache slot; builder derives ATA from [6] canonical + quote mint + quote TP)
+    /// [6] protocol_fee_recipient (observed for this pool; used as ix meta #9)
+    /// [7] protocol_fee_recipient_ta (observed fee TA; ix meta #10)
     /// [8] event_authority (cache slot; builders use canonical `__event_authority` PDA for ix metas)
     /// [9] coin_creator_vault_ata
     /// [10] coin_creator_vault_authority
@@ -2882,26 +2890,10 @@ impl PumpFunAmmDex {
             .unwrap_or_else(|| Pubkey::new_from_array(spl_token::id().to_bytes()));
         let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes()); // WSOL always SPL Token
 
-        // Canonical protocol fee recipient + quote ATA — same as `dex_parser.rs`
-        // `build_pool_accounts_from_create_pool` / mainnet SELL references. Do not trust
-        // `pool_accounts[6]` / `[7]` alone: misaligned or stale cache slots caused
-        // `InvalidProtocolFeeRecipient` (6013) while ix account order was already correct.
+        let parsed_pfr = pool_accounts.get(6).copied().unwrap_or_default();
+        let parsed_pfr_ta = pool_accounts.get(7).copied().unwrap_or_default();
         let (protocol_fee_recipient, protocol_fee_recipient_ta) =
-            pump_amm_canonical_protocol_fee_accounts(quote_mint, quote_tp);
-        if pool_accounts.len() > 6 && pool_accounts[6] != protocol_fee_recipient {
-            warn!(
-                from_pool_accounts = %pool_accounts[6],
-                expected = %protocol_fee_recipient,
-                "pump_amm build_swap_ix_from_pool_accounts: pool_accounts[6] != canonical protocol_fee_recipient; using canonical"
-            );
-        }
-        if pool_accounts.len() > 7 && pool_accounts[7] != protocol_fee_recipient_ta {
-            warn!(
-                from_pool_accounts = %pool_accounts[7],
-                expected = %protocol_fee_recipient_ta,
-                "pump_amm build_swap_ix_from_pool_accounts: pool_accounts[7] != derived protocol_fee_recipient_ta; using canonical derivation"
-            );
-        }
+            pump_amm_resolve_protocol_fee_accounts(parsed_pfr, parsed_pfr_ta, quote_mint, quote_tp);
 
         // User token accounts are deterministic ATAs with correct token program.
         let user_base_ta = Self::derive_ata_with_program(user, base_mint, base_tp);
@@ -3373,15 +3365,18 @@ mod tests {
         assert_eq!(ixs[0].accounts[15].pubkey, canonical_ea);
     }
 
-    /// SELL path: ix[9]/[10] must use canonical protocol_fee_recipient + derived ATA (not pool_accounts[6]/[7]).
+    /// SELL path: ix[9]/[10] must match pool_accounts[6]/[7] (non-global protocol fee recipients).
     #[test]
-    fn test_pumpswap_sell_protocol_fee_recipient_metas_are_canonical() {
+    fn test_pumpswap_sell_protocol_fee_metas_preserve_pool_accounts() {
         let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
         let base_mint = Pubkey::new_unique();
         let user = Pubkey::new_unique();
-        let canonical_pfr = Pubkey::from_str(PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT).unwrap();
         let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
-        let expected_pfr_ta = PumpFunAmmDex::derive_ata_with_program(canonical_pfr, wsol, quote_tp);
+        let jcr = Pubkey::from_str(PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT).unwrap();
+        // Mainnet ref sell 2XvVpoa5... uses a non-JCR recipient; model that here.
+        let observed_pfr = Pubkey::new_unique();
+        assert_ne!(observed_pfr, jcr);
+        let observed_pfr_ta = PumpFunAmmDex::derive_ata_with_program(observed_pfr, wsol, quote_tp);
 
         let pool_accounts: Vec<Pubkey> = vec![
             Pubkey::new_unique(),
@@ -3390,8 +3385,8 @@ mod tests {
             wsol,
             Pubkey::new_unique(),
             Pubkey::new_unique(),
-            Pubkey::new_unique(), // [6] wrong on purpose
-            Pubkey::new_unique(), // [7] wrong on purpose
+            observed_pfr,
+            observed_pfr_ta,
             Pubkey::new_unique(),
             Pubkey::new_unique(),
             Pubkey::new_unique(),
@@ -3400,8 +3395,6 @@ mod tests {
             Pubkey::new_unique(),
         ];
         assert_eq!(pool_accounts.len(), 14);
-        assert_ne!(pool_accounts[6], canonical_pfr);
-        assert_ne!(pool_accounts[7], expected_pfr_ta);
 
         let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts(
             &base_mint.to_string(),
@@ -3415,8 +3408,8 @@ mod tests {
         .expect("SELL build");
 
         assert_eq!(ixs[0].accounts.len(), 21);
-        assert_eq!(ixs[0].accounts[9].pubkey, canonical_pfr);
-        assert_eq!(ixs[0].accounts[10].pubkey, expected_pfr_ta);
+        assert_eq!(ixs[0].accounts[9].pubkey, observed_pfr);
+        assert_eq!(ixs[0].accounts[10].pubkey, observed_pfr_ta);
     }
 
     /// SELL path: Token-2022 base mint — ix[11] must be Token-2022 program; user base ATA (ix[5]) must match derivation.
@@ -3471,9 +3464,9 @@ mod tests {
         assert_eq!(ixs[0].accounts[5].pubkey, expected_user_base);
     }
 
-    /// Cached/sync `build_swap_ix`: stale `PumpAmmPoolStatic.protocol_fee_*` must not reach ix #9/#10.
+    /// Cached/sync `build_swap_ix`: ix #9/#10 follow `PumpAmmPoolStatic.protocol_fee_*` from cache.
     #[test]
-    fn test_build_swap_ix_protocol_fee_metas_canonical_despite_stale_cached_pool() {
+    fn test_build_swap_ix_uses_cached_protocol_fee_accounts() {
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
         let mut dex = PumpFunAmmDex::new(rpc);
         let user = Pubkey::new_unique();
@@ -3482,9 +3475,9 @@ mod tests {
         let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
         let base_mint = Pubkey::new_unique();
         let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).unwrap();
-        let canonical_pfr = Pubkey::from_str(PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT).unwrap();
         let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
-        let expected_pfr_ta = PumpFunAmmDex::derive_ata_with_program(canonical_pfr, wsol, quote_tp);
+        let cached_pfr = Pubkey::new_unique();
+        let cached_pfr_ta = PumpFunAmmDex::derive_ata_with_program(cached_pfr, wsol, quote_tp);
 
         let pool = PumpAmmPoolStatic {
             pool_market: Pubkey::new_unique(),
@@ -3493,8 +3486,8 @@ mod tests {
             quote_mint: wsol,
             pool_base_vault: Pubkey::new_unique(),
             pool_quote_vault: Pubkey::new_unique(),
-            protocol_fee_recipient: Pubkey::new_unique(),
-            protocol_fee_recipient_ta: Pubkey::new_unique(),
+            protocol_fee_recipient: cached_pfr,
+            protocol_fee_recipient_ta: cached_pfr_ta,
             event_authority: pump_amm_canonical_event_authority(&program_id),
             coin_creator_vault_ata: Pubkey::new_unique(),
             coin_creator_vault_authority: Pubkey::new_unique(),
@@ -3509,7 +3502,70 @@ mod tests {
             .expect("SELL build_swap_ix");
 
         assert_eq!(ixs[0].accounts.len(), 21);
-        assert_eq!(ixs[0].accounts[9].pubkey, canonical_pfr);
-        assert_eq!(ixs[0].accounts[10].pubkey, expected_pfr_ta);
+        assert_eq!(ixs[0].accounts[9].pubkey, cached_pfr);
+        assert_eq!(ixs[0].accounts[10].pubkey, cached_pfr_ta);
+    }
+
+    /// Missing fee accounts in pool_accounts → JCR fallback (same as cold-path discovery gap).
+    #[test]
+    fn test_build_swap_ix_from_pool_accounts_fallback_when_fee_pubkeys_default() {
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let base_mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let fallback_pfr = Pubkey::from_str(PUMPFUN_AMM_FALLBACK_PROTOCOL_FEE_RECIPIENT).unwrap();
+        let fallback_pfr_ta = PumpFunAmmDex::derive_ata_with_program(fallback_pfr, wsol, quote_tp);
+
+        let mut pool_accounts: Vec<Pubkey> = vec![
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            wsol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        assert_eq!(pool_accounts.len(), 14);
+
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+            &base_mint.to_string(),
+            WSOL_MINT,
+            1_000_000,
+            1,
+            user,
+            &pool_accounts,
+            None,
+        )
+        .expect("SELL build");
+        assert_eq!(ixs[0].accounts[9].pubkey, fallback_pfr);
+        assert_eq!(ixs[0].accounts[10].pubkey, fallback_pfr_ta);
+
+        // Recipient set but TA missing → derive ATA from recipient (not full JCR fallback).
+        let observed = Pubkey::new_unique();
+        assert_ne!(observed, fallback_pfr);
+        pool_accounts[6] = observed;
+        pool_accounts[7] = Pubkey::default();
+        let ixs2 = PumpFunAmmDex::build_swap_ix_from_pool_accounts(
+            &base_mint.to_string(),
+            WSOL_MINT,
+            1_000_000,
+            1,
+            user,
+            &pool_accounts,
+            None,
+        )
+        .expect("SELL build partial fee");
+        assert_eq!(ixs2[0].accounts[9].pubkey, observed);
+        assert_eq!(
+            ixs2[0].accounts[10].pubkey,
+            PumpFunAmmDex::derive_ata_with_program(observed, wsol, quote_tp)
+        );
     }
 }

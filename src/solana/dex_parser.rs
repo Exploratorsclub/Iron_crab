@@ -1032,6 +1032,9 @@ fn build_pool_accounts_from_create_pool(accounts: &[Pubkey]) -> Option<Vec<Pubke
 
     let fee_config = Pubkey::from_str("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx").ok()?;
     let fee_program = Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ").ok()?;
+    // `create_pool` does not include protocol fee metas in the instruction; swap txs do. Use the
+    // same JCR+ATA fallback as cold-path market parse when no better data exists (not a global
+    // truth for all pools — see pumpfun_amm `pump_amm_fallback_protocol_fee_accounts`).
     let protocol_fee_recipient =
         Pubkey::from_str("JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU").ok()?;
 
