@@ -292,6 +292,12 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                     }
                 }
                 cache.upsert(pool_addr, minimal_state, update.geyser_slot);
+                if update.dex == "pump_amm" {
+                    cache.merge_pump_amm_pool_accounts_readiness(
+                        pool_addr,
+                        update.effective_dex_readiness(),
+                    );
+                }
                 // P3 #13: Propagate base_decimals and quote_decimals to SLAVE cache
                 apply_decimals_from_metadata(cache, update);
                 return true;
@@ -360,6 +366,12 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                     }
                 }
                 cache.upsert(addr, minimal_state, update.geyser_slot);
+                if update.dex == "pump_amm" {
+                    cache.merge_pump_amm_pool_accounts_readiness(
+                        addr,
+                        update.effective_dex_readiness(),
+                    );
+                }
                 // P3 #13: Apply decimals from metadata when present (e.g. BalanceUpdated with metadata)
                 apply_decimals_from_metadata(cache, update);
                 return true;
@@ -462,6 +474,7 @@ pub async fn bootstrap_pool_cache_from_jetstream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::DexPoolReadiness;
 
     /// A.30 Regression: cashback_enabled must be true when JetStream metadata contains
     /// cashback_enabled="true". Verifies pool_cache_sync propagates metadata correctly.
@@ -510,5 +523,178 @@ mod tests {
             }
             other => panic!("expected PumpFun state, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_pump_amm_readiness_ready_enables_ready_only_pool_accounts() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        // Fewer than 14 accounts: not legacy-authoritative → no Ready without explicit key.
+        let mut meta_short = std::collections::HashMap::new();
+        meta_short.insert(
+            "pool_accounts".to_string(),
+            accounts[..13]
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            1,
+        );
+        update.metadata = Some(meta_short);
+        assert!(apply_pool_cache_update(&cache, &update));
+        assert!(cache
+            .get_pump_amm_pool_accounts_by_base_mint(&base_mint)
+            .is_some());
+        assert!(cache
+            .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+            .is_none());
+
+        let mut meta_full = std::collections::HashMap::new();
+        meta_full.insert(
+            "pool_accounts".to_string(),
+            accounts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            2,
+        );
+        update.metadata = Some(meta_full);
+        update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        assert!(apply_pool_cache_update(&cache, &update));
+        assert!(cache
+            .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+            .is_some());
+    }
+
+    /// I-24d / legacy JetStream: struct literal with 14 pool_accounts + non-zero reserves, no readiness key.
+    #[test]
+    fn test_pump_amm_legacy_authoritative_no_readiness_key_is_ready() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "pool_accounts".to_string(),
+            accounts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            100,
+            200,
+            None,
+            1,
+        );
+        update.metadata = Some(meta);
+        assert_eq!(
+            update.effective_dex_readiness(),
+            DexPoolReadiness::Ready,
+            "legacy authoritative pump_amm update without dex_pool_readiness key"
+        );
+        assert!(apply_pool_cache_update(&cache, &update));
+        assert!(cache
+            .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+            .is_some());
+    }
+
+    #[test]
+    fn test_pump_amm_readiness_merge_never_downgrades() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "pool_accounts".to_string(),
+            accounts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+
+        let mut ready_update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            1,
+        );
+        ready_update.metadata = Some(meta.clone());
+        ready_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        assert!(apply_pool_cache_update(&cache, &ready_update));
+        assert!(cache
+            .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+            .is_some());
+
+        let mut weak_update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_market.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            2,
+        );
+        weak_update.metadata = Some(meta);
+        weak_update.set_dex_readiness_in_metadata(DexPoolReadiness::Observed);
+        assert!(apply_pool_cache_update(&cache, &weak_update));
+        assert!(
+            cache
+                .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+                .is_some(),
+            "merge must not downgrade Ready to Observed"
+        );
     }
 }

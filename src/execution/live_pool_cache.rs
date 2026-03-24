@@ -39,6 +39,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
 
+use crate::ipc::DexPoolReadiness;
+
 // Re-export parsers
 use crate::solana::dex::meteora_dlmm_layout::DlmmPool;
 use crate::solana::dex::orca_whirlpool_layout::{self, WhirlpoolParsed};
@@ -303,6 +305,11 @@ pub struct LivePoolCache {
 
     /// Count of vaults at last notification (to avoid spamming)
     last_notified_vault_count: AtomicU64,
+
+    /// PumpSwap pool-market (pool address) → explicit readiness for cache-first `pool_accounts` use.
+    /// Monotonic: [`DexPoolReadiness::merge`] on update; never stored inside `PumpAmmState` to avoid
+    /// touching every constructor site.
+    pool_accounts_readiness_by_market: DashMap<Pubkey, DexPoolReadiness>,
 }
 
 /// Which vault position (A/B or X/Y or 0/1) this vault represents
@@ -332,6 +339,7 @@ impl LivePoolCache {
             max_age_ms: 10_000, // 10 seconds default
             vault_update_tx: Mutex::new(None),
             last_notified_vault_count: AtomicU64::new(0),
+            pool_accounts_readiness_by_market: DashMap::new(),
         }
     }
 
@@ -870,6 +878,55 @@ impl LivePoolCache {
         for entry in self.pools.iter() {
             if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
                 if s.base_mint == *base_mint && !s.pool_accounts.is_empty() {
+                    return Some(s.pool_accounts.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Merge PumpSwap `pool_accounts` readiness for `pool_market` (monotonic — never downgrade).
+    pub fn merge_pump_amm_pool_accounts_readiness(
+        &self,
+        pool_market: Pubkey,
+        incoming: DexPoolReadiness,
+    ) {
+        self.pool_accounts_readiness_by_market
+            .entry(pool_market)
+            .and_modify(|stored| *stored = stored.merge(incoming))
+            .or_insert(incoming);
+    }
+
+    /// Hot-path readiness for PumpSwap `pool_accounts`: explicit JetStream merge wins; if **no** entry
+    /// exists in `pool_accounts_readiness_by_market` (legacy direct upsert / fixtures), treat as Ready
+    /// only when state looks authoritative (≥14 accounts + both reserves `Some` and non-zero).
+    /// Any stored `Partial` / `Observed` / `Ready` is authoritative and is **not** upgraded by this fallback.
+    fn pump_amm_effective_ready_for_cache_first_accounts(
+        &self,
+        pool_market: &Pubkey,
+        state: &PumpAmmState,
+    ) -> bool {
+        match self.pool_accounts_readiness_by_market.get(pool_market) {
+            Some(r) => *r == DexPoolReadiness::Ready,
+            None => {
+                state.pool_accounts.len() >= 14
+                    && state.base_reserve.map(|b| b > 0).unwrap_or(false)
+                    && state.quote_reserve.map(|q| q > 0).unwrap_or(false)
+            }
+        }
+    }
+
+    /// PumpSwap `pool_accounts` for hot-path cache-first use only when effectively Ready (explicit merge or legacy authoritative state).
+    pub fn get_ready_pump_amm_pool_accounts_by_base_mint(
+        &self,
+        base_mint: &Pubkey,
+    ) -> Option<Vec<Pubkey>> {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
+                if s.base_mint == *base_mint
+                    && !s.pool_accounts.is_empty()
+                    && self.pump_amm_effective_ready_for_cache_first_accounts(entry.key(), s)
+                {
                     return Some(s.pool_accounts.clone());
                 }
             }
@@ -1597,6 +1654,62 @@ mod tests {
         let accounts = result.unwrap();
         assert_eq!(accounts.len(), 14);
         assert_eq!(accounts, pool_accounts);
+    }
+
+    /// Legacy / Eval: direct upsert with 14 pool_accounts + non-degenerate reserves, no readiness map entry.
+    #[test]
+    fn test_get_ready_pump_amm_pool_accounts_legacy_fixture_no_readiness_map() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts.clone(),
+            ),
+            100,
+        );
+
+        let ready = cache
+            .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+            .expect("legacy authoritative upsert should satisfy ready-only gate");
+        assert_eq!(ready, pool_accounts);
+    }
+
+    #[test]
+    fn test_get_ready_pump_amm_pool_accounts_explicit_partial_blocks_legacy_fallback() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts.clone(),
+            ),
+            100,
+        );
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Partial);
+
+        assert!(
+            cache
+                .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+                .is_none(),
+            "explicit Partial must not be upgraded to Ready by legacy heuristic"
+        );
     }
 
     #[test]

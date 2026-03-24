@@ -272,12 +272,14 @@ impl PumpFunAmmDex {
         // and are more reliable than the heuristic-based RPC discovery.
         if !force_refresh {
             if let Some(ref cache) = self.live_pool_cache {
-                if let Some(accounts) = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint) {
+                if let Some(accounts) =
+                    cache.get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+                {
                     if accounts.len() >= 14 {
                         debug!(
                             base_mint = %base_mint,
                             accounts_len = accounts.len(),
-                            "pump_amm: pool_accounts from LivePoolCache (ZERO RPC)"
+                            "pump_amm: pool_accounts from LivePoolCache (Ready, ZERO RPC)"
                         );
                         return Ok(Some(accounts));
                     }
@@ -1547,7 +1549,9 @@ impl PumpFunAmmDex {
         // RPC calls (~500-3000ms) in the hot path.
         if !force_refresh {
             if let Some(ref cache) = self.live_pool_cache {
-                if let Some(accounts) = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint) {
+                if let Some(accounts) =
+                    cache.get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
+                {
                     if accounts.len() >= 14 {
                         let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
                         let global_config = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG)?;
@@ -3005,6 +3009,7 @@ impl PumpFunAmmDex {
 mod tests {
     use super::*;
     use crate::execution::live_pool_cache::{CachedPoolState, LivePoolCache, PumpAmmState};
+    use crate::ipc::DexPoolReadiness;
     use crate::solana::dex::Dex;
     use crate::solana::rpc::SolanaRpc;
     use std::str::FromStr;
@@ -3054,6 +3059,7 @@ mod tests {
             }),
             100,
         );
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
         Arc::new(cache)
     }
 
