@@ -184,6 +184,9 @@ pub enum MarketEventKind {
         #[serde(default = "default_sol_mint")]
         quote_mint: String,
         accounts: Vec<String>,
+        /// When absent, consumers treat as [`DexPoolReadiness::Ready`] (legacy events).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pool_readiness: Option<DexPoolReadiness>,
     },
     /// Trade/swap observed on-chain (detailed for 4-filter strategy)
     Trade {
@@ -2264,6 +2267,21 @@ mod tests {
 // Pool Cache Updates (for market-data → execution-engine propagation)
 // ============================================================================
 
+/// DEX-agnostic pool readiness: cache hit alone is not necessarily swap-ready.
+///
+/// Transported on [`PoolCacheUpdate`] and merged into SLAVE [`crate::execution::live_pool_cache::LivePoolCache`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DexPoolReadiness {
+    /// Pool or token observed (e.g. Geyser) but DEX-specific data incomplete.
+    #[default]
+    Observed,
+    /// Synthetic or incomplete DEX-specific account set (e.g. PumpSwap `create_pool` reconstruction).
+    Partial,
+    /// Full DEX-specific dataset available for the intended hot-path use (e.g. verified swap path).
+    Ready,
+}
+
 /// Pool cache update type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -2313,6 +2331,10 @@ pub struct PoolCacheUpdate {
     /// Additional DEX-specific metadata (JSON string)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
+
+    /// Pool readiness for DEX-specific completeness (defaults to [`DexPoolReadiness::Observed`] when absent in JSON).
+    #[serde(default)]
+    pub readiness: DexPoolReadiness,
 }
 
 impl PoolCacheUpdate {
@@ -2341,6 +2363,7 @@ impl PoolCacheUpdate {
             liquidity_lamports,
             geyser_slot,
             metadata: None,
+            readiness: DexPoolReadiness::Observed,
         }
     }
 
@@ -2368,6 +2391,7 @@ impl PoolCacheUpdate {
             liquidity_lamports: None,
             geyser_slot,
             metadata: None,
+            readiness: DexPoolReadiness::Observed,
         }
     }
 
@@ -2391,6 +2415,7 @@ impl PoolCacheUpdate {
             liquidity_lamports: None,
             geyser_slot,
             metadata: None,
+            readiness: DexPoolReadiness::Observed,
         }
     }
 }

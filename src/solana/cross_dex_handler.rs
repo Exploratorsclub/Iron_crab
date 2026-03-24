@@ -1298,6 +1298,7 @@ mod tests {
                 quote_reserve: Some(quote_reserve),
                 pool_accounts: vec![],
                 creator: None,
+                pool_readiness: crate::ipc::DexPoolReadiness::Ready,
             }),
             100,
         );

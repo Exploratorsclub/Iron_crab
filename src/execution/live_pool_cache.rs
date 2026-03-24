@@ -39,9 +39,19 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
 
+use crate::ipc::DexPoolReadiness;
+
 // Re-export parsers
 use crate::solana::dex::meteora_dlmm_layout::DlmmPool;
 use crate::solana::dex::orca_whirlpool_layout::{self, WhirlpoolParsed};
+
+/// Monotonic merge for SLAVE cache: never downgrade `Ready` from weaker updates.
+pub fn merge_dex_pool_readiness(
+    existing: DexPoolReadiness,
+    incoming: DexPoolReadiness,
+) -> DexPoolReadiness {
+    existing.max(incoming)
+}
 
 // ============================================================================
 // DEX-specific cached state structs
@@ -181,6 +191,8 @@ pub struct PumpAmmState {
     pub pool_accounts: Vec<Pubkey>,
     /// Creator of the token (parsed from pool account at offset 11-43)
     pub creator: Option<Pubkey>,
+    /// DEX-specific completeness for hot-path swap use (from JetStream / DexPoolAccounts).
+    pub pool_readiness: DexPoolReadiness,
 }
 
 /// Meteora CPMM (DAMM V2) cached state
@@ -705,11 +717,26 @@ impl LivePoolCache {
     ///
     /// Without this, PumpAmm entries parsed from Geyser have empty pool_accounts,
     /// making them unusable for tx building.
-    pub fn set_pump_amm_pool_accounts(&self, pool: &Pubkey, accounts: Vec<Pubkey>) {
+    /// Merge readiness for an existing PumpAmm entry (e.g. after authoritative Geyser pool account parse).
+    pub fn merge_pump_amm_pool_readiness(&self, pool: &Pubkey, incoming: DexPoolReadiness) {
+        if let Some(mut entry) = self.pools.get_mut(pool) {
+            if let CachedPoolState::PumpAmm(ref mut s) = entry.value_mut().state {
+                s.pool_readiness = merge_dex_pool_readiness(s.pool_readiness, incoming);
+            }
+        }
+    }
+
+    pub fn set_pump_amm_pool_accounts(
+        &self,
+        pool: &Pubkey,
+        accounts: Vec<Pubkey>,
+        readiness: DexPoolReadiness,
+    ) {
         if let Some(mut entry) = self.pools.get_mut(pool) {
             if let CachedPoolState::PumpAmm(ref mut s) = entry.value_mut().state {
                 let was_empty = s.pool_accounts.is_empty();
                 s.pool_accounts = accounts.clone();
+                s.pool_readiness = merge_dex_pool_readiness(s.pool_readiness, readiness);
                 if was_empty {
                     tracing::info!(
                         pool = %pool,
@@ -771,6 +798,18 @@ impl LivePoolCache {
         if let Some(entry) = self.pools.get(pool) {
             if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
                 if !s.pool_accounts.is_empty() {
+                    return Some(s.pool_accounts.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Like [`Self::get_pump_amm_pool_accounts`] but only when [`DexPoolReadiness::Ready`].
+    pub fn get_pump_amm_pool_accounts_ready_only(&self, pool: &Pubkey) -> Option<Vec<Pubkey>> {
+        if let Some(entry) = self.pools.get(pool) {
+            if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
+                if s.pool_readiness == DexPoolReadiness::Ready && !s.pool_accounts.is_empty() {
                     return Some(s.pool_accounts.clone());
                 }
             }
@@ -877,6 +916,24 @@ impl LivePoolCache {
         None
     }
 
+    /// Swap-building path: only returns accounts when pool is [`DexPoolReadiness::Ready`].
+    pub fn get_pump_amm_pool_accounts_by_base_mint_ready_only(
+        &self,
+        base_mint: &Pubkey,
+    ) -> Option<Vec<Pubkey>> {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
+                if s.base_mint == *base_mint
+                    && s.pool_readiness == DexPoolReadiness::Ready
+                    && !s.pool_accounts.is_empty()
+                {
+                    return Some(s.pool_accounts.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// I-24d / Bug #27: Readiness for PumpSwap quotes after authoritative `PoolCacheUpdate`.
     ///
     /// `pool_accounts` alone is insufficient: SLAVE cache can still show stale
@@ -884,7 +941,7 @@ impl LivePoolCache {
     /// Matches what [`crate::execution::quote_calculator::quote_output_amount`] requires
     /// for `CachedPoolState::PumpAmm`.
     pub fn pump_amm_quote_ready_by_base_mint(&self, base_mint: &Pubkey) -> bool {
-        match self.get_pump_amm_pool_accounts_by_base_mint(base_mint) {
+        match self.get_pump_amm_pool_accounts_by_base_mint_ready_only(base_mint) {
             Some(a) if a.len() >= 14 => {}
             _ => return false,
         }
@@ -1156,6 +1213,7 @@ fn parse_pumpamm_pool(data: &[u8]) -> Option<CachedPoolState> {
         quote_reserve: None,
         pool_accounts: vec![], // Will be populated from DexPoolAccounts event
         creator: Some(creator),
+        pool_readiness: DexPoolReadiness::Observed,
     }))
 }
 
@@ -1362,6 +1420,7 @@ mod tests {
                 quote_reserve: Some(50_000_000_000),
                 pool_accounts: vec![],
                 creator: None,
+                pool_readiness: DexPoolReadiness::Observed,
             }),
             100,
         );
@@ -1494,6 +1553,7 @@ mod tests {
             quote_reserve,
             pool_accounts,
             creator: None,
+            pool_readiness: DexPoolReadiness::Ready,
         })
     }
 
@@ -1695,7 +1755,11 @@ mod tests {
             100,
         );
 
-        cache.set_pump_amm_pool_accounts(&pool_market, accounts_to_set.clone());
+        cache.set_pump_amm_pool_accounts(
+            &pool_market,
+            accounts_to_set.clone(),
+            DexPoolReadiness::Ready,
+        );
 
         let result = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint);
         assert!(result.is_some());
@@ -1730,11 +1794,16 @@ mod tests {
                 quote_reserve: Some(quote_reserve),
                 pool_accounts: vec![],
                 creator: Some(creator),
+                pool_readiness: DexPoolReadiness::Ready,
             }),
             100,
         );
 
-        cache.set_pump_amm_pool_accounts(&pool_market, new_accounts.clone());
+        cache.set_pump_amm_pool_accounts(
+            &pool_market,
+            new_accounts.clone(),
+            DexPoolReadiness::Ready,
+        );
 
         let (r_base, r_quote, _) = cache
             .get_pump_amm_reserves_by_base_mint(&base_mint)

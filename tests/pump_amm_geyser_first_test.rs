@@ -4,6 +4,7 @@
 //! RPC uses unreachable URL (http://127.0.0.1:0) — tests pass only if cache path is used.
 
 use ironcrab::execution::live_pool_cache::{CachedPoolState, LivePoolCache, PumpAmmState};
+use ironcrab::ipc::DexPoolReadiness;
 use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
@@ -32,6 +33,7 @@ fn make_pump_amm_cache_with_reserves(
             quote_reserve: Some(quote_reserve),
             pool_accounts: vec![],
             creator: None,
+            pool_readiness: DexPoolReadiness::Observed,
         }),
         100,
     );
@@ -55,6 +57,7 @@ fn make_pump_amm_cache_with_pool_accounts(
             quote_reserve: Some(1),
             pool_accounts,
             creator: None,
+            pool_readiness: DexPoolReadiness::Ready,
         }),
         100,
     );

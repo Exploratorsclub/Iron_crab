@@ -64,6 +64,7 @@ fn retry_not_triggered_on_6023() {
 #[test]
 fn fixture_pubkeys_parse_and_cache_hit() {
     use ironcrab::execution::live_pool_cache::{CachedPoolState, LivePoolCache, PumpAmmState};
+    use ironcrab::ipc::DexPoolReadiness;
     use solana_sdk::pubkey::Pubkey;
     use std::str::FromStr;
 
@@ -101,6 +102,7 @@ fn fixture_pubkeys_parse_and_cache_hit() {
             quote_reserve: Some(50_000_000_000),
             pool_accounts: pool_accounts.clone(),
             creator: None,
+            pool_readiness: DexPoolReadiness::Ready,
         }),
         0,
     );

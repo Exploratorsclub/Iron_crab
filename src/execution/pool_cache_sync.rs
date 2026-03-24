@@ -20,11 +20,12 @@ use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use tracing::{debug, info, warn};
 
+use crate::execution::live_pool_cache::merge_dex_pool_readiness;
 use crate::execution::live_pool_cache::{
     CachedPoolState, LivePoolCache, MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState,
     RaydiumAmmState, RaydiumCpmmState,
 };
-use crate::ipc::{PoolCacheUpdate, PoolCacheUpdateType};
+use crate::ipc::{DexPoolReadiness, PoolCacheUpdate, PoolCacheUpdateType};
 use crate::nats::{slave_consumer_config, NatsClient, STREAM_NAME};
 
 /// Extract base_reserve and quote_reserve from CachedPoolState (for merge logic).
@@ -167,6 +168,11 @@ fn build_minimal_pool_state_with_reserves(
                 quote_reserve: Some(quote_reserve),
                 pool_accounts,
                 creator,
+                pool_readiness: if update.dex == "pump_amm" {
+                    update.readiness
+                } else {
+                    DexPoolReadiness::Observed
+                },
             })
         }
         "pumpfun" => {
@@ -288,6 +294,10 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                             if new_pump.creator.is_none() && existing_pump.creator.is_some() {
                                 new_pump.creator = existing_pump.creator;
                             }
+                            new_pump.pool_readiness = merge_dex_pool_readiness(
+                                existing_pump.pool_readiness,
+                                new_pump.pool_readiness,
+                            );
                         }
                     }
                 }
@@ -339,6 +349,10 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         if new_pump.creator.is_none() && existing_pump.creator.is_some() {
                             new_pump.creator = existing_pump.creator;
                         }
+                        new_pump.pool_readiness = merge_dex_pool_readiness(
+                            existing_pump.pool_readiness,
+                            new_pump.pool_readiness,
+                        );
                     }
                 }
                 // Bug #25: Preserve cashback_enabled for pumpfun when BalanceUpdated has no metadata
@@ -509,6 +523,100 @@ mod tests {
                 assert!(s.cashback_enabled, "A.30: cashback_enabled must be true when JetStream metadata contains cashback_enabled=\"true\"");
             }
             other => panic!("expected PumpFun state, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pump_amm_create_pool_partial_not_swap_ready_path() {
+        let cache = LivePoolCache::new();
+        let pool_addr = "14Nx7vjtSeMVWugP4zUq5EJkD97ZXKRFUCAPhJJ1pump";
+        let base_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let quote_mint = "So11111111111111111111111111111111111111112";
+
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run-123",
+            pool_addr.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            0,
+            0,
+            None,
+            12345,
+        );
+        update.readiness = DexPoolReadiness::Partial;
+        let acc = "14Nx7vjtSeMVWugP4zUq5EJkD97ZXKRFUCAPhJJ1pump";
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            "pool_accounts".to_string(),
+            std::iter::repeat_n(acc, 14).collect::<Vec<_>>().join(","),
+        );
+        update.metadata = Some(meta);
+
+        assert!(apply_pool_cache_update(&cache, &update));
+
+        let pool_pk = Pubkey::from_str(pool_addr).unwrap();
+        let base_pk = Pubkey::from_str(base_mint).unwrap();
+        match cache.get(&pool_pk).expect("pool present") {
+            CachedPoolState::PumpAmm(s) => {
+                assert_eq!(s.pool_readiness, DexPoolReadiness::Partial);
+                assert_eq!(s.pool_accounts.len(), 14);
+            }
+            other => panic!("expected PumpAmm, got {:?}", other),
+        }
+        assert!(
+            cache
+                .get_pump_amm_pool_accounts_by_base_mint_ready_only(&base_pk)
+                .is_none(),
+            "partial create_pool must not satisfy ready-only pool_accounts lookup"
+        );
+    }
+
+    #[test]
+    fn test_balance_updated_does_not_downgrade_pump_amm_ready() {
+        let cache = LivePoolCache::new();
+        let pool_addr = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+        let base_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let quote_mint = "So11111111111111111111111111111111111111112";
+
+        let mut ready = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run-123",
+            pool_addr.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            100,
+            200,
+            None,
+            1,
+        );
+        ready.readiness = DexPoolReadiness::Ready;
+        assert!(apply_pool_cache_update(&cache, &ready));
+
+        let bal = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run-123",
+            pool_addr.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            150,
+            250,
+            2,
+        );
+        assert!(apply_pool_cache_update(&cache, &bal));
+
+        let pool_pk = Pubkey::from_str(pool_addr).unwrap();
+        match cache.get(&pool_pk).expect("pool present") {
+            CachedPoolState::PumpAmm(s) => {
+                assert_eq!(s.pool_readiness, DexPoolReadiness::Ready);
+            }
+            other => panic!("expected PumpAmm, got {:?}", other),
         }
     }
 }

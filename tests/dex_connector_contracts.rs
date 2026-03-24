@@ -4,6 +4,7 @@
 //! PumpSwap AMM: quote monotonicity, price impact, unknown pair, zero input, build IX validity.
 
 use ironcrab::execution::live_pool_cache::{CachedPoolState, LivePoolCache, PumpAmmState};
+use ironcrab::ipc::DexPoolReadiness;
 use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
@@ -32,6 +33,7 @@ fn make_pump_amm_cache_with_reserves(
             quote_reserve: Some(quote_reserve),
             pool_accounts: vec![],
             creator: None,
+            pool_readiness: DexPoolReadiness::Ready,
         }),
         100,
     );

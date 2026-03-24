@@ -2519,6 +2519,7 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             base_mint,
             quote_mint,
             accounts,
+            ..
         } => {
             debug!(
                 dex = %dex,

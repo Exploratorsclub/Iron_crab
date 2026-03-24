@@ -31,9 +31,9 @@ use uuid::Uuid;
 use ironcrab::config::WalletTrackerCfg;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest,
-    ControlRequestKind, ControlResponse, ControlResponseStatus, ExecutionResult, ExecutionStatus,
-    IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles,
-    NATIVE_SOL_MINT,
+    ControlRequestKind, ControlResponse, ControlResponseStatus, DexPoolReadiness, ExecutionResult,
+    ExecutionStatus, IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate,
+    PriorityFeePercentiles, NATIVE_SOL_MINT,
 };
 use ironcrab::metrics::{
     serve_metrics, set_readiness_control_sub_active, set_readiness_mode,
@@ -1755,6 +1755,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
                 quote_reserve: Some(quote_reserve),
                 pool_accounts: accounts.clone(),
                 creator: creator_opt,
+                pool_readiness: DexPoolReadiness::Ready,
             });
             ctx.live_pool_cache.upsert(pool_address, state, 0);
 
@@ -1774,6 +1775,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
                     None,
                     0,
                 );
+                pool_update.readiness = DexPoolReadiness::Ready;
                 let mut meta = std::collections::HashMap::new();
                 let accounts_str: Vec<String> = accounts.iter().map(|p| p.to_string()).collect();
                 meta.insert("pool_accounts".to_string(), accounts_str.join(","));
@@ -3189,6 +3191,12 @@ async fn run_geyser_loop(
 
                     // Update MASTER LivePoolCache (Single Source of Truth)
                     ctx.live_pool_cache.upsert(account_update.pubkey, cached_state.clone(), account_update.slot);
+                    if matches!(&cached_state, CachedPoolState::PumpAmm(_)) {
+                        ctx.live_pool_cache.merge_pump_amm_pool_readiness(
+                            &account_update.pubkey,
+                            DexPoolReadiness::Ready,
+                        );
+                    }
 
                     // FIX-29: One-time Cold Path RPC to fetch Serum/OpenBook accounts for Raydium AMM.
                     // These are static (never change) — fetch once, cache forever.
@@ -3374,6 +3382,9 @@ async fn run_geyser_loop(
                             Some(0), // liquidity_lamports not available from account data
                             account_update.slot,
                         );
+                        if cached_state.dex_name() == "pump_amm" {
+                            pool_update.readiness = DexPoolReadiness::Ready;
+                        }
 
                         // Propagate DEX-specific metadata to SLAVE caches via PoolCacheUpdate.metadata.
                         // This ensures execution-engine receives creator, pool accounts, etc. from Geyser
@@ -4105,6 +4116,7 @@ async fn run_geyser_loop(
                             base_mint: base_mint.clone(),
                             quote_mint: quote_mint.clone(),
                             accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
+                            pool_readiness: Some(DexPoolReadiness::Ready),
                         },
                     );
 
@@ -4126,7 +4138,11 @@ async fn run_geyser_loop(
                     // Ensures the Geyser PoolCacheUpdate builder can use these as fallback
                     // when the parsed Geyser state has empty pool_accounts.
                     if pool_accounts.len() >= 14 {
-                        ctx.live_pool_cache.set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
+                        ctx.live_pool_cache.set_pump_amm_pool_accounts(
+                            pool_address,
+                            pool_accounts.clone(),
+                            DexPoolReadiness::Ready,
+                        );
 
                         // FIX-33: Persist pool_accounts to JetStream so bootstrap recovers them after restart.
                         if let Some(ref nats) = ctx.nats {
@@ -4143,6 +4159,7 @@ async fn run_geyser_loop(
                                 None,
                                 tx_update.slot,
                             );
+                            pool_update.readiness = DexPoolReadiness::Ready;
                             let mut meta = std::collections::HashMap::new();
                             let accounts_str: Vec<String> = pool_accounts.iter().map(|p| p.to_string()).collect();
                             meta.insert("pool_accounts".to_string(), accounts_str.join(","));
@@ -4184,6 +4201,7 @@ async fn run_geyser_loop(
                                     base_mint: mint.to_string(),
                                     quote_mint: quote_mint.to_string(),
                                     accounts: pool_accounts.iter().map(|p| p.to_string()).collect(),
+                                    pool_readiness: None,
                                 },
                             );
 
@@ -4465,6 +4483,7 @@ async fn run_geyser_loop(
                             base_mint: pool_event.base_mint.to_string(),
                             quote_mint: pool_event.quote_mint.to_string(),
                             accounts,
+                            pool_readiness: None,
                         },
                     );
 

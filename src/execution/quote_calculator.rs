@@ -899,6 +899,7 @@ mod tests {
             quote_reserve: Some(50_000_000_000),       // 50 SOL
             pool_accounts: vec![],
             creator: None,
+            pool_readiness: crate::ipc::DexPoolReadiness::Observed,
         };
 
         // Buy tokens with 1 SOL
@@ -925,6 +926,7 @@ mod tests {
             quote_reserve: Some(50_000_000_000),       // 50 SOL
             pool_accounts: vec![],
             creator: None,
+            pool_readiness: crate::ipc::DexPoolReadiness::Observed,
         };
 
         // Sell 20K tokens
