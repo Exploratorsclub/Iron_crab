@@ -182,6 +182,32 @@ fn is_pumpfun_bonding_curve_structural_sim_error(error_code: Option<&str>) -> bo
         .unwrap_or(false)
 }
 
+/// Cold Path only: PumpFun bonding-curve recovery (`EnsurePumpfunBondingCurve`) is allowed for
+/// kill-switch/liquidation sells **and** explicit manual sell-all tooling (`sell_all=true`).
+///
+/// Rationale: `sell-all` / keyless tooling may tag `sell_all=true` without `purpose=liquidation`;
+/// that path is still Cold Path (not momentum hot path). PumpSwap recovery stays gated on
+/// `is_liquidation_sell` only.
+#[inline]
+fn is_pumpfun_bonding_curve_cold_path_recovery_sell(intent: &TradeIntent) -> bool {
+    if intent.side != TradeSide::Sell {
+        return false;
+    }
+    if intent.metadata.get("sell_all").map(|v| v.as_str()) == Some("true") {
+        return true;
+    }
+    intent
+        .metadata
+        .get("purpose")
+        .map(|v| v == "liquidation")
+        .unwrap_or(false)
+        || intent
+            .metadata
+            .get("kill_switch")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+}
+
 /// Scope-1 async PumpSwap healing: only **regular momentum strategy** SELLs (hot path).
 ///
 /// Excludes cold-path / manual safety tooling (e.g. `sell-all` uses `source == "sell-all"` and
@@ -8367,7 +8393,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         // PumpFun bonding curve SELL: stale virtual/real reserves or cashback layout → 6023/6024/Overflow.
         // Cold-path recovery: EnsurePumpfunBondingCurve with force_refresh (RPC in market-data), bounded JetStream wait, one retry.
         if !pumpfun_bonding_recovery_attempted
-            && is_liquidation_sell
+            && is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent)
             && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun")
             && intent.resources.pools.len() == 1
             && is_pumpfun_bonding_curve_structural_sim_error(sim_result.error_code.as_deref())
@@ -10210,9 +10236,10 @@ async fn spawn_rebroadcast_loop(
 #[cfg(test)]
 mod execution_engine_tests {
     use super::{
-        is_pump_amm_structural_sim_error, is_regular_momentum_hot_path_sell,
-        pump_amm_pool_market_hint_merge, record_pump_amm_hot_path_refresh_after_success,
-        select_best_route, try_pump_amm_hot_path_refresh_publish, DiscoveryRequestOutcome,
+        is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_cold_path_recovery_sell,
+        is_regular_momentum_hot_path_sell, pump_amm_pool_market_hint_merge,
+        record_pump_amm_hot_path_refresh_after_success, select_best_route,
+        try_pump_amm_hot_path_refresh_publish, DiscoveryRequestOutcome,
         PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
     };
     use ironcrab::ipc::{
@@ -10268,6 +10295,87 @@ mod execution_engine_tests {
             .metadata
             .insert("sell_all".to_string(), "true".to_string());
         assert!(!is_regular_momentum_hot_path_sell(&intent));
+    }
+
+    #[test]
+    fn pumpfun_bonding_recovery_cold_path_includes_sell_all_without_purpose_liquidation() {
+        let mut intent = TradeIntent::new_sell(
+            "sell-all",
+            "v0.1.0",
+            "run-1",
+            "id-sa".to_string(),
+            "sell-all",
+            IntentTier::Tier0,
+            IntentOrigin::StrategyA,
+            "Mint111111111111111111111111111111111111111".to_string(),
+            6,
+            ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+            1_000_000,
+            0,
+            200,
+            TradingRegime::NotApplicable,
+        );
+        intent
+            .metadata
+            .insert("sell_all".to_string(), "true".to_string());
+        intent
+            .metadata
+            .insert("dex".to_string(), "pumpfun".to_string());
+        assert!(is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent));
+    }
+
+    #[test]
+    fn pumpfun_bonding_recovery_cold_path_includes_liquidation_and_kill_switch() {
+        let mut intent = TradeIntent::new_sell(
+            "execution-engine",
+            "v0.1.0",
+            "run-1",
+            "id-liq".to_string(),
+            "execution-engine",
+            IntentTier::Tier0,
+            IntentOrigin::ExecutionMevB,
+            "Mint222222222222222222222222222222222222222".to_string(),
+            6,
+            ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+            1_000_000,
+            0,
+            200,
+            TradingRegime::NotApplicable,
+        );
+        intent
+            .metadata
+            .insert("purpose".to_string(), "liquidation".to_string());
+        assert!(is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent));
+
+        intent.metadata.remove("purpose");
+        intent
+            .metadata
+            .insert("kill_switch".to_string(), "true".to_string());
+        assert!(is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent));
+    }
+
+    #[test]
+    fn pumpfun_bonding_recovery_not_momentum_hot_path_sell() {
+        let mut intent = TradeIntent::new_sell(
+            "momentum-bot",
+            "v0.1.0",
+            "run-1",
+            "id-mo".to_string(),
+            "momentum-bot",
+            IntentTier::Tier1,
+            IntentOrigin::StrategyA,
+            "Mint333333333333333333333333333333333333333".to_string(),
+            6,
+            ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+            1_000_000,
+            0,
+            200,
+            TradingRegime::Early,
+        );
+        intent
+            .metadata
+            .insert("dex".to_string(), "pumpfun".to_string());
+        assert!(!is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent));
     }
 
     /// I-24d: Verifies that ControlResponse status maps correctly to DiscoveryRequestOutcome.
