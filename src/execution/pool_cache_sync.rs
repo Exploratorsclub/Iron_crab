@@ -1473,6 +1473,10 @@ mod tests {
         ready_up.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
         assert!(apply_pool_cache_update(&cache, &ready_up));
         assert!(cache.meteora_cpmm_pool_explicitly_ready(&pool));
+        assert_eq!(
+            cache.meteora_cpmm_readiness(&pool),
+            Some(DexPoolReadiness::Ready)
+        );
 
         let mut weak = PoolCacheUpdate::new_pool_discovered(
             "test",
@@ -1492,6 +1496,10 @@ mod tests {
         assert!(
             cache.meteora_cpmm_pool_explicitly_ready(&pool),
             "merge must not downgrade Ready to Observed for Meteora CPMM"
+        );
+        assert_eq!(
+            cache.meteora_cpmm_readiness(&pool),
+            Some(DexPoolReadiness::Ready)
         );
     }
 }
