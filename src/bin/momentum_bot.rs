@@ -2488,6 +2488,9 @@ impl MomentumContext {
             })
     }
 
+    /// Cache verified `DexPoolAccounts` from market-data for deterministic BUY IX building.
+    /// PoolCreated / trade observation alone does not populate this — partial or short rows
+    /// (especially for PumpSwap) are dropped so BUY cannot proceed on stale fragments.
     fn record_dex_pool_accounts(
         &self,
         dex: &str,
@@ -7480,6 +7483,110 @@ mod tests {
         let candidates = ctx.collect_timed_exit_reconcile_candidates(now);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].mint, "mint");
+    }
+
+    /// PumpSwap BUY must not use partial account lists; `record_dex_pool_accounts` rejects them.
+    #[test]
+    fn pump_amm_dex_pool_accounts_short_list_not_cached() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = MomentumContext {
+            run_id: "test".to_string(),
+            config: parking_lot::RwLock::new(MomentumConfig::default()),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
+            position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        let mint = "TokenMint1111111111111111111111111111111111";
+        let pool = "PoolPubkey1111111111111111111111111111111111";
+        let wsol = "So11111111111111111111111111111111111111112";
+
+        ctx.token_trackers.write().insert(
+            mint.to_string(),
+            TokenTracker::new(mint, pool, "pump_amm", 1, 0),
+        );
+
+        let short: Vec<String> = (0..5).map(|i| format!("A{i}")).collect();
+        ctx.record_dex_pool_accounts("pump_amm", pool, mint, wsol, &short);
+
+        assert!(
+            ctx.try_get_dex_pool_accounts_for_mint(mint).is_none(),
+            "short PumpSwap account list must not satisfy BUY"
+        );
+        assert!(ctx.pending_pool_accounts.read().get(mint).is_none());
+    }
+
+    /// Full verified 14-account `DexPoolAccounts` row is required before BUY can resolve accounts.
+    #[test]
+    fn pump_amm_dex_pool_accounts_full_list_cached_for_buy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_config = JsonlWriterConfig::new("trade_intents").with_log_dir(tmp.path());
+        let jsonl_writer = JsonlWriter::new(jsonl_config).expect("jsonl writer");
+
+        let ctx = MomentumContext {
+            run_id: "test".to_string(),
+            config: parking_lot::RwLock::new(MomentumConfig::default()),
+            nats: None,
+            jsonl_writer,
+            intent_counter: std::sync::atomic::AtomicU64::new(0),
+            pool_first_seen: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            pending_dev_info: parking_lot::RwLock::new(HashMap::new()),
+            pending_pool_accounts: parking_lot::RwLock::new(HashMap::new()),
+            mint_infos: parking_lot::RwLock::new(HashMap::new()),
+            token_trackers: parking_lot::RwLock::new(HashMap::new()),
+            positions: parking_lot::RwLock::new(HashMap::new()),
+            pending_intents: parking_lot::RwLock::new(HashMap::new()),
+            mint_pools: parking_lot::RwLock::new(HashMap::new()),
+            live_pool_cache: LivePoolCache::new(),
+            position_kv: tokio::sync::OnceCell::new(),
+            orphaned_mints: parking_lot::RwLock::new(HashMap::new()),
+            tokens_tracked: std::sync::atomic::AtomicU64::new(0),
+            tokens_blacklisted: std::sync::atomic::AtomicU64::new(0),
+            intents_generated: std::sync::atomic::AtomicU64::new(0),
+            exits_generated: std::sync::atomic::AtomicU64::new(0),
+            last_event_slot: std::sync::atomic::AtomicU64::new(0),
+            last_event_ts_ms: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        let mint = "TokenMint2222222222222222222222222222222222";
+        let pool = "PoolPubkey2222222222222222222222222222222222";
+        let wsol = "So11111111111111111111111111111111111111112";
+
+        ctx.token_trackers.write().insert(
+            mint.to_string(),
+            TokenTracker::new(mint, pool, "pump_amm", 1, 0),
+        );
+
+        let mut accounts: Vec<String> = (0..14).map(|i| format!("Acc{i:02}")).collect();
+        accounts[0] = pool.to_string();
+
+        ctx.record_dex_pool_accounts("pump_amm", pool, mint, wsol, &accounts);
+
+        let got = ctx
+            .try_get_dex_pool_accounts_for_mint(mint)
+            .expect("full verified PumpSwap account set should be available for BUY");
+        assert_eq!(got.len(), 14);
+        assert_eq!(got[0], pool);
     }
 }
 
