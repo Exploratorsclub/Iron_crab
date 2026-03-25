@@ -8,6 +8,10 @@ use tracing::debug;
 
 use super::{Dex, Quote};
 use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
+
+/// Re-export: conservative [`crate::ipc::DexPoolReadiness`] for Raydium AMM v4 pool cache / JetStream
+/// (static Serum accounts + both-side liquidity; reserves alone are never `Ready`).
+pub use crate::execution::live_pool_cache::raydium_amm_readiness_for_pool_cache_update;
 use crate::solana::rpc::SolanaRpc;
 use dashmap::DashMap;
 #[cfg(feature = "rpc_fallback")]

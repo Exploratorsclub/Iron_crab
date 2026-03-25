@@ -78,8 +78,8 @@ const EXECUTION_RESULT_DEDUP_CAPACITY: usize = 4096;
 
 // LivePoolCache - MASTER Cache (Single Source of Truth)
 use ironcrab::execution::live_pool_cache::{
-    parse_pool_account, CachedPoolState, LivePoolCache, PumpAmmState, PumpFunState,
-    RaydiumCpmmState,
+    parse_pool_account, raydium_amm_readiness_for_pool_cache_update, CachedPoolState,
+    LivePoolCache, PumpAmmState, PumpFunState, RaydiumCpmmState,
 };
 
 // P1 Crash Isolation: Systemd Watchdog support
@@ -1577,7 +1577,7 @@ async fn publish_wallet_snapshot(
                 wallet_mints_explicit_ready_count += 1;
                 debug!(
                     mint = %mint_str,
-                    "wallet mint: explicit DexPoolReadiness::Ready (PumpSwap / PumpFun / Raydium CPMM)"
+                    "wallet mint: explicit DexPoolReadiness::Ready (PumpSwap / PumpFun / Raydium CPMM / Raydium AMM)"
                 );
             }
         }
@@ -1587,7 +1587,7 @@ async fn publish_wallet_snapshot(
             wallet = %wallet_str,
             wallet_mints_explicit_ready_count,
             nonzero_wallet_mints = mints_in_wallet.len(),
-            "Wallet snapshot: mints with explicit Ready merge (PumpSwap / PumpFun / Raydium CPMM); excludes legacy PumpSwap effective-ready"
+            "Wallet snapshot: mints with explicit Ready merge (PumpSwap / PumpFun / Raydium CPMM / Raydium AMM); excludes legacy PumpSwap effective-ready"
         );
     }
 
@@ -3498,6 +3498,19 @@ async fn run_geyser_loop(
                                                 );
                                             }
                                         }
+                                        if vault_info.dex == "raydium" {
+                                            if let Some(CachedPoolState::RaydiumAmm(ref s)) =
+                                                ctx.live_pool_cache.get(&vault_info.pool_address)
+                                            {
+                                                let readiness =
+                                                    raydium_amm_readiness_for_pool_cache_update(s);
+                                                balance_update.set_dex_readiness_in_metadata(readiness);
+                                                ctx.live_pool_cache.merge_raydium_amm_pool_readiness(
+                                                    vault_info.pool_address,
+                                                    readiness,
+                                                );
+                                            }
+                                        }
                                         let subject = pool_subject(&vault_info.pool_address.to_string());
                                         if let Err(e) = nats.jetstream_publish(&subject, &balance_update).await {
                                             warn!(error = %e, "Failed to publish PoolCacheUpdate::BalanceUpdated to JetStream");
@@ -3701,6 +3714,12 @@ async fn run_geyser_loop(
                                 let rpc = Arc::clone(&rpc);
                                 let cache = Arc::clone(&ctx.live_pool_cache);
                                 let market_id = s.market_id;
+                                let slot = account_update.slot;
+                                let run_id_spawn = ctx.run_id.clone();
+                                let nats_spawn = ctx
+                                    .nats
+                                    .as_ref()
+                                    .map(|n| n.clone_for_spawned_publish());
                                 tokio::spawn(async move {
                                     match rpc.get_account_retry(&market_id).await {
                                         Ok(account) => {
@@ -3709,6 +3728,78 @@ async fn run_geyser_loop(
                                             {
                                                 if let (Some(b), Some(a), Some(e)) = (bids, asks, eq) {
                                                     cache.set_raydium_serum_accounts(&pool_pk, b, a, e);
+                                                    let readiness =
+                                                        match cache.get(&pool_pk).as_ref() {
+                                                            Some(CachedPoolState::RaydiumAmm(st)) => {
+                                                                raydium_amm_readiness_for_pool_cache_update(st)
+                                                            }
+                                                            _ => DexPoolReadiness::Observed,
+                                                        };
+                                                    cache.merge_raydium_amm_pool_readiness(pool_pk, readiness);
+                                                    if let Some(ref nats) = nats_spawn {
+                                                        if let Some(CachedPoolState::RaydiumAmm(st)) =
+                                                            cache.get(&pool_pk)
+                                                        {
+                                                            let mut pool_update =
+                                                                PoolCacheUpdate::new_balance_updated(
+                                                                    "market-data",
+                                                                    BUILD_VERSION,
+                                                                    &run_id_spawn,
+                                                                    pool_pk.to_string(),
+                                                                    "raydium".to_string(),
+                                                                    st.base_mint.to_string(),
+                                                                    st.quote_mint.to_string(),
+                                                                    st.coin_reserve.unwrap_or(0),
+                                                                    st.pc_reserve.unwrap_or(0),
+                                                                    slot,
+                                                                );
+                                                            let mut meta = std::collections::HashMap::new();
+                                                            if st.market_id != Pubkey::default() {
+                                                                meta.insert(
+                                                                    "market_id".to_string(),
+                                                                    st.market_id.to_string(),
+                                                                );
+                                                            }
+                                                            if let (Some(bids), Some(asks), Some(eq)) = (
+                                                                st.serum_bids,
+                                                                st.serum_asks,
+                                                                st.serum_event_queue,
+                                                            ) {
+                                                                meta.insert(
+                                                                    "serum_bids".to_string(),
+                                                                    bids.to_string(),
+                                                                );
+                                                                meta.insert(
+                                                                    "serum_asks".to_string(),
+                                                                    asks.to_string(),
+                                                                );
+                                                                meta.insert(
+                                                                    "serum_event_queue".to_string(),
+                                                                    eq.to_string(),
+                                                                );
+                                                            }
+                                                            if !meta.is_empty() {
+                                                                pool_update.metadata = Some(meta);
+                                                            }
+                                                            pool_update.set_dex_readiness_in_metadata(readiness);
+                                                            let subject =
+                                                                pool_subject(&pool_pk.to_string());
+                                                            if let Err(e) = nats
+                                                                .jetstream_publish(&subject, &pool_update)
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    error = %e,
+                                                                    "Failed to publish Raydium AMM PoolCacheUpdate after serum fetch"
+                                                                );
+                                                                NATS_ERRORS_TOTAL
+                                                                    .fetch_add(1, Ordering::Relaxed);
+                                                            } else {
+                                                                NATS_MESSAGES_PUBLISHED_TOTAL
+                                                                    .fetch_add(1, Ordering::Relaxed);
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -4016,6 +4107,12 @@ async fn run_geyser_loop(
                                 if !meta.is_empty() {
                                     pool_update.metadata = Some(meta);
                                 }
+                                let readiness = raydium_amm_readiness_for_pool_cache_update(s);
+                                pool_update.set_dex_readiness_in_metadata(readiness);
+                                ctx.live_pool_cache.merge_raydium_amm_pool_readiness(
+                                    account_update.pubkey,
+                                    readiness,
+                                );
                             }
                             CachedPoolState::RaydiumCpmm(s) => {
                                 let mut meta = std::collections::HashMap::new();
