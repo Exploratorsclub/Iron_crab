@@ -3238,13 +3238,13 @@ async fn run_geyser_loop(
                                             account_update.slot,
                                         );
                                         if vault_info.dex == "raydium_cpmm" {
-                                            if let Some(CachedPoolState::RaydiumCpmm(s)) =
+                                            if let Some(CachedPoolState::RaydiumCpmm(ref s)) =
                                                 ctx.live_pool_cache.get(&vault_info.pool_address)
                                             {
                                                 let mut meta = std::collections::HashMap::new();
                                                 meta.insert(
                                                     POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
-                                                    raydium_cpmm_vaults_for_pool_cache_update(&s),
+                                                    raydium_cpmm_vaults_for_pool_cache_update(s),
                                                 );
                                                 balance_update.metadata = Some(meta);
                                                 let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();

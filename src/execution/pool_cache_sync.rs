@@ -392,7 +392,8 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                     }
                 }
                 // BalanceUpdated has no vault pubkeys in the scalar fields — preserve from existing
-                // or from metadata (`raydium_cpmm_vaults`) so reserve updates stay coherent.
+                // or from metadata (`raydium_cpmm_vaults`: base_vault,quote_vault matching normalized
+                // base_mint/quote_mint on the update) so reserve updates stay coherent.
                 if update.dex == "raydium_cpmm" {
                     if let CachedPoolState::RaydiumCpmm(ref mut new_cpmm) = minimal_state {
                         // Prefer existing vaults only when both are non-default. Legacy JetStream
@@ -986,6 +987,50 @@ mod tests {
             cache.raydium_cpmm_readiness(&pool),
             Some(DexPoolReadiness::Partial)
         );
+    }
+
+    /// On-chain `token_0 == SOL`: publisher sends normalized base/quote mints and base/quote vault order in metadata.
+    #[test]
+    fn test_raydium_cpmm_pool_discovered_metadata_vaults_match_normalized_mints_when_sol_is_token_0(
+    ) {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let sol = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let base_mint = Pubkey::new_unique();
+        let v_non_sol_vault = Pubkey::new_unique();
+        let v_sol_vault = Pubkey::new_unique();
+
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "raydium_cpmm".to_string(),
+            base_mint.to_string(),
+            sol.to_string(),
+            1_000_000,
+            50_000_000_000,
+            None,
+            1,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
+            format!("{v_non_sol_vault},{v_sol_vault}"),
+        );
+        update.metadata = Some(meta);
+        update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        assert!(apply_pool_cache_update(&cache, &update));
+
+        match cache.get(&pool).expect("pool in cache") {
+            CachedPoolState::RaydiumCpmm(s) => {
+                assert_eq!(s.token_0_mint, base_mint);
+                assert_eq!(s.token_1_mint, sol);
+                assert_eq!(s.token_0_vault, v_non_sol_vault);
+                assert_eq!(s.token_1_vault, v_sol_vault);
+            }
+            other => panic!("expected RaydiumCpmm, got {:?}", other),
+        }
     }
 
     #[test]
