@@ -2382,6 +2382,12 @@ pub const POOL_CACHE_UPDATE_DEX_READINESS_KEY: &str = "dex_pool_readiness";
 /// Metadata key for comma-separated PumpSwap account pubkeys on [`PoolCacheUpdate`].
 pub const POOL_CACHE_UPDATE_POOL_ACCOUNTS_KEY: &str = "pool_accounts";
 
+/// Metadata key for Raydium CPMM: `token_0_vault,token_1_vault` (comma-separated base58).
+///
+/// Lets SLAVE [`PoolCacheUpdate::BalanceUpdated`] merge preserve vault pubkeys when the
+/// update only carries reserve scalars (same pattern as PumpSwap `pool_accounts`).
+pub const POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY: &str = "raydium_cpmm_vaults";
+
 /// Pool cache update type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

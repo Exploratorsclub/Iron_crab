@@ -33,7 +33,7 @@ use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest,
     ControlRequestKind, ControlResponse, ControlResponseStatus, DexPoolReadiness, ExecutionResult,
     ExecutionStatus, IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate,
-    PriorityFeePercentiles, NATIVE_SOL_MINT,
+    PriorityFeePercentiles, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::metrics::{
     serve_metrics, set_readiness_control_sub_active, set_readiness_mode,
@@ -3209,7 +3209,7 @@ async fn run_geyser_loop(
 
                                     // Publish PoolCacheUpdate::BalanceUpdated to JetStream (persistent state)
                                     if let Some(ref nats) = ctx.nats {
-                                        let balance_update = PoolCacheUpdate::new_balance_updated(
+                                        let mut balance_update = PoolCacheUpdate::new_balance_updated(
                                             "market-data",
                                             BUILD_VERSION,
                                             run_id,
@@ -3221,6 +3221,41 @@ async fn run_geyser_loop(
                                             final_quote,
                                             account_update.slot,
                                         );
+                                        if vault_info.dex == "raydium_cpmm" {
+                                            if let Some(CachedPoolState::RaydiumCpmm(s)) =
+                                                ctx.live_pool_cache.get(&vault_info.pool_address)
+                                            {
+                                                let mut meta = std::collections::HashMap::new();
+                                                meta.insert(
+                                                    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
+                                                    format!("{},{}", s.token_0_vault, s.token_1_vault),
+                                                );
+                                                balance_update.metadata = Some(meta);
+                                                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+                                                let r0 = s.reserve_0.unwrap_or(0);
+                                                let r1 = s.reserve_1.unwrap_or(0);
+                                                let (base_side_liq, quote_side_liq) =
+                                                    if s.token_1_mint == sol {
+                                                        (r0 > 0, r1 > 0)
+                                                    } else if s.token_0_mint == sol {
+                                                        (r1 > 0, r0 > 0)
+                                                    } else {
+                                                        (r0 > 0, r1 > 0)
+                                                    };
+                                                let readiness = if base_side_liq && quote_side_liq {
+                                                    DexPoolReadiness::Ready
+                                                } else if r0 > 0 || r1 > 0 {
+                                                    DexPoolReadiness::Partial
+                                                } else {
+                                                    DexPoolReadiness::Observed
+                                                };
+                                                balance_update.set_dex_readiness_in_metadata(readiness);
+                                                ctx.live_pool_cache.merge_raydium_cpmm_pool_readiness(
+                                                    vault_info.pool_address,
+                                                    readiness,
+                                                );
+                                            }
+                                        }
                                         let subject = pool_subject(&vault_info.pool_address.to_string());
                                         if let Err(e) = nats.jetstream_publish(&subject, &balance_update).await {
                                             warn!(error = %e, "Failed to publish PoolCacheUpdate::BalanceUpdated to JetStream");
@@ -3358,6 +3393,61 @@ async fn run_geyser_loop(
                     // Update MASTER LivePoolCache (Single Source of Truth)
                     ctx.live_pool_cache.upsert(account_update.pubkey, cached_state.clone(), account_update.slot);
 
+                    // Raydium CPMM: register vault ATAs for Geyser reserve updates (enables non-RPC reserve path).
+                    if let CachedPoolState::RaydiumCpmm(s) = &cached_state {
+                        let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+                        let (base_mint_v, quote_mint_v, coin_vault, pc_vault) =
+                            if s.token_1_mint == sol {
+                                (s.token_0_mint, s.token_1_mint, s.token_0_vault, s.token_1_vault)
+                            } else if s.token_0_mint == sol {
+                                (s.token_1_mint, s.token_0_mint, s.token_1_vault, s.token_0_vault)
+                            } else {
+                                (s.token_0_mint, s.token_1_mint, s.token_0_vault, s.token_1_vault)
+                            };
+                        let dex_str = "raydium_cpmm".to_string();
+                        let mut vaults_changed = false;
+                        {
+                            let mut vaults = ctx.tracked_vaults.write();
+                            vaults.entry(coin_vault).or_insert_with(|| {
+                                vaults_changed = true;
+                                VaultInfo {
+                                    pool_address: account_update.pubkey,
+                                    dex: dex_str.clone(),
+                                    base_mint: base_mint_v,
+                                    quote_mint: quote_mint_v,
+                                    is_base_vault: true,
+                                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                                    active_id: None,
+                                    bin_step: None,
+                                }
+                            });
+                            vaults.entry(pc_vault).or_insert_with(|| {
+                                vaults_changed = true;
+                                VaultInfo {
+                                    pool_address: account_update.pubkey,
+                                    dex: dex_str,
+                                    base_mint: base_mint_v,
+                                    quote_mint: quote_mint_v,
+                                    is_base_vault: false,
+                                    last_balance: std::sync::atomic::AtomicU64::new(0),
+                                    active_id: None,
+                                    bin_step: None,
+                                }
+                            });
+                        }
+                        if vaults_changed {
+                            let vault_list: Vec<Pubkey> =
+                                ctx.tracked_vaults.read().keys().copied().collect();
+                            let _ = ctx.tracked_vaults_tx.send(vault_list);
+                            debug!(
+                                pool = %account_update.pubkey,
+                                coin_vault = %coin_vault,
+                                pc_vault = %pc_vault,
+                                "Registered Raydium CPMM vaults for Geyser reserve subscription"
+                            );
+                        }
+                    }
+
                     // FIX-29: One-time Cold Path RPC to fetch Serum/OpenBook accounts for Raydium AMM.
                     // These are static (never change) — fetch once, cache forever.
                     if let CachedPoolState::RaydiumAmm(ref s) = cached_state {
@@ -3403,7 +3493,29 @@ async fn run_geyser_loop(
                             (s.base_mint, s.quote_mint, s.coin_reserve.unwrap_or(0), s.pc_reserve.unwrap_or(0))
                         }
                         CachedPoolState::RaydiumCpmm(s) => {
-                            (s.token_0_mint, s.token_1_mint, s.reserve_0.unwrap_or(0), s.reserve_1.unwrap_or(0))
+                            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+                            if s.token_1_mint == sol {
+                                (
+                                    s.token_0_mint,
+                                    s.token_1_mint,
+                                    s.reserve_0.unwrap_or(0),
+                                    s.reserve_1.unwrap_or(0),
+                                )
+                            } else if s.token_0_mint == sol {
+                                (
+                                    s.token_1_mint,
+                                    s.token_0_mint,
+                                    s.reserve_1.unwrap_or(0),
+                                    s.reserve_0.unwrap_or(0),
+                                )
+                            } else {
+                                (
+                                    s.token_0_mint,
+                                    s.token_1_mint,
+                                    s.reserve_0.unwrap_or(0),
+                                    s.reserve_1.unwrap_or(0),
+                                )
+                            }
                         }
                         CachedPoolState::Meteora(s) => {
                             (s.token_x_mint, s.token_y_mint, s.reserve_x_balance.unwrap_or(0), s.reserve_y_balance.unwrap_or(0))
@@ -3662,6 +3774,36 @@ async fn run_geyser_loop(
                                 if !meta.is_empty() {
                                     pool_update.metadata = Some(meta);
                                 }
+                            }
+                            CachedPoolState::RaydiumCpmm(s) => {
+                                let mut meta = std::collections::HashMap::new();
+                                meta.insert(
+                                    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
+                                    format!("{},{}", s.token_0_vault, s.token_1_vault),
+                                );
+                                pool_update.metadata = Some(meta);
+                                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+                                let r0 = s.reserve_0.unwrap_or(0);
+                                let r1 = s.reserve_1.unwrap_or(0);
+                                let (base_side_liq, quote_side_liq) = if s.token_1_mint == sol {
+                                    (r0 > 0, r1 > 0)
+                                } else if s.token_0_mint == sol {
+                                    (r1 > 0, r0 > 0)
+                                } else {
+                                    (r0 > 0, r1 > 0)
+                                };
+                                let readiness = if base_side_liq && quote_side_liq {
+                                    DexPoolReadiness::Ready
+                                } else if r0 > 0 || r1 > 0 {
+                                    DexPoolReadiness::Partial
+                                } else {
+                                    DexPoolReadiness::Observed
+                                };
+                                pool_update.set_dex_readiness_in_metadata(readiness);
+                                ctx.live_pool_cache.merge_raydium_cpmm_pool_readiness(
+                                    account_update.pubkey,
+                                    readiness,
+                                );
                             }
                             _ => {}
                         }
