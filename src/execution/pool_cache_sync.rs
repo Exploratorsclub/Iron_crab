@@ -21,8 +21,8 @@ use std::str::FromStr;
 use tracing::{debug, info, warn};
 
 use crate::execution::live_pool_cache::{
-    CachedPoolState, LivePoolCache, MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState,
-    RaydiumAmmState, RaydiumCpmmState,
+    CachedPoolState, LivePoolCache, MeteoraCpmmState, MeteoraState, OrcaWhirlpoolState,
+    PumpAmmState, PumpFunState, RaydiumAmmState, RaydiumCpmmState,
 };
 use crate::ipc::{PoolCacheUpdate, PoolCacheUpdateType, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY};
 use crate::nats::{slave_consumer_config, NatsClient, STREAM_NAME};
@@ -42,7 +42,7 @@ fn extract_reserves(state: &CachedPoolState) -> (u64, u64) {
         ),
         CachedPoolState::PumpAmm(s) => (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0)),
         CachedPoolState::PumpFun(s) => (s.virtual_token_reserves, s.virtual_sol_reserves),
-        CachedPoolState::MeteoraCpmm(_) => (0, 0),
+        CachedPoolState::MeteoraCpmm(s) => (s.reserve_0, s.reserve_1),
     }
 }
 
@@ -130,7 +130,7 @@ fn build_minimal_pool_state_with_reserves(
             reserve_0: Some(base_reserve),
             reserve_1: Some(quote_reserve),
         }),
-        "meteora_cpmm" | "meteora_dlmm" => CachedPoolState::Meteora(MeteoraState {
+        "meteora_dlmm" => CachedPoolState::Meteora(MeteoraState {
             token_x_mint: base_mint,
             token_y_mint: quote_mint,
             reserve_x: Pubkey::default(),
@@ -139,6 +139,21 @@ fn build_minimal_pool_state_with_reserves(
             bin_step: 0,
             reserve_x_balance: Some(base_reserve),
             reserve_y_balance: Some(quote_reserve),
+        }),
+        "meteora_cpmm" => CachedPoolState::MeteoraCpmm(MeteoraCpmmState {
+            token_0_mint: base_mint,
+            token_1_mint: quote_mint,
+            token_0_vault: Pubkey::default(),
+            token_1_vault: Pubkey::default(),
+            amm_config: Pubkey::default(),
+            observation_key: Pubkey::default(),
+            token_0_program: Pubkey::default(),
+            token_1_program: Pubkey::default(),
+            reserve_0: base_reserve,
+            reserve_1: quote_reserve,
+            mint_0_decimals: 0,
+            mint_1_decimals: 0,
+            status: 0,
         }),
         "pump_amm" => {
             let creator = update
@@ -442,6 +457,49 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 }
                 // BalanceUpdated often omits metadata: preserve Serum static accounts + vault pubkeys
                 // from existing Raydium AMM state so SLAVE readiness does not spuriously downgrade.
+                // BalanceUpdated has no on-chain layout fields: preserve vaults / config / programs /
+                // decimals / status from existing Geyser-parsed Meteora CPMM so SLAVE stays coherent.
+                if update.dex == "meteora_cpmm" {
+                    if let CachedPoolState::MeteoraCpmm(ref mut new_cpmm) = minimal_state {
+                        if let Some(CachedPoolState::MeteoraCpmm(ex)) = existing.as_ref() {
+                            // Minimal JetStream rebuild uses 0 for decimals/status; always take chain
+                            // values from existing Geyser state when present (0 decimals is valid).
+                            new_cpmm.mint_0_decimals = ex.mint_0_decimals;
+                            new_cpmm.mint_1_decimals = ex.mint_1_decimals;
+                            new_cpmm.status = ex.status;
+                            if new_cpmm.token_0_vault == Pubkey::default()
+                                && ex.token_0_vault != Pubkey::default()
+                            {
+                                new_cpmm.token_0_vault = ex.token_0_vault;
+                            }
+                            if new_cpmm.token_1_vault == Pubkey::default()
+                                && ex.token_1_vault != Pubkey::default()
+                            {
+                                new_cpmm.token_1_vault = ex.token_1_vault;
+                            }
+                            if new_cpmm.amm_config == Pubkey::default()
+                                && ex.amm_config != Pubkey::default()
+                            {
+                                new_cpmm.amm_config = ex.amm_config;
+                            }
+                            if new_cpmm.observation_key == Pubkey::default()
+                                && ex.observation_key != Pubkey::default()
+                            {
+                                new_cpmm.observation_key = ex.observation_key;
+                            }
+                            if new_cpmm.token_0_program == Pubkey::default()
+                                && ex.token_0_program != Pubkey::default()
+                            {
+                                new_cpmm.token_0_program = ex.token_0_program;
+                            }
+                            if new_cpmm.token_1_program == Pubkey::default()
+                                && ex.token_1_program != Pubkey::default()
+                            {
+                                new_cpmm.token_1_program = ex.token_1_program;
+                            }
+                        }
+                    }
+                }
                 if update.dex == "raydium" {
                     if let CachedPoolState::RaydiumAmm(ref mut new_am) = minimal_state {
                         if let Some(CachedPoolState::RaydiumAmm(ex)) = existing.as_ref() {
@@ -1067,6 +1125,189 @@ mod tests {
                 assert_eq!(s.token_1_vault, v_sol_vault);
             }
             other => panic!("expected RaydiumCpmm, got {:?}", other),
+        }
+    }
+
+    /// Scope 12: `meteora_cpmm` JetStream minimal state must use `CachedPoolState::MeteoraCpmm`,
+    /// not DLMM-shaped `Meteora`.
+    #[test]
+    fn test_meteora_cpmm_pool_discovered_builds_meteora_cpmm_variant() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token_0 = Pubkey::new_unique();
+        let token_1 = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+
+        let update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "meteora_cpmm".to_string(),
+            token_0.to_string(),
+            token_1.to_string(),
+            1_000_000,
+            50_000_000_000,
+            None,
+            1,
+        );
+        assert!(apply_pool_cache_update(&cache, &update));
+
+        match cache.get(&pool).expect("pool in cache") {
+            CachedPoolState::MeteoraCpmm(s) => {
+                assert_eq!(s.token_0_mint, token_0);
+                assert_eq!(s.token_1_mint, token_1);
+                assert_eq!(s.reserve_0, 1_000_000);
+                assert_eq!(s.reserve_1, 50_000_000_000);
+            }
+            other => panic!("expected MeteoraCpmm, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_meteora_dlmm_pool_discovered_stays_meteora_dlmm_variant() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token_x = Pubkey::new_unique();
+        let token_y = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+
+        let update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "meteora_dlmm".to_string(),
+            token_x.to_string(),
+            token_y.to_string(),
+            100,
+            200,
+            None,
+            1,
+        );
+        assert!(apply_pool_cache_update(&cache, &update));
+
+        match cache.get(&pool).expect("pool in cache") {
+            CachedPoolState::Meteora(s) => {
+                assert_eq!(s.token_x_mint, token_x);
+                assert_eq!(s.token_y_mint, token_y);
+                assert_eq!(s.reserve_x_balance, Some(100));
+                assert_eq!(s.reserve_y_balance, Some(200));
+            }
+            other => panic!("expected Meteora (DLMM), got {:?}", other),
+        }
+    }
+
+    /// Partial BalanceUpdated (one vault) must merge with prior reserves for Meteora CPMM.
+    #[test]
+    fn test_meteora_cpmm_balance_updated_merges_single_side_reserve() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token_0 = Pubkey::new_unique();
+        let token_1 = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+
+        let disc = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "meteora_cpmm".to_string(),
+            token_0.to_string(),
+            token_1.to_string(),
+            1_000_000,
+            2_000_000,
+            None,
+            1,
+        );
+        assert!(apply_pool_cache_update(&cache, &disc));
+
+        let bal = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "meteora_cpmm".to_string(),
+            token_0.to_string(),
+            token_1.to_string(),
+            0,
+            9_999_999,
+            2,
+        );
+        assert!(apply_pool_cache_update(&cache, &bal));
+
+        match cache.get(&pool).expect("pool in cache") {
+            CachedPoolState::MeteoraCpmm(s) => {
+                assert_eq!(
+                    s.reserve_0, 1_000_000,
+                    "token_0 side must be preserved when update has 0"
+                );
+                assert_eq!(s.reserve_1, 9_999_999);
+            }
+            other => panic!("expected MeteoraCpmm, got {:?}", other),
+        }
+    }
+
+    /// After Geyser-filled vaults/decimals, JetStream BalanceUpdated must not zero them.
+    #[test]
+    fn test_meteora_cpmm_balance_updated_preserves_geyser_static_fields() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token_0 = Pubkey::new_unique();
+        let token_1 = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let v0 = Pubkey::new_unique();
+        let v1 = Pubkey::new_unique();
+        let amm_cfg = Pubkey::new_unique();
+        let obs = Pubkey::new_unique();
+        let p0 = Pubkey::new_unique();
+        let p1 = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(MeteoraCpmmState {
+                token_0_mint: token_0,
+                token_1_mint: token_1,
+                token_0_vault: v0,
+                token_1_vault: v1,
+                amm_config: amm_cfg,
+                observation_key: obs,
+                token_0_program: p0,
+                token_1_program: p1,
+                reserve_0: 100,
+                reserve_1: 200,
+                mint_0_decimals: 6,
+                mint_1_decimals: 9,
+                status: 1,
+            }),
+            1,
+        );
+
+        let bal = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "meteora_cpmm".to_string(),
+            token_0.to_string(),
+            token_1.to_string(),
+            111,
+            0,
+            2,
+        );
+        assert!(apply_pool_cache_update(&cache, &bal));
+
+        match cache.get(&pool).expect("pool in cache") {
+            CachedPoolState::MeteoraCpmm(s) => {
+                assert_eq!(s.token_0_vault, v0);
+                assert_eq!(s.token_1_vault, v1);
+                assert_eq!(s.amm_config, amm_cfg);
+                assert_eq!(s.observation_key, obs);
+                assert_eq!(s.token_0_program, p0);
+                assert_eq!(s.token_1_program, p1);
+                assert_eq!(s.mint_0_decimals, 6);
+                assert_eq!(s.mint_1_decimals, 9);
+                assert_eq!(s.status, 1);
+                assert_eq!(s.reserve_0, 111);
+                assert_eq!(s.reserve_1, 200);
+            }
+            other => panic!("expected MeteoraCpmm, got {:?}", other),
         }
     }
 
