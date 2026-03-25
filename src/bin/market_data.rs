@@ -1175,8 +1175,9 @@ async fn publish_wallet_snapshot(
         warn!(error = %e, "Failed to write WalletSnapshotComplete (bootstrap) to JSONL");
     }
 
-    // 4b) Cold-path inventory: count wallet-held mints with explicit multi-DEX ready coverage
-    // (PumpSwap + PumpFun bonding today). Not derived from snapshot completeness alone.
+    // 4b) Cold-path inventory: count wallet-held mints where LivePoolCache reports explicit
+    // readiness only — PumpSwap: merge_pump_amm_pool_accounts_readiness(Ready); PumpFun:
+    // merge_pumpfun_bonding_readiness(Ready). No legacy PumpSwap heuristic / snapshot completeness.
     let mut wallet_mints_explicit_ready_count: usize = 0;
     for mint_str in &mints_in_wallet {
         if let Ok(pk) = Pubkey::from_str(mint_str) {
@@ -1184,7 +1185,7 @@ async fn publish_wallet_snapshot(
                 wallet_mints_explicit_ready_count += 1;
                 debug!(
                     mint = %mint_str,
-                    "wallet mint: explicit ready pool present (PumpSwap and/or PumpFun bonding)"
+                    "wallet mint: explicit DexPoolReadiness::Ready (PumpSwap map and/or PumpFun bonding)"
                 );
             }
         }
@@ -1194,7 +1195,7 @@ async fn publish_wallet_snapshot(
             wallet = %wallet_str,
             wallet_mints_explicit_ready_count,
             nonzero_wallet_mints = mints_in_wallet.len(),
-            "Wallet snapshot: mint-level explicit ready coverage (DEX slices with readiness model; not cache-presence)"
+            "Wallet snapshot: mints with explicit Ready merge (PumpSwap/PumpFun); excludes legacy PumpSwap effective-ready"
         );
     }
 
