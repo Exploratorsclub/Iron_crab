@@ -78,8 +78,9 @@ const EXECUTION_RESULT_DEDUP_CAPACITY: usize = 4096;
 
 // LivePoolCache - MASTER Cache (Single Source of Truth)
 use ironcrab::execution::live_pool_cache::{
-    parse_pool_account, raydium_amm_readiness_for_pool_cache_update, CachedPoolState,
-    LivePoolCache, PumpAmmState, PumpFunState, RaydiumCpmmState,
+    meteora_cpmm_readiness_for_pool_cache_update, parse_pool_account,
+    raydium_amm_readiness_for_pool_cache_update, CachedPoolState, LivePoolCache, PumpAmmState,
+    PumpFunState, RaydiumCpmmState,
 };
 
 // P1 Crash Isolation: Systemd Watchdog support
@@ -3498,6 +3499,19 @@ async fn run_geyser_loop(
                                                 );
                                             }
                                         }
+                                        if vault_info.dex == "meteora_cpmm" {
+                                            if let Some(CachedPoolState::MeteoraCpmm(ref s)) =
+                                                ctx.live_pool_cache.get(&vault_info.pool_address)
+                                            {
+                                                let readiness =
+                                                    meteora_cpmm_readiness_for_pool_cache_update(s);
+                                                balance_update.set_dex_readiness_in_metadata(readiness);
+                                                ctx.live_pool_cache.merge_meteora_cpmm_pool_readiness(
+                                                    vault_info.pool_address,
+                                                    readiness,
+                                                );
+                                            }
+                                        }
                                         if vault_info.dex == "raydium" {
                                             if let Some(CachedPoolState::RaydiumAmm(ref s)) =
                                                 ctx.live_pool_cache.get(&vault_info.pool_address)
@@ -3700,6 +3714,63 @@ async fn run_geyser_loop(
                                 pc_vault = %pc_vault,
                                 "Registered Raydium CPMM vaults for Geyser reserve subscription"
                             );
+                        }
+                    }
+
+                    // Meteora CPMM: register vault ATAs for Geyser reserve updates (same pattern as Raydium CPMM).
+                    if ctx.config.read().enable_meteora_cpmm {
+                        if let CachedPoolState::MeteoraCpmm(s) = &cached_state {
+                            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+                            let (base_mint_v, quote_mint_v, vault_base, vault_quote) =
+                                if s.token_1_mint == sol {
+                                    (s.token_0_mint, s.token_1_mint, s.token_0_vault, s.token_1_vault)
+                                } else if s.token_0_mint == sol {
+                                    (s.token_1_mint, s.token_0_mint, s.token_1_vault, s.token_0_vault)
+                                } else {
+                                    (s.token_0_mint, s.token_1_mint, s.token_0_vault, s.token_1_vault)
+                                };
+                            let dex_str = "meteora_cpmm".to_string();
+                            let mut vaults_changed = false;
+                            {
+                                let mut vaults = ctx.tracked_vaults.write();
+                                vaults.entry(vault_base).or_insert_with(|| {
+                                    vaults_changed = true;
+                                    VaultInfo {
+                                        pool_address: account_update.pubkey,
+                                        dex: dex_str.clone(),
+                                        base_mint: base_mint_v,
+                                        quote_mint: quote_mint_v,
+                                        is_base_vault: true,
+                                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                                        active_id: None,
+                                        bin_step: None,
+                                    }
+                                });
+                                vaults.entry(vault_quote).or_insert_with(|| {
+                                    vaults_changed = true;
+                                    VaultInfo {
+                                        pool_address: account_update.pubkey,
+                                        dex: dex_str,
+                                        base_mint: base_mint_v,
+                                        quote_mint: quote_mint_v,
+                                        is_base_vault: false,
+                                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                                        active_id: None,
+                                        bin_step: None,
+                                    }
+                                });
+                            }
+                            if vaults_changed {
+                                let vault_list: Vec<Pubkey> =
+                                    ctx.tracked_vaults.read().keys().copied().collect();
+                                let _ = ctx.tracked_vaults_tx.send(vault_list);
+                                debug!(
+                                    pool = %account_update.pubkey,
+                                    vault_base = %vault_base,
+                                    vault_quote = %vault_quote,
+                                    "Registered Meteora CPMM vaults for Geyser reserve subscription"
+                                );
+                            }
                         }
                     }
 
@@ -3973,7 +4044,29 @@ async fn run_geyser_loop(
                             (s.token_mint, Pubkey::default(), s.virtual_token_reserves, s.virtual_sol_reserves)
                         }
                         CachedPoolState::MeteoraCpmm(s) => {
-                            (s.token_0_mint, s.token_1_mint, s.reserve_0, s.reserve_1)
+                            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+                            if s.token_1_mint == sol {
+                                (
+                                    s.token_0_mint,
+                                    s.token_1_mint,
+                                    s.reserve_0,
+                                    s.reserve_1,
+                                )
+                            } else if s.token_0_mint == sol {
+                                (
+                                    s.token_1_mint,
+                                    s.token_0_mint,
+                                    s.reserve_1,
+                                    s.reserve_0,
+                                )
+                            } else {
+                                (
+                                    s.token_0_mint,
+                                    s.token_1_mint,
+                                    s.reserve_0,
+                                    s.reserve_1,
+                                )
+                            }
                         }
                     };
 
@@ -4129,6 +4222,14 @@ async fn run_geyser_loop(
                                 let readiness = raydium_cpmm_readiness_for_pool_cache_update(s);
                                 pool_update.set_dex_readiness_in_metadata(readiness);
                                 ctx.live_pool_cache.merge_raydium_cpmm_pool_readiness(
+                                    account_update.pubkey,
+                                    readiness,
+                                );
+                            }
+                            CachedPoolState::MeteoraCpmm(s) => {
+                                let readiness = meteora_cpmm_readiness_for_pool_cache_update(s);
+                                pool_update.set_dex_readiness_in_metadata(readiness);
+                                ctx.live_pool_cache.merge_meteora_cpmm_pool_readiness(
                                     account_update.pubkey,
                                     readiness,
                                 );
