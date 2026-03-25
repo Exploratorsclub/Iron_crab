@@ -2236,8 +2236,10 @@ impl ExecutionContext {
         warn!(
             request_id = %request_id,
             base_mint = %base_mint,
+            bonding_curve = "derived PDA from mint (EnsurePumpfunBondingCurve)",
+            error_family = "6023/6024/Overflow/0x1787/0x1788 (structural sim fail)",
             target = "market-data",
-            "PumpFun cold-path: EnsurePumpfunBondingCurve force_refresh (stale bonding-curve sim fail recovery)"
+            "PumpFun cold-path: triggering EnsurePumpfunBondingCurve force_refresh via market-data (RPC, not cache-first)"
         );
 
         if nats.publish(TOPIC_CONTROL_REQUESTS, &req).await.is_err() {
@@ -10242,18 +10244,22 @@ async fn spawn_rebroadcast_loop(
 mod execution_engine_tests {
     use super::{
         is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_cold_path_recovery_sell,
-        is_regular_momentum_hot_path_sell, pump_amm_pool_market_hint_merge,
-        record_pump_amm_hot_path_refresh_after_success, select_best_route,
-        try_pump_amm_hot_path_refresh_publish, DiscoveryRequestOutcome,
+        is_pumpfun_bonding_curve_structural_sim_error, is_regular_momentum_hot_path_sell,
+        pump_amm_pool_market_hint_merge, record_pump_amm_hot_path_refresh_after_success,
+        select_best_route, try_pump_amm_hot_path_refresh_publish,
+        wait_for_pumpfun_bonding_cache_refresh, DiscoveryRequestOutcome,
         PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
     };
+    use ironcrab::execution::live_pool_cache::{CachedPoolState, LivePoolCache, PumpFunState};
     use ironcrab::ipc::{
         ControlResponse, ControlResponseStatus, ExplicitAmount, IntentOrigin, IntentTier,
         TradeIntent, TradeResources, TradeSide, TradingRegime,
     };
+    use ironcrab::solana::dex::pumpfun::PumpFunDex;
     use parking_lot::Mutex as ParkingMutex;
     use solana_sdk::pubkey::Pubkey;
     use std::collections::HashMap;
+    use std::str::FromStr;
     use std::time::Instant;
 
     #[test]
@@ -10265,6 +10271,29 @@ mod execution_engine_tests {
         assert!(is_pump_amm_structural_sim_error(Some("0x1787")));
         assert!(!is_pump_amm_structural_sim_error(Some("Custom(6005)")));
         assert!(!is_pump_amm_structural_sim_error(None));
+    }
+
+    #[test]
+    fn pumpfun_bonding_structural_sim_error_matches_cold_path_recovery_pattern() {
+        assert!(is_pumpfun_bonding_curve_structural_sim_error(Some(
+            "Simulation failed: Custom(6023)"
+        )));
+        assert!(is_pumpfun_bonding_curve_structural_sim_error(Some(
+            "Custom(6024)"
+        )));
+        assert!(is_pumpfun_bonding_curve_structural_sim_error(Some(
+            "Overflow"
+        )));
+        assert!(is_pumpfun_bonding_curve_structural_sim_error(Some(
+            "0x1787"
+        )));
+        assert!(is_pumpfun_bonding_curve_structural_sim_error(Some(
+            "0x1788"
+        )));
+        assert!(!is_pumpfun_bonding_curve_structural_sim_error(Some(
+            "Custom(6005)"
+        )));
+        assert!(!is_pumpfun_bonding_curve_structural_sim_error(None));
     }
 
     #[test]
@@ -10381,6 +10410,106 @@ mod execution_engine_tests {
             .metadata
             .insert("dex".to_string(), "pumpfun".to_string());
         assert!(!is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent));
+    }
+
+    #[test]
+    fn wait_for_pumpfun_bonding_cache_refresh_detects_jetstream_merge() {
+        let mint_str = "Mint111111111111111111111111111111111111111";
+        let mint = Pubkey::from_str(mint_str).unwrap();
+        let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(&mint);
+        let assoc = Pubkey::new_unique();
+
+        let cache = LivePoolCache::new();
+        let before = (100u64, 200u64, 10u64, 20u64, false, false);
+        cache.upsert(
+            bonding_curve,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve,
+                associated_bonding_curve: assoc,
+                virtual_sol_reserves: before.1,
+                virtual_token_reserves: before.0,
+                real_sol_reserves: before.3,
+                real_token_reserves: before.2,
+                complete: before.4,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: before.5,
+            }),
+            0,
+        );
+
+        let cache_clone = std::sync::Arc::new(cache);
+        let cache_for_task = std::sync::Arc::clone(&cache_clone);
+        let bonding = bonding_curve;
+        let mint_copy = mint;
+        let assoc_copy = assoc;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            cache_for_task.upsert(
+                bonding,
+                CachedPoolState::PumpFun(PumpFunState {
+                    token_mint: mint_copy,
+                    bonding_curve: bonding,
+                    associated_bonding_curve: assoc_copy,
+                    virtual_sol_reserves: before.1,
+                    virtual_token_reserves: before.0 + 1,
+                    real_sol_reserves: before.3,
+                    real_token_reserves: before.2,
+                    complete: before.4,
+                    creator: Pubkey::new_unique(),
+                    cashback_enabled: before.5,
+                }),
+                1,
+            );
+        });
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ok = rt.block_on(wait_for_pumpfun_bonding_cache_refresh(
+            cache_clone.as_ref(),
+            &bonding_curve,
+            Some(before),
+            500,
+            5,
+        ));
+        assert!(
+            ok,
+            "expected snapshot change after simulated PoolCacheUpdate merge"
+        );
+    }
+
+    #[test]
+    fn wait_for_pumpfun_bonding_cache_refresh_times_out_when_snapshot_unchanged() {
+        let mint_str = "Mint222222222222222222222222222222222222222";
+        let mint = Pubkey::from_str(mint_str).unwrap();
+        let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(&mint);
+        let snap = (50u64, 60u64, 1u64, 2u64, false, true);
+        let cache = LivePoolCache::new();
+        cache.upsert(
+            bonding_curve,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: snap.1,
+                virtual_token_reserves: snap.0,
+                real_sol_reserves: snap.3,
+                real_token_reserves: snap.2,
+                complete: snap.4,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: snap.5,
+            }),
+            0,
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ok = rt.block_on(wait_for_pumpfun_bonding_cache_refresh(
+            &cache,
+            &bonding_curve,
+            Some(snap),
+            80,
+            10,
+        ));
+        assert!(!ok);
     }
 
     /// I-24d: Verifies that ControlResponse status maps correctly to DiscoveryRequestOutcome.
