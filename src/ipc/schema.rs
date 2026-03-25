@@ -2390,6 +2390,13 @@ pub const POOL_CACHE_UPDATE_POOL_ACCOUNTS_KEY: &str = "pool_accounts";
 /// update only carries reserve scalars (same pattern as PumpSwap `pool_accounts`).
 pub const POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY: &str = "raydium_cpmm_vaults";
 
+/// Metadata key for Meteora CPMM: `base_vault,quote_vault` (comma-separated base58).
+///
+/// **Order matches normalized [`PoolCacheUpdate::base_mint`] / [`PoolCacheUpdate::quote_mint`]**
+/// (non-SOL base first, SOL quote second when SOL is involved), same contract as
+/// [`POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY`].
+pub const POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY: &str = "meteora_cpmm_vaults";
+
 /// Pool cache update type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
