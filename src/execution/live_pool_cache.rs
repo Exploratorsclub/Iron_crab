@@ -958,6 +958,21 @@ impl LivePoolCache {
         false
     }
 
+    /// Cold-path bootstrap: Raydium CPMM pools in cache that list `mint` as token_0 or token_1.
+    /// Bounded iteration over the in-memory cache only (no chain scan).
+    #[must_use]
+    pub fn raydium_cpmm_pools_for_mint(&self, mint: &Pubkey) -> Vec<(Pubkey, RaydiumCpmmState)> {
+        let mut out = Vec::new();
+        for entry in self.pools.iter() {
+            if let CachedPoolState::RaydiumCpmm(s) = &entry.value().state {
+                if s.token_0_mint == *mint || s.token_1_mint == *mint {
+                    out.push((*entry.key(), s.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// `true` only after explicit JetStream / control-path merge recorded [`DexPoolReadiness::Ready`]
     /// for this bonding curve (Bug #36: cache hit alone is not ready).
     #[must_use]

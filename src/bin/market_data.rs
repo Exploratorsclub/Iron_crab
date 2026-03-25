@@ -576,7 +576,7 @@ fn try_parse_token_account_balance(data: &[u8]) -> Option<u64> {
 }
 
 /// Wallet `mints_in_wallet` are non-zero balances from bootstrap RPC; pick at most `max_mints`
-/// unique pubkeys that still lack explicit PumpSwap/PumpFun Ready per
+/// unique pubkeys that still lack explicit PumpSwap/PumpFun/Raydium-CPMM Ready per
 /// [`LivePoolCache::base_mint_has_any_ready_pool`]. Preserves iteration order; skips WSOL.
 fn wallet_mints_needing_dex_bootstrap_verify(
     cache: &LivePoolCache,
@@ -609,9 +609,10 @@ fn wallet_mints_needing_dex_bootstrap_verify(
     out
 }
 
-/// Cold-path only: bounded PumpSwap then PumpFun discovery for wallet-relevant mints without
-/// explicit Ready. Reuses [`handle_ensure_pump_amm_pool_accounts`] and
-/// [`handle_ensure_pumpfun_bonding_curve`] (MASTER cache + JetStream). Skips periodic snapshots.
+/// Cold-path only: bounded PumpSwap, then PumpFun, then Raydium CPMM (cache-scoped) for
+/// wallet-relevant mints without explicit Ready. Reuses [`handle_ensure_pump_amm_pool_accounts`],
+/// [`handle_ensure_pumpfun_bonding_curve`], and the same JetStream `PoolCacheUpdate` path as
+/// Geyser for Raydium CPMM. Skips periodic snapshots.
 async fn run_bounded_wallet_dex_bootstrap_verify(
     ctx: &MarketDataContext,
     rpc: &Arc<SolanaRpc>,
@@ -638,7 +639,7 @@ async fn run_bounded_wallet_dex_bootstrap_verify(
         count = candidates.len(),
         grace_ms = WALLET_BOOTSTRAP_DEX_VERIFY_GRACE_MS,
         max_mints = WALLET_BOOTSTRAP_DEX_VERIFY_MAX_MINTS,
-        "Wallet bootstrap: bounded DEX readiness verification (PumpSwap EnsurePumpAmmPoolAccounts, then PumpFun EnsurePumpfunBondingCurve if still not ready)"
+        "Wallet bootstrap: bounded DEX readiness verification (PumpSwap, then PumpFun, then Raydium CPMM if still not ready)"
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(
@@ -682,6 +683,225 @@ async fn run_bounded_wallet_dex_bootstrap_verify(
             WALLET_BOOTSTRAP_ENSURE_PUMPFUN_FORCE_REFRESH,
         )
         .await;
+
+        if ctx.live_pool_cache.base_mint_has_any_ready_pool(&pk) {
+            continue;
+        }
+
+        if ctx.config.read().enable_raydium_cpmm {
+            let request_id_rc = format!("wallet_bootstrap_rcpmm_{}", Uuid::new_v4());
+            handle_wallet_bootstrap_raydium_cpmm_verify_for_mint(
+                ctx,
+                rpc,
+                run_id,
+                &request_id_rc,
+                &pk,
+            )
+            .await;
+        }
+    }
+}
+
+/// Cold-path only: Raydium CPMM promotion for one wallet mint. Uses **only** pools already present
+/// in [`LivePoolCache`] (from Geyser); no `getProgramAccounts` / global scan. RPC: per-pool
+/// `get_account` + per-vault balance reads — bounded by the number of matching cache rows.
+///
+/// Publishes [`PoolCacheUpdate`] with the same metadata/readiness keys as the Geyser path so
+/// [`crate::execution::pool_cache_sync`] and SLAVE caches stay aligned (I-24a / Bug #36).
+async fn handle_wallet_bootstrap_raydium_cpmm_verify_for_mint(
+    ctx: &MarketDataContext,
+    rpc: &Arc<SolanaRpc>,
+    run_id: &str,
+    request_id: &str,
+    base_mint: &Pubkey,
+) {
+    if ctx
+        .live_pool_cache
+        .base_mint_has_explicit_raydium_cpmm_ready_pool(base_mint)
+    {
+        debug!(
+            request_id = %request_id,
+            mint = %base_mint,
+            "Wallet bootstrap Raydium CPMM: already explicit Ready for this mint, skip"
+        );
+        return;
+    }
+
+    let pools = ctx.live_pool_cache.raydium_cpmm_pools_for_mint(base_mint);
+    if pools.is_empty() {
+        debug!(
+            request_id = %request_id,
+            mint = %base_mint,
+            "Wallet bootstrap Raydium CPMM: no CPMM pool rows in LivePoolCache for mint, skip RPC"
+        );
+        return;
+    }
+
+    info!(
+        request_id = %request_id,
+        mint = %base_mint,
+        pools = pools.len(),
+        "Wallet bootstrap Raydium CPMM: verifying cache-scoped pools (cold-path RPC, no global scan)"
+    );
+
+    let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+
+    for (pool_addr, mut state) in pools {
+        if ctx.live_pool_cache.base_mint_has_any_ready_pool(base_mint) {
+            break;
+        }
+        if ctx
+            .live_pool_cache
+            .base_mint_has_explicit_raydium_cpmm_ready_pool(base_mint)
+        {
+            break;
+        }
+
+        let pool_acc = match rpc.get_account_opt_retry(&pool_addr).await {
+            Ok(Some(acc)) => acc,
+            Ok(None) | Err(_) => {
+                debug!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    "Wallet bootstrap Raydium CPMM: pool account fetch miss, skip"
+                );
+                continue;
+            }
+        };
+
+        let raydium_cpmm_program = Pubkey::from_str(RAYDIUM_CPMM).expect("RAYDIUM_CPMM constant");
+        let parsed_state = match parse_pool_account(&raydium_cpmm_program, &pool_acc.data) {
+            Some(CachedPoolState::RaydiumCpmm(s)) => s,
+            _ => {
+                debug!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    data_len = pool_acc.data.len(),
+                    "Wallet bootstrap Raydium CPMM: parse pool failed, skip"
+                );
+                continue;
+            }
+        };
+
+        state.token_0_mint = parsed_state.token_0_mint;
+        state.token_1_mint = parsed_state.token_1_mint;
+        state.token_0_vault = parsed_state.token_0_vault;
+        state.token_1_vault = parsed_state.token_1_vault;
+
+        if state.token_0_mint != *base_mint && state.token_1_mint != *base_mint {
+            continue;
+        }
+
+        let vault0 = state.token_0_vault;
+        let vault1 = state.token_1_vault;
+        let bal0 = match rpc.get_account_opt_retry(&vault0).await {
+            Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
+            _ => None,
+        };
+        let bal1 = match rpc.get_account_opt_retry(&vault1).await {
+            Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
+            _ => None,
+        };
+        let (b0, b1) = match (bal0, bal1) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                debug!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    "Wallet bootstrap Raydium CPMM: vault balance RPC incomplete, skip"
+                );
+                continue;
+            }
+        };
+
+        state.reserve_0 = Some(b0);
+        state.reserve_1 = Some(b1);
+
+        ctx.live_pool_cache
+            .upsert(pool_addr, CachedPoolState::RaydiumCpmm(state.clone()), 0);
+
+        let readiness = raydium_cpmm_readiness_for_pool_cache_update(&state);
+        ctx.live_pool_cache
+            .merge_raydium_cpmm_pool_readiness(pool_addr, readiness);
+
+        if readiness == DexPoolReadiness::Observed {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                mint = %base_mint,
+                "Wallet bootstrap Raydium CPMM: reserves still degenerate (Observed), no JetStream publish"
+            );
+            continue;
+        }
+
+        let (pub_base_mint, pub_quote_mint, base_r, quote_r) = if state.token_1_mint == sol {
+            (state.token_0_mint, state.token_1_mint, b0, b1)
+        } else if state.token_0_mint == sol {
+            (state.token_1_mint, state.token_0_mint, b1, b0)
+        } else {
+            (state.token_0_mint, state.token_1_mint, b0, b1)
+        };
+
+        let jetstream_ok = if let Some(ref nats) = ctx.nats {
+            let mut balance_update = PoolCacheUpdate::new_balance_updated(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                pool_addr.to_string(),
+                "raydium_cpmm".to_string(),
+                pub_base_mint.to_string(),
+                pub_quote_mint.to_string(),
+                base_r,
+                quote_r,
+                0,
+            );
+            let mut meta = std::collections::HashMap::new();
+            meta.insert(
+                POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
+                raydium_cpmm_vaults_for_pool_cache_update(&state),
+            );
+            balance_update.metadata = Some(meta);
+            balance_update.set_dex_readiness_in_metadata(readiness);
+            let subject = pool_subject(&pool_addr.to_string());
+            match nats.jetstream_publish(&subject, &balance_update).await {
+                Ok(true) => {
+                    info!(
+                        request_id = %request_id,
+                        pool = %pool_addr,
+                        mint = %base_mint,
+                        readiness = ?readiness,
+                        "Wallet bootstrap Raydium CPMM: published PoolCacheUpdate::BalanceUpdated to JetStream"
+                    );
+                    true
+                }
+                Ok(false) => {
+                    warn!(
+                        request_id = %request_id,
+                        pool = %pool_addr,
+                        "Wallet bootstrap Raydium CPMM: JetStream publish failed (timeout or drop)"
+                    );
+                    false
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        request_id = %request_id,
+                        "Wallet bootstrap Raydium CPMM: Failed to publish PoolCacheUpdate to JetStream"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if !jetstream_ok {
+            warn!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                "Wallet bootstrap Raydium CPMM: MASTER cache updated but JetStream publish failed — SSOT drift risk"
+            );
+        }
     }
 }
 
@@ -1335,7 +1555,8 @@ async fn publish_wallet_snapshot(
     }
 
     // 4a) Bounded cold-path verification for wallet non-zero mints without explicit Ready
-    // (PumpSwap then PumpFun); reuses I-24d handlers — no hot-path RPC.
+    // (PumpSwap, then PumpFun, then cache-scoped Raydium CPMM); reuses I-24d handlers + JetStream
+    // — no hot-path RPC.
     run_bounded_wallet_dex_bootstrap_verify(
         ctx,
         rpc,
@@ -1356,7 +1577,7 @@ async fn publish_wallet_snapshot(
                 wallet_mints_explicit_ready_count += 1;
                 debug!(
                     mint = %mint_str,
-                    "wallet mint: explicit DexPoolReadiness::Ready (PumpSwap map and/or PumpFun bonding)"
+                    "wallet mint: explicit DexPoolReadiness::Ready (PumpSwap / PumpFun / Raydium CPMM)"
                 );
             }
         }
@@ -1366,7 +1587,7 @@ async fn publish_wallet_snapshot(
             wallet = %wallet_str,
             wallet_mints_explicit_ready_count,
             nonzero_wallet_mints = mints_in_wallet.len(),
-            "Wallet snapshot: mints with explicit Ready merge (PumpSwap/PumpFun); excludes legacy PumpSwap effective-ready"
+            "Wallet snapshot: mints with explicit Ready merge (PumpSwap / PumpFun / Raydium CPMM); excludes legacy PumpSwap effective-ready"
         );
     }
 
@@ -5415,5 +5636,38 @@ mod discovery_tests {
             raydium_cpmm_readiness_for_pool_cache_update(&s),
             DexPoolReadiness::Observed
         );
+    }
+
+    #[test]
+    fn test_live_pool_cache_raydium_cpmm_pools_for_mint_bounded_to_cache() {
+        let cache = LivePoolCache::new();
+        let m = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let p1 = Pubkey::new_unique();
+        let p2 = Pubkey::new_unique();
+        let v = RaydiumCpmmState {
+            token_0_mint: m,
+            token_1_mint: other,
+            token_0_vault: Pubkey::new_unique(),
+            token_1_vault: Pubkey::new_unique(),
+            reserve_0: None,
+            reserve_1: None,
+        };
+        cache.upsert(p1, CachedPoolState::RaydiumCpmm(v.clone()), 0);
+        cache.upsert(
+            p2,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: other,
+                token_1_mint: other,
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            0,
+        );
+        let rows = cache.raydium_cpmm_pools_for_mint(&m);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, p1);
     }
 }
