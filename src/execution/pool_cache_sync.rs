@@ -1161,6 +1161,10 @@ mod tests {
         disc.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
         assert!(apply_pool_cache_update(&cache, &disc));
         assert!(cache.raydium_amm_pool_explicitly_ready(&pool));
+        assert_eq!(
+            cache.raydium_amm_readiness(&pool),
+            Some(DexPoolReadiness::Ready)
+        );
 
         let mut bal = PoolCacheUpdate::new_balance_updated(
             "test",
@@ -1189,6 +1193,10 @@ mod tests {
         assert!(
             cache.raydium_amm_pool_explicitly_ready(&pool),
             "merge must not downgrade Ready to Observed for Raydium AMM"
+        );
+        assert_eq!(
+            cache.raydium_amm_readiness(&pool),
+            Some(DexPoolReadiness::Ready)
         );
     }
 }

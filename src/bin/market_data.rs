@@ -3714,7 +3714,6 @@ async fn run_geyser_loop(
                                 let rpc = Arc::clone(&rpc);
                                 let cache = Arc::clone(&ctx.live_pool_cache);
                                 let market_id = s.market_id;
-                                let slot = account_update.slot;
                                 let run_id_spawn = ctx.run_id.clone();
                                 let nats_spawn = ctx
                                     .nats
@@ -3737,8 +3736,11 @@ async fn run_geyser_loop(
                                                         };
                                                     cache.merge_raydium_amm_pool_readiness(pool_pk, readiness);
                                                     if let Some(ref nats) = nats_spawn {
-                                                        if let Some(CachedPoolState::RaydiumAmm(st)) =
-                                                            cache.get(&pool_pk)
+                                                        if let Some((
+                                                            CachedPoolState::RaydiumAmm(st),
+                                                            pool_slot,
+                                                            _age_ms,
+                                                        )) = cache.get_with_metadata(&pool_pk)
                                                         {
                                                             let mut pool_update =
                                                                 PoolCacheUpdate::new_balance_updated(
@@ -3751,7 +3753,7 @@ async fn run_geyser_loop(
                                                                     st.quote_mint.to_string(),
                                                                     st.coin_reserve.unwrap_or(0),
                                                                     st.pc_reserve.unwrap_or(0),
-                                                                    slot,
+                                                                    pool_slot,
                                                                 );
                                                             let mut meta = std::collections::HashMap::new();
                                                             if st.market_id != Pubkey::default() {
