@@ -113,6 +113,27 @@ fn raydium_cpmm_vaults_for_pool_cache_update(s: &RaydiumCpmmState) -> String {
     format!("{first_vault},{second_vault}")
 }
 
+/// SOL-aware readiness from pool reserves (single source for BalanceUpdated vs PoolDiscovered paths).
+fn raydium_cpmm_readiness_from_cached_state(s: &RaydiumCpmmState) -> DexPoolReadiness {
+    let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+    let r0 = s.reserve_0.unwrap_or(0);
+    let r1 = s.reserve_1.unwrap_or(0);
+    let (base_side_liq, quote_side_liq) = if s.token_1_mint == sol {
+        (r0 > 0, r1 > 0)
+    } else if s.token_0_mint == sol {
+        (r1 > 0, r0 > 0)
+    } else {
+        (r0 > 0, r1 > 0)
+    };
+    if base_side_liq && quote_side_liq {
+        DexPoolReadiness::Ready
+    } else if r0 > 0 || r1 > 0 {
+        DexPoolReadiness::Partial
+    } else {
+        DexPoolReadiness::Observed
+    }
+}
+
 /// Market data configuration (hot-reloadable via NATS)
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -3247,24 +3268,8 @@ async fn run_geyser_loop(
                                                     raydium_cpmm_vaults_for_pool_cache_update(s),
                                                 );
                                                 balance_update.metadata = Some(meta);
-                                                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-                                                let r0 = s.reserve_0.unwrap_or(0);
-                                                let r1 = s.reserve_1.unwrap_or(0);
-                                                let (base_side_liq, quote_side_liq) =
-                                                    if s.token_1_mint == sol {
-                                                        (r0 > 0, r1 > 0)
-                                                    } else if s.token_0_mint == sol {
-                                                        (r1 > 0, r0 > 0)
-                                                    } else {
-                                                        (r0 > 0, r1 > 0)
-                                                    };
-                                                let readiness = if base_side_liq && quote_side_liq {
-                                                    DexPoolReadiness::Ready
-                                                } else if r0 > 0 || r1 > 0 {
-                                                    DexPoolReadiness::Partial
-                                                } else {
-                                                    DexPoolReadiness::Observed
-                                                };
+                                                let readiness =
+                                                    raydium_cpmm_readiness_from_cached_state(s);
                                                 balance_update.set_dex_readiness_in_metadata(readiness);
                                                 ctx.live_pool_cache.merge_raydium_cpmm_pool_readiness(
                                                     vault_info.pool_address,
@@ -3798,23 +3803,7 @@ async fn run_geyser_loop(
                                     raydium_cpmm_vaults_for_pool_cache_update(s),
                                 );
                                 pool_update.metadata = Some(meta);
-                                let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-                                let r0 = s.reserve_0.unwrap_or(0);
-                                let r1 = s.reserve_1.unwrap_or(0);
-                                let (base_side_liq, quote_side_liq) = if s.token_1_mint == sol {
-                                    (r0 > 0, r1 > 0)
-                                } else if s.token_0_mint == sol {
-                                    (r1 > 0, r0 > 0)
-                                } else {
-                                    (r0 > 0, r1 > 0)
-                                };
-                                let readiness = if base_side_liq && quote_side_liq {
-                                    DexPoolReadiness::Ready
-                                } else if r0 > 0 || r1 > 0 {
-                                    DexPoolReadiness::Partial
-                                } else {
-                                    DexPoolReadiness::Observed
-                                };
+                                let readiness = raydium_cpmm_readiness_from_cached_state(s);
                                 pool_update.set_dex_readiness_in_metadata(readiness);
                                 ctx.live_pool_cache.merge_raydium_cpmm_pool_readiness(
                                     account_update.pubkey,
