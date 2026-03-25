@@ -318,6 +318,12 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         update.effective_dex_readiness(),
                     );
                 }
+                if update.dex == "raydium" {
+                    cache.merge_raydium_amm_pool_readiness(
+                        pool_addr,
+                        update.effective_dex_readiness(),
+                    );
+                }
                 if update.dex == "pumpfun" {
                     cache.merge_pumpfun_bonding_readiness(
                         pool_addr,
@@ -434,6 +440,34 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         }
                     }
                 }
+                // BalanceUpdated often omits metadata: preserve Serum static accounts + vault pubkeys
+                // from existing Raydium AMM state so SLAVE readiness does not spuriously downgrade.
+                if update.dex == "raydium" {
+                    if let CachedPoolState::RaydiumAmm(ref mut new_am) = minimal_state {
+                        if let Some(CachedPoolState::RaydiumAmm(ex)) = existing.as_ref() {
+                            if new_am.market_id == Pubkey::default()
+                                && ex.market_id != Pubkey::default()
+                            {
+                                new_am.market_id = ex.market_id;
+                            }
+                            if new_am.serum_bids.is_none() {
+                                new_am.serum_bids = ex.serum_bids;
+                            }
+                            if new_am.serum_asks.is_none() {
+                                new_am.serum_asks = ex.serum_asks;
+                            }
+                            if new_am.serum_event_queue.is_none() {
+                                new_am.serum_event_queue = ex.serum_event_queue;
+                            }
+                            if new_am.coin_vault == Pubkey::default() {
+                                new_am.coin_vault = ex.coin_vault;
+                            }
+                            if new_am.pc_vault == Pubkey::default() {
+                                new_am.pc_vault = ex.pc_vault;
+                            }
+                        }
+                    }
+                }
                 cache.upsert(addr, minimal_state, update.geyser_slot);
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_pool_accounts_readiness(
@@ -443,6 +477,9 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 }
                 if update.dex == "raydium_cpmm" {
                     cache.merge_raydium_cpmm_pool_readiness(addr, update.effective_dex_readiness());
+                }
+                if update.dex == "raydium" {
+                    cache.merge_raydium_amm_pool_readiness(addr, update.effective_dex_readiness());
                 }
                 if update.dex == "pumpfun" {
                     cache.merge_pumpfun_bonding_readiness(addr, update.effective_dex_readiness());
@@ -1085,6 +1122,81 @@ mod tests {
         assert!(
             cache.raydium_cpmm_pool_explicitly_ready(&pool),
             "merge must not downgrade Ready to Observed for Raydium CPMM"
+        );
+    }
+
+    /// BalanceUpdated for `raydium` omits metadata: SLAVE must keep Serum static accounts from
+    /// existing state so readiness does not spuriously downgrade.
+    #[test]
+    fn test_raydium_amm_balance_updated_preserves_serum_and_merges_readiness() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let market_id = Pubkey::new_unique();
+        let bids = Pubkey::new_unique();
+        let asks = Pubkey::new_unique();
+        let eq = Pubkey::new_unique();
+
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("market_id".to_string(), market_id.to_string());
+        meta.insert("serum_bids".to_string(), bids.to_string());
+        meta.insert("serum_asks".to_string(), asks.to_string());
+        meta.insert("serum_event_queue".to_string(), eq.to_string());
+
+        let mut disc = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "raydium".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1_000_000,
+            50_000_000_000,
+            None,
+            1,
+        );
+        disc.metadata = Some(meta);
+        disc.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        assert!(apply_pool_cache_update(&cache, &disc));
+        assert!(cache.raydium_amm_pool_explicitly_ready(&pool));
+        assert_eq!(
+            cache.raydium_amm_readiness(&pool),
+            Some(DexPoolReadiness::Ready)
+        );
+
+        let mut bal = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "raydium".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            2_000_000,
+            60_000_000_000,
+            2,
+        );
+        bal.set_dex_readiness_in_metadata(DexPoolReadiness::Observed);
+        assert!(apply_pool_cache_update(&cache, &bal));
+
+        match cache.get(&pool).expect("pool in cache") {
+            CachedPoolState::RaydiumAmm(s) => {
+                assert_eq!(s.market_id, market_id);
+                assert_eq!(s.serum_bids, Some(bids));
+                assert_eq!(s.serum_asks, Some(asks));
+                assert_eq!(s.serum_event_queue, Some(eq));
+            }
+            other => panic!("expected RaydiumAmm, got {:?}", other),
+        }
+        assert!(
+            cache.raydium_amm_pool_explicitly_ready(&pool),
+            "merge must not downgrade Ready to Observed for Raydium AMM"
+        );
+        assert_eq!(
+            cache.raydium_amm_readiness(&pool),
+            Some(DexPoolReadiness::Ready)
         );
     }
 }

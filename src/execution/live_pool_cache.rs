@@ -113,6 +113,32 @@ pub struct RaydiumAmmState {
     pub serum_event_queue: Option<Pubkey>,
 }
 
+/// JetStream / MASTER [`DexPoolReadiness`] for Raydium AMM v4 (conservative, explicit).
+///
+/// `Ready` only when the static Serum/OpenBook accounts required for swap building are present
+/// (`market_id`, bids, asks, event queue from Geyser parse or one-time cold-path fill) **and**
+/// both vault reserves are known and non-zero (matches [`crate::execution::quote_calculator`] needs).
+///
+/// Reserves alone never imply `Ready` (swap path still needs Serum accounts — see `RaydiumSwapAccounts`).
+#[must_use]
+pub fn raydium_amm_readiness_for_pool_cache_update(s: &RaydiumAmmState) -> DexPoolReadiness {
+    let static_ok = s.market_id != Pubkey::default()
+        && s.serum_bids.is_some()
+        && s.serum_asks.is_some()
+        && s.serum_event_queue.is_some();
+    let r_coin = s.coin_reserve.unwrap_or(0);
+    let r_pc = s.pc_reserve.unwrap_or(0);
+    // `coin_reserve` / `pc_reserve` are the two pool legs; both must be non-zero for a usable
+    // constant-product quote (same idea as Raydium CPMM non-SOL pair).
+    if static_ok && r_coin > 0 && r_pc > 0 {
+        DexPoolReadiness::Ready
+    } else if r_coin > 0 || r_pc > 0 {
+        DexPoolReadiness::Partial
+    } else {
+        DexPoolReadiness::Observed
+    }
+}
+
 /// Raydium CPMM cached state
 #[derive(Debug, Clone)]
 pub struct RaydiumCpmmState {
@@ -317,6 +343,9 @@ pub struct LivePoolCache {
 
     /// Raydium CPMM pool address → explicit [`DexPoolReadiness`] from JetStream / MASTER (Bug #36).
     raydium_cpmm_readiness_by_pool: DashMap<Pubkey, DexPoolReadiness>,
+
+    /// Raydium AMM v4 pool address → explicit [`DexPoolReadiness`] from JetStream / MASTER (Bug #36).
+    raydium_amm_readiness_by_pool: DashMap<Pubkey, DexPoolReadiness>,
 }
 
 /// Which vault position (A/B or X/Y or 0/1) this vault represents
@@ -349,6 +378,7 @@ impl LivePoolCache {
             pool_accounts_readiness_by_market: DashMap::new(),
             pumpfun_bonding_readiness_by_curve: DashMap::new(),
             raydium_cpmm_readiness_by_pool: DashMap::new(),
+            raydium_amm_readiness_by_pool: DashMap::new(),
         }
     }
 
@@ -926,6 +956,14 @@ impl LivePoolCache {
             .or_insert(incoming);
     }
 
+    /// Merge Raydium AMM v4 pool readiness for `pool` (monotonic — never downgrade).
+    pub fn merge_raydium_amm_pool_readiness(&self, pool: Pubkey, incoming: DexPoolReadiness) {
+        self.raydium_amm_readiness_by_pool
+            .entry(pool)
+            .and_modify(|stored| *stored = stored.merge(incoming))
+            .or_insert(incoming);
+    }
+
     /// `true` only when JetStream merge recorded [`DexPoolReadiness::Ready`] for this Raydium CPMM pool.
     #[must_use]
     pub fn raydium_cpmm_pool_explicitly_ready(&self, pool: &Pubkey) -> bool {
@@ -941,6 +979,21 @@ impl LivePoolCache {
         self.raydium_cpmm_readiness_by_pool.get(pool).map(|r| *r)
     }
 
+    /// `true` only when JetStream merge recorded [`DexPoolReadiness::Ready`] for this Raydium AMM pool.
+    #[must_use]
+    pub fn raydium_amm_pool_explicitly_ready(&self, pool: &Pubkey) -> bool {
+        self.raydium_amm_readiness_by_pool
+            .get(pool)
+            .map(|r| *r == DexPoolReadiness::Ready)
+            .unwrap_or(false)
+    }
+
+    /// Monotonic merge result for this Raydium AMM pool (tests / diagnostics).
+    #[must_use]
+    pub fn raydium_amm_readiness(&self, pool: &Pubkey) -> Option<DexPoolReadiness> {
+        self.raydium_amm_readiness_by_pool.get(pool).map(|r| *r)
+    }
+
     /// Mint-level helper: Raydium CPMM slice — explicit `Ready` only (no cache-hit heuristic).
     #[must_use]
     pub fn base_mint_has_explicit_raydium_cpmm_ready_pool(&self, base_mint: &Pubkey) -> bool {
@@ -951,6 +1004,23 @@ impl LivePoolCache {
                 }
                 let pool = entry.key();
                 if self.raydium_cpmm_pool_explicitly_ready(pool) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Mint-level helper: Raydium AMM v4 slice — explicit `Ready` only (no cache-hit heuristic).
+    #[must_use]
+    pub fn base_mint_has_explicit_raydium_amm_ready_pool(&self, base_mint: &Pubkey) -> bool {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::RaydiumAmm(s) = &entry.value().state {
+                if s.base_mint != *base_mint && s.quote_mint != *base_mint {
+                    continue;
+                }
+                let pool = entry.key();
+                if self.raydium_amm_pool_explicitly_ready(pool) {
                     return true;
                 }
             }
@@ -1088,15 +1158,20 @@ impl LivePoolCache {
     ///   bonding-curve account for a cached [`PumpFunState`] whose `token_mint` equals `base_mint`.
     /// - Raydium CPMM: [`Self::base_mint_has_explicit_raydium_cpmm_ready_pool`] — explicit
     ///   [`DexPoolReadiness::Ready`] in [`Self::raydium_cpmm_readiness_by_pool`] only.
+    /// - Raydium AMM v4: [`Self::base_mint_has_explicit_raydium_amm_ready_pool`] — explicit
+    ///   [`DexPoolReadiness::Ready`] in [`Self::raydium_amm_readiness_by_pool`] only.
     ///
-    /// **Conservative:** Orca, Meteora, Raydium AMM v4, etc. are **not** treated as ready here
-    /// until they have an explicit readiness path.
+    /// **Conservative:** Orca, Meteora, etc. are **not** treated as ready here until they have an
+    /// explicit readiness path.
     #[must_use]
     pub fn base_mint_has_any_ready_pool(&self, base_mint: &Pubkey) -> bool {
         if self.base_mint_has_explicit_pump_amm_ready_pool(base_mint) {
             return true;
         }
         if self.base_mint_has_explicit_raydium_cpmm_ready_pool(base_mint) {
+            return true;
+        }
+        if self.base_mint_has_explicit_raydium_amm_ready_pool(base_mint) {
             return true;
         }
         for entry in self.pools.iter() {
@@ -1392,6 +1467,7 @@ pub fn create_shared_cache() -> SharedLivePoolCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_cache_basic_operations() {
@@ -2286,6 +2362,113 @@ mod tests {
         );
 
         assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_raydium_amm_readiness_helper_reserves_only_is_partial() {
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let s = RaydiumAmmState {
+            base_mint: base,
+            quote_mint: quote,
+            coin_vault: Pubkey::new_unique(),
+            pc_vault: Pubkey::new_unique(),
+            base_decimals: 9,
+            quote_decimals: 9,
+            coin_reserve: Some(100),
+            pc_reserve: Some(200),
+            market_id: Pubkey::new_unique(),
+            serum_bids: None,
+            serum_asks: None,
+            serum_event_queue: None,
+        };
+        assert_eq!(
+            raydium_amm_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Partial
+        );
+    }
+
+    #[test]
+    fn test_raydium_amm_readiness_helper_ready_when_static_and_both_sides_liquid() {
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let s = RaydiumAmmState {
+            base_mint: base,
+            quote_mint: quote,
+            coin_vault: Pubkey::new_unique(),
+            pc_vault: Pubkey::new_unique(),
+            base_decimals: 9,
+            quote_decimals: 9,
+            coin_reserve: Some(100),
+            pc_reserve: Some(200),
+            market_id: Pubkey::new_unique(),
+            serum_bids: Some(Pubkey::new_unique()),
+            serum_asks: Some(Pubkey::new_unique()),
+            serum_event_queue: Some(Pubkey::new_unique()),
+        };
+        assert_eq!(
+            raydium_amm_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_raydium_amm_explicit_ready() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint,
+                quote_mint,
+                coin_vault: Pubkey::new_unique(),
+                pc_vault: Pubkey::new_unique(),
+                base_decimals: 9,
+                quote_decimals: 9,
+                coin_reserve: Some(1),
+                pc_reserve: Some(2),
+                market_id: Pubkey::new_unique(),
+                serum_bids: Some(Pubkey::new_unique()),
+                serum_asks: Some(Pubkey::new_unique()),
+                serum_event_queue: Some(Pubkey::new_unique()),
+            }),
+            100,
+        );
+        cache.merge_raydium_amm_pool_readiness(pool, DexPoolReadiness::Ready);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+        assert!(cache.base_mint_has_explicit_raydium_amm_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_raydium_amm_readiness_merge_monotone() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint,
+                quote_mint,
+                coin_vault: Pubkey::new_unique(),
+                pc_vault: Pubkey::new_unique(),
+                base_decimals: 9,
+                quote_decimals: 9,
+                coin_reserve: Some(1),
+                pc_reserve: Some(2),
+                market_id: Pubkey::new_unique(),
+                serum_bids: Some(Pubkey::new_unique()),
+                serum_asks: Some(Pubkey::new_unique()),
+                serum_event_queue: Some(Pubkey::new_unique()),
+            }),
+            100,
+        );
+        cache.merge_raydium_amm_pool_readiness(pool, DexPoolReadiness::Ready);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+        cache.merge_raydium_amm_pool_readiness(pool, DexPoolReadiness::Observed);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
     }
 
     #[test]
