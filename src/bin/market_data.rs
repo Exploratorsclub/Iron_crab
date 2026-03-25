@@ -302,6 +302,10 @@ const WALLET_BOOTSTRAP_DEX_VERIFY_GRACE_MS: u64 = 400;
 /// Max wallet-held mints to run PumpSwap/PumpFun bootstrap verification for per startup (deduped).
 const WALLET_BOOTSTRAP_DEX_VERIFY_MAX_MINTS: usize = 8;
 
+/// Wallet bootstrap PumpFun step: must use `force_refresh` so `handle_ensure_pumpfun_bonding_curve`
+/// does not early-return on `CachedPoolState::PumpFun` without explicit Ready (merge + JetStream).
+const WALLET_BOOTSTRAP_ENSURE_PUMPFUN_FORCE_REFRESH: bool = true;
+
 /// Associated Token Program ID
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 
@@ -638,7 +642,7 @@ async fn run_bounded_wallet_dex_bootstrap_verify(
             run_id,
             &request_id_pf,
             &base_mint_str,
-            false,
+            WALLET_BOOTSTRAP_ENSURE_PUMPFUN_FORCE_REFRESH,
         )
         .await;
     }
@@ -5157,5 +5161,40 @@ mod discovery_tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], a);
         assert_eq!(out[1], b);
+    }
+
+    /// Regression (PR #47 follow-up): Geyser may leave `PumpFun` in cache without explicit Ready.
+    /// `handle_ensure_pumpfun_bonding_curve(..., force_refresh=false)` then returns early ("cache hit")
+    /// and never runs merge + JetStream. Wallet bootstrap must pass `WALLET_BOOTSTRAP_ENSURE_PUMPFUN_FORCE_REFRESH`
+    /// (true) into that handler so the promotion path runs.
+    #[test]
+    fn test_bootstrap_verify_pumpfun_cached_without_explicit_ready_scenario() {
+        let cache = LivePoolCache::new();
+        let base_mint = Pubkey::new_unique();
+        let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(&base_mint);
+        cache.upsert(
+            bonding_curve,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: base_mint,
+                bonding_curve,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_000_000_000_000_000,
+                real_sol_reserves: 0,
+                real_token_reserves: 793_100_000_000_000,
+                complete: false,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: false,
+            }),
+            100,
+        );
+        assert!(
+            !cache.base_mint_has_any_ready_pool(&base_mint),
+            "candidate mint: cached PumpFun without explicit Ready merge"
+        );
+        assert!(
+            !cache.pumpfun_bonding_curve_explicitly_ready(&bonding_curve),
+            "explicit Ready must be absent for this regression scenario"
+        );
     }
 }
