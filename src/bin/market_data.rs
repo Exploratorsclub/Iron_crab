@@ -295,6 +295,17 @@ struct TrackedWallet {
 /// WSOL Mint address constant
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
+/// Scope-8: After `WalletSnapshotComplete`, wait briefly for in-flight Geyser merges before
+/// cold-path RPC verification for wallet-only mints without explicit Ready (bounded).
+const WALLET_BOOTSTRAP_DEX_VERIFY_GRACE_MS: u64 = 400;
+
+/// Max wallet-held mints to run PumpSwap/PumpFun bootstrap verification for per startup (deduped).
+const WALLET_BOOTSTRAP_DEX_VERIFY_MAX_MINTS: usize = 8;
+
+/// Wallet bootstrap PumpFun step: must use `force_refresh` so `handle_ensure_pumpfun_bonding_curve`
+/// does not early-return on `CachedPoolState::PumpFun` without explicit Ready (merge + JetStream).
+const WALLET_BOOTSTRAP_ENSURE_PUMPFUN_FORCE_REFRESH: bool = true;
+
 /// Associated Token Program ID
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 
@@ -527,6 +538,116 @@ fn try_parse_token_account_balance(data: &[u8]) -> Option<u64> {
     }
 }
 
+/// Wallet `mints_in_wallet` are non-zero balances from bootstrap RPC; pick at most `max_mints`
+/// unique pubkeys that still lack explicit PumpSwap/PumpFun Ready per
+/// [`LivePoolCache::base_mint_has_any_ready_pool`]. Preserves iteration order; skips WSOL.
+fn wallet_mints_needing_dex_bootstrap_verify(
+    cache: &LivePoolCache,
+    mints_in_wallet: &[String],
+    wsol_mint_str: &str,
+    max_mints: usize,
+) -> Vec<Pubkey> {
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<Pubkey> = HashSet::new();
+    let mut out: Vec<Pubkey> = Vec::new();
+    for s in mints_in_wallet {
+        if out.len() >= max_mints {
+            break;
+        }
+        if s == wsol_mint_str {
+            continue;
+        }
+        let Ok(pk) = Pubkey::from_str(s) else {
+            continue;
+        };
+        if !seen.insert(pk) {
+            continue;
+        }
+        if cache.base_mint_has_any_ready_pool(&pk) {
+            continue;
+        }
+        out.push(pk);
+    }
+    out
+}
+
+/// Cold-path only: bounded PumpSwap then PumpFun discovery for wallet-relevant mints without
+/// explicit Ready. Reuses [`handle_ensure_pump_amm_pool_accounts`] and
+/// [`handle_ensure_pumpfun_bonding_curve`] (MASTER cache + JetStream). Skips periodic snapshots.
+async fn run_bounded_wallet_dex_bootstrap_verify(
+    ctx: &MarketDataContext,
+    rpc: &Arc<SolanaRpc>,
+    pump_amm_dex: &PumpFunAmmDex,
+    mints_in_wallet: &[String],
+    run_id: &str,
+    is_periodic: bool,
+) {
+    if is_periodic {
+        return;
+    }
+
+    let candidates = wallet_mints_needing_dex_bootstrap_verify(
+        ctx.live_pool_cache.as_ref(),
+        mints_in_wallet,
+        WSOL_MINT,
+        WALLET_BOOTSTRAP_DEX_VERIFY_MAX_MINTS,
+    );
+    if candidates.is_empty() {
+        return;
+    }
+
+    info!(
+        count = candidates.len(),
+        grace_ms = WALLET_BOOTSTRAP_DEX_VERIFY_GRACE_MS,
+        max_mints = WALLET_BOOTSTRAP_DEX_VERIFY_MAX_MINTS,
+        "Wallet bootstrap: bounded DEX readiness verification (PumpSwap EnsurePumpAmmPoolAccounts, then PumpFun EnsurePumpfunBondingCurve if still not ready)"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(
+        WALLET_BOOTSTRAP_DEX_VERIFY_GRACE_MS,
+    ))
+    .await;
+
+    for pk in candidates {
+        if ctx.live_pool_cache.base_mint_has_any_ready_pool(&pk) {
+            debug!(
+                mint = %pk,
+                "Wallet bootstrap DEX verify: explicit Ready after grace period, skip RPC"
+            );
+            continue;
+        }
+
+        let base_mint_str = pk.to_string();
+        let request_id = format!("wallet_bootstrap_pamm_{}", Uuid::new_v4());
+        handle_ensure_pump_amm_pool_accounts(
+            ctx,
+            pump_amm_dex,
+            run_id,
+            &request_id,
+            &base_mint_str,
+            None,
+            false,
+        )
+        .await;
+
+        if ctx.live_pool_cache.base_mint_has_any_ready_pool(&pk) {
+            continue;
+        }
+
+        let request_id_pf = format!("wallet_bootstrap_pfun_{}", Uuid::new_v4());
+        handle_ensure_pumpfun_bonding_curve(
+            ctx,
+            rpc,
+            run_id,
+            &request_id_pf,
+            &base_mint_str,
+            WALLET_BOOTSTRAP_ENSURE_PUMPFUN_FORCE_REFRESH,
+        )
+        .await;
+    }
+}
+
 /// Publish wallet token balance snapshot for position reconciliation.
 ///
 /// Called at market-data startup to provide momentum-bot with current wallet state.
@@ -545,7 +666,8 @@ fn try_parse_token_account_balance(data: &[u8]) -> Option<u64> {
 /// No RPC calls are made in the runtime hot-path.
 async fn publish_wallet_snapshot(
     ctx: &MarketDataContext,
-    rpc: &SolanaRpc,
+    rpc: &Arc<SolanaRpc>,
+    pump_amm_dex: &PumpFunAmmDex,
     wallet: &Pubkey,
     is_periodic: bool,
 ) -> Result<()> {
@@ -1174,6 +1296,18 @@ async fn publish_wallet_snapshot(
     if let Err(e) = ctx.jsonl_writer.write(&complete_event) {
         warn!(error = %e, "Failed to write WalletSnapshotComplete (bootstrap) to JSONL");
     }
+
+    // 4a) Bounded cold-path verification for wallet non-zero mints without explicit Ready
+    // (PumpSwap then PumpFun); reuses I-24d handlers — no hot-path RPC.
+    run_bounded_wallet_dex_bootstrap_verify(
+        ctx,
+        rpc,
+        pump_amm_dex,
+        &mints_in_wallet,
+        &ctx.run_id,
+        is_periodic,
+    )
+    .await;
 
     // 4b) Cold-path inventory: count wallet-held mints where LivePoolCache reports explicit
     // readiness only — PumpSwap: merge_pump_amm_pool_accounts_readiness(Ready); PumpFun:
@@ -2222,6 +2356,13 @@ async fn run_geyser_loop(
     let rpc = Arc::new(SolanaRpc::new(&rpc_url));
     info!(rpc_url = %rpc_url, "Initialized RPC client for metadata/fallback");
 
+    // Shared PumpFunAmmDex for wallet bootstrap verification and ControlRequest discovery (dedupe).
+    let pump_amm_dex = Arc::new(PumpFunAmmDex::new_with_cache(
+        Arc::clone(&rpc),
+        ctx.live_pool_cache.clone(),
+        true, // allow_rpc_on_miss: Cold Path Discovery
+    ));
+
     // === P0: Wallet Balance Snapshot (Position Reconciliation) ===
     // Bootstrap wallet state at startup (max 1 RPC roundtrip) using known mints from JetStream.
     //
@@ -2232,7 +2373,10 @@ async fn run_geyser_loop(
     {
         if let Ok(wallet_pubkey) = Pubkey::from_str(&wallet_pubkey_str) {
             info!(wallet = %wallet_pubkey, "📸 Publishing wallet balance snapshot for position reconciliation");
-            if let Err(e) = publish_wallet_snapshot(&ctx, &rpc, &wallet_pubkey, false).await {
+            if let Err(e) =
+                publish_wallet_snapshot(&ctx, &rpc, pump_amm_dex.as_ref(), &wallet_pubkey, false)
+                    .await
+            {
                 warn!(error = %e, "Failed to publish wallet snapshot (continuing anyway)");
             }
             Some(wallet_pubkey)
@@ -2395,13 +2539,6 @@ async fn run_geyser_loop(
     } else {
         None
     };
-
-    // Shared PumpFunAmmDex for Discovery (dedupe/storm protection: one instance, internal cache).
-    let pump_amm_dex = Arc::new(PumpFunAmmDex::new_with_cache(
-        rpc.clone(),
-        ctx.live_pool_cache.clone(),
-        true, // allow_rpc_on_miss: Cold Path Discovery
-    ));
 
     loop {
         tokio::select! {
@@ -4975,6 +5112,89 @@ mod discovery_tests {
         assert_eq!(
             discovery_response_status_for_jetstream(false),
             ControlResponseStatus::Error
+        );
+    }
+
+    #[test]
+    fn test_wallet_mints_needing_dex_bootstrap_verify_skips_ready_and_wsol() {
+        let cache = LivePoolCache::new();
+        let wsol = WSOL_MINT;
+        let ready_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let quote = Pubkey::new_unique();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: ready_mint,
+                quote_mint: quote,
+                pool_base_token_account: accounts[4],
+                pool_quote_token_account: accounts[5],
+                base_reserve: Some(1),
+                quote_reserve: Some(1),
+                pool_accounts: accounts.clone(),
+                creator: None,
+            }),
+            0,
+        );
+        cache.merge_pump_amm_pool_accounts_readiness(pool, DexPoolReadiness::Ready);
+
+        let need = Pubkey::new_unique();
+        let mints = vec![
+            wsol.to_string(),
+            need.to_string(),
+            ready_mint.to_string(),
+            need.to_string(),
+        ];
+        let out = wallet_mints_needing_dex_bootstrap_verify(&cache, &mints, wsol, 8);
+        assert_eq!(out, vec![need]);
+    }
+
+    #[test]
+    fn test_wallet_mints_needing_dex_bootstrap_verify_respects_cap() {
+        let cache = LivePoolCache::new();
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let c = Pubkey::new_unique();
+        let mints = vec![a.to_string(), b.to_string(), c.to_string()];
+        let out = wallet_mints_needing_dex_bootstrap_verify(&cache, &mints, WSOL_MINT, 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], a);
+        assert_eq!(out[1], b);
+    }
+
+    /// Regression (PR #47 follow-up): Geyser may leave `PumpFun` in cache without explicit Ready.
+    /// `handle_ensure_pumpfun_bonding_curve(..., force_refresh=false)` then returns early ("cache hit")
+    /// and never runs merge + JetStream. Wallet bootstrap must pass `WALLET_BOOTSTRAP_ENSURE_PUMPFUN_FORCE_REFRESH`
+    /// (true) into that handler so the promotion path runs.
+    #[test]
+    fn test_bootstrap_verify_pumpfun_cached_without_explicit_ready_scenario() {
+        let cache = LivePoolCache::new();
+        let base_mint = Pubkey::new_unique();
+        let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(&base_mint);
+        cache.upsert(
+            bonding_curve,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: base_mint,
+                bonding_curve,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_000_000_000_000_000,
+                real_sol_reserves: 0,
+                real_token_reserves: 793_100_000_000_000,
+                complete: false,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: false,
+            }),
+            100,
+        );
+        assert!(
+            !cache.base_mint_has_any_ready_pool(&base_mint),
+            "candidate mint: cached PumpFun without explicit Ready merge"
+        );
+        assert!(
+            !cache.pumpfun_bonding_curve_explicitly_ready(&bonding_curve),
+            "explicit Ready must be absent for this regression scenario"
         );
     }
 }
