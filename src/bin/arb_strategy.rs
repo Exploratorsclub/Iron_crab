@@ -1559,6 +1559,13 @@ impl ArbContext {
 // Intent Generation
 // ============================================================================
 
+/// PumpSwap (`pump_amm`) needs the full verified 14-account static set from
+/// `DexPoolAccounts` (market-data verification). Partial or observation-only
+/// cache rows must not produce swap intents.
+fn pump_amm_pool_accounts_valid_for_swap(pool_address: &str, accounts: &[String]) -> bool {
+    accounts.len() == 14 && accounts.first().map(|s| s.as_str()) == Some(pool_address)
+}
+
 /// Creates an arb intent from the opportunity.
 /// Returns None if required DexPoolAccounts are missing for ANY pool.
 ///
@@ -1567,6 +1574,8 @@ impl ArbContext {
 /// - DexPoolAccounts must be available for BOTH buy and sell pools
 /// - If Geyser hasn't delivered the data, RPC won't have it either (same validator)
 /// - Missing data = REJECT intent, don't try RPC fallback
+/// - For PumpSwap (`pump_amm`), cached accounts must be the full verified 14-account
+///   set matching `pool_address` (not merely "some" accounts from observation).
 fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeIntent> {
     let config = ctx.config.read();
 
@@ -1602,6 +1611,31 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     // Both pools have accounts - safe to proceed
     let buy_accts = buy_accounts.unwrap();
     let sell_accts = sell_accounts.unwrap();
+
+    if opp.buy_dex == "pump_amm"
+        && !pump_amm_pool_accounts_valid_for_swap(&opp.buy_pool, &buy_accts)
+    {
+        debug!(
+            buy_pool = %opp.buy_pool,
+            mint = %opp.base_mint,
+            buy_accounts_len = buy_accts.len(),
+            "Rejecting arb: buy pool has incomplete PumpSwap DexPoolAccounts (need 14 + accounts[0]==pool)"
+        );
+        ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    if opp.sell_dex == "pump_amm"
+        && !pump_amm_pool_accounts_valid_for_swap(&opp.sell_pool, &sell_accts)
+    {
+        debug!(
+            sell_pool = %opp.sell_pool,
+            mint = %opp.base_mint,
+            sell_accounts_len = sell_accts.len(),
+            "Rejecting arb: sell pool has incomplete PumpSwap DexPoolAccounts (need 14 + accounts[0]==pool)"
+        );
+        ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
 
     // Combine accounts: buy pool accounts + sell pool accounts
     // Format: buy accounts are prefixed with "buy:" and sell with "sell:" for disambiguation
@@ -2577,5 +2611,28 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
         }
 
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod pump_amm_strategy_tests {
+    use super::pump_amm_pool_accounts_valid_for_swap;
+
+    #[test]
+    fn pump_amm_requires_14_accounts_with_pool_as_first() {
+        let pool = "PoolPubkey1111111111111111111111111111111111";
+        let mut ok: Vec<String> = (0..14).map(|i| format!("A{i}")).collect();
+        ok[0] = pool.to_string();
+        assert!(pump_amm_pool_accounts_valid_for_swap(pool, &ok));
+    }
+
+    #[test]
+    fn pump_amm_rejects_short_or_mismatched_accounts() {
+        let pool = "PoolPubkey1111111111111111111111111111111111";
+        let short: Vec<String> = (0..5).map(|i| format!("A{i}")).collect();
+        assert!(!pump_amm_pool_accounts_valid_for_swap(pool, &short));
+
+        let wrong_first: Vec<String> = (0..14).map(|i| format!("A{i}")).collect();
+        assert!(!pump_amm_pool_accounts_valid_for_swap(pool, &wrong_first));
     }
 }
