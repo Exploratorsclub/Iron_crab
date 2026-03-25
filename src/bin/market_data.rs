@@ -113,8 +113,8 @@ fn raydium_cpmm_vaults_for_pool_cache_update(s: &RaydiumCpmmState) -> String {
     format!("{first_vault},{second_vault}")
 }
 
-/// SOL-aware readiness from pool reserves (single source for BalanceUpdated vs PoolDiscovered paths).
-fn raydium_cpmm_readiness_from_cached_state(s: &RaydiumCpmmState) -> DexPoolReadiness {
+/// JetStream readiness for Raydium CPMM (SOL-aware base/quote): single source for BalanceUpdated and PoolDiscovered.
+fn raydium_cpmm_readiness_for_pool_cache_update(s: &RaydiumCpmmState) -> DexPoolReadiness {
     let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
     let r0 = s.reserve_0.unwrap_or(0);
     let r1 = s.reserve_1.unwrap_or(0);
@@ -3269,7 +3269,7 @@ async fn run_geyser_loop(
                                                 );
                                                 balance_update.metadata = Some(meta);
                                                 let readiness =
-                                                    raydium_cpmm_readiness_from_cached_state(s);
+                                                    raydium_cpmm_readiness_for_pool_cache_update(s);
                                                 balance_update.set_dex_readiness_in_metadata(readiness);
                                                 ctx.live_pool_cache.merge_raydium_cpmm_pool_readiness(
                                                     vault_info.pool_address,
@@ -3803,7 +3803,7 @@ async fn run_geyser_loop(
                                     raydium_cpmm_vaults_for_pool_cache_update(s),
                                 );
                                 pool_update.metadata = Some(meta);
-                                let readiness = raydium_cpmm_readiness_from_cached_state(s);
+                                let readiness = raydium_cpmm_readiness_for_pool_cache_update(s);
                                 pool_update.set_dex_readiness_in_metadata(readiness);
                                 ctx.live_pool_cache.merge_raydium_cpmm_pool_readiness(
                                     account_update.pubkey,
@@ -5342,6 +5342,78 @@ mod discovery_tests {
         assert!(
             !cache.pumpfun_bonding_curve_explicitly_ready(&bonding_curve),
             "explicit Ready must be absent for this regression scenario"
+        );
+    }
+
+    #[test]
+    fn test_raydium_cpmm_readiness_helper_sol_quote_both_sides() {
+        let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let base = Pubkey::new_unique();
+        let s = RaydiumCpmmState {
+            token_0_mint: base,
+            token_1_mint: sol,
+            token_0_vault: Pubkey::default(),
+            token_1_vault: Pubkey::default(),
+            reserve_0: Some(100),
+            reserve_1: Some(200),
+        };
+        assert_eq!(
+            raydium_cpmm_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn test_raydium_cpmm_readiness_helper_sol_as_token_0_one_side_only_partial() {
+        let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let base = Pubkey::new_unique();
+        let s = RaydiumCpmmState {
+            token_0_mint: sol,
+            token_1_mint: base,
+            token_0_vault: Pubkey::default(),
+            token_1_vault: Pubkey::default(),
+            reserve_0: Some(50),
+            reserve_1: Some(0),
+        };
+        assert_eq!(
+            raydium_cpmm_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Partial
+        );
+    }
+
+    #[test]
+    fn test_raydium_cpmm_readiness_helper_non_sol_pair_both_sides_ready() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let s = RaydiumCpmmState {
+            token_0_mint: a,
+            token_1_mint: b,
+            token_0_vault: Pubkey::default(),
+            token_1_vault: Pubkey::default(),
+            reserve_0: Some(1),
+            reserve_1: Some(2),
+        };
+        assert_eq!(
+            raydium_cpmm_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn test_raydium_cpmm_readiness_helper_observed_when_zero_reserves() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let s = RaydiumCpmmState {
+            token_0_mint: a,
+            token_1_mint: b,
+            token_0_vault: Pubkey::default(),
+            token_1_vault: Pubkey::default(),
+            reserve_0: Some(0),
+            reserve_1: Some(0),
+        };
+        assert_eq!(
+            raydium_cpmm_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Observed
         );
     }
 }
