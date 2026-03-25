@@ -950,6 +950,15 @@ impl LivePoolCache {
             .unwrap_or(false)
     }
 
+    /// Execution-engine / TX-building: PumpSwap `pool_accounts` usable only when explicitly
+    /// effectively Ready (see [`Self::get_ready_pump_amm_pool_accounts_by_base_mint`]) and
+    /// the v1 account list is complete (≥14). Bug #36: a non-empty cache hit is not `ready`.
+    pub fn pump_amm_swap_accounts_ready_by_base_mint(&self, base_mint: &Pubkey) -> bool {
+        self.get_ready_pump_amm_pool_accounts_by_base_mint(base_mint)
+            .map(|a| a.len() >= 14)
+            .unwrap_or(false)
+    }
+
     // ========================================================================
     // Stats
     // ========================================================================
@@ -1710,6 +1719,35 @@ mod tests {
                 .is_none(),
             "explicit Partial must not be upgraded to Ready by legacy heuristic"
         );
+        assert!(
+            !cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint),
+            "execution-engine gate: Partial must not count as swap-ready pool_accounts"
+        );
+    }
+
+    #[test]
+    fn test_pump_amm_swap_accounts_ready_matches_get_ready_gate() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts.clone(),
+            ),
+            100,
+        );
+        assert!(cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint));
+
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Observed);
+        assert!(!cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint));
     }
 
     #[test]

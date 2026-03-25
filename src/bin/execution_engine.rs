@@ -1486,11 +1486,15 @@ enum DiscoveryRequestOutcome {
     Timeout,
 }
 
-/// I-24d: Bounded wait until PumpSwap AMM is quote-ready in SLAVE cache (JetStream path).
+/// I-24d: Bounded wait until PumpSwap AMM is usable for quotes **and** swap account lists in SLAVE cache (JetStream path).
 ///
 /// `ControlResponse=Ok` can correlate before `apply_pool_cache_update` exposes non-degenerate
 /// `base_reserve`/`quote_reserve` (Bug #27): `pool_accounts` alone is a weak readiness signal.
-/// Polls until `LivePoolCache::pump_amm_quote_ready_by_base_mint` is true or timeout.
+/// Bug #36: non-empty `pool_accounts` must not be treated as hot-path ready without explicit
+/// [`DexPoolReadiness::Ready`] (or legacy authoritative heuristic inside
+/// [`LivePoolCache::get_ready_pump_amm_pool_accounts_by_base_mint`]).
+/// Polls until both `pump_amm_quote_ready_by_base_mint` and
+/// `pump_amm_swap_accounts_ready_by_base_mint` are true or timeout.
 async fn wait_for_usable_pump_amm_cache_state(
     cache: &LivePoolCache,
     base_mint: &Pubkey,
@@ -1499,7 +1503,9 @@ async fn wait_for_usable_pump_amm_cache_state(
 ) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     while std::time::Instant::now() < deadline {
-        if cache.pump_amm_quote_ready_by_base_mint(base_mint) {
+        if cache.pump_amm_quote_ready_by_base_mint(base_mint)
+            && cache.pump_amm_swap_accounts_ready_by_base_mint(base_mint)
+        {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
@@ -1889,7 +1895,7 @@ impl ExecutionContext {
                 let accounts = match self
                     .live_pool_cache
                     .as_ref()
-                    .and_then(|c| c.get_pump_amm_pool_accounts_by_base_mint(&mint))
+                    .and_then(|c| c.get_ready_pump_amm_pool_accounts_by_base_mint(&mint))
                 {
                     Some(a) if a.len() >= 14 => a,
                     _ => {
@@ -1923,7 +1929,7 @@ impl ExecutionContext {
                                     warn!(mint = %mint_str, "6005-retry: usable PumpAmm cache state not visible after discovery timeout (pool_accounts+reserves)");
                                     return None;
                                 }
-                                match cache.get_pump_amm_pool_accounts_by_base_mint(&mint) {
+                                match cache.get_ready_pump_amm_pool_accounts_by_base_mint(&mint) {
                                     Some(a) if a.len() >= 14 => a,
                                     _ => {
                                         warn!(mint = %mint_str, "6005-retry: pool_accounts still missing after discovery");
@@ -2016,7 +2022,7 @@ impl ExecutionContext {
                                     }
                                 };
                                 let accounts = match cache
-                                    .get_pump_amm_pool_accounts_by_base_mint(&mint)
+                                    .get_ready_pump_amm_pool_accounts_by_base_mint(&mint)
                                 {
                                     Some(a) if a.len() >= 14 => a,
                                     _ => {
@@ -2703,10 +2709,9 @@ impl ExecutionContext {
                             maybe_ping_watchdog();
                             if let Some(pool_id) = q.route.first().cloned() {
                                 // I-24d: Cache-only — no pump_amm.pool_accounts_v1_for_base_mint.
-                                let accounts = ctx
-                                    .live_pool_cache
-                                    .as_ref()
-                                    .and_then(|c| c.get_pump_amm_pool_accounts_by_base_mint(&mint));
+                                let accounts = ctx.live_pool_cache.as_ref().and_then(|c| {
+                                    c.get_ready_pump_amm_pool_accounts_by_base_mint(&mint)
+                                });
                                 match accounts {
                                     Some(accounts) if accounts.len() >= 14 => {
                                         let acct_strings: Vec<String> =
@@ -2727,7 +2732,7 @@ impl ExecutionContext {
                                     _ => {
                                         // I-24d: Request discovery, wait bounded on authoritative cache state.
                                         // pool_id from quote enables fast getAccount path in market-data.
-                                        info!(mint = %mint, pool = %pool_id, "pump_amm quote ok but pool_accounts missing; requesting discovery");
+                                        info!(mint = %mint, pool = %pool_id, "pump_amm quote ok but ready pool_accounts missing; requesting discovery");
                                         match ctx
                                             .request_discovery_and_wait(
                                                 &mint.to_string(),
@@ -2747,7 +2752,7 @@ impl ExecutionContext {
                                                     .await
                                                     {
                                                         let accounts = cache
-                                                            .get_pump_amm_pool_accounts_by_base_mint(&mint);
+                                                            .get_ready_pump_amm_pool_accounts_by_base_mint(&mint);
                                                         if let Some(accounts) = accounts {
                                                             if accounts.len() >= 14 {
                                                                 let acct_strings: Vec<String> =
@@ -2861,7 +2866,7 @@ impl ExecutionContext {
                                                     if let Some(pool_id) = q.route.first().cloned()
                                                     {
                                                         let accounts = cache
-                                                            .get_pump_amm_pool_accounts_by_base_mint(&mint);
+                                                            .get_ready_pump_amm_pool_accounts_by_base_mint(&mint);
                                                         if let Some(accounts) = accounts {
                                                             if accounts.len() >= 14 {
                                                                 let acct_strings: Vec<String> =
