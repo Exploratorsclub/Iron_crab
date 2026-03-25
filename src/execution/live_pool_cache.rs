@@ -935,6 +935,12 @@ impl LivePoolCache {
             .unwrap_or(false)
     }
 
+    /// Monotonic merge result for this pool (tests / diagnostics).
+    #[must_use]
+    pub fn raydium_cpmm_readiness(&self, pool: &Pubkey) -> Option<DexPoolReadiness> {
+        self.raydium_cpmm_readiness_by_pool.get(pool).map(|r| *r)
+    }
+
     /// Mint-level helper: Raydium CPMM slice — explicit `Ready` only (no cache-hit heuristic).
     #[must_use]
     pub fn base_mint_has_explicit_raydium_cpmm_ready_pool(&self, base_mint: &Pubkey) -> bool {
