@@ -1515,17 +1515,32 @@ async fn wait_for_usable_pump_amm_cache_state(
 
 /// After `EnsurePumpfunBondingCurve` + JetStream merge: wait until SLAVE cache reflects a change
 /// vs the pre-request snapshot (or new entry appears).
+///
+/// When `require_explicit_ready` is true (cold-path recovery after RPC refresh), we require both:
+/// - [`LivePoolCache::pumpfun_bonding_curve_explicitly_ready`] (JetStream carried `Ready`), **and**
+/// - a **fresh** bonding-curve snapshot vs `before` (proves this request’s merge, not a stale Ready).
+///
+/// Without the snapshot check, an older `Ready` + unchanged reserves could satisfy the wait
+/// immediately after `ControlResponse::Ok` (Bug #34).
 async fn wait_for_pumpfun_bonding_cache_refresh(
     cache: &LivePoolCache,
     bonding_curve: &Pubkey,
     before: Option<(u64, u64, u64, u64, bool, bool)>,
     timeout_ms: u64,
     poll_interval_ms: u64,
+    require_explicit_ready: bool,
 ) -> bool {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     while Instant::now() < deadline {
         let after = cache.pumpfun_bonding_curve_reserves_snapshot(bonding_curve);
-        if after != before {
+        if require_explicit_ready {
+            if cache.pumpfun_bonding_curve_explicitly_ready(bonding_curve)
+                && after.is_some()
+                && after != before
+            {
+                return true;
+            }
+        } else if after != before {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
@@ -8454,6 +8469,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                             before_snap,
                             DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
                             DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                            true,
                         )
                         .await
                         {
@@ -10252,8 +10268,8 @@ mod execution_engine_tests {
     };
     use ironcrab::execution::live_pool_cache::{CachedPoolState, LivePoolCache, PumpFunState};
     use ironcrab::ipc::{
-        ControlResponse, ControlResponseStatus, ExplicitAmount, IntentOrigin, IntentTier,
-        TradeIntent, TradeResources, TradeSide, TradingRegime,
+        ControlResponse, ControlResponseStatus, DexPoolReadiness, ExplicitAmount, IntentOrigin,
+        IntentTier, TradeIntent, TradeResources, TradeSide, TradingRegime,
     };
     use ironcrab::solana::dex::pumpfun::PumpFunDex;
     use parking_lot::Mutex as ParkingMutex;
@@ -10470,6 +10486,7 @@ mod execution_engine_tests {
             Some(before),
             500,
             5,
+            false,
         ));
         assert!(
             ok,
@@ -10508,8 +10525,93 @@ mod execution_engine_tests {
             Some(snap),
             80,
             10,
+            false,
         ));
         assert!(!ok);
+    }
+
+    /// Bug #36 / #34: cold-path wait needs explicit Ready **and** a snapshot change vs pre-request
+    /// (proves fresh JetStream merge for this EnsurePumpfunBondingCurve request).
+    #[test]
+    fn wait_for_pumpfun_bonding_cache_refresh_require_ready_requires_explicit_merge() {
+        let mint_str = "Mint444444444444444444444444444444444444444";
+        let mint = Pubkey::from_str(mint_str).unwrap();
+        let (bonding_curve, _) = PumpFunDex::derive_bonding_curve_static(&mint);
+        let snap = (50u64, 60u64, 1u64, 2u64, false, true);
+        let cache = LivePoolCache::new();
+        cache.upsert(
+            bonding_curve,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: snap.1,
+                virtual_token_reserves: snap.0,
+                real_sol_reserves: snap.3,
+                real_token_reserves: snap.2,
+                complete: snap.4,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: snap.5,
+            }),
+            0,
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ok_no_ready = rt.block_on(wait_for_pumpfun_bonding_cache_refresh(
+            &cache,
+            &bonding_curve,
+            Some(snap),
+            60,
+            10,
+            true,
+        ));
+        assert!(
+            !ok_no_ready,
+            "without explicit Ready merge, must not succeed even when snapshot matches"
+        );
+
+        cache.merge_pumpfun_bonding_readiness(bonding_curve, DexPoolReadiness::Ready);
+        let ok_stale_ready_same_snap = rt.block_on(wait_for_pumpfun_bonding_cache_refresh(
+            &cache,
+            &bonding_curve,
+            Some(snap),
+            80,
+            10,
+            true,
+        ));
+        assert!(
+            !ok_stale_ready_same_snap,
+            "pre-existing Ready + unchanged snapshot must not satisfy wait (no fresh merge proof)"
+        );
+
+        cache.upsert(
+            bonding_curve,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: snap.1,
+                virtual_token_reserves: snap.0 + 1,
+                real_sol_reserves: snap.3,
+                real_token_reserves: snap.2,
+                complete: snap.4,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: snap.5,
+            }),
+            1,
+        );
+        let ok_fresh = rt.block_on(wait_for_pumpfun_bonding_cache_refresh(
+            &cache,
+            &bonding_curve,
+            Some(snap),
+            200,
+            5,
+            true,
+        ));
+        assert!(
+            ok_fresh,
+            "explicit Ready + snapshot change vs before must satisfy cold-path wait"
+        );
     }
 
     /// I-24d: Verifies that ControlResponse status maps correctly to DiscoveryRequestOutcome.
