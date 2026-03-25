@@ -310,6 +310,10 @@ pub struct LivePoolCache {
     /// Monotonic: [`DexPoolReadiness::merge`] on update; never stored inside `PumpAmmState` to avoid
     /// touching every constructor site.
     pool_accounts_readiness_by_market: DashMap<Pubkey, DexPoolReadiness>,
+
+    /// PumpFun bonding-curve account → explicit [`DexPoolReadiness`] from JetStream / MASTER (Bug #36).
+    /// Monotonic merge; not implied by [`Self::contains`] or non-empty bonding-curve state.
+    pumpfun_bonding_readiness_by_curve: DashMap<Pubkey, DexPoolReadiness>,
 }
 
 /// Which vault position (A/B or X/Y or 0/1) this vault represents
@@ -340,6 +344,7 @@ impl LivePoolCache {
             vault_update_tx: Mutex::new(None),
             last_notified_vault_count: AtomicU64::new(0),
             pool_accounts_readiness_by_market: DashMap::new(),
+            pumpfun_bonding_readiness_by_curve: DashMap::new(),
         }
     }
 
@@ -895,6 +900,28 @@ impl LivePoolCache {
             .entry(pool_market)
             .and_modify(|stored| *stored = stored.merge(incoming))
             .or_insert(incoming);
+    }
+
+    /// Merge PumpFun bonding-curve readiness for `bonding_curve` (monotonic — never downgrade).
+    pub fn merge_pumpfun_bonding_readiness(
+        &self,
+        bonding_curve: Pubkey,
+        incoming: DexPoolReadiness,
+    ) {
+        self.pumpfun_bonding_readiness_by_curve
+            .entry(bonding_curve)
+            .and_modify(|stored| *stored = stored.merge(incoming))
+            .or_insert(incoming);
+    }
+
+    /// `true` only after explicit JetStream / control-path merge recorded [`DexPoolReadiness::Ready`]
+    /// for this bonding curve (Bug #36: cache hit alone is not ready).
+    #[must_use]
+    pub fn pumpfun_bonding_curve_explicitly_ready(&self, bonding_curve: &Pubkey) -> bool {
+        self.pumpfun_bonding_readiness_by_curve
+            .get(bonding_curve)
+            .map(|r| *r == DexPoolReadiness::Ready)
+            .unwrap_or(false)
     }
 
     /// Hot-path readiness for PumpSwap `pool_accounts`: explicit JetStream merge wins; if **no** entry

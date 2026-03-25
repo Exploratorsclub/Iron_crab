@@ -298,6 +298,12 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         update.effective_dex_readiness(),
                     );
                 }
+                if update.dex == "pumpfun" {
+                    cache.merge_pumpfun_bonding_readiness(
+                        pool_addr,
+                        update.effective_dex_readiness(),
+                    );
+                }
                 // P3 #13: Propagate base_decimals and quote_decimals to SLAVE cache
                 apply_decimals_from_metadata(cache, update);
                 return true;
@@ -371,6 +377,9 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         addr,
                         update.effective_dex_readiness(),
                     );
+                }
+                if update.dex == "pumpfun" {
+                    cache.merge_pumpfun_bonding_readiness(addr, update.effective_dex_readiness());
                 }
                 // P3 #13: Apply decimals from metadata when present (e.g. BalanceUpdated with metadata)
                 apply_decimals_from_metadata(cache, update);
@@ -695,6 +704,105 @@ mod tests {
                 .get_ready_pump_amm_pool_accounts_by_base_mint(&base_mint)
                 .is_some(),
             "merge must not downgrade Ready to Observed"
+        );
+    }
+
+    /// Bug #36 (PumpFun): Geyser / partial JetStream must not imply explicit Ready for bonding curve.
+    #[test]
+    fn test_pumpfun_partial_jetstream_not_explicit_ready() {
+        let cache = LivePoolCache::new();
+        let pool_addr = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_addr.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1_000_000,
+            100_000_000,
+            Some(0),
+            1,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("creator".to_string(), Pubkey::new_unique().to_string());
+        meta.insert(
+            "associated_bonding_curve".to_string(),
+            Pubkey::new_unique().to_string(),
+        );
+        meta.insert("complete".to_string(), "false".to_string());
+        meta.insert("real_token_reserves".to_string(), "100".to_string());
+        meta.insert("real_sol_reserves".to_string(), "200".to_string());
+        meta.insert("cashback_enabled".to_string(), "false".to_string());
+        update.metadata = Some(meta);
+        update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
+
+        assert!(apply_pool_cache_update(&cache, &update));
+        assert!(
+            !cache.pumpfun_bonding_curve_explicitly_ready(&pool_addr),
+            "Partial Geyser path must not set explicit Ready"
+        );
+    }
+
+    /// Bug #36: explicit Ready from cold-path style message; merge Observed must not downgrade.
+    #[test]
+    fn test_pumpfun_readiness_merge_ready_then_observed_stays_ready() {
+        let cache = LivePoolCache::new();
+        let pool_addr = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+
+        let mut ready_up = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_addr.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            2,
+            Some(0),
+            1,
+        );
+        let mut m = std::collections::HashMap::new();
+        m.insert("creator".to_string(), Pubkey::new_unique().to_string());
+        m.insert(
+            "associated_bonding_curve".to_string(),
+            Pubkey::new_unique().to_string(),
+        );
+        m.insert("complete".to_string(), "false".to_string());
+        m.insert("real_token_reserves".to_string(), "1".to_string());
+        m.insert("real_sol_reserves".to_string(), "2".to_string());
+        m.insert("cashback_enabled".to_string(), "false".to_string());
+        ready_up.metadata = Some(m.clone());
+        ready_up.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        assert!(apply_pool_cache_update(&cache, &ready_up));
+        assert!(cache.pumpfun_bonding_curve_explicitly_ready(&pool_addr));
+
+        let mut weak = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool_addr.to_string(),
+            "pumpfun".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            2,
+            Some(0),
+            2,
+        );
+        weak.metadata = Some(m);
+        weak.set_dex_readiness_in_metadata(DexPoolReadiness::Observed);
+        assert!(apply_pool_cache_update(&cache, &weak));
+        assert!(
+            cache.pumpfun_bonding_curve_explicitly_ready(&pool_addr),
+            "merge must not downgrade Ready to Observed for PumpFun"
         );
     }
 }

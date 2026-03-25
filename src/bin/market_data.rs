@@ -2086,6 +2086,10 @@ async fn handle_ensure_pumpfun_bonding_curve(
             state.cashback_enabled.to_string(),
         );
         pool_update.metadata = Some(meta);
+        // Cold-path RPC refresh: explicit Ready for JetStream / SLAVE (Bug #36).
+        pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        ctx.live_pool_cache
+            .merge_pumpfun_bonding_readiness(bonding_curve, DexPoolReadiness::Ready);
         let subject = pool_subject(&bonding_curve_str);
         match nats.jetstream_publish(&subject, &pool_update).await {
             Ok(true) => {
@@ -3383,6 +3387,8 @@ async fn run_geyser_loop(
                         // without needing RPC fallbacks.
                         match &cached_state {
                             CachedPoolState::PumpFun(s) => {
+                                // SLAVE minimal state uses quote_mint for SOL side; must not be default.
+                                pool_update.quote_mint = NATIVE_SOL_MINT.to_string();
                                 // Always propagate real_reserves + complete for SELL validation
                                 // in execution-engine's SLAVE cache.
                                 let mut meta = std::collections::HashMap::new();
@@ -3395,6 +3401,12 @@ async fn run_geyser_loop(
                                 meta.insert("real_sol_reserves".to_string(), s.real_sol_reserves.to_string());
                                 meta.insert("cashback_enabled".to_string(), s.cashback_enabled.to_string());
                                 pool_update.metadata = Some(meta);
+                                // Geyser-fed bonding curve: observation / partial only — not cold-path verified Ready.
+                                pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Partial);
+                                ctx.live_pool_cache.merge_pumpfun_bonding_readiness(
+                                    account_update.pubkey,
+                                    DexPoolReadiness::Partial,
+                                );
 
                                 // === BondingCurveProgress event for momentum-bot exit signal ===
                                 // PumpFun initial real_token_reserves = 793_100_000_000_000
@@ -3677,6 +3689,12 @@ async fn run_geyser_loop(
                             }
                         }
                         pool_update.metadata = Some(meta);
+                        // Fallback path: weaker than full Geyser parse — observed only.
+                        pool_update.set_dex_readiness_in_metadata(DexPoolReadiness::Observed);
+                        ctx.live_pool_cache.merge_pumpfun_bonding_readiness(
+                            *pool_address,
+                            DexPoolReadiness::Observed,
+                        );
 
                         if let Some(ref nats) = ctx.nats {
                             let subject = pool_subject(&pool_str);
