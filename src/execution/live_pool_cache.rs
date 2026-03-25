@@ -314,6 +314,9 @@ pub struct LivePoolCache {
     /// PumpFun bonding-curve account → explicit [`DexPoolReadiness`] from JetStream / MASTER (Bug #36).
     /// Monotonic merge; not implied by [`Self::contains`] or non-empty bonding-curve state.
     pumpfun_bonding_readiness_by_curve: DashMap<Pubkey, DexPoolReadiness>,
+
+    /// Raydium CPMM pool address → explicit [`DexPoolReadiness`] from JetStream / MASTER (Bug #36).
+    raydium_cpmm_readiness_by_pool: DashMap<Pubkey, DexPoolReadiness>,
 }
 
 /// Which vault position (A/B or X/Y or 0/1) this vault represents
@@ -345,6 +348,7 @@ impl LivePoolCache {
             last_notified_vault_count: AtomicU64::new(0),
             pool_accounts_readiness_by_market: DashMap::new(),
             pumpfun_bonding_readiness_by_curve: DashMap::new(),
+            raydium_cpmm_readiness_by_pool: DashMap::new(),
         }
     }
 
@@ -914,6 +918,46 @@ impl LivePoolCache {
             .or_insert(incoming);
     }
 
+    /// Merge Raydium CPMM pool readiness for `pool` (monotonic — never downgrade).
+    pub fn merge_raydium_cpmm_pool_readiness(&self, pool: Pubkey, incoming: DexPoolReadiness) {
+        self.raydium_cpmm_readiness_by_pool
+            .entry(pool)
+            .and_modify(|stored| *stored = stored.merge(incoming))
+            .or_insert(incoming);
+    }
+
+    /// `true` only when JetStream merge recorded [`DexPoolReadiness::Ready`] for this Raydium CPMM pool.
+    #[must_use]
+    pub fn raydium_cpmm_pool_explicitly_ready(&self, pool: &Pubkey) -> bool {
+        self.raydium_cpmm_readiness_by_pool
+            .get(pool)
+            .map(|r| *r == DexPoolReadiness::Ready)
+            .unwrap_or(false)
+    }
+
+    /// Monotonic merge result for this pool (tests / diagnostics).
+    #[must_use]
+    pub fn raydium_cpmm_readiness(&self, pool: &Pubkey) -> Option<DexPoolReadiness> {
+        self.raydium_cpmm_readiness_by_pool.get(pool).map(|r| *r)
+    }
+
+    /// Mint-level helper: Raydium CPMM slice — explicit `Ready` only (no cache-hit heuristic).
+    #[must_use]
+    pub fn base_mint_has_explicit_raydium_cpmm_ready_pool(&self, base_mint: &Pubkey) -> bool {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::RaydiumCpmm(s) = &entry.value().state {
+                if s.token_0_mint != *base_mint && s.token_1_mint != *base_mint {
+                    continue;
+                }
+                let pool = entry.key();
+                if self.raydium_cpmm_pool_explicitly_ready(pool) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// `true` only after explicit JetStream / control-path merge recorded [`DexPoolReadiness::Ready`]
     /// for this bonding curve (Bug #36: cache hit alone is not ready).
     #[must_use]
@@ -1027,13 +1071,17 @@ impl LivePoolCache {
     ///   effective-ready fallback (see [`Self::pump_amm_effective_ready_for_cache_first_accounts`]).
     /// - PumpFun bonding curve: [`Self::pumpfun_bonding_curve_explicitly_ready`] on the
     ///   bonding-curve account for a cached [`PumpFunState`] whose `token_mint` equals `base_mint`.
+    /// - Raydium CPMM: [`Self::base_mint_has_explicit_raydium_cpmm_ready_pool`] — explicit
+    ///   [`DexPoolReadiness::Ready`] in [`Self::raydium_cpmm_readiness_by_pool`] only.
     ///
-    /// **Conservative:** pools on Raydium, Orca, Meteora, etc. are **not** treated as ready here
-    /// until they have an explicit readiness path — returns `false` unless PumpSwap or PumpFun
-    /// conditions above hold.
+    /// **Conservative:** Orca, Meteora, Raydium AMM v4, etc. are **not** treated as ready here
+    /// until they have an explicit readiness path.
     #[must_use]
     pub fn base_mint_has_any_ready_pool(&self, base_mint: &Pubkey) -> bool {
         if self.base_mint_has_explicit_pump_amm_ready_pool(base_mint) {
+            return true;
+        }
+        if self.base_mint_has_explicit_raydium_cpmm_ready_pool(base_mint) {
             return true;
         }
         for entry in self.pools.iter() {
@@ -2223,6 +2271,81 @@ mod tests {
         );
 
         assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_raydium_cpmm_explicit_ready() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote_mint,
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            100,
+        );
+        cache.merge_raydium_cpmm_pool_readiness(pool, DexPoolReadiness::Ready);
+
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+        assert!(cache.base_mint_has_explicit_raydium_cpmm_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_raydium_cpmm_partial_does_not_count() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote_mint,
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(0),
+            }),
+            100,
+        );
+        cache.merge_raydium_cpmm_pool_readiness(pool, DexPoolReadiness::Partial);
+
+        assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_raydium_cpmm_readiness_merge_monotone() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: quote_mint,
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: Some(1),
+                reserve_1: Some(2),
+            }),
+            100,
+        );
+        cache.merge_raydium_cpmm_pool_readiness(pool, DexPoolReadiness::Ready);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+
+        cache.merge_raydium_cpmm_pool_readiness(pool, DexPoolReadiness::Observed);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
     }
 
     #[test]
