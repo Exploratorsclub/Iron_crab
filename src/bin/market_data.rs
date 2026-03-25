@@ -79,6 +79,7 @@ const EXECUTION_RESULT_DEDUP_CAPACITY: usize = 4096;
 // LivePoolCache - MASTER Cache (Single Source of Truth)
 use ironcrab::execution::live_pool_cache::{
     parse_pool_account, CachedPoolState, LivePoolCache, PumpAmmState, PumpFunState,
+    RaydiumCpmmState,
 };
 
 // P1 Crash Isolation: Systemd Watchdog support
@@ -96,6 +97,21 @@ const PUMPFUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMPFUN_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const METEORA_CPMM: &str = "cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D";
+
+/// Raydium CPMM: `PoolCacheUpdate` uses normalized base/quote (non-SOL first). JetStream vault
+/// metadata must list vault pubkeys in the same order as `base_mint` / `quote_mint` so SLAVE
+/// `build_minimal_pool_state_with_reserves` maps `token_0_*` ↔ vaults coherently.
+fn raydium_cpmm_vaults_for_pool_cache_update(s: &RaydiumCpmmState) -> String {
+    let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+    let (first_vault, second_vault) = if s.token_1_mint == sol {
+        (s.token_0_vault, s.token_1_vault)
+    } else if s.token_0_mint == sol {
+        (s.token_1_vault, s.token_0_vault)
+    } else {
+        (s.token_0_vault, s.token_1_vault)
+    };
+    format!("{first_vault},{second_vault}")
+}
 
 /// Market data configuration (hot-reloadable via NATS)
 #[allow(dead_code)]
@@ -3228,7 +3244,7 @@ async fn run_geyser_loop(
                                                 let mut meta = std::collections::HashMap::new();
                                                 meta.insert(
                                                     POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
-                                                    format!("{},{}", s.token_0_vault, s.token_1_vault),
+                                                    raydium_cpmm_vaults_for_pool_cache_update(&s),
                                                 );
                                                 balance_update.metadata = Some(meta);
                                                 let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
@@ -3779,7 +3795,7 @@ async fn run_geyser_loop(
                                 let mut meta = std::collections::HashMap::new();
                                 meta.insert(
                                     POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY.to_string(),
-                                    format!("{},{}", s.token_0_vault, s.token_1_vault),
+                                    raydium_cpmm_vaults_for_pool_cache_update(s),
                                 );
                                 pool_update.metadata = Some(meta);
                                 let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
