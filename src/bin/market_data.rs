@@ -1175,6 +1175,30 @@ async fn publish_wallet_snapshot(
         warn!(error = %e, "Failed to write WalletSnapshotComplete (bootstrap) to JSONL");
     }
 
+    // 4b) Cold-path inventory: count wallet-held mints where LivePoolCache reports explicit
+    // readiness only — PumpSwap: merge_pump_amm_pool_accounts_readiness(Ready); PumpFun:
+    // merge_pumpfun_bonding_readiness(Ready). No legacy PumpSwap heuristic / snapshot completeness.
+    let mut wallet_mints_explicit_ready_count: usize = 0;
+    for mint_str in &mints_in_wallet {
+        if let Ok(pk) = Pubkey::from_str(mint_str) {
+            if ctx.live_pool_cache.base_mint_has_any_ready_pool(&pk) {
+                wallet_mints_explicit_ready_count += 1;
+                debug!(
+                    mint = %mint_str,
+                    "wallet mint: explicit DexPoolReadiness::Ready (PumpSwap map and/or PumpFun bonding)"
+                );
+            }
+        }
+    }
+    if !mints_in_wallet.is_empty() {
+        info!(
+            wallet = %wallet_str,
+            wallet_mints_explicit_ready_count,
+            nonzero_wallet_mints = mints_in_wallet.len(),
+            "Wallet snapshot: mints with explicit Ready merge (PumpSwap/PumpFun); excludes legacy PumpSwap effective-ready"
+        );
+    }
+
     // 5) Publish SOL + WSOL as WalletBalanceSnapshot to JetStream (SSOT for bot state).
     //    execution-engine/WsolManager bootstrap from JetStream on startup.
     if !is_periodic {

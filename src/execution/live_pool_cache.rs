@@ -986,6 +986,68 @@ impl LivePoolCache {
             .unwrap_or(false)
     }
 
+    /// PumpSwap only, for mint-level **explicit** readiness: a pool for `base_mint` counts iff
+    /// [`Self::pool_accounts_readiness_by_market`] has [`DexPoolReadiness::Ready`] for that
+    /// pool market **and** `pool_accounts` is non-empty with ≥14 entries (swap v1 layout).
+    ///
+    /// Does **not** use the legacy fallback inside [`Self::pump_amm_effective_ready_for_cache_first_accounts`]
+    /// (no readiness-map entry but 14+ accounts + reserves). That path remains for
+    /// [`Self::get_ready_pump_amm_pool_accounts_by_base_mint`] / execution; this helper is
+    /// intentionally narrower for [`Self::base_mint_has_any_ready_pool`].
+    #[must_use]
+    pub fn base_mint_has_explicit_pump_amm_ready_pool(&self, base_mint: &Pubkey) -> bool {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
+                if s.base_mint != *base_mint {
+                    continue;
+                }
+                let pool_market = entry.key();
+                let explicit_ready = self
+                    .pool_accounts_readiness_by_market
+                    .get(pool_market)
+                    .map(|r| *r == DexPoolReadiness::Ready)
+                    .unwrap_or(false);
+                if explicit_ready && !s.pool_accounts.is_empty() && s.pool_accounts.len() >= 14 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// DEX-agnostic mint-level gate: does this **base mint** currently have **at least one**
+    /// pool that is explicitly ready for the wallet-relevant slices we model today?
+    ///
+    /// This does **not** infer readiness from mint presence, `WalletSnapshotComplete`,
+    /// `tracked_mints`, or a mere cache hit (Bug #36).
+    ///
+    /// **Signals consumed today:**
+    /// - PumpSwap: [`Self::base_mint_has_explicit_pump_amm_ready_pool`] only — explicit
+    ///   [`DexPoolReadiness::Ready`] in [`Self::pool_accounts_readiness_by_market`], no legacy
+    ///   effective-ready fallback (see [`Self::pump_amm_effective_ready_for_cache_first_accounts`]).
+    /// - PumpFun bonding curve: [`Self::pumpfun_bonding_curve_explicitly_ready`] on the
+    ///   bonding-curve account for a cached [`PumpFunState`] whose `token_mint` equals `base_mint`.
+    ///
+    /// **Conservative:** pools on Raydium, Orca, Meteora, etc. are **not** treated as ready here
+    /// until they have an explicit readiness path — returns `false` unless PumpSwap or PumpFun
+    /// conditions above hold.
+    #[must_use]
+    pub fn base_mint_has_any_ready_pool(&self, base_mint: &Pubkey) -> bool {
+        if self.base_mint_has_explicit_pump_amm_ready_pool(base_mint) {
+            return true;
+        }
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpFun(s) = &entry.value().state {
+                if s.token_mint == *base_mint
+                    && self.pumpfun_bonding_curve_explicitly_ready(entry.key())
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     // ========================================================================
     // Stats
     // ========================================================================
@@ -1997,6 +2059,203 @@ mod tests {
         } else {
             panic!("Expected PumpFun state");
         }
+    }
+
+    fn make_pumpfun_state_for_curve(token_mint: Pubkey, bonding_curve: Pubkey) -> CachedPoolState {
+        CachedPoolState::PumpFun(PumpFunState {
+            token_mint,
+            bonding_curve,
+            associated_bonding_curve: Pubkey::new_unique(),
+            virtual_sol_reserves: 30_000_000_000,
+            virtual_token_reserves: 1_000_000_000_000_000,
+            real_sol_reserves: 0,
+            real_token_reserves: 793_100_000_000_000,
+            complete: false,
+            creator: Pubkey::new_unique(),
+            cashback_enabled: false,
+        })
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_pumpswap_ready() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts,
+            ),
+            100,
+        );
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
+
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+        assert!(cache.base_mint_has_explicit_pump_amm_ready_pool(&base_mint));
+    }
+
+    /// Legacy authoritative PumpAmm upsert (no `pool_accounts_readiness_by_market` entry) is
+    /// swap-ready via [`Self::pump_amm_swap_accounts_ready_by_base_mint`] but must **not**
+    /// satisfy [`Self::base_mint_has_any_ready_pool`] (explicit Ready merge only).
+    #[test]
+    fn test_base_mint_has_any_ready_pool_pumpswap_legacy_without_explicit_merge_is_false() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts,
+            ),
+            100,
+        );
+
+        assert!(
+            cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint),
+            "legacy path still counts as swap-ready for execution-engine"
+        );
+        assert!(
+            !cache.base_mint_has_explicit_pump_amm_ready_pool(&base_mint),
+            "mint-level gate: no explicit Ready merge"
+        );
+        assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
+
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+        assert!(cache.base_mint_has_explicit_pump_amm_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_pumpfun_bonding_ready() {
+        let cache = LivePoolCache::new();
+        let bonding_curve = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+
+        cache.upsert(
+            bonding_curve,
+            make_pumpfun_state_for_curve(base_mint, bonding_curve),
+            100,
+        );
+        cache.merge_pumpfun_bonding_readiness(bonding_curve, DexPoolReadiness::Ready);
+
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_false_when_pumpswap_observed_only() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts,
+            ),
+            100,
+        );
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Observed);
+
+        assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_false_when_pumpswap_partial_only() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool_market,
+            make_pump_amm_state(
+                base_mint,
+                quote_mint,
+                Some(1_000_000_000),
+                Some(50_000_000_000),
+                pool_accounts,
+            ),
+            100,
+        );
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Partial);
+
+        assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_false_raydium_only_in_cache() {
+        let cache = LivePoolCache::new();
+        let base_mint = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+
+        cache.upsert(
+            Pubkey::new_unique(),
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base_mint,
+                token_1_mint: other,
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            100,
+        );
+
+        assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_pumpfun_cached_without_explicit_ready() {
+        let cache = LivePoolCache::new();
+        let bonding_curve = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+
+        cache.upsert(
+            bonding_curve,
+            make_pumpfun_state_for_curve(base_mint, bonding_curve),
+            100,
+        );
+
+        assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_pumpfun_merge_monotone() {
+        let cache = LivePoolCache::new();
+        let bonding_curve = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+
+        cache.upsert(
+            bonding_curve,
+            make_pumpfun_state_for_curve(base_mint, bonding_curve),
+            100,
+        );
+        cache.merge_pumpfun_bonding_readiness(bonding_curve, DexPoolReadiness::Ready);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+
+        cache.merge_pumpfun_bonding_readiness(bonding_curve, DexPoolReadiness::Observed);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
     }
 
     #[test]
