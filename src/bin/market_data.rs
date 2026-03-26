@@ -20,6 +20,7 @@
 use anyhow::Result;
 use clap::Parser;
 use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -86,7 +87,8 @@ const EXECUTION_RESULT_DEDUP_CAPACITY: usize = 4096;
 use ironcrab::execution::live_pool_cache::{
     meteora_cpmm_readiness_for_pool_cache_update, orca_readiness_for_pool_cache_update,
     parse_pool_account, raydium_amm_readiness_for_pool_cache_update, CachedPoolState,
-    LivePoolCache, MeteoraCpmmState, PumpAmmState, PumpFunState, RaydiumCpmmState,
+    LivePoolCache, MeteoraCpmmState, OrcaWhirlpoolState, PumpAmmState, PumpFunState,
+    RaydiumCpmmState,
 };
 
 // P1 Crash Isolation: Systemd Watchdog support
@@ -136,6 +138,52 @@ fn meteora_cpmm_vaults_for_pool_cache_update(s: &MeteoraCpmmState) -> String {
 /// On-chain `token_0_mint,token_1_mint` for SLAVE bootstrap when JetStream uses normalized base/quote.
 fn meteora_cpmm_onchain_mints_for_pool_cache_update(s: &MeteoraCpmmState) -> String {
     format!("{},{}", s.token_0_mint, s.token_1_mint)
+}
+
+/// Orca Whirlpool: PoolCacheUpdate metadata keys for SLAVE bootstrap (BalanceUpdated + PoolDiscovered).
+fn orca_metadata_for_pool_cache_update(s: &OrcaWhirlpoolState) -> HashMap<String, String> {
+    let mut meta = HashMap::new();
+    meta.insert(
+        POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY.to_string(),
+        format!("{},{}", s.token_vault_a, s.token_vault_b),
+    );
+    meta.insert(
+        POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY.to_string(),
+        s.tick_current_index.to_string(),
+    );
+    meta.insert(
+        POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY.to_string(),
+        s.tick_spacing.to_string(),
+    );
+    meta.insert(
+        POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY.to_string(),
+        s.sqrt_price.to_string(),
+    );
+    meta.insert(
+        POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY.to_string(),
+        s.liquidity.to_string(),
+    );
+    meta.insert(
+        POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY.to_string(),
+        s.fee_rate.to_string(),
+    );
+    meta.insert(
+        POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY.to_string(),
+        s.protocol_fee_rate.to_string(),
+    );
+    if let Some(p) = s.token_a_program {
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY.to_string(),
+            p.to_string(),
+        );
+    }
+    if let Some(p) = s.token_b_program {
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY.to_string(),
+            p.to_string(),
+        );
+    }
+    meta
 }
 
 /// JetStream readiness for Raydium CPMM (SOL-aware base/quote): single source for BalanceUpdated and PoolDiscovered.
@@ -3798,51 +3846,8 @@ async fn run_geyser_loop(
                                                     .metadata
                                                     .take()
                                                     .unwrap_or_default();
-                                                meta.insert(
-                                                    POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY
-                                                        .to_string(),
-                                                    format!("{},{}", s.token_vault_a, s.token_vault_b),
-                                                );
-                                                meta.insert(
-                                                    POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY
-                                                        .to_string(),
-                                                    s.tick_current_index.to_string(),
-                                                );
-                                                meta.insert(
-                                                    POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY
-                                                        .to_string(),
-                                                    s.tick_spacing.to_string(),
-                                                );
-                                                meta.insert(
-                                                    POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY.to_string(),
-                                                    s.sqrt_price.to_string(),
-                                                );
-                                                meta.insert(
-                                                    POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY.to_string(),
-                                                    s.liquidity.to_string(),
-                                                );
-                                                meta.insert(
-                                                    POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY.to_string(),
-                                                    s.fee_rate.to_string(),
-                                                );
-                                                meta.insert(
-                                                    POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY
-                                                        .to_string(),
-                                                    s.protocol_fee_rate.to_string(),
-                                                );
-                                                if let Some(p) = s.token_a_program {
-                                                    meta.insert(
-                                                        POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY
-                                                            .to_string(),
-                                                        p.to_string(),
-                                                    );
-                                                }
-                                                if let Some(p) = s.token_b_program {
-                                                    meta.insert(
-                                                        POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY
-                                                            .to_string(),
-                                                        p.to_string(),
-                                                    );
+                                                for (k, v) in orca_metadata_for_pool_cache_update(s) {
+                                                    meta.insert(k, v);
                                                 }
                                                 balance_update.metadata = Some(meta);
                                                 let readiness =
@@ -4574,48 +4579,8 @@ async fn run_geyser_loop(
                                 );
                             }
                             CachedPoolState::Orca(s) => {
-                                let mut meta = std::collections::HashMap::new();
-                                meta.insert(
-                                    POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY.to_string(),
-                                    format!("{},{}", s.token_vault_a, s.token_vault_b),
-                                );
-                                meta.insert(
-                                    POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY.to_string(),
-                                    s.tick_current_index.to_string(),
-                                );
-                                meta.insert(
-                                    POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY.to_string(),
-                                    s.tick_spacing.to_string(),
-                                );
-                                meta.insert(
-                                    POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY.to_string(),
-                                    s.sqrt_price.to_string(),
-                                );
-                                meta.insert(
-                                    POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY.to_string(),
-                                    s.liquidity.to_string(),
-                                );
-                                meta.insert(
-                                    POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY.to_string(),
-                                    s.fee_rate.to_string(),
-                                );
-                                meta.insert(
-                                    POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY.to_string(),
-                                    s.protocol_fee_rate.to_string(),
-                                );
-                                if let Some(p) = s.token_a_program {
-                                    meta.insert(
-                                        POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY.to_string(),
-                                        p.to_string(),
-                                    );
-                                }
-                                if let Some(p) = s.token_b_program {
-                                    meta.insert(
-                                        POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY.to_string(),
-                                        p.to_string(),
-                                    );
-                                }
-                                pool_update.metadata = Some(meta);
+                                pool_update.metadata =
+                                    Some(orca_metadata_for_pool_cache_update(s));
                                 let readiness = orca_readiness_for_pool_cache_update(s);
                                 pool_update.set_dex_readiness_in_metadata(readiness);
                                 ctx.live_pool_cache.merge_orca_pool_readiness(
