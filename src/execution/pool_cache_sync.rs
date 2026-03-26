@@ -25,8 +25,9 @@ use crate::execution::live_pool_cache::{
     PumpAmmState, PumpFunState, RaydiumAmmState, RaydiumCpmmState,
 };
 use crate::ipc::{
-    PoolCacheUpdate, PoolCacheUpdateType, POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY,
-    POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+    PoolCacheUpdate, PoolCacheUpdateType, NATIVE_SOL_MINT,
+    POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY,
+    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use crate::nats::{slave_consumer_config, NatsClient, STREAM_NAME};
 
@@ -45,7 +46,19 @@ fn extract_reserves(state: &CachedPoolState) -> (u64, u64) {
         ),
         CachedPoolState::PumpAmm(s) => (s.base_reserve.unwrap_or(0), s.quote_reserve.unwrap_or(0)),
         CachedPoolState::PumpFun(s) => (s.virtual_token_reserves, s.virtual_sol_reserves),
-        CachedPoolState::MeteoraCpmm(s) => (s.reserve_0, s.reserve_1),
+        CachedPoolState::MeteoraCpmm(s) => {
+            // SLAVE may store reserves in on-chain token_0/token_1 order (when on-chain mint metadata
+            // is present). BalanceUpdated merge treats the tuple as normalized (base, quote); map
+            // like `meteora_cpmm_readiness_for_pool_cache_update` (non-SOL leg = base when SOL present).
+            let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+            if s.token_1_mint == sol {
+                (s.reserve_0, s.reserve_1)
+            } else if s.token_0_mint == sol {
+                (s.reserve_1, s.reserve_0)
+            } else {
+                (s.reserve_0, s.reserve_1)
+            }
+        }
     }
 }
 
