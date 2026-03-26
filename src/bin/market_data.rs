@@ -33,8 +33,8 @@ use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest,
     ControlRequestKind, ControlResponse, ControlResponseStatus, DexPoolReadiness, ExecutionResult,
     ExecutionStatus, IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate,
-    PriorityFeePercentiles, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY,
-    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+    PriorityFeePercentiles, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY,
+    POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::metrics::{
     serve_metrics, set_readiness_control_sub_active, set_readiness_mode,
@@ -126,6 +126,11 @@ fn meteora_cpmm_vaults_for_pool_cache_update(s: &MeteoraCpmmState) -> String {
         (s.token_0_vault, s.token_1_vault)
     };
     format!("{first_vault},{second_vault}")
+}
+
+/// On-chain `token_0_mint,token_1_mint` for SLAVE bootstrap when JetStream uses normalized base/quote.
+fn meteora_cpmm_onchain_mints_for_pool_cache_update(s: &MeteoraCpmmState) -> String {
+    format!("{},{}", s.token_0_mint, s.token_1_mint)
 }
 
 /// JetStream readiness for Raydium CPMM (SOL-aware base/quote): single source for BalanceUpdated and PoolDiscovered.
@@ -1101,6 +1106,10 @@ async fn handle_wallet_bootstrap_meteora_cpmm_verify_for_mint(
             meta.insert(
                 POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY.to_string(),
                 meteora_cpmm_vaults_for_pool_cache_update(&state),
+            );
+            meta.insert(
+                POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY.to_string(),
+                meteora_cpmm_onchain_mints_for_pool_cache_update(&state),
             );
             balance_update.metadata = Some(meta);
             balance_update.set_dex_readiness_in_metadata(readiness);
@@ -3744,6 +3753,16 @@ async fn run_geyser_loop(
                                             if let Some(CachedPoolState::MeteoraCpmm(ref s)) =
                                                 ctx.live_pool_cache.get(&vault_info.pool_address)
                                             {
+                                                let mut meta = balance_update.metadata.take().unwrap_or_default();
+                                                meta.insert(
+                                                    POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY.to_string(),
+                                                    meteora_cpmm_vaults_for_pool_cache_update(s),
+                                                );
+                                                meta.insert(
+                                                    POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY.to_string(),
+                                                    meteora_cpmm_onchain_mints_for_pool_cache_update(s),
+                                                );
+                                                balance_update.metadata = Some(meta);
                                                 let readiness =
                                                     meteora_cpmm_readiness_for_pool_cache_update(s);
                                                 balance_update.set_dex_readiness_in_metadata(readiness);
@@ -4468,6 +4487,16 @@ async fn run_geyser_loop(
                                 );
                             }
                             CachedPoolState::MeteoraCpmm(s) => {
+                                let mut meta = std::collections::HashMap::new();
+                                meta.insert(
+                                    POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY.to_string(),
+                                    meteora_cpmm_vaults_for_pool_cache_update(s),
+                                );
+                                meta.insert(
+                                    POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY.to_string(),
+                                    meteora_cpmm_onchain_mints_for_pool_cache_update(s),
+                                );
+                                pool_update.metadata = Some(meta);
                                 let readiness = meteora_cpmm_readiness_for_pool_cache_update(s);
                                 pool_update.set_dex_readiness_in_metadata(readiness);
                                 ctx.live_pool_cache.merge_meteora_cpmm_pool_readiness(

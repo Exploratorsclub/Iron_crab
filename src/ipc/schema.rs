@@ -2397,6 +2397,14 @@ pub const POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY: &str = "raydium_cpmm_vaults
 /// [`POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY`].
 pub const POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY: &str = "meteora_cpmm_vaults";
 
+/// Metadata key for Meteora CPMM: `token_0_mint,token_1_mint` (comma-separated base58), **on-chain**
+/// pool account order (not normalized base/quote).
+///
+/// Lets SLAVE `build_minimal_pool_state` map JetStream `base_reserve`/`quote_reserve` (always
+/// normalized: non-SOL base first) onto the correct `reserve_0`/`reserve_1` even when SOL is
+/// token_0 on-chain (I-24a).
+pub const POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY: &str = "meteora_cpmm_onchain_mints";
+
 /// Pool cache update type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
