@@ -2405,6 +2405,25 @@ pub const POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY: &str = "meteora_cpmm_vaults
 /// token_0 on-chain (I-24a).
 pub const POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY: &str = "meteora_cpmm_onchain_mints";
 
+/// Metadata key for Orca Whirlpool: `token_vault_a,token_vault_b` (comma-separated base58).
+///
+/// Order matches on-chain Whirlpool layout (`token_mint_a` / `token_mint_b` on the pool), which is
+/// the same order as [`PoolCacheUpdate::base_mint`] / [`PoolCacheUpdate::quote_mint`] for Orca
+/// publishes from market-data (token A then token B).
+pub const POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY: &str = "orca_whirlpool_vaults";
+
+/// Orca Whirlpool static fields from the pool account (Geyser parse), as decimal strings in metadata.
+pub const POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY: &str = "orca_tick_current_index";
+pub const POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY: &str = "orca_tick_spacing";
+pub const POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY: &str = "orca_sqrt_price";
+pub const POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY: &str = "orca_liquidity";
+pub const POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY: &str = "orca_fee_rate";
+pub const POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY: &str = "orca_protocol_fee_rate";
+
+/// Optional: SPL Token program for `token_mint_a` / `token_mint_b` when known (Token-2022 safe path).
+pub const POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY: &str = "orca_token_a_program";
+pub const POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY: &str = "orca_token_b_program";
+
 /// Pool cache update type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

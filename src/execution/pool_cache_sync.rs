@@ -27,7 +27,11 @@ use crate::execution::live_pool_cache::{
 use crate::ipc::{
     PoolCacheUpdate, PoolCacheUpdateType, NATIVE_SOL_MINT,
     POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY,
-    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+    POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY,
+    POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY,
+    POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY, POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY,
+    POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY,
+    POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use crate::nats::{slave_consumer_config, NatsClient, STREAM_NAME};
 
@@ -84,22 +88,68 @@ fn build_minimal_pool_state_with_reserves(
 
     // Build minimal state based on DEX type
     let state = match update.dex.as_str() {
-        "orca" => CachedPoolState::Orca(OrcaWhirlpoolState {
-            token_mint_a: base_mint,
-            token_mint_b: quote_mint,
-            token_vault_a: Pubkey::default(),
-            token_vault_b: Pubkey::default(),
-            tick_current_index: 0,
-            sqrt_price: 0,
-            liquidity: 0,
-            fee_rate: 0,
-            protocol_fee_rate: 0,
-            tick_spacing: 0,
-            vault_a_balance: Some(base_reserve),
-            vault_b_balance: Some(quote_reserve),
-            token_a_program: None,
-            token_b_program: None,
-        }),
+        "orca" => {
+            let meta = update.metadata.as_ref();
+            let (token_vault_a, token_vault_b) = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY))
+                .and_then(|s| {
+                    let mut it = s.split(',').filter_map(|a| Pubkey::from_str(a.trim()).ok());
+                    match (it.next(), it.next()) {
+                        (Some(va), Some(vb)) => Some((va, vb)),
+                        _ => None,
+                    }
+                })
+                .unwrap_or((Pubkey::default(), Pubkey::default()));
+
+            let tick_current_index = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY))
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+            let tick_spacing = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY))
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+            let sqrt_price = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY))
+                .and_then(|s| s.parse::<u128>().ok())
+                .unwrap_or(0);
+            let liquidity = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY))
+                .and_then(|s| s.parse::<u128>().ok())
+                .unwrap_or(0);
+            let fee_rate = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY))
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+            let protocol_fee_rate = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY))
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+
+            let token_a_program = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY))
+                .and_then(|s| Pubkey::from_str(s.trim()).ok());
+            let token_b_program = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY))
+                .and_then(|s| Pubkey::from_str(s.trim()).ok());
+
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: base_mint,
+                token_mint_b: quote_mint,
+                token_vault_a,
+                token_vault_b,
+                tick_current_index,
+                sqrt_price,
+                liquidity,
+                fee_rate,
+                protocol_fee_rate,
+                tick_spacing,
+                vault_a_balance: Some(base_reserve),
+                vault_b_balance: Some(quote_reserve),
+                token_a_program,
+                token_b_program,
+            })
+        }
         "raydium" => {
             let serum_bids = update
                 .metadata
@@ -430,6 +480,9 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         update.effective_dex_readiness(),
                     );
                 }
+                if update.dex == "orca" {
+                    cache.merge_orca_pool_readiness(pool_addr, update.effective_dex_readiness());
+                }
                 // P3 #13: Propagate base_decimals and quote_decimals to SLAVE cache
                 apply_decimals_from_metadata(cache, update);
                 return true;
@@ -714,6 +767,73 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         }
                     }
                 }
+                // BalanceUpdated from vault path may omit whirlpool static metadata; preserve from SLAVE row
+                // when this message does not carry the corresponding keys (tick 0 is valid — do not use `== 0` heuristics).
+                if update.dex == "orca" {
+                    let um = update.metadata.as_ref();
+                    if let CachedPoolState::Orca(ref mut new_o) = minimal_state {
+                        if let Some(CachedPoolState::Orca(ex)) = existing.as_ref() {
+                            if new_o.token_vault_a == Pubkey::default()
+                                && ex.token_vault_a != Pubkey::default()
+                            {
+                                new_o.token_vault_a = ex.token_vault_a;
+                            }
+                            if new_o.token_vault_b == Pubkey::default()
+                                && ex.token_vault_b != Pubkey::default()
+                            {
+                                new_o.token_vault_b = ex.token_vault_b;
+                            }
+                            if um
+                                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY))
+                                .is_none()
+                            {
+                                new_o.tick_current_index = ex.tick_current_index;
+                            }
+                            if um
+                                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY))
+                                .is_none()
+                            {
+                                new_o.tick_spacing = ex.tick_spacing;
+                            }
+                            if um
+                                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY))
+                                .is_none()
+                            {
+                                new_o.sqrt_price = ex.sqrt_price;
+                            }
+                            if um
+                                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY))
+                                .is_none()
+                            {
+                                new_o.liquidity = ex.liquidity;
+                            }
+                            if um
+                                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY))
+                                .is_none()
+                            {
+                                new_o.fee_rate = ex.fee_rate;
+                            }
+                            if um
+                                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY))
+                                .is_none()
+                            {
+                                new_o.protocol_fee_rate = ex.protocol_fee_rate;
+                            }
+                            if um
+                                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY))
+                                .is_none()
+                            {
+                                new_o.token_a_program = ex.token_a_program;
+                            }
+                            if um
+                                .and_then(|m| m.get(POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY))
+                                .is_none()
+                            {
+                                new_o.token_b_program = ex.token_b_program;
+                            }
+                        }
+                    }
+                }
                 cache.upsert(addr, minimal_state, update.geyser_slot);
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_pool_accounts_readiness(
@@ -732,6 +852,9 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 }
                 if update.dex == "meteora_cpmm" {
                     cache.merge_meteora_cpmm_pool_readiness(addr, update.effective_dex_readiness());
+                }
+                if update.dex == "orca" {
+                    cache.merge_orca_pool_readiness(addr, update.effective_dex_readiness());
                 }
                 // P3 #13: Apply decimals from metadata when present (e.g. BalanceUpdated with metadata)
                 apply_decimals_from_metadata(cache, update);
@@ -837,7 +960,11 @@ mod tests {
     use super::*;
     use crate::ipc::{
         DexPoolReadiness, POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY,
-        POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+        POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY, POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY,
+        POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY, POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY,
+        POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY, POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY,
+        POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY, POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY,
+        POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
     };
 
     /// A.30 Regression: cashback_enabled must be true when JetStream metadata contains
@@ -1866,5 +1993,219 @@ mod tests {
             cache.meteora_cpmm_readiness(&pool),
             Some(DexPoolReadiness::Ready)
         );
+    }
+
+    #[test]
+    fn test_orca_pool_discovered_jetstream_reconstructs_static_fields() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let va = Pubkey::new_unique();
+        let vb = Pubkey::new_unique();
+
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY.to_string(),
+            format!("{va},{vb}"),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY.to_string(),
+            "-7".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY.to_string(),
+            "64".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY.to_string(),
+            "12345678901234567890".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY.to_string(),
+            "999888777666".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY.to_string(),
+            "3000".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY.to_string(),
+            "300".to_string(),
+        );
+
+        let mut disc = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "orca".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            5,
+            6,
+            None,
+            1,
+        );
+        disc.metadata = Some(meta);
+        disc.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        assert!(apply_pool_cache_update(&cache, &disc));
+
+        match cache.get(&pool).expect("pool in cache") {
+            CachedPoolState::Orca(s) => {
+                assert_eq!(s.token_mint_a, base_mint);
+                assert_eq!(s.token_mint_b, quote_mint);
+                assert_eq!(s.token_vault_a, va);
+                assert_eq!(s.token_vault_b, vb);
+                assert_eq!(s.tick_current_index, -7);
+                assert_eq!(s.tick_spacing, 64);
+                assert_eq!(s.sqrt_price, 12_345_678_901_234_567_890u128);
+                assert_eq!(s.liquidity, 999_888_777_666);
+                assert_eq!(s.fee_rate, 3000);
+                assert_eq!(s.protocol_fee_rate, 300);
+                assert_eq!(s.vault_a_balance, Some(5));
+                assert_eq!(s.vault_b_balance, Some(6));
+            }
+            other => panic!("expected Orca, got {:?}", other),
+        }
+        assert!(cache.orca_pool_explicitly_ready(&pool));
+    }
+
+    /// `tick_current_index == 0` is valid; BalanceUpdated without tick metadata must not overwrite from a bogus default.
+    #[test]
+    fn test_orca_balance_updated_preserves_tick_zero_when_metadata_omits_tick() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let va = Pubkey::new_unique();
+        let vb = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: base_mint,
+                token_mint_b: quote_mint,
+                token_vault_a: va,
+                token_vault_b: vb,
+                tick_current_index: 0,
+                sqrt_price: 42,
+                liquidity: 100,
+                fee_rate: 1,
+                protocol_fee_rate: 2,
+                tick_spacing: 8,
+                vault_a_balance: Some(10),
+                vault_b_balance: Some(20),
+                token_a_program: None,
+                token_b_program: None,
+            }),
+            1,
+        );
+
+        let mut bal = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "orca".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            11,
+            21,
+            2,
+        );
+        bal.set_dex_readiness_in_metadata(DexPoolReadiness::Observed);
+        assert!(apply_pool_cache_update(&cache, &bal));
+
+        match cache.get(&pool).expect("pool in cache") {
+            CachedPoolState::Orca(s) => {
+                assert_eq!(s.tick_current_index, 0);
+                assert_eq!(s.sqrt_price, 42);
+                assert_eq!(s.tick_spacing, 8);
+                assert_eq!(s.vault_a_balance, Some(11));
+                assert_eq!(s.vault_b_balance, Some(21));
+            }
+            other => panic!("expected Orca, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_orca_readiness_merge_never_downgrades() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let va = Pubkey::new_unique();
+        let vb = Pubkey::new_unique();
+
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY.to_string(),
+            format!("{va},{vb}"),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY.to_string(),
+            "1".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY.to_string(),
+            "8".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY.to_string(),
+            "100".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY.to_string(),
+            "200".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY.to_string(),
+            "1".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY.to_string(),
+            "2".to_string(),
+        );
+
+        let mut ready_up = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "orca".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            1,
+        );
+        ready_up.metadata = Some(meta.clone());
+        ready_up.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        assert!(apply_pool_cache_update(&cache, &ready_up));
+        assert!(cache.orca_pool_explicitly_ready(&pool));
+
+        let mut weak = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "orca".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            2,
+        );
+        weak.metadata = Some(meta);
+        weak.set_dex_readiness_in_metadata(DexPoolReadiness::Observed);
+        assert!(apply_pool_cache_update(&cache, &weak));
+        assert!(
+            cache.orca_pool_explicitly_ready(&pool),
+            "merge must not downgrade Ready to Observed for Orca"
+        );
+        assert_eq!(cache.orca_readiness(&pool), Some(DexPoolReadiness::Ready));
     }
 }

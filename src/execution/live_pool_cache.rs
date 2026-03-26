@@ -94,6 +94,31 @@ impl From<WhirlpoolParsed> for OrcaWhirlpoolState {
     }
 }
 
+/// JetStream / MASTER [`DexPoolReadiness`] for Orca Whirlpool (conservative, explicit).
+///
+/// `Ready` only when the whirlpool layout is present (non-default vaults, valid tick spacing and
+/// price state from Geyser) **and** both vault balances are known and non-zero — matching what
+/// [`crate::execution::quote_calculator`] and Orca swap building need for believable reserves.
+///
+/// Token programs are **not** required for `Ready` (Orca can fall back to classic SPL with a
+/// trace warning; marking `Observed` until programs are known would be overly strict for mint-gate).
+#[must_use]
+pub fn orca_readiness_for_pool_cache_update(s: &OrcaWhirlpoolState) -> DexPoolReadiness {
+    let static_ok = s.token_vault_a != Pubkey::default()
+        && s.token_vault_b != Pubkey::default()
+        && s.tick_spacing > 0
+        && s.sqrt_price > 0;
+    let va = s.vault_a_balance.unwrap_or(0);
+    let vb = s.vault_b_balance.unwrap_or(0);
+    if static_ok && va > 0 && vb > 0 {
+        DexPoolReadiness::Ready
+    } else if va > 0 || vb > 0 || static_ok {
+        DexPoolReadiness::Partial
+    } else {
+        DexPoolReadiness::Observed
+    }
+}
+
 /// Raydium AMM V4 cached state
 #[derive(Debug, Clone)]
 pub struct RaydiumAmmState {
@@ -377,6 +402,9 @@ pub struct LivePoolCache {
 
     /// Meteora CPMM pool address → explicit [`DexPoolReadiness`] from JetStream / MASTER (Bug #36).
     meteora_cpmm_readiness_by_pool: DashMap<Pubkey, DexPoolReadiness>,
+
+    /// Orca Whirlpool pool address → explicit [`DexPoolReadiness`] from JetStream / MASTER (Bug #36).
+    orca_readiness_by_pool: DashMap<Pubkey, DexPoolReadiness>,
 }
 
 /// Which vault position (A/B or X/Y or 0/1) this vault represents
@@ -411,6 +439,7 @@ impl LivePoolCache {
             raydium_cpmm_readiness_by_pool: DashMap::new(),
             raydium_amm_readiness_by_pool: DashMap::new(),
             meteora_cpmm_readiness_by_pool: DashMap::new(),
+            orca_readiness_by_pool: DashMap::new(),
         }
     }
 
@@ -1004,6 +1033,14 @@ impl LivePoolCache {
             .or_insert(incoming);
     }
 
+    /// Merge Orca Whirlpool pool readiness for `pool` (monotonic — never downgrade).
+    pub fn merge_orca_pool_readiness(&self, pool: Pubkey, incoming: DexPoolReadiness) {
+        self.orca_readiness_by_pool
+            .entry(pool)
+            .and_modify(|stored| *stored = stored.merge(incoming))
+            .or_insert(incoming);
+    }
+
     /// `true` only when JetStream merge recorded [`DexPoolReadiness::Ready`] for this Raydium CPMM pool.
     #[must_use]
     pub fn raydium_cpmm_pool_explicitly_ready(&self, pool: &Pubkey) -> bool {
@@ -1047,6 +1084,21 @@ impl LivePoolCache {
     #[must_use]
     pub fn meteora_cpmm_readiness(&self, pool: &Pubkey) -> Option<DexPoolReadiness> {
         self.meteora_cpmm_readiness_by_pool.get(pool).map(|r| *r)
+    }
+
+    /// `true` only when JetStream merge recorded [`DexPoolReadiness::Ready`] for this Orca pool.
+    #[must_use]
+    pub fn orca_pool_explicitly_ready(&self, pool: &Pubkey) -> bool {
+        self.orca_readiness_by_pool
+            .get(pool)
+            .map(|r| *r == DexPoolReadiness::Ready)
+            .unwrap_or(false)
+    }
+
+    /// Monotonic merge result for this Orca pool (tests / diagnostics).
+    #[must_use]
+    pub fn orca_readiness(&self, pool: &Pubkey) -> Option<DexPoolReadiness> {
+        self.orca_readiness_by_pool.get(pool).map(|r| *r)
     }
 
     /// Mint-level helper: Raydium CPMM slice — explicit `Ready` only (no cache-hit heuristic).
@@ -1093,6 +1145,23 @@ impl LivePoolCache {
                 }
                 let pool = entry.key();
                 if self.raydium_amm_pool_explicitly_ready(pool) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Mint-level helper: Orca Whirlpool — explicit `Ready` only (no cache-hit heuristic).
+    #[must_use]
+    pub fn base_mint_has_explicit_orca_ready_pool(&self, base_mint: &Pubkey) -> bool {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::Orca(s) = &entry.value().state {
+                if s.token_mint_a != *base_mint && s.token_mint_b != *base_mint {
+                    continue;
+                }
+                let pool = entry.key();
+                if self.orca_pool_explicitly_ready(pool) {
                     return true;
                 }
             }
@@ -1249,9 +1318,11 @@ impl LivePoolCache {
     ///   [`DexPoolReadiness::Ready`] in [`Self::raydium_amm_readiness_by_pool`] only.
     /// - Meteora CPMM: [`Self::base_mint_has_explicit_meteora_cpmm_ready_pool`] — explicit
     ///   [`DexPoolReadiness::Ready`] in [`Self::meteora_cpmm_readiness_by_pool`] only.
+    /// - Orca Whirlpool: [`Self::base_mint_has_explicit_orca_ready_pool`] — explicit
+    ///   [`DexPoolReadiness::Ready`] in [`Self::orca_readiness_by_pool`] only.
     ///
-    /// **Conservative:** Orca, Meteora DLMM, etc. are **not** treated as ready here until they have an
-    /// explicit readiness path.
+    /// **Conservative:** Meteora DLMM and other DEXes are **not** treated as ready here until they
+    /// have an explicit readiness path.
     #[must_use]
     pub fn base_mint_has_any_ready_pool(&self, base_mint: &Pubkey) -> bool {
         if self.base_mint_has_explicit_pump_amm_ready_pool(base_mint) {
@@ -1261,6 +1332,9 @@ impl LivePoolCache {
             return true;
         }
         if self.base_mint_has_explicit_meteora_cpmm_ready_pool(base_mint) {
+            return true;
+        }
+        if self.base_mint_has_explicit_orca_ready_pool(base_mint) {
             return true;
         }
         if self.base_mint_has_explicit_raydium_amm_ready_pool(base_mint) {
@@ -2432,6 +2506,156 @@ mod tests {
         cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Partial);
 
         assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    fn make_orca_state(
+        token_mint_a: Pubkey,
+        token_mint_b: Pubkey,
+        vault_a_balance: Option<u64>,
+        vault_b_balance: Option<u64>,
+    ) -> OrcaWhirlpoolState {
+        OrcaWhirlpoolState {
+            token_mint_a,
+            token_mint_b,
+            token_vault_a: Pubkey::new_unique(),
+            token_vault_b: Pubkey::new_unique(),
+            tick_current_index: -42,
+            sqrt_price: 1u128 << 64,
+            liquidity: 1_000_000,
+            fee_rate: 3000,
+            protocol_fee_rate: 300,
+            tick_spacing: 64,
+            vault_a_balance,
+            vault_b_balance,
+            token_a_program: None,
+            token_b_program: None,
+        }
+    }
+
+    #[test]
+    fn test_orca_readiness_helper_partial_when_reserves_but_vault_pubkeys_missing() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let mut s = make_orca_state(a, b, Some(100), Some(200));
+        s.token_vault_a = Pubkey::default();
+        assert_eq!(
+            orca_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Partial,
+            "not Ready: static layout incomplete; reserve scalars alone are partial signal"
+        );
+    }
+
+    #[test]
+    fn test_orca_readiness_helper_observed_when_no_static_and_no_balances() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let mut s = make_orca_state(a, b, None, None);
+        s.token_vault_a = Pubkey::default();
+        s.token_vault_b = Pubkey::default();
+        s.tick_spacing = 0;
+        s.sqrt_price = 0;
+        assert_eq!(
+            orca_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Observed
+        );
+    }
+
+    #[test]
+    fn test_orca_readiness_helper_partial_static_only_no_balances() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let s = make_orca_state(a, b, None, None);
+        assert_eq!(
+            orca_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Partial
+        );
+    }
+
+    #[test]
+    fn test_orca_readiness_helper_partial_one_vault_balance() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let s = make_orca_state(a, b, Some(1), None);
+        assert_eq!(
+            orca_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Partial
+        );
+    }
+
+    #[test]
+    fn test_orca_readiness_helper_ready_full_state() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let s = make_orca_state(a, b, Some(1_000_000), Some(50_000_000_000));
+        assert_eq!(
+            orca_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_orca_cache_hit_without_explicit_merge_is_false() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        cache.upsert(
+            pool,
+            CachedPoolState::Orca(make_orca_state(base_mint, quote_mint, Some(1), Some(2))),
+            100,
+        );
+        assert!(
+            !cache.base_mint_has_any_ready_pool(&base_mint),
+            "Bug #36: Orca cache row must not imply mint-level ready without explicit merge"
+        );
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_orca_explicit_ready() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        cache.upsert(
+            pool,
+            CachedPoolState::Orca(make_orca_state(base_mint, quote_mint, Some(1), Some(2))),
+            100,
+        );
+        cache.merge_orca_pool_readiness(pool, DexPoolReadiness::Ready);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+        assert!(cache.base_mint_has_explicit_orca_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_orca_partial_does_not_count() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        cache.upsert(
+            pool,
+            CachedPoolState::Orca(make_orca_state(base_mint, quote_mint, Some(1), None)),
+            100,
+        );
+        cache.merge_orca_pool_readiness(pool, DexPoolReadiness::Partial);
+        assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_orca_readiness_merge_monotone() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        cache.upsert(
+            pool,
+            CachedPoolState::Orca(make_orca_state(base_mint, quote_mint, Some(1), Some(2))),
+            100,
+        );
+        cache.merge_orca_pool_readiness(pool, DexPoolReadiness::Ready);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+        cache.merge_orca_pool_readiness(pool, DexPoolReadiness::Observed);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
     }
 
     #[test]
