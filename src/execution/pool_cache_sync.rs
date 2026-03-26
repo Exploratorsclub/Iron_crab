@@ -556,7 +556,16 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                                     }
                                 })
                         });
-                        if let Some((bv, qv)) = from_existing_vaults.or(from_meta_vaults) {
+                        if let Some((t0v, t1v)) = from_existing_vaults {
+                            // Already on-chain token_0 / token_1 vault order — do not remap (remap
+                            // below assumes normalized base_vault,quote_vault metadata).
+                            if new_cpmm.token_0_vault == Pubkey::default() {
+                                new_cpmm.token_0_vault = t0v;
+                            }
+                            if new_cpmm.token_1_vault == Pubkey::default() {
+                                new_cpmm.token_1_vault = t1v;
+                            }
+                        } else if let Some((bv, qv)) = from_meta_vaults {
                             let sol =
                                 Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap_or_default();
                             // Map normalized `base_vault,quote_vault` metadata onto **on-chain**
