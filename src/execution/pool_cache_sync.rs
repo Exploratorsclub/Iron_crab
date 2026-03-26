@@ -27,11 +27,13 @@ use crate::execution::live_pool_cache::{
 use crate::ipc::{
     PoolCacheUpdate, PoolCacheUpdateType, NATIVE_SOL_MINT,
     POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY,
-    POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY,
-    POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY,
-    POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY, POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY,
-    POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY,
-    POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY, POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY,
+    POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY, POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY,
+    POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY, POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY,
+    POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY,
+    POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY,
+    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use crate::nats::{slave_consumer_config, NatsClient, STREAM_NAME};
 
@@ -196,16 +198,39 @@ fn build_minimal_pool_state_with_reserves(
             reserve_0: Some(base_reserve),
             reserve_1: Some(quote_reserve),
         }),
-        "meteora_dlmm" => CachedPoolState::Meteora(MeteoraState {
-            token_x_mint: base_mint,
-            token_y_mint: quote_mint,
-            reserve_x: Pubkey::default(),
-            reserve_y: Pubkey::default(),
-            active_id: 0,
-            bin_step: 0,
-            reserve_x_balance: Some(base_reserve),
-            reserve_y_balance: Some(quote_reserve),
-        }),
+        "meteora_dlmm" => {
+            let meta = update.metadata.as_ref();
+            let (reserve_x, reserve_y) = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY))
+                .and_then(|s| {
+                    let mut it = s.split(',').filter_map(|a| Pubkey::from_str(a.trim()).ok());
+                    match (it.next(), it.next()) {
+                        (Some(vx), Some(vy)) => Some((vx, vy)),
+                        _ => None,
+                    }
+                })
+                .unwrap_or((Pubkey::default(), Pubkey::default()));
+
+            let active_id = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY))
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+            let bin_step = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY))
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: base_mint,
+                token_y_mint: quote_mint,
+                reserve_x,
+                reserve_y,
+                active_id,
+                bin_step,
+                reserve_x_balance: Some(base_reserve),
+                reserve_y_balance: Some(quote_reserve),
+            })
+        }
         "meteora_cpmm" => {
             // `base_mint` / `quote_mint` / reserves are normalized (non-SOL first). On-chain
             // Meteora pool state uses token_0 / token_1 — may be SOL,base. Optional metadata carries
@@ -445,6 +470,36 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                                     new_cpmm.token_0_vault = v0;
                                     new_cpmm.token_1_vault = v1;
                                 }
+                            }
+                        }
+                    }
+                }
+                // PoolDiscovered without DLMM metadata (legacy JetStream): keep structural fields from SLAVE.
+                if update.dex == "meteora_dlmm" {
+                    let um = update.metadata.as_ref();
+                    if let CachedPoolState::Meteora(ref mut new_m) = minimal_state {
+                        if let Some(CachedPoolState::Meteora(ex)) = cache.get(&pool_addr).as_ref() {
+                            if new_m.reserve_x == Pubkey::default()
+                                && ex.reserve_x != Pubkey::default()
+                            {
+                                new_m.reserve_x = ex.reserve_x;
+                            }
+                            if new_m.reserve_y == Pubkey::default()
+                                && ex.reserve_y != Pubkey::default()
+                            {
+                                new_m.reserve_y = ex.reserve_y;
+                            }
+                            if um
+                                .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY))
+                                .is_none()
+                            {
+                                new_m.active_id = ex.active_id;
+                            }
+                            if um
+                                .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY))
+                                .is_none()
+                            {
+                                new_m.bin_step = ex.bin_step;
                             }
                         }
                     }
@@ -834,6 +889,36 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         }
                     }
                 }
+                // BalanceUpdated may omit DLMM static fields; `active_id == 0` / `bin_step == 0` are valid on-chain.
+                if update.dex == "meteora_dlmm" {
+                    let um = update.metadata.as_ref();
+                    if let CachedPoolState::Meteora(ref mut new_m) = minimal_state {
+                        if let Some(CachedPoolState::Meteora(ex)) = existing.as_ref() {
+                            if new_m.reserve_x == Pubkey::default()
+                                && ex.reserve_x != Pubkey::default()
+                            {
+                                new_m.reserve_x = ex.reserve_x;
+                            }
+                            if new_m.reserve_y == Pubkey::default()
+                                && ex.reserve_y != Pubkey::default()
+                            {
+                                new_m.reserve_y = ex.reserve_y;
+                            }
+                            if um
+                                .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY))
+                                .is_none()
+                            {
+                                new_m.active_id = ex.active_id;
+                            }
+                            if um
+                                .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY))
+                                .is_none()
+                            {
+                                new_m.bin_step = ex.bin_step;
+                            }
+                        }
+                    }
+                }
                 cache.upsert(addr, minimal_state, update.geyser_slot);
                 if update.dex == "pump_amm" {
                     cache.merge_pump_amm_pool_accounts_readiness(
@@ -960,11 +1045,12 @@ mod tests {
     use super::*;
     use crate::ipc::{
         DexPoolReadiness, POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY,
-        POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY, POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY,
-        POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY, POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY,
-        POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY, POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY,
-        POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY, POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY,
-        POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+        POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY,
+        POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY,
+        POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY,
+        POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY,
+        POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY, POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY,
+        POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
     };
 
     /// A.30 Regression: cashback_enabled must be true when JetStream metadata contains
@@ -1512,6 +1598,189 @@ mod tests {
                 assert_eq!(s.token_y_mint, token_y);
                 assert_eq!(s.reserve_x_balance, Some(100));
                 assert_eq!(s.reserve_y_balance, Some(200));
+            }
+            other => panic!("expected Meteora (DLMM), got {:?}", other),
+        }
+    }
+
+    /// JetStream `PoolDiscovered` with DLMM metadata must reconstruct vaults + static fields.
+    #[test]
+    fn test_meteora_dlmm_pool_discovered_metadata_reconstructs_shape() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token_x = Pubkey::new_unique();
+        let token_y = Pubkey::new_unique();
+        let vx = Pubkey::new_unique();
+        let vy = Pubkey::new_unique();
+
+        let mut update = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "meteora_dlmm".to_string(),
+            token_x.to_string(),
+            token_y.to_string(),
+            1,
+            2,
+            None,
+            1,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY.to_string(),
+            format!("{vx},{vy}"),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY.to_string(),
+            "-42".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY.to_string(),
+            "100".to_string(),
+        );
+        update.metadata = Some(meta);
+
+        assert!(apply_pool_cache_update(&cache, &update));
+
+        match cache.get(&pool).expect("pool in cache") {
+            CachedPoolState::Meteora(s) => {
+                assert_eq!(s.reserve_x, vx);
+                assert_eq!(s.reserve_y, vy);
+                assert_eq!(s.active_id, -42);
+                assert_eq!(s.bin_step, 100);
+                assert_eq!(s.reserve_x_balance, Some(1));
+                assert_eq!(s.reserve_y_balance, Some(2));
+            }
+            other => panic!("expected Meteora (DLMM), got {:?}", other),
+        }
+    }
+
+    /// `active_id == 0` and `bin_step == 0` are valid on-chain; BalanceUpdated without DLMM keys must not clobber them.
+    #[test]
+    fn test_meteora_dlmm_balance_updated_without_metadata_preserves_zero_static_fields() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token_x = Pubkey::new_unique();
+        let token_y = Pubkey::new_unique();
+        let vx = Pubkey::new_unique();
+        let vy = Pubkey::new_unique();
+
+        let mut disc = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "meteora_dlmm".to_string(),
+            token_x.to_string(),
+            token_y.to_string(),
+            10,
+            20,
+            None,
+            1,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY.to_string(),
+            format!("{vx},{vy}"),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY.to_string(),
+            "0".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY.to_string(),
+            "0".to_string(),
+        );
+        disc.metadata = Some(meta);
+        assert!(apply_pool_cache_update(&cache, &disc));
+
+        let bal = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "meteora_dlmm".to_string(),
+            token_x.to_string(),
+            token_y.to_string(),
+            0,
+            99,
+            2,
+        );
+        assert!(apply_pool_cache_update(&cache, &bal));
+
+        match cache.get(&pool).expect("pool in cache") {
+            CachedPoolState::Meteora(s) => {
+                assert_eq!(s.active_id, 0);
+                assert_eq!(s.bin_step, 0);
+                assert_eq!(s.reserve_x, vx);
+                assert_eq!(s.reserve_y, vy);
+                assert_eq!(s.reserve_x_balance, Some(10));
+                assert_eq!(s.reserve_y_balance, Some(99));
+            }
+            other => panic!("expected Meteora (DLMM), got {:?}", other),
+        }
+    }
+
+    /// BalanceUpdated without metadata must keep prior non-zero static fields (not re-derived from unwrap defaults).
+    #[test]
+    fn test_meteora_dlmm_balance_updated_preserves_static_when_metadata_absent() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token_x = Pubkey::new_unique();
+        let token_y = Pubkey::new_unique();
+        let vx = Pubkey::new_unique();
+        let vy = Pubkey::new_unique();
+
+        let mut disc = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "meteora_dlmm".to_string(),
+            token_x.to_string(),
+            token_y.to_string(),
+            5,
+            6,
+            None,
+            1,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY.to_string(),
+            format!("{vx},{vy}"),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY.to_string(),
+            "7".to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY.to_string(),
+            "8".to_string(),
+        );
+        disc.metadata = Some(meta);
+        assert!(apply_pool_cache_update(&cache, &disc));
+
+        let bal = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "meteora_dlmm".to_string(),
+            token_x.to_string(),
+            token_y.to_string(),
+            100,
+            200,
+            2,
+        );
+        assert!(apply_pool_cache_update(&cache, &bal));
+
+        match cache.get(&pool).expect("pool in cache") {
+            CachedPoolState::Meteora(s) => {
+                assert_eq!(s.active_id, 7);
+                assert_eq!(s.bin_step, 8);
+                assert_eq!(s.reserve_x, vx);
+                assert_eq!(s.reserve_y, vy);
             }
             other => panic!("expected Meteora (DLMM), got {:?}", other),
         }
