@@ -1,4 +1,4 @@
-use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
+use crate::execution::live_pool_cache::{CachedPoolState, MeteoraState, SharedLivePoolCache};
 use crate::ipc::{RejectReason, SwapHop, TradeIntent, TradeSide};
 use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::orca::Orca;
@@ -17,6 +17,16 @@ use spl_token_2022;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
+
+/// Whether a [`MeteoraState`] row from LivePoolCache is structurally usable for DLMM planning.
+///
+/// `active_id` and `bin_step` may legitimately be zero on-chain; rejecting cache injection on
+/// `active_id != 0` breaks JetStream/SLAVE rows that preserve real zeros (see pool_cache_sync).
+/// Default vault pubkeys indicate a degenerate/minimal cache row, not “stale active_id”.
+#[must_use]
+fn meteora_dlmm_cache_state_injectable(state: &MeteoraState) -> bool {
+    state.reserve_x != Pubkey::default() && state.reserve_y != Pubkey::default()
+}
 
 /// System program ID
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
@@ -947,7 +957,7 @@ pub async fn build_tx_plan(
             let mut used_cache = false;
             if let Some(cache) = cache {
                 if let Some(CachedPoolState::Meteora(dlmm_state)) = cache.get(&_pool_id) {
-                    if dlmm_state.active_id != 0 {
+                    if meteora_dlmm_cache_state_injectable(&dlmm_state) {
                         if let Ok(true) =
                             meteora.inject_cached_meteora_state(&_pool_id, &dlmm_state)
                         {
@@ -1785,8 +1795,7 @@ async fn build_hop_meteora_dlmm(
     let mut used_cache = false;
     if let Some(cache) = cache {
         if let Some(CachedPoolState::Meteora(dlmm_state)) = cache.get(pool_address) {
-            // Only use if active_id != 0 (real Geyser data, not default)
-            if dlmm_state.active_id != 0 {
+            if meteora_dlmm_cache_state_injectable(&dlmm_state) {
                 if let Ok(true) = meteora.inject_cached_meteora_state(pool_address, &dlmm_state) {
                     tracing::debug!(
                         pool = %pool_address,
@@ -1795,11 +1804,6 @@ async fn build_hop_meteora_dlmm(
                     );
                     used_cache = true;
                 }
-            } else {
-                tracing::warn!(
-                    pool = %pool_address,
-                    "multi-hop meteora: active_id=0 (stale cache), skipping injection"
-                );
             }
         }
     }
@@ -1835,6 +1839,7 @@ async fn build_hop_meteora_dlmm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::live_pool_cache::MeteoraState;
     use crate::ipc::{
         ExplicitAmount, IntentOrigin, IntentTier, TradeExecutionConstraints, TradeResources,
         TradingRegime,
@@ -1942,5 +1947,38 @@ mod tests {
         let intent = base_intent();
         let parsed = super::min_out_raw_from_intent(&intent);
         assert_eq!(parsed, None);
+    }
+
+    /// Regression: `active_id == 0` / `bin_step == 0` are valid on-chain; cache must not be rejected on that alone.
+    #[test]
+    fn meteora_dlmm_cache_injectable_accepts_zero_active_id_with_real_vaults() {
+        let vx = Pubkey::new_unique();
+        let vy = Pubkey::new_unique();
+        let s = MeteoraState {
+            token_x_mint: Pubkey::new_unique(),
+            token_y_mint: Pubkey::new_unique(),
+            reserve_x: vx,
+            reserve_y: vy,
+            active_id: 0,
+            bin_step: 0,
+            reserve_x_balance: Some(1),
+            reserve_y_balance: Some(2),
+        };
+        assert!(super::meteora_dlmm_cache_state_injectable(&s));
+    }
+
+    #[test]
+    fn meteora_dlmm_cache_injectable_rejects_default_vaults() {
+        let s = MeteoraState {
+            token_x_mint: Pubkey::new_unique(),
+            token_y_mint: Pubkey::new_unique(),
+            reserve_x: Pubkey::default(),
+            reserve_y: Pubkey::new_unique(),
+            active_id: 42,
+            bin_step: 10,
+            reserve_x_balance: Some(1),
+            reserve_y_balance: Some(2),
+        };
+        assert!(!super::meteora_dlmm_cache_state_injectable(&s));
     }
 }
