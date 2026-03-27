@@ -1266,6 +1266,24 @@ impl LivePoolCache {
         out
     }
 
+    /// Cold-path bootstrap: Orca Whirlpool pools in cache that list `mint` as `token_mint_a` or
+    /// `token_mint_b`. Bounded iteration over the in-memory cache only (no chain scan).
+    #[must_use]
+    pub fn orca_whirlpool_pools_for_mint(
+        &self,
+        mint: &Pubkey,
+    ) -> Vec<(Pubkey, OrcaWhirlpoolState)> {
+        let mut out = Vec::new();
+        for entry in self.pools.iter() {
+            if let CachedPoolState::Orca(s) = &entry.value().state {
+                if s.token_mint_a == *mint || s.token_mint_b == *mint {
+                    out.push((*entry.key(), s.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// `true` only after explicit JetStream / control-path merge recorded [`DexPoolReadiness::Ready`]
     /// for this bonding curve (Bug #36: cache hit alone is not ready).
     #[must_use]
