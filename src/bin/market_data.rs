@@ -1250,6 +1250,10 @@ async fn handle_wallet_bootstrap_meteora_cpmm_verify_for_mint(
 ///
 /// Publishes [`PoolCacheUpdate`] with [`orca_readiness_for_pool_cache_update`] and
 /// [`orca_metadata_for_pool_cache_update`] like the Geyser path.
+///
+/// **Slot:** Uses `geyser_slot = 0` on [`LivePoolCache::upsert`] and
+/// [`PoolCacheUpdate::new_balance_updated`], same as bounded Raydium/Meteora CPMM wallet bootstrap
+/// verify — this cold-path RPC promotion is not labeled with a prior Geyser discovery slot.
 async fn handle_wallet_bootstrap_orca_whirlpool_verify_for_mint(
     ctx: &MarketDataContext,
     rpc: &Arc<SolanaRpc>,
@@ -1364,14 +1368,8 @@ async fn handle_wallet_bootstrap_orca_whirlpool_verify_for_mint(
         state.vault_a_balance = Some(ba);
         state.vault_b_balance = Some(bb);
 
-        let cache_slot = ctx
-            .live_pool_cache
-            .get_with_metadata(&pool_addr)
-            .map(|(_, slot, _)| slot)
-            .unwrap_or(0);
-
         ctx.live_pool_cache
-            .upsert(pool_addr, CachedPoolState::Orca(state.clone()), cache_slot);
+            .upsert(pool_addr, CachedPoolState::Orca(state.clone()), 0);
 
         let readiness = orca_readiness_for_pool_cache_update(&state);
         ctx.live_pool_cache
@@ -1401,7 +1399,7 @@ async fn handle_wallet_bootstrap_orca_whirlpool_verify_for_mint(
                 pub_quote_mint.to_string(),
                 base_r,
                 quote_r,
-                cache_slot,
+                0,
             );
             balance_update.metadata = Some(orca_metadata_for_pool_cache_update(&state));
             balance_update.set_dex_readiness_in_metadata(readiness);
@@ -6773,6 +6771,28 @@ mod discovery_tests {
         cache.merge_orca_pool_readiness(pool, DexPoolReadiness::Ready);
         assert!(cache.base_mint_has_explicit_orca_ready_pool(&base_mint));
         assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    /// Bounded wallet bootstrap RPC verify uses `geyser_slot = 0` on JetStream publishes (same contract
+    /// as Raydium/Meteora CPMM bootstrap handlers — not a stale Geyser discovery slot).
+    #[test]
+    fn test_orca_bounded_bootstrap_balance_update_uses_slot_zero_like_cpmm() {
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::new_unique();
+        let bal = PoolCacheUpdate::new_balance_updated(
+            "market-data",
+            BUILD_VERSION,
+            "run-test",
+            pool.to_string(),
+            "orca".to_string(),
+            base.to_string(),
+            quote.to_string(),
+            1_000_000,
+            50_000_000_000,
+            0,
+        );
+        assert_eq!(bal.geyser_slot, 0);
     }
 
     #[test]
