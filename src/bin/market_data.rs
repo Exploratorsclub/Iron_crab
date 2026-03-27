@@ -35,12 +35,13 @@ use ironcrab::ipc::{
     ControlRequestKind, ControlResponse, ControlResponseStatus, DexPoolReadiness, ExecutionResult,
     ExecutionStatus, IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate,
     PriorityFeePercentiles, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY,
-    POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY, POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY,
-    POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY, POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY,
-    POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY, POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY,
-    POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY,
-    POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY,
-    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+    POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY,
+    POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY,
+    POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY,
+    POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY, POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY,
+    POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY,
+    POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::metrics::{
     serve_metrics, set_readiness_control_sub_active, set_readiness_mode,
@@ -87,7 +88,7 @@ const EXECUTION_RESULT_DEDUP_CAPACITY: usize = 4096;
 use ironcrab::execution::live_pool_cache::{
     meteora_cpmm_readiness_for_pool_cache_update, orca_readiness_for_pool_cache_update,
     parse_pool_account, raydium_amm_readiness_for_pool_cache_update, CachedPoolState,
-    LivePoolCache, MeteoraCpmmState, OrcaWhirlpoolState, PumpAmmState, PumpFunState,
+    LivePoolCache, MeteoraCpmmState, MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState,
     RaydiumCpmmState,
 };
 
@@ -183,6 +184,24 @@ fn orca_metadata_for_pool_cache_update(s: &OrcaWhirlpoolState) -> HashMap<String
             p.to_string(),
         );
     }
+    meta
+}
+
+/// Meteora DLMM: vault pubkeys + static pool fields for JetStream / SLAVE bootstrap.
+fn meteora_dlmm_metadata_for_pool_cache_update(s: &MeteoraState) -> HashMap<String, String> {
+    let mut meta = HashMap::new();
+    meta.insert(
+        POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY.to_string(),
+        format!("{},{}", s.reserve_x, s.reserve_y),
+    );
+    meta.insert(
+        POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY.to_string(),
+        s.active_id.to_string(),
+    );
+    meta.insert(
+        POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY.to_string(),
+        s.bin_step.to_string(),
+    );
     meta
 }
 
@@ -3859,6 +3878,20 @@ async fn run_geyser_loop(
                                                 );
                                             }
                                         }
+                                        if vault_info.dex == "meteora_dlmm" {
+                                            if let Some(CachedPoolState::Meteora(ref s)) =
+                                                ctx.live_pool_cache.get(&vault_info.pool_address)
+                                            {
+                                                let mut meta = balance_update
+                                                    .metadata
+                                                    .take()
+                                                    .unwrap_or_default();
+                                                for (k, v) in meteora_dlmm_metadata_for_pool_cache_update(s) {
+                                                    meta.insert(k, v);
+                                                }
+                                                balance_update.metadata = Some(meta);
+                                            }
+                                        }
                                         let subject = pool_subject(&vault_info.pool_address.to_string());
                                         if let Err(e) = nats.jetstream_publish(&subject, &balance_update).await {
                                             warn!(error = %e, "Failed to publish PoolCacheUpdate::BalanceUpdated to JetStream");
@@ -4103,6 +4136,54 @@ async fn run_geyser_loop(
                                     vault_base = %vault_base,
                                     vault_quote = %vault_quote,
                                     "Registered Meteora CPMM vaults for Geyser reserve subscription"
+                                );
+                            }
+                        }
+                    }
+
+                    // Meteora DLMM: register reserve vault ATAs (on-chain token_x / token_y order).
+                    if ctx.config.read().enable_meteora_dlmm {
+                        if let CachedPoolState::Meteora(s) = &cached_state {
+                            let dex_str = "meteora_dlmm".to_string();
+                            let mut vaults_changed = false;
+                            {
+                                let mut vaults = ctx.tracked_vaults.write();
+                                vaults.entry(s.reserve_x).or_insert_with(|| {
+                                    vaults_changed = true;
+                                    VaultInfo {
+                                        pool_address: account_update.pubkey,
+                                        dex: dex_str.clone(),
+                                        base_mint: s.token_x_mint,
+                                        quote_mint: s.token_y_mint,
+                                        is_base_vault: true,
+                                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                                        active_id: Some(s.active_id),
+                                        bin_step: Some(s.bin_step),
+                                    }
+                                });
+                                vaults.entry(s.reserve_y).or_insert_with(|| {
+                                    vaults_changed = true;
+                                    VaultInfo {
+                                        pool_address: account_update.pubkey,
+                                        dex: dex_str,
+                                        base_mint: s.token_x_mint,
+                                        quote_mint: s.token_y_mint,
+                                        is_base_vault: false,
+                                        last_balance: std::sync::atomic::AtomicU64::new(0),
+                                        active_id: Some(s.active_id),
+                                        bin_step: Some(s.bin_step),
+                                    }
+                                });
+                            }
+                            if vaults_changed {
+                                let vault_list: Vec<Pubkey> =
+                                    ctx.tracked_vaults.read().keys().copied().collect();
+                                let _ = ctx.tracked_vaults_tx.send(vault_list);
+                                debug!(
+                                    pool = %account_update.pubkey,
+                                    reserve_x = %s.reserve_x,
+                                    reserve_y = %s.reserve_y,
+                                    "Registered Meteora DLMM vaults for Geyser reserve subscription"
                                 );
                             }
                         }
@@ -4588,7 +4669,10 @@ async fn run_geyser_loop(
                                     readiness,
                                 );
                             }
-                            _ => {}
+                            CachedPoolState::Meteora(s) => {
+                                pool_update.metadata =
+                                    Some(meteora_dlmm_metadata_for_pool_cache_update(s));
+                            }
                         }
                         // P3 #13: Propagate base_decimals and quote_decimals to SLAVE caches (all DEX types)
                         {

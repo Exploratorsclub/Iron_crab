@@ -2424,6 +2424,19 @@ pub const POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY: &str = "orca_protocol_fe
 pub const POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY: &str = "orca_token_a_program";
 pub const POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY: &str = "orca_token_b_program";
 
+/// Meteora DLMM: `reserve_x_vault,reserve_y_vault` (comma-separated base58).
+///
+/// Order matches on-chain LB pair layout (`token_x_mint` / `token_y_mint`), which is the same as
+/// [`PoolCacheUpdate::base_mint`] / [`PoolCacheUpdate::quote_mint`] for Meteora DLMM publishes from
+/// market-data (`token_x` → base, `token_y` → quote).
+pub const POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY: &str = "meteora_dlmm_vaults";
+
+/// Meteora DLMM: active bin id from pool account (decimal string, signed i32).
+pub const POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY: &str = "meteora_dlmm_active_id";
+
+/// Meteora DLMM: bin step from pool account (decimal string, u16).
+pub const POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY: &str = "meteora_dlmm_bin_step";
+
 /// Pool cache update type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
