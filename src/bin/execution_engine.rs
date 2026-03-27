@@ -198,14 +198,15 @@ fn is_orca_structural_sim_error(error_code: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// Cold Path only: PumpFun bonding-curve recovery (`EnsurePumpfunBondingCurve`) is allowed for
-/// kill-switch/liquidation sells **and** explicit manual sell-all tooling (`sell_all=true`).
+/// Cold Path only: DEX structural sim recovery (e.g. PumpFun bonding-curve, Orca Whirlpool) is
+/// allowed for kill-switch/liquidation sells **and** explicit manual sell-all tooling
+/// (`sell_all=true`).
 ///
 /// Rationale: `sell-all` / keyless tooling may tag `sell_all=true` without `purpose=liquidation`;
 /// that path is still Cold Path (not momentum hot path). PumpSwap recovery stays gated on
 /// `is_liquidation_sell` only.
 #[inline]
-fn is_pumpfun_bonding_curve_cold_path_recovery_sell(intent: &TradeIntent) -> bool {
+fn is_cold_path_recovery_sell(intent: &TradeIntent) -> bool {
     if intent.side != TradeSide::Sell {
         return false;
     }
@@ -8574,7 +8575,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         // PumpFun bonding curve SELL: stale virtual/real reserves or cashback layout → 6023/6024/Overflow.
         // Cold-path recovery: EnsurePumpfunBondingCurve with force_refresh (RPC in market-data), bounded JetStream wait, one retry.
         if !pumpfun_bonding_recovery_attempted
-            && is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent)
+            && is_cold_path_recovery_sell(&intent)
             && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pumpfun")
             && intent.resources.pools.len() == 1
             && is_pumpfun_bonding_curve_structural_sim_error(sim_result.error_code.as_deref())
@@ -8650,7 +8651,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         // Orca Whirlpool SELL (liquidation / manual cold path): stale tick or vault evidence →
         // structural sim fail. I-24d: one EnsureOrcaWhirlpoolPoolState + bounded JetStream wait + one retry.
         if !orca_recovery_attempted
-            && is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent)
+            && is_cold_path_recovery_sell(&intent)
             && intent.metadata.get("dex").map(|s| s.as_str()) == Some("orca")
             && intent.resources.pools.len() == 1
             && is_orca_structural_sim_error(sim_result.error_code.as_deref())
@@ -10509,7 +10510,7 @@ async fn spawn_rebroadcast_loop(
 #[cfg(test)]
 mod execution_engine_tests {
     use super::{
-        is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_cold_path_recovery_sell,
+        is_cold_path_recovery_sell, is_pump_amm_structural_sim_error,
         is_pumpfun_bonding_curve_structural_sim_error, is_regular_momentum_hot_path_sell,
         pump_amm_pool_market_hint_merge, record_pump_amm_hot_path_refresh_after_success,
         select_best_route, try_pump_amm_hot_path_refresh_publish,
@@ -10621,7 +10622,7 @@ mod execution_engine_tests {
         intent
             .metadata
             .insert("dex".to_string(), "pumpfun".to_string());
-        assert!(is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent));
+        assert!(is_cold_path_recovery_sell(&intent));
     }
 
     #[test]
@@ -10645,13 +10646,13 @@ mod execution_engine_tests {
         intent
             .metadata
             .insert("purpose".to_string(), "liquidation".to_string());
-        assert!(is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent));
+        assert!(is_cold_path_recovery_sell(&intent));
 
         intent.metadata.remove("purpose");
         intent
             .metadata
             .insert("kill_switch".to_string(), "true".to_string());
-        assert!(is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent));
+        assert!(is_cold_path_recovery_sell(&intent));
     }
 
     #[test]
@@ -10675,7 +10676,7 @@ mod execution_engine_tests {
         intent
             .metadata
             .insert("dex".to_string(), "pumpfun".to_string());
-        assert!(!is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent));
+        assert!(!is_cold_path_recovery_sell(&intent));
     }
 
     #[test]
