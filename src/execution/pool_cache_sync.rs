@@ -538,6 +538,12 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 if update.dex == "orca" {
                     cache.merge_orca_pool_readiness(pool_addr, update.effective_dex_readiness());
                 }
+                if update.dex == "meteora_dlmm" {
+                    cache.merge_meteora_dlmm_pool_readiness(
+                        pool_addr,
+                        update.effective_dex_readiness(),
+                    );
+                }
                 // P3 #13: Propagate base_decimals and quote_decimals to SLAVE cache
                 apply_decimals_from_metadata(cache, update);
                 return true;
@@ -940,6 +946,9 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 }
                 if update.dex == "orca" {
                     cache.merge_orca_pool_readiness(addr, update.effective_dex_readiness());
+                }
+                if update.dex == "meteora_dlmm" {
+                    cache.merge_meteora_dlmm_pool_readiness(addr, update.effective_dex_readiness());
                 }
                 // P3 #13: Apply decimals from metadata when present (e.g. BalanceUpdated with metadata)
                 apply_decimals_from_metadata(cache, update);
@@ -2260,6 +2269,59 @@ mod tests {
         );
         assert_eq!(
             cache.meteora_cpmm_readiness(&pool),
+            Some(DexPoolReadiness::Ready)
+        );
+    }
+
+    #[test]
+    fn test_meteora_dlmm_readiness_merge_never_downgrades() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+
+        let mut ready_up = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "meteora_dlmm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            1,
+        );
+        ready_up.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
+        assert!(apply_pool_cache_update(&cache, &ready_up));
+        assert!(cache.meteora_dlmm_pool_explicitly_ready(&pool));
+        assert_eq!(
+            cache.meteora_dlmm_readiness(&pool),
+            Some(DexPoolReadiness::Ready)
+        );
+
+        let mut weak = PoolCacheUpdate::new_pool_discovered(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "meteora_dlmm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1,
+            1,
+            None,
+            2,
+        );
+        weak.set_dex_readiness_in_metadata(DexPoolReadiness::Observed);
+        assert!(apply_pool_cache_update(&cache, &weak));
+        assert!(
+            cache.meteora_dlmm_pool_explicitly_ready(&pool),
+            "merge must not downgrade Ready to Observed for Meteora DLMM"
+        );
+        assert_eq!(
+            cache.meteora_dlmm_readiness(&pool),
             Some(DexPoolReadiness::Ready)
         );
     }

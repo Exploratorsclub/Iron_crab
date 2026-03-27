@@ -282,6 +282,29 @@ pub fn meteora_cpmm_readiness_for_pool_cache_update(s: &MeteoraCpmmState) -> Dex
     }
 }
 
+/// JetStream / MASTER [`DexPoolReadiness`] for Meteora DLMM (conservative, explicit).
+///
+/// `Ready` only when **both** reserve vault pubkeys are non-default (real on-chain vaults from the LB
+/// pair) **and** both vault balances are known and non-zero — matching quote/builder needs for
+/// believable two-sided liquidity. `active_id` / `bin_step` are **not** part of readiness (legitimate
+/// zero values must not block `Ready` after the Scope 16 shape fix).
+#[must_use]
+pub fn meteora_dlmm_readiness_for_pool_cache_update(s: &MeteoraState) -> DexPoolReadiness {
+    let real_vaults = s.reserve_x != Pubkey::default() && s.reserve_y != Pubkey::default();
+    let rx = s.reserve_x_balance;
+    let ry = s.reserve_y_balance;
+    let ready_reserves = matches!((rx, ry), (Some(a), Some(b)) if a > 0 && b > 0);
+    let any_reserve_signal =
+        rx.map(|v| v > 0).unwrap_or(false) || ry.map(|v| v > 0).unwrap_or(false);
+    if real_vaults && ready_reserves {
+        DexPoolReadiness::Ready
+    } else if real_vaults || any_reserve_signal {
+        DexPoolReadiness::Partial
+    } else {
+        DexPoolReadiness::Observed
+    }
+}
+
 // ============================================================================
 // Unified cached pool state enum
 // ============================================================================
@@ -405,6 +428,9 @@ pub struct LivePoolCache {
 
     /// Orca Whirlpool pool address → explicit [`DexPoolReadiness`] from JetStream / MASTER (Bug #36).
     orca_readiness_by_pool: DashMap<Pubkey, DexPoolReadiness>,
+
+    /// Meteora DLMM pool address → explicit [`DexPoolReadiness`] from JetStream / MASTER (Bug #36).
+    meteora_dlmm_readiness_by_pool: DashMap<Pubkey, DexPoolReadiness>,
 }
 
 /// Which vault position (A/B or X/Y or 0/1) this vault represents
@@ -440,6 +466,7 @@ impl LivePoolCache {
             raydium_amm_readiness_by_pool: DashMap::new(),
             meteora_cpmm_readiness_by_pool: DashMap::new(),
             orca_readiness_by_pool: DashMap::new(),
+            meteora_dlmm_readiness_by_pool: DashMap::new(),
         }
     }
 
@@ -1041,6 +1068,14 @@ impl LivePoolCache {
             .or_insert(incoming);
     }
 
+    /// Merge Meteora DLMM pool readiness for `pool` (monotonic — never downgrade).
+    pub fn merge_meteora_dlmm_pool_readiness(&self, pool: Pubkey, incoming: DexPoolReadiness) {
+        self.meteora_dlmm_readiness_by_pool
+            .entry(pool)
+            .and_modify(|stored| *stored = stored.merge(incoming))
+            .or_insert(incoming);
+    }
+
     /// `true` only when JetStream merge recorded [`DexPoolReadiness::Ready`] for this Raydium CPMM pool.
     #[must_use]
     pub fn raydium_cpmm_pool_explicitly_ready(&self, pool: &Pubkey) -> bool {
@@ -1099,6 +1134,38 @@ impl LivePoolCache {
     #[must_use]
     pub fn orca_readiness(&self, pool: &Pubkey) -> Option<DexPoolReadiness> {
         self.orca_readiness_by_pool.get(pool).map(|r| *r)
+    }
+
+    /// `true` only when JetStream merge recorded [`DexPoolReadiness::Ready`] for this Meteora DLMM pool.
+    #[must_use]
+    pub fn meteora_dlmm_pool_explicitly_ready(&self, pool: &Pubkey) -> bool {
+        self.meteora_dlmm_readiness_by_pool
+            .get(pool)
+            .map(|r| *r == DexPoolReadiness::Ready)
+            .unwrap_or(false)
+    }
+
+    /// Monotonic merge result for this Meteora DLMM pool (tests / diagnostics).
+    #[must_use]
+    pub fn meteora_dlmm_readiness(&self, pool: &Pubkey) -> Option<DexPoolReadiness> {
+        self.meteora_dlmm_readiness_by_pool.get(pool).map(|r| *r)
+    }
+
+    /// Mint-level helper: Meteora DLMM slice — explicit `Ready` only (no cache-hit heuristic).
+    #[must_use]
+    pub fn base_mint_has_explicit_meteora_dlmm_ready_pool(&self, base_mint: &Pubkey) -> bool {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::Meteora(s) = &entry.value().state {
+                if s.token_x_mint != *base_mint && s.token_y_mint != *base_mint {
+                    continue;
+                }
+                let pool = entry.key();
+                if self.meteora_dlmm_pool_explicitly_ready(pool) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Mint-level helper: Raydium CPMM slice — explicit `Ready` only (no cache-hit heuristic).
@@ -1318,11 +1385,10 @@ impl LivePoolCache {
     ///   [`DexPoolReadiness::Ready`] in [`Self::raydium_amm_readiness_by_pool`] only.
     /// - Meteora CPMM: [`Self::base_mint_has_explicit_meteora_cpmm_ready_pool`] — explicit
     ///   [`DexPoolReadiness::Ready`] in [`Self::meteora_cpmm_readiness_by_pool`] only.
+    /// - Meteora DLMM: [`Self::base_mint_has_explicit_meteora_dlmm_ready_pool`] — explicit
+    ///   [`DexPoolReadiness::Ready`] in [`Self::meteora_dlmm_readiness_by_pool`] only.
     /// - Orca Whirlpool: [`Self::base_mint_has_explicit_orca_ready_pool`] — explicit
     ///   [`DexPoolReadiness::Ready`] in [`Self::orca_readiness_by_pool`] only.
-    ///
-    /// **Conservative:** Meteora DLMM and other DEXes are **not** treated as ready here until they
-    /// have an explicit readiness path.
     #[must_use]
     pub fn base_mint_has_any_ready_pool(&self, base_mint: &Pubkey) -> bool {
         if self.base_mint_has_explicit_pump_amm_ready_pool(base_mint) {
@@ -1332,6 +1398,9 @@ impl LivePoolCache {
             return true;
         }
         if self.base_mint_has_explicit_meteora_cpmm_ready_pool(base_mint) {
+            return true;
+        }
+        if self.base_mint_has_explicit_meteora_dlmm_ready_pool(base_mint) {
             return true;
         }
         if self.base_mint_has_explicit_orca_ready_pool(base_mint) {
@@ -2996,6 +3065,184 @@ mod tests {
         cache.merge_meteora_cpmm_pool_readiness(pool, DexPoolReadiness::Ready);
         assert!(cache.base_mint_has_any_ready_pool(&base_mint));
         cache.merge_meteora_cpmm_pool_readiness(pool, DexPoolReadiness::Observed);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_meteora_dlmm_state(
+        token_x_mint: Pubkey,
+        token_y_mint: Pubkey,
+        reserve_x: Pubkey,
+        reserve_y: Pubkey,
+        active_id: i32,
+        bin_step: u16,
+        reserve_x_balance: Option<u64>,
+        reserve_y_balance: Option<u64>,
+    ) -> MeteoraState {
+        MeteoraState {
+            token_x_mint,
+            token_y_mint,
+            reserve_x,
+            reserve_y,
+            active_id,
+            bin_step,
+            reserve_x_balance,
+            reserve_y_balance,
+        }
+    }
+
+    #[test]
+    fn test_meteora_dlmm_readiness_helper_weak_default_vaults_observed() {
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::new_unique();
+        let s = make_meteora_dlmm_state(
+            base,
+            quote,
+            Pubkey::default(),
+            Pubkey::default(),
+            0,
+            0,
+            None,
+            None,
+        );
+        assert_eq!(
+            meteora_dlmm_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Observed
+        );
+    }
+
+    #[test]
+    fn test_meteora_dlmm_readiness_helper_ready_with_zero_active_id_and_bin_step() {
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::new_unique();
+        let vx = Pubkey::new_unique();
+        let vy = Pubkey::new_unique();
+        let s = make_meteora_dlmm_state(base, quote, vx, vy, 0, 0, Some(100), Some(200));
+        assert_eq!(
+            meteora_dlmm_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn test_meteora_dlmm_readiness_helper_real_vaults_incomplete_balances_partial() {
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::new_unique();
+        let vx = Pubkey::new_unique();
+        let vy = Pubkey::new_unique();
+        let s = make_meteora_dlmm_state(base, quote, vx, vy, -5, 0, Some(1), None);
+        assert_eq!(
+            meteora_dlmm_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Partial
+        );
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_meteora_dlmm_cache_hit_without_explicit_merge_is_false() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let vx = Pubkey::new_unique();
+        let vy = Pubkey::new_unique();
+        cache.upsert(
+            pool,
+            CachedPoolState::Meteora(make_meteora_dlmm_state(
+                base_mint,
+                quote_mint,
+                vx,
+                vy,
+                0,
+                0,
+                Some(100),
+                Some(200),
+            )),
+            100,
+        );
+        assert!(
+            !cache.base_mint_has_any_ready_pool(&base_mint),
+            "Bug #36: DLMM row in cache must not imply mint-level ready without explicit merge"
+        );
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_meteora_dlmm_explicit_ready() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let vx = Pubkey::new_unique();
+        let vy = Pubkey::new_unique();
+        cache.upsert(
+            pool,
+            CachedPoolState::Meteora(make_meteora_dlmm_state(
+                base_mint,
+                quote_mint,
+                vx,
+                vy,
+                0,
+                0,
+                Some(1),
+                Some(2),
+            )),
+            100,
+        );
+        cache.merge_meteora_dlmm_pool_readiness(pool, DexPoolReadiness::Ready);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+        assert!(cache.base_mint_has_explicit_meteora_dlmm_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_meteora_dlmm_partial_does_not_count() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let vx = Pubkey::new_unique();
+        let vy = Pubkey::new_unique();
+        cache.upsert(
+            pool,
+            CachedPoolState::Meteora(make_meteora_dlmm_state(
+                base_mint,
+                quote_mint,
+                vx,
+                vy,
+                0,
+                0,
+                Some(1),
+                Some(2),
+            )),
+            100,
+        );
+        cache.merge_meteora_dlmm_pool_readiness(pool, DexPoolReadiness::Partial);
+        assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_meteora_dlmm_readiness_merge_monotone() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let vx = Pubkey::new_unique();
+        let vy = Pubkey::new_unique();
+        cache.upsert(
+            pool,
+            CachedPoolState::Meteora(make_meteora_dlmm_state(
+                base_mint,
+                quote_mint,
+                vx,
+                vy,
+                0,
+                0,
+                Some(1),
+                Some(2),
+            )),
+            100,
+        );
+        cache.merge_meteora_dlmm_pool_readiness(pool, DexPoolReadiness::Ready);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+        cache.merge_meteora_dlmm_pool_readiness(pool, DexPoolReadiness::Observed);
         assert!(cache.base_mint_has_any_ready_pool(&base_mint));
     }
 

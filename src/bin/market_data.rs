@@ -86,10 +86,10 @@ const EXECUTION_RESULT_DEDUP_CAPACITY: usize = 4096;
 
 // LivePoolCache - MASTER Cache (Single Source of Truth)
 use ironcrab::execution::live_pool_cache::{
-    meteora_cpmm_readiness_for_pool_cache_update, orca_readiness_for_pool_cache_update,
-    parse_pool_account, raydium_amm_readiness_for_pool_cache_update, CachedPoolState,
-    LivePoolCache, MeteoraCpmmState, MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState,
-    RaydiumCpmmState,
+    meteora_cpmm_readiness_for_pool_cache_update, meteora_dlmm_readiness_for_pool_cache_update,
+    orca_readiness_for_pool_cache_update, parse_pool_account,
+    raydium_amm_readiness_for_pool_cache_update, CachedPoolState, LivePoolCache, MeteoraCpmmState,
+    MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState, RaydiumCpmmState,
 };
 
 // P1 Crash Isolation: Systemd Watchdog support
@@ -3890,6 +3890,13 @@ async fn run_geyser_loop(
                                                     meta.insert(k, v);
                                                 }
                                                 balance_update.metadata = Some(meta);
+                                                let readiness =
+                                                    meteora_dlmm_readiness_for_pool_cache_update(s);
+                                                balance_update.set_dex_readiness_in_metadata(readiness);
+                                                ctx.live_pool_cache.merge_meteora_dlmm_pool_readiness(
+                                                    vault_info.pool_address,
+                                                    readiness,
+                                                );
                                             }
                                         }
                                         let subject = pool_subject(&vault_info.pool_address.to_string());
@@ -4672,6 +4679,12 @@ async fn run_geyser_loop(
                             CachedPoolState::Meteora(s) => {
                                 pool_update.metadata =
                                     Some(meteora_dlmm_metadata_for_pool_cache_update(s));
+                                let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
+                                pool_update.set_dex_readiness_in_metadata(readiness);
+                                ctx.live_pool_cache.merge_meteora_dlmm_pool_readiness(
+                                    account_update.pubkey,
+                                    readiness,
+                                );
                             }
                         }
                         // P3 #13: Propagate base_decimals and quote_decimals to SLAVE caches (all DEX types)
