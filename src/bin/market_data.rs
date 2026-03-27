@@ -2309,8 +2309,8 @@ async fn publish_wallet_snapshot(
     }
 
     // 4a) Bounded cold-path verification for wallet non-zero mints without explicit Ready
-    // (PumpSwap, then PumpFun, then cache-scoped Raydium CPMM); reuses I-24d handlers + JetStream
-    // — no hot-path RPC.
+    // (PumpSwap, PumpFun, Raydium CPMM, Meteora CPMM, Orca, Meteora DLMM — cache-scoped where applicable);
+    // reuses I-24d handlers + JetStream — no hot-path RPC.
     run_bounded_wallet_dex_bootstrap_verify(
         ctx,
         rpc,
@@ -2321,9 +2321,9 @@ async fn publish_wallet_snapshot(
     )
     .await;
 
-    // 4b) Cold-path inventory: count wallet-held mints where LivePoolCache reports explicit
-    // readiness only — PumpSwap: merge_pump_amm_pool_accounts_readiness(Ready); PumpFun:
-    // merge_pumpfun_bonding_readiness(Ready). No legacy PumpSwap heuristic / snapshot completeness.
+    // 4b) Cold-path inventory: count wallet-held mints where [`LivePoolCache::base_mint_has_any_ready_pool`]
+    // is true (explicit Ready merge per slice: PumpSwap, PumpFun bonding, Raydium CPMM, Meteora CPMM,
+    // Meteora DLMM, Orca, Raydium AMM). No legacy PumpSwap heuristic / snapshot completeness.
     let mut wallet_mints_explicit_ready_count: usize = 0;
     for mint_str in &mints_in_wallet {
         if let Ok(pk) = Pubkey::from_str(mint_str) {
@@ -2331,7 +2331,7 @@ async fn publish_wallet_snapshot(
                 wallet_mints_explicit_ready_count += 1;
                 debug!(
                     mint = %mint_str,
-                    "wallet mint: explicit DexPoolReadiness::Ready (PumpSwap / PumpFun / Raydium CPMM / Meteora CPMM / Orca / Raydium AMM)"
+                    "wallet mint: explicit DexPoolReadiness::Ready (PumpSwap / PumpFun / Raydium CPMM / Meteora CPMM / Meteora DLMM / Orca / Raydium AMM)"
                 );
             }
         }
@@ -2341,7 +2341,7 @@ async fn publish_wallet_snapshot(
             wallet = %wallet_str,
             wallet_mints_explicit_ready_count,
             nonzero_wallet_mints = mints_in_wallet.len(),
-            "Wallet snapshot: mints with explicit Ready merge (PumpSwap / PumpFun / Raydium CPMM / Meteora CPMM / Orca / Raydium AMM); excludes legacy PumpSwap effective-ready"
+            "Wallet snapshot: mints with explicit Ready merge (PumpSwap / PumpFun / Raydium CPMM / Meteora CPMM / Meteora DLMM / Orca / Raydium AMM); excludes legacy PumpSwap effective-ready"
         );
     }
 
