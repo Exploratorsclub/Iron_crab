@@ -183,9 +183,19 @@ fn is_pumpfun_bonding_curve_structural_sim_error(error_code: Option<&str>) -> bo
 }
 
 /// Orca Whirlpool: structural sim failure signatures (stale tick/vault layout family).
+/// Cold-path recovery matcher; keep **separate** from PumpFun — same numeric strings today, different
+/// programs (independent evolution).
 #[inline]
 fn is_orca_structural_sim_error(error_code: Option<&str>) -> bool {
-    is_pumpfun_bonding_curve_structural_sim_error(error_code)
+    error_code
+        .map(|e| {
+            e.contains("6023")
+                || e.contains("6024")
+                || e.contains("Overflow")
+                || e.contains("0x1787")
+                || e.contains("0x1788")
+        })
+        .unwrap_or(false)
 }
 
 /// Cold Path only: PumpFun bonding-curve recovery (`EnsurePumpfunBondingCurve`) is allowed for
@@ -1542,10 +1552,7 @@ async fn wait_for_orca_whirlpool_slave_after_recovery(
                 s.vault_a_balance.unwrap_or(0),
                 s.vault_b_balance.unwrap_or(0),
             );
-            if merged == DexPoolReadiness::Ready
-                && cache.orca_pool_explicitly_ready(pool)
-                && Some(after) != before
-            {
+            if merged == DexPoolReadiness::Ready && Some(after) != before {
                 return true;
             }
         }
