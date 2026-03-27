@@ -702,10 +702,10 @@ fn wallet_mints_needing_dex_bootstrap_verify(
     out
 }
 
-/// Cold-path only: bounded PumpSwap, then PumpFun, then Raydium CPMM, then Meteora CPMM
-/// (cache-scoped) for wallet-relevant mints without explicit Ready. Reuses
+/// Cold-path only: bounded PumpSwap, then PumpFun, then Raydium CPMM, then Meteora CPMM, then Orca
+/// Whirlpool (cache-scoped) for wallet-relevant mints without explicit Ready. Reuses
 /// [`handle_ensure_pump_amm_pool_accounts`], [`handle_ensure_pumpfun_bonding_curve`], and the same
-/// JetStream `PoolCacheUpdate` path as Geyser for Raydium/Meteora CPMM. Skips periodic snapshots.
+/// JetStream `PoolCacheUpdate` path as Geyser for Raydium/Meteora CPMM/Orca. Skips periodic snapshots.
 async fn run_bounded_wallet_dex_bootstrap_verify(
     ctx: &MarketDataContext,
     rpc: &Arc<SolanaRpc>,
@@ -732,7 +732,7 @@ async fn run_bounded_wallet_dex_bootstrap_verify(
         count = candidates.len(),
         grace_ms = WALLET_BOOTSTRAP_DEX_VERIFY_GRACE_MS,
         max_mints = WALLET_BOOTSTRAP_DEX_VERIFY_MAX_MINTS,
-        "Wallet bootstrap: bounded DEX readiness verification (PumpSwap, PumpFun, Raydium CPMM, Meteora CPMM if still not ready)"
+        "Wallet bootstrap: bounded DEX readiness verification (PumpSwap, PumpFun, Raydium CPMM, Meteora CPMM, Orca Whirlpool if still not ready)"
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(
@@ -804,6 +804,22 @@ async fn run_bounded_wallet_dex_bootstrap_verify(
                 rpc,
                 run_id,
                 &request_id_mc,
+                &pk,
+            )
+            .await;
+        }
+
+        if ctx.live_pool_cache.base_mint_has_any_ready_pool(&pk) {
+            continue;
+        }
+
+        if ctx.config.read().enable_orca {
+            let request_id_ow = format!("wallet_bootstrap_orca_{}", Uuid::new_v4());
+            handle_wallet_bootstrap_orca_whirlpool_verify_for_mint(
+                ctx,
+                rpc,
+                run_id,
+                &request_id_ow,
                 &pk,
             )
             .await;
@@ -1223,6 +1239,210 @@ async fn handle_wallet_bootstrap_meteora_cpmm_verify_for_mint(
                 request_id = %request_id,
                 pool = %pool_addr,
                 "Wallet bootstrap Meteora CPMM: MASTER cache updated but JetStream publish failed — SSOT drift risk"
+            );
+        }
+    }
+}
+
+/// Cold-path only: Orca Whirlpool promotion for one wallet mint. Uses **only** pools already present
+/// in [`LivePoolCache`] (from Geyser); no `getProgramAccounts` / global scan. RPC: per-pool
+/// `get_account` + per-vault balance reads — bounded by the number of matching cache rows.
+///
+/// Publishes [`PoolCacheUpdate`] with [`orca_readiness_for_pool_cache_update`] and
+/// [`orca_metadata_for_pool_cache_update`] like the Geyser path.
+async fn handle_wallet_bootstrap_orca_whirlpool_verify_for_mint(
+    ctx: &MarketDataContext,
+    rpc: &Arc<SolanaRpc>,
+    run_id: &str,
+    request_id: &str,
+    base_mint: &Pubkey,
+) {
+    if ctx
+        .live_pool_cache
+        .base_mint_has_explicit_orca_ready_pool(base_mint)
+    {
+        debug!(
+            request_id = %request_id,
+            mint = %base_mint,
+            "Wallet bootstrap Orca Whirlpool: already explicit Ready for this mint, skip"
+        );
+        return;
+    }
+
+    let pools = ctx.live_pool_cache.orca_whirlpool_pools_for_mint(base_mint);
+    if pools.is_empty() {
+        debug!(
+            request_id = %request_id,
+            mint = %base_mint,
+            "Wallet bootstrap Orca Whirlpool: no Whirlpool pool rows in LivePoolCache for mint, skip RPC"
+        );
+        return;
+    }
+
+    info!(
+        request_id = %request_id,
+        mint = %base_mint,
+        pools = pools.len(),
+        "Wallet bootstrap Orca Whirlpool: verifying cache-scoped pools (cold-path RPC, no global scan)"
+    );
+
+    let orca_program = Pubkey::from_str(ORCA_WHIRLPOOL).expect("ORCA_WHIRLPOOL constant");
+
+    for (pool_addr, mut state) in pools {
+        if ctx.live_pool_cache.base_mint_has_any_ready_pool(base_mint) {
+            break;
+        }
+        if ctx
+            .live_pool_cache
+            .base_mint_has_explicit_orca_ready_pool(base_mint)
+        {
+            break;
+        }
+
+        let pool_acc = match rpc.get_account_opt_retry(&pool_addr).await {
+            Ok(Some(acc)) => acc,
+            Ok(None) | Err(_) => {
+                debug!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    "Wallet bootstrap Orca Whirlpool: pool account fetch miss, skip"
+                );
+                continue;
+            }
+        };
+
+        let parsed_state = match parse_pool_account(&orca_program, &pool_acc.data) {
+            Some(CachedPoolState::Orca(s)) => s,
+            _ => {
+                debug!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    data_len = pool_acc.data.len(),
+                    "Wallet bootstrap Orca Whirlpool: parse pool failed, skip"
+                );
+                continue;
+            }
+        };
+
+        state.token_mint_a = parsed_state.token_mint_a;
+        state.token_mint_b = parsed_state.token_mint_b;
+        state.token_vault_a = parsed_state.token_vault_a;
+        state.token_vault_b = parsed_state.token_vault_b;
+        state.tick_current_index = parsed_state.tick_current_index;
+        state.sqrt_price = parsed_state.sqrt_price;
+        state.liquidity = parsed_state.liquidity;
+        state.fee_rate = parsed_state.fee_rate;
+        state.protocol_fee_rate = parsed_state.protocol_fee_rate;
+        state.tick_spacing = parsed_state.tick_spacing;
+
+        if state.token_mint_a != *base_mint && state.token_mint_b != *base_mint {
+            continue;
+        }
+
+        let vault_a = state.token_vault_a;
+        let vault_b = state.token_vault_b;
+        let bal_a = match rpc.get_account_opt_retry(&vault_a).await {
+            Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
+            _ => None,
+        };
+        let bal_b = match rpc.get_account_opt_retry(&vault_b).await {
+            Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
+            _ => None,
+        };
+        let (ba, bb) = match (bal_a, bal_b) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                debug!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    "Wallet bootstrap Orca Whirlpool: vault balance RPC incomplete, skip"
+                );
+                continue;
+            }
+        };
+
+        state.vault_a_balance = Some(ba);
+        state.vault_b_balance = Some(bb);
+
+        let cache_slot = ctx
+            .live_pool_cache
+            .get_with_metadata(&pool_addr)
+            .map(|(_, slot, _)| slot)
+            .unwrap_or(0);
+
+        ctx.live_pool_cache
+            .upsert(pool_addr, CachedPoolState::Orca(state.clone()), cache_slot);
+
+        let readiness = orca_readiness_for_pool_cache_update(&state);
+        ctx.live_pool_cache
+            .merge_orca_pool_readiness(pool_addr, readiness);
+
+        if readiness == DexPoolReadiness::Observed {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                mint = %base_mint,
+                "Wallet bootstrap Orca Whirlpool: still Observed after RPC, no JetStream publish"
+            );
+            continue;
+        }
+
+        let (pub_base_mint, pub_quote_mint, base_r, quote_r) =
+            (state.token_mint_a, state.token_mint_b, ba, bb);
+
+        let jetstream_ok = if let Some(ref nats) = ctx.nats {
+            let mut balance_update = PoolCacheUpdate::new_balance_updated(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                pool_addr.to_string(),
+                "orca".to_string(),
+                pub_base_mint.to_string(),
+                pub_quote_mint.to_string(),
+                base_r,
+                quote_r,
+                cache_slot,
+            );
+            balance_update.metadata = Some(orca_metadata_for_pool_cache_update(&state));
+            balance_update.set_dex_readiness_in_metadata(readiness);
+            let subject = pool_subject(&pool_addr.to_string());
+            match nats.jetstream_publish(&subject, &balance_update).await {
+                Ok(true) => {
+                    info!(
+                        request_id = %request_id,
+                        pool = %pool_addr,
+                        mint = %base_mint,
+                        readiness = ?readiness,
+                        "Wallet bootstrap Orca Whirlpool: published PoolCacheUpdate::BalanceUpdated to JetStream"
+                    );
+                    true
+                }
+                Ok(false) => {
+                    warn!(
+                        request_id = %request_id,
+                        pool = %pool_addr,
+                        "Wallet bootstrap Orca Whirlpool: JetStream publish failed (timeout or drop)"
+                    );
+                    false
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        request_id = %request_id,
+                        "Wallet bootstrap Orca Whirlpool: Failed to publish PoolCacheUpdate to JetStream"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if !jetstream_ok {
+            warn!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                "Wallet bootstrap Orca Whirlpool: MASTER cache updated but JetStream publish failed — SSOT drift risk"
             );
         }
     }
@@ -6447,6 +6667,112 @@ mod discovery_tests {
         let rows = cache.meteora_cpmm_pools_for_mint(&m);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, p1);
+    }
+
+    #[test]
+    fn test_live_pool_cache_orca_whirlpool_pools_for_mint_bounded_to_cache() {
+        let cache = LivePoolCache::new();
+        let m = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let p1 = Pubkey::new_unique();
+        let p2 = Pubkey::new_unique();
+        let p3 = Pubkey::new_unique();
+        let on_a = OrcaWhirlpoolState {
+            token_mint_a: m,
+            token_mint_b: other,
+            token_vault_a: Pubkey::new_unique(),
+            token_vault_b: Pubkey::new_unique(),
+            tick_current_index: 0,
+            sqrt_price: 1u128 << 64,
+            liquidity: 1,
+            fee_rate: 3000,
+            protocol_fee_rate: 300,
+            tick_spacing: 64,
+            vault_a_balance: None,
+            vault_b_balance: None,
+            token_a_program: None,
+            token_b_program: None,
+        };
+        cache.upsert(p1, CachedPoolState::Orca(on_a), 0);
+        let on_b = OrcaWhirlpoolState {
+            token_mint_a: other,
+            token_mint_b: m,
+            token_vault_a: Pubkey::new_unique(),
+            token_vault_b: Pubkey::new_unique(),
+            tick_current_index: 0,
+            sqrt_price: 1u128 << 64,
+            liquidity: 1,
+            fee_rate: 3000,
+            protocol_fee_rate: 300,
+            tick_spacing: 64,
+            vault_a_balance: None,
+            vault_b_balance: None,
+            token_a_program: None,
+            token_b_program: None,
+        };
+        cache.upsert(p2, CachedPoolState::Orca(on_b), 0);
+        cache.upsert(
+            p3,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: other,
+                token_mint_b: other,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: 0,
+                sqrt_price: 1u128 << 64,
+                liquidity: 1,
+                fee_rate: 3000,
+                protocol_fee_rate: 300,
+                tick_spacing: 64,
+                vault_a_balance: None,
+                vault_b_balance: None,
+                token_a_program: None,
+                token_b_program: None,
+            }),
+            0,
+        );
+        let rows = cache.orca_whirlpool_pools_for_mint(&m);
+        assert_eq!(rows.len(), 2);
+        let addrs: Vec<Pubkey> = rows.iter().map(|(a, _)| *a).collect();
+        assert!(addrs.contains(&p1));
+        assert!(addrs.contains(&p2));
+        assert!(!addrs.contains(&p3));
+    }
+
+    #[test]
+    fn test_orca_wallet_bootstrap_ready_path_requires_explicit_merge_not_cache_row() {
+        let cache = LivePoolCache::new();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let s = OrcaWhirlpoolState {
+            token_mint_a: base_mint,
+            token_mint_b: quote_mint,
+            token_vault_a: Pubkey::new_unique(),
+            token_vault_b: Pubkey::new_unique(),
+            tick_current_index: -42,
+            sqrt_price: 1u128 << 64,
+            liquidity: 1_000_000,
+            fee_rate: 3000,
+            protocol_fee_rate: 300,
+            tick_spacing: 64,
+            vault_a_balance: Some(1_000_000),
+            vault_b_balance: Some(50_000_000_000),
+            token_a_program: None,
+            token_b_program: None,
+        };
+        assert_eq!(
+            orca_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Ready
+        );
+        cache.upsert(pool, CachedPoolState::Orca(s), 100);
+        assert!(
+            !cache.base_mint_has_any_ready_pool(&base_mint),
+            "Orca cache row with full reserves must not imply mint-level ready without explicit merge"
+        );
+        cache.merge_orca_pool_readiness(pool, DexPoolReadiness::Ready);
+        assert!(cache.base_mint_has_explicit_orca_ready_pool(&base_mint));
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
     }
 
     #[test]
