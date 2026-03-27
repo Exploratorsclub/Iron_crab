@@ -538,6 +538,12 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 if update.dex == "orca" {
                     cache.merge_orca_pool_readiness(pool_addr, update.effective_dex_readiness());
                 }
+                if update.dex == "meteora_dlmm" {
+                    cache.merge_meteora_dlmm_pool_readiness(
+                        pool_addr,
+                        update.effective_dex_readiness(),
+                    );
+                }
                 // P3 #13: Propagate base_decimals and quote_decimals to SLAVE cache
                 apply_decimals_from_metadata(cache, update);
                 return true;
@@ -940,6 +946,9 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 }
                 if update.dex == "orca" {
                     cache.merge_orca_pool_readiness(addr, update.effective_dex_readiness());
+                }
+                if update.dex == "meteora_dlmm" {
+                    cache.merge_meteora_dlmm_pool_readiness(addr, update.effective_dex_readiness());
                 }
                 // P3 #13: Apply decimals from metadata when present (e.g. BalanceUpdated with metadata)
                 apply_decimals_from_metadata(cache, update);
