@@ -669,7 +669,7 @@ fn try_parse_token_account_balance(data: &[u8]) -> Option<u64> {
 
 /// Wallet `mints_in_wallet` are non-zero balances from bootstrap RPC; pick at most `max_mints`
 /// unique pubkeys that still lack explicit Ready for any modeled slice per
-/// [`LivePoolCache::base_mint_has_any_ready_pool`] (PumpSwap, PumpFun, Raydium CPMM, Meteora CPMM,
+/// [`LivePoolCache::base_mint_has_any_ready_pool`] (PumpSwap, PumpFun, Raydium CPMM, Meteora CPMM, Meteora DLMM,
 /// Orca Whirlpool, Raydium AMM). Preserves iteration order; skips WSOL.
 fn wallet_mints_needing_dex_bootstrap_verify(
     cache: &LivePoolCache,
@@ -703,9 +703,9 @@ fn wallet_mints_needing_dex_bootstrap_verify(
 }
 
 /// Cold-path only: bounded PumpSwap, then PumpFun, then Raydium CPMM, then Meteora CPMM, then Orca
-/// Whirlpool (cache-scoped) for wallet-relevant mints without explicit Ready. Reuses
+/// Whirlpool, then Meteora DLMM (cache-scoped) for wallet-relevant mints without explicit Ready. Reuses
 /// [`handle_ensure_pump_amm_pool_accounts`], [`handle_ensure_pumpfun_bonding_curve`], and the same
-/// JetStream `PoolCacheUpdate` path as Geyser for Raydium/Meteora CPMM/Orca. Skips periodic snapshots.
+/// JetStream `PoolCacheUpdate` path as Geyser for Raydium/Meteora CPMM/Orca/DLMM. Skips periodic snapshots.
 async fn run_bounded_wallet_dex_bootstrap_verify(
     ctx: &MarketDataContext,
     rpc: &Arc<SolanaRpc>,
@@ -732,7 +732,7 @@ async fn run_bounded_wallet_dex_bootstrap_verify(
         count = candidates.len(),
         grace_ms = WALLET_BOOTSTRAP_DEX_VERIFY_GRACE_MS,
         max_mints = WALLET_BOOTSTRAP_DEX_VERIFY_MAX_MINTS,
-        "Wallet bootstrap: bounded DEX readiness verification (PumpSwap, PumpFun, Raydium CPMM, Meteora CPMM, Orca Whirlpool if still not ready)"
+        "Wallet bootstrap: bounded DEX readiness verification (PumpSwap, PumpFun, Raydium CPMM, Meteora CPMM, Orca Whirlpool, Meteora DLMM if still not ready)"
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(
@@ -820,6 +820,22 @@ async fn run_bounded_wallet_dex_bootstrap_verify(
                 rpc,
                 run_id,
                 &request_id_ow,
+                &pk,
+            )
+            .await;
+        }
+
+        if ctx.live_pool_cache.base_mint_has_any_ready_pool(&pk) {
+            continue;
+        }
+
+        if ctx.config.read().enable_meteora_dlmm {
+            let request_id_dlmm = format!("wallet_bootstrap_meteora_dlmm_{}", Uuid::new_v4());
+            handle_wallet_bootstrap_meteora_dlmm_verify_for_mint(
+                ctx,
+                rpc,
+                run_id,
+                &request_id_dlmm,
                 &pk,
             )
             .await;
@@ -1441,6 +1457,203 @@ async fn handle_wallet_bootstrap_orca_whirlpool_verify_for_mint(
                 request_id = %request_id,
                 pool = %pool_addr,
                 "Wallet bootstrap Orca Whirlpool: MASTER cache updated but JetStream publish failed — SSOT drift risk"
+            );
+        }
+    }
+}
+
+/// Cold-path only: Meteora DLMM promotion for one wallet mint. Uses **only** pools already present
+/// in [`LivePoolCache`] (from Geyser); no `getProgramAccounts` / global scan. RPC: per-pool
+/// `get_account` (LB pair) + per-reserve-vault balance reads — bounded by matching cache rows.
+///
+/// Publishes [`PoolCacheUpdate`] with [`meteora_dlmm_metadata_for_pool_cache_update`] and
+/// [`meteora_dlmm_readiness_for_pool_cache_update`] like the Geyser path.
+///
+/// **Slot:** `geyser_slot = 0` on [`LivePoolCache::upsert`] and [`PoolCacheUpdate::new_balance_updated`],
+/// same as other bounded wallet-bootstrap verify handlers.
+async fn handle_wallet_bootstrap_meteora_dlmm_verify_for_mint(
+    ctx: &MarketDataContext,
+    rpc: &Arc<SolanaRpc>,
+    run_id: &str,
+    request_id: &str,
+    base_mint: &Pubkey,
+) {
+    if ctx
+        .live_pool_cache
+        .base_mint_has_explicit_meteora_dlmm_ready_pool(base_mint)
+    {
+        debug!(
+            request_id = %request_id,
+            mint = %base_mint,
+            "Wallet bootstrap Meteora DLMM: already explicit Ready for this mint, skip"
+        );
+        return;
+    }
+
+    let pools = ctx.live_pool_cache.meteora_dlmm_pools_for_mint(base_mint);
+    if pools.is_empty() {
+        debug!(
+            request_id = %request_id,
+            mint = %base_mint,
+            "Wallet bootstrap Meteora DLMM: no DLMM pool rows in LivePoolCache for mint, skip RPC"
+        );
+        return;
+    }
+
+    info!(
+        request_id = %request_id,
+        mint = %base_mint,
+        pools = pools.len(),
+        "Wallet bootstrap Meteora DLMM: verifying cache-scoped pools (cold-path RPC, no global scan)"
+    );
+
+    let dlmm_program = Pubkey::from_str(METEORA_DLMM).expect("METEORA_DLMM constant");
+
+    for (pool_addr, mut state) in pools {
+        if ctx.live_pool_cache.base_mint_has_any_ready_pool(base_mint) {
+            break;
+        }
+        if ctx
+            .live_pool_cache
+            .base_mint_has_explicit_meteora_dlmm_ready_pool(base_mint)
+        {
+            break;
+        }
+
+        let pool_acc = match rpc.get_account_opt_retry(&pool_addr).await {
+            Ok(Some(acc)) => acc,
+            Ok(None) | Err(_) => {
+                debug!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    "Wallet bootstrap Meteora DLMM: pool account fetch miss, skip"
+                );
+                continue;
+            }
+        };
+
+        let parsed_state = match parse_pool_account(&dlmm_program, &pool_acc.data) {
+            Some(CachedPoolState::Meteora(s)) => s,
+            _ => {
+                debug!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    data_len = pool_acc.data.len(),
+                    "Wallet bootstrap Meteora DLMM: parse pool failed, skip"
+                );
+                continue;
+            }
+        };
+
+        state.token_x_mint = parsed_state.token_x_mint;
+        state.token_y_mint = parsed_state.token_y_mint;
+        state.reserve_x = parsed_state.reserve_x;
+        state.reserve_y = parsed_state.reserve_y;
+        state.active_id = parsed_state.active_id;
+        state.bin_step = parsed_state.bin_step;
+
+        if state.token_x_mint != *base_mint && state.token_y_mint != *base_mint {
+            continue;
+        }
+
+        let vx = state.reserve_x;
+        let vy = state.reserve_y;
+        let bal_x = match rpc.get_account_opt_retry(&vx).await {
+            Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
+            _ => None,
+        };
+        let bal_y = match rpc.get_account_opt_retry(&vy).await {
+            Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
+            _ => None,
+        };
+        let (bx, by) = match (bal_x, bal_y) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                debug!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    "Wallet bootstrap Meteora DLMM: vault balance RPC incomplete, skip"
+                );
+                continue;
+            }
+        };
+
+        state.reserve_x_balance = Some(bx);
+        state.reserve_y_balance = Some(by);
+
+        ctx.live_pool_cache
+            .upsert(pool_addr, CachedPoolState::Meteora(state.clone()), 0);
+
+        let readiness = meteora_dlmm_readiness_for_pool_cache_update(&state);
+        ctx.live_pool_cache
+            .merge_meteora_dlmm_pool_readiness(pool_addr, readiness);
+
+        if readiness == DexPoolReadiness::Observed {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                mint = %base_mint,
+                "Wallet bootstrap Meteora DLMM: still Observed after RPC, no JetStream publish"
+            );
+            continue;
+        }
+
+        let (pub_base_mint, pub_quote_mint, base_r, quote_r) =
+            (state.token_x_mint, state.token_y_mint, bx, by);
+
+        let jetstream_ok = if let Some(ref nats) = ctx.nats {
+            let mut balance_update = PoolCacheUpdate::new_balance_updated(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                pool_addr.to_string(),
+                "meteora_dlmm".to_string(),
+                pub_base_mint.to_string(),
+                pub_quote_mint.to_string(),
+                base_r,
+                quote_r,
+                0,
+            );
+            balance_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(&state));
+            balance_update.set_dex_readiness_in_metadata(readiness);
+            let subject = pool_subject(&pool_addr.to_string());
+            match nats.jetstream_publish(&subject, &balance_update).await {
+                Ok(true) => {
+                    info!(
+                        request_id = %request_id,
+                        pool = %pool_addr,
+                        mint = %base_mint,
+                        readiness = ?readiness,
+                        "Wallet bootstrap Meteora DLMM: published PoolCacheUpdate::BalanceUpdated to JetStream"
+                    );
+                    true
+                }
+                Ok(false) => {
+                    warn!(
+                        request_id = %request_id,
+                        pool = %pool_addr,
+                        "Wallet bootstrap Meteora DLMM: JetStream publish failed (timeout or drop)"
+                    );
+                    false
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        request_id = %request_id,
+                        "Wallet bootstrap Meteora DLMM: Failed to publish PoolCacheUpdate to JetStream"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if !jetstream_ok {
+            warn!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                "Wallet bootstrap Meteora DLMM: MASTER cache updated but JetStream publish failed — SSOT drift risk"
             );
         }
     }
@@ -6738,6 +6951,58 @@ mod discovery_tests {
     }
 
     #[test]
+    fn test_live_pool_cache_meteora_dlmm_pools_for_mint_bounded_to_cache() {
+        let cache = LivePoolCache::new();
+        let m = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let p1 = Pubkey::new_unique();
+        let p2 = Pubkey::new_unique();
+        let p3 = Pubkey::new_unique();
+        let on_x = MeteoraState {
+            token_x_mint: m,
+            token_y_mint: other,
+            reserve_x: Pubkey::new_unique(),
+            reserve_y: Pubkey::new_unique(),
+            active_id: -1,
+            bin_step: 4,
+            reserve_x_balance: None,
+            reserve_y_balance: None,
+        };
+        cache.upsert(p1, CachedPoolState::Meteora(on_x), 0);
+        let on_y = MeteoraState {
+            token_x_mint: other,
+            token_y_mint: m,
+            reserve_x: Pubkey::new_unique(),
+            reserve_y: Pubkey::new_unique(),
+            active_id: 0,
+            bin_step: 0,
+            reserve_x_balance: None,
+            reserve_y_balance: None,
+        };
+        cache.upsert(p2, CachedPoolState::Meteora(on_y), 0);
+        cache.upsert(
+            p3,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: other,
+                token_y_mint: other,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: 0,
+                bin_step: 1,
+                reserve_x_balance: None,
+                reserve_y_balance: None,
+            }),
+            0,
+        );
+        let rows = cache.meteora_dlmm_pools_for_mint(&m);
+        assert_eq!(rows.len(), 2);
+        let addrs: Vec<Pubkey> = rows.iter().map(|(a, _)| *a).collect();
+        assert!(addrs.contains(&p1));
+        assert!(addrs.contains(&p2));
+        assert!(!addrs.contains(&p3));
+    }
+
+    #[test]
     fn test_orca_wallet_bootstrap_ready_path_requires_explicit_merge_not_cache_row() {
         let cache = LivePoolCache::new();
         let base_mint = Pubkey::new_unique();
@@ -6796,6 +7061,58 @@ mod discovery_tests {
     }
 
     #[test]
+    fn test_meteora_dlmm_wallet_bootstrap_ready_path_requires_explicit_merge_not_cache_row() {
+        let cache = LivePoolCache::new();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let vx = Pubkey::new_unique();
+        let vy = Pubkey::new_unique();
+        let s = MeteoraState {
+            token_x_mint: base_mint,
+            token_y_mint: quote_mint,
+            reserve_x: vx,
+            reserve_y: vy,
+            active_id: 0,
+            bin_step: 0,
+            reserve_x_balance: Some(1_000_000),
+            reserve_y_balance: Some(50_000_000_000),
+        };
+        assert_eq!(
+            meteora_dlmm_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Ready
+        );
+        cache.upsert(pool, CachedPoolState::Meteora(s), 100);
+        assert!(
+            !cache.base_mint_has_any_ready_pool(&base_mint),
+            "DLMM cache row with full reserves must not imply mint-level ready without explicit merge"
+        );
+        cache.merge_meteora_dlmm_pool_readiness(pool, DexPoolReadiness::Ready);
+        assert!(cache.base_mint_has_explicit_meteora_dlmm_ready_pool(&base_mint));
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_meteora_dlmm_bounded_bootstrap_balance_update_uses_slot_zero_like_cpmm() {
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::new_unique();
+        let bal = PoolCacheUpdate::new_balance_updated(
+            "market-data",
+            BUILD_VERSION,
+            "run-test",
+            pool.to_string(),
+            "meteora_dlmm".to_string(),
+            base.to_string(),
+            quote.to_string(),
+            1_000_000,
+            50_000_000_000,
+            0,
+        );
+        assert_eq!(bal.geyser_slot, 0);
+    }
+
+    #[test]
     fn test_wallet_mints_needing_dex_bootstrap_verify_skips_meteora_cpmm_explicit_ready() {
         let cache = LivePoolCache::new();
         let wsol = WSOL_MINT;
@@ -6822,6 +7139,35 @@ mod discovery_tests {
             0,
         );
         cache.merge_meteora_cpmm_pool_readiness(pool, DexPoolReadiness::Ready);
+
+        let other = Pubkey::new_unique();
+        let mints = vec![base_mint.to_string(), other.to_string()];
+        let out = wallet_mints_needing_dex_bootstrap_verify(&cache, &mints, wsol, 8);
+        assert_eq!(out, vec![other]);
+    }
+
+    #[test]
+    fn test_wallet_mints_needing_dex_bootstrap_verify_skips_meteora_dlmm_explicit_ready() {
+        let cache = LivePoolCache::new();
+        let wsol = WSOL_MINT;
+        let base_mint = Pubkey::new_unique();
+        let quote = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        cache.upsert(
+            pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: base_mint,
+                token_y_mint: quote,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: 0,
+                bin_step: 0,
+                reserve_x_balance: Some(1),
+                reserve_y_balance: Some(2),
+            }),
+            0,
+        );
+        cache.merge_meteora_dlmm_pool_readiness(pool, DexPoolReadiness::Ready);
 
         let other = Pubkey::new_unique();
         let mints = vec![base_mint.to_string(), other.to_string()];
