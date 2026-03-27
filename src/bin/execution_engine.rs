@@ -62,11 +62,11 @@ use ironcrab::execution::tx_builder;
 use ironcrab::execution::wsol_manager::{WsolManager, WsolManagerConfig, WSOL_MINT};
 use ironcrab::ipc::{
     CheckResult, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, DecisionOutcome,
-    DecisionRecord, ExecutionResult, ExecutionStatus, ExplicitAmount, FairnessPolicy, FeePolicy,
-    FillStatus, FillUnavailableReason, IntentOrigin, IntentTier, KillSwitchContext, MarketEvent,
-    MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles, RecordHeader, RejectReason,
-    SimulationResult, TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide,
-    TradingRegime,
+    DecisionRecord, DexPoolReadiness, ExecutionResult, ExecutionStatus, ExplicitAmount,
+    FairnessPolicy, FeePolicy, FillStatus, FillUnavailableReason, IntentOrigin, IntentTier,
+    KillSwitchContext, MarketEvent, MarketEventKind, PoolCacheUpdate, PriorityFeePercentiles,
+    RecordHeader, RejectReason, SimulationResult, TradeExecutionConstraints, TradeIntent,
+    TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
@@ -180,6 +180,12 @@ fn is_pumpfun_bonding_curve_structural_sim_error(error_code: Option<&str>) -> bo
                 || e.contains("0x1788")
         })
         .unwrap_or(false)
+}
+
+/// Orca Whirlpool: structural sim failure signatures (stale tick/vault layout family).
+#[inline]
+fn is_orca_structural_sim_error(error_code: Option<&str>) -> bool {
+    is_pumpfun_bonding_curve_structural_sim_error(error_code)
 }
 
 /// Cold Path only: PumpFun bonding-curve recovery (`EnsurePumpfunBondingCurve`) is allowed for
@@ -1522,6 +1528,37 @@ async fn wait_for_usable_pump_amm_cache_state(
 ///
 /// Without the snapshot check, an older `Ready` + unchanged reserves could satisfy the wait
 /// immediately after `ControlResponse::Ok` (Bug #34).
+/// Orca Whirlpool cold-path recovery: bounded wait until SLAVE shows explicit JetStream `Ready` and
+/// a **fresh** on-chain evidence tuple vs `before` (Bug #34 / #36 — `ControlResponse::Ok` alone is insufficient).
+async fn wait_for_orca_whirlpool_slave_after_recovery(
+    cache: &LivePoolCache,
+    pool: &Pubkey,
+    before: Option<(i32, u128, u128, u64, u64)>,
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        if let Some((s, merged)) = cache.orca_whirlpool_slave_readiness_snapshot(pool) {
+            let after = (
+                s.tick_current_index,
+                s.sqrt_price,
+                s.liquidity,
+                s.vault_a_balance.unwrap_or(0),
+                s.vault_b_balance.unwrap_or(0),
+            );
+            if merged == DexPoolReadiness::Ready
+                && cache.orca_pool_explicitly_ready(pool)
+                && Some(after) != before
+            {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+    }
+    false
+}
+
 async fn wait_for_pumpfun_bonding_cache_refresh(
     cache: &LivePoolCache,
     bonding_curve: &Pubkey,
@@ -2304,6 +2341,113 @@ impl ExecutionContext {
                         base_mint = %base_mint,
                         timeout_secs = DISCOVERY_REQUEST_TIMEOUT_SECS,
                         "PumpFun bonding recovery: timeout (no correlated response)"
+                    );
+                    DiscoveryRequestOutcome::Timeout
+                }
+            };
+
+        let _ = self
+            .pending_discovery_responses
+            .lock()
+            .await
+            .remove(&request_id);
+
+        outcome
+    }
+
+    /// I-24d Scope 20: Orca Whirlpool cold-path recovery — `EnsureOrcaWhirlpoolPoolState` with
+    /// `force_refresh_orca=true`. Does not write SLAVE locally; market-data publishes JetStream.
+    async fn request_orca_whirlpool_recovery_and_wait(
+        &self,
+        base_mint: &str,
+        pool_address_hint: Option<&str>,
+    ) -> DiscoveryRequestOutcome {
+        let Some(ref nats) = self.nats else {
+            warn!(
+                request_id = "n/a",
+                base_mint = %base_mint,
+                "Orca cold-path recovery: NATS not connected"
+            );
+            return DiscoveryRequestOutcome::Error("NATS not connected".to_string());
+        };
+
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        {
+            let mut pending = self.pending_discovery_responses.lock().await;
+            pending.insert(request_id.clone(), tx);
+        }
+
+        let mut req = ControlRequest::new(
+            "execution-engine",
+            BUILD_VERSION,
+            &self.run_id,
+            request_id.clone(),
+            "market-data",
+            ControlRequestKind::EnsureOrcaWhirlpoolPoolState {
+                base_mint: base_mint.to_string(),
+            },
+        );
+        req.pool_address_hint = pool_address_hint.map(String::from);
+        req.force_refresh_orca = true;
+
+        warn!(
+            request_id = %request_id,
+            base_mint = %base_mint,
+            pool_address_hint = ?pool_address_hint,
+            target = "market-data",
+            reason = "orca liquidation/manual sell sim structural fail — requesting authoritative Orca RPC refresh via market-data (I-24d)",
+            "Orca cold-path: publishing EnsureOrcaWhirlpoolPoolState (force_refresh_orca)"
+        );
+
+        if nats.publish(TOPIC_CONTROL_REQUESTS, &req).await.is_err() {
+            let mut pending = self.pending_discovery_responses.lock().await;
+            pending.remove(&request_id);
+            warn!(
+                request_id = %request_id,
+                base_mint = %base_mint,
+                "Orca cold-path recovery: publish failed"
+            );
+            return DiscoveryRequestOutcome::Error("publish failed".to_string());
+        }
+
+        let outcome =
+            match tokio::time::timeout(Duration::from_secs(DISCOVERY_REQUEST_TIMEOUT_SECS), rx)
+                .await
+            {
+                Ok(Ok(resp)) => {
+                    let status_str = format!("{:?}", resp.status);
+                    let pool = resp.pool_address.as_deref();
+                    info!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        status = %status_str,
+                        pool_address = ?pool,
+                        "Orca cold-path recovery: ControlResponse correlated"
+                    );
+                    match resp.status {
+                        ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
+                        ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                        ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
+                            resp.message.unwrap_or_else(|| "unknown error".to_string()),
+                        ),
+                    }
+                }
+                Ok(Err(_)) => {
+                    warn!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        "Orca cold-path recovery: channel closed before response"
+                    );
+                    DiscoveryRequestOutcome::Error("channel closed".to_string())
+                }
+                Err(_) => {
+                    warn!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        timeout_secs = DISCOVERY_REQUEST_TIMEOUT_SECS,
+                        "Orca cold-path recovery: timeout waiting for ControlResponse"
                     );
                     DiscoveryRequestOutcome::Timeout
                 }
@@ -7984,6 +8128,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     let checks_len_before_tx_plan_build = checks.len();
     let mut pump_amm_recovery_attempted = false;
     let mut pumpfun_bonding_recovery_attempted = false;
+    let mut orca_recovery_attempted = false;
     let (
         tx_plan,
         plan_hash_str,
@@ -7993,7 +8138,10 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         wallet_pubkey,
         bundle_tip_lamports,
     ) = loop {
-        if pump_amm_recovery_attempted || pumpfun_bonding_recovery_attempted {
+        if pump_amm_recovery_attempted
+            || pumpfun_bonding_recovery_attempted
+            || orca_recovery_attempted
+        {
             checks.truncate(checks_len_before_tx_plan_build);
         }
         let (tx_plan, plan_hash_str) = {
@@ -8484,6 +8632,97 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                             continue;
                         }
                     }
+                }
+            }
+        }
+
+        // Orca Whirlpool SELL (liquidation / manual cold path): stale tick or vault evidence →
+        // structural sim fail. I-24d: one EnsureOrcaWhirlpoolPoolState + bounded JetStream wait + one retry.
+        if !orca_recovery_attempted
+            && is_pumpfun_bonding_curve_cold_path_recovery_sell(&intent)
+            && intent.metadata.get("dex").map(|s| s.as_str()) == Some("orca")
+            && intent.resources.pools.len() == 1
+            && is_orca_structural_sim_error(sim_result.error_code.as_deref())
+        {
+            if Pubkey::from_str(&intent.resources.input_mint).is_err() {
+                break (
+                    tx_plan,
+                    plan_hash_str,
+                    sim_result,
+                    requires_bundle,
+                    bundle_tip_ix,
+                    wallet_pubkey,
+                    bundle_tip_lamports,
+                );
+            }
+            let pool_pk = match Pubkey::from_str(intent.resources.pools[0].as_str()) {
+                Ok(p) => p,
+                Err(_) => {
+                    break (
+                        tx_plan,
+                        plan_hash_str,
+                        sim_result,
+                        requires_bundle,
+                        bundle_tip_ix,
+                        wallet_pubkey,
+                        bundle_tip_lamports,
+                    )
+                }
+            };
+            let before_evidence = ctx
+                .live_pool_cache
+                .as_ref()
+                .and_then(|c| c.get(&pool_pk))
+                .and_then(|st| match st {
+                    CachedPoolState::Orca(s) => Some((
+                        s.tick_current_index,
+                        s.sqrt_price,
+                        s.liquidity,
+                        s.vault_a_balance.unwrap_or(0),
+                        s.vault_b_balance.unwrap_or(0),
+                    )),
+                    _ => None,
+                });
+            warn!(
+                intent_id = %intent.intent_id,
+                mint = %intent.resources.input_mint,
+                pool = %pool_pk,
+                sim_error = ?sim_result.error_code,
+                before_evidence = ?before_evidence,
+                "Orca cold-path: simulation structural fail — requesting EnsureOrcaWhirlpoolPoolState from market-data (bounded wait + one tx rebuild retry)"
+            );
+            if let DiscoveryRequestOutcome::Ok = ctx
+                .request_orca_whirlpool_recovery_and_wait(
+                    &intent.resources.input_mint,
+                    Some(&pool_pk.to_string()),
+                )
+                .await
+            {
+                if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                    if wait_for_orca_whirlpool_slave_after_recovery(
+                        cache,
+                        &pool_pk,
+                        before_evidence,
+                        DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                        DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                    )
+                    .await
+                    {
+                        orca_recovery_attempted = true;
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            mint = %intent.resources.input_mint,
+                            pool = %pool_pk,
+                            "Orca cold-path: SLAVE shows fresh explicit Ready after recovery — rebuilding tx (one retry)"
+                        );
+                        continue;
+                    }
+                    warn!(
+                        intent_id = %intent.intent_id,
+                        pool = %pool_pk,
+                        timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                        "Orca cold-path: ControlResponse ok but bounded wait for SLAVE explicit Ready + fresh evidence timed out"
+                    );
                 }
             }
         }

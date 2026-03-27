@@ -1136,6 +1136,23 @@ impl LivePoolCache {
         self.orca_readiness_by_pool.get(pool).map(|r| *r)
     }
 
+    /// SLAVE-visible Orca Whirlpool row + merged readiness (JetStream path). For cold-path recovery
+    /// waits: compare [`OrcaWhirlpoolState`] evidence vs a pre-request snapshot (Bug #34).
+    #[must_use]
+    pub fn orca_whirlpool_slave_readiness_snapshot(
+        &self,
+        pool: &Pubkey,
+    ) -> Option<(OrcaWhirlpoolState, DexPoolReadiness)> {
+        let state = match self.get(pool)? {
+            CachedPoolState::Orca(s) => s,
+            _ => return None,
+        };
+        let readiness = self
+            .orca_readiness(pool)
+            .unwrap_or(DexPoolReadiness::Observed);
+        Some((state, readiness))
+    }
+
     /// `true` only when JetStream merge recorded [`DexPoolReadiness::Ready`] for this Meteora DLMM pool.
     #[must_use]
     pub fn meteora_dlmm_pool_explicitly_ready(&self, pool: &Pubkey) -> bool {
@@ -2758,6 +2775,22 @@ mod tests {
         assert!(cache.base_mint_has_any_ready_pool(&base_mint));
         cache.merge_orca_pool_readiness(pool, DexPoolReadiness::Observed);
         assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_orca_whirlpool_slave_readiness_snapshot_merges_explicit_ready() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let s = make_orca_state(base_mint, quote_mint, Some(1), Some(2));
+        cache.upsert(pool, CachedPoolState::Orca(s.clone()), 0);
+        cache.merge_orca_pool_readiness(pool, DexPoolReadiness::Ready);
+        let snap = cache
+            .orca_whirlpool_slave_readiness_snapshot(&pool)
+            .expect("snapshot");
+        assert_eq!(snap.1, DexPoolReadiness::Ready);
+        assert_eq!(snap.0.tick_current_index, s.tick_current_index);
     }
 
     #[test]
