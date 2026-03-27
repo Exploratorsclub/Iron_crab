@@ -1684,7 +1684,11 @@ async fn handle_ensure_orca_whirlpool_pool_state(
         "EnsureOrcaWhirlpoolPoolState: starting cache-scoped Orca RPC refresh"
     );
 
-    let mut terminal: Option<(Pubkey, DexPoolReadiness, bool)> = None;
+    // Terminal `ControlResponse::Ok` only when JetStream carried explicit Orca `Ready` (matches
+    // execution-engine `wait_for_orca_whirlpool_slave_after_recovery` — Bug #36: Partial ≠ ready).
+    let mut terminal_ok_pool: Option<Pubkey> = None;
+    // Best-effort: on-chain Ready but JetStream publish failed — report only if no other candidate succeeds.
+    let mut ready_jetstream_failed_pool: Option<Pubkey> = None;
 
     for (pool_addr, state) in candidate_pools {
         if let Some(row) = cold_path_rpc_refresh_orca_whirlpool_pool_row(
@@ -1692,49 +1696,75 @@ async fn handle_ensure_orca_whirlpool_pool_state(
         )
         .await
         {
-            if row.readiness != DexPoolReadiness::Observed && row.jetstream_published {
-                terminal = Some((row.pool_addr, row.readiness, true));
-                break;
-            }
-            if row.readiness != DexPoolReadiness::Observed && !row.jetstream_published {
-                terminal = Some((row.pool_addr, row.readiness, false));
+            match (row.readiness, row.jetstream_published) {
+                (DexPoolReadiness::Ready, true) => {
+                    terminal_ok_pool = Some(row.pool_addr);
+                    break;
+                }
+                (DexPoolReadiness::Ready, false) => {
+                    ready_jetstream_failed_pool = Some(row.pool_addr);
+                }
+                (DexPoolReadiness::Partial, true) => {
+                    debug!(
+                        request_id = %request_id,
+                        pool = %row.pool_addr,
+                        "EnsureOrcaWhirlpoolPoolState: Partial published to JetStream — scan remaining candidates for Ready"
+                    );
+                }
+                (DexPoolReadiness::Partial, false) => {
+                    warn!(
+                        request_id = %request_id,
+                        pool = %row.pool_addr,
+                        "EnsureOrcaWhirlpoolPoolState: Partial row MASTER-updated but JetStream publish failed"
+                    );
+                }
+                (DexPoolReadiness::Observed, _) => {}
             }
         }
     }
 
-    if let Some((pool_pk, readiness, jet_ok)) = terminal {
+    if let Some(pool_pk) = terminal_ok_pool {
         if let Some(ref nats) = ctx.nats {
             let pool_str = pool_pk.to_string();
-            let (status, message) = if jet_ok {
-                info!(
-                    request_id = %request_id,
-                    base_mint = %base_mint_str,
-                    pool = %pool_str,
-                    readiness = ?readiness,
-                    jetstream = "published",
-                    "EnsureOrcaWhirlpoolPoolState: terminal ok (JetStream publish succeeded)"
-                );
-                (ControlResponseStatus::Ok, None)
-            } else {
-                warn!(
-                    request_id = %request_id,
-                    base_mint = %base_mint_str,
-                    pool = %pool_str,
-                    readiness = ?readiness,
-                    "EnsureOrcaWhirlpoolPoolState: terminal error (MASTER updated but JetStream publish failed)"
-                );
-                (
-                    ControlResponseStatus::Error,
-                    Some("JetStream publish failed".to_string()),
-                )
-            };
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                pool = %pool_str,
+                readiness = ?DexPoolReadiness::Ready,
+                jetstream = "published",
+                "EnsureOrcaWhirlpoolPoolState: terminal ok (Orca Ready + JetStream publish)"
+            );
             publish_control_response(
                 nats,
                 &ctx.run_id,
                 request_id,
-                status,
+                ControlResponseStatus::Ok,
                 Some(pool_str),
-                message,
+                None,
+            )
+            .await;
+        }
+        return;
+    }
+
+    if let Some(pool_pk) = ready_jetstream_failed_pool {
+        if let Some(ref nats) = ctx.nats {
+            let pool_str = pool_pk.to_string();
+            let msg = "JetStream publish failed".to_string();
+            warn!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                pool = %pool_str,
+                error = %msg,
+                "EnsureOrcaWhirlpoolPoolState: terminal error (Orca Ready on MASTER but JetStream publish failed)"
+            );
+            publish_control_response(
+                nats,
+                &ctx.run_id,
+                request_id,
+                ControlResponseStatus::Error,
+                Some(pool_str),
+                Some(msg),
             )
             .await;
         }
@@ -1744,7 +1774,7 @@ async fn handle_ensure_orca_whirlpool_pool_state(
     warn!(
         request_id = %request_id,
         base_mint = %base_mint_str,
-        "EnsureOrcaWhirlpoolPoolState: RPC refresh did not yield publishable Orca state (Error)"
+        "EnsureOrcaWhirlpoolPoolState: RPC refresh did not yield Orca Ready + JetStream publish (Error)"
     );
     if let Some(ref nats) = ctx.nats {
         publish_control_response(

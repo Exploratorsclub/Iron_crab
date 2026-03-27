@@ -1519,17 +1519,12 @@ async fn wait_for_usable_pump_amm_cache_state(
     false
 }
 
-/// After `EnsurePumpfunBondingCurve` + JetStream merge: wait until SLAVE cache reflects a change
-/// vs the pre-request snapshot (or new entry appears).
+/// After `EnsureOrcaWhirlpoolPoolState` + JetStream merge: bounded wait until the SLAVE cache shows
+/// explicit Orca [`DexPoolReadiness::Ready`] **and** a **fresh** Whirlpool evidence tuple vs `before`.
 ///
-/// When `require_explicit_ready` is true (cold-path recovery after RPC refresh), we require both:
-/// - [`LivePoolCache::pumpfun_bonding_curve_explicitly_ready`] (JetStream carried `Ready`), **and**
-/// - a **fresh** bonding-curve snapshot vs `before` (proves this request’s merge, not a stale Ready).
-///
-/// Without the snapshot check, an older `Ready` + unchanged reserves could satisfy the wait
-/// immediately after `ControlResponse::Ok` (Bug #34).
-/// Orca Whirlpool cold-path recovery: bounded wait until SLAVE shows explicit JetStream `Ready` and
-/// a **fresh** on-chain evidence tuple vs `before` (Bug #34 / #36 — `ControlResponse::Ok` alone is insufficient).
+/// `ControlResponse::Ok` from market-data is correlated only after an Orca-`Ready` JetStream
+/// publish; this wait still requires a changed snapshot so an older `Ready` cannot satisfy
+/// immediately (Bug #34). Does not treat cache rows as ready without explicit merge (Bug #36).
 async fn wait_for_orca_whirlpool_slave_after_recovery(
     cache: &LivePoolCache,
     pool: &Pubkey,
@@ -1559,6 +1554,15 @@ async fn wait_for_orca_whirlpool_slave_after_recovery(
     false
 }
 
+/// After `EnsurePumpfunBondingCurve` + JetStream merge: wait until SLAVE cache reflects a change
+/// vs the pre-request snapshot (or new entry appears).
+///
+/// When `require_explicit_ready` is true (cold-path recovery after RPC refresh), we require both:
+/// - [`LivePoolCache::pumpfun_bonding_curve_explicitly_ready`] (JetStream carried `Ready`), **and**
+/// - a **fresh** bonding-curve snapshot vs `before` (proves this request’s merge, not a stale Ready).
+///
+/// Without the snapshot check, an older `Ready` + unchanged reserves could satisfy the wait
+/// immediately after `ControlResponse::Ok` (Bug #34).
 async fn wait_for_pumpfun_bonding_cache_refresh(
     cache: &LivePoolCache,
     bonding_curve: &Pubkey,
