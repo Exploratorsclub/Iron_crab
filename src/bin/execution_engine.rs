@@ -1562,6 +1562,36 @@ async fn wait_for_orca_whirlpool_slave_after_recovery(
     false
 }
 
+/// After `EnsureMeteoraDlmmPoolState` + JetStream merge: bounded wait until SLAVE shows explicit
+/// Meteora DLMM [`DexPoolReadiness::Ready`] and a **fresh** evidence tuple vs `before`.
+///
+/// `active_id == 0` with unchanged tuple does not satisfy liquidation/build needs (legacy skip);
+/// successful wait requires explicit `Ready` and snapshot change (Bug #34 / #36).
+async fn wait_for_meteora_dlmm_slave_after_recovery(
+    cache: &LivePoolCache,
+    pool: &Pubkey,
+    before: Option<(i32, u16, Option<u64>, Option<u64>)>,
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        if let Some((s, merged)) = cache.meteora_dlmm_slave_readiness_snapshot(pool) {
+            let after = (
+                s.active_id,
+                s.bin_step,
+                s.reserve_x_balance,
+                s.reserve_y_balance,
+            );
+            if merged == DexPoolReadiness::Ready && Some(after) != before {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+    }
+    false
+}
+
 /// After `EnsurePumpfunBondingCurve` + JetStream merge: wait until SLAVE cache reflects a change
 /// vs the pre-request snapshot (or new entry appears).
 ///
@@ -2474,6 +2504,113 @@ impl ExecutionContext {
         outcome
     }
 
+    /// I-24d Scope 21: Meteora DLMM cold-path recovery — `EnsureMeteoraDlmmPoolState` with
+    /// `force_refresh_meteora_dlmm=true`. Does not write SLAVE locally; market-data publishes JetStream.
+    async fn request_meteora_dlmm_recovery_and_wait(
+        &self,
+        base_mint: &str,
+        pool_address_hint: Option<&str>,
+    ) -> DiscoveryRequestOutcome {
+        let Some(ref nats) = self.nats else {
+            warn!(
+                request_id = "n/a",
+                base_mint = %base_mint,
+                "Meteora DLMM cold-path recovery: NATS not connected"
+            );
+            return DiscoveryRequestOutcome::Error("NATS not connected".to_string());
+        };
+
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        {
+            let mut pending = self.pending_discovery_responses.lock().await;
+            pending.insert(request_id.clone(), tx);
+        }
+
+        let mut req = ControlRequest::new(
+            "execution-engine",
+            BUILD_VERSION,
+            &self.run_id,
+            request_id.clone(),
+            "market-data",
+            ControlRequestKind::EnsureMeteoraDlmmPoolState {
+                base_mint: base_mint.to_string(),
+            },
+        );
+        req.pool_address_hint = pool_address_hint.map(String::from);
+        req.force_refresh_meteora_dlmm = true;
+
+        warn!(
+            request_id = %request_id,
+            base_mint = %base_mint,
+            pool_address_hint = ?pool_address_hint,
+            target = "market-data",
+            reason = "meteora_dlmm liquidation cold path — SLAVE missing usable DLMM state (active_id/reserves/readiness); requesting authoritative RPC refresh via market-data (I-24d)",
+            "Meteora DLMM cold-path: publishing EnsureMeteoraDlmmPoolState (force_refresh_meteora_dlmm)"
+        );
+
+        if nats.publish(TOPIC_CONTROL_REQUESTS, &req).await.is_err() {
+            let mut pending = self.pending_discovery_responses.lock().await;
+            pending.remove(&request_id);
+            warn!(
+                request_id = %request_id,
+                base_mint = %base_mint,
+                "Meteora DLMM cold-path recovery: publish failed"
+            );
+            return DiscoveryRequestOutcome::Error("publish failed".to_string());
+        }
+
+        let outcome =
+            match tokio::time::timeout(Duration::from_secs(DISCOVERY_REQUEST_TIMEOUT_SECS), rx)
+                .await
+            {
+                Ok(Ok(resp)) => {
+                    let status_str = format!("{:?}", resp.status);
+                    let pool = resp.pool_address.as_deref();
+                    info!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        status = %status_str,
+                        pool_address = ?pool,
+                        "Meteora DLMM cold-path recovery: ControlResponse correlated"
+                    );
+                    match resp.status {
+                        ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
+                        ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                        ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
+                            resp.message.unwrap_or_else(|| "unknown error".to_string()),
+                        ),
+                    }
+                }
+                Ok(Err(_)) => {
+                    warn!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        "Meteora DLMM cold-path recovery: channel closed before response"
+                    );
+                    DiscoveryRequestOutcome::Error("channel closed".to_string())
+                }
+                Err(_) => {
+                    warn!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        timeout_secs = DISCOVERY_REQUEST_TIMEOUT_SECS,
+                        "Meteora DLMM cold-path recovery: timeout waiting for ControlResponse"
+                    );
+                    DiscoveryRequestOutcome::Timeout
+                }
+            };
+
+        let _ = self
+            .pending_discovery_responses
+            .lock()
+            .await
+            .remove(&request_id);
+
+        outcome
+    }
+
     /// Hot-path healing: publish `EnsurePumpAmmPoolAccounts` to market-data with `force_refresh=true`
     /// without registering for ControlResponse (no wait, no retry in the same intent).
     /// RPC work happens only in market-data (Cold Path); this path is fire-and-forget NATS publish.
@@ -2612,7 +2749,7 @@ impl ExecutionContext {
         let mut meteora = MeteoraDlmm::new_with_live_cache(
             Arc::clone(&ctx.rpc),
             Some(lpc.clone()),
-            true, // Liquidation = Cold Path — RPC fallback allowed
+            false, // I-24d: no connector RPC fallback — Meteora DLMM cold-path refresh via market-data EnsureMeteoraDlmmPoolState
         );
         meteora.set_user_authority(owner);
         let raydium = Raydium::new_with_live_cache(
@@ -2642,11 +2779,7 @@ impl ExecutionContext {
             for (pool_addr, state) in cache.iter() {
                 match state {
                     CachedPoolState::Meteora(ref ms) => {
-                        // Only inject if we have real Geyser data (active_id != 0)
-                        // Default active_id=0 means no real data, would cause wrong bin array derivation
-                        if ms.active_id != 0
-                            && meteora.inject_cached_meteora_state(&pool_addr, ms).is_ok()
-                        {
+                        if meteora.inject_cached_meteora_state(&pool_addr, ms).is_ok() {
                             meteora_count += 1;
                         }
                     }
@@ -2841,6 +2974,73 @@ impl ExecutionContext {
             //    The PumpFun quoter computes theoretical quotes from cached reserves even for
             //    completed curves, which causes on-chain 6005 (BondingCurveComplete) failures.
             // 3. RPC calls are acceptable here (cold path, safety > speed).
+
+            // I-24d Scope 21: one EnsureMeteoraDlmmPoolState + bounded JetStream wait per liquidation mint
+            // when SLAVE has DLMM rows for this mint but none are explicitly Ready (no connector RPC).
+            if let Some(ref cache) = ctx.live_pool_cache {
+                let rows = cache.meteora_dlmm_pools_for_mint(&mint);
+                if !rows.is_empty() && !cache.base_mint_has_explicit_meteora_dlmm_ready_pool(&mint)
+                {
+                    let pool_hint = rows
+                        .iter()
+                        .find(|(_, s)| s.token_x_mint == mint || s.token_y_mint == mint)
+                        .map(|(pk, _)| pk.to_string());
+                    warn!(
+                        mint = %mint,
+                        dlmm_rows = rows.len(),
+                        pool_address_hint = ?pool_hint,
+                        reason = "liquidation: Meteora DLMM pools in SLAVE but no explicit Ready — requesting EnsureMeteoraDlmmPoolState from market-data (bounded wait, one attempt per mint)",
+                        "Meteora DLMM cold-path: pre-quote recovery request"
+                    );
+                    if let DiscoveryRequestOutcome::Ok = ctx
+                        .request_meteora_dlmm_recovery_and_wait(
+                            mint_str.as_str(),
+                            pool_hint.as_deref(),
+                        )
+                        .await
+                    {
+                        let hint_pk = pool_hint.as_deref().and_then(|s| Pubkey::from_str(s).ok());
+                        let before_evidence = hint_pk.and_then(|pk| {
+                            cache.get(&pk).and_then(|st| match st {
+                                CachedPoolState::Meteora(s) => Some((
+                                    s.active_id,
+                                    s.bin_step,
+                                    s.reserve_x_balance,
+                                    s.reserve_y_balance,
+                                )),
+                                _ => None,
+                            })
+                        });
+                        if let Some(pk) = hint_pk {
+                            if wait_for_meteora_dlmm_slave_after_recovery(
+                                cache,
+                                &pk,
+                                before_evidence,
+                                DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                            )
+                            .await
+                            {
+                                for (pool_addr, ms) in cache.meteora_dlmm_pools_for_mint(&mint) {
+                                    let _ = meteora.inject_cached_meteora_state(&pool_addr, &ms);
+                                }
+                                info!(
+                                    mint = %mint,
+                                    pool = %pk,
+                                    "Meteora DLMM cold-path: SLAVE shows fresh explicit Ready after recovery — continuing liquidation quotes"
+                                );
+                            } else {
+                                warn!(
+                                    mint = %mint,
+                                    pool = %pk,
+                                    timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                    "Meteora DLMM cold-path: ControlResponse ok but bounded wait for SLAVE explicit Ready + fresh evidence timed out"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
 
             // --- Phase 1: Multi-pool routing (preferred for liquidation) ---
             {
@@ -3125,6 +3325,11 @@ impl ExecutionContext {
 
                         if let Some(pool_id) = q.route.first().cloned() {
                             if let Ok(pool_pk) = Pubkey::from_str(&pool_id) {
+                                let explicit_ready = ctx
+                                    .live_pool_cache
+                                    .as_ref()
+                                    .map(|c| c.meteora_dlmm_pool_explicitly_ready(&pool_pk))
+                                    .unwrap_or(false);
                                 if let Some(pool_accounts) = meteora.get_pool_accounts(&pool_pk) {
                                     let active_id = pool_accounts
                                         .get(5)
@@ -3132,7 +3337,7 @@ impl ExecutionContext {
                                         .and_then(|v| v.parse::<i32>().ok())
                                         .unwrap_or(0);
 
-                                    if active_id != 0 {
+                                    if explicit_ready {
                                         quote_attempts.push(format!(
                                             "meteora=ok amount_out={} pool={} active_id={} accounts_len={}",
                                             q.amount_out,
@@ -3148,8 +3353,8 @@ impl ExecutionContext {
                                         );
                                     } else {
                                         quote_attempts.push(format!(
-                                            "meteora=skip active_id=0 (no Geyser data) pool={}",
-                                            pool_id
+                                            "meteora=skip no_explicit_ready pool={} active_id={}",
+                                            pool_id, active_id
                                         ));
                                     }
                                 } else {
@@ -3358,6 +3563,13 @@ impl ExecutionContext {
                                     Ok(pk) => pk,
                                     Err(_) => continue,
                                 };
+                                if !cache.meteora_dlmm_pool_explicitly_ready(&pool_pk) {
+                                    quote_attempts.push(format!(
+                                        "cache=skip meteora no_explicit_ready pool={}",
+                                        pool_id
+                                    ));
+                                    continue;
+                                }
                                 let Some(pool_accounts) = meteora.get_pool_accounts(&pool_pk)
                                 else {
                                     quote_attempts.push(format!(
@@ -3366,18 +3578,6 @@ impl ExecutionContext {
                                     ));
                                     continue;
                                 };
-                                let active_id = pool_accounts
-                                    .get(5)
-                                    .and_then(|s| s.strip_prefix("active_id:"))
-                                    .and_then(|v| v.parse::<i32>().ok())
-                                    .unwrap_or(0);
-                                if active_id == 0 {
-                                    quote_attempts.push(format!(
-                                        "cache=skip meteora active_id=0 pool={}",
-                                        pool_id
-                                    ));
-                                    continue;
-                                }
                                 pool_accounts
                             }
                             CachedPoolState::Orca(_) => {

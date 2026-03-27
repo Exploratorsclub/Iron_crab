@@ -1168,6 +1168,23 @@ impl LivePoolCache {
         self.meteora_dlmm_readiness_by_pool.get(pool).map(|r| *r)
     }
 
+    /// SLAVE-visible Meteora DLMM row + merged readiness (JetStream path). For cold-path recovery
+    /// waits: compare [`MeteoraState`] evidence vs a pre-request snapshot (Bug #34).
+    #[must_use]
+    pub fn meteora_dlmm_slave_readiness_snapshot(
+        &self,
+        pool: &Pubkey,
+    ) -> Option<(MeteoraState, DexPoolReadiness)> {
+        let state = match self.get(pool)? {
+            CachedPoolState::Meteora(s) => s,
+            _ => return None,
+        };
+        let readiness = self
+            .meteora_dlmm_readiness(pool)
+            .unwrap_or(DexPoolReadiness::Observed);
+        Some((state, readiness))
+    }
+
     /// Mint-level helper: Meteora DLMM slice — explicit `Ready` only (no cache-hit heuristic).
     #[must_use]
     pub fn base_mint_has_explicit_meteora_dlmm_ready_pool(&self, base_mint: &Pubkey) -> bool {
@@ -2791,6 +2808,32 @@ mod tests {
             .expect("snapshot");
         assert_eq!(snap.1, DexPoolReadiness::Ready);
         assert_eq!(snap.0.tick_current_index, s.tick_current_index);
+    }
+
+    #[test]
+    fn test_meteora_dlmm_slave_readiness_snapshot_merges_explicit_ready() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let s = make_meteora_dlmm_state(
+            base_mint,
+            quote_mint,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            -3,
+            10,
+            Some(100),
+            Some(200),
+        );
+        cache.upsert(pool, CachedPoolState::Meteora(s.clone()), 0);
+        cache.merge_meteora_dlmm_pool_readiness(pool, DexPoolReadiness::Ready);
+        let snap = cache
+            .meteora_dlmm_slave_readiness_snapshot(&pool)
+            .expect("snapshot");
+        assert_eq!(snap.1, DexPoolReadiness::Ready);
+        assert_eq!(snap.0.active_id, s.active_id);
+        assert_eq!(snap.0.reserve_x_balance, s.reserve_x_balance);
     }
 
     #[test]
