@@ -1565,6 +1565,10 @@ async fn wait_for_orca_whirlpool_slave_after_recovery(
 /// After `EnsureMeteoraDlmmPoolState` + JetStream merge: bounded wait until SLAVE shows explicit
 /// Meteora DLMM [`DexPoolReadiness::Ready`] and a **fresh** evidence tuple vs `before`.
 ///
+/// Callers must pass `before` from a snapshot taken **before** publishing the control request
+/// (same contract as [`wait_for_orca_whirlpool_slave_after_recovery`]). Otherwise a fast merge can
+/// make `before` equal the post-recovery state and this wait never observes a change (Bug #34).
+///
 /// `active_id == 0` with unchanged tuple does not satisfy liquidation/build needs (legacy skip);
 /// successful wait requires explicit `Ready` and snapshot change (Bug #34 / #36).
 async fn wait_for_meteora_dlmm_slave_after_recovery(
@@ -2992,6 +2996,21 @@ impl ExecutionContext {
                         reason = "liquidation: Meteora DLMM pools in SLAVE but no explicit Ready — requesting EnsureMeteoraDlmmPoolState from market-data (bounded wait, one attempt per mint)",
                         "Meteora DLMM cold-path: pre-quote recovery request"
                     );
+                    // Bug #34: capture evidence **before** the request (same as Orca cold-path). If we
+                    // snapshot after `ControlResponse::Ok`, a fast JetStream merge can make `before`
+                    // equal the post-recovery tuple and the wait never observes a change.
+                    let hint_pk = pool_hint.as_deref().and_then(|s| Pubkey::from_str(s).ok());
+                    let before_evidence = hint_pk.and_then(|pk| {
+                        cache.get(&pk).and_then(|st| match st {
+                            CachedPoolState::Meteora(s) => Some((
+                                s.active_id,
+                                s.bin_step,
+                                s.reserve_x_balance,
+                                s.reserve_y_balance,
+                            )),
+                            _ => None,
+                        })
+                    });
                     if let DiscoveryRequestOutcome::Ok = ctx
                         .request_meteora_dlmm_recovery_and_wait(
                             mint_str.as_str(),
@@ -2999,18 +3018,6 @@ impl ExecutionContext {
                         )
                         .await
                     {
-                        let hint_pk = pool_hint.as_deref().and_then(|s| Pubkey::from_str(s).ok());
-                        let before_evidence = hint_pk.and_then(|pk| {
-                            cache.get(&pk).and_then(|st| match st {
-                                CachedPoolState::Meteora(s) => Some((
-                                    s.active_id,
-                                    s.bin_step,
-                                    s.reserve_x_balance,
-                                    s.reserve_y_balance,
-                                )),
-                                _ => None,
-                            })
-                        });
                         if let Some(pk) = hint_pk {
                             if wait_for_meteora_dlmm_slave_after_recovery(
                                 cache,
@@ -10714,10 +10721,13 @@ mod execution_engine_tests {
         is_pumpfun_bonding_curve_structural_sim_error, is_regular_momentum_hot_path_sell,
         pump_amm_pool_market_hint_merge, record_pump_amm_hot_path_refresh_after_success,
         select_best_route, try_pump_amm_hot_path_refresh_publish,
-        wait_for_pumpfun_bonding_cache_refresh, DiscoveryRequestOutcome,
-        PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
+        wait_for_meteora_dlmm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
+        DiscoveryRequestOutcome, PumpAmmHotPathRefreshDecision, RouteCandidate,
+        PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
     };
-    use ironcrab::execution::live_pool_cache::{CachedPoolState, LivePoolCache, PumpFunState};
+    use ironcrab::execution::live_pool_cache::{
+        CachedPoolState, LivePoolCache, MeteoraState, PumpFunState,
+    };
     use ironcrab::ipc::{
         ControlResponse, ControlResponseStatus, DexPoolReadiness, ExplicitAmount, IntentOrigin,
         IntentTier, TradeIntent, TradeResources, TradeSide, TradingRegime,
@@ -11215,5 +11225,70 @@ mod execution_engine_tests {
             try_pump_amm_hot_path_refresh_publish(&map, mint_b, t0),
             PumpAmmHotPathRefreshDecision::Publish
         ));
+    }
+
+    /// Regression: `before` for DLMM recovery wait must be captured **before** awaiting
+    /// `ControlResponse`, or a fast JetStream merge makes `before == after` and the wait times out
+    /// (Bug #34 / #36 — same ordering contract as Orca).
+    #[tokio::test]
+    async fn meteora_dlmm_recovery_wait_needs_pre_request_evidence_snapshot() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(ironcrab::ipc::NATIVE_SOL_MINT).unwrap();
+
+        let initial = MeteoraState {
+            token_x_mint: base_mint,
+            token_y_mint: quote_mint,
+            reserve_x: Pubkey::new_unique(),
+            reserve_y: Pubkey::new_unique(),
+            active_id: 0,
+            bin_step: 10,
+            reserve_x_balance: Some(100),
+            reserve_y_balance: Some(200),
+        };
+        cache.upsert(pool, CachedPoolState::Meteora(initial.clone()), 0);
+        cache.merge_meteora_dlmm_pool_readiness(pool, DexPoolReadiness::Partial);
+
+        let before_evidence = cache.get(&pool).and_then(|st| match st {
+            CachedPoolState::Meteora(s) => Some((
+                s.active_id,
+                s.bin_step,
+                s.reserve_x_balance,
+                s.reserve_y_balance,
+            )),
+            _ => None,
+        });
+        assert_eq!(before_evidence, Some((0, 10, Some(100), Some(200))));
+
+        let mut promoted = initial;
+        promoted.active_id = 42;
+        cache.upsert(pool, CachedPoolState::Meteora(promoted), 0);
+        cache.merge_meteora_dlmm_pool_readiness(pool, DexPoolReadiness::Ready);
+
+        let ok =
+            wait_for_meteora_dlmm_slave_after_recovery(&cache, &pool, before_evidence, 2_000, 5)
+                .await;
+        assert!(
+            ok,
+            "wait should succeed when before is pre-merge and SLAVE shows Ready + changed tuple"
+        );
+
+        // If `before` were wrongly taken after the merge, evidence matches current row → no progress.
+        let stale_before = cache.get(&pool).and_then(|st| match st {
+            CachedPoolState::Meteora(s) => Some((
+                s.active_id,
+                s.bin_step,
+                s.reserve_x_balance,
+                s.reserve_y_balance,
+            )),
+            _ => None,
+        });
+        let stuck =
+            wait_for_meteora_dlmm_slave_after_recovery(&cache, &pool, stale_before, 80, 5).await;
+        assert!(
+            !stuck,
+            "with before == post-recovery evidence, wait must not succeed (guards Bug #34 ordering)"
+        );
     }
 }
