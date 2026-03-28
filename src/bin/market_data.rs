@@ -1789,6 +1789,465 @@ async fn handle_ensure_orca_whirlpool_pool_state(
     }
 }
 
+/// Result of one cache-scoped Meteora DLMM RPC refresh (LB pair + vault balances).
+struct MeteoraDlmmRpcRefreshRowResult {
+    pool_addr: Pubkey,
+    readiness: DexPoolReadiness,
+    /// `true` when a non-`Observed` [`DexPoolReadiness`] update was published to JetStream.
+    jetstream_published: bool,
+}
+
+/// Cold-path only: refresh one Meteora DLMM row already present in MASTER cache — same RPC
+/// pattern as wallet bootstrap (no global scan). Updates MASTER, merges readiness, publishes
+/// JetStream when readiness is not `Observed`.
+///
+/// Returns `None` when this pool row is skipped (fetch/parse/mint mismatch/incomplete vaults).
+async fn cold_path_rpc_refresh_meteora_dlmm_pool_row(
+    ctx: &MarketDataContext,
+    rpc: &Arc<SolanaRpc>,
+    run_id: &str,
+    request_id: &str,
+    base_mint: &Pubkey,
+    pool_addr: Pubkey,
+    mut state: MeteoraState,
+) -> Option<MeteoraDlmmRpcRefreshRowResult> {
+    let dlmm_program = Pubkey::from_str(METEORA_DLMM).expect("METEORA_DLMM constant");
+
+    let pool_acc = match rpc.get_account_opt_retry(&pool_addr).await {
+        Ok(Some(acc)) => acc,
+        Ok(None) | Err(_) => {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                "Meteora DLMM RPC refresh: pool account fetch miss, skip"
+            );
+            return None;
+        }
+    };
+
+    let parsed_state = match parse_pool_account(&dlmm_program, &pool_acc.data) {
+        Some(CachedPoolState::Meteora(s)) => s,
+        _ => {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                data_len = pool_acc.data.len(),
+                "Meteora DLMM RPC refresh: parse pool failed, skip"
+            );
+            return None;
+        }
+    };
+
+    state.token_x_mint = parsed_state.token_x_mint;
+    state.token_y_mint = parsed_state.token_y_mint;
+    state.reserve_x = parsed_state.reserve_x;
+    state.reserve_y = parsed_state.reserve_y;
+    state.active_id = parsed_state.active_id;
+    state.bin_step = parsed_state.bin_step;
+
+    if state.token_x_mint != *base_mint && state.token_y_mint != *base_mint {
+        return None;
+    }
+
+    let vx = state.reserve_x;
+    let vy = state.reserve_y;
+    let bal_x = match rpc.get_account_opt_retry(&vx).await {
+        Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
+        _ => None,
+    };
+    let bal_y = match rpc.get_account_opt_retry(&vy).await {
+        Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
+        _ => None,
+    };
+    let (bx, by) = match (bal_x, bal_y) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                "Meteora DLMM RPC refresh: vault balance RPC incomplete, skip"
+            );
+            return None;
+        }
+    };
+
+    state.reserve_x_balance = Some(bx);
+    state.reserve_y_balance = Some(by);
+
+    ctx.live_pool_cache
+        .upsert(pool_addr, CachedPoolState::Meteora(state.clone()), 0);
+
+    let readiness = meteora_dlmm_readiness_for_pool_cache_update(&state);
+    ctx.live_pool_cache
+        .merge_meteora_dlmm_pool_readiness(pool_addr, readiness);
+
+    if readiness == DexPoolReadiness::Observed {
+        debug!(
+            request_id = %request_id,
+            pool = %pool_addr,
+            mint = %base_mint,
+            "Meteora DLMM RPC refresh: still Observed after RPC, no JetStream publish"
+        );
+        return Some(MeteoraDlmmRpcRefreshRowResult {
+            pool_addr,
+            readiness,
+            jetstream_published: false,
+        });
+    }
+
+    let (pub_base_mint, pub_quote_mint, base_r, quote_r) =
+        (state.token_x_mint, state.token_y_mint, bx, by);
+
+    let jetstream_ok = if let Some(ref nats) = ctx.nats {
+        let mut balance_update = PoolCacheUpdate::new_balance_updated(
+            "market-data",
+            BUILD_VERSION,
+            run_id,
+            pool_addr.to_string(),
+            "meteora_dlmm".to_string(),
+            pub_base_mint.to_string(),
+            pub_quote_mint.to_string(),
+            base_r,
+            quote_r,
+            0,
+        );
+        balance_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(&state));
+        balance_update.set_dex_readiness_in_metadata(readiness);
+        let subject = pool_subject(&pool_addr.to_string());
+        match nats.jetstream_publish(&subject, &balance_update).await {
+            Ok(true) => {
+                info!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    mint = %base_mint,
+                    readiness = ?readiness,
+                    "Meteora DLMM RPC refresh: published PoolCacheUpdate::BalanceUpdated to JetStream"
+                );
+                true
+            }
+            Ok(false) => {
+                warn!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    "Meteora DLMM RPC refresh: JetStream publish failed (timeout or drop)"
+                );
+                false
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    request_id = %request_id,
+                    "Meteora DLMM RPC refresh: Failed to publish PoolCacheUpdate to JetStream"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if !jetstream_ok {
+        warn!(
+            request_id = %request_id,
+            pool = %pool_addr,
+            "Meteora DLMM RPC refresh: MASTER cache updated but JetStream publish failed — SSOT drift risk"
+        );
+    }
+
+    Some(MeteoraDlmmRpcRefreshRowResult {
+        pool_addr,
+        readiness,
+        jetstream_published: jetstream_ok,
+    })
+}
+
+/// I-24d / Scope 21: Cold-path Meteora DLMM recovery — cache-scoped RPC refresh, JetStream SSOT, ControlResponse.
+async fn handle_ensure_meteora_dlmm_pool_state(
+    ctx: &MarketDataContext,
+    rpc: &Arc<SolanaRpc>,
+    run_id: &str,
+    request_id: &str,
+    base_mint_str: &str,
+    pool_address_hint: Option<&str>,
+    force_refresh: bool,
+) {
+    let base_mint = match Pubkey::from_str(base_mint_str) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(base_mint = %base_mint_str, error = %e, "EnsureMeteoraDlmmPoolState: invalid base_mint");
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::Error,
+                    None,
+                    Some(e.to_string()),
+                )
+                .await;
+            }
+            return;
+        }
+    };
+
+    let pool_hint_pk = pool_address_hint.and_then(|s| Pubkey::from_str(s).ok());
+
+    if !force_refresh {
+        if let Some(pool_pk) = pool_hint_pk {
+            if ctx
+                .live_pool_cache
+                .meteora_dlmm_pool_explicitly_ready(&pool_pk)
+            {
+                info!(
+                    request_id = %request_id,
+                    base_mint = %base_mint_str,
+                    pool = %pool_pk,
+                    "EnsureMeteoraDlmmPoolState: cache hit explicit Ready (skip RPC)"
+                );
+                if let Some(ref nats) = ctx.nats {
+                    publish_control_response(
+                        nats,
+                        &ctx.run_id,
+                        request_id,
+                        ControlResponseStatus::Ok,
+                        Some(pool_pk.to_string()),
+                        None,
+                    )
+                    .await;
+                }
+                return;
+            }
+        } else if ctx
+            .live_pool_cache
+            .base_mint_has_explicit_meteora_dlmm_ready_pool(&base_mint)
+        {
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                "EnsureMeteoraDlmmPoolState: mint already has explicit Ready Meteora DLMM pool (skip RPC)"
+            );
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::Ok,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            return;
+        }
+    } else {
+        warn!(
+            request_id = %request_id,
+            base_mint = %base_mint_str,
+            pool_address_hint = ?pool_address_hint,
+            "EnsureMeteoraDlmmPoolState: force_refresh — always running RPC refresh path (no cache-first short-circuit)"
+        );
+    }
+
+    let mut candidate_pools: Vec<(Pubkey, MeteoraState)> = Vec::new();
+    if let Some(pool_pk) = pool_hint_pk {
+        match ctx.live_pool_cache.get(&pool_pk) {
+            Some(CachedPoolState::Meteora(s)) => {
+                if s.token_x_mint != base_mint && s.token_y_mint != base_mint {
+                    warn!(
+                        request_id = %request_id,
+                        pool = %pool_pk,
+                        base_mint = %base_mint_str,
+                        "EnsureMeteoraDlmmPoolState: pool_address_hint DLMM row does not list base_mint"
+                    );
+                    if let Some(ref nats) = ctx.nats {
+                        publish_control_response(
+                            nats,
+                            &ctx.run_id,
+                            request_id,
+                            ControlResponseStatus::Error,
+                            Some(pool_pk.to_string()),
+                            Some("pool hint mint mismatch".to_string()),
+                        )
+                        .await;
+                    }
+                    return;
+                }
+                candidate_pools.push((pool_pk, s));
+            }
+            Some(_) => {
+                warn!(
+                    request_id = %request_id,
+                    pool = %pool_pk,
+                    "EnsureMeteoraDlmmPoolState: pool_address_hint is not a Meteora DLMM row"
+                );
+                if let Some(ref nats) = ctx.nats {
+                    publish_control_response(
+                        nats,
+                        &ctx.run_id,
+                        request_id,
+                        ControlResponseStatus::Error,
+                        Some(pool_pk.to_string()),
+                        Some("pool hint is not meteora dlmm in cache".to_string()),
+                    )
+                    .await;
+                }
+                return;
+            }
+            None => {
+                info!(
+                    request_id = %request_id,
+                    pool = %pool_pk,
+                    base_mint = %base_mint_str,
+                    "EnsureMeteoraDlmmPoolState: pool hint not in LivePoolCache (NotFound)"
+                );
+                if let Some(ref nats) = ctx.nats {
+                    publish_control_response(
+                        nats,
+                        &ctx.run_id,
+                        request_id,
+                        ControlResponseStatus::NotFound,
+                        Some(pool_pk.to_string()),
+                        None,
+                    )
+                    .await;
+                }
+                return;
+            }
+        }
+    } else {
+        candidate_pools = ctx.live_pool_cache.meteora_dlmm_pools_for_mint(&base_mint);
+        if candidate_pools.is_empty() {
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                "EnsureMeteoraDlmmPoolState: no Meteora DLMM rows in LivePoolCache for mint (NotFound)"
+            );
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::NotFound,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            return;
+        }
+    }
+
+    info!(
+        request_id = %request_id,
+        base_mint = %base_mint_str,
+        pool_address_hint = ?pool_address_hint,
+        candidates = candidate_pools.len(),
+        force_refresh = %force_refresh,
+        "EnsureMeteoraDlmmPoolState: starting cache-scoped Meteora DLMM RPC refresh"
+    );
+
+    let mut terminal_ok_pool: Option<Pubkey> = None;
+    let mut ready_jetstream_failed_pool: Option<Pubkey> = None;
+
+    for (pool_addr, state) in candidate_pools {
+        if let Some(row) = cold_path_rpc_refresh_meteora_dlmm_pool_row(
+            ctx, rpc, run_id, request_id, &base_mint, pool_addr, state,
+        )
+        .await
+        {
+            match (row.readiness, row.jetstream_published) {
+                (DexPoolReadiness::Ready, true) => {
+                    terminal_ok_pool = Some(row.pool_addr);
+                    break;
+                }
+                (DexPoolReadiness::Ready, false) => {
+                    ready_jetstream_failed_pool = Some(row.pool_addr);
+                }
+                (DexPoolReadiness::Partial, true) => {
+                    debug!(
+                        request_id = %request_id,
+                        pool = %row.pool_addr,
+                        "EnsureMeteoraDlmmPoolState: Partial published to JetStream — scan remaining candidates for Ready"
+                    );
+                }
+                (DexPoolReadiness::Partial, false) => {
+                    warn!(
+                        request_id = %request_id,
+                        pool = %row.pool_addr,
+                        "EnsureMeteoraDlmmPoolState: Partial row MASTER-updated but JetStream publish failed"
+                    );
+                }
+                (DexPoolReadiness::Observed, _) => {}
+            }
+        }
+    }
+
+    if let Some(pool_pk) = terminal_ok_pool {
+        if let Some(ref nats) = ctx.nats {
+            let pool_str = pool_pk.to_string();
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                pool = %pool_str,
+                readiness = ?DexPoolReadiness::Ready,
+                jetstream = "published",
+                "EnsureMeteoraDlmmPoolState: terminal ok (Meteora DLMM Ready + JetStream publish)"
+            );
+            publish_control_response(
+                nats,
+                &ctx.run_id,
+                request_id,
+                ControlResponseStatus::Ok,
+                Some(pool_str),
+                None,
+            )
+            .await;
+        }
+        return;
+    }
+
+    if let Some(pool_pk) = ready_jetstream_failed_pool {
+        if let Some(ref nats) = ctx.nats {
+            let pool_str = pool_pk.to_string();
+            let msg = "JetStream publish failed".to_string();
+            warn!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                pool = %pool_str,
+                error = %msg,
+                "EnsureMeteoraDlmmPoolState: terminal error (Ready on MASTER but JetStream publish failed)"
+            );
+            publish_control_response(
+                nats,
+                &ctx.run_id,
+                request_id,
+                ControlResponseStatus::Error,
+                Some(pool_str),
+                Some(msg),
+            )
+            .await;
+        }
+        return;
+    }
+
+    warn!(
+        request_id = %request_id,
+        base_mint = %base_mint_str,
+        "EnsureMeteoraDlmmPoolState: RPC refresh did not yield Meteora DLMM Ready + JetStream publish (Error)"
+    );
+    if let Some(ref nats) = ctx.nats {
+        publish_control_response(
+            nats,
+            &ctx.run_id,
+            request_id,
+            ControlResponseStatus::Error,
+            None,
+            Some("meteora dlmm rpc refresh did not produce jetstream-ready state".to_string()),
+        )
+        .await;
+    }
+}
+
 /// Cold-path only: Meteora DLMM promotion for one wallet mint. Uses **only** pools already present
 /// in [`LivePoolCache`] (from Geyser); no `getProgramAccounts` / global scan. RPC: per-pool
 /// `get_account` (LB pair) + per-reserve-vault balance reads — bounded by matching cache rows.
@@ -1834,9 +2293,7 @@ async fn handle_wallet_bootstrap_meteora_dlmm_verify_for_mint(
         "Wallet bootstrap Meteora DLMM: verifying cache-scoped pools (cold-path RPC, no global scan)"
     );
 
-    let dlmm_program = Pubkey::from_str(METEORA_DLMM).expect("METEORA_DLMM constant");
-
-    for (pool_addr, mut state) in pools {
+    for (pool_addr, state) in pools {
         if ctx.live_pool_cache.base_mint_has_any_ready_pool(base_mint) {
             break;
         }
@@ -1847,142 +2304,10 @@ async fn handle_wallet_bootstrap_meteora_dlmm_verify_for_mint(
             break;
         }
 
-        let pool_acc = match rpc.get_account_opt_retry(&pool_addr).await {
-            Ok(Some(acc)) => acc,
-            Ok(None) | Err(_) => {
-                debug!(
-                    request_id = %request_id,
-                    pool = %pool_addr,
-                    "Wallet bootstrap Meteora DLMM: pool account fetch miss, skip"
-                );
-                continue;
-            }
-        };
-
-        let parsed_state = match parse_pool_account(&dlmm_program, &pool_acc.data) {
-            Some(CachedPoolState::Meteora(s)) => s,
-            _ => {
-                debug!(
-                    request_id = %request_id,
-                    pool = %pool_addr,
-                    data_len = pool_acc.data.len(),
-                    "Wallet bootstrap Meteora DLMM: parse pool failed, skip"
-                );
-                continue;
-            }
-        };
-
-        state.token_x_mint = parsed_state.token_x_mint;
-        state.token_y_mint = parsed_state.token_y_mint;
-        state.reserve_x = parsed_state.reserve_x;
-        state.reserve_y = parsed_state.reserve_y;
-        state.active_id = parsed_state.active_id;
-        state.bin_step = parsed_state.bin_step;
-
-        if state.token_x_mint != *base_mint && state.token_y_mint != *base_mint {
-            continue;
-        }
-
-        let vx = state.reserve_x;
-        let vy = state.reserve_y;
-        let bal_x = match rpc.get_account_opt_retry(&vx).await {
-            Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
-            _ => None,
-        };
-        let bal_y = match rpc.get_account_opt_retry(&vy).await {
-            Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
-            _ => None,
-        };
-        let (bx, by) = match (bal_x, bal_y) {
-            (Some(a), Some(b)) => (a, b),
-            _ => {
-                debug!(
-                    request_id = %request_id,
-                    pool = %pool_addr,
-                    "Wallet bootstrap Meteora DLMM: vault balance RPC incomplete, skip"
-                );
-                continue;
-            }
-        };
-
-        state.reserve_x_balance = Some(bx);
-        state.reserve_y_balance = Some(by);
-
-        ctx.live_pool_cache
-            .upsert(pool_addr, CachedPoolState::Meteora(state.clone()), 0);
-
-        let readiness = meteora_dlmm_readiness_for_pool_cache_update(&state);
-        ctx.live_pool_cache
-            .merge_meteora_dlmm_pool_readiness(pool_addr, readiness);
-
-        if readiness == DexPoolReadiness::Observed {
-            debug!(
-                request_id = %request_id,
-                pool = %pool_addr,
-                mint = %base_mint,
-                "Wallet bootstrap Meteora DLMM: still Observed after RPC, no JetStream publish"
-            );
-            continue;
-        }
-
-        let (pub_base_mint, pub_quote_mint, base_r, quote_r) =
-            (state.token_x_mint, state.token_y_mint, bx, by);
-
-        let jetstream_ok = if let Some(ref nats) = ctx.nats {
-            let mut balance_update = PoolCacheUpdate::new_balance_updated(
-                "market-data",
-                BUILD_VERSION,
-                run_id,
-                pool_addr.to_string(),
-                "meteora_dlmm".to_string(),
-                pub_base_mint.to_string(),
-                pub_quote_mint.to_string(),
-                base_r,
-                quote_r,
-                0,
-            );
-            balance_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(&state));
-            balance_update.set_dex_readiness_in_metadata(readiness);
-            let subject = pool_subject(&pool_addr.to_string());
-            match nats.jetstream_publish(&subject, &balance_update).await {
-                Ok(true) => {
-                    info!(
-                        request_id = %request_id,
-                        pool = %pool_addr,
-                        mint = %base_mint,
-                        readiness = ?readiness,
-                        "Wallet bootstrap Meteora DLMM: published PoolCacheUpdate::BalanceUpdated to JetStream"
-                    );
-                    true
-                }
-                Ok(false) => {
-                    warn!(
-                        request_id = %request_id,
-                        pool = %pool_addr,
-                        "Wallet bootstrap Meteora DLMM: JetStream publish failed (timeout or drop)"
-                    );
-                    false
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        request_id = %request_id,
-                        "Wallet bootstrap Meteora DLMM: Failed to publish PoolCacheUpdate to JetStream"
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        if !jetstream_ok {
-            warn!(
-                request_id = %request_id,
-                pool = %pool_addr,
-                "Wallet bootstrap Meteora DLMM: MASTER cache updated but JetStream publish failed — SSOT drift risk"
-            );
-        }
+        let _ = cold_path_rpc_refresh_meteora_dlmm_pool_row(
+            ctx, rpc, run_id, request_id, base_mint, pool_addr, state,
+        )
+        .await;
     }
 }
 
@@ -3963,6 +4288,33 @@ async fn run_geyser_loop(
                                         let rpc_clone = rpc.clone();
                                         tokio::spawn(async move {
                                             handle_ensure_orca_whirlpool_pool_state(
+                                                &ctx_clone,
+                                                &rpc_clone,
+                                                run_id.as_str(),
+                                                &request_id,
+                                                &base_mint,
+                                                pool_hint.as_deref(),
+                                                force_refresh,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                    ControlRequestKind::EnsureMeteoraDlmmPoolState { base_mint } => {
+                                        let run_id = ctx.run_id.clone();
+                                        let request_id = req.request_id.clone();
+                                        let pool_hint = req.pool_address_hint.clone();
+                                        let force_refresh = req.force_refresh_meteora_dlmm;
+                                        info!(
+                                            request_id = %request_id,
+                                            base_mint = %base_mint,
+                                            pool_address_hint = ?pool_hint,
+                                            force_refresh_meteora_dlmm = %force_refresh,
+                                            "EnsureMeteoraDlmmPoolState received"
+                                        );
+                                        let ctx_clone = ctx.clone();
+                                        let rpc_clone = rpc.clone();
+                                        tokio::spawn(async move {
+                                            handle_ensure_meteora_dlmm_pool_state(
                                                 &ctx_clone,
                                                 &rpc_clone,
                                                 run_id.as_str(),
@@ -6850,6 +7202,33 @@ async fn run_simulation_loop(
                                         let rpc_clone = rpc.clone();
                                         tokio::spawn(async move {
                                             handle_ensure_orca_whirlpool_pool_state(
+                                                &ctx_clone,
+                                                &rpc_clone,
+                                                run_id.as_str(),
+                                                &request_id,
+                                                &base_mint,
+                                                pool_hint.as_deref(),
+                                                force_refresh,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                    ControlRequestKind::EnsureMeteoraDlmmPoolState { base_mint } => {
+                                        let run_id = ctx.run_id.clone();
+                                        let request_id = req.request_id.clone();
+                                        let pool_hint = req.pool_address_hint.clone();
+                                        let force_refresh = req.force_refresh_meteora_dlmm;
+                                        info!(
+                                            request_id = %request_id,
+                                            base_mint = %base_mint,
+                                            pool_address_hint = ?pool_hint,
+                                            force_refresh_meteora_dlmm = %force_refresh,
+                                            "EnsureMeteoraDlmmPoolState received (simulation)"
+                                        );
+                                        let ctx_clone = ctx.clone();
+                                        let rpc_clone = rpc.clone();
+                                        tokio::spawn(async move {
+                                            handle_ensure_meteora_dlmm_pool_state(
                                                 &ctx_clone,
                                                 &rpc_clone,
                                                 run_id.as_str(),
