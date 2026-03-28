@@ -203,8 +203,8 @@ fn is_orca_structural_sim_error(error_code: Option<&str>) -> bool {
 /// (`sell_all=true`).
 ///
 /// Rationale: `sell-all` / keyless tooling may tag `sell_all=true` without `purpose=liquidation`;
-/// that path is still Cold Path (not momentum hot path). PumpSwap recovery stays gated on
-/// `is_liquidation_sell` only.
+/// that path is still Cold Path (not momentum hot path). PumpSwap structural sim recovery uses
+/// the same gate as other cold-path DEX recovery ([`is_cold_path_recovery_sell`]).
 #[inline]
 fn is_cold_path_recovery_sell(intent: &TradeIntent) -> bool {
     if intent.side != TradeSide::Sell {
@@ -9047,8 +9047,9 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
         // PumpSwap SELL: stale/wrong creator-vault accounts in cached pool_accounts → Overflow Custom(6023).
         // Cold-path recovery: one EnsurePumpAmmPoolAccounts with force_refresh (RPC market parse).
+        // Gate: liquidation/kill-switch **or** explicit manual `sell_all=true` (not general strategy SELLs).
         if !pump_amm_recovery_attempted
-            && is_liquidation_sell
+            && is_cold_path_recovery_sell(&intent)
             && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pump_amm")
             && is_pump_amm_structural_sim_error(sim_result.error_code.as_deref())
         {
@@ -9089,7 +9090,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                             warn!(
                                 intent_id = %intent.intent_id,
                                 pool = %pool_pk,
-                                "PumpSwap liquidation: simulation 6023/Overflow — force-refresh pool_accounts (market-data RPC), rebuilding tx (one retry)"
+                                "PumpSwap cold-path recovery: simulation 6023/Overflow — force-refresh pool_accounts (market-data RPC), rebuilding tx (one retry)"
                             );
                             continue;
                         }
@@ -11151,6 +11152,33 @@ mod execution_engine_tests {
         intent
             .metadata
             .insert("dex".to_string(), "pumpfun".to_string());
+        assert!(is_cold_path_recovery_sell(&intent));
+    }
+
+    #[test]
+    fn pumpswap_recovery_cold_path_includes_sell_all_without_purpose_liquidation() {
+        let mut intent = TradeIntent::new_sell(
+            "sell-all",
+            "v0.1.0",
+            "run-1",
+            "id-sa-pamm".to_string(),
+            "sell-all",
+            IntentTier::Tier0,
+            IntentOrigin::StrategyA,
+            "Mint111111111111111111111111111111111111111".to_string(),
+            6,
+            ironcrab::ipc::NATIVE_SOL_MINT.to_string(),
+            1_000_000,
+            0,
+            200,
+            TradingRegime::NotApplicable,
+        );
+        intent
+            .metadata
+            .insert("sell_all".to_string(), "true".to_string());
+        intent
+            .metadata
+            .insert("dex".to_string(), "pump_amm".to_string());
         assert!(is_cold_path_recovery_sell(&intent));
     }
 
