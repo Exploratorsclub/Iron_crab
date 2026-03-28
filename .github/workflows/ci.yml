@@ -90,6 +90,16 @@ jobs:
         run: |
           git clone "$EVAL_CLONE_URL" "${{ github.workspace }}/Iron_crab-eval"
 
+      # Upstream eval may lag ironcrab API: inject_cached_amm_state gained coin_reserve/pc_reserve.
+      - name: Align eval Raydium inject_cached_amm_state callsites with patched ironcrab
+        run: |
+          set -euo pipefail
+          EVAL="${{ github.workspace }}/Iron_crab-eval"
+          for f in tests/invariants_hot_path_no_rpc.rs tests/invariants_cross_dex_cold_path_reserves.rs; do
+            test -f "$EVAL/$f" || continue
+            perl -i -0777 -pe 's/(        9,\n        6,\n)        market_id,/${1}        None,\n        None,\n        market_id,/g' "$EVAL/$f"
+          done
+
       - name: Patch eval git-dep to use PR checkout
         run: |
           cat >> "${{ github.workspace }}/Iron_crab-eval/Cargo.toml" <<'EOF'
