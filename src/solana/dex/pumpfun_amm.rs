@@ -45,6 +45,14 @@ fn pump_amm_canonical_event_authority(program_id: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"__event_authority"], program_id).0
 }
 
+/// Singleton `global_volume_accumulator` PDA — same address for all PumpSwap pools under the AMM program.
+///
+/// When market-byte heuristics find no AMM-owned candidate and PDA probes fail (e.g. account owner
+/// differs from `program_id`), we still need this account for BUY; see `tests/pump_amm_market_parse_offsets.rs`.
+fn pump_amm_singleton_global_volume_accumulator(pump_amm_program: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"global_volume_accumulator"], pump_amm_program).0
+}
+
 /// Resolve swap metas #9/#10 from observed pool/parser/cache values.
 ///
 /// `protocol_fee_recipient` is **pool- and observation-specific** (not a global constant). If both
@@ -941,7 +949,12 @@ impl PumpFunAmmDex {
                     .await?
                 {
                     Some(derived_authority) => {
-                        let derived_ata = Self::derive_ata(derived_authority, base_mint);
+                        // Same as offset-211 path: creator fee vault is the quote-mint (WSOL) ATA for this authority.
+                        let derived_ata = Self::derive_ata_with_program(
+                            derived_authority,
+                            expected_quote_mint,
+                            token_program,
+                        );
                         warn!(
                             pool = %pool_market,
                             base_mint = %base_mint,
@@ -992,7 +1005,11 @@ impl PumpFunAmmDex {
                 .await?
             {
                 Some(derived_authority) => {
-                    let derived_ata = Self::derive_ata(derived_authority, base_mint);
+                    let derived_ata = Self::derive_ata_with_program(
+                        derived_authority,
+                        expected_quote_mint,
+                        token_program,
+                    );
                     warn!(
                         pool = %pool_market,
                         base_mint = %base_mint,
@@ -1077,6 +1094,20 @@ impl PumpFunAmmDex {
             )
             .await?
             .unwrap_or_default()
+        };
+
+        // Known-pool fast path: volume accumulator is a single global PDA; heuristics may miss it if
+        // no embedded pubkey resolves to an account owned by `pump_amm_program` (see derive_existing_pda).
+        let global_volume_accumulator = if global_volume_accumulator == Pubkey::default() {
+            let singleton = pump_amm_singleton_global_volume_accumulator(&pump_amm_program);
+            info!(
+                pool = %pool_market,
+                global_volume_accumulator = %singleton,
+                "pump_amm: using singleton global_volume_accumulator PDA (heuristic empty)"
+            );
+            singleton
+        } else {
+            global_volume_accumulator
         };
 
         // Same global fee_config pubkey for all PumpSwap pools (see build_swap_ix_from_pool_accounts).
@@ -3338,6 +3369,31 @@ mod tests {
 
         assert_eq!(ixs[0].accounts.len(), 21);
         assert_eq!(ixs[0].accounts[15].pubkey, canonical_ea);
+    }
+
+    /// Known-pool parse: singleton `global_volume_accumulator` PDA must match mainnet fixture (see `tests/pump_amm_market_parse_offsets.rs`).
+    #[test]
+    fn test_pump_amm_singleton_global_volume_accumulator_fixture() {
+        let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).unwrap();
+        let gva = pump_amm_singleton_global_volume_accumulator(&program_id);
+        let expected = Pubkey::from_str("C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw").unwrap();
+        assert_eq!(gva, expected);
+    }
+
+    /// Creator-vault PDA fallback must derive the quote-mint (WSOL) ATA — same as offset-211 path (not `base_mint`).
+    #[test]
+    fn test_pump_amm_creator_vault_authority_derives_quote_mint_ata() {
+        // Mainnet pool 5rNMGrJ3… — `creator_vault` authority from successful swaps (see tests/pump_amm_market_parse_offsets.rs).
+        let auth = Pubkey::from_str("6tkGUcYBJJ2c1pdtMQayUpEFEpyP3QqY8Lf6pvvpF5Fq").unwrap();
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let token_program = Pubkey::new_from_array(spl_token::id().to_bytes());
+        let ata_wsol = PumpFunAmmDex::derive_ata_with_program(auth, wsol, token_program);
+        let ata_wrong_mint =
+            PumpFunAmmDex::derive_ata_with_program(auth, Pubkey::new_unique(), token_program);
+        assert_ne!(
+            ata_wsol, ata_wrong_mint,
+            "creator fee vault must be the WSOL ATA for this authority, not an ATA for another mint"
+        );
     }
 
     /// SELL path: ix[9]/[10] must match pool_accounts[6]/[7] (non-global protocol fee recipients).
