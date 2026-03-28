@@ -304,6 +304,8 @@ impl Raydium {
     ///
     /// This is used by tx_builder when pool state is available in the live cache.
     /// Serum accounts are optional - if not provided, they'll be fetched via RPC.
+    /// Vault reserves (`coin_reserve` / `pc_reserve`) populate `SimplePool` for `quote_exact_in`;
+    /// use `None` when unknown (quotes skip zero-reserve pools).
     #[allow(clippy::too_many_arguments)]
     pub fn inject_cached_amm_state(
         &self,
@@ -314,6 +316,8 @@ impl Raydium {
         quote_vault: Pubkey,
         _base_decimals: u8,
         _quote_decimals: u8,
+        coin_reserve: Option<u64>,
+        pc_reserve: Option<u64>,
         market_id: Pubkey,
         serum_bids: Option<Pubkey>,
         serum_asks: Option<Pubkey>,
@@ -343,8 +347,8 @@ impl Raydium {
             amm_authority: Some(amm_auth),
             serum_vault_signer,
             target_orders: None, // Not needed for swap
-            reserve_base: 0,     // Not used for instruction building
-            reserve_quote: 0,
+            reserve_base: coin_reserve.unwrap_or(0) as u128,
+            reserve_quote: pc_reserve.unwrap_or(0) as u128,
             fee_bps: 30, // Default Raydium fee
             last_update: std::time::SystemTime::now(),
             serum_bids,
@@ -1848,6 +1852,8 @@ mod tests {
             quote_vault,
             9,
             6,
+            None,
+            None,
             market_id,
             None,
             None,
