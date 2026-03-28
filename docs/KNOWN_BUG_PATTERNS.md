@@ -343,6 +343,40 @@
 
 ---
 
+## 34. Cold-Path Recovery cache-first beantwortet stale PumpSwap pool_accounts erneut
+
+| Symptom | Liquidation oder strukturell fehlgeschlagener SELL sendet Recovery-Request an `market-data`, aber der naechste Versuch verwendet effektiv denselben fehlerhaften PumpSwap-Account-Satz weiter. Wiederholte Sim-Fails trotz Request/Reply; Logs zeigen kanonische Ersetzungen fuer `global_config` / `event_authority` / `protocol_fee_recipient`, aber der Sell scheitert tiefer (z. B. `6023 Overflow`). |
+|---------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Der Recovery-Pfad ist semantisch kein erzwungener Fresh-Refresh, sondern cache-first. `market-data` nutzt einen geteilten `PumpFunAmmDex` mit internem Cache und `live_pool_cache`; `pool_accounts_v1_for_base_mint()` liefert bei vorhandenem 14er-Satz sofort den Cache zurueck. Dadurch kann eine Recovery-Anfrage genau den State wiederverwenden, der den strukturellen Sim-Fail verursacht hat. |
+| **Fix** | Semantik trennen: (a) Normalfall = Engine nutzt Cache direkt, kein Request. (b) Cold-Path Recovery nach strukturellem Sim-Fail = `market-data` macht **force refresh via RPC**, bypassed cache-first und ueberschreibt den autoritativen MASTER-/JetStream-State. (c) Hot Path darf hoechstens asynchronen Refresh triggern, aber nicht blockierend auf RPC warten. (d) Wiederholte Hot-Path-Refreshes fuer denselben Mint lokal deduplen/cooldownen, damit ein strukturell kaputter Pool `market-data` nicht mit identischen `EnsurePumpAmmPoolAccounts(force_refresh=true)`-Publishes flutet. |
+| **Pruefen bei** | `EnsurePumpAmmPoolAccounts` / Recovery-Requests, `market_data.rs`, `pumpfun_amm.rs`, Liquidation-Retry nach Sim-Fail, Warn-Logs fuer RPC-Recovery |
+| **Verwandt** | Bug #25 (Cache-HIT verhindert Cold-Path-RPC-Verifikation), Bug #27 (degenerate cache verhindert Fallback), Bug #33 (stale pool_accounts im Bootstrap), I-24d Request/Reply |
+| **Rollout-Note** | Dieses Muster soll schrittweise auch fuer weitere DEXe gelten. PumpSwap ist der erste vollstaendige Slice; naechster geplanter Scope ist PumpFun Bonding Curve im Cold Path. |
+
+---
+
+## 35. PumpSwap `protocol_fee_recipient` global kanonisiert statt reale Pool-/TX-Werte zu bewahren
+
+| Symptom | PumpSwap Liquidation oder SELL scheitert trotz erfolgreichem Cold-Path-Refresh weiterhin mit `Custom(6023)` oder aehnlichem strukturellem Sell-Fehler. Logs zeigen, dass `build_swap_ix_from_pool_accounts` bzw. `set_pool_from_accounts` `pool_accounts[6]` / `pool_accounts[7]` aktiv auf einen "kanonischen" `protocol_fee_recipient` und dessen ATA umbiegt. |
+|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Fuer PumpSwap wurde faelschlich angenommen, `protocol_fee_recipient` sei global konstant. Dadurch hardcodieren `pumpfun_amm.rs` und teilweise auch `dex_parser.rs` ein einzelnes Wallet (`JCR...`) samt abgeleiteter ATA und ueberschreiben echte, per Geyser/RPC oder aus erfolgreichen Mainnet-TXs beobachtete Werte. Bei betroffenen Pools fuehrt genau diese Kanonisierung dazu, dass ein korrekter Refresh erneut unbrauchbar gemacht wird. |
+| **Fix** | Keine globale Kanonisierung fuer `protocol_fee_recipient` / `protocol_fee_recipient_ta`. Reale PumpSwap-Accountwerte aus Geyser, RPC-Discovery oder parsergestuetzten Referenzdaten end-to-end bewahren. Nur echte globale Konstanten wie `fee_program` / `fee_config` normalisieren. Regressionstest gegen eine erfolgreiche Mainnet-Sell-Referenz oder einen bewusst von `JCR...` abweichenden Pool-Account-Satz hinzufuegen. |
+| **Pruefen bei** | `pumpfun_amm.rs` (`set_pool_from_accounts`, `build_swap_ix`, `build_swap_ix_from_pool_accounts`), `dex_parser.rs` (`build_pool_accounts_from_create_pool`, SELL-Parser), JetStream-/Cache-Persistenz von PumpSwap-`pool_accounts` |
+| **Verwandt** | Bug #20 (DEX Account Order nur gegen echte Mainnet-Referenz fixen), Bug #34 (Cold-Path force refresh darf nicht wieder denselben kaputten Satz bekommen), Pattern #19 (kein Fix ohne harte Runtime-Evidenz) |
+
+---
+
+## 36. Cache-Hit ist nicht automatisch `ready` (DEX-uebergreifend)
+
+| Symptom | Ein Token oder Pool scheint im Cache vorhanden zu sein, ist aber im entscheidenden Pfad nicht wirklich verwendbar. Symptome koennen je nach DEX unterschiedlich aussehen: no-route, struktureller Sim-Fail, degenerate Reserves, fehlende `pool_accounts`, fehlende Cashback-/Creator-/Fee-Daten, stale Restart-State oder Request/Reply, das nur Teilzustand wiederverwendet. |
+|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | Implizite Gleichsetzung von „im Cache vorhanden“ mit „vollstaendig/verwendbar“. Nicht alle Geyser-Events enthalten alle benoetigten Daten. Teilzustand aus Pool-Account, Vault-Update, Trade-Parsing oder synthetischer Rekonstruktion wird zu frueh wie ein autoritativer Vollzustand behandelt. Nach Restart oder bei seltenen Pools kann derselbe Fehler auch durch JetStream-Bootstrap oder cache-first Recovery sichtbar werden. |
+| **Fix** | DEX-uebergreifende Readiness explizit modellieren: `observed` / `partial` / `ready` oder aequivalente Logik. Ein Token ist nur `ready`, wenn mindestens ein Pool fuer dieses Token mit allen DEX-spezifisch benoetigten Daten vorliegt. Geyser bleibt primaere Quelle; RPC-Verifikation nur bounded und nur fuer wallet-relevante Mints. Synthetische Rekonstruktion darf nicht automatisch `ready` setzen. |
+| **Pruefen bei** | Restart-/Bootstrap-Flows, `market-data` Wallet-/Pool-Discovery, `pool_cache_sync.rs`, `live_pool_cache.rs`, DEX-spezifische Quote-/Builder-Pfade, Cold-Path Recovery-Semantik |
+| **Verwandt** | Bug #4 (kein RPC im Hot Path), Bug #25, Bug #27, Bug #28, Bug #33, Bug #34, Bug #35 |
+
+---
+
 ## Quick-Check: Bei neuem Bug
 
 1. Sieht das wie eines der Muster oben?
@@ -351,3 +385,4 @@
 4. Wird ein State (exit_generated, pending, position) korrekt zurückgesetzt?
 5. Sind DEX-Namen/Decimals/Units konsistent?
 6. Bin ich sicher in der Root Cause? (Pattern 19: Kein Fix ohne Evidenz)
+7. Ist der betroffene Token/Pool wirklich `ready` oder nur im Cache vorhanden?

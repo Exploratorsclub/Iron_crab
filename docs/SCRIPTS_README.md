@@ -177,6 +177,15 @@ Plus Python-Services:
 | Control Plane | 8080 | http://localhost:8080 |
 | Trades API | 9899 | http://localhost:9899/trades |
 
+Fuer PumpSwap Async-Healing im `execution-engine` sind aktuell diese Counter
+relevant:
+
+- `pumpswap_hot_path_healing_trigger_total`
+- `pumpswap_hot_path_healing_cooldown_suppressed_total`
+- `pumpswap_hot_path_healing_async_publish_success_total`
+- `pumpswap_hot_path_healing_async_publish_fail_total`
+- `pumpswap_hot_path_healing_skipped_no_nats_total`
+
 ## Grafana Dashboards
 
 Import aus `docs/`:

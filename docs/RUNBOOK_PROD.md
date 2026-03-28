@@ -146,6 +146,29 @@ journalctl -u execution-engine -n 100 --no-pager
 | Control Plane API | `http://localhost:8080` | REST API |
 | Trades API | `http://localhost:9899/trades` | Grafana Infinity |
 
+### PumpSwap Async-Healing Metrics
+
+Im `execution-engine`-Metrics-Endpoint sind fuer den Hot-Path-Healing-Pfad jetzt
+zusetzlich folgende Counter relevant:
+
+- `pumpswap_hot_path_healing_trigger_total`
+- `pumpswap_hot_path_healing_cooldown_suppressed_total`
+- `pumpswap_hot_path_healing_async_publish_success_total`
+- `pumpswap_hot_path_healing_async_publish_fail_total`
+- `pumpswap_hot_path_healing_skipped_no_nats_total`
+
+Interpretation:
+
+- `trigger_total` steigt, wenn ein regulaerer PumpSwap-Hot-Path-SELL nach
+  strukturellem Sim-Fail einen async `force_refresh` publishen wuerde.
+- `cooldown_suppressed_total` steigt, wenn derselbe Pfad wegen lokalem
+  Mint-Cooldown bewusst unterdrueckt wird.
+- `async_publish_success_total` bedeutet `nats.publish -> Ok(true)`.
+- `async_publish_fail_total` bedeutet `Ok(false)` oder `Err(...)`; in diesem
+  Fall startet kein erfolgreicher Healing-Cooldown.
+- `skipped_no_nats_total` zeigt, dass der Healing-Pfad erreicht wurde, aber
+  kein NATS-Client verfuegbar war.
+
 ## Dashboard-Interpretation (WSOL-first)
 
 Aktuelle Architektur handelt primär in WSOL (kein Auto-Unwrap). Daher gelten
