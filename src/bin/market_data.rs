@@ -62,6 +62,7 @@ use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
 use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
+use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex_parser::{
     parse_account_update, parse_transaction_update_with_pool_lookup, DexType, OrcaPoolInfo,
     ParsedDexEvent,
@@ -89,7 +90,8 @@ use ironcrab::execution::live_pool_cache::{
     meteora_cpmm_readiness_for_pool_cache_update, meteora_dlmm_readiness_for_pool_cache_update,
     orca_readiness_for_pool_cache_update, parse_pool_account,
     raydium_amm_readiness_for_pool_cache_update, CachedPoolState, LivePoolCache, MeteoraCpmmState,
-    MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState, RaydiumCpmmState,
+    MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState, RaydiumAmmState,
+    RaydiumCpmmState,
 };
 
 // P1 Crash Isolation: Systemd Watchdog support
@@ -2248,6 +2250,514 @@ async fn handle_ensure_meteora_dlmm_pool_state(
     }
 }
 
+/// Result of one cache-scoped Raydium AMM v4 RPC refresh (pool + vaults + optional Serum).
+struct RaydiumAmmRpcRefreshRowResult {
+    pool_addr: Pubkey,
+    readiness: DexPoolReadiness,
+    /// `true` when a non-`Observed` [`DexPoolReadiness`] update was published to JetStream.
+    jetstream_published: bool,
+}
+
+/// Cold-path only: refresh one Raydium AMM v4 row already present in MASTER cache — no global scan.
+/// Fetches pool account, vault balances, and Serum/OpenBook bids/asks/event_queue when `market_id`
+/// is set and serum pointers are missing (same authoritative path as FIX-29 Geyser follow-up).
+async fn cold_path_rpc_refresh_raydium_amm_pool_row(
+    ctx: &MarketDataContext,
+    rpc: &Arc<SolanaRpc>,
+    run_id: &str,
+    request_id: &str,
+    base_mint: &Pubkey,
+    pool_addr: Pubkey,
+    mut state: RaydiumAmmState,
+) -> Option<RaydiumAmmRpcRefreshRowResult> {
+    let raydium_program = Pubkey::from_str(RAYDIUM_AMM_V4).expect("RAYDIUM_AMM_V4 constant");
+
+    let pool_acc = match rpc.get_account_opt_retry(&pool_addr).await {
+        Ok(Some(acc)) => acc,
+        Ok(None) | Err(_) => {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                "Raydium AMM RPC refresh: pool account fetch miss, skip"
+            );
+            return None;
+        }
+    };
+
+    let parsed_state = match parse_pool_account(&raydium_program, &pool_acc.data) {
+        Some(CachedPoolState::RaydiumAmm(s)) => s,
+        _ => {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                data_len = pool_acc.data.len(),
+                "Raydium AMM RPC refresh: parse pool failed, skip"
+            );
+            return None;
+        }
+    };
+
+    state.base_mint = parsed_state.base_mint;
+    state.quote_mint = parsed_state.quote_mint;
+    state.coin_vault = parsed_state.coin_vault;
+    state.pc_vault = parsed_state.pc_vault;
+    state.base_decimals = parsed_state.base_decimals;
+    state.quote_decimals = parsed_state.quote_decimals;
+    state.market_id = parsed_state.market_id;
+
+    if state.base_mint != *base_mint && state.quote_mint != *base_mint {
+        return None;
+    }
+
+    let coin_vault = state.coin_vault;
+    let pc_vault = state.pc_vault;
+    let bal_coin = match rpc.get_account_opt_retry(&coin_vault).await {
+        Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
+        _ => None,
+    };
+    let bal_pc = match rpc.get_account_opt_retry(&pc_vault).await {
+        Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
+        _ => None,
+    };
+    let (bc, bq) = match (bal_coin, bal_pc) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                "Raydium AMM RPC refresh: vault balance RPC incomplete, skip"
+            );
+            return None;
+        }
+    };
+
+    state.coin_reserve = Some(bc);
+    state.pc_reserve = Some(bq);
+
+    ctx.live_pool_cache
+        .upsert(pool_addr, CachedPoolState::RaydiumAmm(state.clone()), 0);
+
+    // Serum/OpenBook static accounts (same as FIX-29 one-shot path in Geyser handler).
+    if state.market_id != Pubkey::default()
+        && (state.serum_bids.is_none()
+            || state.serum_asks.is_none()
+            || state.serum_event_queue.is_none())
+    {
+        match rpc.get_account_retry(&state.market_id).await {
+            Ok(account) => {
+                if let Some((bids_o, asks_o, eq_o, _bv, _qv)) =
+                    Raydium::parse_serum_market_accounts(&account.data)
+                {
+                    if let (Some(b), Some(a), Some(e)) = (bids_o, asks_o, eq_o) {
+                        ctx.live_pool_cache
+                            .set_raydium_serum_accounts(&pool_addr, b, a, e);
+                        ctx.raydium_serum_fetched.write().insert(pool_addr);
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    market_id = %state.market_id,
+                    error = %e,
+                    "Raydium AMM RPC refresh: serum market fetch failed (may stay Partial)"
+                );
+            }
+        }
+    }
+
+    let readiness = match ctx.live_pool_cache.get(&pool_addr).as_ref() {
+        Some(CachedPoolState::RaydiumAmm(st)) => raydium_amm_readiness_for_pool_cache_update(st),
+        _ => DexPoolReadiness::Observed,
+    };
+    ctx.live_pool_cache
+        .merge_raydium_amm_pool_readiness(pool_addr, readiness);
+
+    if readiness == DexPoolReadiness::Observed {
+        debug!(
+            request_id = %request_id,
+            pool = %pool_addr,
+            mint = %base_mint,
+            "Raydium AMM RPC refresh: still Observed after RPC, no JetStream publish"
+        );
+        return Some(RaydiumAmmRpcRefreshRowResult {
+            pool_addr,
+            readiness,
+            jetstream_published: false,
+        });
+    }
+
+    let jetstream_ok = if let Some(ref nats) = ctx.nats {
+        if let Some((CachedPoolState::RaydiumAmm(st), pool_slot, _age_ms)) =
+            ctx.live_pool_cache.get_with_metadata(&pool_addr)
+        {
+            let mut balance_update = PoolCacheUpdate::new_balance_updated(
+                "market-data",
+                BUILD_VERSION,
+                run_id,
+                pool_addr.to_string(),
+                "raydium".to_string(),
+                st.base_mint.to_string(),
+                st.quote_mint.to_string(),
+                st.coin_reserve.unwrap_or(0),
+                st.pc_reserve.unwrap_or(0),
+                pool_slot,
+            );
+            let mut meta = std::collections::HashMap::new();
+            if st.market_id != Pubkey::default() {
+                meta.insert("market_id".to_string(), st.market_id.to_string());
+            }
+            if let (Some(bids), Some(asks), Some(eq)) =
+                (st.serum_bids, st.serum_asks, st.serum_event_queue)
+            {
+                meta.insert("serum_bids".to_string(), bids.to_string());
+                meta.insert("serum_asks".to_string(), asks.to_string());
+                meta.insert("serum_event_queue".to_string(), eq.to_string());
+            }
+            if !meta.is_empty() {
+                balance_update.metadata = Some(meta);
+            }
+            balance_update.set_dex_readiness_in_metadata(readiness);
+            let subject = pool_subject(&pool_addr.to_string());
+            match nats.jetstream_publish(&subject, &balance_update).await {
+                Ok(true) => {
+                    info!(
+                        request_id = %request_id,
+                        pool = %pool_addr,
+                        mint = %base_mint,
+                        readiness = ?readiness,
+                        "Raydium AMM RPC refresh: published PoolCacheUpdate::BalanceUpdated to JetStream"
+                    );
+                    true
+                }
+                Ok(false) => {
+                    warn!(
+                        request_id = %request_id,
+                        pool = %pool_addr,
+                        "Raydium AMM RPC refresh: JetStream publish failed (timeout or drop)"
+                    );
+                    false
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        request_id = %request_id,
+                        "Raydium AMM RPC refresh: Failed to publish PoolCacheUpdate to JetStream"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if !jetstream_ok {
+        warn!(
+            request_id = %request_id,
+            pool = %pool_addr,
+            "Raydium AMM RPC refresh: MASTER cache updated but JetStream publish failed — SSOT drift risk"
+        );
+    }
+
+    Some(RaydiumAmmRpcRefreshRowResult {
+        pool_addr,
+        readiness,
+        jetstream_published: jetstream_ok,
+    })
+}
+
+/// I-24d Scope 22: Cold-path Raydium AMM v4 recovery — cache-scoped RPC refresh, JetStream SSOT,
+/// [`ControlResponse`].
+async fn handle_ensure_raydium_amm_pool_state(
+    ctx: &MarketDataContext,
+    rpc: &Arc<SolanaRpc>,
+    run_id: &str,
+    request_id: &str,
+    base_mint_str: &str,
+    pool_address_hint: Option<&str>,
+    force_refresh: bool,
+) {
+    let base_mint = match Pubkey::from_str(base_mint_str) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(base_mint = %base_mint_str, error = %e, "EnsureRaydiumAmmPoolState: invalid base_mint");
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::Error,
+                    None,
+                    Some(e.to_string()),
+                )
+                .await;
+            }
+            return;
+        }
+    };
+
+    let pool_hint_pk = pool_address_hint.and_then(|s| Pubkey::from_str(s).ok());
+
+    if !force_refresh {
+        if let Some(pool_pk) = pool_hint_pk {
+            if ctx
+                .live_pool_cache
+                .raydium_amm_pool_explicitly_ready(&pool_pk)
+            {
+                info!(
+                    request_id = %request_id,
+                    base_mint = %base_mint_str,
+                    pool = %pool_pk,
+                    "EnsureRaydiumAmmPoolState: cache hit explicit Ready (skip RPC)"
+                );
+                if let Some(ref nats) = ctx.nats {
+                    publish_control_response(
+                        nats,
+                        &ctx.run_id,
+                        request_id,
+                        ControlResponseStatus::Ok,
+                        Some(pool_pk.to_string()),
+                        None,
+                    )
+                    .await;
+                }
+                return;
+            }
+        } else if ctx
+            .live_pool_cache
+            .base_mint_has_explicit_raydium_amm_ready_pool(&base_mint)
+        {
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                "EnsureRaydiumAmmPoolState: mint already has explicit Ready Raydium AMM pool (skip RPC)"
+            );
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::Ok,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            return;
+        }
+    } else {
+        warn!(
+            request_id = %request_id,
+            base_mint = %base_mint_str,
+            pool_address_hint = ?pool_address_hint,
+            "EnsureRaydiumAmmPoolState: force_refresh — always running RPC refresh path (no cache-first short-circuit)"
+        );
+    }
+
+    let mut candidate_pools: Vec<(Pubkey, RaydiumAmmState)> = Vec::new();
+    if let Some(pool_pk) = pool_hint_pk {
+        match ctx.live_pool_cache.get(&pool_pk) {
+            Some(CachedPoolState::RaydiumAmm(s)) => {
+                if s.base_mint != base_mint && s.quote_mint != base_mint {
+                    warn!(
+                        request_id = %request_id,
+                        pool = %pool_pk,
+                        base_mint = %base_mint_str,
+                        "EnsureRaydiumAmmPoolState: pool_address_hint Raydium AMM row does not list base_mint"
+                    );
+                    if let Some(ref nats) = ctx.nats {
+                        publish_control_response(
+                            nats,
+                            &ctx.run_id,
+                            request_id,
+                            ControlResponseStatus::Error,
+                            Some(pool_pk.to_string()),
+                            Some("pool hint mint mismatch".to_string()),
+                        )
+                        .await;
+                    }
+                    return;
+                }
+                candidate_pools.push((pool_pk, s));
+            }
+            Some(_) => {
+                warn!(
+                    request_id = %request_id,
+                    pool = %pool_pk,
+                    "EnsureRaydiumAmmPoolState: pool_address_hint is not a Raydium AMM row"
+                );
+                if let Some(ref nats) = ctx.nats {
+                    publish_control_response(
+                        nats,
+                        &ctx.run_id,
+                        request_id,
+                        ControlResponseStatus::Error,
+                        Some(pool_pk.to_string()),
+                        Some("pool hint is not raydium amm in cache".to_string()),
+                    )
+                    .await;
+                }
+                return;
+            }
+            None => {
+                info!(
+                    request_id = %request_id,
+                    pool = %pool_pk,
+                    base_mint = %base_mint_str,
+                    "EnsureRaydiumAmmPoolState: pool hint not in LivePoolCache (NotFound)"
+                );
+                if let Some(ref nats) = ctx.nats {
+                    publish_control_response(
+                        nats,
+                        &ctx.run_id,
+                        request_id,
+                        ControlResponseStatus::NotFound,
+                        Some(pool_pk.to_string()),
+                        None,
+                    )
+                    .await;
+                }
+                return;
+            }
+        }
+    } else {
+        candidate_pools = ctx.live_pool_cache.raydium_amm_pools_for_mint(&base_mint);
+        if candidate_pools.is_empty() {
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                "EnsureRaydiumAmmPoolState: no Raydium AMM rows in LivePoolCache for mint (NotFound)"
+            );
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::NotFound,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            return;
+        }
+    }
+
+    info!(
+        request_id = %request_id,
+        base_mint = %base_mint_str,
+        pool_address_hint = ?pool_address_hint,
+        candidates = candidate_pools.len(),
+        force_refresh = %force_refresh,
+        "EnsureRaydiumAmmPoolState: starting cache-scoped Raydium AMM RPC refresh"
+    );
+
+    let mut terminal_ok_pool: Option<Pubkey> = None;
+    let mut ready_jetstream_failed_pool: Option<Pubkey> = None;
+
+    for (pool_addr, state) in candidate_pools {
+        if let Some(row) = cold_path_rpc_refresh_raydium_amm_pool_row(
+            ctx, rpc, run_id, request_id, &base_mint, pool_addr, state,
+        )
+        .await
+        {
+            match (row.readiness, row.jetstream_published) {
+                (DexPoolReadiness::Ready, true) => {
+                    terminal_ok_pool = Some(row.pool_addr);
+                    break;
+                }
+                (DexPoolReadiness::Ready, false) => {
+                    ready_jetstream_failed_pool = Some(row.pool_addr);
+                }
+                (DexPoolReadiness::Partial, true) => {
+                    debug!(
+                        request_id = %request_id,
+                        pool = %row.pool_addr,
+                        "EnsureRaydiumAmmPoolState: Partial published to JetStream — scan remaining candidates for Ready"
+                    );
+                }
+                (DexPoolReadiness::Partial, false) => {
+                    warn!(
+                        request_id = %request_id,
+                        pool = %row.pool_addr,
+                        "EnsureRaydiumAmmPoolState: Partial row MASTER-updated but JetStream publish failed"
+                    );
+                }
+                (DexPoolReadiness::Observed, _) => {}
+            }
+        }
+    }
+
+    if let Some(pool_pk) = terminal_ok_pool {
+        if let Some(ref nats) = ctx.nats {
+            let pool_str = pool_pk.to_string();
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                pool = %pool_str,
+                readiness = ?DexPoolReadiness::Ready,
+                jetstream = "published",
+                "EnsureRaydiumAmmPoolState: terminal ok (Raydium AMM Ready + JetStream publish)"
+            );
+            publish_control_response(
+                nats,
+                &ctx.run_id,
+                request_id,
+                ControlResponseStatus::Ok,
+                Some(pool_str),
+                None,
+            )
+            .await;
+        }
+        return;
+    }
+
+    if let Some(pool_pk) = ready_jetstream_failed_pool {
+        if let Some(ref nats) = ctx.nats {
+            let pool_str = pool_pk.to_string();
+            let msg = "JetStream publish failed".to_string();
+            warn!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                pool = %pool_str,
+                error = %msg,
+                "EnsureRaydiumAmmPoolState: terminal error (Raydium AMM Ready on MASTER but JetStream publish failed)"
+            );
+            publish_control_response(
+                nats,
+                &ctx.run_id,
+                request_id,
+                ControlResponseStatus::Error,
+                Some(pool_str),
+                Some(msg),
+            )
+            .await;
+        }
+        return;
+    }
+
+    warn!(
+        request_id = %request_id,
+        base_mint = %base_mint_str,
+        "EnsureRaydiumAmmPoolState: RPC refresh did not yield Raydium AMM Ready + JetStream publish (Error)"
+    );
+    if let Some(ref nats) = ctx.nats {
+        publish_control_response(
+            nats,
+            &ctx.run_id,
+            request_id,
+            ControlResponseStatus::Error,
+            None,
+            Some("raydium amm rpc refresh did not produce jetstream-ready state".to_string()),
+        )
+        .await;
+    }
+}
+
 /// Cold-path only: Meteora DLMM promotion for one wallet mint. Uses **only** pools already present
 /// in [`LivePoolCache`] (from Geyser); no `getProgramAccounts` / global scan. RPC: per-pool
 /// `get_account` (LB pair) + per-reserve-vault balance reads — bounded by matching cache rows.
@@ -4315,6 +4825,33 @@ async fn run_geyser_loop(
                                         let rpc_clone = rpc.clone();
                                         tokio::spawn(async move {
                                             handle_ensure_meteora_dlmm_pool_state(
+                                                &ctx_clone,
+                                                &rpc_clone,
+                                                run_id.as_str(),
+                                                &request_id,
+                                                &base_mint,
+                                                pool_hint.as_deref(),
+                                                force_refresh,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                    ControlRequestKind::EnsureRaydiumAmmPoolState { base_mint } => {
+                                        let run_id = ctx.run_id.clone();
+                                        let request_id = req.request_id.clone();
+                                        let pool_hint = req.pool_address_hint.clone();
+                                        let force_refresh = req.force_refresh_raydium_amm;
+                                        info!(
+                                            request_id = %request_id,
+                                            base_mint = %base_mint,
+                                            pool_address_hint = ?pool_hint,
+                                            force_refresh_raydium_amm = %force_refresh,
+                                            "EnsureRaydiumAmmPoolState received"
+                                        );
+                                        let ctx_clone = ctx.clone();
+                                        let rpc_clone = rpc.clone();
+                                        tokio::spawn(async move {
+                                            handle_ensure_raydium_amm_pool_state(
                                                 &ctx_clone,
                                                 &rpc_clone,
                                                 run_id.as_str(),
@@ -7229,6 +7766,33 @@ async fn run_simulation_loop(
                                         let rpc_clone = rpc.clone();
                                         tokio::spawn(async move {
                                             handle_ensure_meteora_dlmm_pool_state(
+                                                &ctx_clone,
+                                                &rpc_clone,
+                                                run_id.as_str(),
+                                                &request_id,
+                                                &base_mint,
+                                                pool_hint.as_deref(),
+                                                force_refresh,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                    ControlRequestKind::EnsureRaydiumAmmPoolState { base_mint } => {
+                                        let run_id = ctx.run_id.clone();
+                                        let request_id = req.request_id.clone();
+                                        let pool_hint = req.pool_address_hint.clone();
+                                        let force_refresh = req.force_refresh_raydium_amm;
+                                        info!(
+                                            request_id = %request_id,
+                                            base_mint = %base_mint,
+                                            pool_address_hint = ?pool_hint,
+                                            force_refresh_raydium_amm = %force_refresh,
+                                            "EnsureRaydiumAmmPoolState received (simulation)"
+                                        );
+                                        let ctx_clone = ctx.clone();
+                                        let rpc_clone = rpc.clone();
+                                        tokio::spawn(async move {
+                                            handle_ensure_raydium_amm_pool_state(
                                                 &ctx_clone,
                                                 &rpc_clone,
                                                 run_id.as_str(),

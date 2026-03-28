@@ -1596,6 +1596,38 @@ async fn wait_for_meteora_dlmm_slave_after_recovery(
     false
 }
 
+/// Evidence tuple for Raydium AMM cold-path JetStream wait (Bug #34): reserves + serum triple.
+type RaydiumAmmSlaveEvidence = (u64, u64, Option<Pubkey>, Option<Pubkey>, Option<Pubkey>);
+
+/// After `EnsureRaydiumAmmPoolState` + JetStream merge: bounded wait until SLAVE shows explicit
+/// Raydium AMM v4 [`DexPoolReadiness::Ready`] and a **fresh** evidence tuple vs `before`
+/// (reserves + serum pubkey triple). Same Bug #34 / #36 contract as Orca / DLMM.
+async fn wait_for_raydium_amm_slave_after_recovery(
+    cache: &LivePoolCache,
+    pool: &Pubkey,
+    before: Option<RaydiumAmmSlaveEvidence>,
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        if let Some((s, merged)) = cache.raydium_amm_slave_readiness_snapshot(pool) {
+            let after = (
+                s.coin_reserve.unwrap_or(0),
+                s.pc_reserve.unwrap_or(0),
+                s.serum_bids,
+                s.serum_asks,
+                s.serum_event_queue,
+            );
+            if merged == DexPoolReadiness::Ready && Some(after) != before {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+    }
+    false
+}
+
 /// After `EnsurePumpfunBondingCurve` + JetStream merge: wait until SLAVE cache reflects a change
 /// vs the pre-request snapshot (or new entry appears).
 ///
@@ -2615,6 +2647,113 @@ impl ExecutionContext {
         outcome
     }
 
+    /// I-24d Scope 22: Raydium AMM v4 cold-path recovery — `EnsureRaydiumAmmPoolState` with
+    /// `force_refresh_raydium_amm=true`. Does not write SLAVE locally; market-data publishes JetStream.
+    async fn request_raydium_amm_recovery_and_wait(
+        &self,
+        base_mint: &str,
+        pool_address_hint: Option<&str>,
+    ) -> DiscoveryRequestOutcome {
+        let Some(ref nats) = self.nats else {
+            warn!(
+                request_id = "n/a",
+                base_mint = %base_mint,
+                "Raydium AMM cold-path recovery: NATS not connected"
+            );
+            return DiscoveryRequestOutcome::Error("NATS not connected".to_string());
+        };
+
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        {
+            let mut pending = self.pending_discovery_responses.lock().await;
+            pending.insert(request_id.clone(), tx);
+        }
+
+        let mut req = ControlRequest::new(
+            "execution-engine",
+            BUILD_VERSION,
+            &self.run_id,
+            request_id.clone(),
+            "market-data",
+            ControlRequestKind::EnsureRaydiumAmmPoolState {
+                base_mint: base_mint.to_string(),
+            },
+        );
+        req.pool_address_hint = pool_address_hint.map(String::from);
+        req.force_refresh_raydium_amm = true;
+
+        warn!(
+            request_id = %request_id,
+            base_mint = %base_mint,
+            pool_address_hint = ?pool_address_hint,
+            target = "market-data",
+            reason = "liquidation/manual cold path — SLAVE has Raydium AMM rows for mint but no explicit Ready; requesting authoritative RPC refresh via market-data (I-24d)",
+            "Raydium AMM cold-path: publishing EnsureRaydiumAmmPoolState (force_refresh_raydium_amm)"
+        );
+
+        if nats.publish(TOPIC_CONTROL_REQUESTS, &req).await.is_err() {
+            let mut pending = self.pending_discovery_responses.lock().await;
+            pending.remove(&request_id);
+            warn!(
+                request_id = %request_id,
+                base_mint = %base_mint,
+                "Raydium AMM cold-path recovery: publish failed"
+            );
+            return DiscoveryRequestOutcome::Error("publish failed".to_string());
+        }
+
+        let outcome =
+            match tokio::time::timeout(Duration::from_secs(DISCOVERY_REQUEST_TIMEOUT_SECS), rx)
+                .await
+            {
+                Ok(Ok(resp)) => {
+                    let status_str = format!("{:?}", resp.status);
+                    let pool = resp.pool_address.as_deref();
+                    info!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        status = %status_str,
+                        pool_address = ?pool,
+                        "Raydium AMM cold-path recovery: ControlResponse correlated"
+                    );
+                    match resp.status {
+                        ControlResponseStatus::Ok => DiscoveryRequestOutcome::Ok,
+                        ControlResponseStatus::NotFound => DiscoveryRequestOutcome::NotFound,
+                        ControlResponseStatus::Error => DiscoveryRequestOutcome::Error(
+                            resp.message.unwrap_or_else(|| "unknown error".to_string()),
+                        ),
+                    }
+                }
+                Ok(Err(_)) => {
+                    warn!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        "Raydium AMM cold-path recovery: channel closed before response"
+                    );
+                    DiscoveryRequestOutcome::Error("channel closed".to_string())
+                }
+                Err(_) => {
+                    warn!(
+                        request_id = %request_id,
+                        base_mint = %base_mint,
+                        timeout_secs = DISCOVERY_REQUEST_TIMEOUT_SECS,
+                        "Raydium AMM cold-path recovery: timeout waiting for ControlResponse"
+                    );
+                    DiscoveryRequestOutcome::Timeout
+                }
+            };
+
+        let _ = self
+            .pending_discovery_responses
+            .lock()
+            .await
+            .remove(&request_id);
+
+        outcome
+    }
+
     /// Hot-path healing: publish `EnsurePumpAmmPoolAccounts` to market-data with `force_refresh=true`
     /// without registering for ControlResponse (no wait, no retry in the same intent).
     /// RPC work happens only in market-data (Cold Path); this path is fire-and-forget NATS publish.
@@ -2759,7 +2898,7 @@ impl ExecutionContext {
         let raydium = Raydium::new_with_live_cache(
             Arc::clone(&ctx.rpc),
             Some(lpc.clone()),
-            true, // Liquidation = Cold Path — RPC fallback allowed
+            false, // I-24d: no connector RPC fallback — Raydium AMM cold-path via market-data EnsureRaydiumAmmPoolState
         );
         let orca = Orca::new_with_cache_ext(
             Arc::clone(&ctx.rpc),
@@ -2769,9 +2908,6 @@ impl ExecutionContext {
         );
         orca.set_user_authority(owner);
 
-        if let Err(e) = raydium.refresh_pools().await {
-            warn!(error = %e, "Raydium refresh_pools failed; liquidation may miss routes");
-        }
         if let Err(e) = orca.refresh_pools().await {
             warn!(error = %e, "Orca refresh_pools failed; liquidation may miss routes");
         }
@@ -2780,6 +2916,7 @@ impl ExecutionContext {
         if let Some(ref cache) = ctx.live_pool_cache {
             let mut meteora_count = 0;
             let mut orca_count = 0;
+            let mut raydium_amm_count = 0;
             for (pool_addr, state) in cache.iter() {
                 match state {
                     CachedPoolState::Meteora(ref ms) => {
@@ -2792,12 +2929,31 @@ impl ExecutionContext {
                             orca_count += 1;
                         }
                     }
+                    CachedPoolState::RaydiumAmm(ref s) => {
+                        raydium.inject_cached_amm_state(
+                            pool_addr,
+                            s.base_mint,
+                            s.quote_mint,
+                            s.coin_vault,
+                            s.pc_vault,
+                            s.base_decimals,
+                            s.quote_decimals,
+                            s.coin_reserve,
+                            s.pc_reserve,
+                            s.market_id,
+                            s.serum_bids,
+                            s.serum_asks,
+                            s.serum_event_queue,
+                        );
+                        raydium_amm_count += 1;
+                    }
                     _ => {}
                 }
             }
             info!(
                 meteora_pools = meteora_count,
                 orca_pools = orca_count,
+                raydium_amm_pools = raydium_amm_count,
                 "DEX pools injected from LivePoolCache (GEYSER-FIRST)"
             );
         }
@@ -3042,6 +3198,88 @@ impl ExecutionContext {
                                     pool = %pk,
                                     timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
                                     "Meteora DLMM cold-path: ControlResponse ok but bounded wait for SLAVE explicit Ready + fresh evidence timed out"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // I-24d Scope 22: one EnsureRaydiumAmmPoolState + bounded JetStream wait per liquidation mint
+            // when SLAVE has Raydium AMM rows for this mint but none are explicitly Ready (no connector RPC).
+            if let Some(ref cache) = ctx.live_pool_cache {
+                let rows = cache.raydium_amm_pools_for_mint(&mint);
+                if !rows.is_empty() && !cache.base_mint_has_explicit_raydium_amm_ready_pool(&mint) {
+                    let pool_hint = rows
+                        .iter()
+                        .find(|(_, s)| s.base_mint == mint || s.quote_mint == mint)
+                        .map(|(pk, _)| pk.to_string());
+                    warn!(
+                        mint = %mint,
+                        raydium_amm_rows = rows.len(),
+                        pool_address_hint = ?pool_hint,
+                        reason = "liquidation: Raydium AMM pools in SLAVE but no explicit Ready — requesting EnsureRaydiumAmmPoolState from market-data (bounded wait, one attempt per mint)",
+                        "Raydium AMM cold-path: pre-quote recovery request"
+                    );
+                    let hint_pk = pool_hint.as_deref().and_then(|s| Pubkey::from_str(s).ok());
+                    let before_evidence = hint_pk.and_then(|pk| {
+                        cache
+                            .raydium_amm_slave_readiness_snapshot(&pk)
+                            .map(|(s, _)| {
+                                (
+                                    s.coin_reserve.unwrap_or(0),
+                                    s.pc_reserve.unwrap_or(0),
+                                    s.serum_bids,
+                                    s.serum_asks,
+                                    s.serum_event_queue,
+                                )
+                            })
+                    });
+                    if let DiscoveryRequestOutcome::Ok = ctx
+                        .request_raydium_amm_recovery_and_wait(
+                            mint_str.as_str(),
+                            pool_hint.as_deref(),
+                        )
+                        .await
+                    {
+                        if let Some(pk) = hint_pk {
+                            if wait_for_raydium_amm_slave_after_recovery(
+                                cache,
+                                &pk,
+                                before_evidence,
+                                DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                            )
+                            .await
+                            {
+                                for (pool_addr, st) in cache.raydium_amm_pools_for_mint(&mint) {
+                                    raydium.inject_cached_amm_state(
+                                        pool_addr,
+                                        st.base_mint,
+                                        st.quote_mint,
+                                        st.coin_vault,
+                                        st.pc_vault,
+                                        st.base_decimals,
+                                        st.quote_decimals,
+                                        st.coin_reserve,
+                                        st.pc_reserve,
+                                        st.market_id,
+                                        st.serum_bids,
+                                        st.serum_asks,
+                                        st.serum_event_queue,
+                                    );
+                                }
+                                info!(
+                                    mint = %mint,
+                                    pool = %pk,
+                                    "Raydium AMM cold-path: SLAVE shows fresh explicit Ready after recovery — continuing liquidation quotes"
+                                );
+                            } else {
+                                warn!(
+                                    mint = %mint,
+                                    pool = %pk,
+                                    timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                    "Raydium AMM cold-path: ControlResponse ok but bounded wait for SLAVE explicit Ready + fresh evidence timed out"
                                 );
                             }
                         }
@@ -4234,7 +4472,7 @@ impl ExecutionContext {
         let raydium = Raydium::new_with_live_cache(
             Arc::clone(&ctx.rpc),
             burn_lpc.clone(),
-            true, // Burn job = Cold Path — RPC fallback allowed
+            false, // I-24d: Raydium AMM route check uses cache + market-data EnsureRaydiumAmmPoolState, not connector scan
         );
         let burn_pumpfun_cache = burn_lpc;
         let pumpfun = match PumpFunDex::new(Arc::clone(&ctx.rpc), burn_pumpfun_cache) {
@@ -4244,9 +4482,6 @@ impl ExecutionContext {
                 None
             }
         };
-        if let Err(e) = raydium.refresh_pools().await {
-            warn!(error = %e, "Raydium refresh_pools failed in burn job; route validation may miss routes");
-        }
         #[cfg(unix)]
         maybe_ping_watchdog();
 
@@ -4355,6 +4590,90 @@ impl ExecutionContext {
             }
 
             if !route_exists {
+                if let Some(ref cache) = ctx.live_pool_cache {
+                    let rows = cache.raydium_amm_pools_for_mint(&mint);
+                    if !rows.is_empty()
+                        && !cache.base_mint_has_explicit_raydium_amm_ready_pool(&mint)
+                    {
+                        let pool_hint = rows
+                            .iter()
+                            .find(|(_, s)| s.base_mint == mint || s.quote_mint == mint)
+                            .map(|(pk, _)| pk.to_string());
+                        warn!(
+                            request_id = %request_id,
+                            mint = %mint,
+                            raydium_amm_rows = rows.len(),
+                            pool_address_hint = ?pool_hint,
+                            reason = "manual burn: Raydium AMM in SLAVE but no explicit Ready — EnsureRaydiumAmmPoolState from market-data (bounded wait, one attempt)",
+                            "Raydium AMM cold-path: burn job pre-quote recovery"
+                        );
+                        let hint_pk = pool_hint.as_deref().and_then(|s| Pubkey::from_str(s).ok());
+                        let before_evidence = hint_pk.and_then(|pk| {
+                            cache
+                                .raydium_amm_slave_readiness_snapshot(&pk)
+                                .map(|(s, _)| {
+                                    (
+                                        s.coin_reserve.unwrap_or(0),
+                                        s.pc_reserve.unwrap_or(0),
+                                        s.serum_bids,
+                                        s.serum_asks,
+                                        s.serum_event_queue,
+                                    )
+                                })
+                        });
+                        if let DiscoveryRequestOutcome::Ok = ctx
+                            .request_raydium_amm_recovery_and_wait(
+                                &mint.to_string(),
+                                pool_hint.as_deref(),
+                            )
+                            .await
+                        {
+                            if let Some(pk) = hint_pk {
+                                if wait_for_raydium_amm_slave_after_recovery(
+                                    cache,
+                                    &pk,
+                                    before_evidence,
+                                    DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                    DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                                )
+                                .await
+                                {
+                                    for (pool_addr, st) in cache.raydium_amm_pools_for_mint(&mint) {
+                                        raydium.inject_cached_amm_state(
+                                            pool_addr,
+                                            st.base_mint,
+                                            st.quote_mint,
+                                            st.coin_vault,
+                                            st.pc_vault,
+                                            st.base_decimals,
+                                            st.quote_decimals,
+                                            st.coin_reserve,
+                                            st.pc_reserve,
+                                            st.market_id,
+                                            st.serum_bids,
+                                            st.serum_asks,
+                                            st.serum_event_queue,
+                                        );
+                                    }
+                                    info!(
+                                        request_id = %request_id,
+                                        mint = %mint,
+                                        pool = %pk,
+                                        "Raydium AMM cold-path: burn job SLAVE Ready after recovery"
+                                    );
+                                } else {
+                                    warn!(
+                                        request_id = %request_id,
+                                        mint = %mint,
+                                        pool = %pk,
+                                        timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                        "Raydium AMM cold-path: burn job bounded wait timed out after ControlResponse ok"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Ok(Some(_q)) = raydium
                     .quote_exact_in(&mint.to_string(), &sol_mint.to_string(), quote_amount)
                     .await
