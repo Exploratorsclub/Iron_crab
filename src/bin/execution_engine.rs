@@ -2916,6 +2916,7 @@ impl ExecutionContext {
         if let Some(ref cache) = ctx.live_pool_cache {
             let mut meteora_count = 0;
             let mut orca_count = 0;
+            let mut raydium_amm_count = 0;
             for (pool_addr, state) in cache.iter() {
                 match state {
                     CachedPoolState::Meteora(ref ms) => {
@@ -2928,12 +2929,29 @@ impl ExecutionContext {
                             orca_count += 1;
                         }
                     }
+                    CachedPoolState::RaydiumAmm(ref s) => {
+                        raydium.inject_cached_amm_state(
+                            pool_addr,
+                            s.base_mint,
+                            s.quote_mint,
+                            s.coin_vault,
+                            s.pc_vault,
+                            s.base_decimals,
+                            s.quote_decimals,
+                            s.market_id,
+                            s.serum_bids,
+                            s.serum_asks,
+                            s.serum_event_queue,
+                        );
+                        raydium_amm_count += 1;
+                    }
                     _ => {}
                 }
             }
             info!(
                 meteora_pools = meteora_count,
                 orca_pools = orca_count,
+                raydium_amm_pools = raydium_amm_count,
                 "DEX pools injected from LivePoolCache (GEYSER-FIRST)"
             );
         }
