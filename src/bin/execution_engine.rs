@@ -159,7 +159,7 @@ fn pump_amm_pool_market_hint_pk(intent: &TradeIntent, ctx: &ExecutionContext) ->
 }
 
 /// Stale/wrong PumpSwap `pool_accounts` (e.g. creator vault) → simulation Overflow / Custom(6023) / 0x1787.
-/// Must match the liquidation cold-path recovery matcher.
+/// Must stay aligned with the PumpSwap cold-path recovery branch (`is_cold_path_recovery_sell` + `dex=pump_amm`).
 #[inline]
 fn is_pump_amm_structural_sim_error(error_code: Option<&str>) -> bool {
     error_code
@@ -168,7 +168,7 @@ fn is_pump_amm_structural_sim_error(error_code: Option<&str>) -> bool {
 }
 
 /// PumpFun bonding curve: stale reserves / wrong account count (cashback) → Custom(6023/6024), Overflow.
-/// Cold-path recovery matcher (liquidation / manual); must stay aligned with handler below.
+/// Cold-path structural sim matcher for PumpFun bonding-curve recovery (`is_cold_path_recovery_sell` handlers below).
 #[inline]
 fn is_pumpfun_bonding_curve_structural_sim_error(error_code: Option<&str>) -> bool {
     error_code
@@ -8967,7 +8967,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         }
 
         // Regular PumpSwap SELL hot path: on structural sim failure, trigger async pool_accounts refresh
-        // (no wait, no retry this intent). Liquidation uses synchronous wait+retry below.
+        // (no wait, no retry this intent). Cold-path recovery (`is_cold_path_recovery_sell`: liquidation,
+        // kill-switch, or explicit `sell_all=true`) uses the synchronous wait + one tx rebuild retry below.
         if !ctx.replay_mode
             && !is_liquidation_sell
             && is_regular_momentum_hot_path_sell(&intent)
@@ -9047,7 +9048,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
         // PumpSwap SELL: stale/wrong creator-vault accounts in cached pool_accounts → Overflow Custom(6023).
         // Cold-path recovery: one EnsurePumpAmmPoolAccounts with force_refresh (RPC market parse).
-        // Gate: liquidation/kill-switch **or** explicit manual `sell_all=true` (not general strategy SELLs).
+        // Gate: `is_cold_path_recovery_sell` — liquidation, kill-switch, or explicit `sell_all=true` (not general momentum SELLs).
         if !pump_amm_recovery_attempted
             && is_cold_path_recovery_sell(&intent)
             && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pump_amm")
@@ -9175,7 +9176,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             }
         }
 
-        // Orca Whirlpool SELL (liquidation / manual cold path): stale tick or vault evidence →
+        // Orca Whirlpool SELL (cold-path recovery slice via `is_cold_path_recovery_sell`): stale tick or vault evidence →
         // structural sim fail. I-24d: one EnsureOrcaWhirlpoolPoolState + bounded JetStream wait + one retry.
         if !orca_recovery_attempted
             && is_cold_path_recovery_sell(&intent)
@@ -11060,7 +11061,7 @@ mod execution_engine_tests {
     use std::time::Instant;
 
     #[test]
-    fn pump_amm_structural_sim_error_matches_liquidation_pattern() {
+    fn pump_amm_structural_sim_error_matches_cold_path_recovery_pattern() {
         assert!(is_pump_amm_structural_sim_error(Some(
             "Simulation failed: Custom(6023)"
         )));
