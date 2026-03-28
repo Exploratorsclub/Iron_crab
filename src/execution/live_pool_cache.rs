@@ -1333,6 +1333,38 @@ impl LivePoolCache {
         out
     }
 
+    /// Cold-path bootstrap: Raydium AMM v4 pools in cache that list `mint` as `base_mint` or
+    /// `quote_mint`. Bounded iteration over the in-memory cache only (no chain scan).
+    #[must_use]
+    pub fn raydium_amm_pools_for_mint(&self, mint: &Pubkey) -> Vec<(Pubkey, RaydiumAmmState)> {
+        let mut out = Vec::new();
+        for entry in self.pools.iter() {
+            if let CachedPoolState::RaydiumAmm(s) = &entry.value().state {
+                if s.base_mint == *mint || s.quote_mint == *mint {
+                    out.push((*entry.key(), s.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// SLAVE-visible Raydium AMM row + merged readiness (JetStream path). For cold-path recovery
+    /// waits: compare [`RaydiumAmmState`] evidence vs a pre-request snapshot (Bug #34).
+    #[must_use]
+    pub fn raydium_amm_slave_readiness_snapshot(
+        &self,
+        pool: &Pubkey,
+    ) -> Option<(RaydiumAmmState, DexPoolReadiness)> {
+        let state = match self.get(pool)? {
+            CachedPoolState::RaydiumAmm(s) => s,
+            _ => return None,
+        };
+        let readiness = self
+            .raydium_amm_readiness(pool)
+            .unwrap_or(DexPoolReadiness::Observed);
+        Some((state, readiness))
+    }
+
     /// `true` only after explicit JetStream / control-path merge recorded [`DexPoolReadiness::Ready`]
     /// for this bonding curve (Bug #36: cache hit alone is not ready).
     #[must_use]
