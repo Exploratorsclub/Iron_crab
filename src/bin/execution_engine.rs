@@ -158,14 +158,9 @@ fn pump_amm_pool_market_hint_pk(intent: &TradeIntent, ctx: &ExecutionContext) ->
     pump_amm_pool_market_hint_merge(intent_pool, cache_pool)
 }
 
-/// Scope-35 / I-24e: Cold-path PumpSwap recovery sell with explicit `resources.pools[0]` and cache-backed
-/// plan build (`resources.accounts` empty). Returns `(base_mint, pool_market)` when bounded
-/// `EnsurePumpAmmPoolAccounts` should run **before** the first simulate — SLAVE lacks swap-ready accounts
-/// for the hinted pool row. No RPC here; discovery stays on market-data.
-fn cold_path_pump_amm_preplan_discovery_keys(
-    intent: &TradeIntent,
-    ctx: &ExecutionContext,
-) -> Option<(Pubkey, Pubkey)> {
+/// Scope-35 / I-24e: Narrow cold-path PumpSwap shape — explicit pool hint, cache-backed plan build.
+/// (`tx_builder` reads `pool_accounts` from SLAVE for `resources.pools[0]` when `resources.accounts` is empty.)
+fn cold_path_pump_amm_scope35_shape(intent: &TradeIntent) -> Option<(Pubkey, Pubkey)> {
     if !is_cold_path_recovery_sell(intent) {
         return None;
     }
@@ -175,22 +170,108 @@ fn cold_path_pump_amm_preplan_discovery_keys(
     if intent.resources.pools.len() != 1 {
         return None;
     }
-    // Hint-only manual path: tx_builder reads `pool_accounts` from SLAVE via `resources.pools[0]`.
     if !intent.resources.accounts.is_empty() {
         return None;
     }
     let pool_pk = Pubkey::from_str(intent.resources.pools[0].as_str()).ok()?;
     let base_mint_pk = Pubkey::from_str(&intent.resources.input_mint).ok()?;
-    let needs_discovery = ctx.live_pool_cache.as_ref().is_none_or(|cache| {
-        if !cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint_pk) {
-            return true;
+    Some((base_mint_pk, pool_pk))
+}
+
+/// True when SLAVE cannot satisfy `tx_builder` + [`PumpFunAmmDex::build_swap_ix_from_pool_accounts`]
+/// for this intent pool row: need PumpAmm row at `pool_pk`, `base_mint` match, **≥14** `pool_accounts`
+/// (v1 layout; SELL path in `tx_builder` accepts 12 in validation but swap build requires 14).
+fn cold_path_pump_amm_slave_insufficient_for_intent_pool(
+    cache: &LivePoolCache,
+    base_mint_pk: &Pubkey,
+    pool_pk: &Pubkey,
+) -> bool {
+    match cache.get(pool_pk) {
+        Some(CachedPoolState::PumpAmm(amm)) => {
+            amm.base_mint != *base_mint_pk || amm.pool_accounts.len() < 14
         }
-        match cache.get(&pool_pk) {
-            Some(CachedPoolState::PumpAmm(amm)) => amm.pool_accounts.len() < 12,
-            _ => true,
+        _ => true,
+    }
+}
+
+/// Scope-35: single bounded `EnsurePumpAmmPoolAccounts` + SLAVE wait; no engine RPC.
+async fn pump_amm_scope35_bounded_discovery_and_wait(
+    ctx: &ExecutionContext,
+    intent: &TradeIntent,
+    base_mint_pk: &Pubkey,
+    pool_pk: &Pubkey,
+) -> bool {
+    info!(
+        intent_id = %intent.intent_id,
+        mint = %base_mint_pk,
+        pool = %pool_pk,
+        "PumpSwap cold-path scope-35: EnsurePumpAmmPoolAccounts (bounded, pool_address_hint from intent)"
+    );
+    let outcome = ctx
+        .request_discovery_and_wait(
+            &intent.resources.input_mint,
+            Some(&pool_pk.to_string()),
+            false,
+        )
+        .await;
+    match outcome {
+        DiscoveryRequestOutcome::Ok => {
+            if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                if wait_for_usable_pump_amm_cache_state(
+                    cache,
+                    base_mint_pk,
+                    DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                    DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                )
+                .await
+                {
+                    info!(
+                        intent_id = %intent.intent_id,
+                        mint = %base_mint_pk,
+                        pool = %pool_pk,
+                        "PumpSwap cold-path scope-35: SLAVE PumpAmm usable after discovery — rebuilding tx (one loop retry)"
+                    );
+                    return true;
+                }
+                warn!(
+                    intent_id = %intent.intent_id,
+                    mint = %base_mint_pk,
+                    pool = %pool_pk,
+                    timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                    "PumpSwap cold-path scope-35: ControlResponse ok but bounded wait for usable SLAVE PumpAmm state timed out"
+                );
+            }
+            false
         }
-    });
-    needs_discovery.then_some((base_mint_pk, pool_pk))
+        DiscoveryRequestOutcome::NotFound => {
+            warn!(
+                intent_id = %intent.intent_id,
+                mint = %base_mint_pk,
+                pool = %pool_pk,
+                "PumpSwap cold-path scope-35: EnsurePumpAmmPoolAccounts not_found"
+            );
+            false
+        }
+        DiscoveryRequestOutcome::Error(e) => {
+            warn!(
+                intent_id = %intent.intent_id,
+                mint = %base_mint_pk,
+                pool = %pool_pk,
+                error = %e,
+                "PumpSwap cold-path scope-35: EnsurePumpAmmPoolAccounts error"
+            );
+            false
+        }
+        DiscoveryRequestOutcome::Timeout => {
+            warn!(
+                intent_id = %intent.intent_id,
+                mint = %base_mint_pk,
+                pool = %pool_pk,
+                "PumpSwap cold-path scope-35: EnsurePumpAmmPoolAccounts reply timeout"
+            );
+            false
+        }
+    }
 }
 
 /// Stale/wrong PumpSwap `pool_accounts` (e.g. creator vault) → simulation Overflow / Custom(6023) / 0x1787.
@@ -8700,6 +8781,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // tx_builder::build_tx_plan (which requires metadata.dex and pools_len==1).
     let checks_len_before_tx_plan_build = checks.len();
     let mut pump_amm_recovery_attempted = false;
+    let mut pump_amm_scope35_bounded_discovery_attempted = false;
     let mut pumpfun_bonding_recovery_attempted = false;
     let mut orca_recovery_attempted = false;
     let (
@@ -8717,6 +8799,32 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         {
             checks.truncate(checks_len_before_tx_plan_build);
         }
+        // Scope-35 / I-24d–e: **before** first `build_tx_plan` — A.43 gap when cache misses pool_accounts
+        // for hinted pool (UnsupportedIntent would reject before simulation).
+        if !is_cross_dex_arb && !pump_amm_scope35_bounded_discovery_attempted {
+            if let Some((base_mint_pk, pool_pk)) = cold_path_pump_amm_scope35_shape(&intent) {
+                let needs = ctx.live_pool_cache.as_ref().is_none_or(|cache| {
+                    cold_path_pump_amm_slave_insufficient_for_intent_pool(
+                        cache,
+                        &base_mint_pk,
+                        &pool_pk,
+                    )
+                });
+                if needs
+                    && pump_amm_scope35_bounded_discovery_and_wait(
+                        ctx,
+                        &intent,
+                        &base_mint_pk,
+                        &pool_pk,
+                    )
+                    .await
+                {
+                    pump_amm_scope35_bounded_discovery_attempted = true;
+                    continue;
+                }
+            }
+        }
+
         let (tx_plan, plan_hash_str) = {
             info!(intent_id = %intent.intent_id, "Building tx plan");
 
@@ -8882,6 +8990,32 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         (plan, plan_hash_str)
                     }
                     tx_builder::TxPlanOutcome::Unsupported(u) => {
+                        // Scope-35: `build_tx_plan` can fail before simulation when SLAVE lacks pool row/accounts;
+                        // one bounded discovery + rebuild (same narrow gate as pre-build path).
+                        let mut scope35_retry = false;
+                        if !is_cross_dex_arb
+                            && !pump_amm_scope35_bounded_discovery_attempted
+                            && u.reason == RejectReason::UnsupportedIntent
+                        {
+                            if let Some((base_mint_pk, pool_pk)) =
+                                cold_path_pump_amm_scope35_shape(&intent)
+                            {
+                                if pump_amm_scope35_bounded_discovery_and_wait(
+                                    ctx,
+                                    &intent,
+                                    &base_mint_pk,
+                                    &pool_pk,
+                                )
+                                .await
+                                {
+                                    pump_amm_scope35_bounded_discovery_attempted = true;
+                                    scope35_retry = true;
+                                }
+                            }
+                        }
+                        if scope35_retry {
+                            continue;
+                        }
                         checks.push(CheckResult {
                             check_name: "tx_plan".to_string(),
                             passed: false,
@@ -8895,84 +9029,6 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 }
             }
         };
-
-        // Scope-35 / I-24d–e: Cold-path PumpSwap sell-all (hint in `resources.pools[0]`, no inline accounts):
-        // if SLAVE has no usable `pool_accounts` for that pool yet, request bounded EnsurePumpAmmPoolAccounts
-        // (pool_address_hint from intent — no local RPC, no SLAVE writes), wait on JetStream merge, rebuild once.
-        if !pump_amm_recovery_attempted && !is_cross_dex_arb {
-            if let Some((base_mint_pk, pool_pk)) =
-                cold_path_pump_amm_preplan_discovery_keys(&intent, ctx)
-            {
-                info!(
-                    intent_id = %intent.intent_id,
-                    mint = %base_mint_pk,
-                    pool = %pool_pk,
-                    "PumpSwap cold-path pre-plan: missing usable pool_accounts for hinted pool — EnsurePumpAmmPoolAccounts (bounded)"
-                );
-                match ctx
-                    .request_discovery_and_wait(
-                        &intent.resources.input_mint,
-                        Some(&pool_pk.to_string()),
-                        false,
-                    )
-                    .await
-                {
-                    DiscoveryRequestOutcome::Ok => {
-                        if let Some(cache) = ctx.live_pool_cache.as_ref() {
-                            if wait_for_usable_pump_amm_cache_state(
-                                cache,
-                                &base_mint_pk,
-                                DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
-                                DISCOVERY_CACHE_POLL_INTERVAL_MS,
-                            )
-                            .await
-                            {
-                                pump_amm_recovery_attempted = true;
-                                info!(
-                                    intent_id = %intent.intent_id,
-                                    mint = %base_mint_pk,
-                                    pool = %pool_pk,
-                                    "PumpSwap cold-path pre-plan: SLAVE PumpAmm usable after discovery — rebuilding tx (one retry)"
-                                );
-                                continue;
-                            }
-                            warn!(
-                                intent_id = %intent.intent_id,
-                                mint = %base_mint_pk,
-                                pool = %pool_pk,
-                                timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
-                                "PumpSwap cold-path pre-plan: ControlResponse ok but bounded wait for usable SLAVE PumpAmm state timed out"
-                            );
-                        }
-                    }
-                    DiscoveryRequestOutcome::NotFound => {
-                        warn!(
-                            intent_id = %intent.intent_id,
-                            mint = %base_mint_pk,
-                            pool = %pool_pk,
-                            "PumpSwap cold-path pre-plan: EnsurePumpAmmPoolAccounts not_found"
-                        );
-                    }
-                    DiscoveryRequestOutcome::Error(e) => {
-                        warn!(
-                            intent_id = %intent.intent_id,
-                            mint = %base_mint_pk,
-                            pool = %pool_pk,
-                            error = %e,
-                            "PumpSwap cold-path pre-plan: EnsurePumpAmmPoolAccounts error"
-                        );
-                    }
-                    DiscoveryRequestOutcome::Timeout => {
-                        warn!(
-                            intent_id = %intent.intent_id,
-                            mint = %base_mint_pk,
-                            pool = %pool_pk,
-                            "PumpSwap cold-path pre-plan: EnsurePumpAmmPoolAccounts reply timeout"
-                        );
-                    }
-                }
-            }
-        }
 
         // === P1: Check if bundle required for atomic execution ===
         let requires_bundle = intent.requires_bundle();
