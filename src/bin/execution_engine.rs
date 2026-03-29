@@ -8799,8 +8799,11 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         {
             checks.truncate(checks_len_before_tx_plan_build);
         }
-        // Scope-35 / I-24d–e: **before** first `build_tx_plan` — A.43 gap when cache misses pool_accounts
-        // for hinted pool (UnsupportedIntent would reject before simulation).
+        // Scope-35 / I-24d–e — PLACEMENT INVARIANT (merge review):
+        // This block MUST stay **above** the `tx_builder::build_tx_plan` call in this loop. A.43 fails
+        // *inside* `build_tx_plan` with `UnsupportedIntent` when SLAVE lacks pool_accounts; a post-plan
+        // hook never runs. We also handle `TxPlanOutcome::UnsupportedIntent` below as a one-shot retry
+        // after `pump_amm_scope35_bounded_discovery_attempted` is still false.
         if !is_cross_dex_arb && !pump_amm_scope35_bounded_discovery_attempted {
             if let Some((base_mint_pk, pool_pk)) = cold_path_pump_amm_scope35_shape(&intent) {
                 let needs = ctx.live_pool_cache.as_ref().is_none_or(|cache| {
@@ -8990,8 +8993,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         (plan, plan_hash_str)
                     }
                     tx_builder::TxPlanOutcome::Unsupported(u) => {
-                        // Scope-35: `build_tx_plan` can fail before simulation when SLAVE lacks pool row/accounts;
-                        // one bounded discovery + rebuild (same narrow gate as pre-build path).
+                        // Scope-35 fallback: same narrow intent shape; hits when pre-build `needs` heuristic
+                        // missed edge cases but `build_tx_plan` still returns UnsupportedIntent (A.43).
                         let mut scope35_retry = false;
                         if !is_cross_dex_arb
                             && !pump_amm_scope35_bounded_discovery_attempted
