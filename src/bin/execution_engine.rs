@@ -1530,6 +1530,39 @@ async fn wait_for_usable_pump_amm_cache_state(
     false
 }
 
+/// PumpSwap cold-path pre-plan gate: must match [`tx_builder::build_tx_plan`] when
+/// `resources.accounts` is empty — it reads `cache.get(pool_market)` and requires ≥12 accounts
+/// (SELL accepts 12 or 14). Do **not** require 14 here; that would block valid 12-account SELL
+/// cache rows and misalign with the builder.
+#[inline]
+fn pump_amm_hint_pool_cache_usable_for_tx_plan_builder(
+    cache: &LivePoolCache,
+    pool_market_hint: &Pubkey,
+) -> bool {
+    matches!(
+        cache.get(pool_market_hint),
+        Some(CachedPoolState::PumpAmm(ref s)) if s.pool_accounts.len() >= 12
+    )
+}
+
+/// I-24d: bounded wait until SLAVE cache exposes a PumpSwap row for `pool_market_hint` that
+/// satisfies the same ≥12-account rule as [`tx_builder::build_tx_plan`] (empty intent accounts).
+async fn wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder(
+    cache: &LivePoolCache,
+    pool_market_hint: &Pubkey,
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        if pump_amm_hint_pool_cache_usable_for_tx_plan_builder(cache, pool_market_hint) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+    }
+    false
+}
+
 /// After `EnsureOrcaWhirlpoolPoolState` + JetStream merge: bounded wait until the SLAVE cache shows
 /// explicit Orca [`DexPoolReadiness::Ready`] **and** a **fresh** Whirlpool evidence tuple vs `before`.
 ///
@@ -8664,6 +8697,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
     // NOTE: Cross-DEX arb intents are NOT single-swap plans and therefore must not go through
     // tx_builder::build_tx_plan (which requires metadata.dex and pools_len==1).
     let checks_len_before_tx_plan_build = checks.len();
+    let mut pump_amm_preplan_discovery_attempted = false;
     let mut pump_amm_recovery_attempted = false;
     let mut pumpfun_bonding_recovery_attempted = false;
     let mut orca_recovery_attempted = false;
@@ -8676,7 +8710,8 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
         wallet_pubkey,
         bundle_tip_lamports,
     ) = loop {
-        if pump_amm_recovery_attempted
+        if pump_amm_preplan_discovery_attempted
+            || pump_amm_recovery_attempted
             || pumpfun_bonding_recovery_attempted
             || orca_recovery_attempted
         {
@@ -8821,6 +8856,81 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
 
                 (tx_plan, plan_hash_str)
             } else {
+                // Scope 35b / A.43: cold-path PumpSwap with pool hint + empty `resources.accounts`
+                // dies in `build_tx_plan` before simulation if the hint pool is missing from SLAVE
+                // cache or `pool_accounts` are too short. Run bounded I-24d discovery **before** the
+                // first plan build (same mechanism as post-sim recovery, different placement).
+                if !ctx.replay_mode
+                    && !pump_amm_preplan_discovery_attempted
+                    && is_cold_path_recovery_sell(&intent)
+                    && intent.metadata.get("dex").map(|s| s.as_str()) == Some("pump_amm")
+                    && intent.resources.accounts.is_empty()
+                    && intent.resources.pools.len() == 1
+                {
+                    if let (Ok(_base_mint_pk), Ok(pool_pk)) = (
+                        Pubkey::from_str(&intent.resources.input_mint),
+                        Pubkey::from_str(&intent.resources.pools[0]),
+                    ) {
+                        let cache_ok_for_builder = ctx.live_pool_cache.as_ref().is_some_and(|c| {
+                            pump_amm_hint_pool_cache_usable_for_tx_plan_builder(c, &pool_pk)
+                        });
+                        if !cache_ok_for_builder {
+                            let pool_hint_str = intent.resources.pools[0].as_str();
+                            match ctx
+                                .request_discovery_and_wait(
+                                    &intent.resources.input_mint,
+                                    Some(pool_hint_str),
+                                    false,
+                                )
+                                .await
+                            {
+                                DiscoveryRequestOutcome::Ok => {
+                                    if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                                        if wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder(
+                                            cache,
+                                            &pool_pk,
+                                            DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                            DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                                        )
+                                        .await
+                                        {
+                                            pump_amm_preplan_discovery_attempted = true;
+                                            warn!(
+                                                intent_id = %intent.intent_id,
+                                                pool = %pool_pk,
+                                                "PumpSwap cold-path pre-plan: EnsurePumpAmmPoolAccounts + SLAVE cache wait OK — retrying plan/sim loop once"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+                                DiscoveryRequestOutcome::NotFound => {
+                                    warn!(
+                                        intent_id = %intent.intent_id,
+                                        pool = %pool_hint_str,
+                                        "PumpSwap cold-path pre-plan: EnsurePumpAmmPoolAccounts NotFound — proceeding to plan build (expected UnsupportedIntent if still missing)"
+                                    );
+                                }
+                                DiscoveryRequestOutcome::Error(ref msg) => {
+                                    warn!(
+                                        intent_id = %intent.intent_id,
+                                        pool = %pool_hint_str,
+                                        error = %msg,
+                                        "PumpSwap cold-path pre-plan: EnsurePumpAmmPoolAccounts error — proceeding to plan build"
+                                    );
+                                }
+                                DiscoveryRequestOutcome::Timeout => {
+                                    warn!(
+                                        intent_id = %intent.intent_id,
+                                        pool = %pool_hint_str,
+                                        "PumpSwap cold-path pre-plan: EnsurePumpAmmPoolAccounts reply timeout — proceeding to plan build"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Option C: Pass LivePoolCache for zero-RPC quote calculation
                 match tx_builder::build_tx_plan(
                     &intent,
@@ -11040,14 +11150,15 @@ mod execution_engine_tests {
     use super::{
         is_cold_path_recovery_sell, is_pump_amm_structural_sim_error,
         is_pumpfun_bonding_curve_structural_sim_error, is_regular_momentum_hot_path_sell,
-        pump_amm_pool_market_hint_merge, record_pump_amm_hot_path_refresh_after_success,
-        select_best_route, try_pump_amm_hot_path_refresh_publish,
-        wait_for_meteora_dlmm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
-        DiscoveryRequestOutcome, PumpAmmHotPathRefreshDecision, RouteCandidate,
-        PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
+        pump_amm_hint_pool_cache_usable_for_tx_plan_builder, pump_amm_pool_market_hint_merge,
+        record_pump_amm_hot_path_refresh_after_success, select_best_route,
+        try_pump_amm_hot_path_refresh_publish, wait_for_meteora_dlmm_slave_after_recovery,
+        wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
+        wait_for_pumpfun_bonding_cache_refresh, DiscoveryRequestOutcome,
+        PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
     };
     use ironcrab::execution::live_pool_cache::{
-        CachedPoolState, LivePoolCache, MeteoraState, PumpFunState,
+        CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState, PumpFunState,
     };
     use ironcrab::ipc::{
         ControlResponse, ControlResponseStatus, DexPoolReadiness, ExplicitAmount, IntentOrigin,
@@ -11456,6 +11567,89 @@ mod execution_engine_tests {
                 status
             );
         }
+    }
+
+    /// Scope 35b: pre-plan gate must match tx_builder (≥12 accounts on hint pool row), not ≥14.
+    #[test]
+    fn pump_amm_preplan_builder_readiness_accepts_12_account_cache_row() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(ironcrab::ipc::NATIVE_SOL_MINT).unwrap();
+        let short: Vec<Pubkey> = (0..11).map(|_| Pubkey::new_unique()).collect();
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: base,
+                quote_mint: wsol,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1),
+                quote_reserve: Some(1),
+                pool_accounts: short,
+                creator: None,
+            }),
+            0,
+        );
+        assert!(
+            !pump_amm_hint_pool_cache_usable_for_tx_plan_builder(&cache, &pool),
+            "11 accounts must not satisfy tx_builder empty-accounts path"
+        );
+
+        let twelve: Vec<Pubkey> = (0..12).map(|_| Pubkey::new_unique()).collect();
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: base,
+                quote_mint: wsol,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1),
+                quote_reserve: Some(1),
+                pool_accounts: twelve,
+                creator: None,
+            }),
+            0,
+        );
+        assert!(pump_amm_hint_pool_cache_usable_for_tx_plan_builder(
+            &cache, &pool
+        ));
+    }
+
+    #[test]
+    fn pump_amm_preplan_wait_succeeds_after_cache_merge() {
+        let cache = std::sync::Arc::new(LivePoolCache::new());
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(ironcrab::ipc::NATIVE_SOL_MINT).unwrap();
+        let cache_clone = std::sync::Arc::clone(&cache);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let twelve: Vec<Pubkey> = (0..12).map(|_| Pubkey::new_unique()).collect();
+            cache_clone.upsert(
+                pool,
+                CachedPoolState::PumpAmm(PumpAmmState {
+                    base_mint: base,
+                    quote_mint: wsol,
+                    pool_base_token_account: Pubkey::new_unique(),
+                    pool_quote_token_account: Pubkey::new_unique(),
+                    base_reserve: Some(1),
+                    quote_reserve: Some(1),
+                    pool_accounts: twelve,
+                    creator: None,
+                }),
+                1,
+            );
+        });
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ok = rt.block_on(wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder(
+            cache.as_ref(),
+            &pool,
+            500,
+            10,
+        ));
+        assert!(ok, "wait must observe ≥12 accounts after background upsert");
     }
 
     #[test]
