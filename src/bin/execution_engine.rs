@@ -158,6 +158,41 @@ fn pump_amm_pool_market_hint_pk(intent: &TradeIntent, ctx: &ExecutionContext) ->
     pump_amm_pool_market_hint_merge(intent_pool, cache_pool)
 }
 
+/// Scope-35 / I-24e: Cold-path PumpSwap recovery sell with explicit `resources.pools[0]` and cache-backed
+/// plan build (`resources.accounts` empty). Returns `(base_mint, pool_market)` when bounded
+/// `EnsurePumpAmmPoolAccounts` should run **before** the first simulate — SLAVE lacks swap-ready accounts
+/// for the hinted pool row. No RPC here; discovery stays on market-data.
+fn cold_path_pump_amm_preplan_discovery_keys(
+    intent: &TradeIntent,
+    ctx: &ExecutionContext,
+) -> Option<(Pubkey, Pubkey)> {
+    if !is_cold_path_recovery_sell(intent) {
+        return None;
+    }
+    if intent.metadata.get("dex").map(|s| s.as_str()) != Some("pump_amm") {
+        return None;
+    }
+    if intent.resources.pools.len() != 1 {
+        return None;
+    }
+    // Hint-only manual path: tx_builder reads `pool_accounts` from SLAVE via `resources.pools[0]`.
+    if !intent.resources.accounts.is_empty() {
+        return None;
+    }
+    let pool_pk = Pubkey::from_str(intent.resources.pools[0].as_str()).ok()?;
+    let base_mint_pk = Pubkey::from_str(&intent.resources.input_mint).ok()?;
+    let needs_discovery = ctx.live_pool_cache.as_ref().is_none_or(|cache| {
+        if !cache.pump_amm_swap_accounts_ready_by_base_mint(&base_mint_pk) {
+            return true;
+        }
+        match cache.get(&pool_pk) {
+            Some(CachedPoolState::PumpAmm(amm)) => amm.pool_accounts.len() < 12,
+            _ => true,
+        }
+    });
+    needs_discovery.then_some((base_mint_pk, pool_pk))
+}
+
 /// Stale/wrong PumpSwap `pool_accounts` (e.g. creator vault) → simulation Overflow / Custom(6023) / 0x1787.
 /// Must stay aligned with the PumpSwap cold-path recovery branch (`is_cold_path_recovery_sell` + `dex=pump_amm`).
 #[inline]
@@ -8860,6 +8895,84 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                 }
             }
         };
+
+        // Scope-35 / I-24d–e: Cold-path PumpSwap sell-all (hint in `resources.pools[0]`, no inline accounts):
+        // if SLAVE has no usable `pool_accounts` for that pool yet, request bounded EnsurePumpAmmPoolAccounts
+        // (pool_address_hint from intent — no local RPC, no SLAVE writes), wait on JetStream merge, rebuild once.
+        if !pump_amm_recovery_attempted && !is_cross_dex_arb {
+            if let Some((base_mint_pk, pool_pk)) =
+                cold_path_pump_amm_preplan_discovery_keys(&intent, ctx)
+            {
+                info!(
+                    intent_id = %intent.intent_id,
+                    mint = %base_mint_pk,
+                    pool = %pool_pk,
+                    "PumpSwap cold-path pre-plan: missing usable pool_accounts for hinted pool — EnsurePumpAmmPoolAccounts (bounded)"
+                );
+                match ctx
+                    .request_discovery_and_wait(
+                        &intent.resources.input_mint,
+                        Some(&pool_pk.to_string()),
+                        false,
+                    )
+                    .await
+                {
+                    DiscoveryRequestOutcome::Ok => {
+                        if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                            if wait_for_usable_pump_amm_cache_state(
+                                cache,
+                                &base_mint_pk,
+                                DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                            )
+                            .await
+                            {
+                                pump_amm_recovery_attempted = true;
+                                info!(
+                                    intent_id = %intent.intent_id,
+                                    mint = %base_mint_pk,
+                                    pool = %pool_pk,
+                                    "PumpSwap cold-path pre-plan: SLAVE PumpAmm usable after discovery — rebuilding tx (one retry)"
+                                );
+                                continue;
+                            }
+                            warn!(
+                                intent_id = %intent.intent_id,
+                                mint = %base_mint_pk,
+                                pool = %pool_pk,
+                                timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                                "PumpSwap cold-path pre-plan: ControlResponse ok but bounded wait for usable SLAVE PumpAmm state timed out"
+                            );
+                        }
+                    }
+                    DiscoveryRequestOutcome::NotFound => {
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            mint = %base_mint_pk,
+                            pool = %pool_pk,
+                            "PumpSwap cold-path pre-plan: EnsurePumpAmmPoolAccounts not_found"
+                        );
+                    }
+                    DiscoveryRequestOutcome::Error(e) => {
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            mint = %base_mint_pk,
+                            pool = %pool_pk,
+                            error = %e,
+                            "PumpSwap cold-path pre-plan: EnsurePumpAmmPoolAccounts error"
+                        );
+                    }
+                    DiscoveryRequestOutcome::Timeout => {
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            mint = %base_mint_pk,
+                            pool = %pool_pk,
+                            "PumpSwap cold-path pre-plan: EnsurePumpAmmPoolAccounts reply timeout"
+                        );
+                    }
+                }
+            }
+        }
 
         // === P1: Check if bundle required for atomic execution ===
         let requires_bundle = intent.requires_bundle();
