@@ -1165,6 +1165,17 @@ pub enum ControlRequestKind {
         /// Base mint (base58) of the token side this recovery is for (intent-relevant mint).
         base_mint: String,
     },
+
+    /// Cold-path recovery: refresh Meteora CPMM pool account + vault reserves from RPC for pools
+    /// already present in MASTER [`LivePoolCache`] (cache-scoped; no global `getProgramAccounts`).
+    /// Publishes `PoolCacheUpdate` to JetStream when readiness promotes to at least Partial / Ready.
+    ///
+    /// Optional pool address: use top-level `pool_address_hint` on [`ControlRequest`] for the
+    /// same backward-compatible fast-path style as Raydium CPMM.
+    EnsureMeteoraCpmmPoolState {
+        /// Base mint (base58) of the token side this recovery is for (intent-relevant mint).
+        base_mint: String,
+    },
 }
 
 fn default_true() -> bool {
@@ -1224,6 +1235,12 @@ pub struct ControlRequest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub force_refresh_raydium_cpmm: bool,
 
+    /// When true, market-data must **not** short-circuit EnsureMeteoraCpmmPoolState from existing
+    /// explicit Ready in LivePoolCache: always run the bounded RPC refresh path and republish when
+    /// readiness allows. Cold-path only (I-5); default false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_refresh_meteora_cpmm: bool,
+
     #[serde(flatten)]
     pub kind: ControlRequestKind,
 }
@@ -1248,6 +1265,7 @@ impl ControlRequest {
             force_refresh_meteora_dlmm: false,
             force_refresh_raydium_amm: false,
             force_refresh_raydium_cpmm: false,
+            force_refresh_meteora_cpmm: false,
             kind,
         }
     }
@@ -2480,6 +2498,55 @@ mod tests {
         assert!(!json_min.contains("force_refresh_raydium_cpmm"));
         let parsed_min: ControlRequest = serde_json::from_str(&json_min).unwrap();
         assert!(!parsed_min.force_refresh_raydium_cpmm);
+    }
+
+    #[test]
+    fn test_control_request_ensure_meteora_cpmm_pool_state_serde() {
+        let mut req = ControlRequest::new(
+            "execution-engine",
+            "v0.1.0",
+            "run-123",
+            "req-meteora-cpmm-001".to_string(),
+            "market-data",
+            ControlRequestKind::EnsureMeteoraCpmmPoolState {
+                base_mint: "MintMeteoraCpmm111111111111111111111111".to_string(),
+            },
+        );
+        req.pool_address_hint = Some("PoolMeteoraCpmm111111111111111111111111".to_string());
+        req.force_refresh_meteora_cpmm = true;
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("ensure_meteora_cpmm_pool_state"));
+        assert!(json.contains("MintMeteoraCpmm111111111111111111111111"));
+        assert!(json.contains("pool_address_hint"));
+        assert!(json.contains("PoolMeteoraCpmm111111111111111111111111"));
+        assert!(json.contains("\"force_refresh_meteora_cpmm\":true"));
+
+        let parsed: ControlRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.request_id, "req-meteora-cpmm-001");
+        assert!(parsed.force_refresh_meteora_cpmm);
+        match &parsed.kind {
+            ControlRequestKind::EnsureMeteoraCpmmPoolState { base_mint } => {
+                assert_eq!(base_mint, "MintMeteoraCpmm111111111111111111111111");
+            }
+            _ => panic!("expected EnsureMeteoraCpmmPoolState"),
+        }
+
+        let req_minimal = ControlRequest::new(
+            "execution-engine",
+            "v0.1.0",
+            "run-123",
+            "req-meteora-cpmm-002".to_string(),
+            "market-data",
+            ControlRequestKind::EnsureMeteoraCpmmPoolState {
+                base_mint: "MintMeteoraCpmm222222222222222222222222".to_string(),
+            },
+        );
+        let json_min = serde_json::to_string(&req_minimal).unwrap();
+        assert!(!json_min.contains("pool_address_hint"));
+        assert!(!json_min.contains("force_refresh_meteora_cpmm"));
+        let parsed_min: ControlRequest = serde_json::from_str(&json_min).unwrap();
+        assert!(!parsed_min.force_refresh_meteora_cpmm);
     }
 
     #[test]
