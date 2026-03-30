@@ -1048,6 +1048,194 @@ async fn handle_wallet_bootstrap_raydium_cpmm_verify_for_mint(
     }
 }
 
+/// Result of one cache-scoped Meteora CPMM RPC refresh (pool + vault balances).
+struct MeteoraCpmmRpcRefreshRowResult {
+    pool_addr: Pubkey,
+    readiness: DexPoolReadiness,
+    /// `true` when a non-`Observed` [`DexPoolReadiness`] update was published to JetStream.
+    jetstream_published: bool,
+}
+
+/// Cold-path only: refresh one Meteora CPMM row already present in MASTER cache — no global scan.
+async fn cold_path_rpc_refresh_meteora_cpmm_pool_row(
+    ctx: &MarketDataContext,
+    rpc: &Arc<SolanaRpc>,
+    run_id: &str,
+    request_id: &str,
+    base_mint: &Pubkey,
+    pool_addr: Pubkey,
+    mut state: MeteoraCpmmState,
+) -> Option<MeteoraCpmmRpcRefreshRowResult> {
+    let meteora_cpmm_program = Pubkey::from_str(METEORA_CPMM).expect("METEORA_CPMM constant");
+    let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
+
+    let pool_acc = match rpc.get_account_opt_retry(&pool_addr).await {
+        Ok(Some(acc)) => acc,
+        Ok(None) | Err(_) => {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                "Meteora CPMM RPC refresh: pool account fetch miss, skip"
+            );
+            return None;
+        }
+    };
+
+    let parsed_state = match parse_pool_account(&meteora_cpmm_program, &pool_acc.data) {
+        Some(CachedPoolState::MeteoraCpmm(s)) => s,
+        _ => {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                data_len = pool_acc.data.len(),
+                "Meteora CPMM RPC refresh: parse pool failed, skip"
+            );
+            return None;
+        }
+    };
+
+    state.token_0_mint = parsed_state.token_0_mint;
+    state.token_1_mint = parsed_state.token_1_mint;
+    state.token_0_vault = parsed_state.token_0_vault;
+    state.token_1_vault = parsed_state.token_1_vault;
+    state.amm_config = parsed_state.amm_config;
+    state.observation_key = parsed_state.observation_key;
+    state.token_0_program = parsed_state.token_0_program;
+    state.token_1_program = parsed_state.token_1_program;
+    state.mint_0_decimals = parsed_state.mint_0_decimals;
+    state.mint_1_decimals = parsed_state.mint_1_decimals;
+    state.status = parsed_state.status;
+
+    if state.token_0_mint != *base_mint && state.token_1_mint != *base_mint {
+        return None;
+    }
+
+    let vault0 = state.token_0_vault;
+    let vault1 = state.token_1_vault;
+    let bal0 = match rpc.get_account_opt_retry(&vault0).await {
+        Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
+        _ => None,
+    };
+    let bal1 = match rpc.get_account_opt_retry(&vault1).await {
+        Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
+        _ => None,
+    };
+    let (b0, b1) = match (bal0, bal1) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                "Meteora CPMM RPC refresh: vault balance RPC incomplete, skip"
+            );
+            return None;
+        }
+    };
+
+    state.reserve_0 = b0;
+    state.reserve_1 = b1;
+
+    ctx.live_pool_cache
+        .upsert(pool_addr, CachedPoolState::MeteoraCpmm(state.clone()), 0);
+
+    let readiness = meteora_cpmm_readiness_for_pool_cache_update(&state);
+    ctx.live_pool_cache
+        .merge_meteora_cpmm_pool_readiness(pool_addr, readiness);
+
+    if readiness == DexPoolReadiness::Observed {
+        debug!(
+            request_id = %request_id,
+            pool = %pool_addr,
+            mint = %base_mint,
+            "Meteora CPMM RPC refresh: reserves still degenerate (Observed), no JetStream publish"
+        );
+        return Some(MeteoraCpmmRpcRefreshRowResult {
+            pool_addr,
+            readiness,
+            jetstream_published: false,
+        });
+    }
+
+    let (pub_base_mint, pub_quote_mint, base_r, quote_r) = if state.token_1_mint == sol {
+        (state.token_0_mint, state.token_1_mint, b0, b1)
+    } else if state.token_0_mint == sol {
+        (state.token_1_mint, state.token_0_mint, b1, b0)
+    } else {
+        (state.token_0_mint, state.token_1_mint, b0, b1)
+    };
+
+    let jetstream_ok = if let Some(ref nats) = ctx.nats {
+        let mut balance_update = PoolCacheUpdate::new_balance_updated(
+            "market-data",
+            BUILD_VERSION,
+            run_id,
+            pool_addr.to_string(),
+            "meteora_cpmm".to_string(),
+            pub_base_mint.to_string(),
+            pub_quote_mint.to_string(),
+            base_r,
+            quote_r,
+            0,
+        );
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY.to_string(),
+            meteora_cpmm_vaults_for_pool_cache_update(&state),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY.to_string(),
+            meteora_cpmm_onchain_mints_for_pool_cache_update(&state),
+        );
+        balance_update.metadata = Some(meta);
+        balance_update.set_dex_readiness_in_metadata(readiness);
+        let subject = pool_subject(&pool_addr.to_string());
+        match nats.jetstream_publish(&subject, &balance_update).await {
+            Ok(true) => {
+                info!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    mint = %base_mint,
+                    readiness = ?readiness,
+                    "Meteora CPMM RPC refresh: published PoolCacheUpdate::BalanceUpdated to JetStream"
+                );
+                true
+            }
+            Ok(false) => {
+                warn!(
+                    request_id = %request_id,
+                    pool = %pool_addr,
+                    "Meteora CPMM RPC refresh: JetStream publish failed (timeout or drop)"
+                );
+                false
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    request_id = %request_id,
+                    "Meteora CPMM RPC refresh: Failed to publish PoolCacheUpdate to JetStream"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if !jetstream_ok {
+        warn!(
+            request_id = %request_id,
+            pool = %pool_addr,
+            "Meteora CPMM RPC refresh: MASTER cache updated but JetStream publish failed — SSOT drift risk"
+        );
+    }
+
+    Some(MeteoraCpmmRpcRefreshRowResult {
+        pool_addr,
+        readiness,
+        jetstream_published: jetstream_ok,
+    })
+}
+
 /// Cold-path only: Meteora CPMM promotion for one wallet mint. Uses **only** pools already present
 /// in [`LivePoolCache`] (from Geyser); no global scan. RPC: per-pool `get_account` + per-vault
 /// balance reads — bounded by the number of matching cache rows.
@@ -1090,9 +1278,7 @@ async fn handle_wallet_bootstrap_meteora_cpmm_verify_for_mint(
         "Wallet bootstrap Meteora CPMM: verifying cache-scoped pools (cold-path RPC, no global scan)"
     );
 
-    let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap_or_default();
-
-    for (pool_addr, mut state) in pools {
+    for (pool_addr, state) in pools {
         if ctx.live_pool_cache.base_mint_has_any_ready_pool(base_mint) {
             break;
         }
@@ -1103,162 +1289,10 @@ async fn handle_wallet_bootstrap_meteora_cpmm_verify_for_mint(
             break;
         }
 
-        let pool_acc = match rpc.get_account_opt_retry(&pool_addr).await {
-            Ok(Some(acc)) => acc,
-            Ok(None) | Err(_) => {
-                debug!(
-                    request_id = %request_id,
-                    pool = %pool_addr,
-                    "Wallet bootstrap Meteora CPMM: pool account fetch miss, skip"
-                );
-                continue;
-            }
-        };
-
-        let meteora_cpmm_program = Pubkey::from_str(METEORA_CPMM).expect("METEORA_CPMM constant");
-        let parsed_state = match parse_pool_account(&meteora_cpmm_program, &pool_acc.data) {
-            Some(CachedPoolState::MeteoraCpmm(s)) => s,
-            _ => {
-                debug!(
-                    request_id = %request_id,
-                    pool = %pool_addr,
-                    data_len = pool_acc.data.len(),
-                    "Wallet bootstrap Meteora CPMM: parse pool failed, skip"
-                );
-                continue;
-            }
-        };
-
-        state.token_0_mint = parsed_state.token_0_mint;
-        state.token_1_mint = parsed_state.token_1_mint;
-        state.token_0_vault = parsed_state.token_0_vault;
-        state.token_1_vault = parsed_state.token_1_vault;
-        state.amm_config = parsed_state.amm_config;
-        state.observation_key = parsed_state.observation_key;
-        state.token_0_program = parsed_state.token_0_program;
-        state.token_1_program = parsed_state.token_1_program;
-        state.mint_0_decimals = parsed_state.mint_0_decimals;
-        state.mint_1_decimals = parsed_state.mint_1_decimals;
-        state.status = parsed_state.status;
-
-        if state.token_0_mint != *base_mint && state.token_1_mint != *base_mint {
-            continue;
-        }
-
-        let vault0 = state.token_0_vault;
-        let vault1 = state.token_1_vault;
-        let bal0 = match rpc.get_account_opt_retry(&vault0).await {
-            Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
-            _ => None,
-        };
-        let bal1 = match rpc.get_account_opt_retry(&vault1).await {
-            Ok(Some(acc)) => try_parse_token_account_balance(&acc.data),
-            _ => None,
-        };
-        let (b0, b1) = match (bal0, bal1) {
-            (Some(a), Some(b)) => (a, b),
-            _ => {
-                debug!(
-                    request_id = %request_id,
-                    pool = %pool_addr,
-                    "Wallet bootstrap Meteora CPMM: vault balance RPC incomplete, skip"
-                );
-                continue;
-            }
-        };
-
-        state.reserve_0 = b0;
-        state.reserve_1 = b1;
-
-        ctx.live_pool_cache
-            .upsert(pool_addr, CachedPoolState::MeteoraCpmm(state.clone()), 0);
-
-        let readiness = meteora_cpmm_readiness_for_pool_cache_update(&state);
-        ctx.live_pool_cache
-            .merge_meteora_cpmm_pool_readiness(pool_addr, readiness);
-
-        if readiness == DexPoolReadiness::Observed {
-            debug!(
-                request_id = %request_id,
-                pool = %pool_addr,
-                mint = %base_mint,
-                "Wallet bootstrap Meteora CPMM: reserves still degenerate (Observed), no JetStream publish"
-            );
-            continue;
-        }
-
-        let (pub_base_mint, pub_quote_mint, base_r, quote_r) = if state.token_1_mint == sol {
-            (state.token_0_mint, state.token_1_mint, b0, b1)
-        } else if state.token_0_mint == sol {
-            (state.token_1_mint, state.token_0_mint, b1, b0)
-        } else {
-            (state.token_0_mint, state.token_1_mint, b0, b1)
-        };
-
-        let jetstream_ok = if let Some(ref nats) = ctx.nats {
-            let mut balance_update = PoolCacheUpdate::new_balance_updated(
-                "market-data",
-                BUILD_VERSION,
-                run_id,
-                pool_addr.to_string(),
-                "meteora_cpmm".to_string(),
-                pub_base_mint.to_string(),
-                pub_quote_mint.to_string(),
-                base_r,
-                quote_r,
-                0,
-            );
-            let mut meta = std::collections::HashMap::new();
-            meta.insert(
-                POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY.to_string(),
-                meteora_cpmm_vaults_for_pool_cache_update(&state),
-            );
-            meta.insert(
-                POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY.to_string(),
-                meteora_cpmm_onchain_mints_for_pool_cache_update(&state),
-            );
-            balance_update.metadata = Some(meta);
-            balance_update.set_dex_readiness_in_metadata(readiness);
-            let subject = pool_subject(&pool_addr.to_string());
-            match nats.jetstream_publish(&subject, &balance_update).await {
-                Ok(true) => {
-                    info!(
-                        request_id = %request_id,
-                        pool = %pool_addr,
-                        mint = %base_mint,
-                        readiness = ?readiness,
-                        "Wallet bootstrap Meteora CPMM: published PoolCacheUpdate::BalanceUpdated to JetStream"
-                    );
-                    true
-                }
-                Ok(false) => {
-                    warn!(
-                        request_id = %request_id,
-                        pool = %pool_addr,
-                        "Wallet bootstrap Meteora CPMM: JetStream publish failed (timeout or drop)"
-                    );
-                    false
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        request_id = %request_id,
-                        "Wallet bootstrap Meteora CPMM: Failed to publish PoolCacheUpdate to JetStream"
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        if !jetstream_ok {
-            warn!(
-                request_id = %request_id,
-                pool = %pool_addr,
-                "Wallet bootstrap Meteora CPMM: MASTER cache updated but JetStream publish failed — SSOT drift risk"
-            );
-        }
+        let _ = cold_path_rpc_refresh_meteora_cpmm_pool_row(
+            ctx, rpc, run_id, request_id, base_mint, pool_addr, state,
+        )
+        .await;
     }
 }
 
@@ -3218,6 +3252,294 @@ async fn handle_ensure_raydium_cpmm_pool_state(
             ControlResponseStatus::Error,
             None,
             Some("raydium cpmm rpc refresh did not produce jetstream-ready state".to_string()),
+        )
+        .await;
+    }
+}
+
+/// I-24d: Cold-path Meteora CPMM recovery — cache-scoped RPC refresh, JetStream SSOT,
+/// [`ControlResponse`].
+async fn handle_ensure_meteora_cpmm_pool_state(
+    ctx: &MarketDataContext,
+    rpc: &Arc<SolanaRpc>,
+    run_id: &str,
+    request_id: &str,
+    base_mint_str: &str,
+    pool_address_hint: Option<&str>,
+    force_refresh: bool,
+) {
+    let base_mint = match Pubkey::from_str(base_mint_str) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(base_mint = %base_mint_str, error = %e, "EnsureMeteoraCpmmPoolState: invalid base_mint");
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::Error,
+                    None,
+                    Some(e.to_string()),
+                )
+                .await;
+            }
+            return;
+        }
+    };
+
+    let pool_hint_pk = pool_address_hint.and_then(|s| Pubkey::from_str(s).ok());
+
+    if !force_refresh {
+        if let Some(pool_pk) = pool_hint_pk {
+            if ctx
+                .live_pool_cache
+                .meteora_cpmm_pool_explicitly_ready(&pool_pk)
+            {
+                info!(
+                    request_id = %request_id,
+                    base_mint = %base_mint_str,
+                    pool = %pool_pk,
+                    "EnsureMeteoraCpmmPoolState: cache hit explicit Ready (skip RPC)"
+                );
+                if let Some(ref nats) = ctx.nats {
+                    publish_control_response(
+                        nats,
+                        &ctx.run_id,
+                        request_id,
+                        ControlResponseStatus::Ok,
+                        Some(pool_pk.to_string()),
+                        None,
+                    )
+                    .await;
+                }
+                return;
+            }
+        } else if ctx
+            .live_pool_cache
+            .base_mint_has_explicit_meteora_cpmm_ready_pool(&base_mint)
+        {
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                "EnsureMeteoraCpmmPoolState: mint already has explicit Ready Meteora CPMM pool (skip RPC)"
+            );
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::Ok,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            return;
+        }
+    } else {
+        warn!(
+            request_id = %request_id,
+            base_mint = %base_mint_str,
+            pool_address_hint = ?pool_address_hint,
+            "EnsureMeteoraCpmmPoolState: force_refresh — always running RPC refresh path (no cache-first short-circuit)"
+        );
+    }
+
+    let mut candidate_pools: Vec<(Pubkey, MeteoraCpmmState)> = Vec::new();
+    if let Some(pool_pk) = pool_hint_pk {
+        match ctx.live_pool_cache.get(&pool_pk) {
+            Some(CachedPoolState::MeteoraCpmm(s)) => {
+                if s.token_0_mint != base_mint && s.token_1_mint != base_mint {
+                    warn!(
+                        request_id = %request_id,
+                        pool = %pool_pk,
+                        base_mint = %base_mint_str,
+                        "EnsureMeteoraCpmmPoolState: pool_address_hint Meteora CPMM row does not list base_mint"
+                    );
+                    if let Some(ref nats) = ctx.nats {
+                        publish_control_response(
+                            nats,
+                            &ctx.run_id,
+                            request_id,
+                            ControlResponseStatus::Error,
+                            Some(pool_pk.to_string()),
+                            Some("pool hint mint mismatch".to_string()),
+                        )
+                        .await;
+                    }
+                    return;
+                }
+                candidate_pools.push((pool_pk, s));
+            }
+            Some(_) => {
+                warn!(
+                    request_id = %request_id,
+                    pool = %pool_pk,
+                    "EnsureMeteoraCpmmPoolState: pool_address_hint is not a Meteora CPMM row"
+                );
+                if let Some(ref nats) = ctx.nats {
+                    publish_control_response(
+                        nats,
+                        &ctx.run_id,
+                        request_id,
+                        ControlResponseStatus::Error,
+                        Some(pool_pk.to_string()),
+                        Some("pool hint is not meteora cpmm in cache".to_string()),
+                    )
+                    .await;
+                }
+                return;
+            }
+            None => {
+                info!(
+                    request_id = %request_id,
+                    pool = %pool_pk,
+                    base_mint = %base_mint_str,
+                    "EnsureMeteoraCpmmPoolState: pool hint not in LivePoolCache (NotFound)"
+                );
+                if let Some(ref nats) = ctx.nats {
+                    publish_control_response(
+                        nats,
+                        &ctx.run_id,
+                        request_id,
+                        ControlResponseStatus::NotFound,
+                        Some(pool_pk.to_string()),
+                        None,
+                    )
+                    .await;
+                }
+                return;
+            }
+        }
+    } else {
+        candidate_pools = ctx.live_pool_cache.meteora_cpmm_pools_for_mint(&base_mint);
+        if candidate_pools.is_empty() {
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                "EnsureMeteoraCpmmPoolState: no Meteora CPMM rows in LivePoolCache for mint (NotFound)"
+            );
+            if let Some(ref nats) = ctx.nats {
+                publish_control_response(
+                    nats,
+                    &ctx.run_id,
+                    request_id,
+                    ControlResponseStatus::NotFound,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            return;
+        }
+    }
+
+    info!(
+        request_id = %request_id,
+        base_mint = %base_mint_str,
+        pool_address_hint = ?pool_address_hint,
+        candidates = candidate_pools.len(),
+        force_refresh = %force_refresh,
+        "EnsureMeteoraCpmmPoolState: starting cache-scoped Meteora CPMM RPC refresh"
+    );
+
+    let mut terminal_ok_pool: Option<Pubkey> = None;
+    let mut ready_jetstream_failed_pool: Option<Pubkey> = None;
+
+    for (pool_addr, state) in candidate_pools {
+        if let Some(row) = cold_path_rpc_refresh_meteora_cpmm_pool_row(
+            ctx, rpc, run_id, request_id, &base_mint, pool_addr, state,
+        )
+        .await
+        {
+            match (row.readiness, row.jetstream_published) {
+                (DexPoolReadiness::Ready, true) => {
+                    terminal_ok_pool = Some(row.pool_addr);
+                    break;
+                }
+                (DexPoolReadiness::Ready, false) => {
+                    ready_jetstream_failed_pool = Some(row.pool_addr);
+                }
+                (DexPoolReadiness::Partial, true) => {
+                    debug!(
+                        request_id = %request_id,
+                        pool = %row.pool_addr,
+                        "EnsureMeteoraCpmmPoolState: Partial published to JetStream — scan remaining candidates for Ready"
+                    );
+                }
+                (DexPoolReadiness::Partial, false) => {
+                    warn!(
+                        request_id = %request_id,
+                        pool = %row.pool_addr,
+                        "EnsureMeteoraCpmmPoolState: Partial row MASTER-updated but JetStream publish failed"
+                    );
+                }
+                (DexPoolReadiness::Observed, _) => {}
+            }
+        }
+    }
+
+    if let Some(pool_pk) = terminal_ok_pool {
+        if let Some(ref nats) = ctx.nats {
+            let pool_str = pool_pk.to_string();
+            info!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                pool = %pool_str,
+                readiness = ?DexPoolReadiness::Ready,
+                jetstream = "published",
+                "EnsureMeteoraCpmmPoolState: terminal ok (Meteora CPMM Ready + JetStream publish)"
+            );
+            publish_control_response(
+                nats,
+                &ctx.run_id,
+                request_id,
+                ControlResponseStatus::Ok,
+                Some(pool_str),
+                None,
+            )
+            .await;
+        }
+        return;
+    }
+
+    if let Some(pool_pk) = ready_jetstream_failed_pool {
+        if let Some(ref nats) = ctx.nats {
+            let pool_str = pool_pk.to_string();
+            let msg = "JetStream publish failed".to_string();
+            warn!(
+                request_id = %request_id,
+                base_mint = %base_mint_str,
+                pool = %pool_str,
+                error = %msg,
+                "EnsureMeteoraCpmmPoolState: terminal error (Meteora CPMM Ready on MASTER but JetStream publish failed)"
+            );
+            publish_control_response(
+                nats,
+                &ctx.run_id,
+                request_id,
+                ControlResponseStatus::Error,
+                Some(pool_str),
+                Some(msg),
+            )
+            .await;
+        }
+        return;
+    }
+
+    warn!(
+        request_id = %request_id,
+        base_mint = %base_mint_str,
+        "EnsureMeteoraCpmmPoolState: RPC refresh did not yield Meteora CPMM Ready + JetStream publish (Error)"
+    );
+    if let Some(ref nats) = ctx.nats {
+        publish_control_response(
+            nats,
+            &ctx.run_id,
+            request_id,
+            ControlResponseStatus::Error,
+            None,
+            Some("meteora cpmm rpc refresh did not produce jetstream-ready state".to_string()),
         )
         .await;
     }
@@ -5344,6 +5666,33 @@ async fn run_geyser_loop(
                                         let rpc_clone = rpc.clone();
                                         tokio::spawn(async move {
                                             handle_ensure_raydium_cpmm_pool_state(
+                                                &ctx_clone,
+                                                &rpc_clone,
+                                                run_id.as_str(),
+                                                &request_id,
+                                                &base_mint,
+                                                pool_hint.as_deref(),
+                                                force_refresh,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                    ControlRequestKind::EnsureMeteoraCpmmPoolState { base_mint } => {
+                                        let run_id = ctx.run_id.clone();
+                                        let request_id = req.request_id.clone();
+                                        let pool_hint = req.pool_address_hint.clone();
+                                        let force_refresh = req.force_refresh_meteora_cpmm;
+                                        info!(
+                                            request_id = %request_id,
+                                            base_mint = %base_mint,
+                                            pool_address_hint = ?pool_hint,
+                                            force_refresh_meteora_cpmm = %force_refresh,
+                                            "EnsureMeteoraCpmmPoolState received"
+                                        );
+                                        let ctx_clone = ctx.clone();
+                                        let rpc_clone = rpc.clone();
+                                        tokio::spawn(async move {
+                                            handle_ensure_meteora_cpmm_pool_state(
                                                 &ctx_clone,
                                                 &rpc_clone,
                                                 run_id.as_str(),
@@ -8312,6 +8661,33 @@ async fn run_simulation_loop(
                                         let rpc_clone = rpc.clone();
                                         tokio::spawn(async move {
                                             handle_ensure_raydium_cpmm_pool_state(
+                                                &ctx_clone,
+                                                &rpc_clone,
+                                                run_id.as_str(),
+                                                &request_id,
+                                                &base_mint,
+                                                pool_hint.as_deref(),
+                                                force_refresh,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                    ControlRequestKind::EnsureMeteoraCpmmPoolState { base_mint } => {
+                                        let run_id = ctx.run_id.clone();
+                                        let request_id = req.request_id.clone();
+                                        let pool_hint = req.pool_address_hint.clone();
+                                        let force_refresh = req.force_refresh_meteora_cpmm;
+                                        info!(
+                                            request_id = %request_id,
+                                            base_mint = %base_mint,
+                                            pool_address_hint = ?pool_hint,
+                                            force_refresh_meteora_cpmm = %force_refresh,
+                                            "EnsureMeteoraCpmmPoolState received (simulation)"
+                                        );
+                                        let ctx_clone = ctx.clone();
+                                        let rpc_clone = rpc.clone();
+                                        tokio::spawn(async move {
+                                            handle_ensure_meteora_cpmm_pool_state(
                                                 &ctx_clone,
                                                 &rpc_clone,
                                                 run_id.as_str(),
