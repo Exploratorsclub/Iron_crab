@@ -158,12 +158,21 @@ fn pump_amm_pool_market_hint_pk(intent: &TradeIntent, ctx: &ExecutionContext) ->
     pump_amm_pool_market_hint_merge(intent_pool, cache_pool)
 }
 
-/// Stale/wrong PumpSwap `pool_accounts` (e.g. creator vault) → simulation Overflow / Custom(6023) / 0x1787.
+/// Stale/wrong PumpSwap `pool_accounts` (e.g. creator vault, protocol fee recipient) → simulation
+/// Overflow / Custom(6023) / Custom(6013 InvalidProtocolFeeRecipient) / 0x1787 / 0x177d.
 /// Must stay aligned with the PumpSwap cold-path recovery branch (`is_cold_path_recovery_sell` + `dex=pump_amm`).
 #[inline]
 fn is_pump_amm_structural_sim_error(error_code: Option<&str>) -> bool {
     error_code
-        .map(|e| e.contains("6023") || e.contains("Overflow") || e.contains("0x1787"))
+        .map(|e| {
+            e.contains("6023")
+                || e.contains("6013")
+                || e.contains("InvalidProtocolFeeRecipient")
+                || e.contains("Overflow")
+                || e.contains("0x1787")
+                || e.contains("0x177d")
+                || e.contains("0x177D")
+        })
         .unwrap_or(false)
 }
 
@@ -9120,7 +9129,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                         mint = %intent.resources.input_mint,
                         pool_hint = ?pool_hint_str,
                         sim_error = ?sim_result.error_code,
-                        "PumpSwap regular SELL: simulation structural error (6023/Overflow family); triggering async non-blocking EnsurePumpAmmPoolAccounts force_refresh to market-data (no wait, no retry this intent)"
+                        "PumpSwap regular SELL: simulation structural error (6013/6023/Overflow family); triggering async non-blocking EnsurePumpAmmPoolAccounts force_refresh to market-data (no wait, no retry this intent)"
                     );
                     if let Some(ref nats) = ctx.nats {
                         ExecutionContext::fire_pump_amm_pool_accounts_refresh_async(
@@ -9156,7 +9165,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
             }
         }
 
-        // PumpSwap SELL: stale/wrong creator-vault accounts in cached pool_accounts → Overflow Custom(6023).
+        // PumpSwap SELL: stale/wrong pool_accounts (creator vault, protocol fee recipient, …) → e.g. Custom(6023), Custom(6013).
         // Cold-path recovery: one EnsurePumpAmmPoolAccounts with force_refresh (RPC market parse).
         // Gate: `is_cold_path_recovery_sell` — liquidation, kill-switch, or explicit `sell_all=true` (not general momentum SELLs).
         if !pump_amm_recovery_attempted
@@ -9201,7 +9210,7 @@ async fn process_intent(ctx: &ExecutionContext, intent: TradeIntent) -> Result<(
                             warn!(
                                 intent_id = %intent.intent_id,
                                 pool = %pool_pk,
-                                "PumpSwap cold-path recovery: simulation 6023/Overflow — force-refresh pool_accounts (market-data RPC), rebuilding tx (one retry)"
+                                "PumpSwap cold-path recovery: simulation structural (6013/6023/Overflow family) — force-refresh pool_accounts (market-data RPC), rebuilding tx (one retry)"
                             );
                             continue;
                         }
@@ -11176,8 +11185,16 @@ mod execution_engine_tests {
         assert!(is_pump_amm_structural_sim_error(Some(
             "Simulation failed: Custom(6023)"
         )));
+        assert!(is_pump_amm_structural_sim_error(Some(
+            "Simulation failed: Custom(6013)"
+        )));
+        assert!(is_pump_amm_structural_sim_error(Some(
+            "InvalidProtocolFeeRecipient"
+        )));
         assert!(is_pump_amm_structural_sim_error(Some("Overflow")));
         assert!(is_pump_amm_structural_sim_error(Some("0x1787")));
+        assert!(is_pump_amm_structural_sim_error(Some("0x177d")));
+        assert!(is_pump_amm_structural_sim_error(Some("0x177D")));
         assert!(!is_pump_amm_structural_sim_error(Some("Custom(6005)")));
         assert!(!is_pump_amm_structural_sim_error(None));
     }
