@@ -159,7 +159,7 @@ fn pump_amm_pool_market_hint_pk(intent: &TradeIntent, ctx: &ExecutionContext) ->
 }
 
 /// Stale/wrong PumpSwap `pool_accounts` (e.g. creator vault, protocol fee recipient) → simulation
-/// Overflow / Custom(6023) / Custom(6013 InvalidProtocolFeeRecipient) / 0x1787.
+/// Overflow / Custom(6023) / Custom(6013 InvalidProtocolFeeRecipient) / 0x1787 / 0x177D.
 /// Must stay aligned with the PumpSwap cold-path recovery branch (`is_cold_path_recovery_sell` + `dex=pump_amm`).
 #[inline]
 fn is_pump_amm_structural_sim_error(error_code: Option<&str>) -> bool {
@@ -170,6 +170,7 @@ fn is_pump_amm_structural_sim_error(error_code: Option<&str>) -> bool {
                 || e.contains("InvalidProtocolFeeRecipient")
                 || e.contains("Overflow")
                 || e.contains("0x1787")
+                || e.contains("0x177D")
         })
         .unwrap_or(false)
 }
@@ -11191,6 +11192,7 @@ mod execution_engine_tests {
         )));
         assert!(is_pump_amm_structural_sim_error(Some("Overflow")));
         assert!(is_pump_amm_structural_sim_error(Some("0x1787")));
+        assert!(is_pump_amm_structural_sim_error(Some("0x177D")));
         assert!(!is_pump_amm_structural_sim_error(Some("Custom(6005)")));
         assert!(!is_pump_amm_structural_sim_error(None));
     }
