@@ -708,6 +708,48 @@ fn wallet_mints_needing_dex_bootstrap_verify(
     out
 }
 
+/// Wallet mints that graduated from PumpFun to PumpSwap (`complete`) but still lack explicit
+/// PumpSwap [`DexPoolReadiness::Ready`]. Disjoint from [`wallet_mints_needing_dex_bootstrap_verify`]:
+/// those mints have **no** ready pool at all; here bonding-curve Ready from JetStream satisfied
+/// [`LivePoolCache::base_mint_has_any_ready_pool`] and incorrectly skipped the PumpSwap bootstrap
+/// path (Scope-40 / KNOWN_BUG_PATTERNS #33).
+fn wallet_mints_needing_pump_amm_after_pumpfun_migration(
+    cache: &LivePoolCache,
+    mints_in_wallet: &[String],
+    wsol_mint_str: &str,
+    max_mints: usize,
+) -> Vec<Pubkey> {
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<Pubkey> = HashSet::new();
+    let mut out: Vec<Pubkey> = Vec::new();
+    for s in mints_in_wallet {
+        if out.len() >= max_mints {
+            break;
+        }
+        if s == wsol_mint_str {
+            continue;
+        }
+        let Ok(pk) = Pubkey::from_str(s) else {
+            continue;
+        };
+        if !seen.insert(pk) {
+            continue;
+        }
+        if cache.base_mint_has_explicit_pump_amm_ready_pool(&pk) {
+            continue;
+        }
+        if !cache.pumpfun_bonding_curve_complete_for_mint(&pk) {
+            continue;
+        }
+        if !cache.base_mint_has_any_ready_pool(&pk) {
+            continue;
+        }
+        out.push(pk);
+    }
+    out
+}
+
 /// Cold-path only: bounded PumpSwap, then PumpFun, then Raydium CPMM, then Meteora CPMM, then Orca
 /// Whirlpool, then Meteora DLMM (cache-scoped) for wallet-relevant mints without explicit Ready. Reuses
 /// [`handle_ensure_pump_amm_pool_accounts`], [`handle_ensure_pumpfun_bonding_curve`], and the same
@@ -745,6 +787,36 @@ async fn run_bounded_wallet_dex_bootstrap_verify(
         WALLET_BOOTSTRAP_DEX_VERIFY_GRACE_MS,
     ))
     .await;
+
+    // Scope-40: graduated PumpFun → PumpSwap tokens can have bonding-curve explicit Ready from
+    // JetStream while PumpSwap pool_accounts never ran through bootstrap; ensure PumpSwap discovery
+    // runs once (hint-free path still uses market-data RPC; engine stays I-24d clean).
+    let pump_amm_migration = wallet_mints_needing_pump_amm_after_pumpfun_migration(
+        ctx.live_pool_cache.as_ref(),
+        mints_in_wallet,
+        WSOL_MINT,
+        WALLET_BOOTSTRAP_DEX_VERIFY_MAX_MINTS,
+    );
+    for pk in pump_amm_migration {
+        if ctx
+            .live_pool_cache
+            .base_mint_has_explicit_pump_amm_ready_pool(&pk)
+        {
+            continue;
+        }
+        let base_mint_str = pk.to_string();
+        let request_id = format!("wallet_bootstrap_pamm_migrated_{}", Uuid::new_v4());
+        handle_ensure_pump_amm_pool_accounts(
+            ctx,
+            pump_amm_dex,
+            run_id,
+            &request_id,
+            &base_mint_str,
+            None,
+            false,
+        )
+        .await;
+    }
 
     for pk in candidates {
         if ctx.live_pool_cache.base_mint_has_any_ready_pool(&pk) {

@@ -305,7 +305,7 @@ impl PumpFunAmmDex {
         });
 
         // I-24d FAST PATH: When pool_address_hint provided, try single getAccount first.
-        // Avoids slow getProgramAccounts scan that routinely exceeds 15s discovery timeout.
+        // Avoids slow getProgramAccounts scan that routinely exceeds cold-path discovery timeout.
         if let Some(pool_market) = effective_pool_hint {
             info!(
                 base_mint = %base_mint,

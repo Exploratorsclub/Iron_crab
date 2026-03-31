@@ -1495,10 +1495,12 @@ struct CachedBlockhash {
 const MAX_BLOCKHASH_AGE_SECS: u64 = 30;
 
 /// I-24d: Bounded wait timeout for Discovery Request/Reply (market-data).
-const DISCOVERY_REQUEST_TIMEOUT_SECS: u64 = 15;
+/// Scope-40: local-validator `getProgramAccounts` fallback for PumpSwap can be ~25s; 45s budget.
+const DISCOVERY_REQUEST_TIMEOUT_SECS: u64 = 45;
 
 /// I-24d: Bounded wait for authoritative SLAVE PumpAmm state (JetStream `PoolCacheUpdate` merge).
-const DISCOVERY_CACHE_WAIT_TIMEOUT_MS: u64 = 10_000;
+/// Must cover [`DISCOVERY_REQUEST_TIMEOUT_SECS`] plus merge/publish slack.
+const DISCOVERY_CACHE_WAIT_TIMEOUT_MS: u64 = 55_000;
 
 /// I-24d: Poll interval when waiting for usable PumpAmm cache state in SLAVE cache.
 const DISCOVERY_CACHE_POLL_INTERVAL_MS: u64 = 100;
