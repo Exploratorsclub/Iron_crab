@@ -384,6 +384,10 @@ struct MarketDataContext {
     /// Only emit when progress changes by >= 50 bps or complete flag changes.
     last_emitted_curve_progress:
         parking_lot::RwLock<std::collections::HashMap<Pubkey, (u32, bool)>>,
+
+    /// PumpSwap / PumpFun AMM cold-path helper; set at Geyser-loop start before wallet snapshot.
+    /// Used for background wallet-bootstrap DEX verification (watchdog-safe).
+    pump_amm_dex: parking_lot::RwLock<Option<Arc<PumpFunAmmDex>>>,
 }
 
 #[derive(Debug, Default)]
@@ -3624,12 +3628,17 @@ async fn handle_wallet_bootstrap_meteora_dlmm_verify_for_mint(
 ///
 /// After startup, live balance updates are handled by Geyser (tracked ATA subscriptions).
 /// No RPC calls are made in the runtime hot-path.
+///
+/// When `dex_verify_blocking` is false (normal startup), bounded wallet DEX verification runs in a
+/// background task so the caller can reach the main loop and systemd watchdog pings before slow
+/// cold-path RPC completes. When true (`wallet_snapshot_only`), verification is awaited so the
+/// one-shot process exits with work finished.
 async fn publish_wallet_snapshot(
-    ctx: &MarketDataContext,
+    ctx: &Arc<MarketDataContext>,
     rpc: &Arc<SolanaRpc>,
-    pump_amm_dex: &PumpFunAmmDex,
     wallet: &Pubkey,
     is_periodic: bool,
+    dex_verify_blocking: bool,
 ) -> Result<()> {
     use async_nats::jetstream;
     use futures::StreamExt;
@@ -4260,15 +4269,62 @@ async fn publish_wallet_snapshot(
     // 4a) Bounded cold-path verification for wallet non-zero mints without explicit Ready
     // (PumpSwap, PumpFun, Raydium CPMM, Meteora CPMM, Orca, Meteora DLMM — cache-scoped where applicable);
     // reuses I-24d handlers + JetStream — no hot-path RPC.
-    run_bounded_wallet_dex_bootstrap_verify(
-        ctx,
-        rpc,
-        pump_amm_dex,
-        &mints_in_wallet,
-        &ctx.run_id,
-        is_periodic,
-    )
-    .await;
+    //
+    // Normal startup: spawn so systemd WatchdogSec is not exceeded while Ensure*/RPC runs serially.
+    // wallet_snapshot_only: block so one-shot mode still completes verification before exit.
+    if !is_periodic {
+        let mints_clone = mints_in_wallet.clone();
+        if dex_verify_blocking {
+            let dex_opt = ctx.pump_amm_dex.read().clone();
+            if let Some(dex) = dex_opt {
+                run_bounded_wallet_dex_bootstrap_verify(
+                    ctx.as_ref(),
+                    rpc,
+                    dex.as_ref(),
+                    &mints_clone,
+                    ctx.run_id.as_str(),
+                    false,
+                )
+                .await;
+            } else {
+                warn!(
+                    run_id = %ctx.run_id,
+                    "Wallet bootstrap DEX verify skipped: pump_amm_dex not initialized"
+                );
+            }
+        } else {
+            let ctx_spawn = Arc::clone(ctx);
+            let rpc_spawn = Arc::clone(rpc);
+            tokio::spawn(async move {
+                let dex_opt = ctx_spawn.pump_amm_dex.read().clone();
+                let Some(dex) = dex_opt else {
+                    warn!(
+                        run_id = %ctx_spawn.run_id,
+                        "Wallet bootstrap DEX verify skipped: pump_amm_dex not initialized (unexpected)"
+                    );
+                    return;
+                };
+                info!(
+                    run_id = %ctx_spawn.run_id,
+                    mints = mints_clone.len(),
+                    "Wallet bootstrap: bounded DEX verification running in background (watchdog-safe)"
+                );
+                run_bounded_wallet_dex_bootstrap_verify(
+                    ctx_spawn.as_ref(),
+                    &rpc_spawn,
+                    dex.as_ref(),
+                    &mints_clone,
+                    ctx_spawn.run_id.as_str(),
+                    false,
+                )
+                .await;
+                info!(
+                    run_id = %ctx_spawn.run_id,
+                    "Wallet bootstrap: bounded DEX verification background task finished"
+                );
+            });
+        }
+    }
 
     // 4b) Cold-path inventory: count wallet-held mints where [`LivePoolCache::base_mint_has_any_ready_pool`]
     // is true (explicit Ready merge per slice: PumpSwap, PumpFun bonding, Raydium CPMM, Meteora CPMM,
@@ -4572,6 +4628,7 @@ async fn main() -> Result<()> {
         tracked_wallet_mint_decimals: parking_lot::RwLock::new(std::collections::HashMap::new()),
         execution_results_deduper: parking_lot::Mutex::new(ExecutionResultDeduper::default()),
         last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        pump_amm_dex: parking_lot::RwLock::new(None),
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -5323,6 +5380,7 @@ async fn run_geyser_loop(
         ctx.live_pool_cache.clone(),
         true, // allow_rpc_on_miss: Cold Path Discovery
     ));
+    *ctx.pump_amm_dex.write() = Some(Arc::clone(&pump_amm_dex));
 
     // === P0: Wallet Balance Snapshot (Position Reconciliation) ===
     // Bootstrap wallet state at startup (max 1 RPC roundtrip) using known mints from JetStream.
@@ -5335,7 +5393,7 @@ async fn run_geyser_loop(
         if let Ok(wallet_pubkey) = Pubkey::from_str(&wallet_pubkey_str) {
             info!(wallet = %wallet_pubkey, "📸 Publishing wallet balance snapshot for position reconciliation");
             if let Err(e) =
-                publish_wallet_snapshot(&ctx, &rpc, pump_amm_dex.as_ref(), &wallet_pubkey, false)
+                publish_wallet_snapshot(&ctx, &rpc, &wallet_pubkey, false, wallet_snapshot_only)
                     .await
             {
                 warn!(error = %e, "Failed to publish wallet snapshot (continuing anyway)");
