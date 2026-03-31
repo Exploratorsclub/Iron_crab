@@ -4275,24 +4275,22 @@ async fn publish_wallet_snapshot(
     if !is_periodic {
         let mints_clone = mints_in_wallet.clone();
         if dex_verify_blocking {
-            match ctx.pump_amm_dex.read().as_ref() {
-                Some(dex) => {
-                    run_bounded_wallet_dex_bootstrap_verify(
-                        ctx.as_ref(),
-                        rpc,
-                        dex.as_ref(),
-                        &mints_clone,
-                        ctx.run_id.as_str(),
-                        false,
-                    )
-                    .await;
-                }
-                None => {
-                    warn!(
-                        run_id = %ctx.run_id,
-                        "Wallet bootstrap DEX verify skipped: pump_amm_dex not initialized"
-                    );
-                }
+            let dex_opt = ctx.pump_amm_dex.read().clone();
+            if let Some(dex) = dex_opt {
+                run_bounded_wallet_dex_bootstrap_verify(
+                    ctx.as_ref(),
+                    rpc,
+                    dex.as_ref(),
+                    &mints_clone,
+                    ctx.run_id.as_str(),
+                    false,
+                )
+                .await;
+            } else {
+                warn!(
+                    run_id = %ctx.run_id,
+                    "Wallet bootstrap DEX verify skipped: pump_amm_dex not initialized"
+                );
             }
         } else {
             let ctx_spawn = Arc::clone(ctx);
