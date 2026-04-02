@@ -782,12 +782,15 @@ impl PumpFunAmmDex {
             // Tx-history-free: `protocol_fee_recipient` is stored in the canonical `global_config`
             // account at a fixed offset (verified against mainnet swap ix accounts; Scope 41).
             // Pool markets often have only one WSOL vault (pool) — no embedded fee TA to discover.
+            let gc_account_opt = self
+                .rpc_get_account_owner_executable_and_data(global_config)
+                .await?;
+
             let fixed_protocol_fee_from_global_config = if let Some((gc_owner, gc_exec, gc_data)) =
-                self.rpc_get_account_owner_executable_and_data(global_config)
-                    .await?
+                gc_account_opt.as_ref()
             {
-                if !gc_exec
-                    && gc_owner == pump_amm_program
+                if !*gc_exec
+                    && *gc_owner == pump_amm_program
                     && gc_data.len() >= PUMPFUN_AMM_GLOBAL_CONFIG_PROTOCOL_FEE_RECIPIENT_OFFSET + 32
                 {
                     let pfr = Pubkey::new_from_array(
@@ -822,11 +825,8 @@ impl PumpFunAmmDex {
                 let mut extra_authority_candidates: Vec<Pubkey> = Vec::new();
                 let mut embedded_fee_ta_from_global: Option<(Pubkey, Pubkey, u64)> = None;
 
-                if let Some((gc_owner, gc_exec, gc_data)) = self
-                    .rpc_get_account_owner_executable_and_data(global_config)
-                    .await?
-                {
-                    if !gc_exec && gc_owner == pump_amm_program && gc_data.len() >= 32 {
+                if let Some((gc_owner, gc_exec, gc_data)) = gc_account_opt.as_ref() {
+                    if !*gc_exec && *gc_owner == pump_amm_program && gc_data.len() >= 32 {
                         // Scan the global_config raw bytes for candidate pubkeys.
                         let mut gc_pubkeys: Vec<Pubkey> = Vec::new();
                         for i in 0..=(gc_data.len().saturating_sub(32)) {
