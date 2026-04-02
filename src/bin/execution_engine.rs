@@ -1498,9 +1498,10 @@ const MAX_BLOCKHASH_AGE_SECS: u64 = 30;
 /// Scope-40: local-validator `getProgramAccounts` fallback for PumpSwap can be ~25s; 45s budget.
 const DISCOVERY_REQUEST_TIMEOUT_SECS: u64 = 45;
 
-/// I-24d: Bounded wait for authoritative SLAVE PumpAmm state (JetStream `PoolCacheUpdate` merge).
-/// Must cover [`DISCOVERY_REQUEST_TIMEOUT_SECS`] plus merge/publish slack.
-const DISCOVERY_CACHE_WAIT_TIMEOUT_MS: u64 = 55_000;
+/// I-24d: Bounded wait for authoritative SLAVE pool state after a successful discovery/recovery reply
+/// (JetStream `PoolCacheUpdate` delivery + merge into `LivePoolCache`). Call sites run only after
+/// `DiscoveryRequestOutcome::Ok`, so this must **not** re-budget [`DISCOVERY_REQUEST_TIMEOUT_SECS`].
+const DISCOVERY_CACHE_WAIT_TIMEOUT_MS: u64 = 10_000;
 
 /// I-24d: Poll interval when waiting for usable PumpAmm cache state in SLAVE cache.
 const DISCOVERY_CACHE_POLL_INTERVAL_MS: u64 = 100;
