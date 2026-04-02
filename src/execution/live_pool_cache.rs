@@ -943,6 +943,22 @@ impl LivePoolCache {
         false
     }
 
+    /// `true` if any cached PumpFun bonding-curve row for this mint has `complete == true`
+    /// (migrated / graduated to PumpSwap). Used after restart so cold-path bootstrap can still
+    /// run [`EnsurePumpAmmPoolAccounts`] when bonding-curve JetStream state looks "ready" but
+    /// PumpSwap explicit readiness is missing (Bug #33 / Scope-40).
+    #[must_use]
+    pub fn pumpfun_bonding_curve_complete_for_mint(&self, mint: &Pubkey) -> bool {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpFun(s) = &entry.value().state {
+                if s.token_mint == *mint && s.complete {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Get PumpAmm reserves (base, quote) for a given base_mint from cache.
     ///
     /// Returns `Some((base_reserve, quote_reserve, pool_market))` if both reserves
@@ -2547,6 +2563,21 @@ mod tests {
             creator: Pubkey::new_unique(),
             cashback_enabled: false,
         })
+    }
+
+    #[test]
+    fn test_pumpfun_bonding_curve_complete_for_mint() {
+        let cache = LivePoolCache::new();
+        let bonding_curve = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        cache.upsert(
+            bonding_curve,
+            make_pumpfun_state_for_curve(base_mint, bonding_curve),
+            100,
+        );
+        assert!(!cache.pumpfun_bonding_curve_complete_for_mint(&base_mint));
+        assert!(cache.mark_pumpfun_complete_for_mint(&base_mint));
+        assert!(cache.pumpfun_bonding_curve_complete_for_mint(&base_mint));
     }
 
     #[test]
