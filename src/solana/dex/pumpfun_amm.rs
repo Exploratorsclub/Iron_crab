@@ -625,12 +625,7 @@ impl PumpFunAmmDex {
         &self,
         address: Pubkey,
     ) -> Result<Option<(Pubkey, bool)>> {
-        let acc = match self.rpc.get_account_opt_retry(&address).await {
-            Ok(Some(a)) => a,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(anyhow!("get_account failed: {e}")),
-        };
-        Ok(Some((acc.owner, acc.executable)))
+        Self::rpc_account_owner_executable_for(self.rpc.as_ref(), address).await
     }
 
     async fn rpc_get_account_owner_executable_and_data(
