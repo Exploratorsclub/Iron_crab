@@ -1951,7 +1951,8 @@ impl PumpFunAmmDex {
         // build the full static account set by parsing on-chain state + deriving PDAs. This avoids
         // relying on tx-history (some pools can exist with no successful swaps yet).
         let mut market_parse_err: Option<anyhow::Error> = None;
-        let mut last_local_parse_fail: Option<PumpAmmLocalParseFailReason> = None;
+        let first_market = markets.first().copied();
+        let mut first_market_local_parse_fail: Option<PumpAmmLocalParseFailReason> = None;
         for m in &markets {
             match self.try_market_parse_outcome_for_pool(*m, base_mint).await {
                 Ok(PumpAmmMarketParseOutcome::Ok(pool)) => {
@@ -1960,7 +1961,9 @@ impl PumpFunAmmDex {
                     return Ok(Some(pool));
                 }
                 Ok(PumpAmmMarketParseOutcome::LocalFail(reason)) => {
-                    last_local_parse_fail = Some(reason);
+                    if first_market == Some(*m) {
+                        first_market_local_parse_fail = Some(reason);
+                    }
                     warn!(
                         market = %m,
                         base_mint = %base_mint,
@@ -2016,7 +2019,7 @@ impl PumpFunAmmDex {
                 .try_bounded_external_tx_history_pool(
                     m,
                     base_mint,
-                    last_local_parse_fail,
+                    first_market_local_parse_fail,
                     "discover_pool_static_after_local_tx_history",
                 )
                 .await?
