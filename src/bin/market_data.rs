@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use ironcrab::config::WalletTrackerCfg;
+use ironcrab::config::{Config, WalletTrackerCfg};
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest,
     ControlRequestKind, ControlResponse, ControlResponseStatus, DexPoolReadiness, ExecutionResult,
@@ -388,6 +388,10 @@ struct MarketDataContext {
     /// PumpSwap / PumpFun AMM cold-path helper; set at Geyser-loop start before wallet snapshot.
     /// Used for background wallet-bootstrap DEX verification (watchdog-safe).
     pump_amm_dex: parking_lot::RwLock<Option<Arc<PumpFunAmmDex>>>,
+
+    /// Optional Helius (or other full-history) RPC — **only** for bounded PumpSwap TX-history
+    /// fallback in `EnsurePumpAmmPoolAccounts` when the local validator lacks tx index (Cold Path).
+    helius_rpc: Option<Arc<SolanaRpc>>,
 }
 
 #[derive(Debug, Default)]
@@ -4541,6 +4545,30 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let run_id = Uuid::new_v4().to_string();
 
+    let helius_rpc: Option<Arc<SolanaRpc>> = match Config::load(&args.config) {
+        Ok(cfg) => cfg
+            .solana
+            .helius_rpc_url
+            .as_ref()
+            .map(|u| u.trim())
+            .filter(|u| !u.is_empty())
+            .map(|url| {
+                info!(
+                    helius_rpc_host = %url.split('/').nth(2).unwrap_or("?"),
+                    "Loaded solana.helius_rpc_url for bounded PumpSwap TX-history fallback (Cold Path only)"
+                );
+                Arc::new(SolanaRpc::new(url))
+            }),
+        Err(e) => {
+            warn!(
+                error = %e,
+                config_path = %args.config.display(),
+                "Could not load config.toml; Helius PumpSwap fallback disabled (optional)"
+            );
+            None
+        }
+    };
+
     let wallet_env = std::env::var("IRONCRAB_WALLET_PUBKEY").ok();
     info!(
         run_id = %run_id,
@@ -4704,6 +4732,7 @@ async fn main() -> Result<()> {
         execution_results_deduper: parking_lot::Mutex::new(ExecutionResultDeduper::default()),
         last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pump_amm_dex: parking_lot::RwLock::new(None),
+        helius_rpc,
     });
 
     // === Main Loop: Geyser subscription or simulation ===
@@ -5450,11 +5479,13 @@ async fn run_geyser_loop(
     info!(rpc_url = %rpc_url, "Initialized RPC client for metadata/fallback");
 
     // Shared PumpFunAmmDex for wallet bootstrap verification and ControlRequest discovery (dedupe).
-    let pump_amm_dex = Arc::new(PumpFunAmmDex::new_with_cache(
+    let mut pump_inner = PumpFunAmmDex::new_with_cache(
         Arc::clone(&rpc),
         ctx.live_pool_cache.clone(),
         true, // allow_rpc_on_miss: Cold Path Discovery
-    ));
+    );
+    pump_inner.set_bounded_tx_fallback_rpc(ctx.helius_rpc.clone());
+    let pump_amm_dex = Arc::new(pump_inner);
     *ctx.pump_amm_dex.write() = Some(Arc::clone(&pump_amm_dex));
 
     // === P0: Wallet Balance Snapshot (Position Reconciliation) ===
@@ -8548,11 +8579,13 @@ async fn run_simulation_loop(
         None
     };
 
-    let pump_amm_dex = Arc::new(PumpFunAmmDex::new_with_cache(
+    let mut pump_inner = PumpFunAmmDex::new_with_cache(
         Arc::clone(&rpc),
         ctx.live_pool_cache.clone(),
         true, // allow_rpc_on_miss: Cold Path Discovery
-    ));
+    );
+    pump_inner.set_bounded_tx_fallback_rpc(ctx.helius_rpc.clone());
+    let pump_amm_dex = Arc::new(pump_inner);
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut slot: u64 = 0;
