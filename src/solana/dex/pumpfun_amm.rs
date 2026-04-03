@@ -297,6 +297,74 @@ impl PumpFunAmmDex {
         self.bounded_tx_fallback_rpc = rpc;
     }
 
+    /// Bounded external `getProgramAccounts` for PumpSwap markets (Helius) when local validator
+    /// returns error or zero markets for the base_mint + WSOL memcmp filters. Cold path only.
+    async fn try_bounded_external_pool_markets_via_program_accounts(
+        &self,
+        base_mint: Pubkey,
+        local_failure_stage: &'static str,
+    ) -> Result<Option<Vec<Pubkey>>> {
+        const BOUNDED_EXTERNAL_GPA_TIMEOUT: Duration = Duration::from_secs(15);
+        let Some(ref h_rpc) = self.bounded_tx_fallback_rpc else {
+            info!(
+                base_mint = %base_mint,
+                local_failure_stage,
+                "pump_amm: helius_unconfigured — bounded external getProgramAccounts (pool markets) skipped"
+            );
+            return Ok(None);
+        };
+
+        info!(
+            base_mint = %base_mint,
+            local_failure_stage,
+            timeout_secs = BOUNDED_EXTERNAL_GPA_TIMEOUT.as_secs(),
+            "pump_amm: bounded external pool-market discovery starting (Helius getProgramAccounts)"
+        );
+
+        match tokio::time::timeout(
+            BOUNDED_EXTERNAL_GPA_TIMEOUT,
+            Self::discover_pool_markets_via_program_accounts_with_rpc(h_rpc.as_ref(), base_mint),
+        )
+        .await
+        {
+            Ok(Ok(v)) if !v.is_empty() => {
+                info!(
+                    base_mint = %base_mint,
+                    market_count = v.len(),
+                    local_failure_stage,
+                    "pump_amm: bounded external getProgramAccounts SUCCESS (pool market addresses)"
+                );
+                Ok(Some(v))
+            }
+            Ok(Ok(_)) => {
+                warn!(
+                    base_mint = %base_mint,
+                    local_failure_stage,
+                    "pump_amm: bounded external getProgramAccounts returned 0 markets (helius_miss)"
+                );
+                Ok(None)
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    base_mint = %base_mint,
+                    local_failure_stage,
+                    error = %e,
+                    "pump_amm: bounded external getProgramAccounts error (helius_failed)"
+                );
+                Ok(None)
+            }
+            Err(_) => {
+                warn!(
+                    base_mint = %base_mint,
+                    local_failure_stage,
+                    timeout_secs = BOUNDED_EXTERNAL_GPA_TIMEOUT.as_secs(),
+                    "pump_amm: bounded external getProgramAccounts timed out (helius_failed)"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// After local market parse fails or local tx-history is empty: one bounded `getSignaturesForAddress`
     /// + `getTransaction` scan via optional full-index RPC (Helius). Never used without empty local sig list.
     async fn try_bounded_external_tx_history_pool(
@@ -1435,8 +1503,8 @@ impl PumpFunAmmDex {
     /// Discover PumpSwap pool market addresses by base_mint via getProgramAccounts RPC.
     ///
     /// COLD PATH ONLY. Uses RPC (getProgramAccounts). Never call from hot path.
-    async fn discover_pool_markets_via_program_accounts(
-        &self,
+    async fn discover_pool_markets_via_program_accounts_with_rpc(
+        rpc: &SolanaRpc,
         base_mint: Pubkey,
     ) -> Result<Vec<Pubkey>> {
         use solana_commitment_config::CommitmentConfig;
@@ -1464,8 +1532,7 @@ impl PumpFunAmmDex {
             ..Default::default()
         };
 
-        let accounts = self
-            .rpc
+        let accounts = rpc
             .get_program_accounts_with_config_retry(&program_id, config)
             .await
             .map_err(|e| anyhow!("getProgramAccounts failed: {e}"))?;
@@ -1474,6 +1541,15 @@ impl PumpFunAmmDex {
         out.sort();
         out.dedup();
         Ok(out)
+    }
+
+    /// Discover PumpSwap pool market addresses by base_mint via local validator RPC.
+    async fn discover_pool_markets_via_program_accounts(
+        &self,
+        base_mint: Pubkey,
+    ) -> Result<Vec<Pubkey>> {
+        Self::discover_pool_markets_via_program_accounts_with_rpc(self.rpc.as_ref(), base_mint)
+            .await
     }
 
     /// Bounded TX-history scan for one pool market (Cold Path). Uses `tx_rpc` for signatures + txs
@@ -1931,7 +2007,7 @@ impl PumpFunAmmDex {
         );
 
         let mut discovery_err: Option<anyhow::Error> = None;
-        let markets = match self
+        let mut markets = match self
             .discover_pool_markets_via_program_accounts(base_mint)
             .await
         {
@@ -1941,6 +2017,52 @@ impl PumpFunAmmDex {
                 Vec::new()
             }
         };
+
+        let local_gpa_error = discovery_err.is_some();
+        let local_gpa_zero_markets = markets.is_empty();
+        if local_gpa_error || local_gpa_zero_markets {
+            if local_gpa_error {
+                if let Some(ref e) = discovery_err {
+                    warn!(
+                        base_mint = %base_mint,
+                        error = %e,
+                        "pump_amm: local getProgramAccounts failed or unusable; attempting bounded external pool-market discovery"
+                    );
+                }
+            } else {
+                info!(
+                    base_mint = %base_mint,
+                    "pump_amm: local getProgramAccounts returned 0 markets; attempting bounded external pool-market discovery"
+                );
+            }
+
+            let stage = if local_gpa_error {
+                "local_getProgramAccounts_error"
+            } else {
+                "local_getProgramAccounts_zero_markets"
+            };
+
+            if let Some(external) = self
+                .try_bounded_external_pool_markets_via_program_accounts(base_mint, stage)
+                .await?
+            {
+                for pk in external {
+                    if !markets.contains(&pk) {
+                        markets.push(pk);
+                    }
+                }
+                markets.sort();
+                markets.dedup();
+                if local_gpa_error && !markets.is_empty() {
+                    info!(
+                        base_mint = %base_mint,
+                        market_count = markets.len(),
+                        "pump_amm: external pool-market discovery recovered after local getProgramAccounts error"
+                    );
+                    discovery_err = None;
+                }
+            }
+        }
 
         // Fast path: if we can locate the pool market via program-accounts lookup, attempt to
         // build the full static account set by parsing on-chain state + deriving PDAs. This avoids
