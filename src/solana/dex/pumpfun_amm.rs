@@ -124,9 +124,54 @@ fn anchor_disc(ix_name: &str) -> [u8; 8] {
     disc
 }
 
-#[allow(dead_code)]
+/// Stable, structured reason when local (validator) market-account parsing cannot build `PumpAmmPoolStatic`.
+/// Used by `market-data` cold-path logging (Scope 42); not a global canonicalization of fee recipients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpAmmLocalParseFailReason {
+    PoolMarketNotFound,
+    PoolMarketOwnerMismatch,
+    PoolMarketDataTooShort,
+    BaseOrQuoteMintMismatch,
+    NoBaseVaultTokenAccount,
+    NoQuoteVaultTokenAccount,
+    ProtocolFeeRecipientUnresolved,
+    ProtocolFeeRecipientTokenAccountMissing,
+    CreatorVaultMissing,
+    FeeConfigMissing,
+    GlobalVolumeAccumulatorMissing,
+    RpcGetMultipleAccountsFailed,
+}
+
+impl std::fmt::Display for PumpAmmLocalParseFailReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::PoolMarketNotFound => "pool_market_not_found",
+            Self::PoolMarketOwnerMismatch => "pool_market_owner_mismatch",
+            Self::PoolMarketDataTooShort => "pool_market_layout_mismatch",
+            Self::BaseOrQuoteMintMismatch => "base_quote_mint_mismatch",
+            Self::NoBaseVaultTokenAccount => "no_base_vault_token_account",
+            Self::NoQuoteVaultTokenAccount => "no_quote_vault_token_account",
+            Self::ProtocolFeeRecipientUnresolved => "protocol_fee_recipient_missing",
+            Self::ProtocolFeeRecipientTokenAccountMissing => "protocol_fee_recipient_ta_missing",
+            Self::CreatorVaultMissing => "creator_vault_missing",
+            Self::FeeConfigMissing => "fee_config_missing",
+            Self::GlobalVolumeAccumulatorMissing => "global_volume_accumulator_missing",
+            Self::RpcGetMultipleAccountsFailed => "rpc_get_multiple_accounts_failed",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Outcome of parsing a PumpSwap pool market account via RPC (cold path).
 #[derive(Debug, Clone)]
-struct PumpAmmPoolStatic {
+#[allow(clippy::large_enum_variant)]
+pub enum PumpAmmMarketParseOutcome {
+    Ok(PumpAmmPoolStatic),
+    LocalFail(PumpAmmLocalParseFailReason),
+}
+
+#[derive(Debug, Clone)]
+pub struct PumpAmmPoolStatic {
     pool_market: Pubkey,
     global_config: Pubkey,
     base_mint: Pubkey,
@@ -141,6 +186,28 @@ struct PumpAmmPoolStatic {
     global_volume_accumulator: Pubkey,
     fee_config: Pubkey,
     fee_program: Pubkey,
+}
+
+impl PumpAmmPoolStatic {
+    /// V1 ordering for JetStream / `build_swap_ix_from_pool_accounts` (14 accounts).
+    pub fn as_pool_accounts_v14(&self) -> Vec<Pubkey> {
+        vec![
+            self.pool_market,
+            self.global_config,
+            self.base_mint,
+            self.quote_mint,
+            self.pool_base_vault,
+            self.pool_quote_vault,
+            self.protocol_fee_recipient,
+            self.protocol_fee_recipient_ta,
+            self.event_authority,
+            self.coin_creator_vault_ata,
+            self.coin_creator_vault_authority,
+            self.global_volume_accumulator,
+            self.fee_config,
+            self.fee_program,
+        ]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +256,10 @@ pub struct PumpFunAmmDex {
     /// When LivePoolCache is set and cache miss: if false, return None (Hot Path, no RPC).
     /// If true, fall back to RPC discovery (Cold Path, e.g. Liquidation). P3 #12.
     allow_rpc_on_miss: bool,
+
+    /// Optional RPC with full tx index (e.g. Helius). **Only** used for bounded `getSignaturesForAddress`
+    /// + `getTransaction` after local validator parse/history failed — set by `market-data` Cold Path only.
+    bounded_tx_fallback_rpc: Option<Arc<SolanaRpc>>,
 }
 
 impl PumpFunAmmDex {
@@ -203,6 +274,7 @@ impl PumpFunAmmDex {
             cached_data: DashMap::new(),
             live_pool_cache: None,
             allow_rpc_on_miss: true, // No cache: always RPC (Cold Path only)
+            bounded_tx_fallback_rpc: None,
         }
     }
 
@@ -220,25 +292,157 @@ impl PumpFunAmmDex {
         dex
     }
 
+    /// Cold path only (`market-data`): bounded TX-history fallback when local validator lacks index.
+    pub fn set_bounded_tx_fallback_rpc(&mut self, rpc: Option<Arc<SolanaRpc>>) {
+        self.bounded_tx_fallback_rpc = rpc;
+    }
+
+    /// After local market parse fails or local tx-history is empty: one bounded `getSignaturesForAddress`
+    /// + `getTransaction` scan via optional full-index RPC (Helius). Never used without empty local sig list.
+    async fn try_bounded_external_tx_history_pool(
+        &self,
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+        local_parse_fail_reason: Option<PumpAmmLocalParseFailReason>,
+        log_ctx: &'static str,
+    ) -> Result<Option<PumpAmmPoolStatic>> {
+        const BOUNDED_EXTERNAL_TX_TIMEOUT: Duration = Duration::from_secs(12);
+        let Some(ref h_rpc) = self.bounded_tx_fallback_rpc else {
+            info!(
+                pool = %pool_market,
+                log_ctx,
+                "pump_amm: helius_unconfigured — bounded external TX-history skipped"
+            );
+            return Ok(None);
+        };
+
+        let local_sigs_empty = match self
+            .rpc
+            .get_signatures_for_address(&pool_market, Some(1))
+            .await
+        {
+            Ok(v) => v.is_empty(),
+            Err(e) => {
+                warn!(
+                    pool = %pool_market,
+                    error = %e,
+                    log_ctx,
+                    "pump_amm: local getSignaturesForAddress failed; treating as empty local tx index"
+                );
+                true
+            }
+        };
+        if !local_sigs_empty {
+            debug!(
+                pool = %pool_market,
+                log_ctx,
+                "pump_amm: local validator has tx signatures — skipping bounded external TX-history"
+            );
+            return Ok(None);
+        }
+
+        info!(
+            pool = %pool_market,
+            base_mint = %base_mint,
+            local_parse_fail_reason = ?local_parse_fail_reason.map(|r| r.to_string()),
+            log_ctx,
+            "pump_amm: bounded external TX-history fallback starting (Helius / full index)"
+        );
+
+        match tokio::time::timeout(
+            BOUNDED_EXTERNAL_TX_TIMEOUT,
+            self.discover_pool_static_via_tx_history_with_rpc(
+                Arc::clone(h_rpc),
+                pool_market,
+                base_mint,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(Some(pool))) => {
+                info!(
+                    pool = %pool_market,
+                    log_ctx,
+                    "pump_amm: bounded external TX-history fallback SUCCESS"
+                );
+                Ok(Some(pool))
+            }
+            Ok(Ok(None)) => {
+                warn!(
+                    pool = %pool_market,
+                    log_ctx,
+                    "pump_amm: bounded external TX-history returned no pool"
+                );
+                Ok(None)
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    pool = %pool_market,
+                    error = %e,
+                    log_ctx,
+                    "pump_amm: bounded external TX-history error (helius_failed)"
+                );
+                Ok(None)
+            }
+            Err(_) => {
+                warn!(
+                    pool = %pool_market,
+                    timeout_secs = BOUNDED_EXTERNAL_TX_TIMEOUT.as_secs(),
+                    log_ctx,
+                    "pump_amm: bounded external TX-history timed out (helius_failed)"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     pub fn set_user_authority(&mut self, user: Pubkey) {
         self.user_authority = Some(user);
     }
 
+    /// Primary RPC client (local validator in `market-data`). Cold-path helpers may compare against Helius.
+    pub fn rpc_client(&self) -> Arc<SolanaRpc> {
+        Arc::clone(&self.rpc)
+    }
+
+    /// Cold path: cache a fully resolved `PumpAmmPoolStatic` after external discovery (e.g. Helius TX-history).
+    pub fn insert_pool_static_cache(&self, pool: PumpAmmPoolStatic) {
+        let base_mint = pool.base_mint;
+        let pool_market = pool.pool_market;
+        self.pools_by_base.insert(base_mint, pool);
+        self.pools_by_market.insert(pool_market, base_mint);
+    }
+
     /// Fetch transaction via SolanaRpc and return as Value for legacy JSON parsers.
     async fn fetch_tx_as_value(&self, sig: &str) -> Result<Value> {
+        Self::fetch_tx_as_value_with_rpc(self.rpc.as_ref(), sig).await
+    }
+
+    async fn fetch_tx_as_value_with_rpc(rpc: &SolanaRpc, sig: &str) -> Result<Value> {
         let sig_parsed = sig.parse::<Signature>().context("invalid signature")?;
         let cfg = RpcTransactionConfig {
             encoding: Some(UiTransactionEncoding::JsonParsed),
             max_supported_transaction_version: Some(0),
             commitment: None,
         };
-        let tx = self
-            .rpc
+        let tx = rpc
             .get_transaction_with_config_retry(&sig_parsed, cfg)
             .await
             .map_err(|e| anyhow!("getTransaction failed: {e}"))?;
         let tx_val = serde_json::to_value(&tx).context("serialize transaction")?;
         Ok(json!({"result": tx_val}))
+    }
+
+    async fn rpc_account_owner_executable_for(
+        rpc: &SolanaRpc,
+        address: Pubkey,
+    ) -> Result<Option<(Pubkey, bool)>> {
+        let acc = match rpc.get_account_opt_retry(&address).await {
+            Ok(Some(a)) => a,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(anyhow!("get_account failed: {e}")),
+        };
+        Ok(Some((acc.owner, acc.executable)))
     }
 
     /// Return the deterministic v1 pool-accounts list for a Pump.fun AMM pool.
@@ -325,10 +529,10 @@ impl PumpFunAmmDex {
                 "pump_amm: pool_address hint provided, trying direct getAccount (fast path)"
             );
             match self
-                .try_parse_pool_static_from_market_account(pool_market, base_mint)
-                .await
+                .try_market_parse_outcome_for_pool(pool_market, base_mint)
+                .await?
             {
-                Ok(Some(pool)) => {
+                PumpAmmMarketParseOutcome::Ok(pool) => {
                     self.pools_by_base.insert(base_mint, pool.clone());
                     self.pools_by_market.insert(pool.pool_market, base_mint);
                     info!(
@@ -336,46 +540,33 @@ impl PumpFunAmmDex {
                         pool_market = %pool.pool_market,
                         "pump_amm: PumpAmmPoolStatic from pool_address hint (fast path)"
                     );
-                    return Ok(Some(vec![
-                        pool.pool_market,
-                        pool.global_config,
-                        pool.base_mint,
-                        pool.quote_mint,
-                        pool.pool_base_vault,
-                        pool.pool_quote_vault,
-                        pool.protocol_fee_recipient,
-                        pool.protocol_fee_recipient_ta,
-                        pool.event_authority,
-                        pool.coin_creator_vault_ata,
-                        pool.coin_creator_vault_authority,
-                        pool.global_volume_accumulator,
-                        pool.fee_config,
-                        pool.fee_program,
-                    ]));
+                    return Ok(Some(pool.as_pool_accounts_v14()));
                 }
-                Ok(None) => {
+                PumpAmmMarketParseOutcome::LocalFail(reason) => {
                     warn!(
                         base_mint = %base_mint,
                         pool = %pool_market,
-                        "pump_amm: pool_address hint parse returned None; refusing discover_pool_static (no unbounded getProgramAccounts)"
+                        local_parse_fail_reason = %reason,
+                        "pump_amm: pool_address hint local market parse failed (structured reason)"
                     );
+                    if let Some(pool) = self
+                        .try_bounded_external_tx_history_pool(
+                            pool_market,
+                            base_mint,
+                            Some(reason),
+                            "pool_address_hint",
+                        )
+                        .await?
+                    {
+                        self.insert_pool_static_cache(pool.clone());
+                        return Ok(Some(pool.as_pool_accounts_v14()));
+                    }
                     return Err(anyhow!(
-                        "pump_amm: pool_address hint parse returned no usable pool (base_mint={}, pool={}); refusing unbounded RPC discovery (I-24d)",
+                        "pump_amm: pool_address hint parse failed local_parse={} (base_mint={}, pool={}); refusing unbounded getProgramAccounts (I-24d)",
+                        reason,
                         base_mint,
                         pool_market
                     ));
-                }
-                Err(e) => {
-                    warn!(
-                        base_mint = %base_mint,
-                        pool = %pool_market,
-                        error = %e,
-                        "pump_amm: pool_address hint parse failed; refusing discover_pool_static (no unbounded getProgramAccounts)"
-                    );
-                    return Err(e.context(format!(
-                        "pump_amm: pool_address hint parse error (base_mint={}, pool={}); refusing unbounded RPC discovery (I-24d)",
-                        base_mint, pool_market
-                    )));
                 }
             }
         }
@@ -507,11 +698,12 @@ impl PumpFunAmmDex {
         Ok(None)
     }
 
-    async fn try_parse_pool_static_from_market_account(
+    /// Cold path: full market parse outcome with a stable local-fail reason code (for `market-data` logs).
+    pub async fn try_market_parse_outcome_for_pool(
         &self,
         pool_market: Pubkey,
         expected_base_mint: Pubkey,
-    ) -> Result<Option<PumpAmmPoolStatic>> {
+    ) -> Result<PumpAmmMarketParseOutcome> {
         self.try_parse_pool_static_from_market_account_inner(pool_market, expected_base_mint, None)
             .await
     }
@@ -526,7 +718,7 @@ impl PumpFunAmmDex {
         pool_market: Pubkey,
         expected_base_mint: Pubkey,
         prefetched_data: Option<(Pubkey, bool, Vec<u8>)>,
-    ) -> Result<Option<PumpAmmPoolStatic>> {
+    ) -> Result<PumpAmmMarketParseOutcome> {
         let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
         let expected_quote_mint = Pubkey::from_str(WSOL_MINT)?;
 
@@ -537,16 +729,22 @@ impl PumpFunAmmDex {
                 .rpc_get_account_owner_executable_and_data(pool_market)
                 .await?
             else {
-                return Ok(None);
+                return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                    PumpAmmLocalParseFailReason::PoolMarketNotFound,
+                ));
             };
             r
         };
         if executable || owner != pump_amm_program {
-            return Ok(None);
+            return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                PumpAmmLocalParseFailReason::PoolMarketOwnerMismatch,
+            ));
         }
 
         if data.len() < PUMPFUN_AMM_MARKET_MIN_DATA_LEN {
-            return Ok(None);
+            return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                PumpAmmLocalParseFailReason::PoolMarketDataTooShort,
+            ));
         }
 
         // Canonical global config (same for every pool). Do **not** slice from market bytes:
@@ -568,7 +766,9 @@ impl PumpFunAmmDex {
         // This fallback is only used for WSOL pairs and assumes the program's swap semantics
         // (buy uses quote-in, sell uses base-in).
         if base_mint != expected_base_mint || quote_mint != expected_quote_mint {
-            return Ok(None);
+            return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                PumpAmmLocalParseFailReason::BaseOrQuoteMintMismatch,
+            ));
         }
 
         // Parse the remaining 32-byte fields after quote_mint; these typically include the
@@ -621,12 +821,19 @@ impl PumpFunAmmDex {
 
         const MULTI_ACCOUNTS_CHUNK: usize = 100;
         for chunk in all_candidates.chunks(MULTI_ACCOUNTS_CHUNK) {
-            let accounts = self
-                .rpc
-                .rpc
-                .get_multiple_accounts(chunk)
-                .await
-                .map_err(|e| anyhow!("get_multiple_accounts failed: {e}"))?;
+            let accounts = match self.rpc.rpc.get_multiple_accounts(chunk).await {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(
+                        pool = %pool_market,
+                        error = %e,
+                        "pump_amm market parse: get_multiple_accounts failed (market candidate chunk)"
+                    );
+                    return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                        PumpAmmLocalParseFailReason::RpcGetMultipleAccountsFailed,
+                    ));
+                }
+            };
 
             for (pk, acc_opt) in chunk.iter().copied().zip(accounts.into_iter()) {
                 let Some(acc) = acc_opt else {
@@ -734,14 +941,16 @@ impl PumpFunAmmDex {
         base_token_accounts.sort_by_key(|t| std::cmp::Reverse(t.balance));
         quote_token_accounts.sort_by_key(|t| std::cmp::Reverse(t.balance));
 
-        let pool_base_vault = base_token_accounts
-            .first()
-            .map(|t| t.address)
-            .ok_or_else(|| anyhow!("pump_amm market parse: no base vault token accounts"))?;
-        let pool_quote_vault = quote_token_accounts
-            .first()
-            .map(|t| t.address)
-            .ok_or_else(|| anyhow!("pump_amm market parse: no quote vault token accounts"))?;
+        let Some(pool_base_vault) = base_token_accounts.first().map(|t| t.address) else {
+            return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                PumpAmmLocalParseFailReason::NoBaseVaultTokenAccount,
+            ));
+        };
+        let Some(pool_quote_vault) = quote_token_accounts.first().map(|t| t.address) else {
+            return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                PumpAmmLocalParseFailReason::NoQuoteVaultTokenAccount,
+            ));
+        };
 
         // Build a list of plausible authorities for fee/creator recipients.
         // These can appear as plain Pubkeys in the market account even when the corresponding
@@ -841,14 +1050,19 @@ impl PumpFunAmmDex {
                         gc_pubkeys.dedup();
 
                         for chunk in gc_pubkeys.chunks(MULTI_ACCOUNTS_CHUNK) {
-                            let accounts = self
-                                .rpc
-                                .rpc
-                                .get_multiple_accounts(chunk)
-                                .await
-                                .map_err(|e| {
-                                    anyhow!("get_multiple_accounts (global_config) failed: {e}")
-                                })?;
+                            let accounts = match self.rpc.rpc.get_multiple_accounts(chunk).await {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    warn!(
+                                        pool = %pool_market,
+                                        error = %e,
+                                        "pump_amm market parse: get_multiple_accounts failed (global_config scan)"
+                                    );
+                                    return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                                        PumpAmmLocalParseFailReason::RpcGetMultipleAccountsFailed,
+                                    ));
+                                }
+                            };
 
                             for (pk, acc_opt) in chunk.iter().copied().zip(accounts.into_iter()) {
                                 let Some(acc) = acc_opt else {
@@ -940,7 +1154,9 @@ impl PumpFunAmmDex {
                              authority_candidates_count={})",
                             combined.len(),
                         );
-                        return Ok(None);
+                        return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                            PumpAmmLocalParseFailReason::ProtocolFeeRecipientTokenAccountMissing,
+                        ));
                     }
                 }
             }
@@ -1028,7 +1244,9 @@ impl PumpFunAmmDex {
                              authority_candidates_count={})",
                             authority_candidates.len()
                         );
-                        return Ok(None);
+                        return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                            PumpAmmLocalParseFailReason::CreatorVaultMissing,
+                        ));
                     }
                 }
             }
@@ -1083,7 +1301,9 @@ impl PumpFunAmmDex {
                          authority_candidates_count={})",
                         authority_candidates.len()
                     );
-                    return Ok(None);
+                    return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                        PumpAmmLocalParseFailReason::CreatorVaultMissing,
+                    ));
                 }
             }
         };
@@ -1172,14 +1392,32 @@ impl PumpFunAmmDex {
             fee_config
         };
 
-        if fee_config == Pubkey::default() || global_volume_accumulator == Pubkey::default() {
+        if fee_config == Pubkey::default() && global_volume_accumulator == Pubkey::default() {
             warn!(
                 pool = %pool_market,
-                fee_config_default = (fee_config == Pubkey::default()),
-                vol_accum_default = (global_volume_accumulator == Pubkey::default()),
                 "pump_amm market parse FAIL: fee_config or global_volume_accumulator is default"
             );
-            return Ok(None);
+            return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                PumpAmmLocalParseFailReason::FeeConfigMissing,
+            ));
+        }
+        if fee_config == Pubkey::default() {
+            warn!(
+                pool = %pool_market,
+                "pump_amm market parse FAIL: fee_config is default"
+            );
+            return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                PumpAmmLocalParseFailReason::FeeConfigMissing,
+            ));
+        }
+        if global_volume_accumulator == Pubkey::default() {
+            warn!(
+                pool = %pool_market,
+                "pump_amm market parse FAIL: global_volume_accumulator is default"
+            );
+            return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                PumpAmmLocalParseFailReason::GlobalVolumeAccumulatorMissing,
+            ));
         }
 
         if protocol_fee_recipient == Pubkey::default()
@@ -1190,10 +1428,12 @@ impl PumpFunAmmDex {
                 "pump_amm market parse FAIL: protocol_fee_recipient unresolved after market + \
                  global_config paths (no Fee-Program PDA guessing — Bug #35)"
             );
-            return Ok(None);
+            return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                PumpAmmLocalParseFailReason::ProtocolFeeRecipientUnresolved,
+            ));
         }
 
-        Ok(Some(PumpAmmPoolStatic {
+        Ok(PumpAmmMarketParseOutcome::Ok(PumpAmmPoolStatic {
             pool_market,
             global_config,
             base_mint,
@@ -1255,8 +1495,34 @@ impl PumpFunAmmDex {
         Ok(out)
     }
 
+    /// Bounded TX-history scan for one pool market (Cold Path). Uses `tx_rpc` for signatures + txs
+    /// so `market-data` can pass Helius when the local validator has no history index.
+    pub async fn discover_pool_static_via_tx_history_with_rpc(
+        &self,
+        tx_rpc: Arc<SolanaRpc>,
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+    ) -> Result<Option<PumpAmmPoolStatic>> {
+        self.discover_pool_static_via_tx_history_market_only_inner(tx_rpc, pool_market, base_mint)
+            .await
+    }
+
     async fn discover_pool_static_via_tx_history_market_only(
         &self,
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+    ) -> Result<Option<PumpAmmPoolStatic>> {
+        self.discover_pool_static_via_tx_history_market_only_inner(
+            Arc::clone(&self.rpc),
+            pool_market,
+            base_mint,
+        )
+        .await
+    }
+
+    async fn discover_pool_static_via_tx_history_market_only_inner(
+        &self,
+        tx_rpc: Arc<SolanaRpc>,
         pool_market: Pubkey,
         base_mint: Pubkey,
     ) -> Result<Option<PumpAmmPoolStatic>> {
@@ -1270,8 +1536,7 @@ impl PumpFunAmmDex {
             pool_market, base_mint
         );
 
-        let sigs = self
-            .rpc
+        let sigs = tx_rpc
             .get_signatures_for_address(&pool_market, Some(200))
             .await
             .map_err(|e| anyhow!("getSignaturesForAddress failed: {e}"))?;
@@ -1321,7 +1586,7 @@ impl PumpFunAmmDex {
                 );
             }
 
-            let tx_v = self.fetch_tx_as_value(&sig).await?;
+            let tx_v = Self::fetch_tx_as_value_with_rpc(tx_rpc.as_ref(), &sig).await?;
 
             let msg = match tx_v
                 .get("result")
@@ -1492,9 +1757,9 @@ impl PumpFunAmmDex {
 
                 // CRITICAL: fee_config must be owned by the Fee Program, not the AMM Program!
                 // This matches the fix in discover_pool_markets_via_program_accounts (lines 763-818).
-                let Some((fee_owner, fee_executable)) = self
-                    .rpc_get_account_owner_and_executable(pool.fee_config)
-                    .await?
+                let Some((fee_owner, fee_executable)) =
+                    Self::rpc_account_owner_executable_for(tx_rpc.as_ref(), pool.fee_config)
+                        .await?
                 else {
                     if is_ref_tx {
                         info!("pump_amm TX-history: reference TX fee_config account not found");
@@ -1615,10 +1880,10 @@ impl PumpFunAmmDex {
                     "pump_amm: LivePoolCache has pool address but no pool_accounts, trying direct getAccount"
                 );
                 match self
-                    .try_parse_pool_static_from_market_account(pool_address, base_mint)
+                    .try_market_parse_outcome_for_pool(pool_address, base_mint)
                     .await
                 {
-                    Ok(Some(pool)) => {
+                    Ok(PumpAmmMarketParseOutcome::Ok(pool)) => {
                         self.pools_by_base.insert(base_mint, pool.clone());
                         self.pools_by_market.insert(pool.pool_market, base_mint);
                         info!(
@@ -1628,14 +1893,28 @@ impl PumpFunAmmDex {
                         );
                         return Ok(Some(pool));
                     }
-                    Ok(None) => {
+                    Ok(PumpAmmMarketParseOutcome::LocalFail(reason)) => {
                         warn!(
                             base_mint = %base_mint,
                             pool = %pool_address,
-                            "pump_amm: cached pool address parse returned None; refusing getProgramAccounts (no unbounded scan)"
+                            local_parse_fail_reason = %reason,
+                            "pump_amm: cached pool address local market parse failed"
                         );
+                        if let Some(pool) = self
+                            .try_bounded_external_tx_history_pool(
+                                pool_address,
+                                base_mint,
+                                Some(reason),
+                                "livepoolcache_pool_address",
+                            )
+                            .await?
+                        {
+                            self.insert_pool_static_cache(pool.clone());
+                            return Ok(Some(pool));
+                        }
                         return Err(anyhow!(
-                            "pump_amm: LivePoolCache pool address present but market parse returned no usable pool (base_mint={}, pool={}); refusing unbounded RPC discovery",
+                            "pump_amm: LivePoolCache pool address present but market parse failed local_parse={} (base_mint={}, pool={}); refusing unbounded RPC discovery",
+                            reason,
                             base_mint,
                             pool_address
                         ));
@@ -1645,7 +1924,7 @@ impl PumpFunAmmDex {
                             base_mint = %base_mint,
                             pool = %pool_address,
                             error = %e,
-                            "pump_amm: cached pool address parse failed; refusing getProgramAccounts (no unbounded scan)"
+                            "pump_amm: cached pool address parse RPC error; refusing getProgramAccounts (no unbounded scan)"
                         );
                         return Err(e.context(format!(
                             "pump_amm: cached pool address parse error (base_mint={}, pool={}); refusing unbounded RPC discovery",
@@ -1686,17 +1965,23 @@ impl PumpFunAmmDex {
         // build the full static account set by parsing on-chain state + deriving PDAs. This avoids
         // relying on tx-history (some pools can exist with no successful swaps yet).
         let mut market_parse_err: Option<anyhow::Error> = None;
+        let mut last_local_parse_fail: Option<PumpAmmLocalParseFailReason> = None;
         for m in &markets {
-            match self
-                .try_parse_pool_static_from_market_account(*m, base_mint)
-                .await
-            {
-                Ok(Some(pool)) => {
+            match self.try_market_parse_outcome_for_pool(*m, base_mint).await {
+                Ok(PumpAmmMarketParseOutcome::Ok(pool)) => {
                     self.pools_by_base.insert(base_mint, pool.clone());
                     self.pools_by_market.insert(pool.pool_market, base_mint);
                     return Ok(Some(pool));
                 }
-                Ok(None) => {}
+                Ok(PumpAmmMarketParseOutcome::LocalFail(reason)) => {
+                    last_local_parse_fail = Some(reason);
+                    warn!(
+                        market = %m,
+                        base_mint = %base_mint,
+                        local_parse_fail_reason = %reason,
+                        "pump_amm: local market parse failed (getProgramAccounts path)"
+                    );
+                }
                 Err(e) => {
                     market_parse_err = Some(anyhow!("{e:#}").context(format!(
                         "pump_amm market parse failed market={m} base_mint={base_mint}"
@@ -1729,7 +2014,7 @@ impl PumpFunAmmDex {
                 }
                 Ok(None) => {
                     warn!(
-                        "pump_amm TX-history fallback returned None for market {} base_mint {}",
+                        "pump_amm TX-history fallback returned None for market {} base_mint {} (tx_history_unavailable on local RPC)",
                         m, base_mint
                     );
                 }
@@ -1739,6 +2024,24 @@ impl PumpFunAmmDex {
                         m, base_mint, e
                     );
                 }
+            }
+
+            if let Some(pool) = self
+                .try_bounded_external_tx_history_pool(
+                    m,
+                    base_mint,
+                    last_local_parse_fail,
+                    "discover_pool_static_after_local_tx_history",
+                )
+                .await?
+            {
+                self.insert_pool_static_cache(pool.clone());
+                info!(
+                    market = %m,
+                    base_mint = %base_mint,
+                    "pump_amm: bounded external TX-history SUCCESS after local tx-history miss"
+                );
+                return Ok(Some(pool));
             }
 
             if let Some(e) = market_parse_err {
@@ -2295,7 +2598,7 @@ impl Dex for PumpFunAmmDex {
             )
             .await
         {
-            Ok(Some(pool)) => {
+            Ok(PumpAmmMarketParseOutcome::Ok(pool)) => {
                 self.pools_by_base.insert(base_mint, pool.clone());
                 self.pools_by_market.insert(*pool_address, base_mint);
                 debug!(
@@ -2304,14 +2607,15 @@ impl Dex for PumpFunAmmDex {
                 );
                 Ok(())
             }
-            Ok(None) => {
+            Ok(PumpAmmMarketParseOutcome::LocalFail(reason)) => {
                 // Market-account heuristics failed (common for Token-2022 pools or
                 // pools with non-standard account layouts).
                 // Fallback: parse instruction accounts from a real on-chain swap tx.
                 warn!(
                     pool = %pool_address,
                     base_mint = %base_mint,
-                    "pump_amm load_pool_by_address: market-account parse returned None, trying TX-history fallback"
+                    local_parse_fail_reason = %reason,
+                    "pump_amm load_pool_by_address: market-account parse failed, trying TX-history fallback"
                 );
                 match self
                     .discover_pool_static_via_tx_history_market_only(*pool_address, base_mint)
@@ -2328,12 +2632,14 @@ impl Dex for PumpFunAmmDex {
                         Ok(())
                     }
                     Ok(None) => Err(anyhow!(
-                        "pump_amm pool {} could not be parsed (market-account returned None, TX-history also None)",
-                        pool_address
+                        "pump_amm pool {} could not be parsed (local_parse={}, TX-history also None)",
+                        pool_address,
+                        reason
                     )),
                     Err(e) => Err(anyhow!(
-                        "pump_amm pool {} market-account returned None, TX-history fallback failed: {}",
+                        "pump_amm pool {} local_parse={}, TX-history fallback failed: {}",
                         pool_address,
+                        reason,
                         e
                     )),
                 }
