@@ -400,11 +400,6 @@ impl PumpFunAmmDex {
         self.user_authority = Some(user);
     }
 
-    /// Primary RPC client (local validator in `market-data`). Cold-path helpers may compare against Helius.
-    pub fn rpc_client(&self) -> Arc<SolanaRpc> {
-        Arc::clone(&self.rpc)
-    }
-
     /// Cold path: cache a fully resolved `PumpAmmPoolStatic` after external discovery (e.g. Helius TX-history).
     pub fn insert_pool_static_cache(&self, pool: PumpAmmPoolStatic) {
         let base_mint = pool.base_mint;
@@ -1392,15 +1387,6 @@ impl PumpFunAmmDex {
             fee_config
         };
 
-        if fee_config == Pubkey::default() && global_volume_accumulator == Pubkey::default() {
-            warn!(
-                pool = %pool_market,
-                "pump_amm market parse FAIL: fee_config or global_volume_accumulator is default"
-            );
-            return Ok(PumpAmmMarketParseOutcome::LocalFail(
-                PumpAmmLocalParseFailReason::FeeConfigMissing,
-            ));
-        }
         if fee_config == Pubkey::default() {
             warn!(
                 pool = %pool_market,
