@@ -144,6 +144,15 @@ pub enum PumpAmmLocalParseFailReason {
     FeeConfigMissing,
     GlobalVolumeAccumulatorMissing,
     RpcGetMultipleAccountsFailed,
+    /// Cold-path authoritative parse: protocol fee accounts are not in `global_config` at the
+    /// fixed offset (would require embedded-market or scan heuristics / tx-history).
+    AuthoritativeProtocolFeeUnresolved,
+    /// Cold-path authoritative parse: creator vault cannot be derived from market offset 211
+    /// (would require embedded-base-TA, authority search, or multi-seed PDA probing).
+    AuthoritativeCreatorVaultUnresolved,
+    /// Cold-path authoritative parse: multiple fee-program-owned accounts match market-derived
+    /// candidates — cannot pick one without heuristics.
+    AuthoritativeFeeConfigAmbiguous,
 }
 
 impl std::fmt::Display for PumpAmmLocalParseFailReason {
@@ -161,6 +170,9 @@ impl std::fmt::Display for PumpAmmLocalParseFailReason {
             Self::FeeConfigMissing => "fee_config_missing",
             Self::GlobalVolumeAccumulatorMissing => "global_volume_accumulator_missing",
             Self::RpcGetMultipleAccountsFailed => "rpc_get_multiple_accounts_failed",
+            Self::AuthoritativeProtocolFeeUnresolved => "authoritative_protocol_fee_unresolved",
+            Self::AuthoritativeCreatorVaultUnresolved => "authoritative_creator_vault_unresolved",
+            Self::AuthoritativeFeeConfigAmbiguous => "authoritative_fee_config_ambiguous",
         };
         f.write_str(s)
     }
@@ -250,6 +262,8 @@ enum PumpAmmGvaParseKind {
     EmbeddedAmmOwnedLargestData,
     PdaSeedProbe,
     SingletonGlobalVolumeAccumulator,
+    /// Singleton PDA verified via `getAccount` (owner = AMM program) — cold-path authoritative parse.
+    SingletonPdaRpcVerified,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -257,6 +271,8 @@ enum PumpAmmFeeConfigParseKind {
     EmbeddedFeeProgramOwnedFromMarket,
     FeeProgramPdaProbe,
     ConstantMainnetFeeConfig,
+    /// Exactly one fee-program-owned account among market-derived candidates (RPC owner-verified).
+    UniqueVerifiedFeeProgramAccount,
 }
 
 #[derive(Debug, Clone)]
@@ -954,12 +970,22 @@ impl PumpFunAmmDex {
         creator: PumpAmmCreatorParseKind,
         gva: PumpAmmGvaParseKind,
         fee_cfg: PumpAmmFeeConfigParseKind,
+        authoritative_market_parse: bool,
     ) -> PumpAmmPoolAccountsDiagnostic {
         let (pfr_res, pfr_tag) = match fee {
-            PumpAmmFeeParseKind::EmbeddedSecondQuoteTa => (
-                PumpAmmFieldResolution::Heuristic,
-                "embedded_second_quote_ta",
-            ),
+            PumpAmmFeeParseKind::EmbeddedSecondQuoteTa => {
+                if authoritative_market_parse {
+                    (
+                        PumpAmmFieldResolution::MarketLayout,
+                        "market_derived_non_pool_quote_token_account",
+                    )
+                } else {
+                    (
+                        PumpAmmFieldResolution::Heuristic,
+                        "embedded_second_quote_ta",
+                    )
+                }
+            }
             PumpAmmFeeParseKind::GlobalConfigOffset57DerivedWsolAta => (
                 PumpAmmFieldResolution::Deterministic,
                 "global_config_offset_57_derived_wsol_ata",
@@ -998,7 +1024,14 @@ impl PumpFunAmmDex {
         };
         let (cc_ata_res, cc_ata_tag) = match creator {
             PumpAmmCreatorParseKind::EmbeddedSecondBaseTa => {
-                (PumpAmmFieldResolution::Heuristic, "embedded_second_base_ta")
+                if authoritative_market_parse {
+                    (
+                        PumpAmmFieldResolution::MarketLayout,
+                        "market_derived_non_pool_base_token_account",
+                    )
+                } else {
+                    (PumpAmmFieldResolution::Heuristic, "embedded_second_base_ta")
+                }
             }
             PumpAmmCreatorParseKind::MarketOffset211CreatorVaultPda => (
                 PumpAmmFieldResolution::MarketLayout,
@@ -1015,10 +1048,19 @@ impl PumpFunAmmDex {
             ),
         };
         let (cc_auth_res, cc_auth_tag) = match creator {
-            PumpAmmCreatorParseKind::EmbeddedSecondBaseTa => (
-                PumpAmmFieldResolution::Heuristic,
-                "embedded_second_base_ta_owner",
-            ),
+            PumpAmmCreatorParseKind::EmbeddedSecondBaseTa => {
+                if authoritative_market_parse {
+                    (
+                        PumpAmmFieldResolution::MarketLayout,
+                        "market_derived_non_pool_base_ta_owner",
+                    )
+                } else {
+                    (
+                        PumpAmmFieldResolution::Heuristic,
+                        "embedded_second_base_ta_owner",
+                    )
+                }
+            }
             PumpAmmCreatorParseKind::MarketOffset211CreatorVaultPda => (
                 PumpAmmFieldResolution::MarketLayout,
                 "creator_vault_pda_from_market_seed",
@@ -1045,6 +1087,10 @@ impl PumpFunAmmDex {
                 PumpAmmFieldResolution::Deterministic,
                 "singleton_pda_global_volume_accumulator",
             ),
+            PumpAmmGvaParseKind::SingletonPdaRpcVerified => (
+                PumpAmmFieldResolution::Deterministic,
+                "singleton_pda_global_volume_accumulator_rpc_verified",
+            ),
         };
         let (fc_res, fc_tag) = match fee_cfg {
             PumpAmmFeeConfigParseKind::EmbeddedFeeProgramOwnedFromMarket => (
@@ -1057,6 +1103,10 @@ impl PumpFunAmmDex {
             PumpAmmFeeConfigParseKind::ConstantMainnetFeeConfig => (
                 PumpAmmFieldResolution::Deterministic,
                 "constant_PUMPFUN_AMM_FEE_CONFIG",
+            ),
+            PumpAmmFeeConfigParseKind::UniqueVerifiedFeeProgramAccount => (
+                PumpAmmFieldResolution::MarketLayout,
+                "unique_fee_program_owned_account_market_candidates",
             ),
         };
         PumpAmmPoolAccountsDiagnostic {
@@ -1246,6 +1296,8 @@ impl PumpFunAmmDex {
     ) -> Result<PumpAmmMarketParseOutcome> {
         let (diag_source, diag_force_refresh) =
             diagnostic_ctx.unwrap_or(("rpc_market_parse", false));
+        // Cold-path `force_refresh` (EnsurePumpAmm): publish only v14 sets with zero heuristic fields.
+        let authoritative_market_parse = diag_force_refresh;
         let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
         let expected_quote_mint = Pubkey::from_str(WSOL_MINT)?;
 
@@ -1503,208 +1555,342 @@ impl PumpFunAmmDex {
         authority_candidates.sort();
         authority_candidates.dedup();
 
-        // Protocol fee recipient: prefer an embedded quote token account; otherwise derive ATA.
-        // Some PumpSwap markets do not embed the fee recipient TA in the market account.
-        // In that case, fall back to scanning the global_config account for either:
-        // - an embedded quote token account (best), or
-        // - additional authority pubkeys (then derive ATA and validate existence).
-        let (protocol_fee_recipient, protocol_fee_recipient_ta, fee_parse_kind) = if let Some(t) =
-            quote_token_accounts
+        // Protocol fee recipient: embedded non-pool quote TA (market layout), else `global_config`
+        // fixed offset + SPL ATA derivation, else (non-authoritative path only) global_config scan
+        // / authority search. Authoritative cold-path parse refuses scan/heuristic fee resolution.
+        let (protocol_fee_recipient, protocol_fee_recipient_ta, fee_parse_kind) =
+            if authoritative_market_parse {
+                if let Some(t) = quote_token_accounts
+                    .iter()
+                    .find(|t| t.address != pool_quote_vault)
+                {
+                    (
+                        t.token_owner,
+                        t.address,
+                        PumpAmmFeeParseKind::EmbeddedSecondQuoteTa,
+                    )
+                } else {
+                    let gc_account_opt = self
+                        .rpc_get_account_owner_executable_and_data(global_config)
+                        .await?;
+
+                    let fixed_protocol_fee_from_global_config = if let Some((
+                        gc_owner,
+                        gc_exec,
+                        gc_data,
+                    )) = gc_account_opt.as_ref()
+                    {
+                        if !*gc_exec
+                            && *gc_owner == pump_amm_program
+                            && gc_data.len()
+                                >= PUMPFUN_AMM_GLOBAL_CONFIG_PROTOCOL_FEE_RECIPIENT_OFFSET + 32
+                        {
+                            let pfr = Pubkey::new_from_array(
+                                gc_data[PUMPFUN_AMM_GLOBAL_CONFIG_PROTOCOL_FEE_RECIPIENT_OFFSET
+                                    ..PUMPFUN_AMM_GLOBAL_CONFIG_PROTOCOL_FEE_RECIPIENT_OFFSET + 32]
+                                    .try_into()
+                                    .map_err(|_| {
+                                        anyhow!("global_config protocol_fee_recipient slice")
+                                    })?,
+                            );
+                            if pfr != Pubkey::default() {
+                                let pfr_ta =
+                                    Self::derive_ata_with_program(pfr, quote_mint, token_program);
+                                info!(
+                                    pool = %pool_market,
+                                    protocol_fee_recipient = %pfr,
+                                    protocol_fee_recipient_ta = %pfr_ta,
+                                    "pump_amm: authoritative protocol fee from global_config offset \
+                                     (no second quote TA in market)"
+                                );
+                                Some((pfr, pfr_ta))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some((pfr, ta)) = fixed_protocol_fee_from_global_config {
+                        (
+                            pfr,
+                            ta,
+                            PumpAmmFeeParseKind::GlobalConfigOffset57DerivedWsolAta,
+                        )
+                    } else {
+                        warn!(
+                            pool = %pool_market,
+                            "pump_amm authoritative market parse FAIL: protocol_fee_recipient not \
+                             in global_config at fixed offset (no embedded non-pool quote TA)"
+                        );
+                        return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                            PumpAmmLocalParseFailReason::AuthoritativeProtocolFeeUnresolved,
+                        ));
+                    }
+                }
+            } else if let Some(t) = quote_token_accounts
                 .iter()
                 .find(|t| t.address != pool_quote_vault)
-        {
-            (
-                t.token_owner,
-                t.address,
-                PumpAmmFeeParseKind::EmbeddedSecondQuoteTa,
-            )
-        } else {
-            // Tx-history-free: `protocol_fee_recipient` is stored in the canonical `global_config`
-            // account at a fixed offset (verified against mainnet swap ix accounts; Scope 41).
-            // Pool markets often have only one WSOL vault (pool) — no embedded fee TA to discover.
-            let gc_account_opt = self
-                .rpc_get_account_owner_executable_and_data(global_config)
-                .await?;
-
-            let fixed_protocol_fee_from_global_config = if let Some((gc_owner, gc_exec, gc_data)) =
-                gc_account_opt.as_ref()
             {
-                if !*gc_exec
-                    && *gc_owner == pump_amm_program
-                    && gc_data.len() >= PUMPFUN_AMM_GLOBAL_CONFIG_PROTOCOL_FEE_RECIPIENT_OFFSET + 32
+                (
+                    t.token_owner,
+                    t.address,
+                    PumpAmmFeeParseKind::EmbeddedSecondQuoteTa,
+                )
+            } else {
+                // Tx-history-free: `protocol_fee_recipient` is stored in the canonical `global_config`
+                // account at a fixed offset (verified against mainnet swap ix accounts; Scope 41).
+                // Pool markets often have only one WSOL vault (pool) — no embedded fee TA to discover.
+                let gc_account_opt = self
+                    .rpc_get_account_owner_executable_and_data(global_config)
+                    .await?;
+
+                let fixed_protocol_fee_from_global_config = if let Some((
+                    gc_owner,
+                    gc_exec,
+                    gc_data,
+                )) = gc_account_opt.as_ref()
                 {
-                    let pfr = Pubkey::new_from_array(
-                        gc_data[PUMPFUN_AMM_GLOBAL_CONFIG_PROTOCOL_FEE_RECIPIENT_OFFSET
-                            ..PUMPFUN_AMM_GLOBAL_CONFIG_PROTOCOL_FEE_RECIPIENT_OFFSET + 32]
-                            .try_into()
-                            .map_err(|_| anyhow!("global_config protocol_fee_recipient slice"))?,
-                    );
-                    if pfr != Pubkey::default() {
-                        let pfr_ta = Self::derive_ata_with_program(pfr, quote_mint, token_program);
-                        info!(
-                            pool = %pool_market,
-                            protocol_fee_recipient = %pfr,
-                            protocol_fee_recipient_ta = %pfr_ta,
-                            "pump_amm: protocol fee accounts from global_config fixed offset \
-                             (no second quote TA in market; tx-history-free)"
+                    if !*gc_exec
+                        && *gc_owner == pump_amm_program
+                        && gc_data.len()
+                            >= PUMPFUN_AMM_GLOBAL_CONFIG_PROTOCOL_FEE_RECIPIENT_OFFSET + 32
+                    {
+                        let pfr = Pubkey::new_from_array(
+                            gc_data[PUMPFUN_AMM_GLOBAL_CONFIG_PROTOCOL_FEE_RECIPIENT_OFFSET
+                                ..PUMPFUN_AMM_GLOBAL_CONFIG_PROTOCOL_FEE_RECIPIENT_OFFSET + 32]
+                                .try_into()
+                                .map_err(|_| {
+                                    anyhow!("global_config protocol_fee_recipient slice")
+                                })?,
                         );
-                        Some((pfr, pfr_ta))
+                        if pfr != Pubkey::default() {
+                            let pfr_ta =
+                                Self::derive_ata_with_program(pfr, quote_mint, token_program);
+                            info!(
+                                pool = %pool_market,
+                                protocol_fee_recipient = %pfr,
+                                protocol_fee_recipient_ta = %pfr_ta,
+                                "pump_amm: protocol fee accounts from global_config fixed offset \
+                                 (no second quote TA in market; tx-history-free)"
+                            );
+                            Some((pfr, pfr_ta))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
-            if let Some((pfr, ta)) = fixed_protocol_fee_from_global_config {
-                (
-                    pfr,
-                    ta,
-                    PumpAmmFeeParseKind::GlobalConfigOffset57DerivedWsolAta,
-                )
-            } else {
-                let mut extra_authority_candidates: Vec<Pubkey> = Vec::new();
-                let mut embedded_fee_ta_from_global: Option<(Pubkey, Pubkey, u64)> = None;
+                if let Some((pfr, ta)) = fixed_protocol_fee_from_global_config {
+                    (
+                        pfr,
+                        ta,
+                        PumpAmmFeeParseKind::GlobalConfigOffset57DerivedWsolAta,
+                    )
+                } else {
+                    let mut extra_authority_candidates: Vec<Pubkey> = Vec::new();
+                    let mut embedded_fee_ta_from_global: Option<(Pubkey, Pubkey, u64)> = None;
 
-                if let Some((gc_owner, gc_exec, gc_data)) = gc_account_opt.as_ref() {
-                    if !*gc_exec && *gc_owner == pump_amm_program && gc_data.len() >= 32 {
-                        // Scan the global_config raw bytes for candidate pubkeys.
-                        let mut gc_pubkeys: Vec<Pubkey> = Vec::new();
-                        for i in 0..=(gc_data.len().saturating_sub(32)) {
-                            let pk = Pubkey::new_from_array(
-                                gc_data[i..i + 32]
-                                    .try_into()
-                                    .map_err(|_| anyhow!("global_config scan pubkey slice"))?,
-                            );
-                            gc_pubkeys.push(pk);
-                        }
-                        gc_pubkeys.sort();
-                        gc_pubkeys.dedup();
+                    if let Some((gc_owner, gc_exec, gc_data)) = gc_account_opt.as_ref() {
+                        if !*gc_exec && *gc_owner == pump_amm_program && gc_data.len() >= 32 {
+                            // Scan the global_config raw bytes for candidate pubkeys.
+                            let mut gc_pubkeys: Vec<Pubkey> = Vec::new();
+                            for i in 0..=(gc_data.len().saturating_sub(32)) {
+                                let pk = Pubkey::new_from_array(
+                                    gc_data[i..i + 32]
+                                        .try_into()
+                                        .map_err(|_| anyhow!("global_config scan pubkey slice"))?,
+                                );
+                                gc_pubkeys.push(pk);
+                            }
+                            gc_pubkeys.sort();
+                            gc_pubkeys.dedup();
 
-                        for chunk in gc_pubkeys.chunks(MULTI_ACCOUNTS_CHUNK) {
-                            let accounts = match self.rpc.rpc.get_multiple_accounts(chunk).await {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    warn!(
-                                        pool = %pool_market,
-                                        error = %e,
-                                        "pump_amm market parse: get_multiple_accounts failed (global_config scan)"
-                                    );
-                                    return Ok(PumpAmmMarketParseOutcome::LocalFail(
-                                        PumpAmmLocalParseFailReason::RpcGetMultipleAccountsFailed,
-                                    ));
-                                }
-                            };
-
-                            for (pk, acc_opt) in chunk.iter().copied().zip(accounts.into_iter()) {
-                                let Some(acc) = acc_opt else {
-                                    continue;
+                            for chunk in gc_pubkeys.chunks(MULTI_ACCOUNTS_CHUNK) {
+                                let accounts = match self.rpc.rpc.get_multiple_accounts(chunk).await
+                                {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        warn!(
+                                            pool = %pool_market,
+                                            error = %e,
+                                            "pump_amm market parse: get_multiple_accounts failed (global_config scan)"
+                                        );
+                                        return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                                            PumpAmmLocalParseFailReason::RpcGetMultipleAccountsFailed,
+                                        ));
+                                    }
                                 };
-                                let acc_owner = acc.owner;
-                                let acc_data = acc.data;
 
-                                if acc_owner == token_program || acc_owner == token_2022_program {
-                                    if let Some((mint, token_owner)) =
-                                        Self::parse_spl_token_account_mint_and_owner(&acc_data)
+                                for (pk, acc_opt) in chunk.iter().copied().zip(accounts.into_iter())
+                                {
+                                    let Some(acc) = acc_opt else {
+                                        continue;
+                                    };
+                                    let acc_owner = acc.owner;
+                                    let acc_data = acc.data;
+
+                                    if acc_owner == token_program || acc_owner == token_2022_program
                                     {
-                                        if mint == quote_mint && pk != pool_quote_vault {
-                                            let bal =
-                                                Self::parse_spl_token_account_amount(&acc_data)
-                                                    .unwrap_or(0);
-                                            match embedded_fee_ta_from_global {
-                                                None => {
-                                                    embedded_fee_ta_from_global =
-                                                        Some((token_owner, pk, bal));
-                                                }
-                                                Some((_prev_owner, _prev_ta, prev_bal)) => {
-                                                    // Heuristic: prefer the smaller balance (fee TA
-                                                    // tends to hold little vs pool vault).
-                                                    if bal < prev_bal {
+                                        if let Some((mint, token_owner)) =
+                                            Self::parse_spl_token_account_mint_and_owner(&acc_data)
+                                        {
+                                            if mint == quote_mint && pk != pool_quote_vault {
+                                                let bal =
+                                                    Self::parse_spl_token_account_amount(&acc_data)
+                                                        .unwrap_or(0);
+                                                match embedded_fee_ta_from_global {
+                                                    None => {
                                                         embedded_fee_ta_from_global =
                                                             Some((token_owner, pk, bal));
+                                                    }
+                                                    Some((_prev_owner, _prev_ta, prev_bal)) => {
+                                                        // Heuristic: prefer the smaller balance (fee TA
+                                                        // tends to hold little vs pool vault).
+                                                        if bal < prev_bal {
+                                                            embedded_fee_ta_from_global =
+                                                                Some((token_owner, pk, bal));
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
+                                        continue;
                                     }
-                                    continue;
-                                }
 
-                                // Keep any existing, non-token pubkeys as additional authority candidates.
-                                if !acc.executable
-                                    && pk != Pubkey::default()
-                                    && pk != pool_market
-                                    && pk != global_config
-                                    && pk != base_mint
-                                    && pk != quote_mint
-                                    && pk != pool_base_vault
-                                    && pk != pool_quote_vault
-                                    && pk != pump_amm_program
-                                    && pk != token_program
-                                    && pk != token_2022_program
-                                    && pk != associated_token_program
-                                    && pk != system_program
-                                {
-                                    extra_authority_candidates.push(pk);
+                                    // Keep any existing, non-token pubkeys as additional authority candidates.
+                                    if !acc.executable
+                                        && pk != Pubkey::default()
+                                        && pk != pool_market
+                                        && pk != global_config
+                                        && pk != base_mint
+                                        && pk != quote_mint
+                                        && pk != pool_base_vault
+                                        && pk != pool_quote_vault
+                                        && pk != pump_amm_program
+                                        && pk != token_program
+                                        && pk != token_2022_program
+                                        && pk != associated_token_program
+                                        && pk != system_program
+                                    {
+                                        extra_authority_candidates.push(pk);
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                if let Some((owner, ta, _bal)) = embedded_fee_ta_from_global {
-                    (
-                        owner,
-                        ta,
-                        PumpAmmFeeParseKind::GlobalConfigScanEmbeddedQuoteTa,
-                    )
-                } else {
-                    // Retry ATA derivation with any extra authorities found in global_config.
-                    let mut combined = authority_candidates.clone();
-                    combined.extend(extra_authority_candidates);
-                    combined.sort();
-                    combined.dedup();
-
-                    if let Some((auth, ta)) =
-                        find_authority_with_existing_token_account(combined.clone(), quote_mint)
-                            .await?
-                    {
-                        (auth, ta, PumpAmmFeeParseKind::AuthoritySearchQuoteMint)
-                    } else if let Some((auth, ta)) =
-                        // Some fee flows (notably `sell`) can accrue fees in the input mint.
-                        // If the protocol fee recipient TA is not for WSOL, fall back to base mint.
-                        find_authority_with_existing_token_account(
-                            combined.clone(),
-                            base_mint,
+                    if let Some((owner, ta, _bal)) = embedded_fee_ta_from_global {
+                        (
+                            owner,
+                            ta,
+                            PumpAmmFeeParseKind::GlobalConfigScanEmbeddedQuoteTa,
                         )
-                        .await?
-                    {
-                        (auth, ta, PumpAmmFeeParseKind::AuthoritySearchBaseMint)
                     } else {
-                        // Cannot infer protocol fee accounts from market/global_config — do not substitute
-                        // a global mainnet recipient (pool-specific; see Bug #35).
-                        warn!(
-                            pool = %pool_market,
-                            "pump_amm market parse FAIL: no protocol fee recipient token account \
-                             (global_config={global_config} tried_mints=[{quote_mint},{base_mint}] \
-                             authority_candidates_count={})",
-                            combined.len(),
-                        );
-                        return Ok(PumpAmmMarketParseOutcome::LocalFail(
-                            PumpAmmLocalParseFailReason::ProtocolFeeRecipientTokenAccountMissing,
-                        ));
+                        // Retry ATA derivation with any extra authorities found in global_config.
+                        let mut combined = authority_candidates.clone();
+                        combined.extend(extra_authority_candidates);
+                        combined.sort();
+                        combined.dedup();
+
+                        if let Some((auth, ta)) =
+                            find_authority_with_existing_token_account(combined.clone(), quote_mint)
+                                .await?
+                        {
+                            (auth, ta, PumpAmmFeeParseKind::AuthoritySearchQuoteMint)
+                        } else if let Some((auth, ta)) =
+                            // Some fee flows (notably `sell`) can accrue fees in the input mint.
+                            // If the protocol fee recipient TA is not for WSOL, fall back to base mint.
+                            find_authority_with_existing_token_account(
+                                    combined.clone(),
+                                    base_mint,
+                                )
+                                .await?
+                        {
+                            (auth, ta, PumpAmmFeeParseKind::AuthoritySearchBaseMint)
+                        } else {
+                            // Cannot infer protocol fee accounts from market/global_config — do not substitute
+                            // a global mainnet recipient (pool-specific; see Bug #35).
+                            warn!(
+                                pool = %pool_market,
+                                "pump_amm market parse FAIL: no protocol fee recipient token account \
+                                 (global_config={global_config} tried_mints=[{quote_mint},{base_mint}] \
+                                 authority_candidates_count={})",
+                                combined.len(),
+                            );
+                            return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                                PumpAmmLocalParseFailReason::ProtocolFeeRecipientTokenAccountMissing,
+                            ));
+                        }
                     }
                 }
-            }
-        };
+            };
 
-        // Creator vault: prefer an embedded second base token account; else canonical layout at
-        // offset 211 (`creator_vault` PDA + WSOL ATA); else authority heuristics / legacy PDAs.
+        // Creator vault: embedded non-pool base TA or market offset 211 + `creator_vault` PDA;
+        // authoritative cold-path parse refuses authority search / multi-seed PDA probing.
         let (coin_creator_vault_authority, coin_creator_vault_ata, creator_parse_kind) =
-            if let Some(t) = base_token_accounts
+            if authoritative_market_parse {
+                if let Some(t) = base_token_accounts
+                    .iter()
+                    .find(|t| t.address != pool_base_vault)
+                {
+                    (
+                        t.token_owner,
+                        t.address,
+                        PumpAmmCreatorParseKind::EmbeddedSecondBaseTa,
+                    )
+                } else if data.len() >= PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET + 32 {
+                    let creator_seed = Pubkey::new_from_array(
+                        data[PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET
+                            ..PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET + 32]
+                            .try_into()
+                            .map_err(|_| anyhow!("market creator_seed slice"))?,
+                    );
+                    if creator_seed != Pubkey::default() {
+                        let (auth, _) = Pubkey::find_program_address(
+                            &[b"creator_vault", creator_seed.as_ref()],
+                            &pump_amm_program,
+                        );
+                        let ata = Self::derive_ata_with_program(auth, quote_mint, token_program);
+                        info!(
+                            pool = %pool_market,
+                            creator_seed = %creator_seed,
+                            coin_creator_vault_authority = %auth,
+                            coin_creator_vault_ata = %ata,
+                            "pump_amm: authoritative creator vault from market offset 211 + creator_vault PDA"
+                        );
+                        (
+                            auth,
+                            ata,
+                            PumpAmmCreatorParseKind::MarketOffset211CreatorVaultPda,
+                        )
+                    } else {
+                        warn!(
+                            pool = %pool_market,
+                            "pump_amm authoritative market parse FAIL: creator_seed at offset 211 is default"
+                        );
+                        return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                            PumpAmmLocalParseFailReason::AuthoritativeCreatorVaultUnresolved,
+                        ));
+                    }
+                } else {
+                    warn!(
+                        pool = %pool_market,
+                        data_len = data.len(),
+                        "pump_amm authoritative market parse FAIL: market data too short for creator_seed at offset 211"
+                    );
+                    return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                        PumpAmmLocalParseFailReason::AuthoritativeCreatorVaultUnresolved,
+                    ));
+                }
+            } else if let Some(t) = base_token_accounts
                 .iter()
                 .find(|t| t.address != pool_base_vault)
             {
@@ -1871,11 +2057,31 @@ impl PumpFunAmmDex {
         // from market bytes; same pattern as `global_config`.
         let event_authority = pump_amm_canonical_event_authority(&pump_amm_program);
 
-        // Extract fee_config from fee-program owned accounts (CRITICAL: fee_config must be owned
-        // by pfeeUxB6... Fee Program, not the AMM program).
-        // Extract global_volume_accumulator from AMM-program owned accounts.
-        let (fee_config_raw, mut fee_config_parse_kind) = if !fee_program_owned_accounts.is_empty()
-        {
+        // Extract fee_config (Fee Program–owned) and global_volume_accumulator (AMM singleton PDA).
+        // Authoritative cold-path parse: no "largest AMM-owned account" or multi-seed PDA probing.
+        let (fee_config_raw, mut fee_config_parse_kind) = if authoritative_market_parse {
+            match fee_program_owned_accounts.len() {
+                0 => (
+                    Pubkey::default(),
+                    PumpAmmFeeConfigParseKind::ConstantMainnetFeeConfig,
+                ),
+                1 => (
+                    fee_program_owned_accounts[0].address,
+                    PumpAmmFeeConfigParseKind::UniqueVerifiedFeeProgramAccount,
+                ),
+                n => {
+                    warn!(
+                        pool = %pool_market,
+                        fee_program_candidate_count = n,
+                        "pump_amm authoritative market parse FAIL: multiple fee-program-owned \
+                         pubkey candidates from market (ambiguous fee_config)"
+                    );
+                    return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                        PumpAmmLocalParseFailReason::AuthoritativeFeeConfigAmbiguous,
+                    ));
+                }
+            }
+        } else if !fee_program_owned_accounts.is_empty() {
             // Prefer the first fee-program owned account found in market data
             (
                 fee_program_owned_accounts
@@ -1903,50 +2109,80 @@ impl PumpFunAmmDex {
             )
         };
 
-        let (mut global_volume_accumulator, mut gva_parse_kind) =
-            if !program_owned_accounts.is_empty() {
-                // global_volume_accumulator is owned by the AMM program
-                // Heuristic: prefer the larger account (volume accumulator tends to be bigger)
-                let mut sorted = program_owned_accounts.clone();
-                sorted.sort_by_key(|m| m.data_len);
-                (
-                    sorted.last().map(|m| m.address).unwrap_or_default(),
-                    PumpAmmGvaParseKind::EmbeddedAmmOwnedLargestData,
-                )
-            } else {
-                // Fallback: try deriving from AMM program (singleton first — matches on-chain PumpSwap).
-                (
-                    self.derive_existing_pda(
-                        pump_amm_program,
-                        &[
-                            vec![b"global_volume_accumulator".to_vec()],
-                            vec![
-                                b"global_volume_accumulator".to_vec(),
-                                global_config.to_bytes().to_vec(),
-                            ],
-                            vec![
-                                b"global_volume_accumulator".to_vec(),
-                                pool_market.to_bytes().to_vec(),
-                            ],
-                            vec![
-                                b"volume_accumulator".to_vec(),
-                                global_config.to_bytes().to_vec(),
-                            ],
-                            vec![
-                                b"volume_accumulator".to_vec(),
-                                pool_market.to_bytes().to_vec(),
-                            ],
-                        ],
-                    )
-                    .await?
-                    .unwrap_or_default(),
-                    PumpAmmGvaParseKind::PdaSeedProbe,
-                )
+        let (mut global_volume_accumulator, mut gva_parse_kind) = if authoritative_market_parse {
+            let singleton = pump_amm_singleton_global_volume_accumulator(&pump_amm_program);
+            let Some((owner, executable)) =
+                self.rpc_get_account_owner_and_executable(singleton).await?
+            else {
+                warn!(
+                    pool = %pool_market,
+                    singleton_gva = %singleton,
+                    "pump_amm authoritative market parse FAIL: global_volume_accumulator PDA account missing"
+                );
+                return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                    PumpAmmLocalParseFailReason::GlobalVolumeAccumulatorMissing,
+                ));
             };
+            if executable || owner != pump_amm_program {
+                warn!(
+                    pool = %pool_market,
+                    singleton_gva = %singleton,
+                    owner = %owner,
+                    executable = %executable,
+                    "pump_amm authoritative market parse FAIL: global_volume_accumulator PDA owner mismatch"
+                );
+                return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                    PumpAmmLocalParseFailReason::GlobalVolumeAccumulatorMissing,
+                ));
+            }
+            info!(
+                pool = %pool_market,
+                global_volume_accumulator = %singleton,
+                "pump_amm: authoritative global_volume_accumulator = singleton PDA (RPC owner verified)"
+            );
+            (singleton, PumpAmmGvaParseKind::SingletonPdaRpcVerified)
+        } else if !program_owned_accounts.is_empty() {
+            // global_volume_accumulator is owned by the AMM program
+            // Heuristic: prefer the larger account (volume accumulator tends to be bigger)
+            let mut sorted = program_owned_accounts.clone();
+            sorted.sort_by_key(|m| m.data_len);
+            (
+                sorted.last().map(|m| m.address).unwrap_or_default(),
+                PumpAmmGvaParseKind::EmbeddedAmmOwnedLargestData,
+            )
+        } else {
+            // Fallback: try deriving from AMM program (singleton first — matches on-chain PumpSwap).
+            (
+                self.derive_existing_pda(
+                    pump_amm_program,
+                    &[
+                        vec![b"global_volume_accumulator".to_vec()],
+                        vec![
+                            b"global_volume_accumulator".to_vec(),
+                            global_config.to_bytes().to_vec(),
+                        ],
+                        vec![
+                            b"global_volume_accumulator".to_vec(),
+                            pool_market.to_bytes().to_vec(),
+                        ],
+                        vec![
+                            b"volume_accumulator".to_vec(),
+                            global_config.to_bytes().to_vec(),
+                        ],
+                        vec![
+                            b"volume_accumulator".to_vec(),
+                            pool_market.to_bytes().to_vec(),
+                        ],
+                    ],
+                )
+                .await?
+                .unwrap_or_default(),
+                PumpAmmGvaParseKind::PdaSeedProbe,
+            )
+        };
 
-        // Known-pool fast path: volume accumulator is a single global PDA; heuristics may miss it if
-        // no embedded pubkey resolves to an account owned by `pump_amm_program` (see derive_existing_pda).
-        if global_volume_accumulator == Pubkey::default() {
+        // Non-authoritative: known-pool fast path when embedded candidates miss the singleton PDA.
+        if !authoritative_market_parse && global_volume_accumulator == Pubkey::default() {
             let singleton = pump_amm_singleton_global_volume_accumulator(&pump_amm_program);
             info!(
                 pool = %pool_market,
@@ -2006,6 +2242,7 @@ impl PumpFunAmmDex {
             creator_parse_kind,
             gva_parse_kind,
             fee_config_parse_kind,
+            authoritative_market_parse,
         );
 
         Ok(PumpAmmMarketParseOutcome::Ok(PumpAmmPoolStatic {
@@ -4045,6 +4282,39 @@ mod tests {
             derived_ta, expected_ta,
             "WSOL ATA for protocol_fee_recipient must match swap ix account #10"
         );
+    }
+
+    /// Cold-path authoritative market parse must not label any v14 field `Heuristic` in Scope 44 logs.
+    #[test]
+    fn pump_amm_authoritative_market_parse_diagnostic_has_no_heuristic_fields() {
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let d = PumpFunAmmDex::pump_amm_market_parse_diagnostics(
+            "test_authoritative",
+            true,
+            pool,
+            base,
+            PumpAmmFeeParseKind::GlobalConfigOffset57DerivedWsolAta,
+            PumpAmmCreatorParseKind::MarketOffset211CreatorVaultPda,
+            PumpAmmGvaParseKind::SingletonPdaRpcVerified,
+            PumpAmmFeeConfigParseKind::UniqueVerifiedFeeProgramAccount,
+            true,
+        );
+        for (name, fd) in [
+            ("pfr", &d.protocol_fee_recipient),
+            ("pfr_ta", &d.protocol_fee_recipient_ta),
+            ("cc_ata", &d.coin_creator_vault_ata),
+            ("cc_auth", &d.coin_creator_vault_authority),
+            ("gva", &d.global_volume_accumulator),
+            ("fee_cfg", &d.fee_config),
+            ("fee_prog", &d.fee_program),
+        ] {
+            assert_ne!(
+                fd.resolution,
+                PumpAmmFieldResolution::Heuristic,
+                "field {name} must not be Heuristic for authoritative successful parse"
+            );
+        }
     }
 
     fn make_pump_amm_cache_with_reserves(
