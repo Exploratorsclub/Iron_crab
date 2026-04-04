@@ -170,6 +170,91 @@ pub enum PumpAmmMarketParseOutcome {
     LocalFail(PumpAmmLocalParseFailReason),
 }
 
+/// How a single field in the 14-account PumpSwap static set was obtained (Scope 44 diagnostics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpAmmFieldResolution {
+    /// Fixed constant or canonical PDA (same for all pools / program).
+    Deterministic,
+    /// Parsed from known market-account byte offsets (layout).
+    MarketLayout,
+    /// Picked from RPC-resolved candidates (scan / balance ordering / heuristics).
+    Heuristic,
+    /// Copied from a parsed on-chain swap instruction (tx history).
+    TxHistoryObservation,
+    /// Read from JetStream / Geyser-supplied `pool_accounts` without re-parse.
+    CacheObservation,
+}
+
+#[derive(Debug, Clone)]
+pub struct PumpAmmFieldDiagnostic {
+    pub resolution: PumpAmmFieldResolution,
+    /// Short tag for grep (e.g. `global_config_offset_57`, `embedded_second_quote_ta`).
+    pub tag: &'static str,
+}
+
+/// Provenance for the v14 pool account set and critical fields (cold-path / SIM forensics).
+#[derive(Debug, Clone)]
+pub struct PumpAmmPoolAccountsDiagnostic {
+    /// High-level source: `livepoolcache_ready`, `rpc_market_parse`, `tx_history_local`, …
+    pub source: &'static str,
+    pub base_mint: Pubkey,
+    pub pool_market: Pubkey,
+    pub force_refresh: bool,
+    /// When set, a successful swap tx that supplied this static set (compare ix accounts to v14).
+    pub reference_swap_signature: Option<String>,
+    pub protocol_fee_recipient: PumpAmmFieldDiagnostic,
+    pub protocol_fee_recipient_ta: PumpAmmFieldDiagnostic,
+    pub coin_creator_vault_ata: PumpAmmFieldDiagnostic,
+    pub coin_creator_vault_authority: PumpAmmFieldDiagnostic,
+    pub global_volume_accumulator: PumpAmmFieldDiagnostic,
+    pub fee_config: PumpAmmFieldDiagnostic,
+    pub fee_program: PumpAmmFieldDiagnostic,
+}
+
+impl PumpAmmPoolAccountsDiagnostic {
+    /// Comma-separated v14 pubkeys for copy/paste compare against a mainnet explorer TX.
+    pub fn format_v14_csv(accounts: &[Pubkey]) -> String {
+        accounts
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// Internal: classify market-parse resolution for Scope 44 diagnostics.
+#[derive(Debug, Clone, Copy)]
+enum PumpAmmFeeParseKind {
+    EmbeddedSecondQuoteTa,
+    GlobalConfigOffset57DerivedWsolAta,
+    GlobalConfigScanEmbeddedQuoteTa,
+    AuthoritySearchQuoteMint,
+    AuthoritySearchBaseMint,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PumpAmmCreatorParseKind {
+    EmbeddedSecondBaseTa,
+    MarketOffset211CreatorVaultPda,
+    AuthoritySearchBaseMint,
+    AuthoritySearchQuoteMint,
+    LegacyPdaSeedProbe,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PumpAmmGvaParseKind {
+    EmbeddedAmmOwnedLargestData,
+    PdaSeedProbe,
+    SingletonGlobalVolumeAccumulator,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PumpAmmFeeConfigParseKind {
+    EmbeddedFeeProgramOwnedFromMarket,
+    FeeProgramPdaProbe,
+    ConstantMainnetFeeConfig,
+}
+
 #[derive(Debug, Clone)]
 pub struct PumpAmmPoolStatic {
     pool_market: Pubkey,
@@ -186,6 +271,15 @@ pub struct PumpAmmPoolStatic {
     global_volume_accumulator: Pubkey,
     fee_config: Pubkey,
     fee_program: Pubkey,
+    /// Set when this struct was built inside `pumpfun_amm` (parse / tx-history / cache reconstruct).
+    pub last_parse_diagnostics: Option<PumpAmmPoolAccountsDiagnostic>,
+}
+
+/// Resolved v14 `pool_accounts` plus cold-path provenance (Scope 44).
+#[derive(Debug, Clone)]
+pub struct PoolAccountsV14WithDiagnostic {
+    pub accounts: Vec<Pubkey>,
+    pub diagnostic: PumpAmmPoolAccountsDiagnostic,
 }
 
 impl PumpAmmPoolStatic {
@@ -373,6 +467,7 @@ impl PumpFunAmmDex {
         base_mint: Pubkey,
         local_parse_fail_reason: Option<PumpAmmLocalParseFailReason>,
         log_ctx: &'static str,
+        force_refresh: bool,
     ) -> Result<Option<PumpAmmPoolStatic>> {
         const BOUNDED_EXTERNAL_TX_TIMEOUT: Duration = Duration::from_secs(12);
         let Some(ref h_rpc) = self.bounded_tx_fallback_rpc else {
@@ -423,6 +518,7 @@ impl PumpFunAmmDex {
                 Arc::clone(h_rpc),
                 pool_market,
                 base_mint,
+                force_refresh,
             ),
         )
         .await
@@ -529,7 +625,7 @@ impl PumpFunAmmDex {
         base_mint: Pubkey,
         pool_address_hint: Option<Pubkey>,
         force_refresh: bool,
-    ) -> Result<Option<Vec<Pubkey>>> {
+    ) -> Result<Option<PoolAccountsV14WithDiagnostic>> {
         if force_refresh {
             if let Some((_, pool)) = self.pools_by_base.remove(&base_mint) {
                 self.pools_by_market.remove(&pool.pool_market);
@@ -554,7 +650,16 @@ impl PumpFunAmmDex {
                             accounts_len = accounts.len(),
                             "pump_amm: pool_accounts from LivePoolCache (Ready, ZERO RPC)"
                         );
-                        return Ok(Some(accounts));
+                        let pool_market = accounts[0];
+                        return Ok(Some(PoolAccountsV14WithDiagnostic {
+                            accounts,
+                            diagnostic: Self::pump_amm_livepoolcache_diagnostic(
+                                "livepoolcache_ready",
+                                force_refresh,
+                                pool_market,
+                                base_mint,
+                            ),
+                        }));
                     }
                 }
                 // Cache miss: Hot Path (allow_rpc_on_miss=false) → None. Cold Path (true) → RPC fallback. P3 #12.
@@ -592,7 +697,11 @@ impl PumpFunAmmDex {
                 "pump_amm: pool_address hint provided, trying direct getAccount (fast path)"
             );
             match self
-                .try_market_parse_outcome_for_pool(pool_market, base_mint)
+                .try_market_parse_outcome_for_pool(
+                    pool_market,
+                    base_mint,
+                    Some(("pool_address_hint_getaccount", force_refresh)),
+                )
                 .await?
             {
                 PumpAmmMarketParseOutcome::Ok(pool) => {
@@ -603,7 +712,19 @@ impl PumpFunAmmDex {
                         pool_market = %pool.pool_market,
                         "pump_amm: PumpAmmPoolStatic from pool_address hint (fast path)"
                     );
-                    return Ok(Some(pool.as_pool_accounts_v14()));
+                    let accounts = pool.as_pool_accounts_v14();
+                    let diagnostic = pool.last_parse_diagnostics.clone().unwrap_or_else(|| {
+                        Self::pump_amm_livepoolcache_diagnostic(
+                            "pool_address_hint_fast_path_missing_diag",
+                            force_refresh,
+                            pool.pool_market,
+                            base_mint,
+                        )
+                    });
+                    return Ok(Some(PoolAccountsV14WithDiagnostic {
+                        accounts,
+                        diagnostic,
+                    }));
                 }
                 PumpAmmMarketParseOutcome::LocalFail(reason) => {
                     warn!(
@@ -618,11 +739,25 @@ impl PumpFunAmmDex {
                             base_mint,
                             Some(reason),
                             "pool_address_hint",
+                            force_refresh,
                         )
                         .await?
                     {
                         self.insert_pool_static_cache(pool.clone());
-                        return Ok(Some(pool.as_pool_accounts_v14()));
+                        let accounts = pool.as_pool_accounts_v14();
+                        let diagnostic = pool.last_parse_diagnostics.clone().unwrap_or_else(|| {
+                            Self::pump_amm_tx_history_diagnostic(
+                                "bounded_external_tx_history_pool_address_hint",
+                                force_refresh,
+                                pool.pool_market,
+                                base_mint,
+                                None,
+                            )
+                        });
+                        return Ok(Some(PoolAccountsV14WithDiagnostic {
+                            accounts,
+                            diagnostic,
+                        }));
                     }
                     return Err(anyhow!(
                         "pump_amm: pool_address hint parse failed local_parse={} (base_mint={}, pool={}); refusing unbounded getProgramAccounts (I-24d)",
@@ -643,7 +778,7 @@ impl PumpFunAmmDex {
         // CRITICAL: global_volume_accumulator is required for BUY (BuyExactQuoteIn).
         // The PumpSwap program validates it exists and is initialized.
         // Without it: "AccountNotInitialized" error (Custom(3012)).
-        Ok(Some(vec![
+        let accounts = vec![
             pool.pool_market,                  // [0]
             pool.global_config,                // [1]
             pool.base_mint,                    // [2]
@@ -658,7 +793,19 @@ impl PumpFunAmmDex {
             pool.global_volume_accumulator,    // [11] - REQUIRED for BUY!
             pool.fee_config,                   // [12]
             pool.fee_program,                  // [13]
-        ]))
+        ];
+        let diagnostic = pool.last_parse_diagnostics.clone().unwrap_or_else(|| {
+            Self::pump_amm_livepoolcache_diagnostic(
+                "discover_pool_static_missing_diag",
+                force_refresh,
+                pool.pool_market,
+                base_mint,
+            )
+        });
+        Ok(Some(PoolAccountsV14WithDiagnostic {
+            accounts,
+            diagnostic,
+        }))
     }
 
     /// Convenience wrapper: pool_accounts_v1_for_base_mint without hint.
@@ -666,8 +813,10 @@ impl PumpFunAmmDex {
         &self,
         base_mint: Pubkey,
     ) -> Result<Option<Vec<Pubkey>>> {
-        self.pool_accounts_v1_for_base_mint_with_hint(base_mint, None, false)
-            .await
+        Ok(self
+            .pool_accounts_v1_for_base_mint_with_hint(base_mint, None, false)
+            .await?
+            .map(|w| w.accounts))
     }
 
     fn derive_user_volume_accumulator(
@@ -761,9 +910,303 @@ impl PumpFunAmmDex {
         &self,
         pool_market: Pubkey,
         expected_base_mint: Pubkey,
+        diagnostic_ctx: Option<(&'static str, bool)>,
     ) -> Result<PumpAmmMarketParseOutcome> {
-        self.try_parse_pool_static_from_market_account_inner(pool_market, expected_base_mint, None)
-            .await
+        self.try_parse_pool_static_from_market_account_inner(
+            pool_market,
+            expected_base_mint,
+            None,
+            diagnostic_ctx,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pump_amm_market_parse_diagnostics(
+        source: &'static str,
+        force_refresh: bool,
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+        fee: PumpAmmFeeParseKind,
+        creator: PumpAmmCreatorParseKind,
+        gva: PumpAmmGvaParseKind,
+        fee_cfg: PumpAmmFeeConfigParseKind,
+    ) -> PumpAmmPoolAccountsDiagnostic {
+        let (pfr_res, pfr_tag) = match fee {
+            PumpAmmFeeParseKind::EmbeddedSecondQuoteTa => (
+                PumpAmmFieldResolution::Heuristic,
+                "embedded_second_quote_ta",
+            ),
+            PumpAmmFeeParseKind::GlobalConfigOffset57DerivedWsolAta => (
+                PumpAmmFieldResolution::Deterministic,
+                "global_config_offset_57_derived_wsol_ata",
+            ),
+            PumpAmmFeeParseKind::GlobalConfigScanEmbeddedQuoteTa => (
+                PumpAmmFieldResolution::Heuristic,
+                "global_config_scan_embedded_quote_ta_min_balance",
+            ),
+            PumpAmmFeeParseKind::AuthoritySearchQuoteMint => (
+                PumpAmmFieldResolution::Heuristic,
+                "authority_search_quote_mint",
+            ),
+            PumpAmmFeeParseKind::AuthoritySearchBaseMint => (
+                PumpAmmFieldResolution::Heuristic,
+                "authority_search_base_mint",
+            ),
+        };
+        let (pfr_ta_res, pfr_ta_tag) = match fee {
+            PumpAmmFeeParseKind::EmbeddedSecondQuoteTa => (
+                PumpAmmFieldResolution::Heuristic,
+                "embedded_second_quote_ta_address",
+            ),
+            PumpAmmFeeParseKind::GlobalConfigOffset57DerivedWsolAta => (
+                PumpAmmFieldResolution::Deterministic,
+                "derived_ata_from_global_config_pfr",
+            ),
+            PumpAmmFeeParseKind::GlobalConfigScanEmbeddedQuoteTa => (
+                PumpAmmFieldResolution::Heuristic,
+                "global_config_scan_embedded_quote_ta",
+            ),
+            PumpAmmFeeParseKind::AuthoritySearchQuoteMint
+            | PumpAmmFeeParseKind::AuthoritySearchBaseMint => (
+                PumpAmmFieldResolution::Heuristic,
+                "authority_search_existing_or_derived_ata",
+            ),
+        };
+        let (cc_ata_res, cc_ata_tag) = match creator {
+            PumpAmmCreatorParseKind::EmbeddedSecondBaseTa => {
+                (PumpAmmFieldResolution::Heuristic, "embedded_second_base_ta")
+            }
+            PumpAmmCreatorParseKind::MarketOffset211CreatorVaultPda => (
+                PumpAmmFieldResolution::MarketLayout,
+                "market_offset_211_creator_vault_wsol_ata",
+            ),
+            PumpAmmCreatorParseKind::AuthoritySearchBaseMint
+            | PumpAmmCreatorParseKind::AuthoritySearchQuoteMint => (
+                PumpAmmFieldResolution::Heuristic,
+                "authority_search_creator_vault_ta",
+            ),
+            PumpAmmCreatorParseKind::LegacyPdaSeedProbe => (
+                PumpAmmFieldResolution::Heuristic,
+                "legacy_pda_probe_derived_wsol_ata",
+            ),
+        };
+        let (cc_auth_res, cc_auth_tag) = match creator {
+            PumpAmmCreatorParseKind::EmbeddedSecondBaseTa => (
+                PumpAmmFieldResolution::Heuristic,
+                "embedded_second_base_ta_owner",
+            ),
+            PumpAmmCreatorParseKind::MarketOffset211CreatorVaultPda => (
+                PumpAmmFieldResolution::MarketLayout,
+                "creator_vault_pda_from_market_seed",
+            ),
+            PumpAmmCreatorParseKind::AuthoritySearchBaseMint
+            | PumpAmmCreatorParseKind::AuthoritySearchQuoteMint => {
+                (PumpAmmFieldResolution::Heuristic, "authority_search_owner")
+            }
+            PumpAmmCreatorParseKind::LegacyPdaSeedProbe => (
+                PumpAmmFieldResolution::Heuristic,
+                "legacy_pda_probe_authority",
+            ),
+        };
+        let (gva_res, gva_tag) = match gva {
+            PumpAmmGvaParseKind::EmbeddedAmmOwnedLargestData => (
+                PumpAmmFieldResolution::Heuristic,
+                "amm_program_owned_max_datalen_candidate",
+            ),
+            PumpAmmGvaParseKind::PdaSeedProbe => (
+                PumpAmmFieldResolution::Heuristic,
+                "pda_seed_probe_global_volume_accumulator",
+            ),
+            PumpAmmGvaParseKind::SingletonGlobalVolumeAccumulator => (
+                PumpAmmFieldResolution::Deterministic,
+                "singleton_pda_global_volume_accumulator",
+            ),
+        };
+        let (fc_res, fc_tag) = match fee_cfg {
+            PumpAmmFeeConfigParseKind::EmbeddedFeeProgramOwnedFromMarket => (
+                PumpAmmFieldResolution::Heuristic,
+                "fee_program_owned_from_market_candidate",
+            ),
+            PumpAmmFeeConfigParseKind::FeeProgramPdaProbe => {
+                (PumpAmmFieldResolution::Heuristic, "fee_program_pda_probe")
+            }
+            PumpAmmFeeConfigParseKind::ConstantMainnetFeeConfig => (
+                PumpAmmFieldResolution::Deterministic,
+                "constant_PUMPFUN_AMM_FEE_CONFIG",
+            ),
+        };
+        PumpAmmPoolAccountsDiagnostic {
+            source,
+            base_mint,
+            pool_market,
+            force_refresh,
+            reference_swap_signature: None,
+            protocol_fee_recipient: PumpAmmFieldDiagnostic {
+                resolution: pfr_res,
+                tag: pfr_tag,
+            },
+            protocol_fee_recipient_ta: PumpAmmFieldDiagnostic {
+                resolution: pfr_ta_res,
+                tag: pfr_ta_tag,
+            },
+            coin_creator_vault_ata: PumpAmmFieldDiagnostic {
+                resolution: cc_ata_res,
+                tag: cc_ata_tag,
+            },
+            coin_creator_vault_authority: PumpAmmFieldDiagnostic {
+                resolution: cc_auth_res,
+                tag: cc_auth_tag,
+            },
+            global_volume_accumulator: PumpAmmFieldDiagnostic {
+                resolution: gva_res,
+                tag: gva_tag,
+            },
+            fee_config: PumpAmmFieldDiagnostic {
+                resolution: fc_res,
+                tag: fc_tag,
+            },
+            fee_program: PumpAmmFieldDiagnostic {
+                resolution: PumpAmmFieldResolution::Deterministic,
+                tag: "constant_PUMPFUN_AMM_FEE_PROGRAM",
+            },
+        }
+    }
+
+    fn pump_amm_tx_history_diagnostic(
+        source: &'static str,
+        force_refresh: bool,
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+        reference_sig: Option<String>,
+    ) -> PumpAmmPoolAccountsDiagnostic {
+        let obs = PumpAmmFieldResolution::TxHistoryObservation;
+        PumpAmmPoolAccountsDiagnostic {
+            source,
+            base_mint,
+            pool_market,
+            force_refresh,
+            reference_swap_signature: reference_sig,
+            protocol_fee_recipient: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_9",
+            },
+            protocol_fee_recipient_ta: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_10",
+            },
+            coin_creator_vault_ata: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_17",
+            },
+            coin_creator_vault_authority: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_18",
+            },
+            global_volume_accumulator: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_16",
+            },
+            fee_config: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_19",
+            },
+            fee_program: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_20",
+            },
+        }
+    }
+
+    /// Local paginated tx scanner uses **different** account indices for fee_config/fee_program than
+    /// `discover_pool_static_via_tx_history_market_only_inner` (see inline comments at each site).
+    fn pump_amm_tx_history_diagnostic_local_paginated_scan(
+        source: &'static str,
+        force_refresh: bool,
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+        reference_sig: Option<String>,
+    ) -> PumpAmmPoolAccountsDiagnostic {
+        let obs = PumpAmmFieldResolution::TxHistoryObservation;
+        PumpAmmPoolAccountsDiagnostic {
+            source,
+            base_mint,
+            pool_market,
+            force_refresh,
+            reference_swap_signature: reference_sig,
+            protocol_fee_recipient: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_9",
+            },
+            protocol_fee_recipient_ta: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_10",
+            },
+            coin_creator_vault_ata: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_17",
+            },
+            coin_creator_vault_authority: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_18",
+            },
+            global_volume_accumulator: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_19",
+            },
+            fee_config: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_21_amm_owned_guard",
+            },
+            fee_program: PumpAmmFieldDiagnostic {
+                resolution: obs,
+                tag: "swap_ix_index_22",
+            },
+        }
+    }
+
+    fn pump_amm_livepoolcache_diagnostic(
+        source: &'static str,
+        force_refresh: bool,
+        pool_market: Pubkey,
+        base_mint: Pubkey,
+    ) -> PumpAmmPoolAccountsDiagnostic {
+        let cache = PumpAmmFieldResolution::CacheObservation;
+        PumpAmmPoolAccountsDiagnostic {
+            source,
+            base_mint,
+            pool_market,
+            force_refresh,
+            reference_swap_signature: None,
+            protocol_fee_recipient: PumpAmmFieldDiagnostic {
+                resolution: cache,
+                tag: "jetstream_v14_slot6",
+            },
+            protocol_fee_recipient_ta: PumpAmmFieldDiagnostic {
+                resolution: cache,
+                tag: "jetstream_v14_slot7",
+            },
+            coin_creator_vault_ata: PumpAmmFieldDiagnostic {
+                resolution: cache,
+                tag: "jetstream_v14_slot9",
+            },
+            coin_creator_vault_authority: PumpAmmFieldDiagnostic {
+                resolution: cache,
+                tag: "jetstream_v14_slot10",
+            },
+            global_volume_accumulator: PumpAmmFieldDiagnostic {
+                resolution: cache,
+                tag: "jetstream_v14_slot11",
+            },
+            fee_config: PumpAmmFieldDiagnostic {
+                resolution: cache,
+                tag: "jetstream_v14_slot12",
+            },
+            fee_program: PumpAmmFieldDiagnostic {
+                resolution: cache,
+                tag: "jetstream_v14_slot13",
+            },
+        }
     }
 
     /// Parse PumpSwap AMM pool structure from on-chain market account.
@@ -776,7 +1219,10 @@ impl PumpFunAmmDex {
         pool_market: Pubkey,
         expected_base_mint: Pubkey,
         prefetched_data: Option<(Pubkey, bool, Vec<u8>)>,
+        diagnostic_ctx: Option<(&'static str, bool)>,
     ) -> Result<PumpAmmMarketParseOutcome> {
+        let (diag_source, diag_force_refresh) =
+            diagnostic_ctx.unwrap_or(("rpc_market_parse", false));
         let pump_amm_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID)?;
         let expected_quote_mint = Pubkey::from_str(WSOL_MINT)?;
 
@@ -1039,12 +1485,16 @@ impl PumpFunAmmDex {
         // In that case, fall back to scanning the global_config account for either:
         // - an embedded quote token account (best), or
         // - additional authority pubkeys (then derive ATA and validate existence).
-        let (protocol_fee_recipient, protocol_fee_recipient_ta) = if let Some(t) =
+        let (protocol_fee_recipient, protocol_fee_recipient_ta, fee_parse_kind) = if let Some(t) =
             quote_token_accounts
                 .iter()
                 .find(|t| t.address != pool_quote_vault)
         {
-            (t.token_owner, t.address)
+            (
+                t.token_owner,
+                t.address,
+                PumpAmmFeeParseKind::EmbeddedSecondQuoteTa,
+            )
         } else {
             // Tx-history-free: `protocol_fee_recipient` is stored in the canonical `global_config`
             // account at a fixed offset (verified against mainnet swap ix accounts; Scope 41).
@@ -1087,7 +1537,11 @@ impl PumpFunAmmDex {
             };
 
             if let Some((pfr, ta)) = fixed_protocol_fee_from_global_config {
-                (pfr, ta)
+                (
+                    pfr,
+                    ta,
+                    PumpAmmFeeParseKind::GlobalConfigOffset57DerivedWsolAta,
+                )
             } else {
                 let mut extra_authority_candidates: Vec<Pubkey> = Vec::new();
                 let mut embedded_fee_ta_from_global: Option<(Pubkey, Pubkey, u64)> = None;
@@ -1179,7 +1633,11 @@ impl PumpFunAmmDex {
                 }
 
                 if let Some((owner, ta, _bal)) = embedded_fee_ta_from_global {
-                    (owner, ta)
+                    (
+                        owner,
+                        ta,
+                        PumpAmmFeeParseKind::GlobalConfigScanEmbeddedQuoteTa,
+                    )
                 } else {
                     // Retry ATA derivation with any extra authorities found in global_config.
                     let mut combined = authority_candidates.clone();
@@ -1191,7 +1649,7 @@ impl PumpFunAmmDex {
                         find_authority_with_existing_token_account(combined.clone(), quote_mint)
                             .await?
                     {
-                        (auth, ta)
+                        (auth, ta, PumpAmmFeeParseKind::AuthoritySearchQuoteMint)
                     } else if let Some((auth, ta)) =
                         // Some fee flows (notably `sell`) can accrue fees in the input mint.
                         // If the protocol fee recipient TA is not for WSOL, fall back to base mint.
@@ -1201,7 +1659,7 @@ impl PumpFunAmmDex {
                         )
                         .await?
                     {
-                        (auth, ta)
+                        (auth, ta, PumpAmmFeeParseKind::AuthoritySearchBaseMint)
                     } else {
                         // Cannot infer protocol fee accounts from market/global_config — do not substitute
                         // a global mainnet recipient (pool-specific; see Bug #35).
@@ -1222,44 +1680,118 @@ impl PumpFunAmmDex {
 
         // Creator vault: prefer an embedded second base token account; else canonical layout at
         // offset 211 (`creator_vault` PDA + WSOL ATA); else authority heuristics / legacy PDAs.
-        let (coin_creator_vault_authority, coin_creator_vault_ata) = if let Some(t) =
-            base_token_accounts
+        let (coin_creator_vault_authority, coin_creator_vault_ata, creator_parse_kind) =
+            if let Some(t) = base_token_accounts
                 .iter()
                 .find(|t| t.address != pool_base_vault)
-        {
-            (t.token_owner, t.address)
-        } else if data.len() >= PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET + 32 {
-            let creator_seed = Pubkey::new_from_array(
-                data[PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET
-                    ..PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET + 32]
-                    .try_into()
-                    .map_err(|_| anyhow!("market creator_seed slice"))?,
-            );
-            if creator_seed != Pubkey::default() {
-                let (auth, _) = Pubkey::find_program_address(
-                    &[b"creator_vault", creator_seed.as_ref()],
-                    &pump_amm_program,
+            {
+                (
+                    t.token_owner,
+                    t.address,
+                    PumpAmmCreatorParseKind::EmbeddedSecondBaseTa,
+                )
+            } else if data.len() >= PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET + 32 {
+                let creator_seed = Pubkey::new_from_array(
+                    data[PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET
+                        ..PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET + 32]
+                        .try_into()
+                        .map_err(|_| anyhow!("market creator_seed slice"))?,
                 );
-                // On-chain swaps use the creator fee vault as a WSOL (quote) token account for this authority.
-                let ata = Self::derive_ata_with_program(auth, quote_mint, token_program);
-                info!(
-                    pool = %pool_market,
-                    creator_seed = %creator_seed,
-                    coin_creator_vault_authority = %auth,
-                    coin_creator_vault_ata = %ata,
-                    "pump_amm: creator vault from market offset 211 + creator_vault PDA (quote-mint ATA)"
-                );
-                (auth, ata)
+                if creator_seed != Pubkey::default() {
+                    let (auth, _) = Pubkey::find_program_address(
+                        &[b"creator_vault", creator_seed.as_ref()],
+                        &pump_amm_program,
+                    );
+                    // On-chain swaps use the creator fee vault as a WSOL (quote) token account for this authority.
+                    let ata = Self::derive_ata_with_program(auth, quote_mint, token_program);
+                    info!(
+                        pool = %pool_market,
+                        creator_seed = %creator_seed,
+                        coin_creator_vault_authority = %auth,
+                        coin_creator_vault_ata = %ata,
+                        "pump_amm: creator vault from market offset 211 + creator_vault PDA (quote-mint ATA)"
+                    );
+                    (
+                        auth,
+                        ata,
+                        PumpAmmCreatorParseKind::MarketOffset211CreatorVaultPda,
+                    )
+                } else if let Some((auth, ta)) = find_authority_with_existing_token_account(
+                    authority_candidates.clone(),
+                    base_mint,
+                )
+                .await?
+                {
+                    (auth, ta, PumpAmmCreatorParseKind::AuthoritySearchBaseMint)
+                } else if let Some((auth, ta)) = find_authority_with_existing_token_account(
+                    authority_candidates.clone(),
+                    quote_mint,
+                )
+                .await?
+                {
+                    (auth, ta, PumpAmmCreatorParseKind::AuthoritySearchQuoteMint)
+                } else {
+                    match self
+                        .derive_existing_pda(
+                            pump_amm_program,
+                            &[
+                                vec![
+                                    b"creator_vault_authority".to_vec(),
+                                    pool_market.to_bytes().to_vec(),
+                                ],
+                                vec![b"creator_vault".to_vec(), pool_market.to_bytes().to_vec()],
+                                vec![b"creator".to_vec(), pool_market.to_bytes().to_vec()],
+                                vec![b"vault_authority".to_vec(), pool_market.to_bytes().to_vec()],
+                                vec![b"token_creator".to_vec(), pool_market.to_bytes().to_vec()],
+                            ],
+                        )
+                        .await?
+                    {
+                        Some(derived_authority) => {
+                            // Same as offset-211 path: creator fee vault is the quote-mint (WSOL) ATA for this authority.
+                            let derived_ata = Self::derive_ata_with_program(
+                                derived_authority,
+                                expected_quote_mint,
+                                token_program,
+                            );
+                            warn!(
+                                pool = %pool_market,
+                                base_mint = %base_mint,
+                                derived_ata = %derived_ata,
+                                authority_candidates_count = authority_candidates.len(),
+                                "pump_amm: creator vault ATA not on-chain; using derived address (FIX-32 parity)"
+                            );
+                            (
+                                derived_authority,
+                                derived_ata,
+                                PumpAmmCreatorParseKind::LegacyPdaSeedProbe,
+                            )
+                        }
+                        None => {
+                            warn!(
+                                pool = %pool_market,
+                                base_mint = %base_mint,
+                                "pump_amm market parse FAIL: no creator vault token account \
+                                 (no embedded ATA; offset 211 path unavailable; no ATA found; no valid PDA; \
+                                 authority_candidates_count={})",
+                                authority_candidates.len()
+                            );
+                            return Ok(PumpAmmMarketParseOutcome::LocalFail(
+                                PumpAmmLocalParseFailReason::CreatorVaultMissing,
+                            ));
+                        }
+                    }
+                }
             } else if let Some((auth, ta)) =
                 find_authority_with_existing_token_account(authority_candidates.clone(), base_mint)
                     .await?
             {
-                (auth, ta)
+                (auth, ta, PumpAmmCreatorParseKind::AuthoritySearchBaseMint)
             } else if let Some((auth, ta)) =
                 find_authority_with_existing_token_account(authority_candidates.clone(), quote_mint)
                     .await?
             {
-                (auth, ta)
+                (auth, ta, PumpAmmCreatorParseKind::AuthoritySearchQuoteMint)
             } else {
                 match self
                     .derive_existing_pda(
@@ -1278,7 +1810,6 @@ impl PumpFunAmmDex {
                     .await?
                 {
                     Some(derived_authority) => {
-                        // Same as offset-211 path: creator fee vault is the quote-mint (WSOL) ATA for this authority.
                         let derived_ata = Self::derive_ata_with_program(
                             derived_authority,
                             expected_quote_mint,
@@ -1291,14 +1822,18 @@ impl PumpFunAmmDex {
                             authority_candidates_count = authority_candidates.len(),
                             "pump_amm: creator vault ATA not on-chain; using derived address (FIX-32 parity)"
                         );
-                        (derived_authority, derived_ata)
+                        (
+                            derived_authority,
+                            derived_ata,
+                            PumpAmmCreatorParseKind::LegacyPdaSeedProbe,
+                        )
                     }
                     None => {
                         warn!(
                             pool = %pool_market,
                             base_mint = %base_mint,
                             "pump_amm market parse FAIL: no creator vault token account \
-                             (no embedded ATA; offset 211 path unavailable; no ATA found; no valid PDA; \
+                             (no embedded ATA; no ATA found; no valid PDA; \
                              authority_candidates_count={})",
                             authority_candidates.len()
                         );
@@ -1307,64 +1842,7 @@ impl PumpFunAmmDex {
                         ));
                     }
                 }
-            }
-        } else if let Some((auth, ta)) =
-            find_authority_with_existing_token_account(authority_candidates.clone(), base_mint)
-                .await?
-        {
-            (auth, ta)
-        } else if let Some((auth, ta)) =
-            find_authority_with_existing_token_account(authority_candidates.clone(), quote_mint)
-                .await?
-        {
-            (auth, ta)
-        } else {
-            match self
-                .derive_existing_pda(
-                    pump_amm_program,
-                    &[
-                        vec![
-                            b"creator_vault_authority".to_vec(),
-                            pool_market.to_bytes().to_vec(),
-                        ],
-                        vec![b"creator_vault".to_vec(), pool_market.to_bytes().to_vec()],
-                        vec![b"creator".to_vec(), pool_market.to_bytes().to_vec()],
-                        vec![b"vault_authority".to_vec(), pool_market.to_bytes().to_vec()],
-                        vec![b"token_creator".to_vec(), pool_market.to_bytes().to_vec()],
-                    ],
-                )
-                .await?
-            {
-                Some(derived_authority) => {
-                    let derived_ata = Self::derive_ata_with_program(
-                        derived_authority,
-                        expected_quote_mint,
-                        token_program,
-                    );
-                    warn!(
-                        pool = %pool_market,
-                        base_mint = %base_mint,
-                        derived_ata = %derived_ata,
-                        authority_candidates_count = authority_candidates.len(),
-                        "pump_amm: creator vault ATA not on-chain; using derived address (FIX-32 parity)"
-                    );
-                    (derived_authority, derived_ata)
-                }
-                None => {
-                    warn!(
-                        pool = %pool_market,
-                        base_mint = %base_mint,
-                        "pump_amm market parse FAIL: no creator vault token account \
-                         (no embedded ATA; no ATA found; no valid PDA; \
-                         authority_candidates_count={})",
-                        authority_candidates.len()
-                    );
-                    return Ok(PumpAmmMarketParseOutcome::LocalFail(
-                        PumpAmmLocalParseFailReason::CreatorVaultMissing,
-                    ));
-                }
-            }
-        };
+            };
 
         // Swap ix account #15 must be the `__event_authority` PDA (ConstraintSeeds). Do not infer
         // from market bytes; same pattern as `global_config`.
@@ -1373,81 +1851,95 @@ impl PumpFunAmmDex {
         // Extract fee_config from fee-program owned accounts (CRITICAL: fee_config must be owned
         // by pfeeUxB6... Fee Program, not the AMM program).
         // Extract global_volume_accumulator from AMM-program owned accounts.
-        let fee_config = if !fee_program_owned_accounts.is_empty() {
+        let (fee_config_raw, mut fee_config_parse_kind) = if !fee_program_owned_accounts.is_empty()
+        {
             // Prefer the first fee-program owned account found in market data
-            fee_program_owned_accounts
-                .first()
-                .map(|m| m.address)
-                .unwrap_or_default()
+            (
+                fee_program_owned_accounts
+                    .first()
+                    .map(|m| m.address)
+                    .unwrap_or_default(),
+                PumpAmmFeeConfigParseKind::EmbeddedFeeProgramOwnedFromMarket,
+            )
         } else {
             // Fallback: try deriving fee_config PDA from Fee Program
-            self.derive_existing_pda(
-                fee_program,
-                &[
-                    vec![b"fee_config".to_vec(), global_config.to_bytes().to_vec()],
-                    vec![b"fee_config".to_vec(), pool_market.to_bytes().to_vec()],
-                    vec![b"fee_config".to_vec()],
-                    vec![b"fees".to_vec(), global_config.to_bytes().to_vec()],
-                    vec![b"fees".to_vec(), pool_market.to_bytes().to_vec()],
-                ],
+            (
+                self.derive_existing_pda(
+                    fee_program,
+                    &[
+                        vec![b"fee_config".to_vec(), global_config.to_bytes().to_vec()],
+                        vec![b"fee_config".to_vec(), pool_market.to_bytes().to_vec()],
+                        vec![b"fee_config".to_vec()],
+                        vec![b"fees".to_vec(), global_config.to_bytes().to_vec()],
+                        vec![b"fees".to_vec(), pool_market.to_bytes().to_vec()],
+                    ],
+                )
+                .await?
+                .unwrap_or_default(),
+                PumpAmmFeeConfigParseKind::FeeProgramPdaProbe,
             )
-            .await?
-            .unwrap_or_default()
         };
 
-        let global_volume_accumulator = if !program_owned_accounts.is_empty() {
-            // global_volume_accumulator is owned by the AMM program
-            // Heuristic: prefer the larger account (volume accumulator tends to be bigger)
-            let mut sorted = program_owned_accounts.clone();
-            sorted.sort_by_key(|m| m.data_len);
-            sorted.last().map(|m| m.address).unwrap_or_default()
-        } else {
-            // Fallback: try deriving from AMM program (singleton first — matches on-chain PumpSwap).
-            self.derive_existing_pda(
-                pump_amm_program,
-                &[
-                    vec![b"global_volume_accumulator".to_vec()],
-                    vec![
-                        b"global_volume_accumulator".to_vec(),
-                        global_config.to_bytes().to_vec(),
-                    ],
-                    vec![
-                        b"global_volume_accumulator".to_vec(),
-                        pool_market.to_bytes().to_vec(),
-                    ],
-                    vec![
-                        b"volume_accumulator".to_vec(),
-                        global_config.to_bytes().to_vec(),
-                    ],
-                    vec![
-                        b"volume_accumulator".to_vec(),
-                        pool_market.to_bytes().to_vec(),
-                    ],
-                ],
-            )
-            .await?
-            .unwrap_or_default()
-        };
+        let (mut global_volume_accumulator, mut gva_parse_kind) =
+            if !program_owned_accounts.is_empty() {
+                // global_volume_accumulator is owned by the AMM program
+                // Heuristic: prefer the larger account (volume accumulator tends to be bigger)
+                let mut sorted = program_owned_accounts.clone();
+                sorted.sort_by_key(|m| m.data_len);
+                (
+                    sorted.last().map(|m| m.address).unwrap_or_default(),
+                    PumpAmmGvaParseKind::EmbeddedAmmOwnedLargestData,
+                )
+            } else {
+                // Fallback: try deriving from AMM program (singleton first — matches on-chain PumpSwap).
+                (
+                    self.derive_existing_pda(
+                        pump_amm_program,
+                        &[
+                            vec![b"global_volume_accumulator".to_vec()],
+                            vec![
+                                b"global_volume_accumulator".to_vec(),
+                                global_config.to_bytes().to_vec(),
+                            ],
+                            vec![
+                                b"global_volume_accumulator".to_vec(),
+                                pool_market.to_bytes().to_vec(),
+                            ],
+                            vec![
+                                b"volume_accumulator".to_vec(),
+                                global_config.to_bytes().to_vec(),
+                            ],
+                            vec![
+                                b"volume_accumulator".to_vec(),
+                                pool_market.to_bytes().to_vec(),
+                            ],
+                        ],
+                    )
+                    .await?
+                    .unwrap_or_default(),
+                    PumpAmmGvaParseKind::PdaSeedProbe,
+                )
+            };
 
         // Known-pool fast path: volume accumulator is a single global PDA; heuristics may miss it if
         // no embedded pubkey resolves to an account owned by `pump_amm_program` (see derive_existing_pda).
-        let global_volume_accumulator = if global_volume_accumulator == Pubkey::default() {
+        if global_volume_accumulator == Pubkey::default() {
             let singleton = pump_amm_singleton_global_volume_accumulator(&pump_amm_program);
             info!(
                 pool = %pool_market,
                 global_volume_accumulator = %singleton,
                 "pump_amm: using singleton global_volume_accumulator PDA (heuristic empty)"
             );
-            singleton
-        } else {
-            global_volume_accumulator
-        };
+            global_volume_accumulator = singleton;
+            gva_parse_kind = PumpAmmGvaParseKind::SingletonGlobalVolumeAccumulator;
+        }
 
         // Same global fee_config pubkey for all PumpSwap pools (see build_swap_ix_from_pool_accounts).
-        let fee_config = if fee_config == Pubkey::default() {
+        let fee_config = if fee_config_raw == Pubkey::default() {
+            fee_config_parse_kind = PumpAmmFeeConfigParseKind::ConstantMainnetFeeConfig;
             Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG)?
         } else {
-            fee_config
+            fee_config_raw
         };
 
         if fee_config == Pubkey::default() {
@@ -1482,6 +1974,17 @@ impl PumpFunAmmDex {
             ));
         }
 
+        let diag = Self::pump_amm_market_parse_diagnostics(
+            diag_source,
+            diag_force_refresh,
+            pool_market,
+            base_mint,
+            fee_parse_kind,
+            creator_parse_kind,
+            gva_parse_kind,
+            fee_config_parse_kind,
+        );
+
         Ok(PumpAmmMarketParseOutcome::Ok(PumpAmmPoolStatic {
             pool_market,
             global_config,
@@ -1497,6 +2000,7 @@ impl PumpFunAmmDex {
             global_volume_accumulator,
             fee_config,
             fee_program,
+            last_parse_diagnostics: Some(diag),
         }))
     }
 
@@ -1559,20 +2063,28 @@ impl PumpFunAmmDex {
         tx_rpc: Arc<SolanaRpc>,
         pool_market: Pubkey,
         base_mint: Pubkey,
+        force_refresh: bool,
     ) -> Result<Option<PumpAmmPoolStatic>> {
-        self.discover_pool_static_via_tx_history_market_only_inner(tx_rpc, pool_market, base_mint)
-            .await
+        self.discover_pool_static_via_tx_history_market_only_inner(
+            tx_rpc,
+            pool_market,
+            base_mint,
+            force_refresh,
+        )
+        .await
     }
 
     async fn discover_pool_static_via_tx_history_market_only(
         &self,
         pool_market: Pubkey,
         base_mint: Pubkey,
+        force_refresh: bool,
     ) -> Result<Option<PumpAmmPoolStatic>> {
         self.discover_pool_static_via_tx_history_market_only_inner(
             Arc::clone(&self.rpc),
             pool_market,
             base_mint,
+            force_refresh,
         )
         .await
     }
@@ -1582,6 +2094,7 @@ impl PumpFunAmmDex {
         tx_rpc: Arc<SolanaRpc>,
         pool_market: Pubkey,
         base_mint: Pubkey,
+        force_refresh: bool,
     ) -> Result<Option<PumpAmmPoolStatic>> {
         // Minimal, bounded tx-history fallback.
         // Some Pump AMM market accounts do not embed the fee/creator token accounts we need to
@@ -1794,6 +2307,13 @@ impl PumpFunAmmDex {
                     global_volume_accumulator: Pubkey::from_str(&account_keys[accounts[16]])?,
                     fee_config: Pubkey::from_str(&account_keys[accounts[19]])?,
                     fee_program: Pubkey::from_str(&account_keys[accounts[20]])?,
+                    last_parse_diagnostics: Some(Self::pump_amm_tx_history_diagnostic(
+                        "tx_history_market_scan",
+                        force_refresh,
+                        pool_market,
+                        base_mint,
+                        Some(sig.clone()),
+                    )),
                 };
 
                 // Fee guardrails (same as the broader scanner).
@@ -1911,6 +2431,12 @@ impl PumpFunAmmDex {
                             global_volume_accumulator: accounts[11],
                             fee_config: accounts[12],
                             fee_program: accounts[13],
+                            last_parse_diagnostics: Some(Self::pump_amm_livepoolcache_diagnostic(
+                                "discover_pool_static_livepoolcache_reconstruct",
+                                force_refresh,
+                                accounts[0],
+                                base_mint,
+                            )),
                         };
                         // Cache internally for build_swap_ix() (sync path)
                         self.pools_by_base.insert(base_mint, pool.clone());
@@ -1937,7 +2463,11 @@ impl PumpFunAmmDex {
                     "pump_amm: LivePoolCache has pool address but no pool_accounts, trying direct getAccount"
                 );
                 match self
-                    .try_market_parse_outcome_for_pool(pool_address, base_mint)
+                    .try_market_parse_outcome_for_pool(
+                        pool_address,
+                        base_mint,
+                        Some(("livepoolcache_pool_address_getaccount", force_refresh)),
+                    )
                     .await
                 {
                     Ok(PumpAmmMarketParseOutcome::Ok(pool)) => {
@@ -1963,6 +2493,7 @@ impl PumpFunAmmDex {
                                 base_mint,
                                 Some(reason),
                                 "livepoolcache_pool_address",
+                                force_refresh,
                             )
                             .await?
                         {
@@ -2071,7 +2602,14 @@ impl PumpFunAmmDex {
         let first_market = markets.first().copied();
         let mut first_market_local_parse_fail: Option<PumpAmmLocalParseFailReason> = None;
         for m in &markets {
-            match self.try_market_parse_outcome_for_pool(*m, base_mint).await {
+            match self
+                .try_market_parse_outcome_for_pool(
+                    *m,
+                    base_mint,
+                    Some(("getprogramaccounts_market_parse", force_refresh)),
+                )
+                .await
+            {
                 Ok(PumpAmmMarketParseOutcome::Ok(pool)) => {
                     self.pools_by_base.insert(base_mint, pool.clone());
                     self.pools_by_market.insert(pool.pool_market, base_mint);
@@ -2106,7 +2644,7 @@ impl PumpFunAmmDex {
             );
 
             match self
-                .discover_pool_static_via_tx_history_market_only(m, base_mint)
+                .discover_pool_static_via_tx_history_market_only(m, base_mint, force_refresh)
                 .await
             {
                 Ok(Some(pool)) => {
@@ -2138,6 +2676,7 @@ impl PumpFunAmmDex {
                     base_mint,
                     first_market_local_parse_fail,
                     "discover_pool_static_after_local_tx_history",
+                    force_refresh,
                 )
                 .await?
             {
@@ -2315,6 +2854,7 @@ impl PumpFunAmmDex {
                             )?,
                             fee_config: Pubkey::default(),
                             fee_program: Pubkey::default(),
+                            last_parse_diagnostics: None,
                         };
 
                         // Deterministic mapping: our Geyser parser and observed on-chain swaps agree that
@@ -2344,6 +2884,14 @@ impl PumpFunAmmDex {
                         let mut pool = pool;
                         pool.fee_program = fee_program;
                         pool.fee_config = fee_config;
+                        pool.last_parse_diagnostics =
+                            Some(Self::pump_amm_tx_history_diagnostic_local_paginated_scan(
+                                "tx_history_paginated_address_scan",
+                                force_refresh,
+                                pool.pool_market,
+                                base_mint,
+                                Some(sig.clone()),
+                            ));
 
                         self.pools_by_base.insert(base_mint, pool.clone());
                         self.pools_by_market.insert(pool.pool_market, base_mint);
@@ -2701,6 +3249,7 @@ impl Dex for PumpFunAmmDex {
                 *pool_address,
                 base_mint,
                 Some(prefetched),
+                Some(("rpc_market_parse_single_pool_account", false)),
             )
             .await
         {
@@ -2724,7 +3273,7 @@ impl Dex for PumpFunAmmDex {
                     "pump_amm load_pool_by_address: market-account parse failed, trying TX-history fallback"
                 );
                 match self
-                    .discover_pool_static_via_tx_history_market_only(*pool_address, base_mint)
+                    .discover_pool_static_via_tx_history_market_only(*pool_address, base_mint, false)
                     .await
                 {
                     Ok(Some(pool)) => {
@@ -2759,7 +3308,11 @@ impl Dex for PumpFunAmmDex {
                     "pump_amm load_pool_by_address: market-account parse error, trying TX-history fallback"
                 );
                 match self
-                    .discover_pool_static_via_tx_history_market_only(*pool_address, base_mint)
+                    .discover_pool_static_via_tx_history_market_only(
+                        *pool_address,
+                        base_mint,
+                        false,
+                    )
                     .await
                 {
                     Ok(Some(pool)) => {
@@ -2916,6 +3469,7 @@ impl Dex for PumpFunAmmDex {
             global_volume_accumulator,
             fee_config,
             fee_program,
+            last_parse_diagnostics: None,
         };
 
         debug!(
@@ -3979,6 +4533,7 @@ mod tests {
             global_volume_accumulator: Pubkey::new_unique(),
             fee_config: Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
             fee_program: Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+            last_parse_diagnostics: None,
         };
         dex.pools_by_base.insert(base_mint, pool);
 
