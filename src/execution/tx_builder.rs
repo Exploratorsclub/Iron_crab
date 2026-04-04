@@ -4,7 +4,10 @@ use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::orca_whirlpool_layout;
 use crate::solana::dex::pumpfun::PumpFunDex;
-use crate::solana::dex::pumpfun_amm::{PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex};
+use crate::solana::dex::pumpfun_amm::{
+    PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex, PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR,
+    PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR,
+};
 use crate::solana::dex::raydium::Raydium;
 use crate::solana::dex::Dex;
 use crate::solana::rpc::SolanaRpc;
@@ -17,10 +20,6 @@ use spl_token_2022;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{info, warn};
-
-// Must match `pumpfun_amm.rs` — used only for Scope 44 cold-path SIM diagnostics (fee overwrite visibility).
-const PUMPFUN_AMM_FEE_CONFIG_PUBKEY: &str = "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx";
-const PUMPFUN_AMM_FEE_PROGRAM_PUBKEY: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 
 /// Whether a [`MeteoraState`] row from LivePoolCache is structurally usable for DLMM planning.
 ///
@@ -898,9 +897,9 @@ pub async fn build_tx_plan(
                 "intent_resources"
             };
             let canonical_fee_cfg =
-                Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG_PUBKEY).unwrap_or_default();
+                Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR).unwrap_or_default();
             let canonical_fee_prog =
-                Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_PUBKEY).unwrap_or_default();
+                Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR).unwrap_or_default();
             let sell_csv: String = ixs[0]
                 .accounts
                 .iter()

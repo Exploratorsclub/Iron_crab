@@ -5011,7 +5011,7 @@ async fn handle_ensure_pump_amm_pool_accounts(
         "I-24d Discovery: EnsurePumpAmmPoolAccounts start (Geyser cache check then RPC fast path if hint)"
     );
     match dex
-        .pool_accounts_v1_for_base_mint_with_hint(base_mint, pool_hint, force_refresh)
+        .pool_accounts_v1_for_base_mint_with_hint_diagnostic(base_mint, pool_hint, force_refresh)
         .await
     {
         Ok(Some(wrapped)) if wrapped.accounts.len() >= 14 => {

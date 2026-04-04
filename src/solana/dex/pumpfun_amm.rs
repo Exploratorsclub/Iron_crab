@@ -31,6 +31,10 @@ const PUMPFUN_AMM_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6
 // Global fee_config account - owned by Fee Program, same for ALL pools.
 // Observed in successful on-chain SELL and BUY transactions.
 const PUMPFUN_AMM_FEE_CONFIG: &str = "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx";
+
+/// Same strings as `build_swap_ix_from_pool_accounts` uses for fee metas (diagnostics / downstream).
+pub const PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR: &str = PUMPFUN_AMM_FEE_CONFIG;
+pub const PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR: &str = PUMPFUN_AMM_FEE_PROGRAM_ID;
 /// Global config account — same for **all** PumpSwap pools (swap instruction account #2).
 /// Verified from successful mainnet SELL/BUY txs; must not be read from market account bytes at
 /// misaligned offsets (see incident: wrong bytes → pubkey with no account → Anchor 3012 on `global_config`).
@@ -620,7 +624,28 @@ impl PumpFunAmmDex {
     ///
     /// `force_refresh`: Cold-path recovery — skip LivePoolCache `pool_accounts` and in-memory
     /// `pools_by_base`, then re-parse the market account via RPC (fixes stale creator-vault / 14er set).
+    ///
+    /// Stable API: returns only the v14 `Vec<Pubkey>` (Eval / downstream compatibility). For Scope 44
+    /// provenance, use [`Self::pool_accounts_v1_for_base_mint_with_hint_diagnostic`].
     pub async fn pool_accounts_v1_for_base_mint_with_hint(
+        &self,
+        base_mint: Pubkey,
+        pool_address_hint: Option<Pubkey>,
+        force_refresh: bool,
+    ) -> Result<Option<Vec<Pubkey>>> {
+        Ok(self
+            .pool_accounts_v1_for_base_mint_with_hint_diagnostic(
+                base_mint,
+                pool_address_hint,
+                force_refresh,
+            )
+            .await?
+            .map(|w| w.accounts))
+    }
+
+    /// Same resolution as [`Self::pool_accounts_v1_for_base_mint_with_hint`], plus Scope 44 diagnostic
+    /// metadata (cold path / market-data only — not required for generic callers).
+    pub async fn pool_accounts_v1_for_base_mint_with_hint_diagnostic(
         &self,
         base_mint: Pubkey,
         pool_address_hint: Option<Pubkey>,
@@ -813,10 +838,8 @@ impl PumpFunAmmDex {
         &self,
         base_mint: Pubkey,
     ) -> Result<Option<Vec<Pubkey>>> {
-        Ok(self
-            .pool_accounts_v1_for_base_mint_with_hint(base_mint, None, false)
-            .await?
-            .map(|w| w.accounts))
+        self.pool_accounts_v1_for_base_mint_with_hint(base_mint, None, false)
+            .await
     }
 
     fn derive_user_volume_accumulator(
