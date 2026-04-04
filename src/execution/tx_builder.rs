@@ -4,7 +4,10 @@ use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::orca_whirlpool_layout;
 use crate::solana::dex::pumpfun::PumpFunDex;
-use crate::solana::dex::pumpfun_amm::PumpFunAmmDex;
+use crate::solana::dex::pumpfun_amm::{
+    PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex, PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR,
+    PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR,
+};
 use crate::solana::dex::raydium::Raydium;
 use crate::solana::dex::Dex;
 use crate::solana::rpc::SolanaRpc;
@@ -16,7 +19,7 @@ use spl_token::solana_program::pubkey::Pubkey as SplProgramPubkey;
 use spl_token_2022;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Whether a [`MeteoraState`] row from LivePoolCache is structurally usable for DLMM planning.
 ///
@@ -880,6 +883,48 @@ pub async fn build_tx_plan(
                 })
             }
         };
+
+        // Scope 44: cold-path only — exact v14 from intent/cache vs final SELL ix metas (fee fields overwritten in builder).
+        if allow_rpc_fallback
+            && intent.side == TradeSide::Sell
+            && pool_accounts.len() >= 14
+            && !ixs.is_empty()
+            && ixs[0].accounts.len() >= 21
+        {
+            let pool_accounts_source = if accounts_len == 0 {
+                "slave_livepoolcache"
+            } else {
+                "intent_resources"
+            };
+            let canonical_fee_cfg =
+                Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR).unwrap_or_default();
+            let canonical_fee_prog =
+                Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR).unwrap_or_default();
+            let sell_csv: String = ixs[0]
+                .accounts
+                .iter()
+                .map(|m| m.pubkey.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            info!(
+                intent_id = %intent.intent_id,
+                scope = "44",
+                dex = "pump_amm",
+                pool_accounts_source = pool_accounts_source,
+                pool = %pool_id,
+                input_mint = %intent.resources.input_mint,
+                base_token_program_override = ?token_program_override,
+                v14_csv = %PumpAmmPoolAccountsDiagnostic::format_v14_csv(&pool_accounts[..14]),
+                sell_ix_accounts_csv = %sell_csv,
+                v14_fee_config = %pool_accounts[12],
+                v14_fee_program = %pool_accounts[13],
+                sell_ix_fee_config_meta = %ixs[0].accounts[19].pubkey,
+                sell_ix_fee_program_meta = %ixs[0].accounts[20].pubkey,
+                fee_config_replaced = (pool_accounts[12] != canonical_fee_cfg),
+                fee_program_replaced = (pool_accounts[13] != canonical_fee_prog),
+                "Scope44: pump_amm SELL simulation plan — compare v14_csv + sell_ix_accounts_csv to ref TX; fee_config/fee_program in ix are builder constants"
+            );
+        }
 
         // NOTE: No in-TX wrap for BUYs!
         // WsolManager maintains WSOL buffer outside of trades.

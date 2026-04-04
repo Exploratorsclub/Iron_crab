@@ -61,7 +61,7 @@ use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
 use ironcrab::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
-use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
+use ironcrab::solana::dex::pumpfun_amm::{PumpAmmPoolAccountsDiagnostic, PumpFunAmmDex};
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex_parser::{
     parse_account_update, parse_transaction_update_with_pool_lookup, DexType, OrcaPoolInfo,
@@ -4923,6 +4923,50 @@ async fn resolve_pump_amm_reserves_for_ensure_discovery(
     }
 }
 
+/// Scope 44: one structured `info!` for cold-path PumpSwap v14 provenance (SIM 6023 forensics).
+fn log_pump_amm_scope44_pool_accounts_diag(
+    request_id: &str,
+    base_mint_str: &str,
+    force_refresh: bool,
+    diag: &PumpAmmPoolAccountsDiagnostic,
+    v14: &[Pubkey],
+) {
+    let ref_sig = diag.reference_swap_signature.as_deref().unwrap_or("");
+    info!(
+        request_id = %request_id,
+        base_mint = %base_mint_str,
+        scope = "44",
+        pump_amm_diag_source = diag.source,
+        pool_market = %diag.pool_market,
+        diag_force_refresh = diag.force_refresh,
+        request_force_refresh = %force_refresh,
+        ref_swap_sig = %ref_sig,
+        v14_csv = %PumpAmmPoolAccountsDiagnostic::format_v14_csv(v14),
+        pfr = %v14.get(6).copied().unwrap_or_default(),
+        pfr_field = ?diag.protocol_fee_recipient.resolution,
+        pfr_tag = diag.protocol_fee_recipient.tag,
+        pfr_ta = %v14.get(7).copied().unwrap_or_default(),
+        pfr_ta_field = ?diag.protocol_fee_recipient_ta.resolution,
+        pfr_ta_tag = diag.protocol_fee_recipient_ta.tag,
+        cc_vault_ata = %v14.get(9).copied().unwrap_or_default(),
+        cc_vault_ata_field = ?diag.coin_creator_vault_ata.resolution,
+        cc_vault_ata_tag = diag.coin_creator_vault_ata.tag,
+        cc_auth = %v14.get(10).copied().unwrap_or_default(),
+        cc_auth_field = ?diag.coin_creator_vault_authority.resolution,
+        cc_auth_tag = diag.coin_creator_vault_authority.tag,
+        gva = %v14.get(11).copied().unwrap_or_default(),
+        gva_field = ?diag.global_volume_accumulator.resolution,
+        gva_tag = diag.global_volume_accumulator.tag,
+        fee_cfg_cached = %v14.get(12).copied().unwrap_or_default(),
+        fee_cfg_field = ?diag.fee_config.resolution,
+        fee_cfg_tag = diag.fee_config.tag,
+        fee_prog_cached = %v14.get(13).copied().unwrap_or_default(),
+        fee_prog_field = ?diag.fee_program.resolution,
+        fee_prog_tag = diag.fee_program.tag,
+        "I-24d Scope44: pump_amm v14 diagnostic — ref_sig=successful swap TX for manual diff; execution-engine SELL overwrites fee_config/fee_program with constants (see tx_builder log)"
+    );
+}
+
 /// I-24d: Handle EnsurePumpAmmPoolAccounts Discovery Request.
 ///
 /// Performs RPC-based discovery (Cold Path), updates MASTER cache, publishes
@@ -4967,10 +5011,19 @@ async fn handle_ensure_pump_amm_pool_accounts(
         "I-24d Discovery: EnsurePumpAmmPoolAccounts start (Geyser cache check then RPC fast path if hint)"
     );
     match dex
-        .pool_accounts_v1_for_base_mint_with_hint(base_mint, pool_hint, force_refresh)
+        .pool_accounts_v1_for_base_mint_with_hint_diagnostic(base_mint, pool_hint, force_refresh)
         .await
     {
-        Ok(Some(accounts)) if accounts.len() >= 14 => {
+        Ok(Some(wrapped)) if wrapped.accounts.len() >= 14 => {
+            let accounts = wrapped.accounts;
+            let diag = wrapped.diagnostic;
+            log_pump_amm_scope44_pool_accounts_diag(
+                request_id,
+                base_mint_str,
+                force_refresh,
+                &diag,
+                &accounts,
+            );
             info!(
                 request_id = %request_id,
                 base_mint = %base_mint_str,
