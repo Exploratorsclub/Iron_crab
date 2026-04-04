@@ -1015,10 +1015,19 @@ impl PumpFunAmmDex {
             ),
         };
         let (pfr_ta_res, pfr_ta_tag) = match fee {
-            PumpAmmFeeParseKind::EmbeddedSecondQuoteTa => (
-                PumpAmmFieldResolution::Heuristic,
-                "embedded_second_quote_ta_address",
-            ),
+            PumpAmmFeeParseKind::EmbeddedSecondQuoteTa => {
+                if authoritative_market_parse {
+                    (
+                        PumpAmmFieldResolution::MarketLayout,
+                        "market_derived_non_pool_quote_token_account_address",
+                    )
+                } else {
+                    (
+                        PumpAmmFieldResolution::Heuristic,
+                        "embedded_second_quote_ta_address",
+                    )
+                }
+            }
             PumpAmmFeeParseKind::GlobalConfigOffset57DerivedWsolAta => (
                 PumpAmmFieldResolution::Deterministic,
                 "derived_ata_from_global_config_pfr",
