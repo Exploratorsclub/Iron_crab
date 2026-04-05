@@ -899,8 +899,6 @@ mod tests {
             quote_reserve: Some(50_000_000_000),       // 50 SOL
             pool_accounts: vec![],
             creator: None,
-            sell_cashback_remaining: false,
-            sell_cashback_third_meta: None,
         };
 
         // Buy tokens with 1 SOL
@@ -927,8 +925,6 @@ mod tests {
             quote_reserve: Some(50_000_000_000),       // 50 SOL
             pool_accounts: vec![],
             creator: None,
-            sell_cashback_remaining: false,
-            sell_cashback_third_meta: None,
         };
 
         // Sell 20K tokens

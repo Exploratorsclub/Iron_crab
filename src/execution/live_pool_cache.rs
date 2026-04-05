@@ -235,12 +235,6 @@ pub struct PumpAmmState {
     pub pool_accounts: Vec<Pubkey>,
     /// Creator of the token (parsed from pool account at offset 11-43)
     pub creator: Option<Pubkey>,
-    /// Observed on-chain: PumpSwap `sell` uses three trailing accounts (cashback / volume tracking).
-    /// When true, the execution builder must append those metas for SELL; derived from `user` + pool (not copied from a third-party tx).
-    /// Monotonic: once true (MASTER/Geyser), never cleared on SLAVE merge.
-    pub sell_cashback_remaining: bool,
-    /// Third readonly trailing meta for extended `sell` (from observed on-chain ix only).
-    pub sell_cashback_third_meta: Option<Pubkey>,
 }
 
 /// Meteora CPMM (DAMM V2) cached state
@@ -437,6 +431,13 @@ pub struct LivePoolCache {
 
     /// Meteora DLMM pool address → explicit [`DexPoolReadiness`] from JetStream / MASTER (Bug #36).
     meteora_dlmm_readiness_by_pool: DashMap<Pubkey, DexPoolReadiness>,
+
+    /// PumpSwap pool-market → extended `sell` layout observed on-chain (Scope 46).
+    /// **Not** part of [`PumpAmmState`] so external crates (Level-5 eval) keep stable struct literals.
+    /// Monotonic flag: once true, never cleared.
+    pump_amm_sell_extended_flag_by_market: DashMap<Pubkey, bool>,
+    /// Third trailing readonly meta for extended `sell` (from observed ix); set when authoritatively known.
+    pump_amm_sell_extended_third_meta_by_market: DashMap<Pubkey, Pubkey>,
 }
 
 /// Which vault position (A/B or X/Y or 0/1) this vault represents
@@ -473,6 +474,8 @@ impl LivePoolCache {
             meteora_cpmm_readiness_by_pool: DashMap::new(),
             orca_readiness_by_pool: DashMap::new(),
             meteora_dlmm_readiness_by_pool: DashMap::new(),
+            pump_amm_sell_extended_flag_by_market: DashMap::new(),
+            pump_amm_sell_extended_third_meta_by_market: DashMap::new(),
         }
     }
 
@@ -873,23 +876,61 @@ impl LivePoolCache {
         }
     }
 
-    /// MASTER/Geyser: extended PumpSwap `sell` observation — flag monotonic; third meta only when observed.
+    /// JetStream / Geyser: merge PumpSwap extended `sell` layout keys into side maps (not `PumpAmmState`).
+    pub fn merge_pump_amm_sell_layout_from_metadata(
+        &self,
+        pool: &Pubkey,
+        meta: Option<&std::collections::HashMap<String, String>>,
+    ) {
+        let Some(m) = meta else {
+            return;
+        };
+        if m.get("pump_amm_sell_cashback_remaining")
+            .is_some_and(|v| v == "true")
+        {
+            self.pump_amm_sell_extended_flag_by_market
+                .insert(*pool, true);
+        }
+        if let Some(s) = m.get("pump_amm_sell_cashback_third_meta") {
+            if let Ok(pk) = Pubkey::from_str(s) {
+                if pk != Pubkey::default() {
+                    self.pump_amm_sell_extended_third_meta_by_market
+                        .insert(*pool, pk);
+                }
+            }
+        }
+    }
+
+    /// Geyser trade path: mark pool-market as needing extended `sell` (monotonic flag + optional third meta).
     pub fn merge_pump_amm_sell_extended_layout(
         &self,
         pool: &Pubkey,
         requires_extended: bool,
         third_meta: Option<Pubkey>,
     ) {
-        if let Some(mut entry) = self.pools.get_mut(pool) {
-            if let CachedPoolState::PumpAmm(ref mut s) = entry.value_mut().state {
-                if requires_extended {
-                    s.sell_cashback_remaining = true;
-                }
-                if let Some(pk) = third_meta.filter(|p| *p != Pubkey::default()) {
-                    s.sell_cashback_third_meta = Some(pk);
-                }
-            }
+        if requires_extended {
+            self.pump_amm_sell_extended_flag_by_market
+                .insert(*pool, true);
         }
+        if let Some(pk) = third_meta.filter(|p| *p != Pubkey::default()) {
+            self.pump_amm_sell_extended_third_meta_by_market
+                .insert(*pool, pk);
+        }
+    }
+
+    /// Extended PumpSwap `sell` layout: flag + third readonly meta (if known).
+    #[must_use]
+    pub fn pump_amm_sell_extended_layout(&self, pool_market: &Pubkey) -> (bool, Option<Pubkey>) {
+        let flag = self
+            .pump_amm_sell_extended_flag_by_market
+            .get(pool_market)
+            .map(|e| *e.value())
+            .unwrap_or(false);
+        let third = self
+            .pump_amm_sell_extended_third_meta_by_market
+            .get(pool_market)
+            .map(|e| *e.value());
+        (flag, third)
     }
 
     /// Set Raydium AMM Serum/OpenBook accounts (bids, asks, event_queue).
@@ -1824,8 +1865,6 @@ fn parse_pumpamm_pool(data: &[u8]) -> Option<CachedPoolState> {
         quote_reserve: None,
         pool_accounts: vec![], // Will be populated from DexPoolAccounts event
         creator: Some(creator),
-        sell_cashback_remaining: false,
-        sell_cashback_third_meta: None,
     }))
 }
 
@@ -2033,8 +2072,6 @@ mod tests {
                 quote_reserve: Some(50_000_000_000),
                 pool_accounts: vec![],
                 creator: None,
-                sell_cashback_remaining: false,
-                sell_cashback_third_meta: None,
             }),
             100,
         );
@@ -2167,8 +2204,6 @@ mod tests {
             quote_reserve,
             pool_accounts,
             creator: None,
-            sell_cashback_remaining: false,
-            sell_cashback_third_meta: None,
         })
     }
 
@@ -2490,8 +2525,6 @@ mod tests {
                 quote_reserve: Some(quote_reserve),
                 pool_accounts: vec![],
                 creator: Some(creator),
-                sell_cashback_remaining: false,
-                sell_cashback_third_meta: None,
             }),
             100,
         );

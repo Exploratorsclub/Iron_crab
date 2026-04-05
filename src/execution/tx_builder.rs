@@ -762,24 +762,19 @@ pub async fn build_tx_plan(
         // - 14 accounts: BUY format (with global_volume_accumulator + user_volume_accumulator)
         let accounts_len = intent.resources.accounts.len();
         let (sell_requires_cashback_remaining, sell_cashback_third_meta) = cache
-            .and_then(|c| c.get(&pool_id))
-            .map(|st| match st {
-                CachedPoolState::PumpAmm(s) => {
-                    (s.sell_cashback_remaining, s.sell_cashback_third_meta)
-                }
-                _ => (false, None),
-            })
+            .map(|c| c.pump_amm_sell_extended_layout(&pool_id))
             .unwrap_or((false, None));
 
         let pool_accounts: Vec<Pubkey> = if accounts_len == 0 {
             if let Some(cache) = cache {
                 if let Some(CachedPoolState::PumpAmm(amm_state)) = cache.get(&pool_id) {
                     if amm_state.pool_accounts.len() >= 12 {
+                        let (sell_ext, sell_third) = cache.pump_amm_sell_extended_layout(&pool_id);
                         tracing::warn!(
                             pool = %pool_id,
                             accounts_len = amm_state.pool_accounts.len(),
-                            sell_cashback_remaining = amm_state.sell_cashback_remaining,
-                            sell_cashback_third_meta = ?amm_state.sell_cashback_third_meta,
+                            sell_cashback_remaining = sell_ext,
+                            sell_cashback_third_meta = ?sell_third,
                             "pump_amm: using cached pool_accounts (intent missing accounts)"
                         );
                         amm_state.pool_accounts.clone()
@@ -1589,8 +1584,7 @@ async fn build_hop_pump_amm(
     let (pool_accounts, sell_requires, sell_third) = if let Some(cache) = cache {
         match cache.get(pool_address) {
             Some(CachedPoolState::PumpAmm(amm_state)) => {
-                let sell_requires = amm_state.sell_cashback_remaining;
-                let sell_third = amm_state.sell_cashback_third_meta;
+                let (sell_requires, sell_third) = cache.pump_amm_sell_extended_layout(pool_address);
                 if amm_state.pool_accounts.len() >= 14 {
                     tracing::debug!(
                         pool = %pool_address,

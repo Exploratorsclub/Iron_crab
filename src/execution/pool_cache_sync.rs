@@ -327,20 +327,6 @@ fn build_minimal_pool_state_with_reserves(
                 })
                 .unwrap_or_default();
 
-            let sell_cashback_remaining = update
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("pump_amm_sell_cashback_remaining"))
-                .map(|v| v == "true")
-                .unwrap_or(false);
-
-            let sell_cashback_third_meta = update
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("pump_amm_sell_cashback_third_meta"))
-                .and_then(|s| Pubkey::from_str(s).ok())
-                .filter(|p| *p != Pubkey::default());
-
             CachedPoolState::PumpAmm(PumpAmmState {
                 base_mint,
                 quote_mint,
@@ -350,8 +336,6 @@ fn build_minimal_pool_state_with_reserves(
                 quote_reserve: Some(quote_reserve),
                 pool_accounts,
                 creator,
-                sell_cashback_remaining,
-                sell_cashback_third_meta,
             })
         }
         "pumpfun" => {
@@ -473,12 +457,6 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                             if new_pump.creator.is_none() && existing_pump.creator.is_some() {
                                 new_pump.creator = existing_pump.creator;
                             }
-                            new_pump.sell_cashback_remaining |=
-                                existing_pump.sell_cashback_remaining;
-                            if new_pump.sell_cashback_third_meta.is_none() {
-                                new_pump.sell_cashback_third_meta =
-                                    existing_pump.sell_cashback_third_meta;
-                            }
                         }
                     }
                 }
@@ -528,6 +506,10 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 }
                 cache.upsert(pool_addr, minimal_state, update.geyser_slot);
                 if update.dex == "pump_amm" {
+                    cache.merge_pump_amm_sell_layout_from_metadata(
+                        &pool_addr,
+                        update.metadata.as_ref(),
+                    );
                     cache.merge_pump_amm_pool_accounts_readiness(
                         pool_addr,
                         update.effective_dex_readiness(),
@@ -612,22 +594,6 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                         }
                         if new_pump.creator.is_none() && existing_pump.creator.is_some() {
                             new_pump.creator = existing_pump.creator;
-                        }
-                        let meta_has_flag = update
-                            .metadata
-                            .as_ref()
-                            .and_then(|m| m.get("pump_amm_sell_cashback_remaining"))
-                            .is_some();
-                        if !meta_has_flag {
-                            new_pump.sell_cashback_remaining =
-                                existing_pump.sell_cashback_remaining;
-                        } else {
-                            new_pump.sell_cashback_remaining |=
-                                existing_pump.sell_cashback_remaining;
-                        }
-                        if new_pump.sell_cashback_third_meta.is_none() {
-                            new_pump.sell_cashback_third_meta =
-                                existing_pump.sell_cashback_third_meta;
                         }
                     }
                 }
@@ -965,6 +931,7 @@ pub fn apply_pool_cache_update(cache: &LivePoolCache, update: &PoolCacheUpdate) 
                 }
                 cache.upsert(addr, minimal_state, update.geyser_slot);
                 if update.dex == "pump_amm" {
+                    cache.merge_pump_amm_sell_layout_from_metadata(&addr, update.metadata.as_ref());
                     cache.merge_pump_amm_pool_accounts_readiness(
                         addr,
                         update.effective_dex_readiness(),
@@ -1191,13 +1158,9 @@ mod tests {
         update.set_dex_readiness_in_metadata(DexPoolReadiness::Ready);
 
         assert!(apply_pool_cache_update(&cache, &update));
-        match cache.get(&pool_market).expect("pool") {
-            CachedPoolState::PumpAmm(s) => {
-                assert!(s.sell_cashback_remaining);
-                assert!(s.sell_cashback_third_meta.is_some());
-            }
-            other => panic!("expected PumpAmm, got {:?}", other),
-        }
+        let (flag, third) = cache.pump_amm_sell_extended_layout(&pool_market);
+        assert!(flag);
+        assert!(third.is_some());
     }
 
     #[test]

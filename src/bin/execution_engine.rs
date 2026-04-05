@@ -7811,8 +7811,6 @@ async fn build_replay_context(
             quote_reserve: Some(50_000_000_000),
             pool_accounts: pool_accounts.clone(),
             creator: None,
-            sell_cashback_remaining: false,
-            sell_cashback_third_meta: None,
         });
         let cache = LivePoolCache::new();
         cache.upsert(pool_market, state, 0);
@@ -11610,8 +11608,6 @@ mod execution_engine_tests {
                 quote_reserve: Some(1),
                 pool_accounts: short,
                 creator: None,
-                sell_cashback_remaining: false,
-                sell_cashback_third_meta: None,
             }),
             0,
         );
@@ -11632,8 +11628,6 @@ mod execution_engine_tests {
                 quote_reserve: Some(1),
                 pool_accounts: twelve,
                 creator: None,
-                sell_cashback_remaining: false,
-                sell_cashback_third_meta: None,
             }),
             0,
         );
@@ -11663,8 +11657,6 @@ mod execution_engine_tests {
                     quote_reserve: Some(1),
                     pool_accounts: twelve,
                     creator: None,
-                    sell_cashback_remaining: false,
-                    sell_cashback_third_meta: None,
                 }),
                 1,
             );

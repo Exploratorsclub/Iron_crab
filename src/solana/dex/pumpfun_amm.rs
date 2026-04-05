@@ -1,4 +1,4 @@
-use crate::execution::live_pool_cache::{CachedPoolState, LivePoolCache};
+use crate::execution::live_pool_cache::LivePoolCache;
 use crate::solana::dex::{Dex, Quote};
 use crate::solana::rpc::SolanaRpc;
 use anyhow::{anyhow, Context, Result};
@@ -721,15 +721,8 @@ impl PumpFunAmmDex {
                             "pump_amm: pool_accounts from LivePoolCache (Ready, ZERO RPC)"
                         );
                         let pool_market = accounts[0];
-                        let (sell_requires, sell_third) = cache
-                            .get(&pool_market)
-                            .map(|e| match e {
-                                CachedPoolState::PumpAmm(s) => {
-                                    (s.sell_cashback_remaining, s.sell_cashback_third_meta)
-                                }
-                                _ => (false, None),
-                            })
-                            .unwrap_or((false, None));
+                        let (sell_requires, sell_third) =
+                            cache.pump_amm_sell_extended_layout(&pool_market);
                         return Ok(Some(PoolAccountsV14WithDiagnostic {
                             accounts,
                             diagnostic: Self::pump_amm_livepoolcache_diagnostic(
@@ -2760,15 +2753,8 @@ impl PumpFunAmmDex {
                                 "pump_amm: cache pool_accounts[8] != canonical event_authority; using canonical"
                             );
                         }
-                        let (sell_requires, sell_third) = cache
-                            .get(&accounts[0])
-                            .map(|e| match e {
-                                CachedPoolState::PumpAmm(s) => {
-                                    (s.sell_cashback_remaining, s.sell_cashback_third_meta)
-                                }
-                                _ => (false, None),
-                            })
-                            .unwrap_or((false, None));
+                        let (sell_requires, sell_third) =
+                            cache.pump_amm_sell_extended_layout(&accounts[0]);
                         let pool = PumpAmmPoolStatic {
                             pool_market: accounts[0],
                             global_config,
@@ -4540,8 +4526,6 @@ mod tests {
                 quote_reserve: Some(quote_reserve),
                 pool_accounts: vec![],
                 creator: None,
-                sell_cashback_remaining: false,
-                sell_cashback_third_meta: None,
             }),
             100,
         );
@@ -4565,8 +4549,6 @@ mod tests {
                 quote_reserve: Some(1),
                 pool_accounts,
                 creator: None,
-                sell_cashback_remaining: false,
-                sell_cashback_third_meta: None,
             }),
             100,
         );

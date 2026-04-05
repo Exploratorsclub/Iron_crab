@@ -32,8 +32,6 @@ fn make_pump_amm_cache_with_reserves(
             quote_reserve: Some(quote_reserve),
             pool_accounts: vec![],
             creator: None,
-            sell_cashback_remaining: false,
-            sell_cashback_third_meta: None,
         }),
         100,
     );
